@@ -123,13 +123,23 @@ impl SubscriptionManager {
 
     /// Drops every subscription held by `agent_id`.
     pub fn remove_agent(&self, agent_id: &str) {
+        let _ = self.unsubscribe_all(agent_id);
+    }
+
+    /// Drops every subscription held by `agent_id`, returning how many were removed.
+    ///
+    /// Python parity: `SubscriptionManager.unsubscribe_all`, which the message
+    /// bus calls from `remove_all_subscriptions`. An empty or unknown agent id
+    /// removes nothing and returns zero.
+    pub fn unsubscribe_all(&self, agent_id: &str) -> usize {
         if agent_id.is_empty() {
-            return;
+            return 0;
         }
         let mut inner = self.inner.write();
         let Some(topics) = inner.by_agent.remove(agent_id) else {
-            return;
+            return 0;
         };
+        let removed = topics.len();
         for topic in topics {
             let topic_empty = inner.by_topic.get_mut(&topic).is_some_and(|agents| {
                 agents.remove(agent_id);
@@ -139,6 +149,44 @@ impl SubscriptionManager {
                 inner.by_topic.remove(&topic);
             }
         }
+        removed
+    }
+
+    /// Replaces the whole registry with `entries` of `(agent_id, pattern)` pairs.
+    ///
+    /// Used by the Redis transport's cross-process registry refresh, which
+    /// rebuilds the local view from the shared Redis sets. Empty agent ids and
+    /// patterns are skipped (matching [`subscribe`](Self::subscribe)) and
+    /// duplicate pairs collapse into one, so a caller may pass a plain union.
+    pub fn replace_all(&self, entries: impl IntoIterator<Item = (String, String)>) {
+        let mut fresh = Inner::default();
+        for (agent_id, pattern) in entries {
+            if agent_id.is_empty() || pattern.is_empty() {
+                continue;
+            }
+            fresh
+                .by_topic
+                .entry(pattern.clone())
+                .or_default()
+                .insert(agent_id.clone());
+            fresh.by_agent.entry(agent_id).or_default().insert(pattern);
+        }
+        *self.inner.write() = fresh;
+    }
+
+    /// Returns the whole registry as `pattern -> sorted agent ids`.
+    ///
+    /// Python parity: `SubscriptionManager.list_subscriptions()` without an
+    /// agent filter. Python returns unordered sets; the agent ids are sorted
+    /// here, so the shape is deterministic.
+    #[must_use]
+    pub fn list(&self) -> BTreeMap<String, Vec<String>> {
+        let inner = self.inner.read();
+        inner
+            .by_topic
+            .iter()
+            .map(|(pattern, agents)| (pattern.clone(), agents.iter().cloned().collect()))
+            .collect()
     }
 
     /// Returns the sorted distinct subscription patterns currently stored.
@@ -320,6 +368,81 @@ mod tests {
         manager.unsubscribe("", "topic");
         manager.unsubscribe("alice", "");
         assert_eq!(manager.subscription_count(), 1);
+    }
+
+    #[test]
+    fn unsubscribe_all_counts_and_prunes() {
+        let manager = SubscriptionManager::new();
+        manager.subscribe("alice", "a");
+        manager.subscribe("alice", "b");
+        manager.subscribe("bob", "b");
+        manager.subscribe("bob", "c");
+
+        assert_eq!(manager.unsubscribe_all("alice"), 2);
+        assert_eq!(manager.unsubscribe_all("alice"), 0);
+        assert_eq!(manager.unsubscribe_all(""), 0);
+        assert_eq!(manager.subscription_count(), 2);
+        assert_eq!(manager.patterns(), vec!["b", "c"]);
+        assert_eq!(manager.subscribers("b"), vec!["bob"]);
+        assert_eq!(manager.topics_of("alice"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn replace_all_rebuilds_both_indices() {
+        let manager = SubscriptionManager::new();
+        manager.subscribe("alice", "old");
+        manager.subscribe("bob", "old");
+
+        manager.replace_all([
+            ("zoe".to_owned(), "news".to_owned()),
+            ("alice".to_owned(), "news".to_owned()),
+            ("alice".to_owned(), "alerts".to_owned()),
+            ("alice".to_owned(), "news".to_owned()),
+            (String::new(), "ignored".to_owned()),
+            ("bob".to_owned(), String::new()),
+        ]);
+
+        assert_eq!(
+            manager.list(),
+            BTreeMap::from([
+                ("alerts".to_owned(), vec!["alice".to_owned()]),
+                (
+                    "news".to_owned(),
+                    vec!["alice".to_owned(), "zoe".to_owned()]
+                ),
+            ])
+        );
+        assert_eq!(manager.topics_of("alice"), vec!["alerts", "news"]);
+        assert_eq!(manager.topics_of("bob"), Vec::<String>::new());
+        assert_eq!(manager.subscription_count(), 3);
+
+        manager.replace_all(Vec::new());
+        assert_eq!(manager.subscription_count(), 0);
+        assert_eq!(manager.list(), BTreeMap::new());
+    }
+
+    #[test]
+    fn list_returns_sorted_agents_per_pattern() {
+        let manager = SubscriptionManager::new();
+        assert_eq!(manager.list(), BTreeMap::new());
+        manager.subscribe("zoe", "news");
+        manager.subscribe("alice", "news");
+        manager.subscribe("alice", "alerts");
+
+        assert_eq!(
+            manager.list(),
+            BTreeMap::from([
+                ("alerts".to_owned(), vec!["alice".to_owned()]),
+                (
+                    "news".to_owned(),
+                    vec!["alice".to_owned(), "zoe".to_owned()]
+                ),
+            ])
+        );
+        assert_eq!(
+            manager.subscription_count(),
+            manager.list().values().map(Vec::len).sum::<usize>()
+        );
     }
 
     #[test]

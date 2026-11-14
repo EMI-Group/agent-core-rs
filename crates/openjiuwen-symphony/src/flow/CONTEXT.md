@@ -4,6 +4,7 @@
 
 Flow distillation and package production, mapping to Python `openjiuwen.symphony.flow`.
 Observed execution traces are ingested, grouped by their successful-edge structure, and distilled into versioned `ExperienceRecipe`s; a frozen recipe can then be packed into a reviewed `SkillPack` artifact.
+A packed recipe also carries the generated SwarmFlow orchestrator script (`swarmflow/run.py`), and a reviewed pack renders as one SDD-0010 SkillPack `SKILL.md` document.
 Distillation is structural, not narrative: evidence groups on its cycle-broken successful-edge signature, versions are content-addressed and immutable, and a model can only write prose.
 The flow store writes eagerly and atomically, so there is no flush on close and a reopened engine reproduces its evidence, recipe versions, and packages.
 Everything here is offline and deterministic; an optional `CompletionModel` supplies only names, applicability, and narrative text, with a template fallback.
@@ -112,7 +113,10 @@ pub struct SkillPack {
     pub schema_version: String, pub package_id: String /*cap-<sha256(materials)[:12]*/,
     pub recipe_id: String, pub recipe_version: u64, pub target_kind: String /*skill*/, pub name: String,
     pub description: String /*[技能包] ...*/, pub steps: Vec<SkillPackStep>,
-    pub artifacts: BTreeMap<String, String>, pub permissions: Vec<String>, pub license: String,
+    pub artifacts: BTreeMap<String, String>,
+    pub swarmflow_script: Option<String> /*rendered as swarmflow/run.py*/,
+    pub trigger_conditions: String /*recipe applicability, empty when undeclared*/,
+    pub permissions: Vec<String>, pub license: String,
 }
 impl SkillPack {
     pub fn materials(&self) -> Value;  pub fn materials_hash(&self) -> String;  pub fn compute_package_id(&self) -> String;
@@ -126,11 +130,79 @@ impl SkillPack {
 
 `pack` freezes only an `active`, `verified` recipe whose structure is a simple linear chain (otherwise `Error::Validation`), and an unknown recipe is `Error::NotFound`.
 
-`SkillPack` materials are `recipe_id`, `target_kind`, `name`, `description`, and the ordered steps, and the content-addressed id is `cap-<sha256(canonical materials)[:12]>`; artifacts, permissions, and license are excluded.
+`SkillPack` materials are `recipe_id`, `target_kind`, `name`, `description`, and the ordered steps, plus `swarmflow_script` and `trigger_conditions` when they are present; the content-addressed id is `cap-<sha256(canonical materials)[:12]>`; artifacts, permissions, and license are excluded.
+A pack built from a recipe therefore carries a different id than an identical pack without a generated script; hand-built packs without a script keep the previous hash because the optional keys are omitted entirely.
+
+`render` returns `SKILL.md`, `dependencies.yaml`, and (when the recipe yielded one) `swarmflow/run.py`; `save` writes nested artifact names by creating their parent directories and rejects anything that escapes the destination, and `load` restores the script from `swarmflow/run.py` and the trigger conditions from the `dependencies.yaml` package header.
 
 The rendered `SKILL.md` has YAML front matter (`name`, `kind: skillpack`, `description`, `skills` in step order) and the body sections `# name`, `When to use`, `Required inputs`, `Included Skills`, `Execution Process`, `Failure handling`, `Final output`, and a fenced `Workflow Graph` block.
 
 The workflow-graph block is `{"graph":{"id":"<name>-workflow","type":"skillpack_workflow","label":<description>,"directed":true,"nodes":...,"edges":...}}`; `dependencies.yaml` carries the ordered capabilities plus a package header, and `load` validates the front-matter skill order and the graph block against it.
+
+### SwarmFlow script
+
+```rust
+pub const SWARMFLOW_MODULE: &str = "swarmflow";
+pub const ALLOWED_OPERATOR: &str = "agent";
+pub const SCRIPT_FILENAME: &str = "swarmflow/run.py";
+pub const SCRIPT_MATERIAL_KEY: &str = "swarmflow_script";
+pub const TRIGGER_CONDITIONS_KEY: &str = "trigger_conditions";
+pub const DEFAULT_STEP_DESCRIPTION: &str = "协作成员能力";
+pub const META_NAME_FALLBACK: &str = "skill-pack";
+pub const IDENTIFIER_PREFIX: &str = "combo-";
+pub const IDENTIFIER_HASH_LENGTH: usize = 12;
+pub const RECIPE_ID_PREFIX: &str = "recipe_";
+
+pub struct SwarmflowScript { pub identifier: String, pub source: String, pub meta: Value, pub task: String, pub steps: Vec<String> }
+impl SwarmflowScript { /* Debug, Clone, PartialEq, Eq, Serialize, Deserialize */ }
+
+pub fn swarmflow_identifier(materials: &Value, recipe_id: &str) -> String;   // combo-<12 hex over canonical materials>
+pub fn generate_swarmflow_script(recipe: &ExperienceRecipe) -> Result<SwarmflowScript>;
+pub fn validate_generated_script(source: &str) -> Result<()>;
+pub fn python_string_literal(value: &str) -> String;                          // repr-like single quotes, UTF-8 preserved
+pub use crate::flow::model::normalize_meta_name;
+// crate-internal packaging plumbing (keeps `pack.rs` to its call sites)
+pub(crate) fn extend_materials(materials: &mut Value, script: Option<&str>, trigger_conditions: &str);
+pub(crate) fn insert_script_artifact(artifacts: &mut BTreeMap<String, String>, script: Option<&str>);
+pub(crate) async fn read_script_artifact(directory: &Path) -> Result<Option<String>>;
+```
+
+The generated script is exactly Python's shape: a module docstring `"""SwarmFlow script generated from recipe <id>."""`, `from swarmflow import agent`, `META = {'name': <identifier>, 'phases': ['step_1', …]}`, `TASK = <task description>`, `async def run(args):`, one `step_N = await agent(<prompt>, label=<id>, phase='step_N')` per capability in topological order, and `return step_<last>`.
+Steps follow `topological_order` (sorted Kahn), predecessors are sorted and joined with ` + `, and an empty combination emits `return None`; `TASK` is always emitted (Python omits it for an empty description) so the validator can require the marker.
+Each prompt is `使用能力 <id>（<description>）完成本阶段任务` plus `。输入来自任务参数` or `。上一步产出：<ids>。`, and a node without a description uses `协作成员能力`.
+Interpolation goes through `python_string_literal`: `\\`, `'`, `\n`, `\r`, `\t`, and other control characters are escaped, multi-byte CJK is emitted verbatim, and the module docstring escapes `\` and `"`.
+`validate_generated_script` is a line-oriented approximation of Python's AST whitelist: it masks strings and comments (so their contents cannot spoof a token), requires balanced brackets and quotes, requires the `META`, `TASK`, and `async def run(args):` markers, allows only `from swarmflow import agent`, allows only `agent(...)` calls (excluding `def`/keyword heads and attribute calls), and rejects the review gate's forbidden tokens; every failure names the first offending line.
+A syntax error inside an expression (for example a missing colon) is not detected — the approximation is documented on the function.
+
+### Rendering
+
+```rust
+pub const SKILL_PACK_NAME_FALLBACK: &str = "symphony-combination";
+pub const SKILL_PACK_TASK_FALLBACK: &str = "由 Symphony 成功执行生成的组合 Skill";
+pub const SKILL_PACK_DESCRIPTION_PREFIX: &str = "[技能包]";
+pub const INCLUDED_SKILL_FALLBACK: &str = "具体用途见该成员的 SKILL.md。";
+pub const INCLUDED_SKILL_LIMIT: usize = 240;
+pub const SKILL_PACK_DOCUMENT_KIND: &str = "skillpack";
+pub const SKILL_PACK_GRAPH_TYPE: &str = "skillpack_workflow";
+pub const SKILL_PACK_NAME_LIMIT: usize = 123;
+
+pub struct RenderedArtifact { pub target: String, pub path: String, pub content: String }
+pub trait SkillAdapter: Send + Sync {
+    fn target(&self) -> &str;
+    fn render(&self, pack: &SkillPack) -> Result<RenderedArtifact>;
+}
+pub struct SkillPackAdapter;
+impl SkillPackAdapter {
+    pub fn new() -> Self;
+    pub fn validate_members(pack: &SkillPack) -> Result<()>;
+    pub fn render(&self, pack: &SkillPack) -> Result<RenderedArtifact>;
+}
+pub fn render_package(pack: &SkillPack, target_kind: &str) -> Result<RenderedArtifact>;
+```
+
+`SkillPackAdapter` renders one SDD-0010 `SKILL.md` root document: YAML front matter (`name`, `kind: skillpack`, `description`, `skills` in chain order) and the sections `When to use`, `Do not use`, `Required inputs`, `Side effects and confirmation`, `Included Skills`, `Execution Process`, `Failure handling`, `Final output`, and `Workflow Graph`.
+`validate_members` requires at least two unique, non-blank members whose `capability_type` is `skill` (case-insensitive) and a simple linear `can_feed` chain; packaging already enforces the recipe's `active` + `verified` status, and a pack does not retain it, so that part of Python's contract is checked at pack time.
+`render_package` dispatches `skill` (and the empty target kind) to `SkillPackAdapter`; any other target is `Error::Unsupported` naming `flow render target \`<name>\``.
 
 ### Review and install
 
@@ -150,7 +222,9 @@ impl ReviewResult { pub fn failed_checks(&self) -> Vec<&ReviewCheck>; pub fn fai
 pub struct InstallPreparation { pub recipe_id: String, pub target_kind: String, pub verdict: String, pub package: Option<SkillPack>, pub artifact_dir: Option<PathBuf>, pub review: Option<ReviewResult>, pub reasons: Vec<String> }
 ```
 
-The `Reviewer` runs seven checks in order — `structure`, `dependencies`, `integrity`, `meta_naming`, `materials`, `permissions`, `license` — and returns `approved` when all pass, `needs_human_review` when `meta_naming` is the only failure, and `rejected` otherwise.
+The `Reviewer` runs ten checks in order — `structure`, `dependencies`, `code_safety`, `secrets`, `artifact_paths`, `integrity`, `meta_naming`, `materials`, `permissions`, `license` — and returns `approved` when all pass, `needs_human_review` when `meta_naming` is the only failure, and `rejected` otherwise.
+
+`code_safety` scans every rendered artifact (including `swarmflow/run.py`) for the forbidden tokens, and runs `validate_generated_script` over a pack's generated script.
 
 A pack may not request `credential_access`, `filesystem_write`, `process`, or `shell`, and may only declare `Apache-2.0`, `BSD-3-Clause`, `MIT`, or `Proprietary`; `review_id` is `review_<12 hex>` over the identity fields, and `reviewed_at` is metadata only.
 
@@ -174,5 +248,12 @@ A pack may not request `credential_access`, `filesystem_write`, `process`, or `s
   - `./model/trace.rs` → `FlowTrace`, `ExecutionGraph`, `TraceNode`/`TraceEdge`, `TraceOutcome`, `from_value` normalization
 - `./store.rs` → atomic flow-root persistence (`evidence.jsonl`, recipe versions, packages)
 - `./engine.rs` → `FlowEngine`, `DistillReport`, grouping, versioning, quality/status, optional narrative
-- `./pack.rs` → `SkillPack`, content-addressed identity, `SKILL.md`/`dependencies.yaml` render, save/load
-- `./review.rs` → `Reviewer`, the seven checks, verdicts, `InstallPreparation`
+- `./codegen.rs` → `generate_swarmflow_script`, `swarmflow_identifier`, `validate_generated_script`, `python_string_literal`, `SwarmflowScript`
+- `./pack.rs` → `SkillPack`, content-addressed identity, `SKILL.md`/`dependencies.yaml`/`swarmflow/run.py` render, save/load
+- `./render.rs` → `SkillPackAdapter`, `SkillAdapter`, `RenderedArtifact`, `render_package`
+- `./review.rs` → `Reviewer`, the ten checks, verdicts, `InstallPreparation`
+
+## Tests
+
+- `tests/flow.rs` — normalization, ingestion, grouping, versioning, persistence, packing/rendering/loading (including `swarmflow/run.py`), the ten review checks, installation preparation, and the model-narrative fallback.
+- `tests/flow_codegen.rs` — pinned two-step script, empty-combination script, identifier stability/content sensitivity, quote/newline/CJK escaping, the validator's accept/reject cases and first-bad-line reporting, member validation failures, the unsupported render target, script participation in the package id, and a full pack → review → install path containing `run.py`.

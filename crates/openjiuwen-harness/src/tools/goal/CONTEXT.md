@@ -24,12 +24,11 @@ Python's split into session-state store + `GoalManager` + per-round `GoalReportS
 - Unknown persisted `status` degrades to `active` with a warning instead of clearing the goal (Python raises and the store drops the record).
 - `get_current_goal` returns `{goal: <record>|null, message?}` inside the six-key envelope and renders Python's flat `goal_id/objective/status/attempt_count/last_assessment` lines for the model.
 - `submit_goal_report` returns `{result: "report_accepted", status}` and adds `goal_id`/`goal_status` when a record was updated, or `message` when none exists (nothing is created).
-- Rails have no direct event sink, so the rail queues `goal.updated` events under `harness.goal_events`; the host drains that key after the task-iteration hooks and forwards each entry to the interaction stream (see Known Issues).
+- Rails have no direct event sink, so the rail queues `goal.updated` events under `harness.goal_events`; the agent's rail-event drain (`crate::agent::RailEventDrain`) forwards them to the invocation stream and to `DeepAgent::drain_rail_events()`.
 - A heartbeat nudge fires when `heartbeat_interval == Some(n)`, `n > 0` and `iteration % n == 0`; `None` and `Some(0)` both disable it.
 - `record_progress` never bumps the revision (Python parity); settling statuses close the clock and set `last_stop_reason`.
 ## Known Issues
-- No goal-event drain in the agent: `GoalRail` appends `goal.updated` payloads under `harness.goal_events` on its rail context, and neither `crate::agent::round` nor `crate::task_loop` copies a rail context's `extra` into the interaction stream, so no rail-queued goal event reaches a caller.
-- A drain would be a new seam (the only interaction frames forwarded are the inner agent's own `interaction` chunks), and until then the host owns the drain after the task-iteration hooks; `src/agent/CONTEXT.md` records the same gap.
+- A host that invokes without reading the stream observes `goal.updated` only through `DeepAgent::drain_rail_events()`; the retained buffer keeps 256 events and then drops the oldest.
 ## Routing Table
 - `./mod.rs` → module docs, declarations, flat re-exports
 - `./schema.rs` → statuses, assessment, token usage, timestamp/value helpers, serde

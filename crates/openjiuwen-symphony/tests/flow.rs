@@ -3,7 +3,7 @@
 //! Everything is offline and deterministic: temporary roots, scripted completion
 //! models, and no clock-dependent assertions (timestamps are never compared).
 //! The tests cover trace normalization, evidence ingestion, grouping, versioning,
-//! persistence, packing/rendering/loading, the seven review checks, installation
+//! persistence, packing/rendering/loading, the ten review checks, installation
 //! preparation, and the model-narrative fallback.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(
@@ -366,6 +366,12 @@ async fn pack_renders_front_matter_and_workflow_graph() {
         .is_file());
 
     let rendered = pack.render();
+    let script = rendered
+        .get("swarmflow/run.py")
+        .expect("generated SwarmFlow script");
+    assert!(script.starts_with("\"\"\"SwarmFlow script generated from recipe "));
+    assert!(script.contains("label='search'"));
+    assert!(script.contains("label='summarize'"));
     let skill_md = rendered.get("SKILL.md").expect("SKILL.md");
     let (front, body) = skill_md.split_once("\n---\n").expect("front matter");
     let yaml = front.strip_prefix("---\n").expect("leading delimiter");
@@ -494,6 +500,9 @@ async fn review_approves_a_valid_pack_and_flags_name_license_and_permissions() {
         [
             "structure",
             "dependencies",
+            "code_safety",
+            "secrets",
+            "artifact_paths",
             "integrity",
             "meta_naming",
             "materials",
@@ -547,6 +556,129 @@ fn failed_names(result: &ReviewResult) -> Vec<&str> {
 }
 
 #[tokio::test]
+async fn review_flags_embedded_script_secrets_and_escaping_paths() {
+    let dir = TempDir::new().unwrap();
+    let (engine, recipe_id) = distilled_engine(dir.path()).await;
+    let pack = engine.pack(&recipe_id).await.unwrap();
+
+    // An embedded script token fails `code_safety` on its own.
+    let mut scripting = pack.clone();
+    scripting.steps[1].description = "run the subprocess helper".to_string();
+    scripting.recompute_identity();
+    let flagged = Reviewer::new().review(&scripting);
+    assert_eq!(flagged.verdict, VERDICT_REJECTED);
+    assert_eq!(failed_names(&flagged), vec!["code_safety"]);
+    assert!(flagged.failure_reasons()[0].contains("subprocess"));
+
+    // A leftover credential fails `secrets` on its own.
+    let mut leaky = pack.clone();
+    leaky.steps[1].description = "call it with api_key: sk-live-0123456789abcdef".to_string();
+    leaky.recompute_identity();
+    let flagged = Reviewer::new().review(&leaky);
+    assert_eq!(flagged.verdict, VERDICT_REJECTED);
+    assert_eq!(failed_names(&flagged), vec!["secrets"]);
+
+    // An escaping material path fails `artifact_paths`; because it is not part
+    // of the rendered materials, `integrity` notices it too.
+    let mut escaping = pack.clone();
+    escaping
+        .artifacts
+        .insert("../escape.md".to_string(), "payload".to_string());
+    let flagged = Reviewer::new().review(&escaping);
+    assert_eq!(flagged.verdict, VERDICT_REJECTED);
+    assert!(failed_names(&flagged).contains(&"artifact_paths"));
+    assert!(failed_names(&flagged).contains(&"integrity"));
+
+    // Windows drive prefixes and absolute paths are rejected as well.
+    for name in ["C:/evil.md", "/etc/passwd"] {
+        let mut escaping = pack.clone();
+        escaping
+            .artifacts
+            .insert(name.to_string(), "payload".to_string());
+        let flagged = Reviewer::new().review(&escaping);
+        assert!(
+            failed_names(&flagged).contains(&"artifact_paths"),
+            "{name} should fail artifact_paths"
+        );
+    }
+
+    // The clean pack still passes every check.
+    let clean = Reviewer::new().review(&pack);
+    assert_eq!(clean.verdict, VERDICT_APPROVED);
+    assert!(clean.failed_checks().is_empty());
+}
+
+#[tokio::test]
+async fn trace_and_model_text_is_redacted_before_it_reaches_a_recipe() {
+    let dir = TempDir::new().unwrap();
+    let model = StaticCompletionModel::single(
+        r#"{"execution_narrative": "leaked key api_key: sk-live-0123456789abcdef", "trigger_conditions": "password = hunter2"}"#,
+    );
+    let engine = FlowEngine::open(dir.path())
+        .await
+        .unwrap()
+        .with_model(Arc::new(model));
+
+    // A trace whose query and node description both carry credentials.
+    let mut payload = chain_payload(
+        "t1",
+        "rotate the api_key: sk-live-0123456789abcdef for search",
+    );
+    payload["graph"]["nodes"]["skill:search"]["metadata"]["description"] =
+        json!("search with Bearer abcdefgh12345678 and password: hunter2");
+    ingest(&engine, payload).await;
+    ingest(&engine, chain_payload("t2", "summarize the release notes")).await;
+
+    let report = engine.distill().await.unwrap();
+    assert!(report.narrative_fallbacks.is_empty());
+    let recipe = engine.recipes().await.into_iter().next().unwrap();
+
+    assert!(!recipe
+        .execution_narrative
+        .contains("sk-live-0123456789abcdef"));
+    assert!(recipe.execution_narrative.contains("<redacted>"));
+    assert!(!recipe
+        .applicability_text("trigger_conditions")
+        .contains("hunter2"));
+    let structure = serde_json::to_string(&recipe.combination_structure).unwrap();
+    assert!(!structure.contains("abcdefgh12345678"));
+    assert!(!structure.contains("hunter2"));
+    assert!(structure.contains("<redacted-credential>"));
+    assert!(structure.contains("<redacted>"));
+    let persisted = fs::read_to_string(
+        dir.path()
+            .join("recipes")
+            .join(&recipe.recipe_id)
+            .join("v1.json"),
+    )
+    .unwrap();
+    assert!(!persisted.contains("sk-live-0123456789abcdef"));
+    assert!(!persisted.contains("hunter2"));
+
+    let pack = engine.pack(&recipe.recipe_id).await.unwrap();
+    let materials = serde_json::to_string(&pack.materials()).unwrap();
+    assert!(!materials.contains("sk-live-0123456789abcdef"));
+    assert!(!materials.contains("abcdefgh12345678"));
+    assert!(materials.contains("<redacted>"));
+    let rendered = pack.render();
+    for (name, text) in &rendered {
+        assert!(
+            !text.contains("sk-live-0123456789abcdef"),
+            "{name} leaked the key"
+        );
+        assert!(
+            !text.contains("abcdefgh12345678"),
+            "{name} leaked the bearer token"
+        );
+    }
+    assert_eq!(
+        Reviewer::new().review(&pack).verdict,
+        VERDICT_APPROVED,
+        "a redacted pack still reviews cleanly"
+    );
+}
+
+#[tokio::test]
 async fn install_writes_artifacts_and_rejects_stale_versions() {
     let dir = TempDir::new().unwrap();
     let (engine, recipe_id) = distilled_engine(dir.path()).await;
@@ -564,6 +696,11 @@ async fn install_writes_artifacts_and_rejects_stale_versions() {
     );
     assert!(destination.path().join("SKILL.md").is_file());
     assert!(destination.path().join("dependencies.yaml").is_file());
+    assert!(destination
+        .path()
+        .join("swarmflow")
+        .join("run.py")
+        .is_file());
     let package = preparation.package.expect("approved package");
     assert_eq!(SkillPack::load(destination.path()).await.unwrap(), package);
     assert_eq!(

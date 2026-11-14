@@ -26,6 +26,23 @@ use super::model::{DreamJob, DreamMetrics, DreamState};
 use super::outcome::{DreamOutcome, DreamRunSummary};
 use super::repository::{DreamRepository, InMemoryDreamRepository};
 
+// The lease-aware sweep. Inherent methods declared in the child module are still public
+// API on [`DreamPlanner`], and the child can use the private helpers below.
+mod lease;
+
+/// One consolidator call's result, before the repository transition is recorded.
+///
+/// Keeping "ask the consolidator" and "record the transition" apart is exactly what lets
+/// the lease-aware sweep renew its lease in between: [`DreamPlanner::attempt`] runs the
+/// two steps back to back for a trusting sweep, while
+/// [`DreamPlanner::run_leased`](DreamPlanner::run_leased) renews before recording.
+enum AttemptResult {
+    /// The consolidator produced an outcome to record.
+    Done(DreamOutcome),
+    /// The consolidator, or [`CallOptions::run`] around it, failed.
+    Failed(Error),
+}
+
 /// The memory-consolidation work one claimed [`DreamJob`] performs.
 ///
 /// The consolidator owns the actual memory mutation and its own cooperative
@@ -233,22 +250,41 @@ impl DreamPlanner {
 
     /// Consolidates one claimed job and records the transition.
     ///
-    /// Returns `true` when the sweep must stop (the run was cancelled).
+    /// Returns `true` when the sweep must stop (the run was cancelled). The body is the
+    /// composition of [`Self::consolidate_step`] and [`Self::record_step`].
     async fn attempt(
         &self,
         job: &DreamJob,
         ctx: &CallOptions,
         summary: &mut DreamRunSummary,
     ) -> Result<bool> {
-        let attempt = match ctx.run(self.consolidator.consolidate(job, ctx)).await {
-            Ok(result) => result,
-            // Cancellation or an elapsed deadline from `CallOptions::run`; the inner
-            // future was dropped, so there is no outcome to inspect.
-            Err(error) => Err(error),
-        };
-        match attempt {
-            Ok(outcome) => self.record_success(job, outcome, summary).await,
-            Err(error) => self.record_failure(job, &error, summary).await,
+        let result = self.consolidate_step(job, ctx).await;
+        self.record_step(job, result, summary).await
+    }
+
+    /// Runs the consolidator for one claimed job, applying the sweep's cancellation.
+    async fn consolidate_step(&self, job: &DreamJob, ctx: &CallOptions) -> AttemptResult {
+        match ctx.run(self.consolidator.consolidate(job, ctx)).await {
+            Ok(Ok(outcome)) => AttemptResult::Done(outcome),
+            // The consolidator's own failure, or cancellation/a deadline from
+            // `CallOptions::run` (whose inner future was dropped, so there is no outcome
+            // to inspect).
+            Ok(Err(error)) | Err(error) => AttemptResult::Failed(error),
+        }
+    }
+
+    /// Records one consolidation result and updates the summary.
+    ///
+    /// Returns `true` when the sweep must stop (the run was cancelled).
+    async fn record_step(
+        &self,
+        job: &DreamJob,
+        result: AttemptResult,
+        summary: &mut DreamRunSummary,
+    ) -> Result<bool> {
+        match result {
+            AttemptResult::Done(outcome) => self.record_success(job, outcome, summary).await,
+            AttemptResult::Failed(error) => self.record_failure(job, &error, summary).await,
         }
     }
 

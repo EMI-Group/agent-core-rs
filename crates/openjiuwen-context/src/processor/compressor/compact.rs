@@ -31,6 +31,16 @@
 //!
 //! A candidate is accepted only when the history really shrinks; nothing is
 //! dropped from the preserved prefix, system messages included.
+//!
+//! Once a candidate is accepted, an optional state snapshot may be reinjected
+//! between the summary and the kept tail: with
+//! [`FullCompactProcessorConfig::reinject_state`] on and a registry wired
+//! through [`FullCompactProcessor::with_reinjection`], the host renders one
+//! `<recovered_context>` message from the sections it can still read, so
+//! behavioural state (the active plan, loaded skills, plan-mode restrictions,
+//! team task status) survives the summary. The message is written only for an
+//! accepted pass, and a stale snapshot left in the kept tail is replaced rather
+//! than stacked a second time.
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
@@ -42,6 +52,10 @@ use openjiuwen_foundation::prompt::{BaseMessage, MessageContent, Role};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{ContextEvent, ContextEventKind};
+use crate::processor::compressor::reinjection::{
+    is_reinjected_state_message, SnapshotContext, SnapshotRegistry, DEFAULT_STATE_MARKER,
+    DEFAULT_STATE_SNAPSHOT_MAX_CHARS, REINJECTED_SECTIONS_METADATA_KEY,
+};
 use crate::processor::compressor::{
     archive_replaced_messages, rollback_recall_archive, summarize, summarize_offline,
 };
@@ -93,6 +107,22 @@ pub struct FullCompactProcessorConfig {
     pub session_memory_enabled: bool,
     /// Keep the assistant tool-call message that owns a kept tool result.
     pub keep_tool_message_pairs: bool,
+    /// Reinject a host-rendered state snapshot after compaction.
+    ///
+    /// Off by default: a host enables it once it has registered
+    /// [`ContextSnapshotProvider`](crate::processor::compressor::reinjection::ContextSnapshotProvider)s
+    /// on the registry handed to
+    /// [`FullCompactProcessor::with_reinjection`]. Without a wired registry the
+    /// field has no effect.
+    pub reinject_state: bool,
+    /// Character budget of one reinjected section.
+    pub state_snapshot_max_chars: usize,
+    /// Sections to reinject by name; empty means every registered provider.
+    pub reinject_sections: Vec<String>,
+    /// Marker that opens a reinjected section header.
+    ///
+    /// `None` (or an empty string) means [`DEFAULT_STATE_MARKER`].
+    pub state_marker: Option<String>,
 }
 
 impl Default for FullCompactProcessorConfig {
@@ -103,6 +133,10 @@ impl Default for FullCompactProcessorConfig {
             messages_to_keep: 10,
             session_memory_enabled: true,
             keep_tool_message_pairs: true,
+            reinject_state: false,
+            state_snapshot_max_chars: DEFAULT_STATE_SNAPSHOT_MAX_CHARS,
+            reinject_sections: Vec::new(),
+            state_marker: Some(DEFAULT_STATE_MARKER.to_owned()),
         }
     }
 }
@@ -267,6 +301,8 @@ pub struct FullCompactProcessor {
     pub model: Option<Arc<dyn Model>>,
     /// Session-memory notes preferred over a model summary.
     pub session_memory: Option<Arc<dyn SessionMemoryStore>>,
+    /// Host-rendered state sections reinjected after an accepted compaction.
+    pub reinjection: Option<Arc<SnapshotRegistry>>,
     /// Cross-run counters, persisted through the context checkpoint.
     pub state: ProcessorState,
 }
@@ -277,6 +313,7 @@ impl std::fmt::Debug for FullCompactProcessor {
             .field("config", &self.config)
             .field("has_model", &self.model.is_some())
             .field("has_session_memory", &self.session_memory.is_some())
+            .field("has_reinjection", &self.reinjection.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -294,6 +331,7 @@ impl FullCompactProcessor {
             config,
             model,
             session_memory,
+            reinjection: None,
             state: ProcessorState::default(),
         }
     }
@@ -303,6 +341,75 @@ impl FullCompactProcessor {
     pub fn with_session_memory(mut self, store: Arc<dyn SessionMemoryStore>) -> Self {
         self.session_memory = Some(store);
         self
+    }
+
+    /// Sets the registry of state sections reinjected after an accepted
+    /// compaction.
+    ///
+    /// The registry is only consulted when
+    /// [`FullCompactProcessorConfig::reinject_state`] is on, and only after the
+    /// candidate has passed the benefit gate.
+    #[must_use]
+    pub fn with_reinjection(mut self, registry: Arc<SnapshotRegistry>) -> Self {
+        self.reinjection = Some(registry);
+        self
+    }
+
+    /// The marker that opens a reinjected section header.
+    fn state_marker(&self) -> &str {
+        self.config
+            .state_marker
+            .as_deref()
+            .filter(|marker| !marker.is_empty())
+            .unwrap_or(DEFAULT_STATE_MARKER)
+    }
+
+    /// The recovered-context message this pass injects, when reinjection is on.
+    ///
+    /// `messages` is the pre-compaction history the snapshot may inspect;
+    /// `candidate` is the accepted compacted history whose tail after
+    /// `summary_index` survives verbatim, which is exactly the tail providers
+    /// de-duplicate against on both the summary and the session-memory path.
+    ///
+    /// This crate holds no session handle and no workspace root, so
+    /// [`SnapshotContext::session_state`] is [`serde_json::Value::Null`] and
+    /// [`SnapshotContext::workspace_root`] is `None` here; a provider that needs
+    /// either captures it in its own fields.
+    fn reinjection_message(
+        &self,
+        messages: &[BaseMessage],
+        candidate: &[BaseMessage],
+        summary_index: usize,
+    ) -> Option<BaseMessage> {
+        if !self.config.reinject_state {
+            return None;
+        }
+        let registry = self.reinjection.as_ref()?;
+        let kept: Vec<BaseMessage> = candidate[summary_index + 1..].to_vec();
+        let only: Vec<&str> = self
+            .config
+            .reinject_sections
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let state = serde_json::Value::Null;
+        let cx = SnapshotContext {
+            session_state: &state,
+            source_messages: messages,
+            kept_messages: &kept,
+            workspace_root: None,
+            state_marker: self.state_marker(),
+            max_chars: self.config.state_snapshot_max_chars,
+        };
+        let message =
+            registry.build_single_message(&cx, (!only.is_empty()).then_some(only.as_slice()))?;
+        let sections = message
+            .metadata
+            .get(REINJECTED_SECTIONS_METADATA_KEY)
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        tracing::debug!(sections, "full compaction reinjected a state snapshot");
+        Some(message)
     }
 
     /// The index of the last compaction boundary, when the history has one.
@@ -505,6 +612,20 @@ impl ContextProcessor for FullCompactProcessor {
             }
             return Ok(None);
         }
+        // The pass is accepted: a state snapshot may now be reinjected after the
+        // summary and before the kept tail. A stale snapshot that survived in
+        // the tail is replaced rather than stacked a second time.
+        let summary_index = prefix.len() + 1;
+        let tokens_after = match self.reinjection_message(messages, &candidate, summary_index) {
+            Some(message) => {
+                let mut tail: Vec<BaseMessage> = candidate.split_off(summary_index + 1);
+                tail.retain(|kept| !is_reinjected_state_message(kept));
+                tail.insert(0, message);
+                candidate.extend(tail);
+                count_messages(cx.counter, &candidate)
+            }
+            None => tokens_after,
+        };
         *messages = candidate;
         self.state.bump("compactions");
         if from_session_memory {

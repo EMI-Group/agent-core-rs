@@ -11,7 +11,14 @@
 //! warning. Only cancellation is propagated, and already-appended history stays.
 //!
 //! [`LongTermMemory::get_recent_messages`] reads the history back as foundation
-//! [`BaseMessage`]s in chronological order.
+//! [`BaseMessage`]s in chronological order, and [`LongTermMemory::get_message_page`]
+//! walks the same history forward as keyset pages, so a caller can replay an arbitrarily
+//! long conversation without an offset or a row number.
+//!
+//! Extracted variables are written through the projection-aware variable path
+//! ([`LongTermMemory::assign_variable`]), so a variable inferred from a conversation is
+//! readable both from the Python-shaped KV API and as a
+//! [`MemoryType::Variable`] record.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -29,7 +36,7 @@ use crate::record::{
     AddMemResult, AddOptions, AddOutcome, CallOptions, MemoryFilter, MemoryRecord, MemoryScope,
     MemoryType, NewMemory,
 };
-use crate::store::StoredMessage;
+use crate::store::{MessagePage, StoredMessage};
 
 use super::variables::validate_variable_name;
 use super::{LongTermMemory, TARGET};
@@ -130,6 +137,54 @@ impl LongTermMemory {
         let limit = num.min(self.config().message_history_limit);
         let stored = self.engine.message_store().recent(scope, limit).await?;
         Ok(stored.into_iter().map(message_from_stored).collect())
+    }
+
+    /// Returns one keyset page of the history of `scope`, oldest row first.
+    ///
+    /// The page is ordered strictly ascending by `(timestamp, id)` and resumes after
+    /// `cursor` (a token from a previous [`MessagePage::next_cursor`]); `None` starts at
+    /// the oldest row. `filter` narrows the page and is `AND`ed with the scope clauses,
+    /// so it can never widen the page past its scope.
+    ///
+    /// `page_size == 0` returns an empty page (`has_more == false`, no cursor) and a
+    /// `page_size` larger than the history returns everything, so no clamping against
+    /// [`crate::config::MemoryEngineConfig::message_history_limit`] applies — that limit
+    /// belongs to the newest-N window of [`LongTermMemory::get_recent_messages`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for an invalid scope or a malformed/tampered
+    /// `cursor` and the storage error when the read fails.
+    pub async fn get_message_page(
+        &self,
+        scope: &MemoryScope,
+        page_size: usize,
+        cursor: Option<&str>,
+        filter: Option<&MemoryFilter>,
+    ) -> Result<MessagePage> {
+        scope.validate()?;
+        self.engine
+            .message_store()
+            .page(scope, page_size, cursor, filter)
+            .await
+    }
+
+    /// Returns one keyset page of the unfiltered history of `scope`.
+    ///
+    /// The convenience form of [`LongTermMemory::get_message_page`] with no extra
+    /// [`MemoryFilter`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for an invalid scope or a malformed/tampered
+    /// `cursor` and the storage error when the read fails.
+    pub async fn page_messages(
+        &self,
+        scope: &MemoryScope,
+        page_size: usize,
+        cursor: Option<&str>,
+    ) -> Result<MessagePage> {
+        self.get_message_page(scope, page_size, cursor, None).await
     }
 
     /// Deletes the conversation history rows matching `filter`, returning how many were
@@ -254,8 +309,25 @@ impl LongTermMemory {
             {
                 continue;
             }
-            self.set_variable(scope, &name, &value).await?;
-            result.variables.insert(name, value);
+            // The projection-aware write, so the extracted variable is a real variable
+            // record rather than a KV-only entry. A name the write path rejects (for
+            // example a case variant of a `forbidden_variables` entry) skips the variable
+            // with a warning, exactly like an invalid name: extraction never fails the
+            // turn. Cancellation and storage errors still propagate.
+            match self.assign_variable(scope, &name, &value, options).await {
+                Ok(_) => {
+                    result.variables.insert(name, value);
+                }
+                Err(Error::Validation(message)) => {
+                    tracing::warn!(
+                        target: TARGET,
+                        variable = %name,
+                        %message,
+                        "skipping an extracted variable the variable write path rejected"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -969,5 +1041,227 @@ mod tests {
         assert!(counter.count_text(&truncated) <= 2, "{truncated}");
         assert_eq!(truncate_to_tokens("single", 0, &counter), "single");
         assert_eq!(truncate_to_tokens("", 4, &counter), "");
+    }
+
+    /// Appends `count` user messages with fixed one-second-apart timestamps.
+    async fn seeded_history(ltm: &LongTermMemory, scope: &MemoryScope, count: usize) {
+        for index in 0..count {
+            let text = format!("history message {index}");
+            let offset = i64::try_from(index).expect("small index");
+            let message = BaseMessage::user(text);
+            ltm.engine()
+                .message_store()
+                .append(scope, &[message], ts(offset))
+                .await
+                .expect("append");
+        }
+    }
+
+    /// Walks every page of a history and returns the contents in order.
+    async fn walk(ltm: &LongTermMemory, scope: &MemoryScope, page_size: usize) -> Vec<String> {
+        let mut contents = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = ltm
+                .get_message_page(scope, page_size, cursor.as_deref(), None)
+                .await
+                .expect("page");
+            assert!(
+                page.items.len() <= page_size,
+                "a page never exceeds its size"
+            );
+            contents.extend(page.items.iter().map(|message| message.content.clone()));
+            let Some(next) = page.next_cursor.clone() else {
+                assert!(!page.has_more, "no cursor on the last page");
+                break;
+            };
+            assert!(page.has_more, "a cursor implies a later page");
+            cursor = Some(next);
+        }
+        contents
+    }
+
+    #[tokio::test]
+    async fn message_pages_walk_the_history_once_in_ascending_order() {
+        let ltm = facade(MemoryEngineConfig::default()).await;
+        seeded_history(&ltm, &scope(), 5).await;
+        assert_eq!(
+            walk(&ltm, &scope(), 2).await,
+            [
+                "history message 0",
+                "history message 1",
+                "history message 2",
+                "history message 3",
+                "history message 4",
+            ]
+        );
+        // Five rows in pages of two is three pages.
+        let mut pages = 0;
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = ltm
+                .page_messages(&scope(), 2, cursor.as_deref())
+                .await
+                .expect("page");
+            pages += 1;
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 3);
+        let first = ltm
+            .page_messages(&scope(), 2, None)
+            .await
+            .expect("first page");
+        assert_eq!(first.items.len(), 2);
+        assert!(first.has_more);
+        assert_eq!(first.items[0].content, "history message 0");
+        assert_eq!(first.items[1].content, "history message 1");
+    }
+
+    #[tokio::test]
+    async fn a_tampered_or_garbage_cursor_is_a_validation_error() {
+        let ltm = facade(MemoryEngineConfig::default()).await;
+        seeded_history(&ltm, &scope(), 5).await;
+        let error = ltm
+            .get_message_page(&scope(), 2, Some("not-a-cursor"), None)
+            .await
+            .expect_err("garbage cursor");
+        assert!(matches!(error, CommonError::Validation(_)), "{error:?}");
+
+        let page = ltm
+            .get_message_page(&scope(), 2, None, None)
+            .await
+            .expect("first page");
+        let token = page.next_cursor.expect("cursor");
+        let mut tampered = token.clone();
+        let last = if tampered.ends_with('0') { '1' } else { '0' };
+        tampered.pop();
+        tampered.push(last);
+        assert_ne!(tampered, token);
+        let error = ltm
+            .get_message_page(&scope(), 2, Some(&tampered), None)
+            .await
+            .expect_err("tampered cursor");
+        assert!(matches!(error, CommonError::Validation(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn zero_page_size_and_a_missing_history_are_empty_pages() {
+        let ltm = facade(MemoryEngineConfig::default()).await;
+        let empty = ltm
+            .get_message_page(&scope(), 2, None, None)
+            .await
+            .expect("missing history");
+        assert_eq!(empty, MessagePage::default());
+        assert!(!empty.has_more);
+        assert!(empty.next_cursor.is_none());
+
+        seeded_history(&ltm, &scope(), 3).await;
+        let zero = ltm
+            .get_message_page(&scope(), 0, None, None)
+            .await
+            .expect("zero page size");
+        assert_eq!(zero, MessagePage::default());
+        let oversized = ltm
+            .get_message_page(&scope(), 100, None, None)
+            .await
+            .expect("oversized page");
+        assert_eq!(oversized.items.len(), 3);
+        assert!(!oversized.has_more);
+        assert!(oversized.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_page_filter_cannot_widen_past_the_scope() {
+        let ltm = facade(MemoryEngineConfig::default()).await;
+        seeded_history(&ltm, &scope(), 3).await;
+        let foreign = MemoryScope::new("bob", "ws");
+        ltm.engine()
+            .message_store()
+            .append(&foreign, &[BaseMessage::user("bob message")], ts(9))
+            .await
+            .expect("append bob");
+
+        let page = ltm
+            .get_message_page(&scope(), 10, None, Some(&MemoryFilter::new()))
+            .await
+            .expect("unfiltered clause");
+        assert_eq!(page.items.len(), 3);
+        assert!(page
+            .items
+            .iter()
+            .all(|message| message.user_id == "alice" && message.scope_id == "ws"));
+
+        let other_user = MemoryFilter {
+            user_id: Some("bob".to_owned()),
+            ..MemoryFilter::default()
+        };
+        let page = ltm
+            .get_message_page(&scope(), 10, None, Some(&other_user))
+            .await
+            .expect("contradicting filter");
+        assert!(page.items.is_empty(), "the scope clause always wins");
+
+        let bounded = MemoryFilter {
+            created_after: Some(ts(0)),
+            ..MemoryFilter::default()
+        };
+        let page = ltm
+            .get_message_page(&scope(), 10, None, Some(&bounded))
+            .await
+            .expect("bounded filter");
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].content, "history message 1");
+    }
+
+    #[tokio::test]
+    async fn the_legacy_recent_window_is_unchanged_by_pagination() {
+        let ltm = facade(MemoryEngineConfig::default()).await;
+        seeded_history(&ltm, &scope(), 5).await;
+        let _ = ltm
+            .get_message_page(&scope(), 2, None, None)
+            .await
+            .expect("page");
+        let recent = ltm.get_recent_messages(&scope(), 2).await.expect("recent");
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].text().as_ref(), "history message 3");
+        assert_eq!(recent[1].text().as_ref(), "history message 4");
+    }
+
+    #[tokio::test]
+    async fn model_variables_are_projected_as_variable_records() {
+        let scripted = Arc::new(ScriptedModel::text(
+            r#"{"facts":[],"variables":{"theme":"dark"}}"#,
+        ));
+        let ltm = LongTermMemory::builder(MemoryEngineConfig::default())
+            .model(scripted)
+            .build()
+            .expect("facade");
+        let agent = AgentMemoryConfig {
+            mem_variables: vec!["theme".to_owned()],
+            ..Default::default()
+        };
+        let result = ltm
+            .add_messages(&scope(), &long_messages(), &agent, &AddOptions::default())
+            .await
+            .expect("add messages");
+        assert_eq!(
+            result.variables.get("theme").map(String::as_str),
+            Some("dark")
+        );
+        assert_eq!(
+            ltm.get_variables(&scope(), None)
+                .await
+                .expect("kv")
+                .get("theme")
+                .map(String::as_str),
+            Some("dark")
+        );
+        let records = ltm.variable_records(&scope()).await.expect("records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, MemoryType::Variable);
+        assert_eq!(records[0].content, "theme=dark");
     }
 }

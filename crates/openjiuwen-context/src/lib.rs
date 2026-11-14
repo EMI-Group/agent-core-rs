@@ -1,16 +1,23 @@
-//! Context windows, token accounting, and compression/offload.
+//! Context windows, token accounting, compression/offload, and usage telemetry.
 //!
 //! Maps to the Python package `core.context_engine` in the openJiuwen reference
 //! implementation. The crate owns the seam between the messages an agent
 //! accumulates and the payload sent to a model:
 //!
-//! - [`ContextConfig`] — budgets, compression threshold, token counter, pipeline.
-//! - [`context`] — `ModelContext`, the conversation history, `save_state`.
-//! - [`engine`] — the per-session context pool, compression, and recovery.
+//! - [`ContextConfig`] — budgets, compression threshold, token counter, window policy, pipeline.
+//! - [`context`] — `ModelContext`, the conversation history, `save_state`, window tracking.
+//! - [`engine`] — the per-session context pool, compression, recovery, usage reports.
 //! - [`window`] — dialogue rounds, window assembly, tool-pair repair.
 //! - [`tokens`] and [`stats`] — counting and per-role statistics.
-//! - [`processor`] — truncation, tool-result trimming/offload, summarisation.
+//! - [`processor`] — truncation, tool-result trimming/offload, summarisation, compressors,
+//!   rule-based result compression, state reinjection.
 //! - [`offload`] — durable storage for content that leaves the window.
+//! - [`usage`] — `context.usage` snapshots, window token reports, KV-cache aggregation.
+//! - [`telemetry`] — the compression-state recorder and its request-correlation scope.
+//! - [`policy`] — context-window resolution (overrides, model table, `OpenRouter` cache) and
+//!   prompt-cache window diffing.
+//! - [`tokenizers`] — encoding selection plus offline artefact discovery, including native
+//!   `tokenizer.json` and `tiktoken` `.model` loading.
 //! - [`prompts`] — the summarisation prompt templates.
 //!
 //! ```
@@ -63,13 +70,16 @@ pub mod engine;
 pub mod engine_options;
 pub mod events;
 pub mod offload;
+pub mod policy;
 pub mod processor;
 pub mod prompts;
 pub mod recall;
 pub mod reload;
 pub mod session_memory;
 pub mod stats;
+pub mod telemetry;
 pub mod tokens;
+pub mod usage;
 pub mod window;
 
 pub use config::{
@@ -85,6 +95,27 @@ pub use events::{
 pub use offload::{
     rehydrate, sanitize_key, InMemoryOffloadStore, KvOffloadStore, OffloadKind, OffloadMarker,
     OffloadRecord, OffloadScope, OffloadStore, SessionOffloadStore, OFFLOAD_MARKER_PREFIX,
+};
+pub use policy::{
+    detect_context_window_change, diff_positions, global_openrouter_window_cache,
+    lookup_model_default_window, tools_signature, ContextWindowChange, ContextWindowPolicy,
+    ContextWindowSnapshot, ContextWindowSource, MessageFingerprint, OpenRouterWindowCache,
+    PositionChange, PromptCacheImpact, ResolvedContextWindow, MODEL_DEFAULT_CONTEXT_WINDOW_TOKENS,
+};
+pub use processor::compressor::adaptive::{
+    render_memory_block_from_plan, render_memory_block_from_plan_with_marker, AdaptiveConfig,
+    AdaptiveContext, AdaptiveStrategy, AdaptiveStrategyConfig, CompressionStrategy,
+    MemoryBlockPlan, StrategyDecision, StrategyInput, StrategyParse, StrategySource,
+};
+pub use processor::compressor::reinjection::{
+    is_reinjected_state_message, strip_state_header, ContextSnapshotProvider, RenderedSection,
+    SnapshotContext, SnapshotRegistry, SnapshotSection, DEFAULT_STATE_MARKER,
+    DEFAULT_STATE_SNAPSHOT_MAX_CHARS, RECOVERED_CONTEXT_INSTRUCTION, RECOVERED_CONTEXT_TAG,
+    REINJECTED_SECTIONS_METADATA_KEY, STATE_REINJECTION_MARKER,
+};
+pub use processor::rule_compression::{
+    ContentRouter, ContentType, RuleCompressionPipeline, RuleCompressionResult, RuleCompressor,
+    RuleContentRouter, RuleContext, TokenCountPolicy,
 };
 pub use processor::{
     ContextPipeline, ContextProcessor, CurrentRoundCompressor, CurrentRoundCompressorConfig,
@@ -117,13 +148,43 @@ pub use session_memory::{
     SESSION_MEMORY_SUMMARY_INTRO,
 };
 pub use stats::{compute_stats, ContextStats, PreparedContext};
+pub use telemetry::{
+    apply_operation, current_compression_operation, current_compression_operation_id,
+    current_request_purpose, modified_messages, stamp_current_operation, with_operation,
+    with_operation_scope, CompressionOperation, CompressionStatePhase, CompressionStateSink,
+    CompressionStateStatus, ContextCompressionMetric, ContextCompressionModifiedMessage,
+    ContextCompressionSaved, ContextCompressionState, ContextCompressionUsage,
+    ContextProcessorStateInput, ContextProcessorStateRecorder, RecordingSink, COMPACTION_PURPOSE,
+    CONTEXT_COMPRESSION_STATE_TYPE, CONTEXT_OPERATION_ID_KEY, REQUEST_PURPOSE_KEY,
+};
 pub use tokens::{check_budget, count_message, count_messages, TokenBudget};
 pub mod tokenizers;
 
+pub use tokenizers::artifacts::{
+    TokenizerArtifactManager, ARTIFACT_ERROR_CODES, LOCAL_ARTIFACT_MISSING_CODE,
+    PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE, REMOTE_DOWNLOAD_DISABLED_CODE,
+    REMOTE_URL_NOT_ALLOWED_CODE, TIKTOKEN_MODEL_MISSING_CODE, TOKENIZER_DOWNLOAD_FAILED_CODE,
+    TOKENIZER_ID_MISSING_CODE, TOKENIZER_JSON_MISSING_CODE, TOKENIZER_NETWORK_UNAVAILABLE_CODE,
+    TOKENIZER_NOT_IN_LOCAL_CACHE_CODE, TOKENIZER_REVISION_UNAVAILABLE_CODE,
+    TOKENIZER_SHA256_MISMATCH_CODE,
+};
 pub use tokenizers::{
-    load_native_tokenizer, ModelEncoding, ModelTokenCounter, SelectedTokenizer, TokenMeasurement,
-    TokenizerEngine, TokenizerMatch, TokenizerMatchKind, TokenizerRegistry, TokenizerSelector,
-    TokenizerSource, TokenizerSpec,
+    load_native_tokenizer, CompatibleTokenizerSpec, ModelEncoding, ModelTokenCounter,
+    SelectedTokenizer, TokenMeasurement, TokenizerEngine, TokenizerMatch, TokenizerMatchKind,
+    TokenizerRegistry, TokenizerSelector, TokenizerSource, TokenizerSpec,
+};
+pub use usage::context_tokens::{
+    count_context_window_tokens, count_messages_tokens, count_tools_tokens,
+    count_usage_tokens_with_tail,
+};
+pub use usage::{
+    is_fallback_source, request_usage_from_metadata, source_name, AnalysisInput, Attribution,
+    CacheAggregationKey, ContextCategory, ContextPartUsage, ContextUsageAnalyzer,
+    ContextUsageMeasurement, ContextUsageSnapshot, ContextWindowTokenReport, ContextWindowUsage,
+    CounterIdentity, KvCacheUsage, MeasurementCacheInfo, PromptSection, RequestKVCacheUsage,
+    SessionKVCacheAggregator, SessionKVCacheUsage, SnapshotOptions, WindowSignatures,
+    CONTEXT_USAGE_EVENT_TYPE, CONTEXT_USAGE_SCHEMA_VERSION, SOURCE_PROVIDER_USAGE, STATUS_INVALID,
+    STATUS_MISS, STATUS_PARTIAL_HIT,
 };
 pub use window::{
     assemble_window, dialogue_round_ranges, drop_orphan_tool_results, find_last_n_rounds_start,

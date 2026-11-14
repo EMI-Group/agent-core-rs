@@ -12,9 +12,11 @@ use std::sync::Arc;
 use openjiuwen_agent::Agent;
 use tokio::task::JoinHandle;
 
+use super::activity::{ActivityStream, ActivityThrottle};
 use super::clock::rfc3339_from_ms;
+use super::lifecycle::{LifecycleStage, SubagentLifecycleEvent};
 use super::persistence::PersistedSubAgentRecord;
-use super::quota::SubagentActivity;
+use super::quota::{SubAgentQuota, SubagentActivity};
 use super::transcript::{TranscriptBuffer, TranscriptChannel, TranscriptEntry};
 use super::{SubAgentId, SubAgentOutcome, SubAgentSpawnRequest, SubagentMetadata, SubagentStatus};
 use crate::schema::SubAgentConfig;
@@ -79,14 +81,18 @@ pub(super) struct Instance {
     pub(super) transcript: TranscriptBuffer,
     /// Live feed of the entries appended to `transcript`.
     pub(super) channel: TranscriptChannel,
+    /// Bounded activity recorder and feed of this instance (disabled by
+    /// [`SubAgentQuota::enable_activity_stream`]).
+    pub(super) activity_stream: ActivityStream,
 }
 
 impl Instance {
     /// Reserves a `Queued` instance at `depth` for `request` and `config`, stamped at `now_ms`.
     ///
-    /// The transcript ring holds at most `transcript_capacity` entries and its live feed
-    /// buffers `transcript_channel_capacity` per subscriber. The reservation records the first
-    /// entry, [`TranscriptEntry::spawn`] with the delegated task description.
+    /// The transcript ring, its live feed and the activity stream are sized and enabled from
+    /// `quota`. The reservation records the first transcript entry,
+    /// [`TranscriptEntry::spawn`] with the delegated task description, and then the matching
+    /// [`ActivityStream::spawn`] frame.
     #[allow(clippy::too_many_arguments)] // one reservation record, straight from the runtime
     pub(super) fn new(
         seq: u64,
@@ -95,12 +101,12 @@ impl Instance {
         now_ms: i64,
         depth: usize,
         config: SubAgentConfig,
-        transcript_capacity: usize,
-        transcript_channel_capacity: usize,
+        quota: &SubAgentQuota,
     ) -> Self {
         let now = rfc3339_from_ms(now_ms);
         let spawn_entry =
             TranscriptEntry::spawn(id.as_str(), request.task_description.clone(), now_ms);
+        let stream_id = id.clone();
         let mut instance = Self {
             seq,
             sub_session_id: id.clone(),
@@ -129,10 +135,14 @@ impl Instance {
             running: false,
             generation: 0,
             handle: None,
-            transcript: TranscriptBuffer::new(transcript_capacity),
-            channel: TranscriptChannel::new(transcript_channel_capacity),
+            transcript: TranscriptBuffer::new(quota.transcript_capacity),
+            channel: TranscriptChannel::new(quota.transcript_channel_capacity),
+            activity_stream: recorder(&stream_id, quota),
         };
         instance.record(spawn_entry);
+        instance
+            .activity_stream
+            .spawn(&request.task_description, now_ms);
         instance
     }
 
@@ -145,14 +155,13 @@ impl Instance {
     /// `Interrupted` and a `Running`/`Queued` activity becomes `Idle`. `closed_reason` is kept
     /// only on a `Closed` record. There is no child agent, no running turn, no queued input and
     /// no turn generation; the persisted transcript is replayed into a fresh ring of
-    /// `transcript_capacity` entries, so it keeps its order and the sequence numbers the ring
-    /// assigns from the oldest retained entry.
+    /// `quota.transcript_capacity` entries, so it keeps its order and the sequence numbers the
+    /// ring assigns from the oldest retained entry. Activity frames are not persisted.
     pub(super) fn restore(
         seq: u64,
         id: SubAgentId,
         record: &PersistedSubAgentRecord,
-        transcript_capacity: usize,
-        transcript_channel_capacity: usize,
+        quota: &SubAgentQuota,
     ) -> Self {
         let status = match record.status {
             SubagentStatus::Running | SubagentStatus::PendingInit => SubagentStatus::Interrupted,
@@ -172,8 +181,9 @@ impl Instance {
         } else {
             record.sub_session_id.clone()
         };
-        let mut transcript = TranscriptBuffer::new(transcript_capacity);
+        let mut transcript = TranscriptBuffer::new(quota.transcript_capacity);
         transcript.extend(record.transcript.iter().cloned());
+        let stream_id = id.clone();
         Self {
             seq,
             subagent_id: id,
@@ -203,7 +213,11 @@ impl Instance {
             generation: 0,
             handle: None,
             transcript,
-            channel: TranscriptChannel::new(transcript_channel_capacity),
+            channel: TranscriptChannel::new(quota.transcript_channel_capacity),
+            // Activity frames are deliberately not persisted: a restored instance starts with an
+            // empty activity history (and the configured enabled/disabled mode) instead of
+            // replaying the frames of the process that wrote the record.
+            activity_stream: recorder(&stream_id, quota),
         }
     }
 
@@ -315,5 +329,47 @@ impl Instance {
             closed_reason: self.closed_reason.clone(),
             transcript: self.transcript.summary(),
         }
+    }
+
+    /// Builds the owned snapshot a lifecycle hook receives for `stage`.
+    ///
+    /// The snapshot carries the identity, nesting and transcript digest of this instance at the
+    /// time of the transition, plus `reason` (the close/evict reason, or the turn error) and
+    /// `now_ms` from the runtime clock. The runtime builds it under its state lock and awaits the
+    /// hooks after releasing it, so a hook never observes a half-updated instance.
+    pub(super) fn lifecycle_event(
+        &self,
+        stage: LifecycleStage,
+        reason: Option<&str>,
+        now_ms: i64,
+    ) -> SubagentLifecycleEvent {
+        SubagentLifecycleEvent {
+            subagent_id: self.subagent_id.clone(),
+            sub_session_id: self.sub_session_id.clone(),
+            subagent_type: self.subagent_type.clone(),
+            depth: self.depth,
+            parent_subagent_id: self.parent_subagent_id.clone(),
+            stage,
+            status: self.status,
+            activity: self.activity,
+            reason: reason.map(str::to_owned),
+            at_ms: now_ms,
+            transcript: self.transcript.summary(),
+        }
+    }
+}
+
+/// Builds the activity recorder of `id`: enabled or disabled by
+/// [`SubAgentQuota::enable_activity_stream`], with the throttle of the quota.
+fn recorder(id: &str, quota: &SubAgentQuota) -> ActivityStream {
+    let throttle = ActivityThrottle::new(
+        quota.activity_capacity,
+        quota.activity_text_max_len,
+        quota.activity_throttle_ms,
+    );
+    if quota.enable_activity_stream {
+        ActivityStream::new(id, throttle)
+    } else {
+        ActivityStream::disabled(id, throttle)
     }
 }

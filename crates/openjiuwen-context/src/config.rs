@@ -15,13 +15,16 @@
 //! ```
 //!
 //! [`ContextEngine`]: crate::engine::ContextEngine
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::prompt::{ApproxTokenCounter, TiktokenCounter, TokenCounter};
 use serde::{Deserialize, Serialize};
 
+use crate::policy::window::{ContextWindowPolicy, ContextWindowSource, ResolvedContextWindow};
 use crate::processor::{ProcessorConfig, ToolResultConfig, TruncationConfig};
+use crate::tokenizers::artifacts::TokenizerArtifactManager;
 use crate::tokenizers::{TokenizerRegistry, TokenizerSelector, TokenizerSpec};
 
 /// Context budget used when [`ContextConfig::max_context_tokens`] is unset.
@@ -93,12 +96,22 @@ impl Default for CompressionRecallConfig {
 }
 
 /// Everything the context engine needs to assemble and compress windows.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct ContextConfig {
-    /// Hard context-window limit reported by the provider; `None` means
-    /// [`DEFAULT_CONTEXT_TOKENS`].
+    /// Hard context-window limit reported by the provider; `None` means the
+    /// window is resolved through [`ContextConfig::context_window_policy`].
     pub max_context_tokens: Option<usize>,
+    /// Context-window resolution policy used when
+    /// [`ContextConfig::max_context_tokens`] is unset.
+    ///
+    /// The precedence is: an explicit [`ContextConfig::max_context_tokens`]
+    /// wins over everything; otherwise, when the policy carries any override,
+    /// [`ContextWindowPolicy::resolve`] walks its ladder (global cap, selected
+    /// model override, configured model map, built-in table, `OpenRouter`
+    /// cache, then [`DEFAULT_CONTEXT_TOKENS`]); a completely default policy
+    /// keeps [`DEFAULT_CONTEXT_TOKENS`], which is the pre-policy behaviour.
+    pub context_window_policy: ContextWindowPolicy,
     /// Tokens held back for the model's answer.
     pub reserve_tokens: usize,
     /// Fraction of the effective maximum at which compression triggers
@@ -131,12 +144,25 @@ pub struct ContextConfig {
     pub tokenizer_provider: Option<String>,
     /// Declared tokenizers used by [`TokenCounterKind::Model`].
     pub tokenizer_registry: Vec<TokenizerSpec>,
+    /// Directory holding cached tokenizer artifacts.
+    ///
+    /// `None` follows
+    /// [`OPENJIUWEN_TOKENIZER_CACHE_DIR`](crate::tokenizers::artifacts::CACHE_DIR_ENV)
+    /// and then `~/.cache/openjiuwen/tokenizers`.
+    pub tokenizer_cache_dir: Option<PathBuf>,
+    /// Whether a tokenizer artifact may be downloaded when it is not cached.
+    ///
+    /// Off by default: context creation and counting never touch the network.
+    pub enable_tokenizer_download: bool,
+    /// Whether artifact resolution is restricted to the local cache.
+    pub tokenizer_offline: bool,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             max_context_tokens: None,
+            context_window_policy: ContextWindowPolicy::default(),
             reserve_tokens: 0,
             compression_threshold: 0.85,
             recent_messages: 6,
@@ -150,6 +176,9 @@ impl Default for ContextConfig {
             model_name: None,
             tokenizer_provider: None,
             tokenizer_registry: Vec::new(),
+            tokenizer_cache_dir: None,
+            enable_tokenizer_download: false,
+            tokenizer_offline: false,
         }
     }
 }
@@ -163,11 +192,33 @@ fn default_processors() -> Vec<ProcessorConfig> {
 }
 
 impl ContextConfig {
+    /// The usable context window and the rung that produced it.
+    ///
+    /// An explicit [`ContextConfig::max_context_tokens`] wins and reports
+    /// [`ContextWindowSource::Global`]; otherwise a policy with any override
+    /// resolves the window through
+    /// [`ContextWindowPolicy::resolve`] for [`ContextConfig::model_name`] and
+    /// [`ContextConfig::tokenizer_provider`]; a completely default policy keeps
+    /// [`DEFAULT_CONTEXT_TOKENS`] with [`ContextWindowSource::Default`].
+    #[must_use]
+    pub fn resolved_window(&self) -> ResolvedContextWindow {
+        if let Some(tokens) = self.max_context_tokens {
+            return ResolvedContextWindow::new(tokens, ContextWindowSource::Global);
+        }
+        if policy_is_configured(&self.context_window_policy) {
+            return self.context_window_policy.resolve(
+                self.model_name.as_deref(),
+                self.tokenizer_provider.as_deref(),
+            );
+        }
+        ResolvedContextWindow::default()
+    }
+
     /// The context budget after subtracting the reserve, saturating at zero.
     #[must_use]
     pub fn effective_max_tokens(&self) -> usize {
-        self.max_context_tokens
-            .unwrap_or(DEFAULT_CONTEXT_TOKENS)
+        self.resolved_window()
+            .tokens
             .saturating_sub(self.reserve_tokens)
     }
 
@@ -204,10 +255,27 @@ impl ContextConfig {
                     self.model_name.clone().unwrap_or_default(),
                     None,
                     registry,
-                );
+                )
+                .with_artifact_manager(self.tokenizer_artifact_manager());
                 Arc::new(selector.select())
             }
         }
+    }
+
+    /// The artifact manager the model-aware counter selects with.
+    ///
+    /// Selection is synchronous, so the manager only reads the local cache even
+    /// when `enable_tokenizer_download` is set; a download stays an explicit
+    /// [`TokenizerArtifactManager::download`] call.
+    #[must_use]
+    pub fn tokenizer_artifact_manager(&self) -> TokenizerArtifactManager {
+        let mut manager = TokenizerArtifactManager::new()
+            .with_enable_download(self.enable_tokenizer_download)
+            .with_offline(self.tokenizer_offline);
+        if let Some(cache_dir) = &self.tokenizer_cache_dir {
+            manager = manager.with_cache_dir(cache_dir.clone());
+        }
+        manager
     }
 
     /// Validates the configuration before it is used by an engine.
@@ -217,8 +285,9 @@ impl ContextConfig {
     /// Returns [`Error::Config`] when the compression threshold is outside
     /// `(0, 1]`, the effective maximum is zero, the `characters` counter has a
     /// zero ratio, a tokenizer registry entry names neither a provider nor a
-    /// model, or compression recall is enabled with a chunk size of zero or an
-    /// overlap that is not smaller than the chunk size.
+    /// model, tokenizer downloads are enabled while the cache is offline, or
+    /// compression recall is enabled with a chunk size of zero or an overlap
+    /// that is not smaller than the chunk size.
     pub fn validate(&self) -> Result<()> {
         let threshold = self.compression_threshold;
         if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
@@ -242,6 +311,11 @@ impl ContextConfig {
         for spec in &self.tokenizer_registry {
             spec.validate()?;
         }
+        if self.enable_tokenizer_download && self.tokenizer_offline {
+            return Err(Error::Config(
+                "enable_tokenizer_download and tokenizer_offline are mutually exclusive".to_owned(),
+            ));
+        }
         let recall = &self.compression_recall;
         if recall.enabled {
             if recall.chunk_size_tokens == 0 {
@@ -258,6 +332,73 @@ impl ContextConfig {
             }
         }
         Ok(())
+    }
+}
+
+/// Whether `policy` carries any override beyond its defaults.
+///
+/// The `OpenRouter` cache handle is not part of the comparison by value, only
+/// by presence, because the cache itself is an interior-mutable handle.
+fn policy_is_configured(policy: &ContextWindowPolicy) -> bool {
+    let default = ContextWindowPolicy::default();
+    policy.context_window_tokens != default.context_window_tokens
+        || policy.model_context_window_tokens_override
+            != default.model_context_window_tokens_override
+        || policy.model_context_window_tokens != default.model_context_window_tokens
+        || policy.enable_openrouter_model_context_window_tokens
+            != default.enable_openrouter_model_context_window_tokens
+        || policy.openrouter_request_timeout != default.openrouter_request_timeout
+        || policy.openrouter_endpoint != default.openrouter_endpoint
+        || policy.model_name != default.model_name
+        || policy.model_provider != default.model_provider
+        || policy.openrouter_cache.is_some()
+}
+
+impl PartialEq for ContextConfig {
+    fn eq(&self, other: &Self) -> bool {
+        let policy_eq = self.context_window_policy.context_window_tokens
+            == other.context_window_policy.context_window_tokens
+            && self
+                .context_window_policy
+                .model_context_window_tokens_override
+                == other
+                    .context_window_policy
+                    .model_context_window_tokens_override
+            && self.context_window_policy.model_context_window_tokens
+                == other.context_window_policy.model_context_window_tokens
+            && self
+                .context_window_policy
+                .enable_openrouter_model_context_window_tokens
+                == other
+                    .context_window_policy
+                    .enable_openrouter_model_context_window_tokens
+            && self.context_window_policy.openrouter_request_timeout
+                == other.context_window_policy.openrouter_request_timeout
+            && self.context_window_policy.openrouter_endpoint
+                == other.context_window_policy.openrouter_endpoint
+            && self.context_window_policy.model_name == other.context_window_policy.model_name
+            && self.context_window_policy.model_provider
+                == other.context_window_policy.model_provider
+            && self.context_window_policy.openrouter_cache.is_some()
+                == other.context_window_policy.openrouter_cache.is_some();
+        self.max_context_tokens == other.max_context_tokens
+            && self.reserve_tokens == other.reserve_tokens
+            && self.compression_threshold == other.compression_threshold
+            && self.recent_messages == other.recent_messages
+            && self.max_context_messages == other.max_context_messages
+            && self.default_window_messages == other.default_window_messages
+            && self.default_window_rounds == other.default_window_rounds
+            && self.enable_reload == other.enable_reload
+            && self.token_counter == other.token_counter
+            && self.compression_recall == other.compression_recall
+            && self.processors == other.processors
+            && self.model_name == other.model_name
+            && self.tokenizer_provider == other.tokenizer_provider
+            && self.tokenizer_registry == other.tokenizer_registry
+            && self.tokenizer_cache_dir == other.tokenizer_cache_dir
+            && self.enable_tokenizer_download == other.enable_tokenizer_download
+            && self.tokenizer_offline == other.tokenizer_offline
+            && policy_eq
     }
 }
 
@@ -424,5 +565,97 @@ mod tests {
             serde_json::from_str(r#"{"compression_threshold": 0.5, "surprise": true}"#).unwrap();
         assert_eq!(partial.compression_threshold, 0.5);
         assert_eq!(partial.recent_messages, 6);
+    }
+
+    #[test]
+    fn the_policy_resolves_the_window_only_when_it_is_configured() {
+        // An explicit budget always wins.
+        let explicit = ContextConfig {
+            max_context_tokens: Some(1000),
+            context_window_policy: ContextWindowPolicy::new()
+                .with_global_tokens(500)
+                .with_model_override(300),
+            ..ContextConfig::default()
+        };
+        assert_eq!(explicit.resolved_window().tokens, 1000);
+        assert_eq!(
+            explicit.resolved_window().source,
+            ContextWindowSource::Global
+        );
+        assert_eq!(explicit.effective_max_tokens(), 1000);
+
+        // A completely default policy keeps today's 200000-token behaviour even
+        // when a model name is configured.
+        let defaulted = ContextConfig {
+            model_name: Some("gpt-4o".to_owned()),
+            ..ContextConfig::default()
+        };
+        assert_eq!(defaulted.resolved_window().tokens, DEFAULT_CONTEXT_TOKENS);
+        assert_eq!(
+            defaulted.resolved_window().source,
+            ContextWindowSource::Default
+        );
+
+        let override_window = ContextConfig {
+            context_window_policy: ContextWindowPolicy::new().with_model_override(111),
+            ..ContextConfig::default()
+        };
+        assert_eq!(override_window.resolved_window().tokens, 111);
+        assert_eq!(
+            override_window.resolved_window().source,
+            ContextWindowSource::Override
+        );
+
+        let model_map = ContextConfig {
+            model_name: Some("acme-model".to_owned()),
+            context_window_policy: ContextWindowPolicy::new().with_model_window("acme-model", 999),
+            ..ContextConfig::default()
+        };
+        assert_eq!(model_map.resolved_window().tokens, 999);
+        assert_eq!(
+            model_map.resolved_window().source,
+            ContextWindowSource::ConfiguredModel
+        );
+
+        let builtin = ContextConfig {
+            context_window_policy: ContextWindowPolicy::new().with_model("gpt-4o"),
+            ..ContextConfig::default()
+        };
+        assert_eq!(builtin.resolved_window().tokens, 128_000);
+        assert_eq!(
+            builtin.resolved_window().source,
+            ContextWindowSource::BuiltIn
+        );
+
+        let unknown = ContextConfig {
+            context_window_policy: ContextWindowPolicy::new().with_model("acme/unknown-model"),
+            ..ContextConfig::default()
+        };
+        assert_eq!(unknown.resolved_window().tokens, DEFAULT_CONTEXT_TOKENS);
+        assert_eq!(
+            unknown.resolved_window().source,
+            ContextWindowSource::Default
+        );
+    }
+
+    #[test]
+    fn the_policy_round_trips_and_compares_without_the_cache_handle() {
+        let config = ContextConfig {
+            context_window_policy: ContextWindowPolicy::new()
+                .with_global_tokens(64_000)
+                .with_model_window("acme", 32_000),
+            ..ContextConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: ContextConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, restored);
+        assert_eq!(
+            restored.context_window_policy.context_window_tokens,
+            Some(64_000)
+        );
+
+        // The cache handle is compared by presence only, so a default policy
+        // equals a policy whose handle is absent.
+        assert_eq!(ContextConfig::default(), ContextConfig::default());
     }
 }

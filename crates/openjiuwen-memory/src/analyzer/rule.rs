@@ -463,7 +463,7 @@ fn is_generic_statement(sentence: &str) -> bool {
 /// only ASCII letters, digits, and underscores; the value must be non-empty. The
 /// delimiter search is case-insensitive but byte offsets are preserved (lowercasing
 /// only rewrites ASCII letters in place), so the returned key keeps its original case.
-fn parse_assignment(sentence: &str) -> Option<(String, String)> {
+pub(crate) fn parse_assignment(sentence: &str) -> Option<(String, String)> {
     let lowered = sentence.to_ascii_lowercase();
     if let Some(rest) = lowered.strip_prefix("set ") {
         if let Some(offset) = rest.find(" to ") {

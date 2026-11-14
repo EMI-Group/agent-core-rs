@@ -1,31 +1,36 @@
-//! Offline axum skeleton of the Python RL service (`agent_rl` service layer).
+//! HTTP service of the Python online-RL (`agent_rl`) service layer.
 //!
-//! Python ships a full RL/RLOps HTTP service backed by Redis, vLLM/verl training
-//! executors, and a rewards gateway. That stack is deferred (see
-//! `docs/PARITY.md`), so this module keeps the *contract* instead: the health and
-//! offline-evaluation endpoints work end-to-end, and every RL operation is
-//! registered with a stable `501` response rather than a `404`.
+//! Python ships the RL Service as a FastAPI app over Redis, vLLM/verl training
+//! executors and a rewards gateway. The Rust port keeps the transport contract
+//! and the same state machines, backed by an in-memory store and the
+//! deterministic offline training executor (see `docs/PARITY.md` for what stays
+//! deferred).
 //!
 //! # Endpoints
 //!
 //! | Method | Path | Behaviour |
 //! |---|---|---|
-//! | `GET` | `/health` | `200 {"status":"ready","model_id":...}`, or `503` when `ready` is false |
+//! | `GET` | `/health` | `200 {"status":"ready","model_id":...}`, or `503 service_not_ready` when the service is not ready or its executor cannot train |
 //! | `POST` | `/v1/evaluate` | offline exact-match scoring over `cases` (or an `answers` map) |
-//! | `POST` | `/v1/rl/tasks/start` | `501` |
-//! | `GET` | `/v1/rl/tasks/{rl_task_id}` | `501` |
-//! | `POST` | `/v1/rl/tasks/{rl_task_id}/stop` | `501` |
-//! | `POST` | `/v1/rl/tasks/{rl_task_id}/reward` | `501` |
-//! | `POST` | `/v1/rl/training/runs` | `501` |
-//! | `GET` | `/v1/rl/training/runs/{id}` | `501` |
-//! | `POST` | `/v1/rl/training/runs/{id}/stop` | `501` |
-//! | `GET` | `/v1/rl/trajectories/stats` | `501` |
-//! | `GET` | `/v1/rl/trajectories` | `501` |
-//! | `GET` | `/v1/rl/trajectories/{id}` | `501` |
-//! | `POST` | `/internal/v1/completions:before` | `501` |
-//! | `POST` | `/internal/v1/completions:after` | `501` |
-//! | `POST` | `/internal/v1/completions:discard` | `501` |
-//! | `POST` | `/internal/v1/rl/tasks/{*operation}` | `501` (serves `.../{id}:finish` and `.../{id}:abort`) |
+//! | `POST` | `/v1/rl/tasks/start` | `201` created / `200` adopted task record |
+//! | `GET` | `/v1/rl/tasks/{rl_task_id}` | task record, `404 task_not_found` |
+//! | `POST` | `/v1/rl/tasks/{rl_task_id}/stop` | `finish(UserStopped)` |
+//! | `POST` | `/v1/rl/tasks/{rl_task_id}/reward` | `{"sample_count": n}` |
+//! | `POST` | `/v1/rl/training/runs` | `201` new / `200` active run, `409 insufficient_samples` |
+//! | `GET` | `/v1/rl/training/runs/{id}` | public training-run record |
+//! | `POST` | `/v1/rl/training/runs/{id}/stop` | canceled run record |
+//! | `GET` | `/v1/rl/trajectories/stats` | sample-ledger counters |
+//! | `GET` | `/v1/rl/trajectories` | sample-ledger listing (`status`, `limit`) |
+//! | `GET` | `/v1/rl/trajectories/{id}` | one sample record |
+//! | `POST` | `/v1/gateway/upload/batch` | persist a sample batch once |
+//! | `POST` | `/internal/v1/completions:before` | reserve a capture, normalize the request |
+//! | `POST` | `/internal/v1/completions:after` | commit the response, `204` |
+//! | `POST` | `/internal/v1/completions:discard` | release the capture, `204` |
+//! | `POST` | `/internal/v1/rl/tasks/{*operation}` | serves `.../{id}:finish` and `.../{id}:abort` |
+//!
+//! The RL routes are implemented in [`crate::online::routes`] over the state
+//! machines of [`crate::online`]; this module owns the configuration, the
+//! envelope, the router assembly and the two routes that need no state machine.
 //!
 //! # Error contract
 //!
@@ -33,10 +38,13 @@
 //! `{"error": {"code": "...", "message": "..."}}`:
 //!
 //! - `invalid_request` — `400`, malformed or inconsistent request payloads.
-//! - `service_not_ready` — `503`, the service is not accepting work yet.
-//! - `internal_error` — `500`, an unexpected evaluation failure.
-//! - `unsupported` — `501`, the deferred RL/ML stack (the message names the
-//!   operation and points at `docs/PARITY.md`).
+//! - the state-machine codes — `400`/`404`/`409`, one per rule (`task_conflict`,
+//!   `turn_closed`, `completion_conflict`, `insufficient_samples`, ...).
+//! - `service_not_ready` — `503`, the service is not accepting work yet, or its
+//!   configured executor cannot train.
+//! - `internal_error` — `500`, an unexpected evaluation or storage failure.
+//! - `unsupported` — `501`, a deferred capability the message names and points
+//!   at `docs/PARITY.md` for.
 //!
 //! The router is pure: building and exercising it binds no socket and needs no
 //! Redis, no model, and no credentials.
@@ -45,7 +53,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{StatusCode, Uri};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -59,6 +67,8 @@ use crate::evaluator::{
     evaluate_cases, EvaluationConfig, EvaluationReport, ExactMatchMetric, MapCaseRunner, Metric,
     MetricEvaluator,
 };
+use crate::online::routes::{rl_router, RlServiceState, RouteState};
+use crate::online::OnlineError;
 
 /// The only metric the offline service implements.
 const SUPPORTED_METRIC: &str = "exact_match";
@@ -70,14 +80,16 @@ const SERVICE_RUN_ID: &str = "service";
 const DEFERRED_REASON: &str =
     "is not supported: the Python RL/ML service stack is deferred; see docs/PARITY.md";
 
-/// Configuration of the RL service skeleton.
+/// Configuration of the RL service.
 ///
 /// Python: `openjiuwen.agent_evolving.agent_rl.rl_service.config.RLServiceConfig`
-/// (reduced — the Redis and training-executor fields belong to deferred scope).
+/// (reduced — the Redis URL and the vendor gateway fields belong to deferred
+/// scope; the batching, activation and executor fields are ported).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct RlServiceConfig {
-    /// Identifier of the model the service would serve; echoed by `/health`.
+    /// Identifier of the model the service serves; echoed by `/health` and
+    /// stamped on every task it starts.
     pub model_id: String,
     /// Host the listener binds to.
     pub listen_host: String,
@@ -85,6 +97,18 @@ pub struct RlServiceConfig {
     pub listen_port: u16,
     /// Whether the service reports itself ready.
     pub ready: bool,
+    /// Pending samples a training run needs before it may claim a batch.
+    pub min_samples_for_training: usize,
+    /// Largest batch one training run may claim.
+    pub max_samples_per_run: usize,
+    /// Activate a succeeded run's artifact through the activator seam.
+    pub auto_activate_lora: bool,
+    /// Root of the `LoRA` artifact repository and of the local executor.
+    pub lora_root: Option<String>,
+    /// Training executor to drive: `"local"` or `"ppo"`.
+    pub executor: String,
+    /// Largest number of samples one upload batch may carry.
+    pub upload_max_samples: usize,
 }
 
 impl Default for RlServiceConfig {
@@ -94,6 +118,12 @@ impl Default for RlServiceConfig {
             listen_host: "127.0.0.1".to_owned(),
             listen_port: 18_081,
             ready: true,
+            min_samples_for_training: 1,
+            max_samples_per_run: 8,
+            auto_activate_lora: true,
+            lora_root: None,
+            executor: "local".to_owned(),
+            upload_max_samples: 256,
         }
     }
 }
@@ -169,6 +199,58 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
+
+    /// Builds an error from an explicit code, message and status.
+    pub fn with_status(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        status: StatusCode,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            status,
+        }
+    }
+
+    /// Builds a `503 service_not_ready` error naming the reason.
+    pub fn service_not_ready_because(message: impl Into<String>) -> Self {
+        Self::with_status(
+            "service_not_ready",
+            message,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    }
+
+    /// The envelope of an online-RL state-machine failure.
+    ///
+    /// The code and the status both come from [`OnlineError`], so a rule decided
+    /// in the state machine is never re-mapped at the transport.
+    pub fn from_online(error: OnlineError) -> Self {
+        let status =
+            StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        Self {
+            code: error.code().to_owned(),
+            message: error.to_string(),
+            status,
+        }
+    }
+
+    /// The envelope of a kernel failure raised outside a state machine.
+    ///
+    /// A deferred capability keeps the `DEFERRED_REASON` wording and answers
+    /// `501`; a validation failure is a `400`; a missing entity is a `404`;
+    /// everything else is an internal error.
+    pub fn from_error(error: Error) -> Self {
+        match error {
+            Error::Unsupported(message) => Self::unsupported(message),
+            Error::Validation(message) => Self::invalid_request(message),
+            Error::NotFound(message) => {
+                Self::with_status("not_found", message, StatusCode::NOT_FOUND)
+            }
+            other => Self::internal(other.to_string()),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -183,59 +265,49 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// Builds the service router with `config` captured as shared state.
+/// Builds the service router over a fresh in-memory state.
+///
+/// The state is built from `config`; when the configuration cannot produce one
+/// (an unknown `executor`, incoherent batching limits) the same route table
+/// answers `503 service_not_ready` naming the reason, so a misconfiguration is a
+/// transport error rather than a panic or a silent fallback.
 ///
 /// The router is built once per server, and also per request in tests; it never
 /// performs I/O of its own.
 pub fn build_router(config: RlServiceConfig) -> Router {
+    match RlServiceState::new(&config) {
+        Ok(state) => build_router_with_state(config, state),
+        Err(error) => router(RouteState::unavailable(
+            config,
+            ApiError::service_not_ready_because(error.to_string()),
+        )),
+    }
+}
+
+/// Builds the service router over an explicitly supplied [`RlServiceState`].
+///
+/// Use this to share one state across routers, or to inspect the state (task
+/// registry, ledger, training runner, checkpoint export) from the caller that
+/// serves it.
+pub fn build_router_with_state(config: RlServiceConfig, state: RlServiceState) -> Router {
+    router(RouteState::ready(config, state))
+}
+
+/// Assembles the two stateless routes and the online-RL route table.
+fn router(state: RouteState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/evaluate", post(evaluate))
-        .route("/v1/rl/tasks/start", post(unsupported_operation))
-        .route("/v1/rl/tasks/{rl_task_id}", get(unsupported_operation))
-        .route(
-            "/v1/rl/tasks/{rl_task_id}/stop",
-            post(unsupported_operation),
-        )
-        .route(
-            "/v1/rl/tasks/{rl_task_id}/reward",
-            post(unsupported_operation),
-        )
-        .route("/v1/rl/training/runs", post(unsupported_operation))
-        .route("/v1/rl/training/runs/{id}", get(unsupported_operation))
-        .route(
-            "/v1/rl/training/runs/{id}/stop",
-            post(unsupported_operation),
-        )
-        // Static route registered before the dynamic one so `stats` can never be
-        // captured as a trajectory id.
-        .route("/v1/rl/trajectories/stats", get(unsupported_operation))
-        .route("/v1/rl/trajectories", get(unsupported_operation))
-        .route("/v1/rl/trajectories/{id}", get(unsupported_operation))
-        .route(
-            "/internal/v1/completions:before",
-            post(unsupported_operation),
-        )
-        .route(
-            "/internal/v1/completions:after",
-            post(unsupported_operation),
-        )
-        .route(
-            "/internal/v1/completions:discard",
-            post(unsupported_operation),
-        )
-        // axum 0.8 cannot express a parameter that only covers part of a path
-        // segment (`{id}:finish`), so the internal task actions — the Python
-        // `.../{id}:finish` and `.../{id}:abort` endpoints — are served by one
-        // catch-all that reports the requested path.
-        .route(
-            "/internal/v1/rl/tasks/{*operation}",
-            post(unsupported_operation),
-        )
-        .with_state(Arc::new(config))
+        .merge(rl_router())
+        .with_state(state)
 }
 
 /// Binds `config.listen_host:config.listen_port` and serves the router.
+///
+/// The state is the one [`build_router`] builds from `config`, so the default
+/// configuration serves the deterministic local executor; a `ppo` executor
+/// serves the same routes and answers `/health` with `503`, because it cannot
+/// train in this build.
 ///
 /// # Errors
 ///
@@ -259,15 +331,21 @@ pub async fn serve(config: RlServiceConfig) -> Result<()> {
 }
 
 /// `GET /health` — readiness probe.
-async fn health(
-    State(config): State<Arc<RlServiceConfig>>,
-) -> std::result::Result<Json<Value>, ApiError> {
-    if !config.ready {
+///
+/// Ready means "this process can accept RL work": the configuration says so, the
+/// state could be built, and the executor can actually train. A `ppo` service
+/// therefore answers `503` with the executor's reason instead of advertising a
+/// GPU stack this build does not link.
+async fn health(State(state): State<RouteState>) -> std::result::Result<Json<Value>, ApiError> {
+    if !state.config().ready {
         return Err(ApiError::service_not_ready());
+    }
+    if let Err(error) = state.online()?.check_health().await {
+        return Err(ApiError::service_not_ready_because(error.to_string()));
     }
     Ok(Json(json!({
         "status": "ready",
-        "model_id": config.model_id,
+        "model_id": state.config().model_id,
     })))
 }
 
@@ -311,11 +389,6 @@ async fn evaluate(
     Ok(Json(report))
 }
 
-/// Every deferred RL operation: answers `501` naming the requested path.
-async fn unsupported_operation(uri: Uri) -> ApiError {
-    ApiError::unsupported(uri.path().to_owned())
-}
-
 /// Resolves the per-case predictions from `answers` or `predictions`.
 fn resolve_predictions(request: &EvaluateRequest) -> std::result::Result<Vec<Value>, ApiError> {
     if let Some(answers) = &request.answers {
@@ -349,7 +422,7 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
     use serde::Serialize;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use tower::ServiceExt;
 
     use super::{build_router, EvaluateRequest, RlServiceConfig};
@@ -378,6 +451,39 @@ mod tests {
             .unwrap()
     }
 
+    /// Builds a request of any method with an optional JSON body.
+    fn request_with(method: &str, uri: &str, body: Option<&Value>) -> Request<Body> {
+        let builder = Request::builder().method(method).uri(uri);
+        match body {
+            Some(body) => builder
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        }
+    }
+
+    /// Builds a `/v1/rl/tasks/start` request carrying every gateway header.
+    fn start_task_request(
+        task_id: &str,
+        policy_name: &str,
+        policy_model: &str,
+        reward_mode: &str,
+    ) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/rl/tasks/start")
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-agent-session-id", "session-1")
+            .header("x-aigw-rl-task-id", task_id)
+            .header("x-aigw-rl-policy-name", policy_name)
+            .header("x-aigw-rl-policy-model", policy_model)
+            .body(Body::from(
+                serde_json::to_vec(&json!({"reward_mode": reward_mode})).unwrap(),
+            ))
+            .unwrap()
+    }
+
     fn post_empty(uri: &str) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -401,12 +507,20 @@ mod tests {
         assert_eq!(config.listen_host, "127.0.0.1");
         assert_eq!(config.listen_port, 18_081);
         assert!(config.ready);
+        assert_eq!(config.min_samples_for_training, 1);
+        assert_eq!(config.max_samples_per_run, 8);
+        assert!(config.auto_activate_lora);
+        assert!(config.lora_root.is_none());
+        assert_eq!(config.executor, "local");
+        assert_eq!(config.upload_max_samples, 256);
 
         let restored: RlServiceConfig =
             serde_json::from_value(serde_json::json!({"model_id": "m", "unknown": 1})).unwrap();
         assert_eq!(restored.model_id, "m");
         assert_eq!(restored.listen_host, "127.0.0.1");
         assert!(restored.ready);
+        assert_eq!(restored.executor, "local");
+        assert_eq!(restored.max_samples_per_run, 8);
     }
 
     #[tokio::test]
@@ -547,99 +661,119 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rl_task_start_returns_unsupported_envelope() {
+    async fn rl_task_start_validates_its_headers_and_body() {
+        let router = build_router(RlServiceConfig::default());
+
+        // No `X-Agent-Session-Id`: the session owns the capture, so it is
+        // checked before the body.
         let (status, body) = send(
-            build_router(RlServiceConfig::default()),
-            post_empty("/v1/rl/tasks/start"),
+            router.clone(),
+            post_json("/v1/rl/tasks/start", &json!({"reward_mode": "terminal"})),
         )
         .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "missing_session_id");
 
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(body["error"]["code"], "unsupported");
-        let message = body["error"]["message"].as_str().unwrap();
-        assert!(message.contains("/v1/rl/tasks/start"), "{message}");
-        assert!(message.contains("deferred"), "{message}");
-        assert!(message.contains("docs/PARITY.md"), "{message}");
+        // The session header alone is not enough: the gateway identity is required.
+        let session_only = serde_json::to_vec(&json!({"reward_mode": "terminal"})).unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/rl/tasks/start")
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-agent-session-id", "session-1")
+            .body(Body::from(session_only))
+            .unwrap();
+        let (status, body) = send(router.clone(), request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_task_request");
+
+        // A body carrying more than `reward_mode` is rejected as a whole.
+        let extra_field = serde_json::to_vec(&json!({"reward_mode": "terminal", "n": 2})).unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/rl/tasks/start")
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-agent-session-id", "session-1")
+            .header("x-aigw-rl-task-id", "task-1")
+            .header("x-aigw-rl-policy-name", "policy-a")
+            .header("x-aigw-rl-policy-model", "pol-model")
+            .body(Body::from(extra_field))
+            .unwrap();
+        let (status, body) = send(router.clone(), request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_task_request");
+
+        // An unknown reward mode is its own code.
+        let (status, body) = send(
+            router,
+            start_task_request("task-1", "policy-a", "pol-model", "per_turn"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_reward_mode");
     }
 
     #[tokio::test]
-    async fn trajectory_stats_route_does_not_collide_with_id_route() {
+    async fn rl_task_and_trajectory_unknown_ids_report_not_found() {
         let router = build_router(RlServiceConfig::default());
 
+        let (status, body) = send(router.clone(), get("/v1/rl/tasks/task-1")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "task_not_found");
+
+        // The static `stats` route must not be shadowed by the `{id}` route.
         let (status, body) = send(router.clone(), get("/v1/rl/trajectories/stats")).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(body["error"]["code"], "unsupported");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .starts_with("/v1/rl/trajectories/stats "),
-            "unexpected message: {body}"
-        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total_samples"], 0);
 
-        let (status, body) = send(router.clone(), get("/v1/rl/trajectories")).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .starts_with("/v1/rl/trajectories "),
-            "unexpected message: {body}"
-        );
-
-        let (status, body) = send(router, get("/v1/rl/trajectories/abc")).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .starts_with("/v1/rl/trajectories/abc "),
-            "unexpected message: {body}"
-        );
+        let (status, body) = send(router, get("/v1/rl/trajectories/traj-1")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "trajectory_not_found");
     }
 
     #[tokio::test]
-    async fn internal_completion_routes_return_unsupported() {
+    async fn internal_routes_validate_their_payloads() {
         let router = build_router(RlServiceConfig::default());
-        for uri in [
-            "/internal/v1/completions:before",
-            "/internal/v1/completions:after",
-            "/internal/v1/completions:discard",
-            "/internal/v1/rl/tasks/t1:finish",
-            "/internal/v1/rl/tasks/t1:abort",
-        ] {
-            let (status, body) = send(router.clone(), post_empty(uri)).await;
-            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "uri: {uri}");
-            assert_eq!(body["error"]["code"], "unsupported", "uri: {uri}");
-            assert!(
-                body["error"]["message"].as_str().unwrap().contains(uri),
-                "uri: {uri} message: {body}"
-            );
-        }
+
+        let (status, body) = send(
+            router.clone(),
+            post_json("/internal/v1/completions:before", &json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_completion");
+
+        // An internal operation with no `:action` suffix is not a task action.
+        let (status, body) = send(router, post_empty("/internal/v1/rl/tasks/t1")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "not_found");
     }
 
     #[tokio::test]
-    async fn rl_action_routes_return_unsupported() {
+    async fn rl_action_routes_report_their_state_errors() {
         let router = build_router(RlServiceConfig::default());
-        for (method, uri) in [
-            ("POST", "/v1/rl/tasks/t1/reward"),
-            ("POST", "/v1/rl/training/runs"),
-            ("GET", "/v1/rl/training/runs/r1"),
-            ("POST", "/v1/rl/training/runs/r1/stop"),
-            ("GET", "/v1/rl/tasks/t1"),
-            ("POST", "/v1/rl/tasks/t1/stop"),
+        let reward = Some(json!({"reward": 0.5}));
+        for (method, uri, payload, code) in [
+            ("POST", "/v1/rl/tasks/t1/reward", reward, "task_not_found"),
+            ("POST", "/v1/rl/training/runs", None, "invalid_request"),
+            (
+                "GET",
+                "/v1/rl/training/runs/r1",
+                None,
+                "training_run_not_found",
+            ),
+            (
+                "POST",
+                "/v1/rl/training/runs/r1/stop",
+                None,
+                "training_run_not_found",
+            ),
+            ("POST", "/v1/rl/tasks/t1/stop", None, "task_not_found"),
         ] {
-            let request = Request::builder()
-                .method(method)
-                .uri(uri)
-                .body(Body::empty())
-                .unwrap();
+            let request = request_with(method, uri, payload.as_ref());
             let (status, body) = send(router.clone(), request).await;
-            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "uri: {uri}");
-            assert!(
-                body["error"]["message"].as_str().unwrap().contains(uri),
-                "uri: {uri} message: {body}"
-            );
+            assert_eq!(body["error"]["code"], code, "uri: {uri} body: {body}");
+            assert!(status.is_client_error(), "uri: {uri} status: {status}");
         }
     }
 

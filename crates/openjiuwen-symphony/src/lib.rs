@@ -25,22 +25,27 @@
 //! - [`orchestration`] — deterministic relation candidates, the bounded planner, the
 //!   typed [`orchestration::OrchestrationPlan`], and an executor that maps a plan onto
 //!   an `openjiuwen-graph` compiled graph.
-//! - [`evaluation`] — fail-soft evaluation suite with deterministic static metrics.
-//! - [`discovery`] — `SKILL.md` folder scanning ([`discovery::SkillFolderScanner`]) and
-//!   the lexical [`discovery::SkillFs`] catalog over installed skills.
-//! - [`experience`] — [`experience::ExperienceBank`]: distilled capability combinations
-//!   with deterministic ranking and persistence.
+//! - [`evaluation`] — fail-soft evaluation suite: static card metrics, trace metrics,
+//!   event-time case windows, status-aware aggregation, and the LLM judge.
+//! - [`discovery`] — `SKILL.md` folder scanning ([`discovery::SkillFolderScanner`]), the
+//!   lexical [`discovery::SkillFs`] catalog over installed skills, its model-facing prompt
+//!   snapshot, and the incremental skill-notice cursor.
+//! - [`experience`] — [`experience::ExperienceBank`] and the persisted,
+//!   embedding-backed [`experience::ExperienceIndex`], fed by session-trace ingestion,
+//!   deterministic clustering, and the collector.
 //! - [`flow`] — flow distillation ([`flow::FlowEngine`]) and reusable `SkillPack` artifacts.
+//! - [`redaction`] — credential/PII redaction for model-facing and packaged text.
 //! - [`llm`] — LLM-guided stages (tree retrieval, ontology matching, semantic scoring,
-//!   fingerprint extraction, judging) with deterministic offline fallbacks.
-//! - [`object_artifact`] — S3/OBS graph artifact persistence over foundation's object
-//!   stores.
+//!   fingerprint extraction, judging) with deterministic offline fallbacks, plus the
+//!   model/metadata identity digests and the persistent relation-match cache.
+//! - [`object_artifact`] — S3/OBS, GCS and Azure Blob graph artifact persistence over
+//!   foundation's object stores and the Google Cloud Storage and Azure Blob REST APIs.
 //! - [`runtime`] — [`runtime::SymphonyRuntime`], the composition root: configuration,
 //!   lifecycle (`start`/`stop`/`close`), graph build, plan, invoke, mutations, and
 //!   evolution feedback.
-//! - [`deferred`] — API-shaped, documented `Error::Unsupported` stubs for the only
-//!   remaining deferred backends, which need a native ML/GPU stack: the faiss
-//!   experience index and `vLLM` logit selection.
+//! - [`deferred`] — an API-shaped, documented `Error::Unsupported` stub for the only
+//!   remaining deferred backend, which needs a native GPU inference stack: `vLLM` logit
+//!   selection.
 //!
 //! # Contracts
 //!
@@ -60,21 +65,21 @@ pub use openjiuwen_common::error::{Error, Result};
 
 /// Immutable, atomically published capability-graph revisions.
 pub mod artifact;
-/// API-shaped stubs for the Python areas that require an LLM/ML stack or external services.
+/// API-shaped stub for the one Python area that requires a GPU inference stack.
 pub mod deferred;
 /// Skill-folder discovery: `SKILL.md` scanning and lexical skill search.
 pub mod discovery;
 /// Error constructors and helpers over [`openjiuwen_common::error`].
 pub mod error;
-/// Fail-soft capability evaluation with deterministic static metrics.
+/// Fail-soft capability evaluation: static and trace metrics, windows, aggregation.
 pub mod evaluation;
-/// The experience bank: distilled capability-combination knowledge with ranking.
+/// The experience layer: bank, persisted index, trace ingestion, clustering, collector.
 pub mod experience;
 /// Flow distillation and reusable SkillPack artifacts.
 pub mod flow;
 /// The `can_feed` capability relationship graph (JGF v2 documents).
 pub mod graph;
-/// LLM-guided stages with deterministic offline fallbacks.
+/// LLM-guided stages with deterministic offline fallbacks, plus the match cache.
 pub mod llm;
 /// Capability cards, fingerprints, data-type vocabulary, and naming helpers.
 pub mod model;
@@ -82,6 +87,8 @@ pub mod model;
 pub mod object_artifact;
 /// Deterministic relation candidates, planning, and plan execution.
 pub mod orchestration;
+/// Credential and PII redaction for model-facing and packaged text.
+pub mod redaction;
 /// The in-memory capability registry with write-through persistence.
 pub mod registry;
 /// The symphony composition root: configuration, lifecycle, graph build, plan, invoke.

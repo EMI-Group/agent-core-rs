@@ -13,6 +13,7 @@ All tests are offline and deterministic.
 - `loaders.rs` → text/JSON/CSV/HTML file loaders with `tempfile`, URL loader with `wiremock`, `AutoLoader` dispatch/stamping/errors, plus DOCX/XLSX/PDF through the path API; binary bytes come from the public `loaders::fixtures` builders.
 - `byte_loading.rs` → the in-memory loading path: `AutoLoader::load_bytes` parity with `load()` for `.txt`/`.md`/`.json`/`.csv`/`.tsv`/`.html`/`.docx`/`.xlsx`/`.pdf`/`.pptx`/`.odt`, `doc_id`/`title`/`file_path`/`file_ext` stamping, unknown-extension/URL bytes/empty-image errors, `DocumentBytes`/`LoadOptions` builders, `Arc<dyn DocumentLoader>` dispatch, and `ZipWriter` → `ZipArchive` plus `fixtures::build_zip` round trips.
 - `knowledge_base.rs` → add/retrieve/filter/rerank/delete/statistics with `HashEmbedding`, multi-KB helpers.
+- `knowledge_base_channels.rs` → BM25/hybrid/agentic/graph retrieval channels, statistics, and filter/threshold/reranker plumbing; uses `HashEmbedding` and the test-local `TableEmbedding` (hand-assigned 2-dimensional vectors, `model_name` `"table-embedding"`), `InMemoryGraphStore`, and `ScriptedRewriter`.
 - `embedding.rs` → `OpenAiEmbedding` request/response behavior with `wiremock`.
 - `graph.rs` → rule extraction pattern families, dedupe/cap, CJK entities, provenance metadata, `TripleMemory`/`TripleBeam`, graph-store traversal and queries.
 - `multimodal.rs` → `MultimodalDocument`/`ContentPart` JSON, data-URI round trips, `content()` shapes, `add_file`, `ImageLoader` metadata/errors, Markdown table round trip, row/column documents and table chunks.
@@ -37,6 +38,7 @@ All tests are offline and deterministic.
 - `./loaders.rs` → loader behavior (path API)
 - `./byte_loading.rs` → in-memory byte loading, fixtures, and ZIP writer/reader round trips
 - `./knowledge_base.rs` → pipeline end to end
+- `./knowledge_base_channels.rs` → dense/sparse/hybrid/agentic/graph channels and their plumbing
 - `./embedding.rs` → OpenAI-compatible embedding client
 - `./graph.rs` → triple extraction and graph store
 - `./multimodal.rs` → multimodal documents, image loading, table conversion

@@ -12,6 +12,7 @@ publish = false
 openjiuwen-common.workspace = true
 openjiuwen-foundation.workspace = true
 openjiuwen-retrieval.workspace = true
+openjiuwen-sysop.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
@@ -30,6 +31,7 @@ sqlx = { workspace = true, optional = true }
 [dev-dependencies]
 openjiuwen-test-support.workspace = true
 tempfile.workspace = true
+wiremock.workspace = true
 
 [features]
 default = []

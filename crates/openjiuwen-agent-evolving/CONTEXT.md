@@ -3,10 +3,10 @@
 ## Intent
 
 Port the portable core of Python `openjiuwen.agent_evolving` (313 files, ~70k LOC) to idiomatic Rust.
-The whole offline surface is ported: datasets, deterministic evaluation, the LLM-as-judge, the optimizer family, checkpointing and the trainer, evolution rails, the RL service contract, RL configuration/batching/rollout/policy/training, and the evolution subsystems (signals, rewards, attribution, trajectories, experience, sharing, TTSE) plus the Docker+git evaluator pipeline.
-What stays deferred is only what genuinely needs a Python ML stack (`torch`, `transformers`, `verl`, `ray`), a distributed service (Redis, vLLM), a vendor HTTP service with authentication, a container browser/PIL runtime, or a remote hub.
+The offline surface is ported end to end: datasets, deterministic evaluation, the LLM-as-judge, the optimizer family, checkpointing and the trainer, evolution rails, the online RL service (task/capture/turn/training-run state machines, HTTP routes, memory and Redis stores, local training executor, LoRA artifact repository), the RL service contract, RL configuration/batching/rollout/policy/training, the evolution subsystems (signals, rewards, attribution, trajectories, experience, sharing, TTSE) and the Docker+git evaluator pipeline.
+What stays deferred is only what genuinely needs a Python ML stack (`torch`, `transformers`, `verl`, `ray`) or a GPU, a vendor HTTP gateway with authentication, a container browser/PIL runtime, or the Python training-stack config ecosystem.
 Deferred paths keep their Python signatures and return `openjiuwen_common::error::Error::Unsupported` with a reason; nothing degrades silently.
-Everything except those paths is offline and deterministic: no model calls, no environment reads, and no wall-clock dependence in tests.
+Everything except those paths is offline and deterministic: no GPU, no model calls in tests, no environment reads, and no wall-clock dependence in report, checkpoint or record contents.
 
 ## Implementation Status
 
@@ -17,9 +17,14 @@ Everything except those paths is offline and deterministic: no model calls, no e
 | `optimizer` — candidate seam, grid baseline, textual-gradient research optimizers, evolve checkpoints | Implemented |
 | `trainer` — bounded train/evaluate loop, resume, budgets, callbacks | Implemented |
 | `rails` — pure evolution events and the harness rail adapter | Implemented |
-| `service` — axum router: health, offline evaluate, 501 RL contract | Implemented |
+| `service` — axum router: health, offline evaluate, the full online RL route table | Implemented (a GPU-backed training run reports `Unsupported`) |
+| `online` — task/capture/turn/training-run state machines, sample ledger, executor seam, LoRA repository, HTTP routes, memory + Redis stores | Implemented (executors are local/deterministic; the GPU PPO executor is deferred) |
 | `rl` — config, packing, normalisation, policy/rollout seams, checkpoints, trainer loop | Implemented (GPU/online engines deferred) |
 | `signal` / `reward` / `attribution` / `trajectory` / `experience` / `sharing` / `ttse` | Implemented (each module documents its remaining seams) |
+| `experience` drafting — draft schema/normalizers, model-driven drafter with deterministic fallback, online evolution orchestrator | Implemented |
+| `sharing` transport — local-file, in-memory and remote HTTP hub backends behind one seam | Implemented (the hub transport is new design) |
+| `ttse` retrieval/dreaming — cosine embedding index with persistence, RRF-fused retrieval, model-backed merge/purge passes | Implemented |
+| `reward` checks — read/python checks, evidence agent, model-judged scoring | Implemented (browser/PIL checks deferred) |
 | `evaluator_pipeline` — Docker + git harness over an injectable command runner | Implemented (agent adapters and evolution loop not ported) |
 | `deferred` — machine-readable deferred table | Implemented |
 
@@ -36,18 +41,29 @@ Everything except those paths is offline and deterministic: no model calls, no e
 - Checkpoints — `EvolveCheckpoint`, `CheckpointStore`, `FileCheckpointStore`, `MemoryCheckpointStore`, `CheckpointManager`, `DefaultCheckpointManager`, `CheckpointSnapshot`, `RestoredState`.
 - `trainer` — `Trainer`, `TrainerConfig`, `TrainableTarget`, `Progress`, `Callbacks`, `NoopCallbacks`, `EpochReport`, `StopReason`, `TrainerReport`.
 
+### Online RL service (`online`, `service`)
+- Tasks — `TaskRegistry`, `TaskSpec`, `TaskRecord`, `TaskStatus`, `RewardMode`, `FinishReason`, `Clock`, `FixedClock`.
+- Captures and turns — `CaptureMeta`, `CaptureStatus`, `PublishState`, `TurnTransition`.
+- Samples — `SampleLedger`, `SampleRecord`, `SampleStatus`.
+- Training runs — `TrainingRunner`, `TrainingRunnerConfig`, `TrainingRunRecord`, `RunStatus`, `RunStage`, `TrainingCheckpoint`.
+- Executors — `TrainingExecutor`, `TrainingRequest`, `TrainingArtifact`, `LocalTrainingExecutor`, `PpoTrainingExecutor`.
+- Artifacts — `LoraRepository`, `LoraVersion`, `LoraAvailability`, `LoraActivator`, `LoraActivation`, `NoopLoraActivator`, `UnsupportedLoraActivator`.
+- Stores — `OnlineStore` (get/set/set_if_absent/del/set_add/set_remove/set_members/set_contains), `MemoryOnlineStore`, `RedisOnlineStore`, `RedisOnlineStoreOptions`.
+- Errors and state — `OnlineError` (`code()`, `http_status()`), `RlServiceState`, `build_router`, `build_router_with_state`, `serve`, `RlServiceConfig`, `EvaluateRequest`, `EvaluateResponse`, `ApiError`.
+
 ### Evolution subsystems
 - `signal` — `EvolutionSignal`, `EvolutionCategory`, `EvolutionTarget`, `SignalTracker`, `TrackedSignal`, the `signals_from_*` extractors.
 - `reward` — `RewardDimension`, `RewardSignal`, `RewardAggregator`, `RewardSummary`, `RewardPack`, `ScoreNormalisation`, `MissingDimensionPolicy`, `aggregate_scores`, `score_evaluated_cases`, `default_pack`.
+- Reward checks — `CheckRunner`, `RewardCheck`, `CheckTool`, `CheckOutcome`, `EvidenceAgent`, `EvidenceTask`, `EvidenceCriterion`, `CriterionKind`, `EvidenceGathered`, `ModelRewardJudge`, `CheckRewardReport`, `CriterionReport`, `CriterionStatus`, `score_criterion`, `to_reward_signal`.
 - `attribution` — `AttributionGraph`, `AttributionNode`, `AttributionEdge`, `CreditAssigner`, `CreditReport`, `CreditRank`, `DiagnosticSignal`, `SignalSource`, `KeywordAttributor`, `KeywordRule`, `KeywordMatch`, `RewardStageAdapter`, `reward_tier`.
 - `trajectory` — `Trajectory`, `TrajectoryStep`, `StepKind`, `StepStatus`, `TrajectoryOutcome`, `TrajectoryBuilder`, `from_messages`, `TrajectoryStore`, `TrajectorySpan`, `spans`, `windows`, `window_around`, `render_digest`, `first_error`, `last_n`, `TrajectoryDigest`.
 - `experience` — `ExperienceRecord`, `ExperienceSection`, `ExperienceArchive`, `ExperienceQuery`, `ExperienceMatch`, `ExperienceExtractor`, `ExperienceLifecycle`, `LifecycleConfig`, `LifecycleReport`, `AddOutcome`.
-- `sharing` — `SharedExperience`, `SharedSkillBundle`, `SharingMeta`, `SkillPackageMeta`, `SkillSearchResult`, `QueryKeywords`, `KeywordExtractor`, `ShareStager`, `StagedBundle`, `SharingBackend`, `LocalFileSharingBackend`, `MemorySharingBackend`.
-- `ttse` — `TtseConfig`, `TipBank`, `TipBankStats`, `TipRecord`, `TipCategory`, `tip_id_for`, `TipClassifier`, `ClassificationRule`, `SuccessDetector`, `SuccessAssessment`, `TipParser`, `TipInducer`, `Dreamer`, `DreamReport`, `TtseEngine`, `consult`, `render_tips`, `ConsultResult`.
+- Drafting — `EvolutionSubject`, `EvolutionSubjectKind`, `EvolutionTarget`, `DraftSection`, `DraftExperience`, `EvolveDraft`, `SimplifyAction`, `SimplifyActionKind`, `SimplifyDraft`, the `normalize_*` normalizers, `ExperienceDrafter`, `DraftInput`, `OnlineEvolutionOrchestrator`, `EvolutionRequest`, `EvolutionStatus`, `OnlineEvolutionResult`, `initial_confidence`, the draft/simplify prompt constants.
+- `sharing` — `SharedExperience`, `SharedSkillBundle`, `SharingMeta`, `SkillPackageMeta`, `SkillSearchResult`, `QueryKeywords`, `KeywordExtractor`, `ShareStager`, `StagedBundle`, `SharingBackend`, `LocalFileSharingBackend`, `MemorySharingBackend`, `RemoteHubOptions`, `RemoteHubSharingBackend`, `HUB_URL_ENV`, `HUB_API_KEY_ENV`.
+- `ttse` — `TtseConfig`, `TipBank`, `TipBankStats`, `TipRecord`, `TipCategory`, `tip_id_for`, `TipClassifier`, `ClassificationRule`, `SuccessDetector`, `SuccessAssessment`, `TipParser`, `TipInducer`, `Dreamer`, `DreamReport`, `TtseEngine`, `consult`, `consult_async`, `rank`, `render_tips`, `ConsultResult`, `RetrieveMode`, `RankedTip`, `EmbeddingIndex`, `IndexMatch`, `cosine`, `RRF_K`, the merge/purge verdict types and parsers.
 
 ### Harness integration and service
 - `rails` — `EvolutionEvent`, `EvolutionObserver`, `EvolutionRailSpec`, `HarnessEvolutionRail`, `registerable_rail`, `EVOLUTION_PRIORITY`.
-- `service` — `RlServiceConfig`, `build_router`, `serve`, `ApiError`, `EvaluateRequest`, `EvaluateResponse`.
 - `rl` — `RlConfig`, `RlTrainingConfig`, `RlRolloutConfig`, `RlRuntimeConfig`, `RlPersistenceConfig`, `RlTask`, `Rollout`, `RolloutMessage`, `RolloutWithReward`, `RewardRegistry`, `RewardFn`, `RewardNormalisation`, `RewardNormaliser`, `RolloutLog`, `BatchPacker`, `RlBatch`, `RlSample`, `token_estimate`, `Policy`, `RolloutEngine`, `DeterministicPolicy`, `FakeRolloutEngine`, `RlUpdate`, `RlTrainer`, `RlTrainerConfig`, `RlEpochReport`, `RlStopReason`, `RlTrainReport`, `RlCheckpoint`, `OfflineRlOptimizer`, `OnlineRlOptimizer`.
 - `evaluator_pipeline` — `CommandRunner`, `ProcessCommandRunner`, `FakeCommandRunner`, `CommandSpec`, `ExecResult`, `DockerEnvironment`, `container_name`, `WorkspacePreparer`, `GitWorkspaceSpec`, `PreparedWorkspace`, `ScoreSpec`, `ScoredRun`, `TestCounts`, `parse_score`, `parse_last_json`, `parse_test_counts`, `EvaluationTask`, `TaskReport`, `EvaluationPipeline`, `PipelineConfig`, `PipelineSummary`.
 - `deferred` — `DeferredFeature`, `DEFERRED_FEATURES`, `deferred_features`, `unsupported`.
@@ -55,15 +71,17 @@ Everything except those paths is offline and deterministic: no model calls, no e
 
 ## Constraints
 
-- Depends only on `openjiuwen-common`, `openjiuwen-core` (for `foundation::llm::Model`, `foundation::tool::ToolInfo`, `foundation::prompt::BaseMessage`, `single_agent::{Agent, AgentOutput}`) and `openjiuwen-harness`; `openjiuwen-harness` must never depend on this crate.
-- No new crates: no crypto, no `rand`, no embedding provider, no Docker/git client library; hashing is local FNV-1a, shuffling is a seeded xorshift64*, and external processes go through `tokio::process` behind a seam.
-- Errors: `openjiuwen_common::error::{Error, Result}` only; no panics on user input; `Error::Unsupported` for every deferred path; `Error::validation` for malformed inputs.
+- Depends only on `openjiuwen-common`, `openjiuwen-core` (for `foundation::llm::Model`, `foundation::tool::ToolInfo`, `foundation::prompt::BaseMessage`, `retrieval::embedding::{Embedding, HashEmbedding}`, `retrieval::vector_store`, `single_agent::{Agent, AgentOutput}`), `openjiuwen-harness`, and the optional `openjiuwen-extensions` (`redis` feature only); `openjiuwen-harness` must never depend on this crate.
+- No new crates.io dependencies: HTTP goes through `openjiuwen_common::http`, embeddings through `openjiuwen_core::retrieval::embedding`, shelling out through the `evaluator_pipeline::CommandRunner` seam, HTTP fakes through `openjiuwen-test-support`'s `wiremock` re-export.
+- The `redis` feature forwards `openjiuwen-extensions/redis` (which pulls no extra crate) and gates `online::redis_store` plus its tests; the default build does not compile it.
+- Errors: `openjiuwen_common::error::{Error, Result}` at module boundaries; `online::OnlineError` inside the state machine, carrying `code()`/`http_status()` for the HTTP layer and converting into `Error` (not_found / validation / workflow); `Error::Unsupported` for every deferred path; `Error::validation` for malformed inputs.
 - Async: tokio; traits use `async_trait`; cancellation is `tokio_util::sync::CancellationToken`; guards are never held across `.await`.
-- Serde: every public data type is `Debug + Clone + PartialEq + Serialize + Deserialize` with `snake_case` Python field names and unknown-field tolerance; `Case`/`EvaluatedCase` also derive `schemars::JsonSchema`.
-- Determinism: no `SystemTime`/`Instant` in report, checkpoint or record contents; the trainer's optional `time_budget_ms` is the only clock use and defaults to `None`; sequence counters and bank ticks replace wall-clock time everywhere else.
+- Serde: every public data type is `Debug + Clone + PartialEq + Serialize + Deserialize` with `snake_case` Python field names and unknown-field tolerance; model handles and the `Dreamer`'s/`EvidenceAgent`'s injected clients are the documented exceptions; `Case`/`EvaluatedCase` also derive `schemars::JsonSchema`.
+- Determinism: no `SystemTime`/`Instant` in report, checkpoint or record contents; `online` takes an injected `Clock` (`FixedClock` by default) and uses monotonic sequence counters; the trainer's optional `time_budget_ms` is the only clock use and defaults to `None`.
+- Online state layout is fixed and documented in `./src/online/CONTEXT.md`: task/capture/turn/training/sample keys live under `rl:v1:*`, and the Redis store prefixes them with `openjiuwen:rl` by default.
+- The Redis store issues single commands (no Lua, no `WATCH`/`MULTI`); single-flight paths are each one `SET … NX`, so one writable service process per database is the documented operational model.
 - No `unsafe`; no stdout logging (`tracing` only where an operation genuinely needs diagnostics, i.e. service serving).
-- Files stay under ~1000 lines; `src/trainer.rs` is the accepted exception only because its inline unit-test module (from line 707) is larger than its 706-line implementation.
-- Tests may use `unwrap`/`expect` via the crate-level `cfg(test)` allowance.
+- Files stay under ~1000 lines; `src/trainer.rs` is the accepted exception (its inline unit-test module is larger than its implementation).
 
 ## Design Decisions
 
@@ -78,42 +96,48 @@ Everything except those paths is offline and deterministic: no model calls, no e
 - Deterministic identifiers replace UUIDs/clock stamps: report `run_id` is caller-supplied, sharing `bundle_id` is `bundle-{16 hex}` of an FNV-1a hash over the skill id and sorted record ids, diagnostic signal ids are `diag-{16 hex}`, TTSE tip ids are the FNV-1a hash of `"{category}:{normalized rule}"`, and `experience`/`signal` recency uses monotonic sequence counters.
 - The RL loop is seam-driven (`Policy` + `RolloutEngine`); `RolloutEngine::roll` deliberately takes only `(task, policy, cancel)` — the per-task sample count belongs to the engine implementation (`FakeRolloutEngine::with_sample_count`), not to the seam.
 - The evaluator pipeline routes every side effect through `CommandRunner`, so it is testable offline; when `docker` is absent the failure is `Error::Unsupported` naming the binary instead of a silent no-op.
-- The axum service declares the RL routes so clients get a stable `501` envelope instead of a `404`, and registers `POST /internal/v1/rl/tasks/{*operation}` as one catch-all because axum 0.8 cannot combine a path parameter with a literal `:finish`/`:abort` suffix in one segment.
+- The online service is a store-agnostic state machine (`OnlineStore` is string/set primitives only), so the in-memory and Redis backends share one implementation and the same tests run over both.
+- Training is a seam (`TrainingExecutor`): `LocalTrainingExecutor` is the deterministic default so the whole claim→run→activate→checkpoint path runs offline, while `PpoTrainingExecutor` returns `Unsupported` naming exactly what is missing (`torch`, `transformers`, `verl`, `ray`, CUDA) and `/health` reports it as `503` rather than pretending to be ready.
+- Training-run single-flight is `SET … NX` on `rl:v1:training_run:active` (the loser re-reads the winner's run) instead of Python's `WATCH`/`MULTI` transaction.
+- LoRA activation is a seam too: `NoopLoraActivator` records the activation deterministically for local runs, and `UnsupportedLoraActivator` names the vendor AIGW gateway.
+- The remote experience hub is an HTTP implementation of the existing `SharingBackend` seam with a documented protocol v1, bearer auth, and the same client-side normalisation (`get` 404 → `Ok(None)`, sorted `list`, `0.0`-score drop, `limit == 0` = unlimited) as the local backends; Python had no HTTP hub, so this transport is new design, not a port.
+- Experience drafting and TTSE dreaming are fail-open by design: model errors, unparsable output and missing models fall back to deterministic derivation (extractor-based drafts; cosine/Jaccard clustering with the representative rule as canonical), so a model outage never yields an empty draft or a shed tip.
+- Retrieval fuses lexical and embedding ranks with reciprocal rank fusion (`RRF_K = 60`, equal weights) and falls back to bank/dump order rather than returning an empty result while the bank holds tips.
+- Reward checks route read/python side effects through `CommandRunner`, keep the rubric arithmetic pure (`0.5·floor + 0.5·challenge`, all-unknown → `None`, any floor `unmet` caps the criterion at 25), and treat the model as a seam; browser/PIL checks are typed `Unsupported` naming playwright/PIL.
+- The axum service declares the whole RL route table so clients get stable envelopes instead of `404`s, and registers `POST /internal/v1/rl/tasks/{*operation}` as one catch-all because axum 0.8 cannot combine a path parameter with a literal `:finish`/`:abort` suffix in one segment.
 - `HarnessEvolutionRail` lives here (upper layer) and implements the harness trait, so the dependency arrow stays `agent-evolving -> harness` and the harness keeps seam-only knowledge.
-- Module-level (`//!`) docs resolve intra-doc links in the parent module's scope, so links written there use explicit `crate::…` paths; item-level docs may use plain relative links.
-- `src/trainer.rs` keeps its inline unit tests in the same file rather than in `tests/`, which is why it is the crate's only file over the line guideline.
+- Module-level (`//!`) docs resolve intra-doc links in the parent module's scope, so links written there use explicit `crate::…` paths; item-level docs use plain relative links and link private items as code spans.
 
 ## Deferred Scope
 
 | Deferred feature | Reason | Behaviour |
 |---|---|---|
-| RL trainer (PPO/verl/ray) | Python-only distributed ML stack (torch, transformers, verl, ray) | `OfflineRlOptimizer::train`/`start_training` return `Error::Unsupported`; `train_with` drives the portable `RlTrainer` |
-| Online RL service state machine | Needs Redis task queues, vLLM/verl executors and gateway integration | `OnlineRlOptimizer::start_training`/`train_on_batch`/`export_lora` return `Error::Unsupported`; the HTTP routes answer `501` |
-| agent_rl proxy/judge/verification gateway | Vendor HTTP services and authentication | not ported; no local seam |
-| RL YAML configuration ecosystem | Python training-stack configuration (verl/ray configs) | reduced `RlConfig` records only |
-| Vendor reward checks (browser/PIL/evidence agent) | Container browser sessions, image analysis and the evidence agent model flow | not ported; the deterministic reward records/aggregation are |
-| Remote sharing hub client | Remote hub transport and authentication; local-file and memory backends are ported | not ported; `SharingBackend` seam plus two offline backends |
-| LLM experience draft pipeline | Live model drafting and the online orchestrator; deterministic extraction is ported | not ported; `ExperienceExtractor` covers the offline half |
-| TTSE embedding retrieval and LLM dreaming | Embedding provider, vector index and model merge passes; deterministic bank/consult are ported | not ported; Jaccard similarity and deterministic clustering used instead |
+| RL trainer (PPO/verl/ray) | Python-only distributed ML stack (torch, transformers, verl, ray) | `OfflineRlOptimizer::train`/`start_training` and `online::PpoTrainingExecutor` return `Error::Unsupported`; `train_with` drives the portable `RlTrainer`, `LocalTrainingExecutor` drives the online run path |
+| agent_rl proxy/judge/verification gateway | Vendor HTTP gateway services and their authentication | not ported; `LoraActivator`/`TrainingExecutor` are the local seams, `UnsupportedLoraActivator` names the gateway |
+| RL YAML configuration ecosystem | Python training-stack configuration files (verl/ray YAML) | reduced `RlConfig` records only |
+| Vendor reward checks (browser/PIL) | Container browser runtime (playwright) and image decoding (PIL); the evidence-agent and model-judged checks are ported | `CheckTool::Browser` and picture reads return `Error::Unsupported` naming the runtime |
 | Full Python agent_evolving unit suite | Representative offline tests only | not ported wholesale |
 
-`src/deferred.rs` carries these nine entries as `DEFERRED_FEATURES`; `deferred::unsupported(area)` builds the corresponding error.
+`src/deferred.rs` carries these five entries as `DEFERRED_FEATURES`; `deferred::unsupported(area)` builds the corresponding error.
 
 ## Verification
 
 - `cargo fmt -p openjiuwen-agent-evolving --check`
+- `cargo metadata --offline --no-deps`
 - `cargo test -p openjiuwen-agent-evolving --offline`
-- `cargo clippy -p openjiuwen-agent-evolving --all-targets -- -D warnings`
-- `cargo doc -p openjiuwen-agent-evolving --no-deps` stays warning-free.
-- Surface at this revision: 309 inline unit tests, 17 integration binaries with 405 tests, and 23 doctests (737 total), all offline.
+- `cargo test -p openjiuwen-agent-evolving --offline --all-features`
+- `cargo clippy -p openjiuwen-agent-evolving --all-targets --all-features --offline -- -D warnings`
+- `cargo doc -p openjiuwen-agent-evolving --no-deps` and `--all-features` stay warning-free.
+- Surface at this revision: 543 inline unit tests (560 with `--all-features`, which adds the Redis-store suite), 22 integration binaries holding 490 tests, and 23 doctests — 1056 tests by default and 1073 with all features, all offline.
 
 ## Dependencies
 
-- `openjiuwen-common` — errors, ids (`uuid_hex`), logging, utilities.
-- `openjiuwen-core` — `foundation::{llm, prompt, tool}` types and `single_agent::{Agent, AgentOutput}`.
+- `openjiuwen-common` — errors, ids (`uuid_hex`), logging, utilities, `http::HttpClient`.
+- `openjiuwen-core` — `foundation::{llm, prompt, tool}` types, `retrieval::embedding`, `retrieval::vector_store`, `single_agent::{Agent, AgentOutput}`.
 - `openjiuwen-harness` — `EvolutionRail` seam, `HarnessRail`, `HarnessRailContext` and `evolution_adapter`.
+- `openjiuwen-extensions` (optional, `redis` feature) — the RESP client behind `online::RedisOnlineStore`.
 - `axum` (service router), `tower` (dev-only, `ServiceExt::oneshot` in tests).
-- Dev-only: `openjiuwen-test-support`, `tempfile`.
+- Dev-only: `openjiuwen-test-support` (scripted models, `wiremock` re-export), `tempfile`.
 
 ## Routing Table
 
@@ -121,24 +145,26 @@ Everything except those paths is offline and deterministic: no model calls, no e
 - `./src/dataset/` → `Case`, `EvaluatedCase`, `CaseLoader`, JSON/JSONL loading (`./src/dataset/CONTEXT.md`)
 - `./src/evaluator/` → evaluator/metric/runner seams, judge rubric+verdict, reports (`./src/evaluator/CONTEXT.md`)
 - `./src/optimizer/` → candidates, grid baseline, checkpoints and stores (`./src/optimizer/CONTEXT.md`); `./src/optimizer/research/` → textual-gradient engine and domain optimizers (`./src/optimizer/research/CONTEXT.md`)
+- `./src/online/` → online RL service: task/capture/turn/training-run state machines, sample ledger, executor seam, LoRA repository, HTTP routes, memory and Redis stores (`./src/online/CONTEXT.md`)
 - `./src/signal/` → signal records, extractors, tracker (`./src/signal/CONTEXT.md`)
-- `./src/reward/` → reward records, aggregation, packs (`./src/reward/CONTEXT.md`)
+- `./src/reward/` → reward records, aggregation, packs, checks/evidence agent/model-judged scoring (`./src/reward/CONTEXT.md`)
 - `./src/attribution/` → attribution graph, credit assignment, keyword rules, reward stage (`./src/attribution/CONTEXT.md`)
 - `./src/trajectory/` → trajectory model, builder, spans, windows, store (`./src/trajectory/CONTEXT.md`)
-- `./src/experience/` → experience records, archive, extractor, lifecycle (`./src/experience/CONTEXT.md`)
-- `./src/sharing/` → sharing wire types, keyword extraction, stager, backends (`./src/sharing/CONTEXT.md`)
-- `./src/ttse/` → tip bank, induction, dreaming, consultation, engine (`./src/ttse/CONTEXT.md`)
+- `./src/experience/` → experience records, archive, extractor, lifecycle, draft schema/drafter/orchestrator (`./src/experience/CONTEXT.md`)
+- `./src/sharing/` → sharing wire types, keyword extraction, stager, local/memory/remote-hub backends (`./src/sharing/CONTEXT.md`)
+- `./src/ttse/` → tip bank, induction, dreaming (deterministic and model-backed), embedding index, retrieval, consultation, engine (`./src/ttse/CONTEXT.md`)
 - `./src/evaluator_pipeline/` → Docker + git evaluation harness (`./src/evaluator_pipeline/CONTEXT.md`)
 - `./src/trainer.rs` → bounded train/evaluate loop, progress, callbacks, reports
 - `./src/rl.rs` → RL config, packing, normalisation, policy/rollout seams, checkpoints, trainer loop, optimizer stubs
 - `./src/rails.rs` → pure evolution events, observer trait, harness rail adapter
-- `./src/service.rs` → axum RL service (health/evaluate, 501 RL endpoints, error envelope)
+- `./src/service.rs` → axum service: health, evaluate, and the online RL route table
 - `./src/deferred.rs` → deferred-feature table and `Error::Unsupported` helper
 - `./src/lib.rs` → crate documentation, module map and the curated re-export surface
 
 ### Tests
-- `./tests/` → 17 offline integration binaries (`./tests/CONTEXT.md`)
+- `./tests/` → 22 offline integration binaries (`./tests/CONTEXT.md`)
 
 ### Siblings (read-only — escalate writes to the parent agent)
 - `../openjiuwen-harness/src/rails/evolution/` → the consumed `EvolutionRail` seam and `evolution_adapter`
 - `../openjiuwen-dev-tools/src/tune/` → the independent `dev_tools.tune` `Case` model
+- `../openjiuwen-extensions/src/redis/` → the RESP client consumed by `online::RedisOnlineStore`

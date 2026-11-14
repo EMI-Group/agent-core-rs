@@ -7,6 +7,7 @@
 //! - user variables: `user_var/{user_id}/{scope_id}/{name}`
 //! - session variables: `session_var/{user_id}/{scope_id}/{session_id}/{name}`
 //! - scope configuration: `memory_scope_config/{scope_id}`
+//! - scope analyzer overrides: `memory_scope_overrides/{scope_id}`
 //!
 //! Vector collections are named `uid_{user}_gid_{scope}_mtype_{kind}`; every segment
 //! passes through [`sanitize_segment`], because collection names become file names
@@ -38,9 +39,19 @@
 //! [`legacy_alternatives`] derives the legacy candidates of a current key or prefix, and
 //! [`current_equivalent`] maps back for diagnostics.
 //!
+//! # Runtime prefix registry
+//!
+//! The prefix constants above are the defaults of [`KvPrefixRegistry`]; every builder has an
+//! `_in` variant that takes a registry, so a deployment can rename a family at runtime
+//! (`register_current` demotes the previous prefix to an alias). The plain builders are the
+//! default-registry form, and [`legacy_alternatives_in`]/[`current_equivalent_in`] are the
+//! registry-aware mappings used by the legacy fallback.
+//!
 //! [`MemoryScope::validate`]: crate::record::MemoryScope::validate
 
 use crate::record::{MemoryScope, MemoryType};
+
+use super::prefix::{KvFamily, KvPrefixRegistry};
 
 /// KV namespace prefix of memory records (Python `UMD`).
 pub const RECORD_PREFIX: &str = "UMD";
@@ -50,6 +61,10 @@ pub const VARIABLE_PREFIX: &str = "user_var";
 pub const SESSION_VARIABLE_PREFIX: &str = "session_var";
 /// KV namespace prefix of per-scope configuration (Python `memory_scope_config`).
 pub const SCOPE_CONFIG_PREFIX: &str = "memory_scope_config";
+/// KV namespace prefix of the persisted per-scope analyzer overrides.
+pub const SCOPE_OVERRIDES_PREFIX: &str = "memory_scope_overrides";
+/// KV namespace prefix of the persisted scope↔user mapping (Python `scope_user_mapping`).
+pub const SCOPE_USER_MAPPING_PREFIX: &str = "scope_user_mapping";
 /// Document collection holding conversation messages.
 pub const MESSAGES_COLLECTION: &str = "messages";
 
@@ -81,19 +96,37 @@ const FNV1A_32_PRIME: u32 = 0x0100_0193;
 /// Key of one record: `UMD/{user_id}/{scope_id}/{id}`.
 #[must_use]
 pub fn record_key(scope: &MemoryScope, id: &str) -> String {
-    format!("{RECORD_PREFIX}/{}/{}/{id}", scope.user_id, scope.scope_id)
+    record_key_with(RECORD_PREFIX, scope, id)
+}
+
+/// Key of one record under the `records` prefix of `prefixes`.
+#[must_use]
+pub fn record_key_in(prefixes: &KvPrefixRegistry, scope: &MemoryScope, id: &str) -> String {
+    record_key_with(prefixes.current(KvFamily::Records), scope, id)
 }
 
 /// Key prefix of every record in `scope`: `UMD/{user_id}/{scope_id}/`.
 #[must_use]
 pub fn record_prefix(scope: &MemoryScope) -> String {
-    format!("{RECORD_PREFIX}/{}/{}/", scope.user_id, scope.scope_id)
+    record_prefix_with(RECORD_PREFIX, scope)
+}
+
+/// Key prefix of every record in `scope` under the `records` prefix of `prefixes`.
+#[must_use]
+pub fn record_prefix_in(prefixes: &KvPrefixRegistry, scope: &MemoryScope) -> String {
+    record_prefix_with(prefixes.current(KvFamily::Records), scope)
 }
 
 /// Key prefix of every record of `user_id`: `UMD/{user_id}/`.
 #[must_use]
 pub fn record_prefix_for(user_id: &str) -> String {
-    format!("{RECORD_PREFIX}/{user_id}/")
+    record_prefix_for_with(RECORD_PREFIX, user_id)
+}
+
+/// Key prefix of every record of `user_id` under the `records` prefix of `prefixes`.
+#[must_use]
+pub fn record_prefix_for_in(prefixes: &KvPrefixRegistry, user_id: &str) -> String {
+    record_prefix_for_with(prefixes.current(KvFamily::Records), user_id)
 }
 
 /// Key prefix of every record with `scope_id`, regardless of user: `UMD/`.
@@ -103,47 +136,137 @@ pub fn record_prefix_for(user_id: &str) -> String {
 /// `_scope_id` argument documents the intent and keeps the Python call shape.
 #[must_use]
 pub fn record_prefix_for_scope(_scope_id: &str) -> String {
-    format!("{RECORD_PREFIX}/")
+    record_namespace_with(RECORD_PREFIX)
+}
+
+/// Key prefix of every record with `scope_id` under the `records` prefix of `prefixes`.
+///
+/// As in [`record_prefix_for_scope`], the scope id only documents the intent: the scan is
+/// the whole record namespace and the caller filters afterwards.
+#[must_use]
+pub fn record_prefix_for_scope_in(prefixes: &KvPrefixRegistry, _scope_id: &str) -> String {
+    record_namespace_with(prefixes.current(KvFamily::Records))
 }
 
 /// Key of one user-scoped variable: `user_var/{user_id}/{scope_id}/{name}`.
 #[must_use]
 pub fn variable_key(scope: &MemoryScope, name: &str) -> String {
-    format!(
-        "{VARIABLE_PREFIX}/{}/{}/{name}",
-        scope.user_id, scope.scope_id
-    )
+    variable_key_with(VARIABLE_PREFIX, scope, name)
+}
+
+/// Key of one user-scoped variable under the `user_variables` prefix of `prefixes`.
+#[must_use]
+pub fn variable_key_in(prefixes: &KvPrefixRegistry, scope: &MemoryScope, name: &str) -> String {
+    variable_key_with(prefixes.current(KvFamily::UserVariables), scope, name)
 }
 
 /// Key prefix of every user-scoped variable in `scope`.
 #[must_use]
 pub fn variable_prefix(scope: &MemoryScope) -> String {
-    format!("{VARIABLE_PREFIX}/{}/{}/", scope.user_id, scope.scope_id)
+    variable_prefix_with(VARIABLE_PREFIX, scope)
+}
+
+/// Key prefix of every user-scoped variable under the `user_variables` prefix of `prefixes`.
+#[must_use]
+pub fn variable_prefix_in(prefixes: &KvPrefixRegistry, scope: &MemoryScope) -> String {
+    variable_prefix_with(prefixes.current(KvFamily::UserVariables), scope)
 }
 
 /// Key of one session-scoped variable:
 /// `session_var/{user_id}/{scope_id}/{session_id}/{name}`.
 #[must_use]
 pub fn session_variable_key(scope: &MemoryScope, session_id: &str, name: &str) -> String {
-    format!(
-        "{SESSION_VARIABLE_PREFIX}/{}/{}/{session_id}/{name}",
-        scope.user_id, scope.scope_id
+    session_variable_key_with(SESSION_VARIABLE_PREFIX, scope, session_id, name)
+}
+
+/// Key of one session-scoped variable under the `session_variables` prefix of `prefixes`.
+#[must_use]
+pub fn session_variable_key_in(
+    prefixes: &KvPrefixRegistry,
+    scope: &MemoryScope,
+    session_id: &str,
+    name: &str,
+) -> String {
+    session_variable_key_with(
+        prefixes.current(KvFamily::SessionVariables),
+        scope,
+        session_id,
+        name,
     )
 }
 
 /// Key prefix of every session-scoped variable of `session_id`.
 #[must_use]
 pub fn session_variable_prefix(scope: &MemoryScope, session_id: &str) -> String {
-    format!(
-        "{SESSION_VARIABLE_PREFIX}/{}/{}/{session_id}/",
-        scope.user_id, scope.scope_id
+    session_variable_prefix_with(SESSION_VARIABLE_PREFIX, scope, session_id)
+}
+
+/// Key prefix of every session-scoped variable under the `session_variables` prefix of `prefixes`.
+#[must_use]
+pub fn session_variable_prefix_in(
+    prefixes: &KvPrefixRegistry,
+    scope: &MemoryScope,
+    session_id: &str,
+) -> String {
+    session_variable_prefix_with(
+        prefixes.current(KvFamily::SessionVariables),
+        scope,
+        session_id,
     )
 }
 
 /// Key of the configuration of `scope_id`: `memory_scope_config/{scope_id}`.
 #[must_use]
 pub fn scope_config_key(scope_id: &str) -> String {
-    format!("{SCOPE_CONFIG_PREFIX}/{scope_id}")
+    scope_config_key_with(SCOPE_CONFIG_PREFIX, scope_id)
+}
+
+/// Key of the configuration of `scope_id` under the `scope_config` prefix of `prefixes`.
+#[must_use]
+pub fn scope_config_key_in(prefixes: &KvPrefixRegistry, scope_id: &str) -> String {
+    scope_config_key_with(prefixes.current(KvFamily::ScopeConfig), scope_id)
+}
+
+/// Key prefix of every scope configuration: `<scope_config current>/`.
+#[must_use]
+pub fn scope_config_prefix_in(prefixes: &KvPrefixRegistry) -> String {
+    format!("{}/", prefixes.current(KvFamily::ScopeConfig))
+}
+/// Key of the analyzer overrides of `scope_id`: `memory_scope_overrides/{scope_id}`.
+///
+/// The namespace is scope-wide like the scope configuration, but it is not a
+/// [`KvFamily`]: its payload is an opaque JSON document owned by the analyzer layer.
+#[must_use]
+pub fn scope_overrides_key(scope_id: &str) -> String {
+    scope_overrides_key_with(SCOPE_OVERRIDES_PREFIX, scope_id)
+}
+
+/// Key of the persisted `scope_id`↔`user_id` mapping: `<current>/{scope_id}/{user_id}`.
+#[must_use]
+pub fn scope_user_mapping_key_in(
+    prefixes: &KvPrefixRegistry,
+    scope_id: &str,
+    user_id: &str,
+) -> String {
+    format!(
+        "{}/{scope_id}/{user_id}",
+        prefixes.current(KvFamily::ScopeUserMapping)
+    )
+}
+
+/// Key prefix of every `scope_id` mapping: `<current>/{scope_id}/`.
+#[must_use]
+pub fn scope_user_mapping_prefix_in(prefixes: &KvPrefixRegistry, scope_id: &str) -> String {
+    format!(
+        "{}/{scope_id}/",
+        prefixes.current(KvFamily::ScopeUserMapping)
+    )
+}
+
+/// Name of the document collection holding conversation history.
+#[must_use]
+pub fn messages_collection_in(prefixes: &KvPrefixRegistry) -> &str {
+    prefixes.current(KvFamily::Messages)
 }
 
 /// Legacy key of one record: `user_mem/{user_id}/{scope_id}/{id}`.
@@ -270,6 +393,48 @@ pub fn current_prefix(legacy_prefix: &str) -> Option<&'static str> {
         .map(|(current, _)| *current)
 }
 
+/// The alias keys of `key` under the registry: one per alias of the key's family.
+///
+/// The same first-segment rewrite as [`legacy_alternatives`], but sourced from the
+/// registry, so every alias of the family (in registration order, excluding the segment of
+/// `key` itself) yields one candidate. A prefix ends with `/`, so point keys and prefixes
+/// share this implementation. Empty for an unknown key.
+#[must_use]
+pub fn legacy_alternatives_in(prefixes: &KvPrefixRegistry, key: &str) -> Vec<String> {
+    let Some((head, rest)) = key.split_once('/') else {
+        return Vec::new();
+    };
+    let Some(family) = prefixes.family_of(head) else {
+        return Vec::new();
+    };
+    let mut alternatives = Vec::new();
+    for alias in prefixes.aliases(family) {
+        if alias == head {
+            continue;
+        }
+        let candidate = format!("{alias}/{rest}");
+        if !alternatives.contains(&candidate) {
+            alternatives.push(candidate);
+        }
+    }
+    alternatives
+}
+
+/// The current-layout equivalent of an alias key or prefix under the registry.
+///
+/// The first segment is replaced by the family's current prefix and the rest is preserved;
+/// `None` when the segment is unknown, when it already is the current prefix, or when `key`
+/// has no `/`.
+#[must_use]
+pub fn current_equivalent_in(prefixes: &KvPrefixRegistry, key: &str) -> Option<String> {
+    let (head, rest) = key.split_once('/')?;
+    let family = prefixes.family_of(head)?;
+    if prefixes.current(family) == head {
+        return None;
+    }
+    Some(format!("{}/{rest}", prefixes.current(family)))
+}
+
 /// Name of the vector collection of one `(scope, kind)` pair.
 ///
 /// Follows the Python `uid_{user}_gid_{scope}_mtype_{kind}` shape with every segment
@@ -329,6 +494,67 @@ fn fnv1a_32(bytes: &[u8]) -> u32 {
     hash
 }
 
+/// `{prefix}/{user}/{scope}/{id}`.
+fn record_key_with(prefix: &str, scope: &MemoryScope, id: &str) -> String {
+    format!("{prefix}/{}/{}/{id}", scope.user_id, scope.scope_id)
+}
+
+/// `{prefix}/{user}/{scope}/`.
+fn record_prefix_with(prefix: &str, scope: &MemoryScope) -> String {
+    format!("{prefix}/{}/{}/", scope.user_id, scope.scope_id)
+}
+
+/// `{prefix}/{user}/`.
+fn record_prefix_for_with(prefix: &str, user_id: &str) -> String {
+    format!("{prefix}/{user_id}/")
+}
+
+/// `{prefix}/`, the whole namespace of a family.
+fn record_namespace_with(prefix: &str) -> String {
+    format!("{prefix}/")
+}
+
+/// `{prefix}/{user}/{scope}/{name}`.
+fn variable_key_with(prefix: &str, scope: &MemoryScope, name: &str) -> String {
+    format!("{prefix}/{}/{}/{name}", scope.user_id, scope.scope_id)
+}
+
+/// `{prefix}/{user}/{scope}/`.
+fn variable_prefix_with(prefix: &str, scope: &MemoryScope) -> String {
+    format!("{prefix}/{}/{}/", scope.user_id, scope.scope_id)
+}
+
+/// `{prefix}/{user}/{scope}/{session}/{name}`.
+fn session_variable_key_with(
+    prefix: &str,
+    scope: &MemoryScope,
+    session_id: &str,
+    name: &str,
+) -> String {
+    format!(
+        "{prefix}/{}/{}/{session_id}/{name}",
+        scope.user_id, scope.scope_id
+    )
+}
+
+/// `{prefix}/{user}/{scope}/{session}/`.
+fn session_variable_prefix_with(prefix: &str, scope: &MemoryScope, session_id: &str) -> String {
+    format!(
+        "{prefix}/{}/{}/{session_id}/",
+        scope.user_id, scope.scope_id
+    )
+}
+
+/// `{prefix}/{scope_id}`.
+fn scope_config_key_with(prefix: &str, scope_id: &str) -> String {
+    format!("{prefix}/{scope_id}")
+}
+
+/// Key of one scope's analyzer overrides under `prefix`.
+fn scope_overrides_key_with(prefix: &str, scope_id: &str) -> String {
+    format!("{prefix}/{scope_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +592,18 @@ mod tests {
     #[test]
     fn scope_config_key_is_scope_wide() {
         assert_eq!(scope_config_key("ws"), "memory_scope_config/ws");
+    }
+    #[test]
+    fn scope_overrides_key_is_scope_wide() {
+        assert_eq!(SCOPE_OVERRIDES_PREFIX, "memory_scope_overrides");
+        assert_eq!(scope_overrides_key("ws"), "memory_scope_overrides/ws");
+        assert_eq!(
+            scope_overrides_key("__default__"),
+            "memory_scope_overrides/__default__"
+        );
+        // Not a KV family: the prefix registry never renames it, and it has no alias.
+        assert_eq!(legacy_alternatives(&scope_overrides_key("ws")).len(), 0);
+        assert_eq!(current_equivalent(&scope_overrides_key("ws")), None);
     }
 
     #[test]
@@ -523,5 +761,137 @@ mod tests {
         assert_eq!(sanitize_segment("a b"), "ab_10a3f9f2");
         assert_ne!(sanitize_segment("a/b"), sanitize_segment("a b"));
         assert_ne!(sanitize_segment("a/b"), sanitize_segment("a:b"));
+    }
+
+    #[test]
+    fn default_registry_builders_match_the_plain_builders() {
+        let prefixes = KvPrefixRegistry::default();
+        let scope = scope();
+        assert_eq!(
+            record_key_in(&prefixes, &scope, "abc"),
+            record_key(&scope, "abc")
+        );
+        assert_eq!(record_prefix_in(&prefixes, &scope), record_prefix(&scope));
+        assert_eq!(
+            record_prefix_for_in(&prefixes, "bob"),
+            record_prefix_for("bob")
+        );
+        assert_eq!(
+            record_prefix_for_scope_in(&prefixes, "ws"),
+            record_prefix_for_scope("ws")
+        );
+        assert_eq!(
+            variable_key_in(&prefixes, &scope, "theme"),
+            variable_key(&scope, "theme")
+        );
+        assert_eq!(
+            variable_prefix_in(&prefixes, &scope),
+            variable_prefix(&scope)
+        );
+        assert_eq!(
+            session_variable_key_in(&prefixes, &scope, "s1", "theme"),
+            session_variable_key(&scope, "s1", "theme")
+        );
+        assert_eq!(
+            session_variable_prefix_in(&prefixes, &scope, "s1"),
+            session_variable_prefix(&scope, "s1")
+        );
+        assert_eq!(scope_config_key_in(&prefixes, "ws"), scope_config_key("ws"));
+        assert_eq!(
+            scope_config_prefix_in(&prefixes),
+            "memory_scope_config/".to_owned()
+        );
+        assert_eq!(
+            scope_user_mapping_key_in(&prefixes, "ws", "alice"),
+            "scope_user_mapping/ws/alice"
+        );
+        assert_eq!(
+            scope_user_mapping_prefix_in(&prefixes, "ws"),
+            "scope_user_mapping/ws/"
+        );
+        assert_eq!(messages_collection_in(&prefixes), MESSAGES_COLLECTION);
+        assert_eq!(
+            legacy_alternatives_in(&prefixes, "UMD/alice/ws/abc"),
+            legacy_alternatives("UMD/alice/ws/abc")
+        );
+        assert_eq!(
+            current_equivalent_in(&prefixes, "user_mem/alice/ws/abc"),
+            current_equivalent("user_mem/alice/ws/abc")
+        );
+    }
+
+    #[test]
+    fn custom_registry_prefixes_flow_into_every_builder() {
+        let prefixes = KvPrefixRegistry::new()
+            .with_current(KvFamily::UserVariables, "vars_v2")
+            .expect("rename user variables")
+            .with_current(KvFamily::Records, "MEMV2")
+            .expect("rename records")
+            .with_current(KvFamily::Messages, "chat_history")
+            .expect("rename messages");
+        let scope = scope();
+        assert_eq!(
+            variable_key_in(&prefixes, &scope, "theme"),
+            "vars_v2/alice/ws/theme"
+        );
+        assert_eq!(variable_prefix_in(&prefixes, &scope), "vars_v2/alice/ws/");
+        assert_eq!(
+            record_key_in(&prefixes, &scope, "abc"),
+            "MEMV2/alice/ws/abc"
+        );
+        assert_eq!(record_prefix_in(&prefixes, &scope), "MEMV2/alice/ws/");
+        assert_eq!(record_prefix_for_in(&prefixes, "bob"), "MEMV2/bob/");
+        assert_eq!(record_prefix_for_scope_in(&prefixes, "ws"), "MEMV2/");
+        assert_eq!(messages_collection_in(&prefixes), "chat_history");
+        // A family that was not renamed keeps its documented prefix.
+        assert_eq!(
+            session_variable_key_in(&prefixes, &scope, "s1", "theme"),
+            "session_var/alice/ws/s1/theme"
+        );
+        // Renaming keeps the previous prefix as a readable alias.
+        assert!(prefixes.contains_prefix(KvFamily::UserVariables, "user_var"));
+    }
+
+    #[test]
+    fn registry_alternatives_map_both_directions() {
+        let prefixes = KvPrefixRegistry::new()
+            .with_current(KvFamily::UserVariables, "vars_v2")
+            .expect("rename user variables");
+        assert_eq!(
+            legacy_alternatives_in(&prefixes, "vars_v2/alice/ws/theme"),
+            ["user_var/alice/ws/theme", "user_variable/alice/ws/theme"]
+        );
+        assert_eq!(
+            legacy_alternatives_in(&prefixes, "vars_v2/alice/ws/"),
+            ["user_var/alice/ws/", "user_variable/alice/ws/"]
+        );
+        assert_eq!(
+            legacy_alternatives_in(&prefixes, "user_var/alice/ws/theme"),
+            ["user_variable/alice/ws/theme"]
+        );
+        assert_eq!(
+            current_equivalent_in(&prefixes, "user_var/alice/ws/theme"),
+            Some("vars_v2/alice/ws/theme".to_owned())
+        );
+        assert_eq!(
+            current_equivalent_in(&prefixes, "user_variable/alice/ws/theme"),
+            Some("vars_v2/alice/ws/theme".to_owned())
+        );
+        assert_eq!(
+            current_equivalent_in(&prefixes, "vars_v2/alice/ws/theme"),
+            None
+        );
+        assert_eq!(current_equivalent_in(&prefixes, "unknown/x"), None);
+        assert_eq!(current_equivalent_in(&prefixes, "vars_v2"), None);
+        assert_eq!(current_equivalent_in(&prefixes, ""), None);
+        assert_eq!(
+            legacy_alternatives_in(&prefixes, "other/x"),
+            Vec::<String>::new()
+        );
+        assert_eq!(legacy_alternatives_in(&prefixes, ""), Vec::<String>::new());
+        assert_eq!(
+            legacy_alternatives_in(&prefixes, "UMD"),
+            Vec::<String>::new()
+        );
     }
 }

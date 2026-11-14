@@ -4,11 +4,14 @@
 //! The suite drives the bus directly with [`common::RecordingHandler`]: it pins
 //! per-topic FIFO ordering, concurrent fan-out to sorted subscribers, subscriber
 //! failure isolation, the Python-compatible timeout message, session cleanup,
-//! lazy start after [`MessageBus::stop`], topic naming, and error forwarding.
+//! lazy start after [`MessageBus::stop`], topic naming, subscription
+//! introspection (`list_subscriptions`, `get_subscription_count`,
+//! `remove_all_subscriptions`), and error forwarding.
 //! Every deadline is well under a second, so the suite stays fast and offline.
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -261,6 +264,48 @@ async fn start_stop_idempotent() {
         .unwrap();
     assert_eq!(reply, json!({"ok": true}));
     assert!(bus.is_started());
+    bus.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn subscription_introspection_matches_python() {
+    let handler = RecordingHandler::new();
+    let bus = started_bus("introspect", &handler).await;
+
+    bus.add_subscription("z", "news");
+    bus.add_subscription("a", "news");
+    bus.add_subscription("a", "alerts");
+    bus.add_subscription("b", "*__p2p__");
+
+    assert_eq!(
+        bus.list_subscriptions(),
+        BTreeMap::from([
+            ("*__p2p__".to_owned(), vec!["b".to_owned()]),
+            ("alerts".to_owned(), vec!["a".to_owned()]),
+            ("news".to_owned(), vec!["a".to_owned(), "z".to_owned()]),
+        ])
+    );
+    assert_eq!(bus.list_agent_subscriptions("a"), vec!["alerts", "news"]);
+    assert_eq!(bus.list_agent_subscriptions("ghost"), Vec::<String>::new());
+    assert_eq!(bus.get_subscription_count(), 4);
+    // Python's formula: the sum of the per-pattern agent counts.
+    assert_eq!(
+        bus.get_subscription_count(),
+        bus.list_subscriptions()
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+    );
+
+    // `remove_all_subscriptions` reports how many pairs it removed, and an
+    // already-clean agent removes nothing.
+    assert_eq!(bus.remove_all_subscriptions("a"), 2);
+    assert_eq!(bus.remove_all_subscriptions("a"), 0);
+    assert_eq!(bus.remove_all_subscriptions(""), 0);
+    assert_eq!(bus.get_subscription_count(), 2);
+    assert_eq!(bus.list_agent_subscriptions("a"), Vec::<String>::new());
+    assert!(!bus.list_subscriptions().contains_key("alerts"));
+    assert_eq!(bus.subscribers("news"), vec!["z"]);
     bus.stop().await.unwrap();
 }
 

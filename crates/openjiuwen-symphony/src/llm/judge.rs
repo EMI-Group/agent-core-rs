@@ -147,12 +147,8 @@ impl LlmJudgeMetric {
 
     /// The score of a valid model verdict.
     fn llm_score(&self, score: f64, reason: String) -> MetricScore {
-        MetricScore {
-            metric: self.name.clone(),
-            score,
-            passed: score >= LLM_PASS_THRESHOLD,
-            detail: Some(reason),
-        }
+        MetricScore::scored(self.name.clone(), score, score >= LLM_PASS_THRESHOLD)
+            .with_detail(reason)
     }
 
     /// The static rubric verdict, with `explanation` recorded in `detail`.
@@ -183,12 +179,8 @@ impl LlmJudgeMetric {
             detail.push_str("; missing: ");
             detail.push_str(&missing.join(", "));
         }
-        MetricScore {
-            metric: self.name.clone(),
-            score,
-            passed: score >= FALLBACK_PASS_THRESHOLD,
-            detail: Some(detail),
-        }
+        MetricScore::scored(self.name.clone(), score, score >= FALLBACK_PASS_THRESHOLD)
+            .with_detail(detail)
     }
 }
 
@@ -316,11 +308,11 @@ mod tests {
         let score = metric.deterministic_score(
             &EvaluationInput {
                 capability: complete,
-                target: None,
+                ..EvaluationInput::default()
             },
             "test",
         );
-        assert_eq!(score.score, 1.0);
+        assert_eq!(score.score, Some(1.0));
         assert!(score.passed);
         assert_eq!(score.metric, "custom");
         assert!(score
@@ -331,11 +323,11 @@ mod tests {
         let score = metric.deterministic_score(
             &EvaluationInput {
                 capability: bare,
-                target: None,
+                ..EvaluationInput::default()
             },
             "test",
         );
-        assert_eq!(score.score, 0.5);
+        assert_eq!(score.score, Some(0.5));
         assert!(score.passed);
         assert!(score
             .detail
@@ -345,11 +337,11 @@ mod tests {
         let score = metric.deterministic_score(
             &EvaluationInput {
                 capability: empty,
-                target: None,
+                ..EvaluationInput::default()
             },
             "test",
         );
-        assert_eq!(score.score, 0.0);
+        assert_eq!(score.score, Some(0.0));
         assert!(!score.passed);
     }
 }

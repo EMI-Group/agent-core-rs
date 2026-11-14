@@ -15,6 +15,8 @@
 //! - `commands` covers the phase-3 REPL surface: the full slash-command table,
 //!   `/cost`, `/compact`, `/sessions`, `/clear`, the `!cmd` shell passthrough,
 //!   `/<skill>` turns and input history.
+// Size note: the `cli` suite is split into submodules, but this router plus the shared
+// fixtures and the REPL/one-shot helpers is long by construction; it is test code only.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod commands;

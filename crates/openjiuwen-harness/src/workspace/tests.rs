@@ -1,5 +1,7 @@
 //! Cross-file unit tests for the workspace module: schema, builder, links, resolution, and
 //! serde. Every test is offline and deterministic and uses a temporary directory.
+// Size note: this file is the workspace module's test suite only (declared under
+// `#[cfg(test)]`), so its length is test cases, not production code.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

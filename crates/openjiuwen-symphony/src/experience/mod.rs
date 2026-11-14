@@ -13,10 +13,25 @@
 //! - [`ExperienceBank`](crate::experience::ExperienceBank) — the authoritative in-memory
 //!   catalog with write-through persistence, generated `exp_NNNN` ids, deterministic
 //!   dedupe, and search.
+//! - [`ExperienceIndex`](crate::experience::ExperienceIndex) — the persisted,
+//!   embedding-backed catalog: one vector per item, a JSONL scalar file, and an integrity
+//!   manifest under an index directory (Python's `ExperienceBank(index_dir, ...)` layout
+//!   without faiss).
 //! - [`ExperienceHit`](crate::experience::ExperienceHit),
 //!   [`ExperienceRanking`](crate::experience::ExperienceRanking), and
 //!   [`SearchOptions`](crate::experience::SearchOptions) — the ranking configuration and
 //!   result types.
+//!
+//! # Two catalogs, one rule set
+//!
+//! [`ExperienceBank`](crate::experience::ExperienceBank) is the store-agnostic catalog: it
+//! keeps items in memory, writes through an
+//! [`ExperienceStore`](crate::experience::ExperienceStore), and re-derives embeddings at
+//! search time. [`ExperienceIndex`](crate::experience::ExperienceIndex) is the durable
+//! embedding catalog: it persists the vectors next to the items, rehydrates them on open
+//! instead of re-embedding, and keeps an integrity manifest of both files. Both share the
+//! generated-id counter, the dedupe merge (the crate-private `merge_item`), and the ranking
+//! helpers, so an item behaves identically in either.
 //!
 //! # Ranking
 //!
@@ -39,13 +54,29 @@
 //! `last_hit_at` wins, and an existing embedding survives. The merge keeps the id of the
 //! entry that was stored first.
 //!
-//! `bank.rs` holds the catalog, `store.rs` the persistence seam and its backends, and
-//! `ranking.rs` the hit type, ranking configuration, and scoring helpers.
+//! `bank.rs` holds the store-backed catalog, `index/` the persisted embedding catalog,
+//! `store.rs` the persistence seam and its backends, and `ranking.rs` the hit type, ranking
+//! configuration, and scoring helpers.
+//!
+//! # Ingestion: trace → cluster → collector
+//!
+//! `trace/` parses agent-runtime session exports into
+//! [`TraceRecord`](crate::experience::TraceRecord)s and caches them next to the sessions;
+//! `cluster.rs` groups those records by skill set and query topic; `collector.rs` turns
+//! each cluster into an [`ExperienceItem`](crate::experience::ExperienceItem) and writes
+//! it into an [`ExperienceBank`](crate::experience::ExperienceBank) or an
+//! [`ExperienceIndex`](crate::experience::ExperienceIndex). Python's LLM distillation is
+//! replaced by the cluster's centroid query and a deterministic token-similarity merge, so
+//! the whole input half works offline.
 #![allow(clippy::module_name_repetitions)]
 
 mod bank;
+pub mod cluster;
+pub mod collector;
+mod index;
 mod ranking;
 mod store;
+pub mod trace;
 
 use std::collections::BTreeSet;
 
@@ -54,6 +85,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub use bank::{AddOutcome, ExperienceBank};
+pub use cluster::{cluster_traces, ClusteredQuery, CLUSTER_SIMILARITY_THRESHOLD};
+pub use collector::{
+    CollectorStats, ExperienceCollector, ExperienceSink, PATTERN_MERGE_THRESHOLD,
+    PENDING_FLUSH_THRESHOLD, QUERY_EXAMPLES_COUNT,
+};
+pub use index::{ExperienceIndex, ExperienceIndexMeta};
+pub use index::{FLAT_VECTOR_ALGORITHM, MANIFEST_VERSION};
 pub use ranking::{
     cosine_similarity, ExperienceHit, ExperienceRanking, SearchOptions, DEFAULT_TOP_K,
 };
@@ -62,6 +100,7 @@ pub use store::SqliteExperienceStore;
 pub use store::{
     ExperienceStore, JsonFileExperienceStore, MemoryExperienceStore, DEFAULT_KEY_PREFIX,
 };
+pub use trace::{SessionPaths, TraceRecord, TraceStore, TraceToolCall};
 
 /// The prefix of every generated experience id (`exp_0001`, `exp_0002`, ...).
 pub const ID_PREFIX: &str = "exp_";
@@ -247,6 +286,44 @@ impl ExperienceItem {
     }
 }
 
+/// Merges `incoming` into `existing`, keeping `existing`'s id, pattern, and embedding.
+///
+/// The success counters add up, the example lists union in first-seen order, the later
+/// `last_hit_at` wins, and `existing`'s embedding survives unless it was empty. The
+/// incoming id is discarded: the entry stored first keeps its identity, so repeated
+/// observations reinforce one record instead of fragmenting the catalog.
+///
+/// This is the single merge rule shared by
+/// [`ExperienceBank::add`](crate::experience::ExperienceBank::add) and
+/// [`ExperienceIndex::add`](crate::experience::ExperienceIndex::add).
+pub(crate) fn merge_item(existing: &mut ExperienceItem, incoming: ExperienceItem) {
+    existing.success_count = existing
+        .success_count
+        .saturating_add(incoming.success_count);
+    for example in incoming.query_examples {
+        if !existing.query_examples.contains(&example) {
+            existing.query_examples.push(example);
+        }
+    }
+    existing.last_hit_at = existing.last_hit_at.max(incoming.last_hit_at);
+    if existing.embedding.is_empty() {
+        existing.embedding = incoming.embedding;
+    }
+}
+
+/// Parses the ordinal of a generated `exp_NNNN` id.
+///
+/// Returns `None` for an id without the [`ID_PREFIX`], for an all-digit suffix that does
+/// not fit a `u64`, and for any other suffix, so a malformed id never aborts a catalog
+/// scan or pushes the generated-id counter around.
+pub(crate) fn ordinal_of(id: &str) -> Option<u64> {
+    let digits = id.strip_prefix(ID_PREFIX)?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 mod tests {
@@ -318,5 +395,51 @@ mod tests {
         assert!(item.has_skill("summarizer"));
         assert!(!item.has_skill("translator"));
         assert_eq!(item.skill_set().len(), 1);
+    }
+
+    #[test]
+    fn ordinals_are_parsed_from_generated_ids_only() {
+        assert_eq!(ordinal_of("exp_0001"), Some(1));
+        assert_eq!(ordinal_of("exp_42"), Some(42));
+        assert_eq!(ordinal_of("exp_"), None);
+        assert_eq!(ordinal_of("exp_x"), None);
+        assert_eq!(ordinal_of("custom_7"), None);
+        assert_eq!(ordinal_of("exp_999999999999999999999999"), None);
+    }
+
+    #[test]
+    fn merge_unions_examples_and_counts() {
+        let mut existing = ExperienceItem::new("Summarize")
+            .with_id("exp_0001")
+            .with_query_examples(["one", "two"])
+            .with_success_count(2)
+            .with_last_hit_at(5.0);
+        let incoming = ExperienceItem::new("summarize")
+            .with_query_examples(["two", "three"])
+            .with_success_count(3)
+            .with_last_hit_at(9.0)
+            .with_embedding(vec![1.0]);
+        merge_item(&mut existing, incoming);
+        assert_eq!(existing.id, "exp_0001");
+        assert_eq!(existing.success_count, 5);
+        assert_eq!(existing.query_examples, vec!["one", "two", "three"]);
+        assert!((existing.last_hit_at - 9.0).abs() < f64::EPSILON);
+        assert_eq!(existing.embedding, vec![1.0]);
+    }
+
+    #[test]
+    fn merge_keeps_the_existing_embedding_and_the_latest_hit() {
+        let mut existing = ExperienceItem::new("Summarize")
+            .with_id("exp_0001")
+            .with_embedding(vec![1.0, 0.0])
+            .with_last_hit_at(9.0);
+        let incoming = ExperienceItem::new("summarize")
+            .with_id("exp_0009")
+            .with_embedding(vec![0.0, 1.0])
+            .with_last_hit_at(3.0);
+        merge_item(&mut existing, incoming);
+        assert_eq!(existing.id, "exp_0001");
+        assert_eq!(existing.embedding, vec![1.0, 0.0]);
+        assert!((existing.last_hit_at - 9.0).abs() < f64::EPSILON);
     }
 }

@@ -3,34 +3,75 @@
 //! Ports the deterministic part of Python `openjiuwen.agent_evolving.ttse.dream`:
 //! near-duplicate tips are clustered by keyword overlap and collapsed onto a
 //! representative, then stale or negligible tips are pruned. No model call is
-//! involved in the offline path.
+//! involved in the offline path; [`crate::ttse::dream_llm`] adds the model-backed
+//! merge and purge passes on top of the same clustering.
 //!
 //! Clustering is connected-component analysis over the pairwise `jaccard`
 //! similarity of tip rules, so the pass is order-independent and idempotent:
 //! once a component has been collapsed onto one representative, no pair of
 //! surviving tips can still reach the merge threshold.
 
+use std::collections::BTreeSet;
+use std::fmt;
+use std::sync::Arc;
+
+use openjiuwen_core::foundation::llm::{Model, ModelRequestConfig};
+
 use crate::ttse::bank::{jaccard, tokenize, TipBank};
 use crate::ttse::config::TtseConfig;
+use crate::ttse::dream_prompt::DEFAULT_MAX_LLM_MERGES;
 use crate::ttse::models::DreamReport;
 
 /// The smallest cluster the dreamer will ever merge.
 ///
 /// A cluster of one is a no-op, so [`TtseConfig::dream_cluster_min_size`] values
 /// below `2` are raised to this floor instead of merging nothing or everything.
-const MIN_CLUSTER_SIZE: usize = 2;
+pub(crate) const MIN_CLUSTER_SIZE: usize = 2;
 
 /// Clusters, merges and prunes the tips of a [`TipBank`](super::TipBank).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Dreamer {
-    config: TtseConfig,
+    /// The shared TTSE tunables.
+    pub(crate) config: TtseConfig,
+    /// The optional model driving the merge and purge passes.
+    pub(crate) model: Option<Arc<dyn Model>>,
+    /// The request sent with every model call.
+    pub(crate) request: ModelRequestConfig,
+    /// How many merge prompts one model-backed pass may send.
+    pub(crate) max_llm_merges: usize,
+    /// Tip ids whose form has already been checked, so a purge pass skips them.
+    pub(crate) form_checked: BTreeSet<String>,
+}
+
+impl fmt::Debug for Dreamer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("Dreamer");
+        debug
+            .field("config", &self.config)
+            .field("request", &self.request)
+            .field("max_llm_merges", &self.max_llm_merges)
+            .field("form_checked", &self.form_checked.len());
+        if let Some(model) = &self.model {
+            debug.field("model", &model.model_name());
+        }
+        debug.finish()
+    }
 }
 
 impl Dreamer {
     /// Builds a dreamer from the shared TTSE configuration.
+    ///
+    /// No model is installed, so [`Dreamer::dream`] is the only pass available
+    /// until [`Dreamer::with_model`] is called.
     #[must_use]
     pub fn new(config: TtseConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            model: None,
+            request: ModelRequestConfig::default(),
+            max_llm_merges: DEFAULT_MAX_LLM_MERGES,
+            form_checked: BTreeSet::new(),
+        }
     }
 
     /// The configuration this dreamer applies.
@@ -117,7 +158,7 @@ impl Dreamer {
 ///
 /// A non-finite threshold collapses to `1.0`, which only merges rules with
 /// identical token sets, instead of poisoning every comparison.
-fn merge_threshold(threshold: f64) -> f64 {
+pub(crate) fn merge_threshold(threshold: f64) -> f64 {
     if threshold.is_finite() {
         threshold.clamp(0.0, 1.0)
     } else {
@@ -130,7 +171,7 @@ fn merge_threshold(threshold: f64) -> f64 {
 /// `ids` and `token_sets` describe the same tips. `ids` must be sorted
 /// ascending; the returned clusters then list their tip ids ascending and are
 /// themselves ordered by their first member.
-fn connected_clusters(
+pub(crate) fn connected_clusters(
     ids: &[String],
     token_sets: &[Vec<String>],
     threshold: f64,
@@ -167,7 +208,7 @@ fn connected_clusters(
 }
 
 /// The root of `node` in the disjoint-set forest, compressing the path.
-fn find(parents: &mut [usize], node: usize) -> usize {
+pub(crate) fn find(parents: &mut [usize], node: usize) -> usize {
     let mut root = node;
     while parents[root] != root {
         root = parents[root];

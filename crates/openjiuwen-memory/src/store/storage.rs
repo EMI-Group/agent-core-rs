@@ -29,6 +29,7 @@ use crate::record::{MemoryFilter, MemoryRecord, MemoryScope, MemoryType};
 use super::json;
 use super::keys;
 use super::legacy;
+use super::prefix::KvPrefixRegistry;
 use super::MemoryStores;
 
 /// The `id` field of a vector collection.
@@ -46,18 +47,31 @@ const VECTOR_ID_MAX_LENGTH: usize = 256;
 pub(crate) struct MemoryStorage {
     /// The underlying KV, vector, document, and graph stores.
     stores: MemoryStores,
+    /// The key/collection prefix layout every derived key uses.
+    prefixes: KvPrefixRegistry,
 }
 
 impl MemoryStorage {
-    /// Builds storage over `stores`.
+    /// Builds storage over `stores` with the default prefix layout.
     pub(crate) fn new(stores: MemoryStores) -> Self {
-        Self { stores }
+        Self::with_prefixes(stores, KvPrefixRegistry::default())
+    }
+
+    /// Builds storage over `stores` with an explicit prefix layout.
+    pub(crate) fn with_prefixes(stores: MemoryStores, prefixes: KvPrefixRegistry) -> Self {
+        Self { stores, prefixes }
+    }
+
+    /// The prefix layout every derived key uses.
+    #[cfg_attr(not(test), allow(dead_code))] // read by the prefix-layout tests only
+    pub(crate) fn prefixes(&self) -> &KvPrefixRegistry {
+        &self.prefixes
     }
 
     /// Persists `record` under its scope/id key, without its embedding.
     pub(crate) async fn put_record(&self, record: &MemoryRecord) -> Result<()> {
         let text = json::record_to_text(record)?;
-        let key = keys::record_key(&record.scope, &record.id);
+        let key = keys::record_key_in(&self.prefixes, &record.scope, &record.id);
         self.stores.kv.set(&key, KvValue::text(text)).await
     }
 
@@ -72,8 +86,10 @@ impl MemoryStorage {
         scope: &MemoryScope,
         id: &str,
     ) -> Result<Option<MemoryRecord>> {
-        let key = keys::record_key(scope, id);
-        let Some((found, text)) = legacy::read_text(self.stores.kv.as_ref(), key).await? else {
+        let key = keys::record_key_in(&self.prefixes, scope, id);
+        let Some((found, text)) =
+            legacy::read_text_in(self.stores.kv.as_ref(), key, &self.prefixes).await?
+        else {
             return Ok(None);
         };
         json::record_from_text(&text)
@@ -94,14 +110,15 @@ impl MemoryStorage {
     /// `super::legacy::list_records`).
     pub(crate) async fn list_records(&self, filter: &MemoryFilter) -> Result<Vec<MemoryRecord>> {
         let prefix = match (&filter.user_id, &filter.scope_id) {
-            (Some(user_id), Some(scope_id)) => {
-                keys::record_prefix(&MemoryScope::new(user_id.clone(), scope_id.clone()))
-            }
-            (Some(user_id), None) => keys::record_prefix_for(user_id),
-            (None, Some(scope_id)) => keys::record_prefix_for_scope(scope_id),
-            (None, None) => keys::record_prefix_for_scope(""),
+            (Some(user_id), Some(scope_id)) => keys::record_prefix_in(
+                &self.prefixes,
+                &MemoryScope::new(user_id.clone(), scope_id.clone()),
+            ),
+            (Some(user_id), None) => keys::record_prefix_for_in(&self.prefixes, user_id),
+            (None, Some(scope_id)) => keys::record_prefix_for_scope_in(&self.prefixes, scope_id),
+            (None, None) => keys::record_prefix_for_scope_in(&self.prefixes, ""),
         };
-        legacy::list_records(self.stores.kv.as_ref(), &prefix, filter).await
+        legacy::list_records_in(self.stores.kv.as_ref(), &prefix, filter, &self.prefixes).await
     }
 
     /// Deletes `record` and its embedding, returning whether the record row existed.
@@ -109,8 +126,9 @@ impl MemoryStorage {
     /// Both the current and the legacy key are removed; a legacy row therefore reports
     /// `true` on its first delete and `false` afterwards.
     pub(crate) async fn delete_record(&self, record: &MemoryRecord) -> Result<bool> {
-        let key = keys::record_key(&record.scope, &record.id);
-        let existed = legacy::delete_with_legacy(self.stores.kv.as_ref(), &key).await?;
+        let key = keys::record_key_in(&self.prefixes, &record.scope, &record.id);
+        let existed =
+            legacy::delete_with_legacy_in(self.stores.kv.as_ref(), &key, &self.prefixes).await?;
         self.delete_embedding(record).await?;
         Ok(existed)
     }
@@ -206,7 +224,7 @@ impl MemoryStorage {
         name: &str,
         value: &str,
     ) -> Result<()> {
-        let key = variable_key(scope, session_id, name);
+        let key = variable_key(&self.prefixes, scope, session_id, name);
         self.stores.kv.set(&key, KvValue::text(value)).await
     }
 
@@ -219,8 +237,8 @@ impl MemoryStorage {
         session_id: Option<&str>,
         name: &str,
     ) -> Result<Option<String>> {
-        let key = variable_key(scope, session_id, name);
-        match legacy::read_text(self.stores.kv.as_ref(), key).await {
+        let key = variable_key(&self.prefixes, scope, session_id, name);
+        match legacy::read_text_in(self.stores.kv.as_ref(), key, &self.prefixes).await {
             Ok(found) => Ok(found.map(|(_, text)| text)),
             // A non-text value is "not a text variable", the documented contract here.
             Err(Error::Validation(_)) => Ok(None),
@@ -237,8 +255,8 @@ impl MemoryStorage {
         scope: &MemoryScope,
         session_id: Option<&str>,
     ) -> Result<BTreeMap<String, String>> {
-        let prefix = variable_prefix(scope, session_id);
-        legacy::list_variables(self.stores.kv.as_ref(), &prefix).await
+        let prefix = variable_prefix(&self.prefixes, scope, session_id);
+        legacy::list_variables_in(self.stores.kv.as_ref(), &prefix, &self.prefixes).await
     }
 
     /// Deletes a variable, returning whether any of its keys existed.
@@ -248,8 +266,8 @@ impl MemoryStorage {
         session_id: Option<&str>,
         name: &str,
     ) -> Result<bool> {
-        let key = variable_key(scope, session_id, name);
-        legacy::delete_with_legacy(self.stores.kv.as_ref(), &key).await
+        let key = variable_key(&self.prefixes, scope, session_id, name);
+        legacy::delete_with_legacy_in(self.stores.kv.as_ref(), &key, &self.prefixes).await
     }
 
     /// Stores the configuration of `scope_id`, returning whether it replaced one.
@@ -260,7 +278,7 @@ impl MemoryStorage {
         scope_id: &str,
         config: &MemoryScopeConfig,
     ) -> Result<bool> {
-        let key = keys::scope_config_key(scope_id);
+        let key = keys::scope_config_key_in(&self.prefixes, scope_id);
         let existed = self.stores.kv.exists(&key).await?;
         let text = serde_json::to_string(config).map_err(|error| {
             Error::external(error)
@@ -279,8 +297,10 @@ impl MemoryStorage {
         &self,
         scope_id: &str,
     ) -> Result<Option<MemoryScopeConfig>> {
-        let key = keys::scope_config_key(scope_id);
-        let Some((found, text)) = legacy::read_text(self.stores.kv.as_ref(), key).await? else {
+        let key = keys::scope_config_key_in(&self.prefixes, scope_id);
+        let Some((found, text)) =
+            legacy::read_text_in(self.stores.kv.as_ref(), key, &self.prefixes).await?
+        else {
             return Ok(None);
         };
         let config = serde_json::from_str(&text).map_err(|error| {
@@ -295,9 +315,68 @@ impl MemoryStorage {
     ///
     /// Both the current and the legacy key are removed.
     pub(crate) async fn delete_scope_config(&self, scope_id: &str) -> Result<bool> {
-        let key = keys::scope_config_key(scope_id);
-        legacy::delete_with_legacy(self.stores.kv.as_ref(), &key).await
+        let key = keys::scope_config_key_in(&self.prefixes, scope_id);
+        legacy::delete_with_legacy_in(self.stores.kv.as_ref(), &key, &self.prefixes).await
     }
+
+    /// Stores the analyzer-override payload of `scope_id` as raw JSON.
+    ///
+    /// The payload is opaque to the store: it is the analyzer layer's document, so this
+    /// module never interprets, defaults, or validates its shape. An existing payload is
+    /// replaced. `scope_id` is validated like every other scope-keyed namespace, so it
+    /// cannot escape the `memory_scope_overrides/{scope_id}` key.
+    pub(crate) async fn set_scope_overrides(&self, scope_id: &str, value: Value) -> Result<()> {
+        validate_scope_id(scope_id)?;
+        let key = keys::scope_overrides_key(scope_id);
+        let text = serde_json::to_string(&value).map_err(|error| {
+            Error::external(error).with_context(format!(
+                "serializing the memory scope overrides `{scope_id}`"
+            ))
+        })?;
+        self.stores.kv.set(&key, KvValue::text(text)).await
+    }
+
+    /// Reads the analyzer-override payload of `scope_id`, or `None` when it is absent.
+    ///
+    /// A missing key is not an error. A stored value that is not UTF-8 text or not valid
+    /// JSON is [`Error::Validation`], never a silent default.
+    pub(crate) async fn get_scope_overrides(&self, scope_id: &str) -> Result<Option<Value>> {
+        validate_scope_id(scope_id)?;
+        let key = keys::scope_overrides_key(scope_id);
+        let Some(value) = self.stores.kv.get(&key).await? else {
+            return Ok(None);
+        };
+        let text = value.as_str().ok_or_else(|| {
+            Error::validation(format!(
+                "memory scope overrides `{key}` are not stored as UTF-8 text"
+            ))
+        })?;
+        let decoded = serde_json::from_str(text).map_err(|error| {
+            Error::validation(format!(
+                "malformed memory scope overrides JSON for `{key}`: {error}"
+            ))
+        })?;
+        Ok(Some(decoded))
+    }
+
+    /// Deletes the analyzer-override payload of `scope_id`, returning whether it existed.
+    pub(crate) async fn delete_scope_overrides(&self, scope_id: &str) -> Result<bool> {
+        validate_scope_id(scope_id)?;
+        let key = keys::scope_overrides_key(scope_id);
+        let existed = self.stores.kv.exists(&key).await?;
+        self.stores.kv.delete(&key).await?;
+        Ok(existed)
+    }
+}
+
+/// Validates a bare `scope_id` before it becomes a storage-key segment.
+///
+/// The rules are the [`MemoryScope`] rules (non-empty, no `/`, `\` or NUL, at most 128
+/// characters), so an invalid id is [`Error::Validation`] rather than a key that
+/// collides with a neighbouring scope's namespace.
+fn validate_scope_id(scope_id: &str) -> Result<()> {
+    MemoryScope::new(crate::record::DEFAULT_ID, scope_id).validate()?;
+    Ok(())
 }
 
 /// Creates the vector collection when it does not exist.
@@ -335,24 +414,34 @@ async fn ensure_collection(vector: &dyn VectorStore, collection: &str, dim: usiz
 }
 
 /// The key of one variable, user-scoped when `session_id` is absent.
-fn variable_key(scope: &MemoryScope, session_id: Option<&str>, name: &str) -> String {
+fn variable_key(
+    prefixes: &KvPrefixRegistry,
+    scope: &MemoryScope,
+    session_id: Option<&str>,
+    name: &str,
+) -> String {
     match session_id {
-        Some(session_id) => keys::session_variable_key(scope, session_id, name),
-        None => keys::variable_key(scope, name),
+        Some(session_id) => keys::session_variable_key_in(prefixes, scope, session_id, name),
+        None => keys::variable_key_in(prefixes, scope, name),
     }
 }
 
 /// The key prefix of one variable namespace, user-scoped when `session_id` is absent.
-fn variable_prefix(scope: &MemoryScope, session_id: Option<&str>) -> String {
+fn variable_prefix(
+    prefixes: &KvPrefixRegistry,
+    scope: &MemoryScope,
+    session_id: Option<&str>,
+) -> String {
     match session_id {
-        Some(session_id) => keys::session_variable_prefix(scope, session_id),
-        None => keys::variable_prefix(scope),
+        Some(session_id) => keys::session_variable_prefix_in(prefixes, scope, session_id),
+        None => keys::variable_prefix_in(prefixes, scope),
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::assert_is_empty)] // `assert!(x.is_empty())` states the expectation directly
 mod tests {
+    use super::super::prefix::KvFamily;
     use super::*;
     use chrono::{DateTime, TimeZone, Utc};
     use openjiuwen_common::error::ErrorKind;
@@ -744,6 +833,158 @@ mod tests {
             .expect("delete again"));
         assert_eq!(storage.get_scope_config("ws").await.expect("absent"), None);
     }
+    #[tokio::test]
+    async fn scope_overrides_round_trip_overwrite_and_delete() {
+        let storage = storage();
+        let payload = serde_json::json!({
+            "extractor": "llm",
+            "classifier": {"kind": "rule", "threshold": 0.75},
+            "tags": ["a", "b"],
+        });
+        assert_eq!(
+            storage.get_scope_overrides("ws").await.expect("absent"),
+            None
+        );
+        storage
+            .set_scope_overrides("ws", payload.clone())
+            .await
+            .expect("set overrides");
+        assert_eq!(
+            storage.get_scope_overrides("ws").await.expect("get"),
+            Some(payload.clone())
+        );
+        let stored = storage
+            .stores
+            .kv
+            .get(&keys::scope_overrides_key("ws"))
+            .await
+            .expect("read key")
+            .expect("key exists");
+        assert_eq!(
+            serde_json::from_str::<Value>(stored.as_str().expect("text")).expect("raw JSON"),
+            payload
+        );
+        // The scope configuration namespace is untouched by the overrides.
+        assert_eq!(storage.get_scope_config("ws").await.expect("config"), None);
+        let replaced = serde_json::json!({"extractor": "rule"});
+        storage
+            .set_scope_overrides("ws", replaced.clone())
+            .await
+            .expect("overwrite");
+        assert_eq!(
+            storage.get_scope_overrides("ws").await.expect("get"),
+            Some(replaced)
+        );
+        assert!(storage.delete_scope_overrides("ws").await.expect("delete"));
+        assert!(!storage
+            .delete_scope_overrides("ws")
+            .await
+            .expect("delete again"));
+        assert_eq!(
+            storage.get_scope_overrides("ws").await.expect("absent"),
+            None
+        );
+    }
+    #[tokio::test]
+    async fn scope_overrides_reject_invalid_scope_ids() {
+        let storage = storage();
+        for scope_id in ["", "ws/one", "ws\\one", "ws\0one", &"x".repeat(129)] {
+            let error = storage
+                .set_scope_overrides(scope_id, serde_json::json!({}))
+                .await
+                .expect_err(scope_id);
+            assert_eq!(error.kind(), ErrorKind::Validation, "{scope_id:?}");
+            assert!(matches!(
+                storage.get_scope_overrides(scope_id).await,
+                Err(Error::Validation(_))
+            ));
+            assert!(matches!(
+                storage.delete_scope_overrides(scope_id).await,
+                Err(Error::Validation(_))
+            ));
+        }
+        // The accepted boundary is exactly the `MemoryScope` rule for `scope_id`.
+        for scope_id in ["ws", &"x".repeat(128)] {
+            assert!(storage
+                .get_scope_overrides(scope_id)
+                .await
+                .expect("valid scope id")
+                .is_none());
+        }
+    }
+    #[tokio::test]
+    async fn scope_overrides_reject_malformed_payloads() {
+        let storage = storage();
+        let key = keys::scope_overrides_key("bad");
+        storage
+            .stores
+            .kv
+            .set(&key, KvValue::text("{not json"))
+            .await
+            .expect("write malformed");
+        let error = storage
+            .get_scope_overrides("bad")
+            .await
+            .expect_err("malformed overrides");
+        assert!(matches!(error, Error::Validation(_)), "{error:?}");
+        storage
+            .stores
+            .kv
+            .set(&key, KvValue::bytes(vec![0_u8, 1, 2]))
+            .await
+            .expect("write bytes");
+        let error = storage
+            .get_scope_overrides("bad")
+            .await
+            .expect_err("byte overrides");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+    }
+    #[tokio::test]
+    async fn scope_overrides_persist_across_a_local_file_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let payload = serde_json::json!({"model": "local-scripted", "retries": 2});
+        {
+            let stores = MemoryStores::local_file(directory.path())
+                .await
+                .expect("open local file");
+            let storage = MemoryStorage::new(stores);
+            storage
+                .set_scope_overrides("ws", payload.clone())
+                .await
+                .expect("set overrides");
+        }
+        let stores = MemoryStores::local_file(directory.path())
+            .await
+            .expect("reopen local file");
+        let storage = MemoryStorage::new(stores);
+        assert_eq!(
+            storage.get_scope_overrides("ws").await.expect("get"),
+            Some(payload)
+        );
+        assert!(storage.delete_scope_overrides("ws").await.expect("delete"));
+    }
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn scope_overrides_persist_across_a_sqlite_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("overrides.db");
+        let payload = serde_json::json!({"extractor": "llm", "attempts": [1, 2]});
+        {
+            let storage =
+                MemoryStorage::new(MemoryStores::sqlite(&path).await.expect("open sqlite"));
+            storage
+                .set_scope_overrides("ws", payload.clone())
+                .await
+                .expect("set overrides");
+        }
+        let storage = MemoryStorage::new(MemoryStores::sqlite(&path).await.expect("reopen sqlite"));
+        assert_eq!(
+            storage.get_scope_overrides("ws").await.expect("get"),
+            Some(payload)
+        );
+        assert!(storage.delete_scope_overrides("ws").await.expect("delete"));
+        assert_eq!(storage.get_scope_overrides("ws").await.expect("gone"), None);
+    }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
@@ -774,5 +1015,133 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].content, "hello");
         assert_eq!(history[0].timestamp, message_time);
+    }
+
+    fn renamed(family: KvFamily, prefix: &str) -> KvPrefixRegistry {
+        KvPrefixRegistry::new()
+            .with_current(family, prefix)
+            .expect("valid prefix")
+    }
+
+    #[tokio::test]
+    async fn custom_variable_prefix_writes_current_and_reads_aliases() {
+        let stores = MemoryStores::in_memory();
+        let prefixes = renamed(KvFamily::UserVariables, "vars_v2");
+        let storage = MemoryStorage::with_prefixes(stores.clone(), prefixes.clone());
+        assert_eq!(storage.prefixes(), &prefixes);
+        let scope = scope();
+        // Data written before the rename lives under the alias prefixes.
+        stores
+            .kv
+            .set(
+                &keys::legacy_variable_key(&scope, "lang"),
+                KvValue::text("en"),
+            )
+            .await
+            .expect("write alias variable");
+        storage
+            .set_variable(&scope, None, "theme", "dark")
+            .await
+            .expect("set variable");
+        let written = stores
+            .kv
+            .get(&keys::variable_key_in(&prefixes, &scope, "theme"))
+            .await
+            .expect("read current key")
+            .expect("current key exists");
+        assert_eq!(written.as_str(), Some("dark"));
+        assert_eq!(
+            storage
+                .get_variable(&scope, None, "theme")
+                .await
+                .expect("get current"),
+            Some("dark".to_owned())
+        );
+        assert_eq!(
+            storage
+                .get_variable(&scope, None, "lang")
+                .await
+                .expect("get alias"),
+            Some("en".to_owned())
+        );
+        // A stale alias value never outranks the current layout.
+        stores
+            .kv
+            .set(
+                &keys::legacy_variable_key(&scope, "theme"),
+                KvValue::text("grey"),
+            )
+            .await
+            .expect("write stale alias");
+        assert_eq!(
+            storage
+                .get_variable(&scope, None, "theme")
+                .await
+                .expect("get current"),
+            Some("dark".to_owned())
+        );
+        assert_eq!(
+            storage
+                .list_variables(&scope, None)
+                .await
+                .expect("list variables"),
+            BTreeMap::from([
+                ("lang".to_owned(), "en".to_owned()),
+                ("theme".to_owned(), "dark".to_owned()),
+            ])
+        );
+        assert!(storage
+            .delete_variable(&scope, None, "theme")
+            .await
+            .expect("delete variable"));
+        assert!(stores
+            .kv
+            .get(&keys::variable_key_in(&prefixes, &scope, "theme"))
+            .await
+            .expect("read current key")
+            .is_none());
+        assert!(stores
+            .kv
+            .get(&keys::legacy_variable_key(&scope, "theme"))
+            .await
+            .expect("read alias key")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn custom_record_prefix_round_trips_and_lists() {
+        let stores = MemoryStores::in_memory();
+        let storage =
+            MemoryStorage::with_prefixes(stores.clone(), renamed(KvFamily::Records, "MEMV2"));
+        let record = record("rec-1", "Alice prefers dark mode", 0);
+        storage.put_record(&record).await.expect("put");
+        let written = stores
+            .kv
+            .get("MEMV2/alice/ws/rec-1")
+            .await
+            .expect("read custom key")
+            .expect("custom key exists");
+        assert!(written.as_str().is_some());
+        let restored = storage
+            .get_record(&scope(), "rec-1")
+            .await
+            .expect("get")
+            .expect("record exists");
+        assert_eq!(restored.content, record.content);
+        let listed = storage
+            .list_records(&MemoryFilter::for_scope(&scope()))
+            .await
+            .expect("list");
+        assert_eq!(
+            listed.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["rec-1"]
+        );
+        assert!(storage.delete_record(&record).await.expect("delete"));
+        assert!(stores
+            .kv
+            .get("MEMV2/alice/ws/rec-1")
+            .await
+            .expect("read custom key")
+            .is_none());
     }
 }

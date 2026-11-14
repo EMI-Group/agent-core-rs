@@ -1,6 +1,7 @@
 //! Behaviour tests for [`SymphonyRuntime`]: lifecycle, graph build and publication,
-//! planning, invocation, idempotent mutations, evolution feedback, semantic search, and
-//! file-backed revision persistence.
+//! planning, invocation, idempotent mutations (digests, the optional journal, and
+//! source-revision compare-and-swap), evolution feedback, semantic search, and file-backed
+//! revision persistence.
 //!
 //! Everything here is offline and deterministic: the capability runner is a local fake,
 //! the semantic index embeds with `HashEmbedding`, file-backed runs use `tempfile`, and no
@@ -19,6 +20,7 @@ use openjiuwen_symphony::artifact::{GraphArtifactStore, MemoryGraphArtifactStore
 use openjiuwen_symphony::error::{ErrorKind, Result};
 use openjiuwen_symphony::graph::{CapabilityEdge, CapabilityGraph, CAN_FEED};
 use openjiuwen_symphony::model::{CapabilityDescriptor, CapabilityIo, CapabilityKey};
+use openjiuwen_symphony::orchestration::mutation::{MutationJournal, MutationRequest};
 use openjiuwen_symphony::orchestration::PlanExecution;
 use openjiuwen_symphony::orchestration::{
     CandidateConfig, CapabilityRunner, ExecutorConfig, PlanConfig, PlanRequest, PlanStatus,
@@ -26,7 +28,8 @@ use openjiuwen_symphony::orchestration::{
 };
 use openjiuwen_symphony::registry::CapabilityRegistry;
 use openjiuwen_symphony::runtime::{
-    InvokeRequest, MutationOperation, RuntimeState, SymphonyConfig, SymphonyRuntime,
+    GraphMutationResult, InvokeRequest, MutationOperation, MutationStatus, RuntimeState,
+    SymphonyConfig, SymphonyRuntime,
 };
 use openjiuwen_symphony::search::{SearchHit, SearchRequest, SemanticIndex};
 use openjiuwen_symphony::store::{AssetStore, KvAssetStore};
@@ -534,6 +537,394 @@ async fn remove_of_an_absent_key_is_a_no_op() {
     assert_eq!(result.removed_edges, 0);
     assert_eq!(result.revision, "v2");
     assert_eq!(runtime.registry().len(), 2);
+}
+
+#[tokio::test]
+async fn mutation_results_report_status_digest_and_serialized_shape() {
+    let runtime = SymphonyRuntime::open(SymphonyConfig::default())
+        .await
+        .expect("open runtime");
+    runtime.start().await.expect("start");
+
+    let added = runtime
+        .add_capabilities(catalog(), "req-status")
+        .await
+        .expect("add");
+    assert_eq!(added.status, MutationStatus::Published);
+    assert!(!added.replayed);
+    assert_eq!(added.digest.len(), 64);
+    assert!(added.source_revision.is_none());
+    assert!(added.diagnostics.is_empty());
+
+    let json = serde_json::to_value(&added).expect("serialize");
+    assert_eq!(json["status"], json!("published"));
+    assert_eq!(json["digest"], json!(added.digest));
+    assert_eq!(json["source_revision"], Value::Null);
+    assert_eq!(json["diagnostics"], json!([]));
+    assert_eq!(json["operation"], json!("add"));
+
+    let replay = runtime
+        .add_capabilities(catalog(), "req-status")
+        .await
+        .expect("replay");
+    assert!(replay.replayed);
+    assert_eq!(replay.status, MutationStatus::Replayed);
+    assert_eq!(replay.digest, added.digest);
+    assert_eq!(replay.revision, added.revision);
+    assert_eq!(replay.changed, added.changed);
+
+    let noop = runtime
+        .remove_capabilities(&[CapabilityKey::new("tool", "ghost")], "req-noop")
+        .await
+        .expect("remove an absent key");
+    assert_eq!(noop.status, MutationStatus::Noop);
+    assert!(!noop.replayed);
+    assert!(noop.changed.is_empty());
+
+    // The new fields are additive: a record written before them still deserializes.
+    let legacy = json!({
+        "operation": "add",
+        "request_id": "req-status",
+        "changed": ["tool:fetch"],
+        "revision": "v2",
+    });
+    let restored: GraphMutationResult =
+        serde_json::from_value(legacy).expect("a legacy record stays readable");
+    assert_eq!(restored.status, MutationStatus::Published);
+    assert_eq!(restored.request_id, "req-status");
+    assert!(restored.digest.is_empty());
+    assert!(!restored.replayed);
+}
+
+#[tokio::test]
+async fn mutation_replay_with_a_different_batch_is_rejected() {
+    let runtime = runtime_with_catalog().await;
+    runtime.start().await.expect("start");
+    let first = runtime
+        .add_capabilities(vec![sum()], "req-conflict")
+        .await
+        .expect("add");
+    assert_eq!(first.changed, vec!["tool:sum"]);
+
+    // The digest covers the declared ids, so a *different id set* is another request ...
+    let error = runtime
+        .add_capabilities(
+            vec![CapabilityDescriptor::new("tool", "other", "Other")],
+            "req-conflict",
+        )
+        .await
+        .expect_err("a reused request id with another batch must be rejected");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(
+        error.message().contains("req-conflict"),
+        "the error must name the request id: {}",
+        error.message()
+    );
+    assert_eq!(
+        runtime
+            .registry()
+            .get(&CapabilityKey::new("tool", "sum"))
+            .await
+            .expect("sum")
+            .description,
+        "adds two numbers together",
+        "a rejected replay must not apply the conflicting batch"
+    );
+    assert!(
+        !runtime
+            .registry()
+            .contains(&CapabilityKey::new("tool", "other"))
+            .await,
+        "a rejected replay must not register the conflicting descriptor"
+    );
+    assert_eq!(
+        runtime
+            .graph_status()
+            .await
+            .expect("status")
+            .current_version
+            .as_deref(),
+        Some("v2"),
+        "a rejected replay must not publish a revision"
+    );
+}
+
+#[tokio::test]
+async fn mutation_digest_covers_the_declared_ids_not_the_payload() {
+    let runtime = runtime_with_catalog().await;
+    runtime.start().await.expect("start");
+    runtime
+        .add_capabilities(vec![sum()], "req-ids-only")
+        .await
+        .expect("add");
+    // Python's digest covers `changed_skill_ids`, so re-sending the same ids with different
+    // descriptor content is a replay, not a conflict.
+    let replay = runtime
+        .add_capabilities(vec![sum().with_description("different")], "req-ids-only")
+        .await
+        .expect("the same id batch replays");
+    assert!(replay.replayed);
+    assert_eq!(
+        runtime
+            .registry()
+            .get(&CapabilityKey::new("tool", "sum"))
+            .await
+            .expect("sum")
+            .description,
+        "adds two numbers together",
+        "a replay must not apply the new payload"
+    );
+}
+
+#[tokio::test]
+async fn mutation_requests_must_match_their_payload() {
+    let runtime = runtime_with_catalog().await;
+    runtime.start().await.expect("start");
+
+    let request = MutationRequest::prepare(
+        MutationOperation::Add,
+        &["tool:sum".to_string()],
+        "req-shape",
+        None,
+    )
+    .expect("prepare");
+    let error = runtime
+        .mutate(request, vec![fetch()])
+        .await
+        .expect_err("a request that disagrees with its payload must be rejected");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.message().contains("changed_skill_ids"));
+    assert!(error.message().contains("tool:sum"));
+    assert_eq!(runtime.registry().len(), 2);
+
+    let empty = runtime
+        .add_capabilities(Vec::new(), "req-empty")
+        .await
+        .expect_err("an empty batch must be rejected");
+    assert_eq!(empty.kind(), ErrorKind::Validation);
+    assert!(empty.message().contains("changed_skill_ids"));
+
+    let blank = runtime
+        .add_capabilities(vec![sum()], "   ")
+        .await
+        .expect_err("a blank request id must be rejected");
+    assert_eq!(blank.kind(), ErrorKind::Validation);
+    assert!(blank.message().contains("request_id"));
+    assert_eq!(
+        runtime
+            .graph_status()
+            .await
+            .expect("status")
+            .current_version
+            .as_deref(),
+        Some("v1"),
+        "a rejected batch must not publish a revision"
+    );
+}
+
+#[tokio::test]
+async fn source_revision_compare_and_swap_rejects_stale_batches() {
+    let runtime = runtime_with_catalog().await;
+    runtime.start().await.expect("start");
+    let current = runtime
+        .graph_status()
+        .await
+        .expect("status")
+        .current_version
+        .expect("a revision exists");
+
+    let request = MutationRequest::prepare(
+        MutationOperation::Add,
+        &["tool:sum".to_string()],
+        "req-cas-ok",
+        Some(&current),
+    )
+    .expect("prepare");
+    let published = runtime
+        .mutate(request, vec![sum()])
+        .await
+        .expect("a batch against the current revision applies");
+    assert_eq!(published.status, MutationStatus::Published);
+    assert_eq!(published.source_revision.as_deref(), Some(current.as_str()));
+    assert_ne!(published.revision, current);
+
+    let stale = MutationRequest::prepare(
+        MutationOperation::Update,
+        &["tool:sum".to_string()],
+        "req-cas-stale",
+        Some(&current),
+    )
+    .expect("prepare");
+    let error = runtime
+        .mutate(stale, vec![sum().with_description("stale write")])
+        .await
+        .expect_err("a batch against a replaced revision must be rejected");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(
+        error.message().contains("source_revision"),
+        "the error must name source_revision: {}",
+        error.message()
+    );
+    assert_eq!(
+        runtime
+            .registry()
+            .get(&CapabilityKey::new("tool", "sum"))
+            .await
+            .expect("sum")
+            .description,
+        "adds two numbers together",
+        "a stale batch must not touch the catalog"
+    );
+
+    let fresh = MutationRequest::prepare(
+        MutationOperation::Update,
+        &["tool:sum".to_string()],
+        "req-cas-fresh",
+        Some(&published.revision),
+    )
+    .expect("prepare");
+    let updated = runtime
+        .mutate(fresh, vec![sum().with_description("fresh write")])
+        .await
+        .expect("a batch against the current revision applies");
+    assert_eq!(updated.status, MutationStatus::Published);
+    assert_eq!(
+        runtime
+            .registry()
+            .get(&CapabilityKey::new("tool", "sum"))
+            .await
+            .expect("sum")
+            .description,
+        "fresh write"
+    );
+}
+
+#[tokio::test]
+async fn builder_with_mutation_journal_writes_the_recorded_result() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("mutations.json");
+    let journal = MutationJournal::open(&path).await.expect("open journal");
+    let runtime = SymphonyRuntime::builder(SymphonyConfig::default())
+        .with_mutation_journal(journal)
+        .open()
+        .await
+        .expect("open runtime");
+    runtime.start().await.expect("start");
+
+    let first = runtime
+        .add_capabilities(catalog(), "req-journal")
+        .await
+        .expect("add");
+    assert_eq!(first.status, MutationStatus::Published);
+
+    let written = MutationJournal::open(&path).await.expect("reopen journal");
+    let record = written
+        .lookup("req-journal")
+        .await
+        .expect("the request is journaled");
+    assert_eq!(record.digest, first.digest);
+    assert_eq!(record.revision, first.revision);
+    assert_eq!(record.operation, MutationOperation::Add);
+    assert!(!record.inserted_at.is_empty());
+    let payload = record.result.expect("the recorded result is kept");
+    let restored: GraphMutationResult = serde_json::from_value(payload).expect("decode result");
+    assert_eq!(restored.request_id, "req-journal");
+    assert_eq!(restored.changed, first.changed);
+    assert_eq!(restored.status, MutationStatus::Published);
+}
+
+#[tokio::test]
+async fn journal_backed_idempotency_survives_a_runtime_rebuild() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("mutations.json");
+    let config = SymphonyConfig {
+        mutation_journal_path: Some(path.clone()),
+        ..SymphonyConfig::default()
+    };
+    let registry = Arc::new(CapabilityRegistry::new());
+    let artifacts = Arc::new(MemoryGraphArtifactStore::new());
+
+    let first = SymphonyRuntime::builder(config.clone())
+        .with_registry(Arc::clone(&registry))
+        .with_artifacts(Arc::clone(&artifacts) as Arc<dyn GraphArtifactStore>)
+        .open()
+        .await
+        .expect("open runtime");
+    first.start().await.expect("start");
+    let added = first
+        .add_capabilities(catalog(), "req-durable")
+        .await
+        .expect("add");
+    assert_eq!(added.status, MutationStatus::Published);
+    assert_eq!(added.revision, "v2");
+    drop(first);
+
+    let second = SymphonyRuntime::builder(config)
+        .with_registry(Arc::clone(&registry))
+        .with_artifacts(Arc::clone(&artifacts) as Arc<dyn GraphArtifactStore>)
+        .open()
+        .await
+        .expect("rebuild runtime");
+    second.start().await.expect("start");
+    let replay = second
+        .add_capabilities(catalog(), "req-durable")
+        .await
+        .expect("the journal answers the replay");
+    assert!(replay.replayed);
+    assert_eq!(replay.status, MutationStatus::Replayed);
+    assert_eq!(replay.revision, added.revision);
+    assert_eq!(replay.changed, added.changed);
+    assert_eq!(replay.added_edges, added.added_edges);
+    assert_eq!(replay.digest, added.digest);
+    assert_eq!(
+        second.graph_status().await.expect("status").current_version,
+        Some("v2".to_string()),
+        "a journaled replay must not publish another revision"
+    );
+
+    let conflict = second
+        .update_capabilities(vec![sum()], "req-durable")
+        .await
+        .expect_err("the recorded digest must reject another batch");
+    assert_eq!(conflict.kind(), ErrorKind::Validation);
+    assert!(conflict.message().contains("req-durable"));
+
+    // A brand-new request id still applies normally.
+    let fresh = second
+        .add_capabilities(vec![sum()], "req-after-rebuild")
+        .await
+        .expect("add");
+    assert_eq!(fresh.status, MutationStatus::Published);
+    assert_eq!(fresh.revision, "v3");
+    assert_eq!(registry.len(), 3);
+    assert!(MutationJournal::open(&path)
+        .await
+        .expect("reopen")
+        .contains("req-after-rebuild"));
+}
+
+#[tokio::test]
+async fn default_config_keeps_the_mutation_ledger_in_memory() {
+    let config = SymphonyConfig::default();
+    assert!(config.mutation_journal_path.is_none());
+    let json = serde_json::to_value(&config).expect("serialize config");
+    assert_eq!(json["mutation_journal_path"], Value::Null);
+    let restored: SymphonyConfig = serde_json::from_value(json).expect("deserialize config");
+    assert_eq!(restored, config);
+
+    let runtime = runtime_with_catalog().await;
+    runtime.start().await.expect("start");
+    let first = runtime
+        .add_capabilities(vec![sum()], "req-memory")
+        .await
+        .expect("add");
+    let replay = runtime
+        .add_capabilities(vec![sum()], "req-memory")
+        .await
+        .expect("replay");
+    assert!(!first.replayed);
+    assert!(replay.replayed);
+    assert_eq!(replay.revision, first.revision);
 }
 
 #[tokio::test]

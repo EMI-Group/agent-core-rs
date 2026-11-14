@@ -17,12 +17,12 @@ No external SDK: requests go through `openjiuwen_common::http`.
 - `validate_texts`/`validate_query` helpers: empty list and blank entries → `Error::Validation`.
 
 ### `fake.rs`
-- `HashEmbedding { dimension, model_name }`; `new(dimension)` (default 64), `Default`.
+- `HashEmbedding { dimension, model_name }`; `new(dimension)` (default 64, `0` → `DEFAULT_HASH_DIMENSION`), `Default`, `with_model_name(name)`, `dimension_size()`.
 - Deterministic SHA-256 per whitespace token → dimension-sized signed vector, mean pooled over tokens, L2 normalised; empty text → zero vector.
 - Same text always yields the same vector; identical vectors have cosine 1.0.
 
 ### `openai.rs`
-- `OpenAiEmbedding { config, client, dimension: Mutex<Option<usize>> }`; `OpenAiEmbedding::new(EmbeddingConfig) -> Result<Self>`.
+- `OpenAiEmbedding { config, client, cached_dimension: Mutex<Option<usize>> }`; `OpenAiEmbedding::new(EmbeddingConfig) -> Result<Self>`, plus `config()` and `endpoint()` accessors.
 - Endpoint: `base_url` unchanged if it ends with `/embeddings`, otherwise trim trailing `/` and append `/embeddings`.
 - Request body `{"model", "input": string|string[], "dimensions"?: n}`; `Authorization: Bearer` when `api_key` is set (never logged); extra headers from config.
 - Batch size `batch_size.or(config.max_batch_size)` (capped by config `max_batch_size` when provided), requests sequential, result order preserved.

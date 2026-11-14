@@ -28,10 +28,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::discovery::models::{SkillInventory, SkillRecord};
+use crate::discovery::models::{inventory_fingerprint, SkillInventory, SkillRecord};
+use crate::discovery::notice::SkillNoticeState;
 use crate::discovery::scanner::{
     ScannedSkill, SkillDiagnostic, SkillFolderScanner, SkillScanConfig,
 };
+use crate::discovery::settings::DEFAULT_MAX_OUTPUT_CHARS;
 use crate::error::Result;
 use crate::model::CapabilityDescriptor;
 use crate::search::lexical::{tokenize, LexicalIndex};
@@ -40,6 +42,114 @@ use crate::search::lexical::{tokenize, LexicalIndex};
 pub const EXCERPT_WIDTH: usize = 160;
 /// The characters of context kept before the matched term in an excerpt.
 pub const EXCERPT_LEAD: usize = 60;
+
+/// The default character budget of a prompt snapshot.
+///
+/// Mirrors Python's `DiscoverySettings.max_output_chars` default (`12_000` characters).
+pub const DEFAULT_PROMPT_MAX_CHARS: usize = DEFAULT_MAX_OUTPUT_CHARS;
+
+/// The prompt-snapshot header line, matching Python's markdown skill-section header.
+pub const PROMPT_HEADER: &str = "# Skills";
+
+/// The text a prompt snapshot renders when no skill is in scope.
+///
+/// This is the exact fallback Python's `# Skills` section uses when no skill is
+/// available, so an empty catalog never renders a blank snapshot.
+pub const PROMPT_EMPTY_TEXT: &str = "# Skills\n\nNo skills are available for this task.";
+
+/// The category a skill without a front-matter `category` is grouped under.
+pub const UNCATEGORIZED_CATEGORY: &str = "Uncategorized";
+
+/// The marker appended when the character budget leaves part of the catalog out.
+pub const PROMPT_TRUNCATION_MARKER: &str = "[truncated]";
+
+/// The shortest partial skill line a truncated snapshot keeps.
+const MIN_TRUNCATED_LINE_CHARS: usize = 8;
+
+/// Options for [`SkillFs::prompt_snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", default)]
+pub struct PromptSnapshotOptions {
+    /// The maximum number of characters the rendered snapshot may use.
+    ///
+    /// `0` means no character budget for skill lines; the header and the truncation
+    /// marker are still rendered so the snapshot is never blank.
+    pub max_chars: usize,
+    /// Whether skills are grouped under `## <category>` section headings.
+    pub include_categories: bool,
+    /// Restricts the snapshot to one worker id; `None` renders the whole catalog.
+    pub worker_id: Option<String>,
+}
+
+impl Default for PromptSnapshotOptions {
+    fn default() -> Self {
+        Self {
+            max_chars: DEFAULT_PROMPT_MAX_CHARS,
+            include_categories: false,
+            worker_id: None,
+        }
+    }
+}
+
+impl PromptSnapshotOptions {
+    /// Builds options with `max_chars` and every other field defaulted.
+    #[must_use]
+    pub fn new(max_chars: usize) -> Self {
+        Self {
+            max_chars,
+            ..Self::default()
+        }
+    }
+
+    /// Enables or disables category section headings.
+    #[must_use]
+    pub fn with_categories(mut self, include_categories: bool) -> Self {
+        self.include_categories = include_categories;
+        self
+    }
+
+    /// Restricts the snapshot to one worker id.
+    #[must_use]
+    pub fn with_worker_id(mut self, worker_id: impl Into<String>) -> Self {
+        self.worker_id = Some(worker_id.into());
+        self
+    }
+}
+
+/// The rendered model-facing view of the visible skill catalog.
+///
+/// `included` lists the worker ids whose lines appear in `rendered`, in render order;
+/// `omitted` lists the in-scope worker ids the character budget left out, in
+/// `(worker_id.casefold(), worker_id)` order. `fingerprint` is
+/// [`inventory_fingerprint`] over the included records, so equal included content
+/// yields the same digest regardless of render order or category layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", default)]
+pub struct PromptSnapshot {
+    /// The rendered text, starting with [`PROMPT_HEADER`] and, when truncated, ending
+    /// with [`PROMPT_TRUNCATION_MARKER`].
+    pub rendered: String,
+    /// The worker ids whose lines were rendered, in render order.
+    pub included: Vec<String>,
+    /// The in-scope worker ids omitted by the character budget, sorted by name.
+    pub omitted: Vec<String>,
+    /// Whether the character budget left at least one in-scope skill out.
+    pub truncated: bool,
+    /// The content-addressed fingerprint of the included skills.
+    pub fingerprint: String,
+}
+
+impl Default for PromptSnapshot {
+    fn default() -> Self {
+        Self {
+            rendered: PROMPT_EMPTY_TEXT.to_string(),
+            included: Vec::new(),
+            omitted: Vec::new(),
+            truncated: false,
+            fingerprint: inventory_fingerprint(&[]),
+        }
+    }
+}
 
 /// One lexical skill hit.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -217,6 +327,181 @@ impl SkillFs {
             .collect()
     }
 
+    /// The worker ids of the enabled, discovered skills.
+    ///
+    /// The order is Python's prompt order: `(worker_id.casefold(), worker_id)`, so it
+    /// is independent of directory iteration order. Skills removed by
+    /// [`SkillScanConfig::disabled_skills`] never reach the catalog, so they are
+    /// absent here as well.
+    #[must_use]
+    pub fn visible_skill_names(&self) -> Vec<String> {
+        self.prompt_order(None)
+            .into_iter()
+            .map(|index| self.records[index].worker_id.clone())
+            .collect()
+    }
+
+    /// Renders the model-facing prompt snapshot of the visible catalog.
+    ///
+    /// The text always starts with [`PROMPT_HEADER`] and, when no skill is in scope,
+    /// is exactly [`PROMPT_EMPTY_TEXT`]. Otherwise it renders one Python-format line
+    /// per skill (`- <worker_id>: <whitespace-collapsed description>`), optionally
+    /// grouped under `## <category>` headings, and appends
+    /// [`PROMPT_TRUNCATION_MARKER`] when `options.max_chars` leaves skills out.
+    ///
+    /// Rendering never splits a code point: lines are appended whole until the budget
+    /// is reached, and the final in-budget line may be shortened to its first
+    /// characters plus `...`. `included` is the render order, `omitted` is the
+    /// `(worker_id.casefold(), worker_id)` order of in-scope skills that did not fit.
+    #[must_use]
+    pub fn prompt_snapshot(&self, options: &PromptSnapshotOptions) -> PromptSnapshot {
+        let order = self.prompt_order(options.worker_id.as_deref());
+        if order.is_empty() {
+            return PromptSnapshot::default();
+        }
+
+        let sections = self.prompt_sections(&order, options.include_categories);
+        let body = render_prompt_body(&sections);
+        let header_chars = PROMPT_HEADER.chars().count();
+        let full_chars = header_chars + 2 + body.chars().count();
+        if options.max_chars > 0 && full_chars <= options.max_chars {
+            let included: Vec<String> = sections
+                .iter()
+                .flat_map(|(_, skills)| skills.iter())
+                .map(|(index, _)| self.records[*index].worker_id.clone())
+                .collect();
+            return PromptSnapshot {
+                rendered: format!("{PROMPT_HEADER}\n\n{body}"),
+                included,
+                omitted: Vec::new(),
+                truncated: false,
+                fingerprint: self.included_fingerprint(&order),
+            };
+        }
+
+        let marker_chars = PROMPT_TRUNCATION_MARKER.chars().count();
+        let content_budget = options
+            .max_chars
+            .saturating_sub(header_chars + 2 + 2 + marker_chars);
+        let selection = select_prompt_lines(&sections, content_budget);
+        let omitted: Vec<String> = order
+            .iter()
+            .filter(|index| !selection.included.contains(index))
+            .map(|index| self.records[*index].worker_id.clone())
+            .collect();
+        let included_names: Vec<String> = selection
+            .included
+            .iter()
+            .map(|index| self.records[*index].worker_id.clone())
+            .collect();
+        let fingerprint = self.included_fingerprint(&selection.included);
+        let mut rendered = String::from(PROMPT_HEADER);
+        if !selection.body.is_empty() {
+            rendered.push_str("\n\n");
+            rendered.push_str(&selection.body);
+        }
+        rendered.push_str("\n\n");
+        rendered.push_str(PROMPT_TRUNCATION_MARKER);
+        PromptSnapshot {
+            rendered,
+            included: included_names,
+            omitted,
+            truncated: true,
+            fingerprint,
+        }
+    }
+
+    /// A notification cursor seeded with this catalog as its baseline.
+    ///
+    /// Callers that need to persist the cursor can serialize the returned state;
+    /// [`SkillNoticeState::consume`] then diffs a later inventory against it.
+    #[must_use]
+    pub fn notice_state(&self) -> SkillNoticeState {
+        SkillNoticeState::new(&self.inventory)
+    }
+
+    /// The indices of in-scope records in Python's prompt order.
+    fn prompt_order(&self, worker_id: Option<&str>) -> Vec<usize> {
+        let mut order: Vec<usize> = self
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| worker_id.is_none_or(|id| record.worker_id == id))
+            .map(|(index, _)| index)
+            .collect();
+        order.sort_by_cached_key(|index| {
+            (
+                self.records[*index].worker_id.to_lowercase(),
+                self.records[*index].worker_id.clone(),
+            )
+        });
+        order
+    }
+
+    /// Groups the prompt order into optional category sections.
+    fn prompt_sections(&self, order: &[usize], include_categories: bool) -> Vec<PromptSection> {
+        if !include_categories {
+            return vec![(
+                None,
+                order
+                    .iter()
+                    .map(|index| (*index, self.prompt_line(*index)))
+                    .collect(),
+            )];
+        }
+
+        let mut grouped: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+        for index in order {
+            grouped
+                .entry(self.category_for(*index))
+                .or_default()
+                .push((*index, self.prompt_line(*index)));
+        }
+        let mut categories: Vec<String> = grouped.keys().cloned().collect();
+        categories.sort_by_cached_key(|category| (category.to_lowercase(), category.clone()));
+        categories
+            .into_iter()
+            .map(|category| {
+                let heading = format!("## {category}");
+                (Some(heading), grouped.remove(&category).unwrap_or_default())
+            })
+            .collect()
+    }
+
+    /// The category label of one record: its descriptor classification or
+    /// [`UNCATEGORIZED_CATEGORY`].
+    fn category_for(&self, index: usize) -> String {
+        let classification = self
+            .descriptors
+            .get(index)
+            .map(|descriptor| descriptor.classification.trim())
+            .unwrap_or_default();
+        if classification.is_empty() {
+            UNCATEGORIZED_CATEGORY.to_string()
+        } else {
+            classification.to_string()
+        }
+    }
+
+    /// The Python-format prompt line of one record.
+    fn prompt_line(&self, index: usize) -> String {
+        let record = &self.records[index];
+        format!(
+            "- {}: {}",
+            record.worker_id,
+            collapse_whitespace(&record.description)
+        )
+    }
+
+    /// The content-addressed fingerprint of the records the snapshot includes.
+    fn included_fingerprint(&self, indices: &[usize]) -> String {
+        let records: Vec<SkillRecord> = indices
+            .iter()
+            .map(|index| self.records[*index].clone())
+            .collect();
+        inventory_fingerprint(&records)
+    }
+
     /// Searches the catalog for `query`, returning at most `top_k` hits.
     ///
     /// An empty query (or one with no alphanumeric tokens) is a filter-only request:
@@ -301,6 +586,121 @@ impl SkillFs {
         };
         excerpt_around(text, matched_terms)
     }
+}
+
+/// One prompt section: an optional `## ...` heading and its `(record index, line)`s.
+type PromptSection = (Option<String>, Vec<(usize, String)>);
+
+/// Renders every section of a prompt snapshot without a character budget.
+fn render_prompt_body(sections: &[PromptSection]) -> String {
+    let mut body = String::new();
+    for (heading, skills) in sections {
+        if let Some(heading) = heading {
+            if !body.is_empty() {
+                body.push_str("\n\n");
+            }
+            body.push_str(heading);
+        }
+        for (position, (_, line)) in skills.iter().enumerate() {
+            if !body.is_empty() {
+                body.push('\n');
+                if position == 0 {
+                    body.push('\n');
+                }
+            }
+            body.push_str(line);
+        }
+    }
+    body
+}
+
+/// The result of fitting prompt sections into a character budget.
+struct PromptSelection {
+    /// The rendered body after [`PROMPT_HEADER`].
+    body: String,
+    /// The record indices whose lines are present, in render order.
+    included: Vec<usize>,
+}
+
+/// Fits section headings and whole skill lines into `budget` characters.
+///
+/// A line that does not fit is shortened to `budget` minus its separator and ends in
+/// `...` when at least [`MIN_TRUNCATED_LINE_CHARS`] characters remain; otherwise the
+/// line and every later line are left out. Category headings are only emitted when at
+/// least one of their skills fits, so a truncated snapshot never renders an empty
+/// section.
+fn select_prompt_lines(sections: &[PromptSection], budget: usize) -> PromptSelection {
+    let mut body = String::new();
+    let mut body_chars = 0usize;
+    let mut included: Vec<usize> = Vec::new();
+    'sections: for (heading, skills) in sections {
+        for (position, (index, line)) in skills.iter().enumerate() {
+            let line_chars = line.chars().count();
+            let heading_chars = if position == 0 {
+                heading.as_ref().map_or(0, |heading| {
+                    let separator = if body.is_empty() { 0 } else { 2 };
+                    separator + heading.chars().count()
+                })
+            } else {
+                0
+            };
+            let projected = body_chars + heading_chars;
+            let separator = if position == 0 {
+                if projected == 0 {
+                    0
+                } else {
+                    2
+                }
+            } else {
+                1
+            };
+            if projected + separator + line_chars <= budget {
+                append_prompt_line(&mut body, heading.as_deref(), position, line);
+                body_chars = projected + separator + line_chars;
+                included.push(*index);
+                continue;
+            }
+
+            let remaining = budget.saturating_sub(projected + separator);
+            if let Some(shortened) = shorten_prompt_line(line, remaining) {
+                append_prompt_line(&mut body, heading.as_deref(), position, &shortened);
+                included.push(*index);
+            }
+            break 'sections;
+        }
+    }
+    PromptSelection { body, included }
+}
+
+/// Appends one selected prompt line, preceded by its heading and separators.
+fn append_prompt_line(body: &mut String, heading: Option<&str>, position: usize, line: &str) {
+    if position == 0 {
+        if let Some(heading) = heading {
+            if !body.is_empty() {
+                body.push_str("\n\n");
+            }
+            body.push_str(heading);
+        }
+    }
+    if !body.is_empty() {
+        body.push('\n');
+        if position == 0 {
+            body.push('\n');
+        }
+    }
+    body.push_str(line);
+}
+
+/// Shortens one prompt line to at most `remaining` characters, keeping code points
+/// intact and ending in `...`; returns `None` when too little room remains.
+fn shorten_prompt_line(line: &str, remaining: usize) -> Option<String> {
+    if remaining < MIN_TRUNCATED_LINE_CHARS {
+        return None;
+    }
+    let keep = remaining - 3;
+    let prefix: String = line.chars().take(keep).collect();
+    let trimmed = prefix.trim_end();
+    Some(format!("{trimmed}..."))
 }
 
 /// Builds the host record for one discovered skill descriptor.
@@ -406,7 +806,7 @@ fn find_ignoring_case(characters: &[char], term: &str) -> Option<usize> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 mod tests {
     use super::*;
 
@@ -446,5 +846,86 @@ mod tests {
             matched_term_count("PDF export", &["pdf".to_string(), "absent".to_string()]),
             1
         );
+    }
+
+    /// Writes one `SKILL.md` under `root/<folder>`.
+    fn write_skill(root: &Path, folder: &str, front_matter: &str, body: &str) {
+        let directory = root.join(folder);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            format!("---\n{front_matter}\n---\n\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_snapshot_pins_pythons_rendered_format() {
+        let directory = tempfile::tempdir().unwrap();
+        write_skill(
+            directory.path(),
+            "alpha",
+            "name: Alpha\ndescription: Adds numbers",
+            "Adds numbers",
+        );
+        write_skill(
+            directory.path(),
+            "beta",
+            "name: Beta\ndescription: Translates text",
+            "Translates text",
+        );
+        let catalog = SkillFs::open(directory.path()).await.unwrap();
+        let snapshot = catalog.prompt_snapshot(&PromptSnapshotOptions::default());
+        assert_eq!(
+            snapshot.rendered,
+            "# Skills\n\n- alpha: Adds numbers\n- beta: Translates text"
+        );
+        assert_eq!(snapshot.included, ["alpha", "beta"]);
+        assert!(snapshot.omitted.is_empty());
+        assert!(!snapshot.truncated);
+        assert_eq!(snapshot.fingerprint, catalog.inventory().fingerprint);
+    }
+
+    #[tokio::test]
+    async fn prompt_snapshot_pins_category_sections() {
+        let directory = tempfile::tempdir().unwrap();
+        write_skill(
+            directory.path(),
+            "alpha",
+            "name: Alpha\ndescription: Adds numbers\ncategory: documents",
+            "Adds numbers",
+        );
+        write_skill(
+            directory.path(),
+            "beta",
+            "name: Beta\ndescription: Translates text",
+            "Translates text",
+        );
+        let catalog = SkillFs::open(directory.path()).await.unwrap();
+        let options = PromptSnapshotOptions::default().with_categories(true);
+        let snapshot = catalog.prompt_snapshot(&options);
+        assert_eq!(
+            snapshot.rendered,
+            "# Skills\n\n\
+             ## documents\n\n\
+             - alpha: Adds numbers\n\n\
+             ## Uncategorized\n\n\
+             - beta: Translates text"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_snapshot_renders_the_documented_empty_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = SkillFs::open(directory.path()).await.unwrap();
+        let snapshot = catalog.prompt_snapshot(&PromptSnapshotOptions::default());
+        assert_eq!(
+            snapshot.rendered,
+            "# Skills\n\nNo skills are available for this task."
+        );
+        assert!(snapshot.included.is_empty());
+        assert!(snapshot.omitted.is_empty());
+        assert!(!snapshot.truncated);
+        assert_eq!(snapshot.fingerprint, inventory_fingerprint(&[]));
     }
 }

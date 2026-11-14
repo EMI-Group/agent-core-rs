@@ -4,9 +4,20 @@
 //! the same immutable, numbered revisions and the same `current` pointer as the in-memory
 //! and filesystem backends, but stores the documents in an
 //! [`ObjectStore`](openjiuwen_foundation::store::ObjectStore) bucket. That makes the graph
-//! artifact shareable between processes and hosts (S3-compatible services, the local
-//! filesystem object store, or any other `ObjectStore` implementation) without changing a
-//! single caller.
+//! artifact shareable between processes and hosts (S3-compatible services, Google Cloud
+//! Storage, Azure Blob Storage, the local filesystem object store, or any other `ObjectStore`
+//! implementation) without changing a single caller.
+//!
+//! # Transports
+//!
+//! [`ArtifactTransport`](crate::object_artifact::ArtifactTransport) names the bucket bindings.
+//! `S3` and `ObjectStore` are resolved from the crate's own object stores
+//! ([`S3ObjectStore`](openjiuwen_foundation::store::external::S3ObjectStore),
+//! [`InMemoryObjectStore`](openjiuwen_foundation::store::InMemoryObjectStore),
+//! [`LocalObjectStore`](openjiuwen_foundation::store::LocalObjectStore)), `Gcs` builds the
+//! Google Cloud Storage client in the `gcs` submodule, which speaks the GCS JSON API directly,
+//! and `AzureBlob` builds the Azure Blob Storage client in the `azure` submodule, which speaks
+//! the Blob REST API directly.
 //!
 //! # Bucket layout
 //!
@@ -61,8 +72,18 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
 use crate::artifact::{GraphArtifactStatus, GraphArtifactStore, GraphRevision};
-use crate::error::{unsupported, validation, Error, ErrorKind, Result};
+use crate::error::{validation, Error, ErrorKind, Result};
 use crate::graph::CapabilityGraph;
+
+mod azure;
+mod gcs;
+mod http;
+
+pub use azure::{
+    AzureBlobAuth, AzureBlobConfig, AzureBlobStore, API_VERSION, AZURITE_ENDPOINT,
+    CLIENT_CREDENTIALS_REASON, DEFAULT_ENDPOINT_SUFFIX,
+};
+pub use gcs::{GcsConfig, GcsObjectStore, DEFAULT_ENDPOINT, SERVICE_ACCOUNT_REASON};
 
 /// Bucket used by [`ObjectGraphArtifactStore::in_memory`] and
 /// [`ObjectGraphArtifactStore::local`], the two constructors that take no bucket name.
@@ -77,11 +98,10 @@ const GRAPH_FILE: &str = "graph.json";
 
 /// Where an [`ObjectGraphArtifactStore`] keeps its objects.
 ///
-/// The enum gives the deferred transports a *typed* home: a caller that asks for Google Cloud
-/// Storage or Azure Blob storage gets an [`Error::Unsupported`] naming the transport instead
-/// of a silent fallback to another backend. Only the S3-compatible transport can be
-/// constructed from a transport descriptor; any other [`ObjectStore`] is handed to
-/// [`ObjectGraphArtifactStore::new`], because it has no serializable connection description.
+/// The description a caller can serialize and pass around: [`ArtifactTransport::S3`],
+/// [`ArtifactTransport::Gcs`] and [`ArtifactTransport::AzureBlob`] carry their connection
+/// details, and a caller that already owns an [`ObjectStore`] hands it to
+/// [`ObjectGraphArtifactStore::new`], because a live store has no serializable description.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactTransport {
@@ -94,21 +114,21 @@ pub enum ArtifactTransport {
     /// An S3-compatible service, built into an
     /// [`S3ObjectStore`].
     S3(S3Config),
-    /// Google Cloud Storage: deferred, there is no in-crate transport.
-    Gcs,
-    /// Azure Blob storage: deferred, there is no in-crate transport.
-    AzureBlob,
+    /// Google Cloud Storage, built into a [`GcsObjectStore`] over the GCS JSON API.
+    Gcs(GcsConfig),
+    /// Azure Blob Storage, built into an [`AzureBlobStore`] over the Blob REST API.
+    AzureBlob(AzureBlobConfig),
 }
 
 impl ArtifactTransport {
-    /// The transport name used in diagnostics and in the unsupported-feature message.
+    /// The transport name used in diagnostics and in a serialized transport descriptor.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::ObjectStore => "object_store",
             Self::S3(_) => "s3",
-            Self::Gcs => "gcs",
-            Self::AzureBlob => "azure_blob",
+            Self::Gcs(_) => "gcs",
+            Self::AzureBlob(_) => "azure_blob",
         }
     }
 }
@@ -210,14 +230,42 @@ impl ObjectGraphArtifactStore {
         Ok(Self::new(Arc::new(store), bucket, prefix))
     }
 
+    /// Builds a store over a [`GcsObjectStore`] described by `config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when `config` does not name a usable HTTP(S) endpoint.
+    pub fn gcs(
+        config: GcsConfig,
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+    ) -> Result<Self> {
+        let store = GcsObjectStore::new(config)?;
+        Ok(Self::new(Arc::new(store), bucket, prefix))
+    }
+
+    /// Builds a store over an [`AzureBlobStore`] described by `config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when the resolved endpoint is not a usable HTTP(S) URL, and
+    /// [`Error::Validation`] when the configured credentials are malformed.
+    pub fn azure_blob(
+        config: AzureBlobConfig,
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+    ) -> Result<Self> {
+        let store = AzureBlobStore::new(config)?;
+        Ok(Self::new(Arc::new(store), bucket, prefix))
+    }
+
     /// Resolves `transport` into a store for `bucket` below `prefix`.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] for the deferred transports ([`ArtifactTransport::Gcs`]
-    /// and [`ArtifactTransport::AzureBlob`]), [`Error::Validation`] for
-    /// [`ArtifactTransport::ObjectStore`] (there is nothing to reconstruct a caller-owned
-    /// store from), and the [`S3ObjectStore`] configuration error for a malformed S3 endpoint.
+    /// Returns [`Error::Validation`] for [`ArtifactTransport::ObjectStore`] (there is nothing to
+    /// reconstruct a caller-owned store from), and the [`S3ObjectStore`], [`GcsObjectStore`] or
+    /// [`AzureBlobStore`] configuration error for a malformed endpoint or credential.
     pub fn open(
         transport: ArtifactTransport,
         bucket: impl Into<String>,
@@ -230,8 +278,8 @@ impl ObjectGraphArtifactStore {
                  pass the store to `ObjectGraphArtifactStore::new` instead",
             )),
             ArtifactTransport::S3(config) => Self::s3(config, bucket, prefix),
-            ArtifactTransport::Gcs => Err(unsupported("artifact transport `gcs`")),
-            ArtifactTransport::AzureBlob => Err(unsupported("artifact transport `azure_blob`")),
+            ArtifactTransport::Gcs(config) => Self::gcs(config, bucket, prefix),
+            ArtifactTransport::AzureBlob(config) => Self::azure_blob(config, bucket, prefix),
         }
     }
 
@@ -735,8 +783,11 @@ mod tests {
     #[test]
     fn transport_names_are_stable() {
         assert_eq!(ArtifactTransport::ObjectStore.as_str(), "object_store");
-        assert_eq!(ArtifactTransport::Gcs.as_str(), "gcs");
-        assert_eq!(ArtifactTransport::AzureBlob.as_str(), "azure_blob");
+        assert_eq!(ArtifactTransport::Gcs(GcsConfig::default()).as_str(), "gcs");
+        assert_eq!(
+            ArtifactTransport::AzureBlob(AzureBlobConfig::default()).as_str(),
+            "azure_blob"
+        );
         assert_eq!(
             ArtifactTransport::S3(S3Config::new("http://localhost:9000")).as_str(),
             "s3"

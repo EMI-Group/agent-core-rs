@@ -5,6 +5,7 @@
 //! handles a team consults (a [`TeamResourceMgr`], a [`MemberCheckpointer`], and
 //! a `TeamTransport`), and every one of them takes a short lock scope so no
 //! lock is ever held across an `.await`.
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use openjiuwen_agent::AgentCard;
@@ -133,27 +134,33 @@ impl TeamRuntime {
     /// Starts the bus and the outbound transport. Idempotent.
     ///
     /// Both are the same in-process bus by default, so the second start is a
-    /// no-op.
+    /// no-op. A successful start marks the runtime running
+    /// ([`TeamRuntime::is_running`]).
     ///
     /// # Errors
     ///
     /// Reserved for future transports; the in-process bus never fails.
     pub async fn start(&self) -> Result<()> {
         self.bus.start().await?;
-        self.transport().start().await
+        self.transport().start().await?;
+        self.running.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Stops the bus and the outbound transport, joining every worker.
     /// Idempotent.
     ///
     /// Both are the same in-process bus by default, so the second stop is a
-    /// no-op.
+    /// no-op. The runtime is no longer running afterwards
+    /// ([`TeamRuntime::is_running`]).
     ///
     /// # Errors
     ///
     /// Reserved for future transports; the in-process bus never fails.
     pub async fn stop(&self) -> Result<()> {
         self.bus.stop().await?;
-        self.transport().stop().await
+        let result = self.transport().stop().await;
+        self.running.store(false, Ordering::SeqCst);
+        result
     }
 }

@@ -7,6 +7,7 @@ The seam is one prompt in, one reply out: each stage renders its own system/user
 Every stage carries a documented deterministic fallback under `FallbackMode::Deterministic` (the default), while `FallbackMode::Error` opts into surfacing model failures.
 The stages are progressive tree retrieval, `can_feed` ontology matching, semantic plan scoring, fingerprint extraction, and LLM judging.
 This keeps the crate fully usable offline with no model configured, and a model is an optimisation rather than a requirement.
+Two supporting layers make model-backed matching economical and reproducible: `identity` derives stable model/metadata fingerprints, and `cache` memoizes ontology-match answers in a JSON file keyed by those fingerprints.
 
 ### Fallback table
 
@@ -51,6 +52,72 @@ impl FoundationCompletionModel {
 }
 ```
 
+### Identity fingerprints
+```rust
+pub const IDENTITY_VERSION: &str = "Symphony-model-identity-v1";
+pub const MAX_METADATA_DEPTH: usize = 64;
+
+pub struct ModelIdentity {
+    pub model: String, pub backend: String,
+    pub temperature: Option<f64>, pub top_p: Option<f64>, pub max_tokens: Option<u64>,
+    pub stop: Vec<String>,
+    pub request_config_sha256: String, pub client_config_sha256: String,
+}   // Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema
+impl ModelIdentity {
+    pub fn of(config: &ModelConfig, backend: &str) -> Self;
+    pub fn with_top_p(self, top_p: f64) -> Self;   // refreshes the request digest
+    pub fn with_stop(self, stop: impl IntoIterator<Item = impl Into<String>>) -> Self;
+}
+
+pub fn canonical_json(value: &Value) -> String;             // sorted keys, compact, depth-capped
+pub fn stable_metadata_sha256(value: &Value) -> String;     // sha256 hex of canonical_json
+pub fn endpoint_sha256(endpoint: &str) -> String;           // normalized endpoint digest
+pub fn graph_identity_sha256(descriptor: &CapabilityDescriptor) -> String;
+pub fn sanitize_metadata(value: &Value) -> Value;           // Python's recursive sanitiser
+```
+`ModelIdentity::of` reads the model name from `CompletionModel::name()`, defaults a blank/absent backend to `"none"`, and computes both digests as SHA-256 over canonical JSON: `request_config_sha256` covers `IDENTITY_VERSION`, `temperature`, `top_p`, `max_tokens`, `stop`; `client_config_sha256` covers `IDENTITY_VERSION`, `backend`, `model`. `ModelConfig` has no `top_p`/`stop`, so those start unset and only `with_top_p`/`with_stop` fill them in; a non-finite sampling value is treated as absent.
+`canonical_json` sorts object keys recursively, keeps array order, emits no whitespace, renders a non-finite number (unreachable through `serde_json`) as `null`, and replaces containers deeper than `MAX_METADATA_DEPTH` with `null` so the result is always well-formed JSON and recursion never overflows.
+`endpoint_sha256` trims, lowercases the scheme and host, drops userinfo, drops a default port (`https:443`, `http:80`), strips path trailing slashes, ignores the fragment — and **excludes the query string** (a documented difference from Python's sorted-query normalization, so a signed URL and its bare endpoint agree). Text without `scheme://`, or with an unparsable authority (unbracketed IPv6, out-of-range port), falls back to the trimmed, slash-stripped text.
+`sanitize_metadata` drops keys `crate::redaction::is_sensitive_name` recognizes and keys whose normalized form ends in `_key`, `secret`, `token`, or `password`; replaces the five endpoint key names with `<key>_sha256`; keeps the five safe key fields (`cache_key`, `key_type`, `partition_key`, `public_key`, `routing_key`); and recurses through objects and arrays preserving key order, with `null` past the depth cap.
+`graph_identity_sha256` hashes `capability_id`, `capability_type`, `name`, `description`, `inputs`, and `outputs` (Python's `graph_identity_dict` minus `version`, which the Rust descriptor lacks), so availability and metadata never invalidate a cache entry while a changed IO list, name, or description does.
+
+### Match cache
+```rust
+pub const CACHE_SCHEMA_VERSION: &str = "Symphony-relation-match-cache-v1";
+
+pub struct CachedMatch {
+    pub candidate_id: String, pub matches: Value, pub diagnostics: Value, pub updated_at: String,
+}   // Default: empty arrays, empty strings
+impl CachedMatch {
+    pub fn new(candidate_id: impl Into<String>, matches: Value) -> Self;   // stamps now_rfc3339()
+    pub fn with_diagnostics(self, diagnostics: Value) -> Self;
+    pub fn with_updated_at(self, updated_at: impl Into<String>) -> Self;   // caller-supplied metadata
+}
+
+pub struct MatchCache { /* PathBuf + BTreeMap<String, CachedMatch> */ }
+impl MatchCache {
+    pub fn new(path: impl Into<PathBuf>) -> Self;                  // empty, no I/O
+    pub async fn open(path: impl Into<PathBuf>) -> Result<Self>;   // absent/empty file = empty cache
+    pub fn path(&self) -> &Path;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn contains(&self, key: &str) -> bool;
+    pub fn keys(&self) -> impl Iterator<Item = &str>;              // file (sorted) order
+    pub async fn lookup(&self, key: &str) -> Option<CachedMatch>;  // in-memory clone
+    pub async fn record(&mut self, key: String, entry: CachedMatch) -> Result<()>;   // writes through
+    pub async fn clear(&mut self) -> Result<()>;                   // empties the file, keeps it
+}
+
+pub fn cache_key(candidate: &Value, source_fingerprint_hash: &str, target_fingerprint_hash: &str, signature: &str) -> String;
+pub fn cache_key_document(candidate: &Value, source_fingerprint_hash: &str, target_fingerprint_hash: &str, signature: &str) -> String;
+```
+The file shape is `{"schema_version": CACHE_SCHEMA_VERSION, "records": {key: {"candidate_id", "matches", "diagnostics", "updated_at"}}}`.
+Records live in a `BTreeMap`, so two files written from the same records are byte-identical; `record` and `clear` rewrite the whole file through a temporary sibling and a rename, so a reader never sees a partial document.
+There is no TTL, eviction, or size bound: the cache is a memo, not a policy, and `clear` is the only way to forget entries.
+`updated_at` is metadata only — it never participates in a key or a lookup, and `MatchCache::lookup` cannot fail.
+An absent or empty file opens empty; malformed JSON, a non-object envelope, or a foreign `schema_version` is `Error::Validation` naming the file (never a silent reset); a single malformed record is warned about and skipped.
+`cache_key` is the SHA-256 of the canonical JSON of `{"candidate", "source_fingerprint_hash", "target_fingerprint_hash", "matcher_signature"}`, so key order never matters while any component change produces a new key.
+
 ### Tree retrieval
 
 ```rust
@@ -90,6 +157,20 @@ impl OntologyMatcher {
     pub fn config(&self) -> &OntologyConfig;
     pub fn capabilities(&self) -> &[CapabilityDescriptor];
     pub async fn match_candidates(&self, candidates: &[RelationCandidate]) -> Result<Vec<OntologyMatch>>;
+    pub async fn match_candidates_with(&self, candidates: &[RelationCandidate], options: &MatchOptions) -> Result<Vec<OntologyMatch>>;
+    pub fn with_cache(self, cache: Arc<tokio::sync::Mutex<MatchCache>>) -> Self;
+    pub fn cache(&self) -> Option<&Arc<tokio::sync::Mutex<MatchCache>>>;
+    pub fn matcher_signature(&self) -> String;
+}
+
+pub const MATCHER_VERSION: &str = "Symphony-ontology-matcher-v2";
+pub const PROMPT_VERSION: &str = "Orchestration-graph-match-v2";
+pub const MATCH_SCHEMA_VERSION: &str = "Symphony-ontology-match-schema-v1";
+
+pub struct MatchOptions { pub force: bool }   // Default: false
+impl MatchOptions {
+    pub fn new() -> Self;
+    pub fn with_force(self, force: bool) -> Self;
 }
 pub struct OntologyMatch { pub source_id: String, pub target_id: String, pub relation: String /*can_feed*/, pub confidence: f64, pub method: String, pub reasons: Vec<String>, pub accepted: bool }
 ```
@@ -99,6 +180,10 @@ pub struct OntologyMatch { pub source_id: String, pub target_id: String, pub rel
 With `require_consensus` the batch is asked twice (forward and reversed) and only the intersection survives, keeping the lower confidence; `accepted` is `confidence >= threshold`, and matches sort by `(source_id, target_id)`.
 
 Without a model, or with an unusable reply under `FallbackMode::Deterministic`, the matcher reports each candidate's own rule confidence with `method = "deterministic_fallback"`; `FallbackMode::Error` surfaces the failure as `Error::Llm`.
+With `with_cache` installed (and a model configured), the matcher first replays every candidate whose `cache_key` is present, then asks the model about the remaining ones in one batch (two with consensus) — a fully cached call performs no model calls at all.
+Fresh model answers are written back per candidate under the same key; a deterministic fallback answer is never cached, so a later run with a working model still asks.
+`MatchOptions::with_force(true)` ignores every hit and refreshes the entries.
+`matcher_signature` is canonical JSON over `MATCHER_VERSION`, `PROMPT_VERSION`, `MATCH_SCHEMA_VERSION`, `CACHE_SCHEMA_VERSION`, `IDENTITY_VERSION`, a digest of the system prompt, the `ModelIdentity` (whose backend is `CompletionModel::name()`), the threshold, the consensus switch, the candidate cap, and the relation/direction/method/description-limit strategy constants; a changed threshold, consensus flag, prompt, or model identity therefore misses the cache instead of returning a stale answer.
 
 ### Semantic scoring
 
@@ -151,6 +236,7 @@ impl LlmJudgeMetric {
 `LlmJudgeMetric` accepts only `{"score":0|1,"reason":"<non-empty>"}`, makes exactly one repair attempt that re-sends the request with the validation error appended, and then applies the fallback mode.
 
 The deterministic rubric gives three equal checks (described description, described input, described output) so all three score `1.0`, a description alone `0.5`, and a card without a description `0.0`, passing at `>= 0.5` with `detail` prefixed `deterministic_fallback:`.
+`evaluation::LlmJudgedMetric` is a thin delegating wrapper over `LlmJudgeMetric` (name `llm_judged`, default rubric, plus `with_model`/`with_rubric`/`with_fallback`/`rubric`/`has_model` and a delegating `Metric` impl), so the crate has exactly one judge implementation and an offline suite scores the card instead of erroring.
 
 ## Constraints
 
@@ -161,6 +247,9 @@ The deterministic rubric gives three equal checks (described description, descri
 - No `unsafe`, no `println!`, no panics on user input; every public item is documented.
 - Do not duplicate retrieval or orchestration types; re-export `CompletionModel`, `StaticCompletionModel`, and `DeterministicScorer`.
 - Files stay around or under 1000 lines; `tree.rs` and `ontology.rs` are the largest and stay focused on their stage.
+- The cache never changes a matching decision: without a cache the matcher is byte-identical, and every cache failure (read, decode, write) is `tracing::warn!`-logged and degrades to a normal model call.
+- Identity helpers are total and deterministic: sorted-key canonical JSON, no wall-clock input to any digest, no panic on malformed or over-deep input.
+- `MatchCache` is not internally synchronized; callers share it through a `tokio::sync::Mutex`, which is only ever held across in-memory work, never across a model call.
 
 ## Routing Table
 
@@ -171,3 +260,5 @@ The deterministic rubric gives three equal checks (described description, descri
 - `./fingerprint.rs` → `FingerprintExtractor`, `FingerprintConfig`, `SemanticProfile` fallback
 - `./judge.rs` → `LlmJudgeMetric`, `DEFAULT_JUDGE_NAME`, `DEFAULT_RUBRIC`, repair attempt, static rubric
 - `./foundation.rs` → `FoundationCompletionModel` adapter over `openjiuwen_foundation::llm::Model`
+- `./identity.rs` → `ModelIdentity`, canonical JSON, metadata/endpoint/graph-identity digests, `sanitize_metadata`
+- `./cache.rs` → `MatchCache`, `CachedMatch`, `CACHE_SCHEMA_VERSION`, `cache_key`, and the cached-payload helpers (`candidate_identity`, `covers`, `decode_cached_matches`)

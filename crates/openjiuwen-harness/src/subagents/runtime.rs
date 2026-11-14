@@ -12,7 +12,7 @@
 //! fan-out, nesting depth, LRU eviction) and every timestamp comes from an injected `Clock`,
 //! so a `ManualClock` makes the lifecycle fully deterministic in tests.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,22 +26,28 @@ use tokio::sync::{Notify, Semaphore};
 use self::clock::Clock;
 use self::clock::SystemClock;
 use self::instance::Instance;
+use self::lifecycle::{LifecycleHooks, LifecycleStage, SubagentLifecycleEvent};
 use self::quota::{SpawnBudget, SubAgentQuota, SubagentActivity};
 use self::transcript::{TranscriptEntry, TranscriptSummary};
 use self::turn::TurnRunner;
 use super::{SubAgentConfig, SubAgentRegistry};
 
+pub mod activity;
+mod activity_api;
 pub mod clock;
 mod evict;
 mod instance;
+pub mod lifecycle;
+mod lifecycle_api;
 mod persist_api;
 pub mod persistence;
 pub mod quota;
+pub mod scheduler;
 pub mod transcript;
 mod transcript_api;
 mod turn;
 
-pub use self::evict::EVICTION_REASON;
+pub use self::evict::{SubagentEviction, EVICTION_REASON};
 pub use self::persist_api::LoadReport;
 
 /// Default per-turn timeout (Python `TURN_TIMEOUT_S_DEFAULT`).
@@ -236,6 +242,8 @@ struct Shared {
     factory: Arc<dyn SubAgentFactory>,
     parent_session_id: String,
     notify: Notify,
+    /// Hooks awaited at the lifecycle transitions (see [`lifecycle`]).
+    lifecycle: LifecycleHooks,
     state: Mutex<RuntimeState>,
 }
 
@@ -247,6 +255,9 @@ struct RuntimeState {
     spawned: usize,
     /// Revision of the persisted bucket; every snapshot advances it.
     revision: u64,
+    /// Ids claimed by an in-flight two-phase eviction, so concurrent evictions of one instance
+    /// cannot both write a tombstone.
+    evicting: BTreeSet<SubAgentId>,
 }
 
 /// The sub-agent instances of one parent session; share it behind an `Arc`.
@@ -276,11 +287,13 @@ impl SubAgentRuntime {
                 factory,
                 parent_session_id: parent_session_id.into(),
                 notify: Notify::new(),
+                lifecycle: LifecycleHooks::new(),
                 state: Mutex::new(RuntimeState {
                     instances: BTreeMap::new(),
                     next_seq: 0,
                     spawned: 0,
                     revision: 0,
+                    evicting: BTreeSet::new(),
                 }),
             }),
             quota,
@@ -374,7 +387,18 @@ impl SubAgentRuntime {
         }
         config.subagent_type = Some(request.subagent_type.clone());
         // The instance keeps the patched configuration, so a restored instance can be rebuilt.
-        let seq = self.reserve(&id, &request, config.clone())?;
+        // The capacity-pressure eviction inside `reserve` cannot await `BeforeEvict` (the slot
+        // must be freed synchronously), so it only captures the `Close` snapshots; they are
+        // awaited here, right after the state lock is released.
+        let mut closed_events = Vec::new();
+        let seq = match self.reserve(&id, &request, config.clone(), &mut closed_events) {
+            Ok(seq) => seq,
+            Err(error) => {
+                lifecycle_api::run_stage(&self.shared, LifecycleStage::Close, closed_events).await;
+                return Err(error);
+            }
+        };
+        lifecycle_api::run_stage(&self.shared, LifecycleStage::Close, closed_events).await;
         let agent = match self.shared.factory.create(&config, &id).await {
             Ok(agent) => agent,
             Err(error) => {
@@ -395,6 +419,9 @@ impl SubAgentRuntime {
             depth = self.depth_of(&id).unwrap_or(1),
             "subagent spawned"
         );
+        if let Some(event) = self.lifecycle_event_for(&id, LifecycleStage::Spawn, None) {
+            lifecycle_api::run_stage(&self.shared, LifecycleStage::Spawn, [event]).await;
+        }
         self.start_turn(
             &id,
             generation,
@@ -527,6 +554,10 @@ impl SubAgentRuntime {
             if interrupt {
                 instance.pending.clear();
             }
+            if instance.running {
+                // The query stays queued behind the running turn (without an interrupt).
+                instance.activity_stream.queued(now_ms);
+            }
             instance.pending.push_back(query.to_owned());
             instance.record(TranscriptEntry::input(id, query, now_ms));
             if interrupted {
@@ -576,7 +607,7 @@ impl SubAgentRuntime {
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn close(&self, id: &str) -> Result<SubagentStatus> {
         let now_ms = self.clock.now_ms();
-        let previous = {
+        let (previous, close_event) = {
             let mut state = self.shared.state.lock();
             let Some(instance) = state.instances.get_mut(id) else {
                 return Err(not_found(id));
@@ -589,9 +620,13 @@ impl SubAgentRuntime {
             let previous = instance.status;
             instance.close(now_ms, CLOSE_REASON_MANUAL);
             instance.record(TranscriptEntry::closed(id, CLOSE_REASON_MANUAL, now_ms));
-            previous
+            instance.activity_stream.closed(CLOSE_REASON_MANUAL, now_ms);
+            let event =
+                instance.lifecycle_event(LifecycleStage::Close, Some(CLOSE_REASON_MANUAL), now_ms);
+            (previous, event)
         };
         self.shared.notify.notify_waiters();
+        lifecycle_api::run_stage(&self.shared, LifecycleStage::Close, [close_event]).await;
         tracing::debug!(
             target: "openjiuwen_harness::subagents",
             subagent_id = %id,
@@ -606,9 +641,9 @@ impl SubAgentRuntime {
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn cancel_all(&self) -> Vec<SubAgentId> {
         let now_ms = self.clock.now_ms();
-        let ids = {
+        let (ids, events) = {
             let mut state = self.shared.state.lock();
-            let mut closed: Vec<(u64, SubAgentId)> = Vec::new();
+            let mut closed: Vec<(u64, SubAgentId, SubagentLifecycleEvent)> = Vec::new();
             for (id, instance) in &mut state.instances {
                 if !instance.is_live() {
                     continue;
@@ -619,12 +654,24 @@ impl SubAgentRuntime {
                     CLOSE_REASON_PARENT_ENDED,
                     now_ms,
                 ));
-                closed.push((instance.seq, id.clone()));
+                instance
+                    .activity_stream
+                    .closed(CLOSE_REASON_PARENT_ENDED, now_ms);
+                let event = instance.lifecycle_event(
+                    LifecycleStage::Close,
+                    Some(CLOSE_REASON_PARENT_ENDED),
+                    now_ms,
+                );
+                closed.push((instance.seq, id.clone(), event));
             }
-            closed.sort_by_key(|(seq, _)| *seq);
-            closed.into_iter().map(|(_, id)| id).collect()
+            closed.sort_by_key(|(seq, _, _)| *seq);
+            let events: Vec<SubagentLifecycleEvent> =
+                closed.iter().map(|(_, _, event)| event.clone()).collect();
+            let ids = closed.into_iter().map(|(_, id, _)| id).collect();
+            (ids, events)
         };
         self.shared.notify.notify_waiters();
+        lifecycle_api::run_stage(&self.shared, LifecycleStage::Close, events).await;
         ids
     }
 
@@ -724,6 +771,21 @@ impl SubAgentRuntime {
         )
     }
 
+    /// Builds the lifecycle snapshot of a known instance, stamped from the runtime clock.
+    fn lifecycle_event_for(
+        &self,
+        id: &str,
+        stage: LifecycleStage,
+        reason: Option<&str>,
+    ) -> Option<SubagentLifecycleEvent> {
+        let now_ms = self.clock.now_ms();
+        let locked = self.shared.state.lock();
+        locked
+            .instances
+            .get(id)
+            .map(|instance| instance.lifecycle_event(stage, reason, now_ms))
+    }
+
     /// Returns the depth of a known instance.
     fn depth_of(&self, id: &str) -> Option<usize> {
         let state = self.shared.state.lock();
@@ -744,6 +806,7 @@ impl SubAgentRuntime {
         id: &SubAgentId,
         request: &SubAgentSpawnRequest,
         config: SubAgentConfig,
+        closed_events: &mut Vec<SubagentLifecycleEvent>,
     ) -> Result<u64> {
         let now_ms = self.clock.now_ms();
         let seq = {
@@ -770,7 +833,9 @@ impl SubAgentRuntime {
             } else {
                 1
             };
-            let evicted = evict::make_room(&mut state, &self.quota, now_ms, parent);
+            let (evicted, evicted_events) =
+                evict::make_room(&mut state, &self.quota, now_ms, parent);
+            closed_events.extend(evicted_events);
             let budget = SpawnBudget {
                 live: evict::live_count(&state),
                 spawned: state.spawned,
@@ -804,20 +869,12 @@ impl SubAgentRuntime {
             }
             state.spawned = state.spawned.saturating_add(1);
             state.instances.remove(id);
+            state.evicting.remove(id);
             let seq = state.next_seq;
             state.next_seq = state.next_seq.wrapping_add(1);
             state.instances.insert(
                 id.clone(),
-                Instance::new(
-                    seq,
-                    request,
-                    id.clone(),
-                    now_ms,
-                    depth,
-                    config,
-                    self.quota.transcript_capacity,
-                    self.quota.transcript_channel_capacity,
-                ),
+                Instance::new(seq, request, id.clone(), now_ms, depth, config, &self.quota),
             );
             seq
         };
@@ -829,6 +886,7 @@ impl SubAgentRuntime {
     fn rollback(&self, id: &str, seq: u64) {
         {
             let mut state = self.shared.state.lock();
+            state.evicting.remove(id);
             if state
                 .instances
                 .get(id)

@@ -5,7 +5,7 @@
 //! deferred-tool discovery API, and end-to-end calls through one `build()` (so the filesystem
 //! tools share their read state and the extended tools share their seams).
 //!
-//! Size note: this file is long by design — it is one parity suite over all 32 tools rather
+//! Size note: this file is long by design — it is one parity suite over all 35 tools rather
 //! than per-module behaviour tests, which stay beside each tool module.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -26,7 +26,9 @@ use crate::permission::{
     PermissionEngine, PermissionEngineConfig, PermissionLevel, PermissionsSection,
 };
 use crate::workspace::Workspace;
-use crate::worktree::{WorktreeManager, NOT_A_REPOSITORY_MARKER, NOT_INSTALLED_MARKER};
+use crate::worktree::{
+    MemoryWorktreeSessionStore, WorktreeManager, NOT_A_REPOSITORY_MARKER, NOT_INSTALLED_MARKER,
+};
 
 /// The twenty default Python tool names, in registry order.
 const EXPECTED_NAMES: [&str; 20] = [
@@ -52,8 +54,9 @@ const EXPECTED_NAMES: [&str; 20] = [
     "coding_memory_edit",
 ];
 
-/// The twelve extended Python tool names, in registry order.
-const EXPECTED_EXTENDED_NAMES: [&str; 12] = [
+/// The fifteen extended tool names, in registry order (fourteen Python tools plus the Rust-only
+/// `mcp_resource_subscription`).
+const EXPECTED_EXTENDED_NAMES: [&str; 15] = [
     "fetch_webpage",
     "web_search",
     "image_metadata",
@@ -61,15 +64,18 @@ const EXPECTED_EXTENDED_NAMES: [&str; 12] = [
     "cron",
     "list_mcp_resources",
     "read_mcp_resource",
+    "mcp_resource_subscription",
     "tool_search",
     "get_current_goal",
     "submit_goal_report",
     "lsp",
     "worktree",
+    "enter_worktree",
+    "exit_worktree",
 ];
 
 /// The `required` list of each Python card; the empty slices have no `required` key at all.
-const EXPECTED_REQUIRED: [(&str, &[&str]); 32] = [
+const EXPECTED_REQUIRED: [(&str, &[&str]); 35] = [
     ("bash", &["command"]),
     ("read_file", &["file_path"]),
     ("write_file", &["file_path", "content"]),
@@ -97,11 +103,14 @@ const EXPECTED_REQUIRED: [(&str, &[&str]); 32] = [
     ("cron", &["action"]),
     ("list_mcp_resources", &[]),
     ("read_mcp_resource", &["uri"]),
+    ("mcp_resource_subscription", &["action"]),
     ("tool_search", &["query"]),
     ("get_current_goal", &[]),
     ("submit_goal_report", &["status", "evidence"]),
     ("lsp", &["action"]),
     ("worktree", &["action"]),
+    ("enter_worktree", &[]),
+    ("exit_worktree", &["action"]),
 ];
 
 /// Builds a registry over `dir` with English card text.
@@ -154,7 +163,7 @@ async fn invoke(tools: &[Arc<dyn Tool>], name: &str, inputs: Value) -> Value {
 fn tool_names_are_exactly_the_twenty_python_names() {
     assert_eq!(tool_names(), &EXPECTED_NAMES);
     assert_eq!(BuiltinTool::DEFAULT.len(), EXPECTED_NAMES.len());
-    assert_eq!(BuiltinTool::ALL.len(), 32);
+    assert_eq!(BuiltinTool::ALL.len(), 35);
     assert_eq!(BuiltinTool::ALL, BuiltinTool::EXTENDED);
 
     let names: Vec<&str> = BuiltinTool::DEFAULT
@@ -353,7 +362,10 @@ fn parallel_safe_flags_match_the_registry() {
                 | BuiltinTool::EditFile
                 | BuiltinTool::Cron
                 | BuiltinTool::SubmitGoalReport
+                | BuiltinTool::McpResourceSubscription
                 | BuiltinTool::Worktree
+                | BuiltinTool::EnterWorktree
+                | BuiltinTool::ExitWorktree
         );
         assert_eq!(tool.parallel_safe(), expected, "for {}", tool.name());
     }
@@ -362,7 +374,10 @@ fn parallel_safe_flags_match_the_registry() {
         "edit_file",
         "cron",
         "submit_goal_report",
+        "mcp_resource_subscription",
         "worktree",
+        "enter_worktree",
+        "exit_worktree",
     ] {
         let tool = BuiltinTool::from_name(name).expect("known tool");
         assert!(!tool.parallel_safe(), "{name} must be serialised");
@@ -808,6 +823,8 @@ fn default_registry_excludes_extended_tools() {
         "submit_goal_report",
         "lsp",
         "worktree",
+        "enter_worktree",
+        "exit_worktree",
     ] {
         assert!(
             tools.iter().all(|tool| tool.card().name != name),
@@ -822,7 +839,7 @@ fn extended_registry_builds_every_tool_in_registry_order() {
     let dir = tempfile::tempdir().expect("temp workspace");
     let registry = extended_registry(&dir);
     let tools = registry.build();
-    assert_eq!(tools.len(), 32);
+    assert_eq!(tools.len(), 35);
     let names: Vec<&str> = tools.iter().map(|tool| tool.card().name.as_str()).collect();
     assert_eq!(
         names,
@@ -831,7 +848,7 @@ fn extended_registry_builds_every_tool_in_registry_order() {
             .map(|tool| tool.name())
             .collect::<Vec<&str>>()
     );
-    assert_eq!(registry.cards("en").len(), 32);
+    assert_eq!(registry.cards("en").len(), 35);
     assert_eq!(registry.tools(), &BuiltinTool::EXTENDED);
 }
 
@@ -1009,6 +1026,98 @@ async fn mcp_resource_tools_without_a_provider_report_the_typed_failure() {
 }
 
 #[tokio::test]
+async fn mcp_resource_subscription_tool_uses_the_registry() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let provider = Arc::new(super::mcp_subscriptions::FakeMcpResourceSubscriptionProvider::new());
+    let subscriptions = Arc::new(
+        super::mcp_subscriptions::McpResourceSubscriptions::new()
+            .with_provider(provider.clone())
+            .with_capacity(4),
+    );
+    let tools = extended_registry(&dir)
+        .with_mcp_subscriptions(subscriptions)
+        .build();
+
+    let subscribed = invoke(
+        &tools,
+        "mcp_resource_subscription",
+        json!({"action": "subscribe", "uri": "mem://notes"}),
+    )
+    .await;
+    assert_eq!(
+        subscribed["success"], true,
+        "subscribe failed: {subscribed}"
+    );
+    assert_eq!(subscribed["data"]["subscription"]["capacity"], json!(4));
+
+    assert!(provider.push_notification("mem://notes", "changed"));
+    let polled = invoke(
+        &tools,
+        "mcp_resource_subscription",
+        json!({"action": "poll", "uri": "mem://notes"}),
+    )
+    .await;
+    assert_eq!(polled["data"]["count"], json!(1));
+    assert_eq!(polled["data"]["events"][0]["reason"], "changed");
+
+    let listed = invoke(
+        &tools,
+        "mcp_resource_subscription",
+        json!({"action": "list"}),
+    )
+    .await;
+    assert_eq!(listed["data"]["count"], json!(1));
+    assert_eq!(listed["data"]["capacity"], json!(4));
+
+    let closed = invoke(
+        &tools,
+        "mcp_resource_subscription",
+        json!({"action": "unsubscribe", "uri": "mem://notes"}),
+    )
+    .await;
+    assert_eq!(closed["success"], true, "unsubscribe failed: {closed}");
+    assert_eq!(provider.unsubscribe_calls(), vec!["mem://notes".to_owned()]);
+}
+
+#[tokio::test]
+async fn mcp_resource_subscription_tool_without_a_registry_reports_the_typed_failure() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let tools = built_extended(&dir);
+    let payload = invoke(
+        &tools,
+        "mcp_resource_subscription",
+        json!({"action": "list"}),
+    )
+    .await;
+    assert_eq!(payload["success"], false);
+    let error = payload["error"].as_str().expect("error text");
+    assert!(
+        error.contains("no subscription registry is configured"),
+        "error: {error}"
+    );
+}
+
+#[test]
+fn mcp_resource_subscription_card_is_mounted_and_serialisable() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let registry = extended_registry(&dir);
+    let card = registry.card(BuiltinTool::McpResourceSubscription, "en");
+    assert_eq!(card.name, "mcp_resource_subscription");
+    assert!(!card.parallel_safe);
+    assert_eq!(card.input_params["required"], json!(["action"]));
+    assert_eq!(
+        card.description,
+        descriptions::description("mcp_resource_subscription", "en")
+    );
+    assert!(registry.mcp_subscriptions().is_none());
+    let subscriptions = Arc::new(super::mcp_subscriptions::McpResourceSubscriptions::new());
+    assert!(registry
+        .with_mcp_subscriptions(subscriptions)
+        .mcp_subscriptions()
+        .is_some());
+}
+
+#[tokio::test]
 async fn tool_search_finds_the_deferred_tool() {
     let dir = tempfile::tempdir().expect("temp workspace");
     let tools = extended_registry(&dir)
@@ -1070,7 +1179,7 @@ fn extended_names_match_the_variant_table() {
         .map(|tool| tool.name())
         .collect();
     assert_eq!(names, super::extended_tool_names().to_vec());
-    assert_eq!(BuiltinTool::ALL.len(), 32);
+    assert_eq!(BuiltinTool::ALL.len(), 35);
     for (index, name) in super::extended_tool_names().iter().enumerate() {
         assert_eq!(
             BuiltinTool::EXTENDED[index].name(),
@@ -1280,6 +1389,13 @@ impl ScriptedGitRunner {
             .expect("runner lock")
             .push_back(Ok(stdout.to_owned()));
     }
+    /// Queues a failing invocation reporting `message` as the git error.
+    fn push_err(&self, message: &str) {
+        self.responses
+            .lock()
+            .expect("runner lock")
+            .push_back(Err(message.to_owned()));
+    }
 }
 
 #[async_trait]
@@ -1384,4 +1500,163 @@ fn worktree_root_override_is_reported() {
     std::fs::create_dir_all(&root).expect("repo dir");
     let registry = extended_registry(&dir).with_worktree_root(root.clone());
     assert_eq!(registry.worktree_root(), Some(root.as_path()));
+}
+#[test]
+fn enter_and_exit_worktree_cards_are_registry_members() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let registry = extended_registry(&dir);
+    for (tool, name, required, properties) in [
+        (
+            BuiltinTool::EnterWorktree,
+            "enter_worktree",
+            Vec::new(),
+            vec!["name"],
+        ),
+        (
+            BuiltinTool::ExitWorktree,
+            "exit_worktree",
+            vec!["action"],
+            vec!["action", "discard_changes"],
+        ),
+    ] {
+        let card = registry.card(tool, "en");
+        assert_eq!(card.name, name);
+        assert_eq!(card.id.len(), 32, "{name} card id is a uuid hex");
+        assert!(card.id.chars().all(|c| c.is_ascii_hexdigit()), "{name} id");
+        assert!(!card.parallel_safe, "{name} mutates worktree state");
+        assert_eq!(card.input_params["type"], json!("object"), "{name} schema");
+        let card_properties = card.input_params["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name} properties is not an object"));
+        for property in &properties {
+            assert!(
+                card_properties.contains_key(*property),
+                "{name} has no {property} property"
+            );
+        }
+        match card.input_params.get("required") {
+            Some(value) => assert_eq!(value, &json!(required), "{name} required"),
+            None => assert!(required.is_empty(), "{name} has no required key"),
+        }
+        assert_eq!(card.description, descriptions::description(name, "en"));
+        assert_eq!(
+            registry.card(tool, "cn").description,
+            descriptions::description(name, "cn")
+        );
+    }
+    let tools = registry.build();
+    let names: Vec<&str> = tools.iter().map(|tool| tool.card().name.as_str()).collect();
+    for name in ["enter_worktree", "exit_worktree"] {
+        assert!(names.contains(&name), "{name} is not mounted: {names:?}");
+    }
+}
+
+#[test]
+fn worktree_session_store_defaults_to_a_shared_memory_store() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let registry = extended_registry(&dir);
+    assert!(
+        registry.worktree_session_store().session().is_none(),
+        "the default store starts empty"
+    );
+    let store = Arc::new(MemoryWorktreeSessionStore::new().with_default_name("feature"));
+    let registry = registry.with_worktree_session_store(store);
+    assert_eq!(
+        registry.worktree_session_store().default_name().as_deref(),
+        Some("feature"),
+        "the wired store replaces the default one"
+    );
+}
+
+#[tokio::test]
+async fn worktree_enter_and_exit_tools_report_typed_failures_without_a_manager() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let registry = extended_registry(&dir);
+    assert!(registry.worktree_manager().is_none(), "no manager is wired");
+    let tools = registry.build();
+    let out = invoke(&tools, "enter_worktree", json!({"name": "feature"})).await;
+    assert_eq!(out["success"], false, "unexpected success: {out}");
+    let error = out["error"].as_str().expect("error string");
+    assert!(
+        error.contains(NOT_A_REPOSITORY_MARKER) || error.contains(NOT_INSTALLED_MARKER),
+        "the manager's typed git failure must surface: {error}"
+    );
+    let out = invoke(&tools, "exit_worktree", json!({"action": "keep"})).await;
+    assert_eq!(out["success"], false, "unexpected success: {out}");
+    assert_eq!(out["error"], json!("No active worktree session to exit."));
+}
+
+#[tokio::test]
+async fn enter_worktree_forwards_the_permission_engine() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let section = PermissionsSection {
+        package_builtin_rules: false,
+        tools: BTreeMap::from([("write_file".to_owned(), PermissionLevel::Deny)]),
+        ..PermissionsSection::default()
+    };
+    let engine = Arc::new(PermissionEngine::new(PermissionEngineConfig::new(section)));
+    let registry = extended_registry(&dir).with_permissions(engine);
+    let tools = registry.build();
+    let out = invoke(&tools, "enter_worktree", json!({"name": "feature"})).await;
+    assert_eq!(out["success"], false, "unexpected success: {out}");
+    let error = out["error"].as_str().expect("error string");
+    assert!(
+        error.to_ascii_lowercase().contains("denied"),
+        "the deny decision must reject the worktree: {error}"
+    );
+}
+
+#[tokio::test]
+async fn enter_worktree_records_the_session_exit_worktree_shares() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let repo = dir.path().to_path_buf();
+    let sha = "1".repeat(40);
+    let listing = format!(
+        "worktree {}\nHEAD {sha}\nbranch refs/heads/main\n",
+        repo.display()
+    );
+    let runner = Arc::new(ScriptedGitRunner::new());
+    // `enter_worktree` lists the worktrees once to look the target up, then creates it:
+    // find_git_root + worktree list twice, a missing branch, the add and the HEAD lookup.
+    runner.push_ok(&repo.to_string_lossy());
+    runner.push_ok(&listing);
+    runner.push_ok(&repo.to_string_lossy());
+    runner.push_ok(&listing);
+    runner.push_err("fatal: not a valid object name");
+    runner.push_ok("");
+    runner.push_ok(&sha);
+    let manager = Arc::new(WorktreeManager::with_runner(&repo, runner));
+    let registry = extended_registry(&dir).with_worktree_manager(Arc::clone(&manager));
+    let tools = registry.build();
+    let out = invoke(&tools, "enter_worktree", json!({"name": "feature"})).await;
+    assert_eq!(out["success"], true, "enter failed: {out}");
+    assert_eq!(
+        out["data"]["worktree_path"],
+        json!(repo.join(".worktrees").join("feature")),
+        "unexpected worktree path: {out}"
+    );
+    assert_eq!(out["data"]["worktree_branch"], json!("worktree-feature"));
+    assert_eq!(out["data"]["existed"], json!(false));
+    let session = registry
+        .worktree_session_store()
+        .session()
+        .expect("the session is recorded");
+    assert_eq!(session.worktree_name, "feature");
+    assert_eq!(session.original_cwd, repo);
+
+    let out = invoke(&tools, "exit_worktree", json!({"action": "keep"})).await;
+    assert_eq!(out["success"], true, "exit failed: {out}");
+    assert_eq!(out["data"]["action"], json!("keep"));
+    assert_eq!(out["data"]["worktree_name"], json!("feature"));
+    let message = out["data"]["message"].as_str().expect("message string");
+    assert!(message.contains("Kept worktree 'feature'"), "{message}");
+    assert!(
+        registry.worktree_session_store().session().is_none(),
+        "exit_worktree must clear the shared session"
+    );
+    assert_eq!(
+        registry.worktree_session_store().default_name().as_deref(),
+        Some("feature"),
+        "the entered name stays the session default"
+    );
 }

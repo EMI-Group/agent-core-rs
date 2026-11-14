@@ -184,8 +184,10 @@ pub const DEFAULT_KEY_PREFIX: &str = "openjiuwen:team";
 pub enum TransportKind { InProcess /*default*/, Redis, Pulsar }
 impl TransportKind { pub const fn as_str(self) -> &'static str; }
 pub struct RedisTransportConfig { pub addr: String /*"127.0.0.1:6379"*/, pub username: Option<String>,
-                                  pub password: Option<SecretString>, pub db: u32,
-                                  pub poll_interval_ms: u64 /*10*/ }
+                                  pub password: Option<SecretString>, pub db: Option<u32>,
+                                  pub poll_interval_ms: u64 /*10*/, pub consumer_group: Option<String>,
+                                  pub claim_idle_ms: u64 /*30_000*/, pub registry_interval_ms: u64 /*250*/,
+                                  pub topology: RedisTopology /*Single*/ }
 pub struct TransportConfig { pub kind: TransportKind, pub key_prefix: String /*"openjiuwen:team"*/,
                              pub redis: Option<RedisTransportConfig> }
 impl TransportConfig { pub fn new() -> Self; pub const fn with_kind(self, kind: TransportKind) -> Self;
@@ -201,6 +203,10 @@ impl TransportConfig { pub fn new() -> Self; pub const fn with_kind(self, kind: 
     fn add_subscription(&self, agent_id: &str, topic: &str);
     fn remove_subscription(&self, agent_id: &str, topic: &str);
     fn subscribers(&self, topic_id: &str) -> Vec<String>;
+    // introspection, defaulted to an empty registry and overridden by both backends
+    fn list_subscriptions(&self) -> BTreeMap<String, Vec<String>>;
+    fn agent_subscriptions(&self, agent_id: &str) -> Vec<String>;
+    fn subscription_count(&self) -> usize;
 }
 pub fn build_transport(config: &TransportConfig, team_id: impl Into<String>, bus_config: MessageBusConfig,
                        handler: Arc<dyn MessageHandler>) -> Result<Arc<dyn TeamTransport>>;
@@ -212,22 +218,46 @@ impl InProcessTransport { pub fn new(team_id: impl Into<String>, bus_config: Mes
 pub struct RedisTransport { .. }
 impl RedisTransport { pub fn new(config: RedisTransportConfig, team_id: impl Into<String>,
                                  key_prefix: impl Into<String>, handler: Arc<dyn MessageHandler>) -> Arc<Self>;
+                      pub fn try_new(config: RedisTransportConfig, team_id: impl Into<String>,
+                                     key_prefix: impl Into<String>, handler: Arc<dyn MessageHandler>)
+                          -> Result<Arc<Self>>;                       // rejects a non-single topology
                       pub fn config(&self) -> &RedisTransportConfig;
                       pub fn key_prefix(&self) -> &str;
+                      pub fn consumer_name(&self) -> &str;                // uuid v4, one per instance
+                      pub fn p2p_consumer_group(&self) -> String;
+                      pub fn pubsub_consumer_group(&self) -> String;
                       pub fn p2p_queue(&self, agent_id: &str) -> String;
                       pub fn reply_queue(&self, message_id: &str) -> String;
                       pub fn pubsub_queue(&self, subscriber: &str) -> String;
                       pub fn is_started(&self) -> bool;
-                      pub fn watch_agent(&self, agent_id: &str) -> Result<()>; }   // starts the agent's two inbox pollers
+                      pub fn watch_agent(&self, agent_id: &str) -> Result<()>;   // starts the agent's two inbox pollers
+                      pub async fn refresh_subscriptions(&self) -> Result<()>; }  // remote ∪ owned, on demand
 ```
-`build_transport` returns `InProcessTransport` for `InProcess`, `RedisTransport` for `Redis` (`Error::Config` when `TransportConfig::redis` is unset), and `Error::Unsupported` for `Pulsar` with a message naming Pulsar as not implemented. The Redis backend speaks RESP2 through `openjiuwen_foundation::store::external::redis` (`RedisConnection`), so no vendor SDK is needed: P2P messages go to `{prefix}:{team}:p2p:{recipient}` as a JSON list push, each request carries its `reply_queue` (`{prefix}:{team}:reply:{message_id}`) for the oneshot correlation, and pub/sub fan-out pushes one JSON envelope per subscriber onto `{prefix}:{team}:pubsub:{subscriber}`. Dispatch is poll-based (`poll_interval_ms`), keys never collide with the message-bus in-process topic names, and a `send` deadline produces `"Message from '<sender>' to '<recipient>' timed out after <t>s"` (`Error::Timeout`).
+`build_transport` selects the backend: `InProcess` → `InProcessTransport`, `Redis` → `RedisTransport::try_new` (`Error::Config` when `TransportConfig::redis` is unset), `Pulsar` → `Error::Unsupported` with a message naming Pulsar and the missing protobuf-framed client, and a Redis topology of `Cluster`/`Sentinel` → `Error::Unsupported` from both `build_transport` and `start` (the workspace has no cluster- or Sentinel-aware RESP client). The Redis backend speaks RESP2 through `openjiuwen_foundation::store::external::redis` (`RedisConnection`), so no vendor SDK is needed. Three delivery key families: `{prefix}:{team}:p2p:{recipient}` (P2P inbox stream; `send` appends `envelope ... reply <reply-key>` with `XADD`), `{prefix}:{team}:reply:{message_id}` (the reply stream of one request; the recipient's worker `XADD`s one `frame` entry — `{"value": <json>}` or `{"error": "<text>"}` — and the waiting `send` `XREAD`s it, then `DEL`s the key so a later request cannot read a stale frame), and `{prefix}:{team}:pubsub:{subscriber}` (one `XADD` copy per sorted subscriber). Two registry key families mirror subscriptions across processes: `{prefix}:{team}:subs` (every registered pattern) and `{prefix}:{team}:subs:{pattern}` (the agent set of that pattern).
+Each inbox kind has one consumer group — `{prefix}:{team}:p2p:cg` and `{prefix}:{team}:pubsub:cg`, overridable via `RedisTransportConfig::consumer_group` — created idempotently with `XGROUP CREATE ... 0 MKSTREAM` (a `BUSYGROUP` reply is expected and ignored). Every transport instance joins with its own `consumer_name()` (uuid v4), so processes may start in any order and the same agent may be watched by several of them without double delivery. Workers poll their stream (`XREADGROUP ... >`, no `BLOCK`), dispatch through the `MessageHandler`, and `XACK` only after the reply `XADD` succeeded, so delivery is at-least-once (a reply-write failure re-delivers the request; there is no dedupe). A claim pass (`XAUTOCLAIM` with `claim_idle_ms`, Redis ≥ 6.2) runs on worker start and after every read-error recovery, so entries a crashed or reconnected consumer left pending are re-dispatched. Only agents registered through `watch_agent` get inbox workers; `start` spawns the ones registered while the transport was stopped.
+Subscriptions are write-through: `add_subscription`/`remove_subscription` update the local `SubscriptionManager` immediately and mirror the pair into the Redis registry on a detached best-effort task (`SADD`, then `SREM`/`SCARD` and an index `SREM` when a pattern set empties), so the synchronous calls never wait for the network. A refresher task started by `start` re-reads the registry every `registry_interval_ms` and replaces the local view with `remote ∪ owned` (owned = pairs this instance added itself), so a process publishes to subscribers registered elsewhere while a not-yet-flushed local pair can never be dropped; `refresh_subscriptions()` runs the same refresh on demand. A clean `stop` removes this instance's owned entries; a crashed process may leave some behind, which is harmless (a publisher `XADD`s into a stream no worker consumes).
+Reads are polled (`poll_interval_ms`, no `BLOCK`), so an idle inbox costs one round trip per interval and a reply one `XREAD` per interval until it arrives. Keys never collide with the message-bus in-process topic names, and a `send` deadline produces `"Message from '<sender>' to '<recipient>' timed out after <t>s"` (`Error::Timeout`).
 `TeamRuntime` owns one `Arc<dyn TeamTransport>` (in-process by default) and `send`/`publish`/`subscribe`/`start`/`stop` delegate to it; `set_transport` rejects a transport whose `team_id` differs from the runtime's (`Error::Validation`).
+
+## Group routing (`routing.rs`)
+
+Additive Rust extension, not a port: Python's `core.multi_agent` has no group, broadcast or inbox layer (its `MessageRouter` only classifies messages by transport-topic suffix); the contract is modelled on the `agent_teams` product, where a broadcast excludes the sender. `GroupRegistry` holds named `group id -> sorted member ids` sets: `register_group(group_id, members)` replaces an existing group and returns its member count (`Validation` for an empty id), `add_member` creates a group implicitly and reports whether the pair is new, `remove_member`/`unregister_group` report whether they removed anything, and `group_members`/`groups`/`groups_of` are sorted, with `group_count`, `member_count` and `clear()` (returning how many groups it removed). `broadcast_targets(members, sender, include_sender)` is a pure helper returning a sorted, deduplicated recipient set with the sender excluded unless `include_sender` is set (and nothing excluded when `sender` is `None`).
+`TeamRuntime::broadcast_to_group(message, group_id, sender, session_id, timeout)` rejects an empty sender (`Validation`) and an unknown group (`NotFound`), then sends one ordinary P2P request per recipient concurrently through the transport; each envelope carries `metadata["group"] = group_id`, a group member not registered with the runtime is logged and reported in `GroupBroadcast::skipped`, a member failure stays in its `GroupDelivery` and never aborts the batch, and one `message_sent` event is emitted before dispatch with `detail.kind = "group"`, `detail.group` and `detail.recipients` (a count). `GroupBroadcast::{succeeded, failed, value_of, into_results}` summarise the deliveries. `RoutingTable` (`team_id`, `groups`, `topics`, `agents`; serde `snake_case` + `default` + `JsonSchema`) is a plain snapshot assembled by `TeamRuntime::routing_table()`: `route(destination)` resolves a group id first and otherwise matches the destination against every topic pattern via `subscription::topic_matches`, and `destinations(agent_id)` returns that agent's topics plus groups. It is a moment-in-time view, not a live one.
+
+## Inbox filters (`inbox.rs`)
+
+Another additive Rust extension: Python's bus delivers every envelope to its registered member. `InboxFilter` is pure data that serializes and defaults to accepting everything; rules apply in order — a sender in `deny_senders` is rejected (deny wins), a set `allow_senders` requires a matching sender (an envelope without a sender is rejected), a non-empty `topics` pattern list requires a matching `topic_id`, every `metadata` pair must be present with that exact string value, and `require_session` requires a session id. The builders (`allow_senders`, `deny_senders`, `allow_topics`, `require_metadata(key, value)`, `require_session`) accumulate. `InboxFilterRegistry` maps an agent id to its filter (`set`/`remove`/`get`/`accepts`/`agents`/`len`/`is_empty`/`clear`); an agent with no entry accepts everything, so an empty registry reproduces the unfiltered behaviour.
+Enforcement lives in the runtime dispatcher, not in a handler wrapper, so it covers every transport: `dispatch_p2p` rejects a filtered envelope with `Error::validation("inbox of '<recipient>' rejected the message from '<sender>'")` and emits no `message_received`, while `dispatch_pubsub` logs at debug and skips that subscriber, so pub/sub stays fire-and-forget and never fails the publisher.
+
+## Communicable facade (`communicable.rs`)
+
+`CommunicableAgent` is the Rust counterpart of Python's `CommunicableAgent` mixin (`team_runtime/communicable_agent.py`): Rust cannot mix the messaging methods into an agent class, so one value owns the binding and exposes the same calls. `new(agent_id)` starts unbound but with a known identity; `bind_runtime(runtime, agent_id)` binds it (the same `(runtime, agent_id)` pair, compared by `Arc` pointer, is a silent no-op, a different pair logs a warning and rebinds), `is_bound`/`runtime`/`agent_id` report the state (the id survives `unbind`), and `unbind` drops only the runtime binding. `send`/`publish`/`subscribe`/`unsubscribe` forward to the runtime with this agent as the sender and the same arguments (no explicit deadline on `send`); while unbound each returns `Error::validation("agent '<id>' is not bound to a team runtime")`, Python's "not bound to a `TeamRuntime`" status error. The binding sits behind a short `parking_lot::RwLock` released before any `.await`, so a bound agent can be shared across tasks.
 
 ## Constraints
 
 - Everything here follows the crate's constraints: async-first tokio, `openjiuwen_common::error` results, serde-serializable public data, no `unsafe`, `tracing` logging, files around ≤1000 lines.
-- No module in this node depends upward: `events`, `autosubscribe`, `pyrepr`, `resources`, `member_checkpoint`, `transport` and `ability` all sit on `common`/`foundation`/`session`/`agent` plus this crate's own `runtime`.
-- Process-local types (event buses, transports, resource managers, checkpoint wrappers, ability managers) are not serializable; only the data they carry is.
+- No module in this node depends upward: `events`, `autosubscribe`, `pyrepr`, `resources`, `member_checkpoint`, `routing`, `inbox`, `communicable`, `transport` and `ability` all sit on `common`/`foundation`/`session`/`agent` plus this crate's own `runtime`.
+- Process-local types (event buses, transports, resource managers, checkpoint wrappers, ability managers, group and inbox-filter registries, communicable agents, `GroupDelivery`/`GroupBroadcast`) are not serializable; the serializable data types here are `InboxFilter` and `RoutingTable`.
 
 ## Routing Table
 
@@ -238,8 +268,12 @@ impl RedisTransport { pub fn new(config: RedisTransportConfig, team_id: impl Int
 - `./member_checkpoint.rs` → per-member checkpoint identity over one shared checkpointer
 - `./transport/mod.rs` → `TeamTransport`, `TransportKind`, `TransportConfig`, `build_transport`
 - `./transport/inproc.rs` → `InProcessTransport` over the message bus
-- `./transport/redis.rs` → `RedisTransport` (RESP2 lists, pollers, `watch_agent`)
+- `./transport/redis/` → `RedisTransport`, split into `config.rs` (settings and topology), `streams.rs` (stream/SET commands and codecs), `worker.rs` (consumer-group delivery loop), `registry.rs` (cross-process subscription registry) and `backend.rs` (the `TeamTransport` impl)
 - `./ability.rs` → `P2PAbilityManager`, `AbilityCall`, `AbilityResult`, `AbilityExecutor`
+- `./routing.rs` → `GroupRegistry`, `broadcast_targets`, `GroupBroadcast`/`GroupDelivery`, `RoutingTable`, `GROUP_METADATA_KEY`
+- `./inbox.rs` → `InboxFilter` and `InboxFilterRegistry` (per-agent acceptance rules)
+- `./communicable.rs` → `CommunicableAgent`, the runtime-bound send/publish/subscribe facade
 - `./runtime/` → the runtime these seams hang off (`seams.rs` attaches them)
+- `./runtime/routing.rs` → the runtime's group/inbox forwarders, `broadcast_to_group` and `routing_table`
 - `./handoff/` → handoff strategy (`handoff/CONTEXT.md`)
 - `./hierarchical/` → hierarchical strategies; re-exports `P2PAbilityManager` under its Python path (`hierarchical/CONTEXT.md`)

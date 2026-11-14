@@ -2,9 +2,11 @@
 //!
 //! Python keeps the bank in an `index_dir` directory (`meta.json`, a JSONL scalar
 //! file, and FAISS vector files) and repairs it from a backup snapshot when the
-//! manifest disagrees with the data. The Rust port keeps the durable part — the items —
-//! and drops the FAISS plumbing, because embeddings are recomputed by the configured
-//! [`openjiuwen_retrieval::Embedding`] instead of being persisted.
+//! manifest disagrees with the data. This seam stores only the durable items: the
+//! embeddings are recomputed by the configured
+//! [`openjiuwen_retrieval::Embedding`] at search time. The catalog that also persists the
+//! vectors and their integrity manifest is
+//! [`ExperienceIndex`](crate::experience::ExperienceIndex).
 //!
 //! Three backends implement the seam:
 //!
@@ -234,21 +236,35 @@ impl JsonFileExperienceStore {
             }
             document
         };
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(Error::external)?;
-            }
-        }
-        let temporary = temporary_path(&self.path);
-        tokio::fs::write(&temporary, document.as_bytes())
-            .await
-            .map_err(Error::external)?;
-        tokio::fs::rename(&temporary, &self.path)
-            .await
-            .map_err(Error::external)
+        write_atomic(&self.path, document.as_bytes()).await
     }
+}
+
+/// Atomically replaces `path` with `bytes` through a `<path>.tmp` sibling and a rename.
+///
+/// Missing parent directories are created first, so a backend can publish into a fresh
+/// directory. A reader therefore observes either the previous document or the complete new
+/// one, never a partial write.
+///
+/// # Errors
+///
+/// Returns [`Error::External`] when a directory cannot be created, the temporary file
+/// cannot be written, or the rename fails.
+pub(crate) async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(Error::external)?;
+        }
+    }
+    let temporary = temporary_path(path);
+    tokio::fs::write(&temporary, bytes)
+        .await
+        .map_err(Error::external)?;
+    tokio::fs::rename(&temporary, path)
+        .await
+        .map_err(Error::external)
 }
 
 #[async_trait]
@@ -380,7 +396,7 @@ impl ExperienceStore for SqliteExperienceStore {
 }
 
 /// The `<file>.tmp` sibling used for the atomic document swap.
-fn temporary_path(path: &Path) -> PathBuf {
+pub(crate) fn temporary_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".tmp");
     PathBuf::from(name)

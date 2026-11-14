@@ -23,6 +23,7 @@ uuid.workspace = true
 schemars.workspace = true
 tokio-util.workspace = true
 axum.workspace = true
+openjiuwen-extensions = { workspace = true, optional = true }
 
 [dev-dependencies]
 openjiuwen-test-support.workspace = true
@@ -31,6 +32,7 @@ tower = { version = "0.5", features = ["util"] }
 
 [features]
 default = []
+redis = ["dep:openjiuwen-extensions", "openjiuwen-extensions/redis"]
 
 [lints]
 workspace = true

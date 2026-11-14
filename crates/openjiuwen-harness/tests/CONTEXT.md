@@ -7,7 +7,7 @@ Unit tests live beside their modules; these cover cross-module behavior.
 
 ## API Surface
 
-Test files (one concern each, 84 tests total):
+Test files (one concern each, twelve binaries, 111 tests total):
 - `deep_agent_loop.rs` (6) — no-tool answer, real `FunctionTool` round, built-in `bash` permission denial, max-iteration truncation, follow-up queue drain, idempotent abort.
 - `workspace_safety.rs` (9) — cn/en schema seeding and markers, traversal/absolute/drive/UNC rejection, top-level-only `get_node_path`, idempotent rebuild, `is_safe_relative_path` truth table, unsafe node paths.
 - `permissions.rs` (14) — allow/ask/deny precedence and `strictest` fold, file-guard fold, session-scoped approvals via the rail, rail `skip_tool` denial, `PermissionConfirmResponse::parse` shapes.
@@ -15,6 +15,11 @@ Test files (one concern each, 84 tests total):
 - `subagents_skills.rs` (19) — built-in presets, fake factory spawn/wait/close/capacity, quota refusal/free and per-parent/depth limits, activity lifecycle and LRU eviction with transcript digests, subagent tool payloads, skill discovery/budget/disabled state, `SkillRootMount`.
 - `protocol.rs` (8) — `NativeHarness` lifecycle, capability gating, single-consumer cursors, checkpoint export, provider `create` from JSON, capability card.
 - `cli.rs` (21) — clap grammar/flags/formats, headless `run_with_model` in all three output formats, scripted REPL transcript, permission answer mapping.
+- `public_surface.rs` (10) — every newly landed item resolves flat from the crate root and does real work: `MoaConfig`/`MoaRail` (asserting the published consultation protocol text in both languages), `ExecutionLog`/`WindowAssembler`, `HeartbeatRail`, `PersonalContextStore`, `WorktreeLock`/`SparseConfig`, `ActivityThrottle`, `drain_rail_events`, `DiagnosticRegistry`/`Diagnostic`, `WorkspaceWatcher` (a real delivered write plus a silent shutdown with `notify`, its typed `Unsupported` refusal without), `GoalRail`.
+- `moa_rail.rs` (4) — two scripted proposers through `consult`/`rank_with_config`, the rail's prompt section and `MoaSnapshot`/`MoaOutcome` extra keys, the all-proposers-fail `Error::Llm`, and the refusal of a reference-free configuration.
+- `persistent_agent_resume.rs` (3) — a rotated journal reopened from disk (`replay`, digest, monotone sequences), `resume` → `ResumePlan` with a rebuilt window and continuation prompt, `ShareFile` export/import round trip plus tamper detection, and the typed `Unsupported` of the remote/distributed handoffs.
+- `goal_rail_events.rs` (4) — a settled goal auto-registers `GoalRail` through a mounted `get_current_goal` tool and reaches both the `stream` interaction frame and `drain_rail_events` exactly once; an active goal publishes the reminder and no event; no goal tool means no rail; the event's output frame round-trips.
+- `watcher_targets.rs` (6) — `#![cfg(feature = "notify")]`: independent per-target steps (a new skill file, an `IDENTITY.md` rewrite, an MCP-config rewrite) each await their own event, one watcher keeps sequences monotonic across targets, a write burst coalesces into one event, and a not-yet-created file target still fires while shutdown is idempotent and publishes nothing afterwards.
 
 ## Constraints
 
@@ -25,6 +30,9 @@ Test files (one concern each, 84 tests total):
 - Every test file opens with `#![allow(clippy::unwrap_used, clippy::expect_used)]` because the workspace runs `clippy::all` + `pedantic` with `-D warnings`.
 - Import from `openjiuwen_harness::{agent,schema,…}`: module paths are canonical even though the crate root also re-exports the primary items flat.
 - Feature-gated areas (browser/cua/mobile) assert `Error::Unsupported` only.
+- `watcher_targets.rs` is gated by `#![cfg(feature = "notify")]`, so a `--no-default-features` run compiles it to an empty suite; every await carries its own 10 s per-target budget (never one deadline shared by several targets) and the only asserted count is the single event one debounce window owns.
+- `watcher_targets.rs` creates every watched parent directory before `start()` (including `skills/demo/`), because `notify` adds a watch for a newly created subdirectory only after its own event-loop thread processes the `Create(IsDir)` notification, so a file written immediately into a directory created after `start()` can be missed outright and no timeout can recover it; the module docs record that mechanism.
+- `public_surface.rs` keeps the `notify`-off branch (`Error::Unsupported` from `WorkspaceWatcher::start`) and the `notify`-on branch as two `#[cfg]` tests, so it passes in both configurations.
 
 ## Routing Table
 
@@ -35,6 +43,11 @@ Test files (one concern each, 84 tests total):
 - `./subagents_skills.rs` → subagents and skills
 - `./protocol.rs` → native harness protocol
 - `./cli.rs` → CLI parsing and run
+- `./public_surface.rs` → flat crate-root re-exports of the new modules
+- `./moa_rail.rs` → MOA consultation, ranking and rail events
+- `./persistent_agent_resume.rs` → journal replay, resume plan and share bundles
+- `./goal_rail_events.rs` → goal rail auto-registration, stream and drain
+- `./watcher_targets.rs` → `notify` watcher per-target delivery, cross-target sequences, coalescing and shutdown (feature-gated)
 
 ## Known Issues
 
@@ -402,6 +415,6 @@ Permission prompt (`permissions.rs:56-66`): answers are trimmed/lowercased — a
 ### 11. Commands and known state
 
 - `cargo fmt -p openjiuwen-harness`; `cargo test -p openjiuwen-harness`; `cargo test -p openjiuwen-harness --no-default-features`; `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings`.
-- The seven `*.rs` files above are the complete `tests/` tree; all seven compile and pass (`cargo test -p openjiuwen-harness`: 1915 unit + 84 integration + 13 doc tests).
+- The twelve `*.rs` files above are the complete `tests/` tree; all twelve compile and pass (`cargo test -p openjiuwen-harness`: 1915 unit + 108 integration + 13 doc tests with `--all-features`; the `notify` binary is empty without the feature).
 - Non-public APIs tests must not reach for: `SubAgentRuntime`'s `test_support` module, `discover_skills`, `Workspace::root`/`get_node` (absent), CLI child modules and `Repl::build`, `DeepLoopEvent` fields (serde-only), `DeepAgent` private fields, protocol `inner`/`cursor`/`events`/`bridge`/`turn`.
 - No panics were found on the public surfaces above; `PermissionLevel` has no `Ord`, `HarnessError` is `#[non_exhaustive]` and not comparable, and `ScriptedModel` is `Clone` but not `Debug`/`Serialize`.

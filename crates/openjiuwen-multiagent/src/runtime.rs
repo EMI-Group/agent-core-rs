@@ -42,6 +42,7 @@
 //! such as the Redis transport supplies its own inbound workers.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -56,12 +57,15 @@ use serde_json::Value;
 use crate::envelope::MessageEnvelope;
 use crate::error::TeamError;
 use crate::events::{TeamEvent, TeamEventBus};
+use crate::inbox::InboxFilterRegistry;
 use crate::member::{AgentProvider, TeamAgent};
 use crate::member_checkpoint::MemberCheckpointer;
 use crate::message_bus::{MessageBus, MessageBusConfig, MessageHandler};
 use crate::resources::TeamResourceMgr;
+use crate::routing::GroupRegistry;
 use crate::transport::{InProcessTransport, TeamTransport};
 
+mod routing;
 mod seams;
 
 /// Team id used when the configured one is absent or empty.
@@ -171,6 +175,13 @@ pub struct TeamRuntime {
     transport: RwLock<Arc<dyn TeamTransport>>,
     resource_mgr: RwLock<Option<Arc<dyn TeamResourceMgr>>>,
     member_checkpointer: RwLock<Option<Arc<MemberCheckpointer>>>,
+    /// Named agent groups used by [`TeamRuntime::broadcast_to_group`].
+    groups: Arc<GroupRegistry>,
+    /// Per-agent filters consulted before an inbound member is invoked.
+    inbox_filters: Arc<InboxFilterRegistry>,
+    /// Whether [`TeamRuntime::start`] succeeded and [`TeamRuntime::stop`] has
+    /// not run since; Python parity for `TeamRuntime._running`.
+    running: AtomicBool,
 }
 
 impl std::fmt::Debug for TeamRuntime {
@@ -178,6 +189,7 @@ impl std::fmt::Debug for TeamRuntime {
         f.debug_struct("TeamRuntime")
             .field("team_id", &self.config.team_id)
             .field("agents", &self.agent_ids())
+            .field("running", &self.running.load(Ordering::SeqCst))
             .field("has_resource_mgr", &self.resource_mgr.read().is_some())
             .field(
                 "has_member_checkpointer",
@@ -238,6 +250,9 @@ impl TeamRuntime {
                 transport: RwLock::new(transport),
                 resource_mgr: RwLock::new(resource_mgr),
                 member_checkpointer: RwLock::new(None),
+                groups: Arc::new(GroupRegistry::new()),
+                inbox_filters: Arc::new(InboxFilterRegistry::new()),
+                running: AtomicBool::new(false),
             }
         })
     }
@@ -359,9 +374,7 @@ impl TeamRuntime {
             registry.order.retain(|id| id != agent_id);
             entry.card
         };
-        for topic in self.bus.agent_topics(agent_id) {
-            self.bus.remove_subscription(agent_id, &topic);
-        }
+        self.bus.remove_all_subscriptions(agent_id);
         self.events
             .emit(TeamEvent::member_left(self.team_id(), agent_id));
         Some(card)
@@ -574,6 +587,45 @@ impl TeamRuntime {
         self.bus.cleanup_session(session_id).await;
     }
 
+    /// Returns `true` between a successful [`TeamRuntime::start`] and
+    /// [`TeamRuntime::stop`].
+    ///
+    /// Python parity: `TeamRuntime.is_running`, the runtime's `_running` flag.
+    /// Both lifecycle methods delegate to the transport, so this reports the
+    /// started state the runtime observed; a freshly built runtime is stopped.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    /// Returns the transport's whole subscription registry as
+    /// `pattern -> sorted agent ids`.
+    ///
+    /// Python parity: `TeamRuntime.list_subscriptions()` without an agent
+    /// filter, which forwards to the message bus.
+    #[must_use]
+    pub fn list_subscriptions(&self) -> BTreeMap<String, Vec<String>> {
+        self.transport().list_subscriptions()
+    }
+
+    /// Returns the sorted patterns `agent_id` is subscribed to.
+    ///
+    /// Python parity: the `topics` list of
+    /// `TeamRuntime.list_subscriptions(agent_id)`.
+    #[must_use]
+    pub fn list_agent_subscriptions(&self, agent_id: &str) -> Vec<String> {
+        self.transport().agent_subscriptions(agent_id)
+    }
+
+    /// Returns the total number of active topic subscriptions.
+    ///
+    /// Python parity: `TeamRuntime.get_subscription_count`, which forwards to
+    /// the message bus.
+    #[must_use]
+    pub fn get_subscription_count(&self) -> usize {
+        self.transport().subscription_count()
+    }
+
     /// Resolves `agent_id`, binds it, and runs one invocation.
     ///
     /// A pinned instance wins over the provider; the bind hook runs on the
@@ -725,6 +777,11 @@ impl TeamRuntime {
             .clone()
             .ok_or_else(|| Error::validation("recipient is required"))?;
         let sender = envelope.sender.clone().unwrap_or_default();
+        if !self.inbox_filters.accepts(&recipient, envelope) {
+            return Err(Error::validation(format!(
+                "inbox of '{recipient}' rejected the message from '{sender}'"
+            )));
+        }
         let mut received =
             TeamEvent::message_received(self.team_id(), &sender, &recipient, &envelope.message_id);
         if let Some(session_id) = &envelope.session_id {
@@ -751,6 +808,15 @@ impl TeamRuntime {
     async fn dispatch_pubsub(&self, envelope: &MessageEnvelope, subscriber: &str) -> Result<()> {
         let sender = envelope.sender.clone().unwrap_or_default();
         let topic = envelope.topic_id.clone().unwrap_or_default();
+        if !self.inbox_filters.accepts(subscriber, envelope) {
+            tracing::debug!(
+                subscriber,
+                sender = %sender,
+                topic = %topic,
+                "team pub/sub delivery rejected by the inbox filter"
+            );
+            return Ok(());
+        }
         let mut received = TeamEvent::pubsub_received(
             self.team_id(),
             &sender,

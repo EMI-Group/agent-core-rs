@@ -9,6 +9,8 @@
 //! switching, input dispatch/phases, the persisted-state entry points, the outer
 //! task loop (follow-up rounds, steering, abort), stream frames, the single-run
 //! guard, rail-published prompt sections, and the factory assembly.
+// Size note: this file is the `agent` node's test suite only; its length is test cases,
+// not production code.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -19,7 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use openjiuwen_agent::{Agent, AgentCard, AgentOutput, ResultType};
+use openjiuwen_agent::{Agent, AgentCard, AgentChunk, AgentOutput, ResultType};
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::{ChatResponse, Model, ModelRequestConfig, StreamChunk};
 use openjiuwen_foundation::tool::{Tool, ToolCard, ToolContext};
@@ -32,13 +34,15 @@ use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
 use super::{create_deep_agent, DeepAgent, DeepAgentBuilder};
+use crate::agent::RAIL_EVENTS_EXTRA_PREFIX;
 use crate::permission::{PermissionLevel, PermissionsSection};
 use crate::prompts::{PromptSection, SectionName};
 use crate::rails::{publish_prompt_section, HarnessRail, HarnessRailContext};
 use crate::schema::{
-    AgentMode, DeepAgentConfig, DeepAgentState, InputDispatchMode, InteractionPhase,
-    OnMaxIterations, SendInputRequest, SubAgentConfig,
+    AgentMode, DeepAgentConfig, DeepAgentState, InputDispatchMode, InteractionEvent,
+    InteractionEventType, InteractionPhase, OnMaxIterations, SendInputRequest, SubAgentConfig,
 };
+use crate::tools::goal::GOAL_EVENT_EXTRA_KEY;
 use crate::tools::tool_card;
 use crate::workspace::Workspace;
 
@@ -735,4 +739,266 @@ async fn a_task_loop_invocation_without_a_session_creates_one() {
     assert_eq!(output.output, "sessionless answer");
     assert_eq!(model.call_count(), 1);
     assert_ne!(agent.phase(), InteractionPhase::Terminated);
+}
+
+/// A rail that queues interaction events at the hooks the test selects.
+///
+/// Rails have no event sink, so the rail appends
+/// [`InteractionEvent::to_output_value`] frames to an array in `ctx.extra`
+/// under `channel`; the drain rail of the agent is what surfaces them.
+struct QueueRail {
+    name: &'static str,
+    channel: String,
+    before_task: Option<InteractionEvent>,
+    after_task: Option<InteractionEvent>,
+    after_invoke: Option<InteractionEvent>,
+    scratch: bool,
+}
+
+impl QueueRail {
+    fn new(name: &'static str, channel: &str) -> Self {
+        Self {
+            name,
+            channel: channel.to_string(),
+            before_task: None,
+            after_task: None,
+            after_invoke: None,
+            scratch: false,
+        }
+    }
+
+    fn before_task(mut self, event: InteractionEvent) -> Self {
+        self.before_task = Some(event);
+        self
+    }
+
+    fn after_task(mut self, event: InteractionEvent) -> Self {
+        self.after_task = Some(event);
+        self
+    }
+
+    fn after_invoke(mut self, event: InteractionEvent) -> Self {
+        self.after_invoke = Some(event);
+        self
+    }
+
+    fn with_scratch(mut self) -> Self {
+        self.scratch = true;
+        self
+    }
+
+    fn queue(&self, ctx: &mut HarnessRailContext, event: &InteractionEvent) {
+        let channel = ctx
+            .extra_mut()
+            .entry(self.channel.clone())
+            .or_insert_with(|| json!([]));
+        if let Some(entries) = channel.as_array_mut() {
+            entries.push(event.to_output_value());
+        }
+        if self.scratch {
+            ctx.extra_mut()
+                .insert("scratch".to_string(), json!({"keep": true}));
+        }
+    }
+}
+
+#[async_trait]
+impl HarnessRail for QueueRail {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn priority(&self) -> i32 {
+        crate::rails::rail_priority::DEFAULT
+    }
+
+    async fn before_task_iteration(&self, ctx: &mut HarnessRailContext) -> Result<()> {
+        if let Some(event) = &self.before_task {
+            self.queue(ctx, event);
+        }
+        Ok(())
+    }
+
+    async fn after_task_iteration(&self, ctx: &mut HarnessRailContext) -> Result<()> {
+        if let Some(event) = &self.after_task {
+            self.queue(ctx, event);
+        }
+        Ok(())
+    }
+
+    async fn after_invoke(&self, ctx: &mut HarnessRailContext) -> Result<()> {
+        if let Some(event) = &self.after_invoke {
+            self.queue(ctx, event);
+        }
+        Ok(())
+    }
+}
+
+/// Builds a task-loop agent with `rails` mounted.
+fn build_event_agent(
+    model: impl Model + 'static,
+    rails: Vec<Arc<dyn HarnessRail>>,
+) -> Arc<DeepAgent> {
+    let config = DeepAgentConfig::default()
+        .with_language("en".to_string())
+        .with_enable_task_loop(true);
+    let mut builder = DeepAgentBuilder::new(AgentCard::new("event-agent"))
+        .config(config)
+        .model(Arc::new(model));
+    for rail in rails {
+        builder = builder.rail(rail);
+    }
+    builder.build().expect("agent builds")
+}
+
+/// Returns the payloads of the `__interaction__` frames of `chunks`, in order.
+fn interaction_frames(chunks: &[Result<AgentChunk>]) -> Vec<Value> {
+    chunks
+        .iter()
+        .filter_map(|chunk| {
+            let chunk = chunk.as_ref().ok()?;
+            (chunk.kind == openjiuwen_agent::output::INTERACTION).then(|| chunk.payload.clone())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn rail_events_of_both_task_iterations_reach_the_stream_in_order() {
+    let rail = QueueRail::new("queue_goal", GOAL_EVENT_EXTRA_KEY)
+        .before_task(InteractionEvent::goal_updated(Some(
+            json!({"id": "before"}),
+        )))
+        .after_task(InteractionEvent::goal_updated(Some(json!({"id": "after"}))))
+        .with_scratch();
+    let agent = build_event_agent(ScriptedModel::text("answered"), vec![Arc::new(rail)]);
+
+    let chunks: Vec<Result<AgentChunk>> =
+        agent.stream(json!({"query": "hi"}), None).collect().await;
+    let frames = interaction_frames(&chunks);
+    assert_eq!(
+        frames.len(),
+        2,
+        "both queued events must surface: {frames:?}"
+    );
+    assert_eq!(frames[0]["type"], json!("goal.updated"));
+    assert_eq!(frames[0]["index"], json!(0));
+    assert_eq!(frames[0]["payload"]["goal"], json!({"id": "before"}));
+    assert_eq!(frames[1]["payload"]["goal"], json!({"id": "after"}));
+    assert_eq!(
+        chunks.last().unwrap().as_ref().unwrap().kind,
+        openjiuwen_agent::output::ANSWER
+    );
+
+    // The same events are retained for a host that does not read the stream,
+    // and each one is drained exactly once.
+    let retained = agent.drain_rail_events();
+    assert_eq!(retained.len(), 2);
+    assert_eq!(retained[0].event_type, InteractionEventType::GoalUpdated);
+    assert_eq!(agent.drain_rail_events().len(), 0);
+}
+
+#[tokio::test]
+async fn a_terminal_goal_event_is_collected_once_by_drain_rail_events() {
+    let rail = QueueRail::new("queue_goal", GOAL_EVENT_EXTRA_KEY).after_task(
+        InteractionEvent::goal_updated(Some(json!({"id": "g-1", "status": "complete"}))),
+    );
+    let agent = build_event_agent(ScriptedModel::text("answered"), vec![Arc::new(rail)]);
+
+    let output = agent
+        .invoke(json!({"query": "hi"}), None)
+        .await
+        .expect("invocation succeeds");
+    assert_eq!(output.result_type, ResultType::Answer);
+
+    let events = agent.drain_rail_events();
+    assert_eq!(
+        events.len(),
+        1,
+        "the settled goal is reported once: {events:?}"
+    );
+    assert_eq!(events[0].event_type, InteractionEventType::GoalUpdated);
+    assert_eq!(
+        events[0].payload.get("goal"),
+        Some(&json!({"id": "g-1", "status": "complete"}))
+    );
+    assert_eq!(agent.drain_rail_events().len(), 0);
+}
+
+#[tokio::test]
+async fn a_rail_event_queued_in_after_invoke_is_drained() {
+    // `after_invoke` is fired by the inner kernel agent through the harness
+    // adapter chain, so this covers the kernel firing points as well.
+    let rail = QueueRail::new("queue_after_invoke", GOAL_EVENT_EXTRA_KEY).after_invoke(
+        InteractionEvent::goal_updated(Some(json!({"id": "kernel"}))),
+    );
+    let agent = DeepAgentBuilder::new(AgentCard::new("after-invoke-agent"))
+        .config(DeepAgentConfig::default().with_language("en".to_string()))
+        .model(Arc::new(ScriptedModel::text("answered")))
+        .rail(Arc::new(rail))
+        .build()
+        .unwrap();
+
+    agent.invoke(json!({"query": "hi"}), None).await.unwrap();
+
+    let events = agent.drain_rail_events();
+    assert_eq!(
+        events.len(),
+        1,
+        "the after_invoke event must survive: {events:?}"
+    );
+    assert_eq!(
+        events[0].payload.get("goal"),
+        Some(&json!({"id": "kernel"}))
+    );
+}
+
+#[tokio::test]
+async fn several_rails_drain_in_a_deterministic_key_order() {
+    let goal = QueueRail::new("queue_goal", GOAL_EVENT_EXTRA_KEY)
+        .before_task(InteractionEvent::goal_updated(Some(json!({"id": "g"}))));
+    let custom = QueueRail::new("queue_custom", &format!("{RAIL_EVENTS_EXTRA_PREFIX}alpha"))
+        .before_task(InteractionEvent::execution_error("code-1", "first", None));
+    let agent = build_event_agent(
+        ScriptedModel::text("answered"),
+        vec![Arc::new(goal), Arc::new(custom)],
+    );
+
+    let chunks: Vec<Result<AgentChunk>> =
+        agent.stream(json!({"query": "hi"}), None).collect().await;
+    let frames = interaction_frames(&chunks);
+    assert_eq!(frames.len(), 2, "every rail event must drain: {frames:?}");
+    // `harness.events.alpha` sorts before `harness.goal_events`.
+    assert_eq!(frames[0]["type"], json!("execution.error"));
+    assert_eq!(frames[0]["payload"]["code"], json!("code-1"));
+    assert_eq!(frames[1]["type"], json!("goal.updated"));
+
+    let retained: Vec<InteractionEventType> = agent
+        .drain_rail_events()
+        .iter()
+        .map(|event| event.event_type)
+        .collect();
+    assert_eq!(
+        retained,
+        vec![
+            InteractionEventType::ExecutionError,
+            InteractionEventType::GoalUpdated
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_round_without_queued_events_drains_nothing() {
+    let agent = build_agent(ScriptedModel::text("plain"));
+    agent.invoke(json!({"query": "hi"}), None).await.unwrap();
+    assert_eq!(agent.drain_rail_events().len(), 0);
+
+    let agent = build_agent(ScriptedModel::text("plain"));
+    let chunks: Vec<Result<AgentChunk>> =
+        agent.stream(json!({"query": "hi"}), None).collect().await;
+    assert_eq!(interaction_frames(&chunks).len(), 0);
+    assert_eq!(
+        chunks.last().unwrap().as_ref().unwrap().kind,
+        openjiuwen_agent::output::ANSWER
+    );
+    assert_eq!(agent.drain_rail_events().len(), 0);
 }

@@ -223,7 +223,9 @@ impl KVCacheStats {
 ///
 /// The protocol deliberately omits lifecycle and provider-action methods: hosts
 /// hold the concrete runtime when they need to clear it or destroy it, and
-/// provider-side prefetch/offload is not implemented by the in-process runtime.
+/// provider-side prefetch/offload/evict runs through
+/// [`crate::kv_cache::action_runtime::KvCacheActionRuntime`], which is a separate
+/// seam from this prefix bookkeeping.
 #[async_trait]
 pub trait KVCacheRuntimeProtocol: Send + Sync {
     /// Records (upserts) one cached prefix.

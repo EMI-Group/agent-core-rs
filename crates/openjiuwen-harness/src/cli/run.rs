@@ -22,16 +22,20 @@
 //! - **instruction files** — `IDENTITY.md`/`OPENJIUWEN.md` under the workspace
 //!   and the home directory become the system prompt ([`InstructionFiles`]);
 //! - **built-in tools** — the builder mounts the twenty default coding tools and
-//!   this module adds the eleven extended tools it can drive (`fetch_webpage`,
+//!   this module adds the thirteen extended tools it can drive (`fetch_webpage`,
 //!   `web_search`, `image_metadata`, `audio_metadata`, `cron`, the two MCP
-//!   resource tools, `tool_search`, the two goal tools and `worktree`); `lsp`
-//!   stays out because it needs a per-workspace server configuration the CLI
-//!   does not resolve yet;
+//!   resource tools, `tool_search`, the two goal tools and the three worktree
+//!   tools); `lsp` stays out because it needs a per-workspace server
+//!   configuration the CLI does not resolve yet, and `mcp_resource_subscription`
+//!   stays out because it needs a subscription registry the CLI does not wire;
 //! - **MCP tools** — the servers declared in `mcp.json` are connected through
 //!   [`McpToolProvider`] and mounted next to the built-in coding tools;
 //! - **permission rules** — the permanent allow rules under the CLI home are
 //!   merged onto the built-in section and handed to the agent and to
 //!   [`CliPermissionHost`], which writes new "always allow" answers back.
+// Size note: ~520 lines of implementation plus an inline test module covering every
+// output format, prompt source and failure path; the resolution helpers live in `paths`,
+// `usage` and `options`.
 
 use std::sync::Arc;
 
@@ -246,12 +250,13 @@ pub async fn build_agent(
 ///   preamble — the same way the Python CLI composes its identity and memory
 ///   layers into one system section — and leaves the built-in prompt untouched
 ///   when no instruction file exists.
-/// - The eleven extended built-in tools the CLI can drive (`fetch_webpage`,
+/// - The thirteen extended built-in tools the CLI can drive (`fetch_webpage`,
 ///   `web_search`, `image_metadata`, `audio_metadata`, `cron`, the two MCP resource
-///   tools, `tool_search`, the two goal tools and `worktree`) are mounted on top of
-///   [`ToolRegistry`]'s default set, so a CLI turn can fetch pages, search, report
-///   media metadata, schedule cron jobs, search the tool index, read MCP resources,
-///   track a goal and manage worktrees. `lsp` is left out.
+///   tools, `tool_search`, the two goal tools and `worktree`/`enter_worktree`/
+///   `exit_worktree`) are mounted on top of [`ToolRegistry`]'s default set, so a
+///   CLI turn can fetch pages, search, report media metadata, schedule cron jobs,
+///   search the tool index, read MCP resources, track a goal and manage worktrees.
+///   `lsp` and `mcp_resource_subscription` are left out — see `CLI_EXTENDED_TOOLS`.
 /// - `mcp.json` (see [`mcp_config::load_for`]) is loaded and every server entry
 ///   is passed to `provider`, whose tools are mounted beside the built-in coding
 ///   tools. With no configuration file the list is empty.
@@ -319,11 +324,20 @@ pub async fn build_agent_with(
 
 /// The extended built-in tools a CLI run or REPL turn mounts.
 ///
-/// These are [`BuiltinTool::EXTENDED`] minus `lsp`, which needs a per-workspace server
-/// configuration the CLI does not resolve yet: mounting it would only offer the model a tool that
-/// always answers "no LSP server configured". The builder keeps [`BuiltinTool::DEFAULT`] as its
-/// baseline, so the CLI mounts this set on top of it rather than in place of it.
-const CLI_EXTENDED_TOOLS: [BuiltinTool; 11] = [
+/// These are [`BuiltinTool::EXTENDED`] minus [`BuiltinTool::DEFAULT`] (which the builder already
+/// mounts) minus two documented exclusions:
+///
+/// - `lsp` needs a per-workspace server configuration the CLI does not resolve yet: mounting it
+///   would only offer the model a tool that always answers "no LSP server configured".
+/// - `mcp_resource_subscription` needs a subscription registry the CLI does not wire, so mounting
+///   it would only offer a tool that never has a subscription to report.
+///
+/// Everything else is mountable without host wiring: the online media/resource tools answer with
+/// their typed `success=false` payload when no backend is configured, and the worktree tools share
+/// the registry's in-process [`crate::worktree::MemoryWorktreeSessionStore`] and degrade to the
+/// manager's typed git error outside a repository. Mounting a goal tool also makes the factory
+/// register the goal rail.
+const CLI_EXTENDED_TOOLS: [BuiltinTool; 13] = [
     BuiltinTool::FetchWebpage,
     BuiltinTool::WebSearch,
     BuiltinTool::ImageMetadata,
@@ -335,16 +349,19 @@ const CLI_EXTENDED_TOOLS: [BuiltinTool; 11] = [
     BuiltinTool::GetCurrentGoal,
     BuiltinTool::SubmitGoalReport,
     BuiltinTool::Worktree,
+    BuiltinTool::EnterWorktree,
+    BuiltinTool::ExitWorktree,
 ];
 
 /// Builds [`CLI_EXTENDED_TOOLS`] over `workspace` for a CLI run.
 ///
 /// The tools come from a [`ToolRegistry`] restricted to that set, which reuses the builder's
 /// seams: the permission engine of `permissions` folds the network guard of `fetch_webpage`, the
-/// worktree tool's guard and the metadata tools' path checks. `web_search`, the two MCP resource
-/// tools and `lsp` need a host-supplied backend; without one the mounted tools answer with their
-/// documented `success=false` payload instead of failing the run, and no network default is added
-/// here. Mounting a goal tool also makes the factory register the goal rail.
+/// worktree tools' guard and the metadata tools' path checks. `web_search`, the two MCP resource
+/// tools and the worktree tools need a host-supplied backend or a git repository; without one the
+/// mounted tools answer with their documented `success=false` payload instead of failing the run,
+/// and no network default is added here. Mounting a goal tool also makes the factory register the
+/// goal rail.
 fn cli_extended_tools(
     workspace: &Workspace,
     permissions: &PermissionsSection,
@@ -749,38 +766,54 @@ mod tests {
         );
     }
 
-    /// The model-facing names of [`CLI_EXTENDED_TOOLS`], in registry order.
-    const CLI_EXTENDED_NAMES: [&str; 11] = [
-        "fetch_webpage",
-        "web_search",
-        "image_metadata",
-        "audio_metadata",
-        "cron",
-        "list_mcp_resources",
-        "read_mcp_resource",
-        "tool_search",
-        "get_current_goal",
-        "submit_goal_report",
-        "worktree",
+    /// Extended tools [`CLI_EXTENDED_TOOLS`] deliberately leaves unmounted, with the reason the
+    /// CLI cannot serve them; the mounted set is [`BuiltinTool::EXTENDED`] minus
+    /// [`BuiltinTool::DEFAULT`] minus this list.
+    const CLI_EXCLUDED_EXTENDED_TOOLS: [BuiltinTool; 2] = [
+        // Needs a per-workspace language-server configuration the CLI does not resolve.
+        BuiltinTool::Lsp,
+        // Needs a subscription registry the CLI does not wire.
+        BuiltinTool::McpResourceSubscription,
     ];
 
+    /// The model-facing names of [`CLI_EXTENDED_TOOLS`], in registry order.
+    fn cli_extended_names() -> Vec<&'static str> {
+        CLI_EXTENDED_TOOLS.iter().map(|tool| tool.name()).collect()
+    }
+
     #[test]
-    fn cli_extended_tools_are_the_extended_set_minus_lsp() {
+    fn cli_extended_tools_are_the_extended_set_minus_the_documented_exclusions() {
         let expected: Vec<BuiltinTool> = BuiltinTool::EXTENDED
             .into_iter()
-            .filter(|tool| *tool != BuiltinTool::Lsp && !BuiltinTool::DEFAULT.contains(tool))
+            .filter(|tool| !BuiltinTool::DEFAULT.contains(tool))
+            .filter(|tool| !CLI_EXCLUDED_EXTENDED_TOOLS.contains(tool))
             .collect();
         assert_eq!(
             CLI_EXTENDED_TOOLS.to_vec(),
             expected,
             "the CLI mounts every extended tool it can serve"
         );
-        let names: Vec<&str> = CLI_EXTENDED_TOOLS.iter().map(|tool| tool.name()).collect();
-        assert_eq!(names, CLI_EXTENDED_NAMES.to_vec());
-        assert!(
-            !CLI_EXTENDED_TOOLS.contains(&BuiltinTool::Lsp),
-            "lsp needs a per-workspace server config the CLI does not resolve"
+        assert_eq!(
+            cli_extended_names(),
+            expected.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+            "the mounted names must follow the registry order"
         );
+        // Every extended tool is defaulted, mounted or a documented exclusion — nothing is
+        // silently dropped when the registry grows.
+        for tool in BuiltinTool::EXTENDED {
+            assert!(
+                BuiltinTool::DEFAULT.contains(&tool)
+                    || CLI_EXTENDED_TOOLS.contains(&tool)
+                    || CLI_EXCLUDED_EXTENDED_TOOLS.contains(&tool),
+                "{tool:?} must be mounted, defaulted or documented as excluded"
+            );
+        }
+        for excluded in CLI_EXCLUDED_EXTENDED_TOOLS {
+            assert!(
+                !CLI_EXTENDED_TOOLS.contains(&excluded),
+                "{excluded:?} needs host wiring the CLI does not provide"
+            );
+        }
         assert!(
             CLI_EXTENDED_TOOLS
                 .iter()
@@ -790,7 +823,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_agent_mounts_the_extended_tools_and_skips_lsp() {
+    async fn build_agent_mounts_the_extended_tools_and_skips_the_excluded_ones() {
         let temp = TempDir::new().unwrap();
         let options = test_options(temp.path());
         std::fs::create_dir_all(&options.workspace).unwrap();
@@ -812,7 +845,7 @@ mod tests {
             .find(|message| message.role.is_system())
             .map(|message| message.text().into_owned())
             .expect("the first model call must carry the system prompt");
-        for name in CLI_EXTENDED_NAMES {
+        for name in cli_extended_names() {
             assert!(
                 prompt.contains(&format!("- **{name}**: ")),
                 "the CLI agent must mount {name}:\n{prompt}"
@@ -824,10 +857,13 @@ mod tests {
                 "the builder baseline must stay mounted ({name}):\n{prompt}"
             );
         }
-        assert!(
-            !prompt.contains("- **lsp**: "),
-            "the CLI must not mount lsp:\n{prompt}"
-        );
+        for excluded in CLI_EXCLUDED_EXTENDED_TOOLS {
+            let name = excluded.name();
+            assert!(
+                !prompt.contains(&format!("- **{name}**: ")),
+                "the CLI must not mount {name}:\n{prompt}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -896,7 +932,14 @@ mod tests {
         let workspace = Workspace::for_language(temp.path(), DEFAULT_LANGUAGE);
         let tools = cli_extended_tools(&workspace, &PermissionsSection::default());
         let names: Vec<&str> = tools.iter().map(|tool| tool.card().name.as_str()).collect();
-        assert_eq!(names, CLI_EXTENDED_NAMES.to_vec());
+        assert_eq!(names, cli_extended_names());
+        for excluded in CLI_EXCLUDED_EXTENDED_TOOLS {
+            assert!(
+                !names.contains(&excluded.name()),
+                "the registry must not mount {}",
+                excluded.name()
+            );
+        }
 
         let ctx = ToolContext::new();
         // `web_search` has no backend in the CLI: the documented payload, never a panic.
@@ -948,6 +991,43 @@ mod tests {
                 .unwrap_or_default()
                 .contains("unsupported URL scheme"),
             "{fetch}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_session_tools_are_mounted_and_degrade_outside_a_repository() {
+        let temp = TempDir::new().unwrap();
+        let workspace = Workspace::for_language(temp.path(), DEFAULT_LANGUAGE);
+        let tools = cli_extended_tools(&workspace, &PermissionsSection::default());
+        let by_name = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.card().name == name)
+                .unwrap_or_else(|| panic!("the CLI must mount {name}"))
+        };
+        let ctx = ToolContext::new();
+
+        // `exit_worktree` has no session recorded: the documented payload, no git call.
+        let exit = by_name("exit_worktree")
+            .invoke(json!({"action": "keep"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(exit["success"], json!(false));
+        assert_eq!(exit["error"], json!("No active worktree session to exit."));
+
+        // `enter_worktree` shares the registry's manager, rooted at the workspace: outside a git
+        // repository the manager's typed git error becomes the payload.
+        let enter = by_name("enter_worktree")
+            .invoke(json!({"name": "cli-demo"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(enter["success"], json!(false));
+        assert!(
+            enter["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Failed to create worktree"),
+            "{enter}"
         );
     }
 }

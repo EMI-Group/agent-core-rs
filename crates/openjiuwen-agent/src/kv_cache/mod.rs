@@ -20,16 +20,27 @@
 //!   estimate afterwards, and renders child-session lineage kwargs.
 //! - [`metadata`] carries the session env keys, lineage resolution, and the
 //!   range/identity derivations used by context compressors and team members.
+//! - [`KvCacheActionRuntime`] is the provider-action executor: it tracks
+//!   admission and residency per cache scope, runs
+//!   [`KvCacheAction::Prefetch`]/[`KvCacheAction::Offload`]/[`KvCacheAction::Evict`]
+//!   through a [`KvCacheActionProvider`], and fails open so inference never waits
+//!   on cache management.
+//! - [`InProcessKvCacheActionProvider`] is the deterministic provider used by
+//!   tests and hosts without a provider integration: every action succeeds and is
+//!   recorded.
 //!
 //! Affinity is opt-in through [`KVCacheAffinityConfig::enabled`]; with the
-//! default config the hook performs no runtime work and reports a miss.
+//! default config the hook performs no runtime work and reports a miss, and the
+//! action runtime is inert.
 //!
 //! # Deferred
 //!
-//! Provider-side prefetch/offload actions and the `Redis`/`Distributed` backends
-//! are not implemented: [`KVCacheBackend::runtime`] returns
+//! The `Redis`/`Distributed` prefix bookkeeping backends and provider HTTP
+//! transports are not implemented: [`KVCacheBackend::runtime`] returns
 //! `Error::Unsupported` with an explicit message for them instead of silently
-//! falling back to the in-process runtime.
+//! falling back to the in-process runtime, and this crate ships only the
+//! in-process action provider (a real provider implements
+//! [`KvCacheActionProvider`] itself).
 //!
 //! ```
 //! use openjiuwen_agent::kv_cache::{
@@ -53,12 +64,23 @@
 //! assert_eq!(session.as_deref(), Some("child"));
 //! assert_eq!(parent.as_deref(), Some("root"));
 //! ```
+pub mod action_runtime;
+pub mod actions;
+pub mod backend;
 pub mod config;
 pub mod hook;
 pub mod metadata;
 pub mod runtime;
 pub mod types;
 
+pub use action_runtime::{
+    KvCacheActionRuntime, KvCacheAdmission, KvCacheBinding, KvCacheInferenceLease, KvCacheResidency,
+};
+pub use actions::{
+    KvCacheAction, KvCacheActionProvider, KvCacheActionRecord, KvCacheActionRequest,
+    KvCacheActionStats, KV_CACHE_ACTION_TARGET_SESSION,
+};
+pub use backend::InProcessKvCacheActionProvider;
 pub use config::{
     resolve_kvc_action_timeout, KVCacheAffinityConfig, KVCacheRuntimeConfig,
     DEFAULT_KV_CACHE_CAPACITY, KVC_MANAGEMENT_MAX_ATTEMPTS, KVC_RANGE_ACTION_TIMEOUT_SECONDS,

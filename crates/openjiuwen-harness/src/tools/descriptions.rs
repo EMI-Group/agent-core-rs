@@ -1,8 +1,10 @@
 //! Model-facing description text of the built-in tools, in English and Chinese.
 //!
 //! The table covers the core twenty tools (the shell, filesystem, todo, `ask_user` and memory
-//! tools) plus the extended tool set (web, media metadata, cron, MCP resources, tool discovery,
-//! goal tracking, LSP navigation and git worktrees).
+//! tools) plus the extended tool set (web, media metadata, cron, MCP resources and subscriptions,
+//! tool discovery, goal tracking, LSP navigation and git worktrees).
+//! The `mcp_resource_subscription` row is Rust-only: Python has no subscription tool, so its text
+//! is written here for this crate (and marked as an extension in the tool module).
 //! Ports the bilingual description constants of `openjiuwen/harness/prompts/tools/`
 //! (`filesystem.py`, `bash.py`, `todo.py`, `ask_user.py`, `memory.py`, `coding_memory.py`,
 //! `web_tools.py`, `vision.py`, `audio.py`, `cron.py`, `mcp.py`, `tool_search.py`, `goal.py`,
@@ -573,6 +575,21 @@ static DESCRIPTIONS: &[(&str, &str, &str)] = &[
         ),
     ),
     (
+        "mcp_resource_subscription",
+        concat!(
+            "Open, close, list and drain subscriptions to the resources of a configured MCP server, so server-side updates become visible to you. ",
+            "Actions: `subscribe` (uri) opens a subscription and returns its counters; `unsubscribe` (uri) closes it; `list` shows the open subscriptions; `poll` (uri, optional limit) returns the buffered update events oldest first.\n",
+            "\n",
+            "Updates only accumulate while a subscription stays open, and the buffer is bounded: `poll` regularly, and read the resource with `read_mcp_resource` when you need the current content rather than the change history. A reason string states clearly when the server or the host cannot subscribe.",
+        ),
+        concat!(
+            "打开、关闭、列出并读取对已配置 MCP 服务器资源的订阅，使服务端的更新对你可见。",
+            "操作：`subscribe`（uri）建立订阅并返回计数器；`unsubscribe`（uri）关闭订阅；`list` 列出当前订阅；`poll`（uri，可选 limit）按从旧到新的顺序返回缓冲的更新事件。\n",
+            "\n",
+            "订阅保持打开期间更新才会累积，且缓冲区有上限：请定期 `poll`；需要当前内容而非变更历史时请用 `read_mcp_resource` 读取。服务器或宿主机无法订阅时会明确说明原因。",
+        ),
+    ),
+    (
         "tool_search",
         concat!(
             "Search registered and available deferred tools based on the user's intent. ",
@@ -636,6 +653,16 @@ static DESCRIPTIONS: &[(&str, &str, &str)] = &[
         "Create and manage git worktrees for this repository. Worktrees live under `.worktrees/<name>` inside the project; never use `..` or paths outside it. Actions: `create` (name, optional branch/base), `list`, `remove` (name, optional force), `lock` (name, optional reason), `unlock` (name), `prune`, `status` (name).",
         "在当前仓库中创建和管理 git worktree。worktree 位于项目内的 `.worktrees/<name>`，禁止使用 `..` 或项目之外的路径。操作：`create`（name，可选 branch/base）、`list`、`remove`（name，可选 force）、`lock`（name，可选 reason）、`unlock`（name）、`prune`、`status`（name）。",
     ),
+    (
+        "enter_worktree",
+        "Create or enter an isolated git worktree under `.worktrees/<name>` in the current repository. A worktree is the same repository with a separate working copy, so file changes there do not affect the main checkout or other worktrees. Only use this tool when the user explicitly mentions worktrees. `name` is optional (at most 64 characters, no `..`, no absolute paths); without it the session's recorded default name is reused.",
+        "在当前仓库中创建或进入位于 `.worktrees/<name>` 下的隔离 git worktree。worktree 是同一个仓库的独立工作副本，其中的文件改动不会影响主检出或其他 worktree。仅在用户明确提到 worktree 时使用此工具。`name` 可选（最长 64 个字符，不得包含 `..`，也不能是绝对路径）；省略时复用当前会话记录的默认名称。",
+    ),
+    (
+        "exit_worktree",
+        "Exit the current worktree session. `action='keep'` preserves the worktree for a later `enter_worktree`; `action='remove'` deletes it, discarding all uncommitted work unless `discard_changes=true` is also set. Removing is destructive: get explicit user confirmation before passing `discard_changes=true`.",
+        "退出当前 worktree 会话。`action='keep'` 保留 worktree，稍后可再次 `enter_worktree`；`action='remove'` 删除 worktree，除非同时设置 `discard_changes=true`，否则会丢弃全部未提交改动。删除不可恢复：传入 `discard_changes=true` 前必须先获得用户明确确认。",
+    ),
 ];
 
 /// Returns the description of `name` in `language`, or `""` for an unknown tool name.
@@ -656,8 +683,8 @@ pub fn description(name: &str, language: &str) -> &'static str {
 mod tests {
     use super::{description, DESCRIPTIONS, SUPPORTED_LANGUAGES};
 
-    /// The thirty-two model-facing tool names: the core registry order, then the extended set.
-    const TOOL_NAMES: [&str; 32] = [
+    /// The thirty-five model-facing tool names: the core registry order, then the extended set.
+    const TOOL_NAMES: [&str; 35] = [
         "bash",
         "read_file",
         "write_file",
@@ -685,11 +712,14 @@ mod tests {
         "cron",
         "list_mcp_resources",
         "read_mcp_resource",
+        "mcp_resource_subscription",
         "tool_search",
         "get_current_goal",
         "submit_goal_report",
         "lsp",
         "worktree",
+        "enter_worktree",
+        "exit_worktree",
     ];
 
     #[test]
@@ -810,6 +840,10 @@ mod tests {
             .starts_with("Read the content of a specific resource"));
         assert!(description("read_mcp_resource", "cn")
             .starts_with("读取已配置 MCP 服务器上某个资源的内容"));
+        assert!(description("mcp_resource_subscription", "en")
+            .starts_with("Open, close, list and drain subscriptions"));
+        assert!(description("mcp_resource_subscription", "cn")
+            .starts_with("打开、关闭、列出并读取对已配置 MCP 服务器资源的订阅"));
         assert!(description("tool_search", "en")
             .starts_with("Search registered and available deferred tools"));
         assert!(description("tool_search", "cn")
@@ -831,6 +865,11 @@ mod tests {
         assert!(description("lsp", "cn").starts_with("LSP（语言服务器协议）代码导航工具"));
         assert!(description("worktree", "en").starts_with("Create and manage git worktrees"));
         assert!(description("worktree", "cn").starts_with("在当前仓库中创建和管理 git worktree"));
+        assert!(description("enter_worktree", "en")
+            .starts_with("Create or enter an isolated git worktree"));
+        assert!(description("enter_worktree", "cn").starts_with("在当前仓库中创建或进入"));
+        assert!(description("exit_worktree", "en").starts_with("Exit the current worktree session"));
+        assert!(description("exit_worktree", "cn").starts_with("退出当前 worktree 会话"));
     }
 
     #[test]

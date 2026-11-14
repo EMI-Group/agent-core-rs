@@ -221,7 +221,7 @@ fn parse_conflict_kind(raw: &str) -> Option<ConflictKind> {
 ///
 /// The first fenced block wins when present (with a `json` language tag removed);
 /// otherwise a payload is sliced out of surrounding prose.
-fn payload(raw: &str) -> Option<Value> {
+pub(crate) fn payload(raw: &str) -> Option<Value> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;

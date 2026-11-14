@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 use crate::processor::ProcessorConfig;
 use crate::recall::RecallArchiveStore;
 use crate::session_memory::SessionMemoryStore;
+use crate::telemetry::ContextProcessorStateRecorder;
+use crate::usage::ContextUsageAnalyzer;
 
 /// Session id used when a context is created without a session.
 pub const DEFAULT_SESSION_ID: &str = "default_session_id";
@@ -77,6 +79,37 @@ pub struct ContextOptions {
     /// Session-memory store override; `None` uses the engine's store, then the
     /// configuration default.
     pub session_memory: Option<Arc<dyn SessionMemoryStore>>,
+    /// Compression-telemetry recorder override.
+    ///
+    /// `None` uses the engine's recorder
+    /// ([`ContextEngine::with_recorder`](crate::engine::ContextEngine::with_recorder));
+    /// when both are unset the context emits no telemetry.
+    pub recorder: Option<Arc<ContextProcessorStateRecorder>>,
+    /// Token-usage analyzer override.
+    ///
+    /// When set, [`ContextEngine::prepare`](crate::engine::ContextEngine::prepare)
+    /// fills [`PreparedContext::usage`](crate::stats::PreparedContext::usage)
+    /// from it; `None` uses the engine's analyzer, and when both are unset the
+    /// prepared payload carries no usage block.
+    pub usage_analyzer: Option<Arc<ContextUsageAnalyzer>>,
+}
+
+impl ContextOptions {
+    /// Sets the telemetry recorder this context reports processor passes to.
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Option<Arc<ContextProcessorStateRecorder>>) -> Self {
+        self.recorder = recorder;
+        self
+    }
+
+    /// Sets the analyzer that fills [`PreparedContext::usage`].
+    ///
+    /// [`PreparedContext::usage`]: crate::stats::PreparedContext::usage
+    #[must_use]
+    pub fn with_usage_analyzer(mut self, analyzer: Option<Arc<ContextUsageAnalyzer>>) -> Self {
+        self.usage_analyzer = analyzer;
+        self
+    }
 }
 
 impl std::fmt::Debug for ContextOptions {
@@ -92,6 +125,8 @@ impl std::fmt::Debug for ContextOptions {
             .field("has_model", &self.model.is_some())
             .field("has_recall", &self.recall.is_some())
             .field("has_session_memory", &self.session_memory.is_some())
+            .field("has_recorder", &self.recorder.is_some())
+            .field("has_usage_analyzer", &self.usage_analyzer.is_some())
             .finish_non_exhaustive()
     }
 }

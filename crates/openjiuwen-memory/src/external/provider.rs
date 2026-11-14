@@ -43,18 +43,49 @@
 //! A provider must never panic on user input and must never swallow an error into an
 //! empty success.
 //!
+//! # Tool rail
+//!
+//! The Python SPI is tool-rail oriented, so the trait also carries the rail as
+//! *provided* methods — a backend gets a working rail for free and overrides only what it
+//! wants to change:
+//!
+//! | Method | Default |
+//! | --- | --- |
+//! | [`MemoryProvider::is_available`] | any declared capability ([`ProviderCapabilities::none`] means "not configured"); no network call |
+//! | [`MemoryProvider::is_initialized`] | `false` |
+//! | [`MemoryProvider::default_scope`] | [`MemoryScope::default`]; vendors derive it from their configuration |
+//! | [`MemoryProvider::get_tool_schemas`] | the four vendor-neutral specs from [`crate::external::rail::default_tool_schemas`] |
+//! | [`MemoryProvider::handle_tool_call`] | dispatches those four tools against [`MemoryProvider::default_scope`] |
+//! | [`MemoryProvider::prefetch`] | one recall rendered by [`crate::prompt::render_snippets`] |
+//! | [`MemoryProvider::sync_turn`] | one episodic memory holding the exchange |
+//! | [`MemoryProvider::system_prompt_block`] | `""` |
+//! | [`MemoryProvider::on_session_end`] | no-op |
+//!
+//! The rail's error policy differs from the record SPI on purpose, and matches Python:
+//! [`MemoryProvider::handle_tool_call`] returns a `{"error": …}` object and logs the
+//! cause at `debug` instead of failing the turn, and [`MemoryProvider::prefetch`] returns
+//! an empty string, because a rail tool is model-facing and a raised error would abort the
+//! conversation. [`MemoryProvider::sync_turn`] and [`MemoryProvider::on_session_end`] are
+//! caller-facing and therefore keep returning [`openjiuwen_common::error::Error`].
+//!
 //! [`SearchMode`]: crate::record::SearchMode
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use openjiuwen_common::error::Result;
 
+use super::rail;
+use crate::analyzer::ConversationTurn;
 use crate::record::{
     AddOptions, AddOutcome, CallOptions, MemoryFilter, MemoryRecord, MemoryScope, MemoryUpdate,
     NewMemory, RecallHit, SearchOptions,
 };
+
+/// The tracing target of provider and rail diagnostics.
+const TARGET: &str = "openjiuwen_memory::external";
 
 /// The operations a backend actually implements.
 ///
@@ -288,6 +319,219 @@ pub trait MemoryProvider: Send + Sync {
     /// false, .. })`; [`openjiuwen_common::error::Error::Unsupported`] is reserved for a
     /// backend that cannot be probed at all.
     async fn health(&self) -> Result<ProviderHealth>;
+
+    /// Whether the provider is configured and ready, evaluated without any network call.
+    ///
+    /// The default reports readiness as soon as the backend declares one capability, so a
+    /// provider with no credential and no backend reports `false`. A vendor whose readiness
+    /// depends on configuration overrides this with the exact check (Python's `mem0`
+    /// provider answers "an API key is set").
+    fn is_available(&self) -> bool {
+        rail::is_available(&self.capabilities())
+    }
+
+    /// Whether [`Self::initialize`] has run on this provider.
+    ///
+    /// The SPI cannot observe that for an arbitrary backend, so the default is `false`; a
+    /// provider that tracks its own setup state overrides it.
+    fn is_initialized(&self) -> bool {
+        false
+    }
+
+    /// The scope the tool rail reads and writes when a tool call carries no scope.
+    ///
+    /// Defaults to [`MemoryScope::default`] (the `__default__` user and scope). A vendor
+    /// derives it from its configuration — the user id it was built for, its workspace —
+    /// because a rail tool never receives a full [`MemoryScope`].
+    fn default_scope(&self) -> MemoryScope {
+        MemoryScope::default()
+    }
+
+    /// The JSON-Schema tool specs this provider advertises to a model.
+    ///
+    /// Defaults to the four vendor-neutral specs of
+    /// [`crate::external::rail::default_tool_schemas`]; a provider that overrides this must
+    /// override [`Self::handle_tool_call`] to accept the same names.
+    fn get_tool_schemas(&self) -> Vec<Value> {
+        rail::default_tool_schemas()
+    }
+
+    /// Executes one model-issued tool call and returns its JSON payload.
+    ///
+    /// The default dispatch handles [`rail::ADD_MEMORY_TOOL`], [`rail::SEARCH_MEMORY_TOOL`],
+    /// [`rail::LIST_MEMORIES_TOOL`], and [`rail::DELETE_MEMORY_TOOL`] against
+    /// [`Self::default_scope`]:
+    ///
+    /// - `add_memory` → `{"result": "stored", "id", "content"}`
+    /// - `search_memory` → `{"results": [{"id", "content", "score", "type"}], "count"}`
+    /// - `list_memories` → `{"memories": [{"id", "content", "type", "importance"}], "count"}`
+    /// - `delete_memory` → `{"result": "deleted" | "not_found", "id"}`
+    ///
+    /// An unknown tool name answers `{"error": "unknown tool: <name>"}`. A validation or
+    /// backend failure is **not** propagated — the payload is `{"error": <message>}` and
+    /// the cause is logged at `debug`, mirroring the Python rail, which never raises out of
+    /// a tool call because a raised error would abort the conversation. The error is never
+    /// dropped silently: `tracing` always records it.
+    async fn handle_tool_call(&self, tool: &str, args: &Value) -> Value {
+        let scope = self.default_scope();
+        match tool {
+            rail::ADD_MEMORY_TOOL => {
+                let memory = match rail::parse_add_args(args) {
+                    Ok(memory) => memory,
+                    Err(error) => return rail::tool_error(error.to_string()),
+                };
+                match self.add(&scope, vec![memory], &AddOptions::default()).await {
+                    Ok(outcome) => outcome
+                        .added
+                        .first()
+                        .or_else(|| outcome.merged.first())
+                        .map_or_else(
+                            || rail::tool_error("the memory was neither added nor merged"),
+                            rail::stored_result,
+                        ),
+                    Err(error) => return tool_failure(self.name(), tool, &error),
+                }
+            }
+            rail::SEARCH_MEMORY_TOOL => {
+                let (query, options) = match rail::parse_search_args(args) {
+                    Ok(parsed) => parsed,
+                    Err(error) => return rail::tool_error(error.to_string()),
+                };
+                match self.search(&scope, &query, &options).await {
+                    Ok(hits) => rail::search_results(&hits),
+                    Err(error) => return tool_failure(self.name(), tool, &error),
+                }
+            }
+            rail::LIST_MEMORIES_TOOL => {
+                let map = rail::args_object(args);
+                let mut filter = MemoryFilter::for_scope(&scope);
+                if let Some(raw) = rail::string_arg(map, "kind")
+                    .map(str::trim)
+                    .filter(|raw| !raw.is_empty())
+                {
+                    match rail::parse_kind(raw) {
+                        Ok(kind) => filter.kinds.push(kind),
+                        Err(error) => return rail::tool_error(error.to_string()),
+                    }
+                }
+                let limit = rail::integer_arg(map, "limit")
+                    .map_or(rail::DEFAULT_LIST_LIMIT, |limit| {
+                        usize::try_from(limit)
+                            .unwrap_or(rail::DEFAULT_LIST_LIMIT)
+                            .max(1)
+                    })
+                    .min(rail::MAX_LIST_LIMIT);
+                match self.list(&filter).await {
+                    Ok(mut records) => {
+                        records.truncate(limit);
+                        rail::memory_listing(&records)
+                    }
+                    Err(error) => return tool_failure(self.name(), tool, &error),
+                }
+            }
+            rail::DELETE_MEMORY_TOOL => {
+                let id = match rail::string_arg(rail::args_object(args), "id")
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                {
+                    Some(id) => id.to_owned(),
+                    None => return rail::tool_error("missing required parameter: id"),
+                };
+                match self.delete(&scope, &id).await {
+                    Ok(existed) => rail::deleted_result(&id, existed),
+                    Err(error) => return tool_failure(self.name(), tool, &error),
+                }
+            }
+            other => rail::tool_error(format!("unknown tool: {other}")),
+        }
+    }
+
+    /// Renders the memories relevant to `query` as prompt text for the current turn.
+    ///
+    /// A blank query returns `""` without touching the backend. Otherwise one recall of
+    /// [`rail::DEFAULT_PREFETCH_TOP_K`] hits runs against [`Self::default_scope`] and is
+    /// rendered by [`crate::prompt::render_snippets`] within
+    /// [`rail::DEFAULT_PREFETCH_MAX_TOKENS`]; no hits, or a failed recall, render to `""`
+    /// so a degraded memory backend never breaks the turn (the failure is logged at
+    /// `debug`).
+    async fn prefetch(&self, query: &str) -> String {
+        let query = query.trim();
+        if query.is_empty() {
+            return String::new();
+        }
+        let options = SearchOptions::default().with_top_k(rail::DEFAULT_PREFETCH_TOP_K);
+        match self.search(&self.default_scope(), query, &options).await {
+            Ok(hits) => crate::prompt::render_snippets(&hits, rail::DEFAULT_PREFETCH_MAX_TOKENS),
+            Err(error) => {
+                tracing::debug!(
+                    target: TARGET,
+                    provider = %self.name(),
+                    %error,
+                    "memory rail prefetch failed; the turn continues without recalled memories"
+                );
+                String::new()
+            }
+        }
+    }
+
+    /// Records one exchange as an episodic memory.
+    ///
+    /// Both messages must hold a non-whitespace character; otherwise nothing is written and
+    /// `Ok(())` is returned (Python's rail skips a half turn the same way). The stored
+    /// content is `"User: <user>\nAssistant: <assistant>"` with source `"conversation"`, so
+    /// a later recall can tell a synced exchange from an explicitly stored fact.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's write error unchanged; a session that cannot persist its turn
+    /// may decide to log it, but the SPI never hides it.
+    async fn sync_turn(&self, user_msg: &str, assistant_msg: &str) -> Result<()> {
+        if user_msg.trim().is_empty() || assistant_msg.trim().is_empty() {
+            return Ok(());
+        }
+        let memory = NewMemory::episodic(format!("User: {user_msg}\nAssistant: {assistant_msg}"))
+            .with_source("conversation");
+        self.add(&self.default_scope(), vec![memory], &AddOptions::default())
+            .await
+            .map(|_outcome| ())
+    }
+
+    /// Provider guidance to splice into the agent's system prompt.
+    ///
+    /// The default is empty: a backend with nothing to say about its own tools stays out of
+    /// the prompt. A provider that advertises tools overrides this to explain them, as
+    /// Python's `mem0` provider does.
+    fn system_prompt_block(&self) -> String {
+        String::new()
+    }
+
+    /// Finalises a session with every turn it produced.
+    ///
+    /// The default is a no-op: a provider that consolidates at session end (one summary
+    /// write, one remote flush) overrides it. A turn list may be empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's error when the finalisation write fails.
+    async fn on_session_end(&self, messages: &[ConversationTurn]) -> Result<()> {
+        let _ = messages;
+        Ok(())
+    }
+}
+
+/// Turns a rail tool failure into the `{"error": …}` payload, logging the cause.
+///
+/// The Python rail returns the exception text to the model; the diagnostic stays on the
+/// `debug` channel here so the message surface is unchanged while operators keep the cause.
+fn tool_failure(provider: &str, tool: &str, error: &openjiuwen_common::error::Error) -> Value {
+    tracing::debug!(
+        target: TARGET,
+        provider,
+        tool,
+        %error,
+        "memory rail tool call failed"
+    );
+    rail::tool_error(error.to_string())
 }
 
 #[cfg(test)]
@@ -446,5 +690,303 @@ mod tests {
         let provider: Arc<dyn MemoryProvider> = Arc::new(NullProvider);
         assert_eq!(provider.name(), "null");
         takes_provider(provider.as_ref());
+    }
+
+    /// A provider with no backend at all: it declares no capability and every record call
+    /// fails, which is exactly the shape the rail must degrade from.
+    struct UnbackedProvider;
+
+    /// The error every [`UnbackedProvider`] call returns.
+    fn no_backend() -> openjiuwen_common::error::Error {
+        openjiuwen_common::error::Error::unsupported("no backend configured")
+    }
+
+    #[async_trait]
+    impl MemoryProvider for UnbackedProvider {
+        fn name(&self) -> &'static str {
+            "unbacked"
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::none()
+        }
+
+        async fn initialize(&self) -> Result<()> {
+            Err(no_backend())
+        }
+
+        async fn add(
+            &self,
+            _scope: &MemoryScope,
+            _memories: Vec<NewMemory>,
+            _options: &AddOptions,
+        ) -> Result<AddOutcome> {
+            Err(no_backend())
+        }
+
+        async fn search(
+            &self,
+            _scope: &MemoryScope,
+            _query: &str,
+            _options: &SearchOptions,
+        ) -> Result<Vec<RecallHit>> {
+            Err(no_backend())
+        }
+
+        async fn get(&self, _scope: &MemoryScope, _id: &str) -> Result<Option<MemoryRecord>> {
+            Err(no_backend())
+        }
+
+        async fn update(
+            &self,
+            _scope: &MemoryScope,
+            _id: &str,
+            _update: MemoryUpdate,
+            _options: &CallOptions,
+        ) -> Result<MemoryRecord> {
+            Err(no_backend())
+        }
+
+        async fn delete(&self, _scope: &MemoryScope, _id: &str) -> Result<bool> {
+            Err(no_backend())
+        }
+
+        async fn list(&self, _filter: &MemoryFilter) -> Result<Vec<MemoryRecord>> {
+            Err(no_backend())
+        }
+
+        async fn clear(&self, _filter: &MemoryFilter) -> Result<usize> {
+            Err(no_backend())
+        }
+
+        async fn health(&self) -> Result<ProviderHealth> {
+            Err(no_backend())
+        }
+    }
+
+    /// A local rail provider over a fresh in-memory engine.
+    async fn local_rail() -> crate::external::EngineProvider {
+        let memory =
+            crate::facade::LongTermMemory::in_memory(crate::config::MemoryEngineConfig::default())
+                .await
+                .expect("in-memory facade");
+        crate::external::EngineProvider::new(Arc::clone(memory.engine()))
+    }
+
+    #[test]
+    fn the_default_tool_set_is_advertised_without_a_backend() {
+        let provider = UnbackedProvider;
+        let schemas = provider.get_tool_schemas();
+        assert_eq!(schemas.len(), 4);
+        let mut names: Vec<&str> = schemas
+            .iter()
+            .map(|schema| schema["name"].as_str().expect("tool name"))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                rail::ADD_MEMORY_TOOL,
+                rail::SEARCH_MEMORY_TOOL,
+                rail::LIST_MEMORIES_TOOL,
+                rail::DELETE_MEMORY_TOOL
+            ]
+        );
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 4, "tool names are unique");
+        for schema in &schemas {
+            assert_eq!(schema["parameters"]["type"], serde_json::json!("object"));
+            assert!(schema["parameters"]["properties"].is_object());
+            assert!(schema["parameters"]["required"].is_array());
+        }
+
+        assert!(!provider.is_available(), "no declared capability");
+        assert!(!provider.is_initialized());
+        assert_eq!(provider.default_scope(), MemoryScope::default());
+        assert_eq!(provider.system_prompt_block(), "");
+    }
+
+    #[tokio::test]
+    async fn handle_tool_call_round_trips_every_default_tool() {
+        let provider = local_rail().await;
+
+        let stored = provider
+            .handle_tool_call(
+                rail::ADD_MEMORY_TOOL,
+                &serde_json::json!({ "content": "alice prefers dark mode" }),
+            )
+            .await;
+        assert_eq!(stored["result"], serde_json::json!("stored"));
+        assert_eq!(
+            stored["content"],
+            serde_json::json!("alice prefers dark mode")
+        );
+        let id = stored["id"].as_str().expect("stored id").to_owned();
+
+        let listing = provider
+            .handle_tool_call(rail::LIST_MEMORIES_TOOL, &serde_json::json!({}))
+            .await;
+        assert_eq!(listing["count"], serde_json::json!(1));
+        assert_eq!(listing["memories"][0]["id"], serde_json::json!(id));
+        assert_eq!(
+            listing["memories"][0]["type"],
+            serde_json::json!("semantic_memory")
+        );
+
+        let narrowed = provider
+            .handle_tool_call(
+                rail::LIST_MEMORIES_TOOL,
+                &serde_json::json!({ "kind": "coding", "limit": 5 }),
+            )
+            .await;
+        assert_eq!(narrowed["count"], serde_json::json!(0));
+        let bad_kind = provider
+            .handle_tool_call(
+                rail::LIST_MEMORIES_TOOL,
+                &serde_json::json!({ "kind": "nope" }),
+            )
+            .await;
+        assert!(
+            bad_kind["error"]
+                .as_str()
+                .expect("error payload")
+                .contains("unknown memory kind"),
+            "{bad_kind}"
+        );
+
+        let searched = provider
+            .handle_tool_call(
+                rail::SEARCH_MEMORY_TOOL,
+                &serde_json::json!({ "query": "dark mode" }),
+            )
+            .await;
+        assert_eq!(searched["count"], serde_json::json!(1));
+        assert_eq!(
+            searched["results"][0]["content"],
+            serde_json::json!("alice prefers dark mode")
+        );
+
+        let deleted = provider
+            .handle_tool_call(rail::DELETE_MEMORY_TOOL, &serde_json::json!({ "id": id }))
+            .await;
+        assert_eq!(
+            deleted,
+            serde_json::json!({ "result": "deleted", "id": id })
+        );
+        let again = provider
+            .handle_tool_call(rail::DELETE_MEMORY_TOOL, &serde_json::json!({ "id": id }))
+            .await;
+        assert_eq!(
+            again,
+            serde_json::json!({ "result": "not_found", "id": id })
+        );
+
+        let unknown = provider
+            .handle_tool_call("nope", &serde_json::json!({}))
+            .await;
+        assert_eq!(
+            unknown,
+            serde_json::json!({ "error": "unknown tool: nope" })
+        );
+
+        let missing = provider
+            .handle_tool_call(rail::ADD_MEMORY_TOOL, &serde_json::json!({}))
+            .await;
+        assert!(
+            missing["error"]
+                .as_str()
+                .expect("error payload")
+                .contains("missing required parameter: content"),
+            "{missing}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_skips_blank_queries_and_renders_hits() {
+        let provider = local_rail().await;
+        assert_eq!(provider.prefetch("").await, "");
+        assert_eq!(provider.prefetch("   ").await, "");
+        assert_eq!(provider.prefetch("nothing is stored yet").await, "");
+
+        provider
+            .handle_tool_call(
+                rail::ADD_MEMORY_TOOL,
+                &serde_json::json!({ "content": "alice prefers dark mode" }),
+            )
+            .await;
+        let rendered = provider.prefetch("dark mode").await;
+        assert!(rendered.contains("alice prefers dark mode"), "{rendered}");
+        assert!(rendered.starts_with("## "), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn sync_turn_stores_one_episodic_memory_and_skips_blank_turns() {
+        let memory =
+            crate::facade::LongTermMemory::in_memory(crate::config::MemoryEngineConfig::default())
+                .await
+                .expect("in-memory facade");
+        let provider = crate::external::EngineProvider::new(Arc::clone(memory.engine()));
+        let scope = MemoryScope::default();
+
+        provider
+            .sync_turn("   ", "an answer")
+            .await
+            .expect("blank user");
+        provider
+            .sync_turn("a question", "  ")
+            .await
+            .expect("blank assistant");
+        assert_eq!(
+            memory.list(&scope, &[]).await.expect("list"),
+            Vec::new(),
+            "a half turn is not written"
+        );
+
+        provider
+            .sync_turn("what theme?", "dark mode")
+            .await
+            .expect("sync");
+        let listed = memory.list(&scope, &[]).await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, crate::record::MemoryType::EpisodicMemory);
+        assert_eq!(listed[0].content, "User: what theme?\nAssistant: dark mode");
+        assert_eq!(listed[0].source.as_deref(), Some("conversation"));
+    }
+
+    #[tokio::test]
+    async fn the_rail_degrades_instead_of_raising() {
+        let provider = UnbackedProvider;
+        let payload = provider
+            .handle_tool_call(
+                rail::ADD_MEMORY_TOOL,
+                &serde_json::json!({ "content": "x" }),
+            )
+            .await;
+        assert!(
+            payload["error"]
+                .as_str()
+                .expect("error payload")
+                .contains("no backend configured"),
+            "{payload}"
+        );
+        let search = provider
+            .handle_tool_call(
+                rail::SEARCH_MEMORY_TOOL,
+                &serde_json::json!({ "query": "x" }),
+            )
+            .await;
+        assert_eq!(
+            search,
+            serde_json::json!({ "error": "unsupported: no backend configured" })
+        );
+        assert_eq!(provider.prefetch("query").await, "");
+        provider
+            .on_session_end(&[ConversationTurn::new("user", "hi")])
+            .await
+            .expect("no-op session end");
+        provider
+            .on_session_end(&[])
+            .await
+            .expect("empty session end");
     }
 }

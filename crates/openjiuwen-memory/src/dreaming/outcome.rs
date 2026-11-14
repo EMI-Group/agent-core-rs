@@ -8,6 +8,7 @@ use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 use super::model::{validate_non_empty, DreamMetrics, DreamState};
+use super::sweep_lock::SweepLockSkip;
 
 /// The result of one completed dream attempt.
 ///
@@ -114,6 +115,13 @@ pub struct DreamRunSummary {
     pub cancelled: usize,
     /// The individual outcomes, in recording order.
     pub outcomes: Vec<DreamOutcome>,
+    /// Why this run skipped its sweep because the sweep lock was unavailable; default `None`.
+    ///
+    /// A run that reports a skip did no work at all (`scanned == 0`): no job was claimed and
+    /// no retention pass ran. The field is additive and `serde` omits it when absent, so
+    /// summaries written before it existed still round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_skip: Option<SweepLockSkip>,
 }
 
 impl DreamRunSummary {
@@ -121,6 +129,21 @@ impl DreamRunSummary {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Builds a summary that reports a skipped sweep: no work done, and `skip` as the reason.
+    #[must_use]
+    pub fn lock_skipped(skip: SweepLockSkip) -> Self {
+        Self {
+            lock_skip: Some(skip),
+            ..Self::default()
+        }
+    }
+
+    /// Whether this summary reports a skipped sweep rather than sweep work.
+    #[must_use]
+    pub const fn is_lock_skip(&self) -> bool {
+        self.lock_skip.is_some()
     }
 
     /// Returns `true` when no outcome has been recorded.
@@ -147,6 +170,9 @@ impl DreamRunSummary {
     }
 
     /// Folds `other` into `self`, concatenating the outcome lists.
+    ///
+    /// A skip marker is sticky: `self` keeps its own reason, and takes `other`'s when it has
+    /// none, so a merged total still remembers why part of it did nothing.
     pub fn merge(&mut self, other: Self) {
         self.scanned = self.scanned.saturating_add(other.scanned);
         self.succeeded = self.succeeded.saturating_add(other.succeeded);
@@ -154,6 +180,9 @@ impl DreamRunSummary {
         self.skipped = self.skipped.saturating_add(other.skipped);
         self.cancelled = self.cancelled.saturating_add(other.cancelled);
         self.outcomes.extend(other.outcomes);
+        if self.lock_skip.is_none() {
+            self.lock_skip = other.lock_skip;
+        }
     }
 }
 

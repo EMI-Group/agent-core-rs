@@ -420,6 +420,7 @@ fn config_round_trips_through_json_and_validates() {
         summary_merge_min_blocks: 4,
         prior_context_window_size: 5,
         custom_compression_prompt: Some("summarise".to_owned()),
+        ..CurrentRoundCompressorConfig::default()
     };
     assert!(config.validate().is_ok());
     let json = serde_json::to_string(&config).unwrap();

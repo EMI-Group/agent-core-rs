@@ -8,6 +8,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::sparse::SparseConfig;
+
 /// One entry of `git worktree list --porcelain`.
 ///
 /// `recorded` attaches the registry record when this helper created the
@@ -76,6 +78,8 @@ pub struct WorktreeCreateResult {
     pub head: Option<String>,
     /// Whether the worktree already existed and was recovered.
     pub existed: bool,
+    /// Sparse-checkout selection applied to the worktree, when any.
+    pub sparse: Option<SparseConfig>,
 }
 
 /// State of a worktree as seen by [`crate::worktree::WorktreeManager::status`].
@@ -100,6 +104,8 @@ pub struct WorktreeStatus {
     pub changed_files: usize,
     /// Whether the registry holds a record for this worktree.
     pub tracked: bool,
+    /// Sparse-checkout selection recorded for the worktree, when any.
+    pub sparse: Option<SparseConfig>,
 }
 
 impl WorktreeStatus {
@@ -156,6 +162,10 @@ pub struct WorktreeRecord {
     pub status: WorktreeState,
     /// Creation timestamp, RFC 3339 in UTC.
     pub created_at: String,
+    /// Sparse-checkout selection to re-apply when the worktree is re-entered.
+    pub sparse: Option<SparseConfig>,
+    /// HEAD commit SHA recorded at creation time, when git reported one.
+    pub head: Option<String>,
 }
 
 impl WorktreeRecord {
@@ -199,6 +209,20 @@ impl WorktreeRecord {
     #[must_use]
     pub fn with_created_at(mut self, created_at: impl Into<String>) -> Self {
         self.created_at = created_at.into();
+        self
+    }
+
+    /// Records the sparse-checkout selection of the worktree.
+    #[must_use]
+    pub fn with_sparse(mut self, sparse: SparseConfig) -> Self {
+        self.sparse = Some(sparse);
+        self
+    }
+
+    /// Records the HEAD commit SHA of the worktree.
+    #[must_use]
+    pub fn with_head(mut self, head: impl Into<String>) -> Self {
+        self.head = Some(head.into());
         self
     }
 }

@@ -29,6 +29,7 @@ use openjiuwen_agent::{
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_session::Session;
 
+use crate::agent::rail_events::{drain_rail_events, RailEventBus};
 use crate::rails::{
     HarnessRailContext, HarnessRailRegistry, TaskIterationInfo, TaskIterationPhase,
 };
@@ -200,6 +201,7 @@ pub struct RoundExecutorHandle {
     session: Option<Arc<dyn Session>>,
     state: Arc<RoundState>,
     stream_tx: Option<UnboundedSender<Result<AgentChunk>>>,
+    rail_events: Option<Arc<RailEventBus>>,
 }
 
 impl RoundExecutorHandle {
@@ -225,6 +227,7 @@ impl RoundExecutorHandle {
             session,
             state,
             stream_tx: None,
+            rail_events: None,
         }
     }
 
@@ -232,6 +235,19 @@ impl RoundExecutorHandle {
     #[must_use]
     pub fn with_stream_sender(mut self, tx: UnboundedSender<Result<AgentChunk>>) -> Self {
         self.stream_tx = Some(tx);
+        self
+    }
+
+    /// Returns this handle draining rail-queued events into `bus`.
+    ///
+    /// The [`RailEventDrain`](crate::agent::RailEventDrain) rail already drains
+    /// the contexts of both layers; this handle drains the contexts it builds
+    /// itself after every rail firing point, so events remain observable when a
+    /// registry has no drain rail (and no event is drained twice: the rail takes
+    /// them out of `extra` first).
+    #[must_use]
+    pub fn with_rail_events(mut self, bus: Arc<RailEventBus>) -> Self {
+        self.rail_events = Some(bus);
         self
     }
 
@@ -273,8 +289,26 @@ impl RoundExecutorHandle {
     /// Fires the user-message and steering hooks for one turn.
     async fn fire_pre_hooks(&self, inputs: &Value) -> Result<()> {
         let mut ctx = HarnessRailContext::new(self.base_context(inputs));
-        self.rails.fire_user_message(&mut ctx).await?;
-        self.rails.fire_steering_drain(&mut ctx).await
+        let result = async {
+            self.rails.fire_user_message(&mut ctx).await?;
+            self.rails.fire_steering_drain(&mut ctx).await
+        }
+        .await;
+        self.drain_events(&mut ctx);
+        result
+    }
+
+    /// Moves the events `ctx` queued into the rail event bus, when one is wired.
+    ///
+    /// Nothing is touched without a bus, and the rail contexts this handle
+    /// builds are drained exactly once: the entries are removed from `extra`.
+    fn drain_events(&self, ctx: &mut HarnessRailContext) {
+        let Some(bus) = &self.rail_events else {
+            return;
+        };
+        for event in drain_rail_events(ctx) {
+            bus.push(event);
+        }
     }
 
     /// Drains the inner stream, forwarding frames and returning the terminal
@@ -349,11 +383,12 @@ impl RoundExecutor for RoundExecutorHandle {
         };
 
         let mut before = HarnessRailContext::new(self.base_context(&inputs));
-        if let Err(error) = self
+        let fired = self
             .rails
             .fire_task_iteration(&mut before, info, TaskIterationPhase::Before)
-            .await
-        {
+            .await;
+        self.drain_events(&mut before);
+        if let Err(error) = fired {
             return Ok(RoundOutcome::failed(RAIL_ERROR_CODE, error.to_string()));
         }
 
@@ -380,11 +415,12 @@ impl RoundExecutor for RoundExecutorHandle {
         let mut after_base = self.base_context(&inputs);
         after_base.output = output;
         let mut after = HarnessRailContext::new(after_base);
-        if let Err(error) = self
+        let fired = self
             .rails
             .fire_task_iteration(&mut after, info, TaskIterationPhase::After)
-            .await
-        {
+            .await;
+        self.drain_events(&mut after);
+        if let Err(error) = fired {
             tracing::warn!(error = %error, "after_task_iteration hook failed");
         }
 

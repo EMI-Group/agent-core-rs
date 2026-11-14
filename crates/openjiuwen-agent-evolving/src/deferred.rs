@@ -2,8 +2,9 @@
 //!
 //! Almost the whole Python `openjiuwen.agent_evolving` area is ported as offline,
 //! deterministic Rust. What remains deferred is the part that genuinely needs a
-//! Python ML stack (`torch`, `transformers`, `verl`, `ray`), a distributed service
-//! (Redis, vLLM), a vendor HTTP service with authentication, or a remote hub.
+//! Python ML stack (`torch`, `transformers`, `verl`, `ray`), a vendor HTTP gateway
+//! with authentication, a container browser runtime (`playwright`) with image
+//! decoding (`PIL`), or Python's own training-stack configuration files.
 //!
 //! This module names those areas and builds the explicit
 //! [`openjiuwen_common::error::Error::Unsupported`] each deferred path returns,
@@ -85,32 +86,16 @@ pub const DEFERRED_FEATURES: &[DeferredFeature] = &[
         reason: "Python-only distributed ML stack (torch, transformers, verl, ray)",
     },
     DeferredFeature {
-        area: "online RL service state machine",
-        reason: "needs Redis task queues, vLLM/verl executors and gateway integration",
-    },
-    DeferredFeature {
         area: "agent_rl proxy/judge/verification gateway",
-        reason: "vendor HTTP services and authentication",
+        reason: "vendor HTTP gateway services and their authentication",
     },
     DeferredFeature {
         area: "RL YAML configuration ecosystem",
-        reason: "Python training-stack configuration (verl/ray configs)",
+        reason: "Python training-stack configuration files (verl/ray YAML)",
     },
     DeferredFeature {
-        area: "vendor reward checks (browser/PIL/evidence agent)",
-        reason: "container browser sessions, image analysis and the evidence agent model flow",
-    },
-    DeferredFeature {
-        area: "remote sharing hub client",
-        reason: "remote hub transport and authentication; local-file and memory backends are ported",
-    },
-    DeferredFeature {
-        area: "LLM experience draft pipeline",
-        reason: "live model drafting and the online orchestrator; deterministic extraction is ported",
-    },
-    DeferredFeature {
-        area: "TTSE embedding retrieval and LLM dreaming",
-        reason: "embedding provider, vector index and model merge passes; deterministic bank/consult are ported",
+        area: "vendor reward checks (browser/PIL)",
+        reason: "container browser runtime (playwright) and image decoding (PIL); the evidence-agent and model-judged checks are ported",
     },
     DeferredFeature {
         area: "full Python agent_evolving unit suite",
@@ -139,12 +124,23 @@ mod tests {
     #[test]
     fn table_covers_every_documented_area() {
         let areas: Vec<&str> = deferred_features().iter().map(|f| f.area).collect();
-        assert_eq!(areas.len(), 9);
+        assert_eq!(areas.len(), 5);
         assert!(areas.contains(&"RL trainer (PPO/verl/ray)"));
-        assert!(areas.contains(&"online RL service state machine"));
-        assert!(areas.contains(&"remote sharing hub client"));
+        assert!(areas.contains(&"agent_rl proxy/judge/verification gateway"));
         assert!(areas.contains(&"RL YAML configuration ecosystem"));
+        assert!(areas.contains(&"vendor reward checks (browser/PIL)"));
         assert!(areas.contains(&"full Python agent_evolving unit suite"));
+        for implemented in [
+            "online RL service state machine",
+            "remote sharing hub client",
+            "LLM experience draft pipeline",
+            "TTSE embedding retrieval and LLM dreaming",
+        ] {
+            assert!(
+                !areas.contains(&implemented),
+                "{implemented} is implemented and must not be listed as deferred"
+            );
+        }
     }
 
     #[test]
@@ -155,6 +151,10 @@ mod tests {
             "prompt/textual-gradient optimizers",
             "evaluator_pipeline",
             "reward, attribution, experience, sharing, signal, trajectory and ttse subsystems",
+            "online RL service state machine",
+            "remote sharing hub client",
+            "LLM experience draft pipeline",
+            "TTSE embedding retrieval and LLM dreaming",
         ] {
             assert!(
                 !areas.contains(&legacy),
@@ -194,11 +194,11 @@ mod tests {
     #[test]
     fn deserialization_resolves_the_canonical_entry() {
         let decoded: DeferredFeature = serde_json::from_str(
-            r#"{"area":"remote sharing hub client","reason":"ignored","unknown_field":true}"#,
+            r#"{"area":"RL trainer (PPO/verl/ray)","reason":"ignored","unknown_field":true}"#,
         )
         .expect("deserialize");
-        assert_eq!(decoded.area, "remote sharing hub client");
-        assert!(decoded.reason.contains("local-file and memory backends"));
+        assert_eq!(decoded.area, "RL trainer (PPO/verl/ray)");
+        assert!(decoded.reason.contains("torch"));
     }
 
     #[test]

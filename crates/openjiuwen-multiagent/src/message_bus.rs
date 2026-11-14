@@ -307,6 +307,42 @@ impl MessageBus {
         self.subscriptions.topics_of(agent_id)
     }
 
+    /// Removes every subscription of `agent_id` and returns how many were removed.
+    ///
+    /// Python parity: `MessageBus.remove_all_subscriptions`, which delegates to
+    /// `SubscriptionManager.unsubscribe_all`; the runtime calls it when a member
+    /// is unregistered.
+    pub fn remove_all_subscriptions(&self, agent_id: &str) -> usize {
+        self.subscriptions.unsubscribe_all(agent_id)
+    }
+
+    /// Returns the whole registry as `pattern -> sorted agent ids`.
+    ///
+    /// Python parity: `MessageBus.list_subscriptions()` without an agent filter
+    /// (Python's unordered sets are sorted here for determinism).
+    #[must_use]
+    pub fn list_subscriptions(&self) -> BTreeMap<String, Vec<String>> {
+        self.subscriptions.list()
+    }
+
+    /// Returns the sorted patterns `agent_id` is subscribed to.
+    ///
+    /// Python parity: the `topics` list of
+    /// `MessageBus.list_subscriptions(agent_id)`.
+    #[must_use]
+    pub fn list_agent_subscriptions(&self, agent_id: &str) -> Vec<String> {
+        self.subscriptions.topics_of(agent_id)
+    }
+
+    /// Returns the total number of `(agent, pattern)` pairs.
+    ///
+    /// Python parity: `MessageBus.get_subscription_count`, the sum of the
+    /// per-pattern subscriber counts.
+    #[must_use]
+    pub fn get_subscription_count(&self) -> usize {
+        self.subscriptions.subscription_count()
+    }
+
     /// Sends a point-to-point envelope and waits for the reply.
     ///
     /// The envelope's [`session_id`](MessageEnvelope::session_id) selects the

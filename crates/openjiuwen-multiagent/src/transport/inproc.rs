@@ -5,6 +5,7 @@
 //! [`MessageBus`], so a team routed through [`InProcessTransport`] behaves
 //! exactly like a team talking to the bus directly.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -107,5 +108,17 @@ impl TeamTransport for InProcessTransport {
 
     fn subscribers(&self, topic_id: &str) -> Vec<String> {
         self.bus.subscribers(topic_id)
+    }
+
+    fn list_subscriptions(&self) -> BTreeMap<String, Vec<String>> {
+        self.bus.list_subscriptions()
+    }
+
+    fn agent_subscriptions(&self, agent_id: &str) -> Vec<String> {
+        self.bus.list_agent_subscriptions(agent_id)
+    }
+
+    fn subscription_count(&self) -> usize {
+        self.bus.get_subscription_count()
     }
 }

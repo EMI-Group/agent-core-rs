@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::events::ContextEvent;
 use crate::tokens::{count_message, count_messages};
+use crate::usage::ContextUsageSnapshot;
 use crate::window::dialogue_round_ranges;
 
 /// Per-role message and token counts plus compression counters.
@@ -101,6 +102,17 @@ pub struct PreparedContext {
     pub window_size: Option<usize>,
     /// Processor events produced while preparing.
     pub events: Vec<ContextEvent>,
+    /// The `context.usage` payload of the prepared window.
+    ///
+    /// `Some` only when a [`ContextUsageAnalyzer`] is configured on the engine
+    /// or the context; the snapshot explains where the window's prompt tokens
+    /// went and is never part of the request. Telemetry can never fail a
+    /// preparation, so a missing analyzer leaves this `None` rather than
+    /// returning an error.
+    ///
+    /// [`ContextUsageAnalyzer`]: crate::usage::ContextUsageAnalyzer
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ContextUsageSnapshot>,
 }
 
 #[cfg(test)]
@@ -169,6 +181,7 @@ mod tests {
             overflow: false,
             window_size: Some(10),
             events: Vec::new(),
+            usage: None,
         };
         let json = serde_json::to_string(&prepared).unwrap();
         assert_eq!(

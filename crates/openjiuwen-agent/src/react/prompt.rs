@@ -2,12 +2,14 @@
 //!
 //! The identity section is the system-role text of
 //! [`ReActAgentConfig::prompt_template`], joined with a blank line and rendered
-//! against the invocation's template variables: the caller's extra keys plus
-//! `query`, `conversation_id`, `user_id`, and `run_kind` when present.
+//! against the invocation's template variables: the caller's extra keys,
+//! `query`, `conversation_id`, `user_id`, `run_kind` when present, and finally
+//! any extra render fields supplied by the caller (the memory rail's
+//! `ctx.extra["memory_variables"]`), which override same-named fields.
 use crate::input::AgentInput;
 use crate::react::config::ReActAgentConfig;
 use openjiuwen_foundation::{BaseMessage, PromptTemplate, TemplateContent};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 /// Renders the identity section of the system prompt for one invocation.
@@ -16,8 +18,16 @@ use std::collections::BTreeMap;
 /// `{{placeholder}}` variables are resolved with
 /// [`PromptTemplate::format`](openjiuwen_foundation::PromptTemplate); unknown
 /// placeholders are left untouched.
+///
+/// `extra_fields` is merged after every other render field, so it wins on a
+/// name collision; only its string values become template variables (mirroring
+/// Python's `_render_system_messages`).
 #[allow(dead_code)] // used by the loop's prompt construction
-pub(crate) fn build_identity(config: &ReActAgentConfig, input: &AgentInput) -> String {
+pub(crate) fn build_identity(
+    config: &ReActAgentConfig,
+    input: &AgentInput,
+    extra_fields: Option<&Map<String, Value>>,
+) -> String {
     let raw = config
         .prompt_template
         .iter()
@@ -45,6 +55,14 @@ pub(crate) fn build_identity(config: &ReActAgentConfig, input: &AgentInput) -> S
     if let Some(run_kind) = &input.run_kind {
         values.insert("run_kind".to_owned(), Value::String(run_kind.clone()));
     }
+    if let Some(extra_fields) = extra_fields {
+        values.extend(
+            extra_fields
+                .iter()
+                .filter(|(_, value)| value.is_string())
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
 
     let rendered = PromptTemplate::new(raw.clone()).format(&values);
     match rendered.content {
@@ -60,8 +78,12 @@ pub(crate) fn build_identity(config: &ReActAgentConfig, input: &AgentInput) -> S
 /// The content may be empty when the template carries no system-role messages;
 /// the loop still passes one system message so the window shape is stable.
 #[allow(dead_code)] // used by the loop's prompt construction
-pub(crate) fn build_system(config: &ReActAgentConfig, input: &AgentInput) -> BaseMessage {
-    BaseMessage::system(build_identity(config, input))
+pub(crate) fn build_system(
+    config: &ReActAgentConfig,
+    input: &AgentInput,
+    extra_fields: Option<&Map<String, Value>>,
+) -> BaseMessage {
+    BaseMessage::system(build_identity(config, input, extra_fields))
 }
 
 #[cfg(test)]
@@ -72,7 +94,7 @@ mod tests {
     #[test]
     fn no_template_renders_empty() {
         let config = ReActAgentConfig::new();
-        assert_eq!(build_identity(&config, &AgentInput::default()), "");
+        assert_eq!(build_identity(&config, &AgentInput::default(), None), "");
     }
 
     #[test]
@@ -85,7 +107,10 @@ mod tests {
         input
             .extra
             .insert("city".to_owned(), Value::String("Paris".to_owned()));
-        assert_eq!(build_identity(&config, &input), "hello bob from Paris");
+        assert_eq!(
+            build_identity(&config, &input, None),
+            "hello bob from Paris"
+        );
     }
 
     #[test]
@@ -95,7 +120,7 @@ mod tests {
             ..ReActAgentConfig::new()
         };
         assert_eq!(
-            build_identity(&config, &AgentInput::from_text("q")),
+            build_identity(&config, &AgentInput::from_text("q"), None),
             "hi {{missing}}"
         );
     }
@@ -110,7 +135,7 @@ mod tests {
             ..ReActAgentConfig::new()
         };
         assert_eq!(
-            build_identity(&config, &AgentInput::default()),
+            build_identity(&config, &AgentInput::default(), None),
             "system text"
         );
     }
@@ -121,15 +146,78 @@ mod tests {
             prompt_template: vec![BaseMessage::system("hello {{query}}")],
             ..ReActAgentConfig::new()
         };
-        let message = build_system(&config, &AgentInput::from_text("bob"));
+        let message = build_system(&config, &AgentInput::from_text("bob"), None);
         assert!(message.role.is_system());
         assert_eq!(message.text(), "hello bob");
     }
 
     #[test]
     fn build_system_allows_empty_content() {
-        let message = build_system(&ReActAgentConfig::new(), &AgentInput::default());
+        let message = build_system(&ReActAgentConfig::new(), &AgentInput::default(), None);
         assert!(message.role.is_system());
         assert_eq!(message.text(), "");
+    }
+
+    #[test]
+    fn memory_variables_render_into_the_system_template() {
+        let config = ReActAgentConfig {
+            prompt_template: vec![BaseMessage::system(
+                "memory: {{sys_long_term_memory}} vars: {{sys_memory_variables}}",
+            )],
+            ..ReActAgentConfig::new()
+        };
+        let fields = serde_json::json!({
+            "sys_memory_variables": "{\"name\":\"Alice\"}",
+            "sys_long_term_memory": "[\"用户画像记忆：\",\"likes helix\"]",
+        });
+        let Some(fields) = fields.as_object() else {
+            panic!("the fixture is an object");
+        };
+        let rendered = build_identity(&config, &AgentInput::from_text("q"), Some(fields));
+        assert_eq!(
+            rendered,
+            "memory: [\"用户画像记忆：\",\"likes helix\"] vars: {\"name\":\"Alice\"}"
+        );
+    }
+
+    #[test]
+    fn memory_variables_override_same_named_input_fields() {
+        let config = ReActAgentConfig {
+            prompt_template: vec![BaseMessage::system("{{user_id}} / {{city}}")],
+            ..ReActAgentConfig::new()
+        };
+        let mut input = AgentInput::from_text("q");
+        input.user_id = Some("alice".to_owned());
+        input
+            .extra
+            .insert("city".to_owned(), Value::String("Paris".to_owned()));
+        let fields = serde_json::json!({
+            "user_id": "override",
+            "city": "Lyon",
+            "ignored": {"nested": true},
+        });
+        let Some(fields) = fields.as_object() else {
+            panic!("the fixture is an object");
+        };
+        assert_eq!(
+            build_identity(&config, &input, Some(fields)),
+            "override / Lyon"
+        );
+    }
+
+    #[test]
+    fn unknown_placeholders_stay_literal_with_memory_variables() {
+        let config = ReActAgentConfig {
+            prompt_template: vec![BaseMessage::system("{{sys_long_term_memory}} {{missing}}")],
+            ..ReActAgentConfig::new()
+        };
+        let fields = serde_json::json!({"sys_long_term_memory": "[]"});
+        let Some(fields) = fields.as_object() else {
+            panic!("the fixture is an object");
+        };
+        assert_eq!(
+            build_identity(&config, &AgentInput::from_text("q"), Some(fields)),
+            "[] {{missing}}"
+        );
     }
 }

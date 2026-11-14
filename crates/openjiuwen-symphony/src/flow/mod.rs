@@ -22,8 +22,12 @@
 //! - [`engine`](crate::flow::engine) — `FlowEngine`: open/ingest/distill/list/candidates/close.
 //! - [`pack`](crate::flow::pack) — `SkillPack`, its `SKILL.md`/`dependencies.yaml` rendering,
 //!   content-addressed identity, and save/load round-tripping.
-//! - [`review`](crate::flow::review) — `Reviewer`, the seven deterministic checks, `ReviewResult`,
-//!   and `FlowEngine::review_and_prepare_install`.
+//! - [`codegen`](crate::flow::codegen) — the generated SwarmFlow `run.py` script, its
+//!   content-addressed `combo-<12 hex>` identifier, and the line-oriented validator.
+//! - [`render`](crate::flow::render) — the `SkillPack` adapter that renders one reviewed
+//!   package as an SDD-0010 `SKILL.md` document, and the unsupported-target boundary.
+//! - [`review`](crate::flow::review) — `Reviewer`, the ten deterministic checks,
+//!   `ReviewResult`, and `FlowEngine::review_and_prepare_install`.
 //!
 //! # Determinism
 //!
@@ -31,12 +35,17 @@
 //! (`reviewed_at`, `distilled_at`) and never participate in ids or equality, and
 //! content-addressed ids are sha256 over canonical JSON (object keys sorted).
 
+pub mod codegen;
 pub mod engine;
 pub mod model;
 pub mod pack;
+pub mod render;
 pub mod review;
 pub mod store;
 
+pub use codegen::{
+    generate_swarmflow_script, swarmflow_identifier, validate_generated_script, SwarmflowScript,
+};
 pub use engine::{DistillReport, FlowEngine};
 pub use model::{
     canonical_json, content_hash, is_valid_meta_name, normalize_capability_id, normalize_meta_name,
@@ -47,6 +56,7 @@ pub use model::{
     SKILL_PACK_TYPE,
 };
 pub use pack::{SkillPack, SkillPackStep};
+pub use render::{render_package, RenderedArtifact, SkillAdapter, SkillPackAdapter};
 pub use review::{
     InstallPreparation, ReviewCheck, ReviewResult, Reviewer, CHECK_FAIL, CHECK_PASS,
     REVIEW_SCHEMA_VERSION, VERDICT_APPROVED, VERDICT_NEEDS_HUMAN_REVIEW, VERDICT_REJECTED,

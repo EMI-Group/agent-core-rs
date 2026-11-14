@@ -26,10 +26,13 @@ mod team;
 
 pub mod ability;
 pub mod autosubscribe;
+pub mod communicable;
 pub mod events;
+pub mod inbox;
 pub mod member_checkpoint;
 pub mod pyrepr;
 pub mod resources;
+pub mod routing;
 pub mod transport;
 
 pub use agent_tool::AgentTool;
@@ -74,11 +77,16 @@ pub use autosubscribe::{
     apply, apply_agent, derive, derive_from_event_card, derive_with_overrides, derived_for_member,
     AutoSubscriptionMode, AutoSubscriptionPlan, SUBSCRIBE_TAG_PREFIX,
 };
+/// One agent id bound to a team runtime, with P2P and pub/sub helpers (Python
+/// `team_runtime/communicable_agent.py`).
+pub use communicable::CommunicableAgent;
 /// Typed team events (the Python `AgentTeamEvents` notifications).
 pub use events::{
     TeamEvent, TeamEventBus, TeamEventFilter, TeamEventKind, TeamEventListener,
     AGENT_P2P_RECEIVED_EVENT, AGENT_PUBSUB_RECEIVED_EVENT, TEAM_EVENT_SCOPE,
 };
+/// Per-agent inbox filters consulted before a delivery reaches its member.
+pub use inbox::{InboxFilter, InboxFilterRegistry};
 /// Per-member checkpoint identity over one shared checkpointer.
 pub use member_checkpoint::{
     member_checkpoint_id, member_checkpoint_key, MemberCheckpointer, MEMBER_CHECKPOINT_NAMESPACE,
@@ -87,6 +95,11 @@ pub use member_checkpoint::{
 pub use pyrepr::{literal_or_json, parse_python_literal, render_python_value, MAX_LITERAL_DEPTH};
 /// The shared resource manager of a team (Python `Runner.resource_mgr` shape).
 pub use resources::{LocalResourceMgr, TeamResourceMgr};
+/// Group routing, broadcast recipients, and a serializable routing snapshot.
+pub use routing::{
+    broadcast_targets, GroupBroadcast, GroupDelivery, GroupRegistry, RoutingTable,
+    GROUP_METADATA_KEY,
+};
 /// The transport seam a team's messages travel over.
 pub use transport::{
     build_transport, InProcessTransport, RedisTransport, RedisTransportConfig, TeamTransport,

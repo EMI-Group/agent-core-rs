@@ -166,9 +166,12 @@ impl ContextProcessor for SummarizationProcessor {
             None => Arc::clone(&self.model),
         };
         let transcript = Self::render_transcript(messages, &selected);
-        let request = ModelRequestConfig::default()
+        let mut request = ModelRequestConfig::default()
             .with_model_name(model.model_name())
             .with_max_tokens(self.config.max_summary_tokens);
+        // No-op outside a `with_operation` scope; inside one it tags the request
+        // with the purpose and operation id that correlate the provider call.
+        crate::telemetry::stamp_current_operation(&mut request);
         let response = model
             .invoke(
                 &[
@@ -179,6 +182,9 @@ impl ContextProcessor for SummarizationProcessor {
             )
             .await
             .map_err(|error| Error::Llm(format!("summarization model call failed: {error}")))?;
+        // Usage is observability only: a call that answered nothing still cost
+        // tokens, so report it before inspecting the text.
+        crate::processor::record_model_usage(&response.usage, model.model_name());
         let summary = response
             .message()
             .map(|message| message.text().into_owned())

@@ -25,9 +25,13 @@ use openjiuwen_common::error::{Error, Result};
 
 use crate::record::MemoryScope;
 
+use super::lease::{DreamLease, LeaseRequest, LeaseStatus, LeasedJob};
 use super::model::{DreamJob, DreamKind, DreamMetrics, DreamState, DreamTrigger};
 use super::outcome::DreamOutcome;
 use super::repository::{DreamFilter, DreamRepository};
+
+#[path = "sqlite_lease.rs"]
+mod lease;
 
 /// Job table DDL, applied idempotently by every constructor.
 const SCHEMA_JOBS: &str = "
@@ -144,7 +148,13 @@ impl SqliteDreamRepository {
     /// Wraps an existing pool (created by a caller or another subsystem) and makes
     /// sure the schema exists.
     pub async fn from_pool(pool: SqlitePool) -> Result<Self> {
-        for statement in [SCHEMA_JOBS, CLAIM_INDEX, SCOPE_INDEX] {
+        for statement in [
+            SCHEMA_JOBS,
+            CLAIM_INDEX,
+            SCOPE_INDEX,
+            lease::SCHEMA_LEASES,
+            lease::LEASE_INDEX,
+        ] {
             sqlx::query(statement)
                 .execute(&pool)
                 .await
@@ -379,16 +389,52 @@ impl DreamRepository for SqliteDreamRepository {
     }
 
     async fn delete_finished(&self, older_than: DateTime<Utc>) -> Result<usize> {
+        let mut transaction = self.pool.begin().await.map_err(Error::external)?;
         let result = sqlx::query(&format!(
             "DELETE FROM dream_jobs
               WHERE state IN ({TERMINAL_STATES})
                 AND COALESCE(finished_at, updated_at) < ?1"
         ))
         .bind(format_time(older_than))
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(Error::external)?;
+        sqlx::query(lease::DELETE_ORPHANS)
+            .execute(&mut *transaction)
+            .await
+            .map_err(Error::external)?;
+        transaction.commit().await.map_err(Error::external)?;
         Ok(usize::try_from(result.rows_affected()).unwrap_or(usize::MAX))
+    }
+
+    async fn claim_next_leased(
+        &self,
+        now: DateTime<Utc>,
+        request: &LeaseRequest,
+    ) -> Result<Option<LeasedJob>> {
+        self.claim_leased(now, request).await
+    }
+
+    async fn renew_lease(
+        &self,
+        job_id: &str,
+        owner: &str,
+        now: DateTime<Utc>,
+        ttl: chrono::Duration,
+    ) -> Result<LeaseStatus> {
+        self.renew_leased(job_id, owner, now, ttl).await
+    }
+
+    async fn release_lease(&self, job_id: &str, owner: &str) -> Result<bool> {
+        self.release_leased(job_id, owner).await
+    }
+
+    async fn lease(&self, job_id: &str) -> Result<Option<DreamLease>> {
+        self.stored_lease(job_id).await
+    }
+
+    async fn delete_job(&self, job_id: &str) -> Result<bool> {
+        self.delete_leased_job(job_id).await
     }
 }
 

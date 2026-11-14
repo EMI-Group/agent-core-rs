@@ -7,8 +7,10 @@
 //! feature (so a caller can log it) and points at the crate's deferred scope (so a
 //! reader can find the justification).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use openjiuwen_symphony::deferred::{FaissExperienceIndex, VllmLogitSelector};
+use openjiuwen_retrieval::HashEmbedding;
+use openjiuwen_symphony::deferred::VllmLogitSelector;
 use openjiuwen_symphony::error::{is_unsupported, Error, ErrorKind};
+use openjiuwen_symphony::experience::ExperienceIndex;
 
 /// Asserts the canonical deferred-stub failure shape for `feature`.
 fn assert_unsupported(result: Result<impl std::fmt::Debug, Error>, feature: &str) {
@@ -20,14 +22,17 @@ fn assert_unsupported(result: Result<impl std::fmt::Debug, Error>, feature: &str
     assert!(message.contains("deferred"), "{feature}: {message}");
 }
 
-#[test]
-fn faiss_experience_index_is_deferred() {
-    let root = std::env::temp_dir();
-    assert_unsupported(FaissExperienceIndex::new(&root), "faiss experience index");
-    assert_unsupported(
-        FaissExperienceIndex::search_by_embedding("tokenizer", 5, 0.7),
-        "faiss experience index",
-    );
+#[tokio::test]
+async fn faiss_ivf_training_is_deferred() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let index = ExperienceIndex::open_with_algorithm(
+        dir.path(),
+        std::sync::Arc::new(HashEmbedding::new(8)),
+        "ivf",
+    )
+    .await;
+    assert_unsupported(index, "faiss IVF");
+    assert!(!dir.path().join("meta.json").exists());
 }
 
 #[test]

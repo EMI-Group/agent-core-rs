@@ -22,10 +22,12 @@
 //!   exact dropped text stays retrievable through [`recall_compressed_context`].
 //!
 //! [`recall_compressed_context`]: crate::recall::recall_compressed_context
+pub mod adaptive;
 pub mod compact;
 pub mod current_round;
 pub mod dialogue;
 pub mod micro_compact;
+pub mod reinjection;
 pub mod round_level;
 
 use std::collections::BTreeSet;
@@ -39,6 +41,11 @@ use openjiuwen_foundation::prompt::{BaseMessage, Role};
 use crate::processor::ProcessorContext;
 use crate::recall::{archive_from_messages, recall_marker, COMPRESSION_RECALL_MARKER_PREFIX};
 
+pub use self::adaptive::{
+    render_memory_block_from_plan, render_memory_block_from_plan_with_marker, AdaptiveConfig,
+    AdaptiveContext, AdaptiveStrategy, AdaptiveStrategyConfig, CompressionStrategy,
+    MemoryBlockPlan, StrategyDecision, StrategyInput, StrategyParse, StrategySource,
+};
 pub use self::compact::{
     FullCompactProcessor, FullCompactProcessorConfig, FULL_COMPACT_BOUNDARY,
     FULL_COMPACT_BOUNDARY_TEXT, FULL_COMPACT_SUMMARY_INTRO,
@@ -306,6 +313,15 @@ pub fn summarize_offline(messages: &[BaseMessage], max_chars: usize) -> String {
 /// text: a compressor must never turn a provider hiccup into a failed
 /// compression pass, and the offline fallback keeps the pipeline functional
 /// without credentials.
+///
+/// Inside an instrumented pipeline pass
+/// ([`ContextPipeline::run_in_phase`](crate::processor::ContextPipeline::run_in_phase))
+/// the request carries the correlation of the running pass — `request_purpose`
+/// (`compaction`) and `context_operation_id` in
+/// [`ModelRequestConfig::extra`] — and the reported token usage is handed to the
+/// pass, so its record can carry `compression_usage`. Outside such a pass both
+/// are no-ops and the request is left untouched. The correlation keys are
+/// opt-in metadata for callbacks and logs: a provider must not depend on them.
 pub async fn summarize(
     model: Option<&Arc<dyn Model>>,
     system_prompt: &str,
@@ -316,15 +332,21 @@ pub async fn summarize(
     let Some(model) = model else {
         return fallback();
     };
-    let request = ModelRequestConfig::default()
+    let mut request = ModelRequestConfig::default()
         .with_model_name(model.model_name())
         .with_max_tokens(max_tokens);
+    // Stamp the running compaction pass onto the request; a no-op when no
+    // operation is in scope.
+    crate::telemetry::stamp_current_operation(&mut request);
     let messages = [
         BaseMessage::system(system_prompt),
         BaseMessage::user(user_prompt),
     ];
     match model.invoke(&messages, &request).await {
         Ok(response) => {
+            // Usage is observability only: report it before looking at the text,
+            // because a call that answered nothing still cost tokens.
+            crate::processor::record_model_usage(&response.usage, model.model_name());
             let text = response
                 .message()
                 .map(|message| message.text().into_owned())

@@ -25,7 +25,16 @@ use parking_lot::RwLock;
 
 pub use crate::schema::SubAgentConfig;
 pub use presets::{build_preset, general_purpose_config, SubAgentPreset, GENERAL_PURPOSE_NAME};
+pub use runtime::activity::{
+    ActivityEvent, ActivityKind, ActivityStream, ActivitySubscription, ActivitySummary,
+    ActivityThrottle, SubagentActivityFrame, DEFAULT_ACTIVITY_CAPACITY,
+    DEFAULT_ACTIVITY_TEXT_MAX_LEN, DEFAULT_ACTIVITY_THROTTLE_MS,
+};
 pub use runtime::clock::{rfc3339_from_ms, Clock, ManualClock, SystemClock};
+pub use runtime::lifecycle::{
+    CallbackLifecycleHook, LifecycleCallback, LifecycleFailure, LifecycleHooks, LifecycleReport,
+    LifecycleStage, SubagentLifecycleEvent, SubagentLifecycleHook,
+};
 pub use runtime::persistence::{
     load_bucket_file, max_persisted_records, save_bucket_file, PersistedSubAgentBuckets,
     PersistedSubAgentRecord, SUBAGENTS_KEY,
@@ -33,14 +42,18 @@ pub use runtime::persistence::{
 pub use runtime::quota::{
     select_lru_candidate, LruCandidate, SpawnBudget, SubAgentQuota, SubagentActivity,
 };
+pub use runtime::scheduler::{
+    EvictionSchedulerConfig, EvictionSchedulerHandle, EvictionSchedulerStats, SweepReport,
+    DEFAULT_EVICTION_INTERVAL, DEFAULT_IDLE_TTL_MS,
+};
 pub use runtime::transcript::{
     TranscriptBuffer, TranscriptChannel, TranscriptEntry, TranscriptKind, TranscriptSubscription,
     TranscriptSummary, DEFAULT_TRANSCRIPT_CAPACITY, DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY,
 };
-pub use runtime::{clock, persistence, quota, transcript};
+pub use runtime::{activity, clock, lifecycle, persistence, quota, scheduler, transcript};
 pub use runtime::{
     LoadReport, ResumeReport, SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentRuntime,
-    SubAgentSpawnRequest, SubagentMetadata, SubagentStatus, EVICTION_REASON,
+    SubAgentSpawnRequest, SubagentEviction, SubagentMetadata, SubagentStatus, EVICTION_REASON,
 };
 pub use subagent_tools::{
     subagent_tools, subagent_tools_with_transcript, SubagentCloseTool, SubagentListTool,
