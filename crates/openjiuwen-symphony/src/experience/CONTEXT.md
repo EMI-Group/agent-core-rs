@@ -5,8 +5,9 @@
 The experience bank: query patterns bound to the skill sets that solved them, mapping to Python `openjiuwen.symphony.experience`.
 The bank records how a query was answered, identifies a duplicate observation, and ranks stored experience against a new query so the planner can reuse a proven skill composition.
 Ranking is embedding-optional: a configured `Embedding` ranks by cosine similarity, and without one a deterministic lexical term-coverage score keeps the bank usable offline.
+A second catalog, `ExperienceIndex`, is the persisted embedding index: it keeps one vector per item, writes Python's `index_dir` layout (a manifest, a JSONL scalar file, and a JSON vector matrix), rehydrates the vectors on open instead of re-embedding, and verifies the manifest before it trusts a row.
 Dedupe is an intentional difference from Python: Python appends blindly and keys on `id`, while this crate merges on the normalized query pattern plus the sorted skill set, so repeated observations reinforce one record instead of fragmenting the catalog.
-The Python faiss + sentence-transformers index is the only deferred part and lives in `crate::deferred`.
+The faiss experience index is no longer deferred: only IVF/faiss *training* stays behind `Error::Unsupported` (`open_with_algorithm` with an `ivf*` name), because exact flat cosine search returns the same neighbours without a GPU stack.
 
 ## API Surface
 
@@ -39,7 +40,8 @@ impl ExperienceItem {
 }
 ```
 
-`embedding` is skipped on serialization, so persisted items carry no vectors and a configured embedder re-derives them at search time.
+`embedding` is skipped on serialization, so persisted items carry no vectors and a configured embedder re-derives them at search time; `ExperienceIndex` stores the vectors in a separate matrix file instead.
+`merge_item` (crate-private, in `mod.rs`) is the one dedupe rule shared by `ExperienceBank::add` and `ExperienceIndex::add`, and `ordinal_of` (also in `mod.rs`) parses `exp_NNNN` for both generated-id counters.
 
 ```rust
 pub struct ExperienceBank;
@@ -103,6 +105,51 @@ pub const DEFAULT_KEY_PREFIX: &str = "experience/";
 `JsonFileExperienceStore` rewrites one JSONL document through `<file>.tmp` plus `rename`, accepts JSONL or a JSON array on load, and warns-and-skips blank, malformed, or id-less entries; a missing file is an empty bank.
 
 `SqliteExperienceStore` (feature `sqlite`) stores each item's JSON under `experience/<id>` in a foundation `SqliteKvStore`, the same key prefix layout as capability descriptors.
+
+```rust
+pub const MANIFEST_VERSION: u32 = 1;
+pub const FLAT_VECTOR_ALGORITHM: &str = "flat";
+pub struct ExperienceIndexMeta {
+    pub version: u32, pub vector_count: usize, pub vector_algorithm: String,
+    pub vector_dimension: usize,
+    pub embeddings_sha256: String,   // of vector/embeddings.json
+    pub scalar_sha256: String,       // of scalar/metadata.jsonl
+}
+pub struct ExperienceIndex;
+impl ExperienceIndex {
+    pub fn new(embedding: Arc<dyn Embedding>) -> Self;                       // in-memory, no directory
+    pub async fn open(dir: impl AsRef<Path>, embedding: Arc<dyn Embedding>) -> Result<Self>;
+    pub async fn open_with_algorithm(dir: impl AsRef<Path>, embedding: Arc<dyn Embedding>, algorithm: impl Into<String>) -> Result<Self>;
+    pub fn embedding(&self) -> &Arc<dyn Embedding>;
+    pub fn dir(&self) -> Option<&Path>;
+    pub fn algorithm(&self) -> &str;                                         // "flat"
+    pub fn meta(&self) -> ExperienceIndexMeta;                               // last load/persist manifest
+    pub fn count(&self) -> usize; pub fn is_empty(&self) -> bool;
+    pub fn items(&self) -> Vec<ExperienceItem>;                              // sorted by id, with embeddings
+    pub fn exist(&self, skill_ids: &[&str]) -> bool;                          // whole skill set, order-free
+    pub fn generate_id(&self) -> String;                                      // `exp_0001`, zero-padded
+    pub async fn add(&self, item: ExperienceItem) -> Result<AddOutcome>;
+    pub async fn add_batch(&self, items: Vec<ExperienceItem>) -> Result<Vec<AddOutcome>>;
+    pub async fn remove(&self, id: &str) -> Result<bool>;
+    pub async fn persist(&self) -> Result<()>;                               // idempotent
+    pub async fn search(&self, query: &str, ranking: &ExperienceRanking) -> Result<Vec<ExperienceHit>>;
+    pub async fn search_with_skill_ids(&self, query: &str, ranking: &ExperienceRanking) -> Result<Vec<String>>;
+}
+```
+`add` embeds `search_text()` with `embed_query` (a caller-supplied `embedding` is replaced: the index owns its vector space) before taking the lock, merges duplicates exactly like the bank, persists, and rolls the touched entry back if the write fails; a merge into an already-embedded duplicate skips the embedding call.
+`add_batch` makes one `embed_documents` call, applies every item, persists once, and restores every touched entry on any failure, so the batch is all-or-nothing.
+`open`/`open_with_algorithm` accept `"flat"` (any case); `ivf`/`ivfpq`/any `ivf*` name is `Error::Unsupported` (`faiss IVF index training`), anything else is `Error::Validation` naming `vector_algorithm`.
+`search` embeds the query and ranks with the shared `rank_by_embedding` helper (ties on id, `top_k == 0` unlimited, `min_score` after truncation), and falls back to lexical ranking for a blank query.
+Persistence: `<dir>/meta.json` (the manifest), `<dir>/scalar/metadata.jsonl` (one item JSON per line, no embedding field), `<dir>/vector/embeddings.json` (`{"dimension","ids","rows"}`), each written temp-sibling + rename in the order vectors → scalar → meta; `persist()` on an in-memory index refreshes the manifest without writing files.
+Load is all-or-nothing and loud: an empty/absent directory is an empty index with `next_ordinal = 1`; a partial file set is `Error::External`, and a version, algorithm, digest, count, dimension, duplicate-id, row-length, or unknown-id problem is `Error::Validation` naming the offending file. Ids resume past the highest `exp_NNNN`; stored vectors are reused, never re-embedded.
+
+## Intentional differences (persisted index)
+
+- `vector/embeddings.json` replaces `vector/faiss_index.bin` + `vector/embeddings.npy`: an exact flat index is the matrix itself, and an offline build has neither numpy nor faiss.
+- Corruption is rejected instead of restored from Python's `_backup/` snapshot; the error names the file so a caller can rebuild or delete the directory.
+- The embedded text is the whole `search_text()` record, where Python's `create_item` embeds only `query_pattern`.
+- Duplicates merge instead of appending, using the same rule as `ExperienceBank`.
+- `meta.json` carries `embeddings_sha256` and `scalar_sha256` only; Python's `vector_sha256` has no counterpart because there is no separate index file.
 
 ## Constraints
 
