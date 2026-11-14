@@ -683,17 +683,10 @@ pub(super) fn map_client_error(error: &Error, method: &str) -> String {
     }
 }
 
-/// The tool description for `language`; only `"en"` selects English.
+/// The tool description for `language`, taken from the shared prompt table.
+///
+/// `crate::tools::descriptions` is the single source of truth, so the model-facing card and
+/// the prompt-side table cannot drift; only `"en"` selects English there.
 fn description(language: &str) -> &'static str {
-    if language == "en" {
-        "LSP (Language Server Protocol) code navigation: hover, definition, references, \
-         completion, document symbols, workspace symbols, implementation, call hierarchy \
-         (prepare, incoming and outgoing calls) and diagnostics (push and pull). Positions are \
-         one-based line and column. Returns short, typed text results."
-    } else {
-        "LSP（语言服务器协议）代码导航工具：hover、definition、references、completion、\
-         symbols（文档符号）、workspace_symbols、implementation、call hierarchy（prepare_call_hierarchy、\
-         incoming_calls、outgoing_calls）和 diagnostics（推送与拉取诊断）。行号和列号从 1 开始，\
-         返回简短的结构化文本结果。"
-    }
+    crate::tools::descriptions::description("lsp", language)
 }
