@@ -36,14 +36,14 @@ use serde_json::{json, Value};
 use openjiuwen_common::error::Result;
 use openjiuwen_foundation::tool::{Tool, ToolCard, ToolContext};
 
-use crate::permission::paths::normalize_lexically;
-use crate::permission::{PermissionEngine, PermissionLevel};
+use crate::permission::{paths::normalize_lexically, PermissionEngine};
 use crate::tools::{schema_for, tool_card, ToolPayload};
 
 use super::events::WorktreeEvent;
 use super::manager::{WorktreeCreateOptions, WorktreeManager};
 use super::models::WorktreeState;
 use super::store::WorktreeIndex;
+use super::tool::deny_reason;
 
 /// Name of the tool that enters a worktree session.
 pub const ENTER_TOOL_NAME: &str = "enter_worktree";
@@ -401,7 +401,7 @@ impl EnterWorktreeTool {
             Ok(target) => target,
             Err(error) => return ToolPayload::fail(error.to_string()),
         };
-        if let Some(reason) = deny_reason(self.permission.as_deref(), &target) {
+        if let Some(reason) = deny_reason(self.permission.as_ref(), "worktree", &target) {
             return ToolPayload::fail(reason);
         }
 
@@ -589,7 +589,9 @@ impl ExitWorktreeTool {
         if !EXIT_ACTIONS.contains(&action.as_str()) {
             return ToolPayload::fail("'action' must be 'keep' or 'remove'.");
         }
-        if let Some(reason) = deny_reason(self.permission.as_deref(), &session.worktree_path) {
+        if let Some(reason) =
+            deny_reason(self.permission.as_ref(), "worktree", &session.worktree_path)
+        {
             return ToolPayload::fail(reason);
         }
         let name = session.worktree_name.clone();
@@ -678,27 +680,6 @@ impl Tool for ExitWorktreeTool {
     async fn invoke(&self, inputs: Value, ctx: &ToolContext) -> Result<Value> {
         ctx.check_cancelled()?;
         Ok(self.run(&inputs).await.to_json())
-    }
-}
-
-/// The reason a `deny` decision rejects an operation on `target`.
-///
-/// The guard is consulted with the write-tool argument shape, because entering
-/// a worktree writes into the repository. `ask` and `allow` pass, and an absent
-/// engine fails open — the same policy the built-in tools apply.
-fn deny_reason(engine: Option<&PermissionEngine>, target: &Path) -> Option<String> {
-    let engine = engine?;
-    let args = json!({ "file_path": target.to_string_lossy() });
-    let result = engine.check_permission("write_file", &args);
-    if result.permission == PermissionLevel::Deny {
-        Some(
-            result
-                .reason
-                .clone()
-                .unwrap_or_else(|| "Permission denied: worktree".to_owned()),
-        )
-    } else {
-        None
     }
 }
 

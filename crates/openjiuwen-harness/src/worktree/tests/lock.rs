@@ -5,7 +5,10 @@
 //! Everything is offline and deterministic: temp directories, no wall-clock
 //! ordering, and every scenario that needs a real `flock` checks
 //! [`WorktreeLock::is_enabled`] first and returns early where the platform (or
-//! the configuration) cannot lock.
+//! the configuration) cannot lock. Cross-process exclusion is asserted with two
+//! independent handles in one process because the underlying `flock` excludes
+//! separate open file descriptions even inside one process; no child process is
+//! spawned, so the suite stays offline and deterministic.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::path::Path;
 use std::time::Duration;
