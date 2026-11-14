@@ -289,8 +289,9 @@ impl RemoteHubSharingBackend {
     ///
     /// # Errors
     ///
-    /// The transport errors of [`Self::send`], plus [`Error::validation`] for a
-    /// `4xx` and [`Error::transport`] for any other non-2xx status.
+    /// The transport errors of the shared HTTP client, plus
+    /// [`Error::validation`] for a `4xx` and [`Error::transport`] for any other
+    /// non-2xx status.
     pub async fn health(&self) -> Result<()> {
         let response = self.send(HttpRequest::get(self.url(HEALTH_PATH))).await?;
         ensure_success(&response, HEALTH_ENDPOINT)

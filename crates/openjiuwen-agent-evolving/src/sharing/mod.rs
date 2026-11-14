@@ -11,9 +11,9 @@
 //! - [`SharingBackend`] — the pluggable store seam, with a local-file backend,
 //!   an in-memory backend and the remote hub client.
 //!
-//! The local backends are the offline port; [`RemoteHubSharingBackend`] and its
-//! HTTP hub protocol are new design (the Python package only knows the local
-//! filesystem), so a hub can be swapped in without touching the stager.
+//! The local backends are the offline port; the remote hub client and its HTTP
+//! protocol are new design (the Python package only knows the local filesystem),
+//! so a hub can be swapped in without touching the stager.
 
 mod backend;
 mod keywords;
