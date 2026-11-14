@@ -11,6 +11,17 @@
 //! Affinity is best-effort: a disabled config performs no runtime work at all,
 //! and every recorded prefix is an optimization hint, never a correctness
 //! requirement.
+//!
+//! Provider-side actions are optional too: a hook built with
+//! [`KVCacheModelCallHook::with_action_runtime`] forwards the lifecycle calls
+//! ([`KVCacheModelCallHook::prepare`], [`KVCacheModelCallHook::suspend`],
+//! [`KVCacheModelCallHook::release`],
+//! [`KVCacheModelCallHook::begin_inference`],
+//! [`KVCacheModelCallHook::end_inference`]) to its
+//! [`KvCacheActionRuntime`], and reports
+//! [`KVCacheCallCapabilities::offload`] for it. A hook without one is unchanged:
+//! it only records and matches prefixes.
+use crate::kv_cache::action_runtime::{KvCacheActionRuntime, KvCacheInferenceLease};
 use crate::kv_cache::config::KVCacheAffinityConfig;
 use crate::kv_cache::metadata::KV_CACHE_AFFINITY_PARENT_SESSION_ID_ENV;
 use crate::kv_cache::runtime::prefix_hash_states;
@@ -26,14 +37,15 @@ use std::sync::Arc;
 /// What the host may do with the KV cache on this call.
 ///
 /// `affinity` and `evict` follow [`KVCacheAffinityConfig::enabled`] (the runtime
-/// supports per-session eviction). `offload` stays `false`: provider-side
-/// prefetch/offload is deferred, so a host must not schedule one.
+/// supports per-session eviction). `offload` requires an attached
+/// [`KvCacheActionRuntime`] as well: without one a host must not schedule a
+/// provider-side prefetch or offload.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct KVCacheCallCapabilities {
     /// Whether prefix affinity lookup/record is active.
     pub affinity: bool,
-    /// Whether provider-side offload is available (never, today).
+    /// Whether provider-side prefetch/offload is available.
     pub offload: bool,
     /// Whether per-session eviction is available.
     pub evict: bool,
@@ -59,13 +71,32 @@ impl KVCacheCallCapabilities {
 pub struct KVCacheModelCallHook {
     runtime: Arc<dyn KVCacheRuntimeProtocol>,
     config: KVCacheAffinityConfig,
+    action_runtime: Option<Arc<KvCacheActionRuntime>>,
 }
 
 impl KVCacheModelCallHook {
     /// Creates a hook over `runtime` with `config`.
     #[must_use]
     pub fn new(runtime: Arc<dyn KVCacheRuntimeProtocol>, config: KVCacheAffinityConfig) -> Self {
-        Self { runtime, config }
+        Self {
+            runtime,
+            config,
+            action_runtime: None,
+        }
+    }
+
+    /// Attaches the provider-action runtime this hook forwards lifecycle calls
+    /// to.
+    #[must_use]
+    pub fn with_action_runtime(mut self, runtime: Arc<KvCacheActionRuntime>) -> Self {
+        self.action_runtime = Some(runtime);
+        self
+    }
+
+    /// The attached provider-action runtime, when there is one.
+    #[must_use]
+    pub fn action_runtime(&self) -> Option<&Arc<KvCacheActionRuntime>> {
+        self.action_runtime.as_ref()
     }
 
     /// The runtime the hook records into.
@@ -82,11 +113,68 @@ impl KVCacheModelCallHook {
 
     /// What this hook supports for the configured affinity settings.
     #[must_use]
-    pub const fn capabilities(&self) -> KVCacheCallCapabilities {
+    pub fn capabilities(&self) -> KVCacheCallCapabilities {
         KVCacheCallCapabilities {
             affinity: self.config.enabled,
-            offload: false,
+            offload: self.action_runtime.is_some() && self.config.enabled,
             evict: self.config.enabled,
+        }
+    }
+
+    /// Opens `identity`'s scope for inference, prefetching when needed.
+    ///
+    /// `false` when no action runtime is attached, when affinity is disabled, or
+    /// when the scope could not be prepared.
+    pub async fn prepare(&self, identity: &KVCacheIdentity) -> bool {
+        match &self.action_runtime {
+            Some(runtime) => runtime.prepare(identity).await,
+            None => false,
+        }
+    }
+
+    /// Blocks `identity`'s scope and offloads it once its inference is idle.
+    ///
+    /// `false` when no action runtime is attached, when affinity is disabled, or
+    /// when no offload was enqueued.
+    pub async fn suspend(&self, identity: &KVCacheIdentity) -> bool {
+        match &self.action_runtime {
+            Some(runtime) => runtime.suspend(identity).await,
+            None => false,
+        }
+    }
+
+    /// Marks `identity`'s scope terminal and evicts it.
+    ///
+    /// `false` when no action runtime is attached, when affinity is disabled, or
+    /// when the provider reported no successful eviction.
+    pub async fn release(&self, identity: &KVCacheIdentity) -> bool {
+        match &self.action_runtime {
+            Some(runtime) => runtime.release(identity).await,
+            None => false,
+        }
+    }
+
+    /// Admits one inference on `identity`'s scope.
+    ///
+    /// `None` when no action runtime is attached, when affinity is disabled, or
+    /// when the scope is terminal.
+    pub async fn begin_inference(
+        &self,
+        identity: &KVCacheIdentity,
+    ) -> Option<KvCacheInferenceLease> {
+        match &self.action_runtime {
+            Some(runtime) => runtime.begin_inference(identity).await,
+            None => None,
+        }
+    }
+
+    /// Ends `lease`'s inference.
+    ///
+    /// A hook without an action runtime has nothing to update (a lease can only
+    /// come from an attached runtime), so this is a no-op.
+    pub async fn end_inference(&self, lease: &KvCacheInferenceLease, succeeded: bool) {
+        if let Some(runtime) = &self.action_runtime {
+            runtime.end_inference(lease, succeeded).await;
         }
     }
 
@@ -260,12 +348,22 @@ fn parent_or_self(session_id: &str, parent_session_id: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_cache::action_runtime::KvCacheActionRuntime;
+    use crate::kv_cache::actions::KvCacheAction;
+    use crate::kv_cache::backend::InProcessKvCacheActionProvider;
     use crate::kv_cache::config::KVCacheAffinityConfig;
     use crate::kv_cache::metadata::first_changed_index;
     use crate::kv_cache::runtime::InProcessKVCacheRuntime;
     use async_trait::async_trait;
     use openjiuwen_common::error::Result;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn action_runtime(config: KVCacheAffinityConfig) -> Arc<KvCacheActionRuntime> {
+        Arc::new(KvCacheActionRuntime::new(
+            Arc::new(InProcessKvCacheActionProvider::new()),
+            config,
+        ))
+    }
 
     /// Runtime that counts calls so a bypass is observable.
     #[derive(Default)]
@@ -526,5 +624,59 @@ mod tests {
 
         let explicit = hook.identity("child", Some("root"), "gpt-test", &messages, &[]);
         assert_eq!(explicit.parent(), Some("root"));
+    }
+
+    #[tokio::test]
+    async fn capabilities_require_an_attached_action_runtime() {
+        let runtime = Arc::new(InProcessKVCacheRuntime::new(1));
+        let absent = KVCacheModelCallHook::new(runtime.clone(), KVCacheAffinityConfig::enabled());
+        assert!(!absent.capabilities().offload);
+
+        let attached = KVCacheModelCallHook::new(runtime.clone(), KVCacheAffinityConfig::enabled())
+            .with_action_runtime(action_runtime(KVCacheAffinityConfig::enabled()));
+        assert!(attached.capabilities().offload);
+        assert!(attached.capabilities().affinity);
+        assert!(attached.action_runtime().is_some());
+
+        let disabled = KVCacheModelCallHook::new(runtime, KVCacheAffinityConfig::default())
+            .with_action_runtime(action_runtime(KVCacheAffinityConfig::default()));
+        assert!(!disabled.capabilities().offload);
+        assert!(!disabled.capabilities().evict);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_calls_delegate_to_the_action_runtime() {
+        let provider = Arc::new(InProcessKvCacheActionProvider::new());
+        let hook =
+            enabled_hook(Arc::new(InProcessKVCacheRuntime::new(8))).with_action_runtime(Arc::new(
+                KvCacheActionRuntime::new(provider.clone(), KVCacheAffinityConfig::enabled()),
+            ));
+        let identity = KVCacheIdentity::new("session-a", "abc123", "gpt-test").with_parent("root");
+
+        assert!(hook.prepare(&identity).await);
+        let lease = hook.begin_inference(&identity).await.expect("lease");
+        hook.end_inference(&lease, true).await;
+        assert!(lease.is_released());
+        assert!(hook.suspend(&identity).await);
+        assert!(hook.release(&identity).await);
+        assert_eq!(
+            provider.actions(),
+            [
+                KvCacheAction::Prefetch,
+                KvCacheAction::Offload,
+                KvCacheAction::Evict,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_calls_without_a_runtime_do_nothing() {
+        let hook = enabled_hook(Arc::new(InProcessKVCacheRuntime::new(8)));
+        let identity = KVCacheIdentity::new("session-a", "abc123", "gpt-test").with_parent("root");
+        assert!(!hook.prepare(&identity).await);
+        assert!(!hook.suspend(&identity).await);
+        assert!(!hook.release(&identity).await);
+        assert!(hook.begin_inference(&identity).await.is_none());
+        assert!(hook.action_runtime().is_none());
     }
 }
