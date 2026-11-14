@@ -73,8 +73,7 @@ fn isolation(label: &str) -> String {
 /// other's entries and every "the cache still/again holds my entry" assertion
 /// would race. Holding this guard for the whole test body keeps the drains
 /// deterministic without touching production code.
-// The lock itself is shared with the JiuwenBox teardown suite.
-
+///
 /// Waits until no other teardown test is running.
 async fn exclusive_teardown() -> tokio::sync::MutexGuard<'static, ()> {
     crate::sys_operation::remote::teardown_guard().lock().await

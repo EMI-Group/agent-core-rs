@@ -114,7 +114,6 @@ pub(crate) fn teardown_guard() -> &'static tokio::sync::Mutex<()> {
 /// for the `aio` sandbox type and for an unknown type, and
 /// [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
 /// for a selector that names nothing to release.
-
 pub async fn teardown_remote(
     sandbox_type: &str,
     selector: &SandboxSelector,
