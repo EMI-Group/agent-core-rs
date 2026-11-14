@@ -19,7 +19,7 @@
 //!
 //! [`KvPrefixRegistry::register_current`] renames a family and demotes the previous current
 //! prefix into the alias list, so data already written under it stays readable through the
-//! legacy fallback in [`super::legacy`]; [`KvPrefixRegistry::register_legacy`] records a
+//! legacy fallback in `super::legacy`; [`KvPrefixRegistry::register_legacy`] records a
 //! historical alias explicitly. The `*_in` builders of [`super::keys`] take the registry, and
 //! the plain builders keep using the default one.
 //!
@@ -129,7 +129,7 @@ impl FamilyPrefixes {
 ///
 /// Build it with [`KvPrefixRegistry::new`] (identical to [`KvPrefixRegistry::default`]) or
 /// [`KvPrefixRegistry::from_json`]; both keep every family present. Passing the registry to
-/// [`super::keys`]' `*_in` builders and to [`super::legacy`] is what makes a renamed keyspace
+/// [`super::keys`]' `*_in` builders and to `super::legacy` is what makes a renamed keyspace
 /// discoverable without changing any other code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvPrefixRegistry {
@@ -620,7 +620,7 @@ mod tests {
         assert!(matches!(error, Error::Validation(_)));
         assert!(error.to_string().contains("messages"), "{error}");
         assert_eq!(missing.current(KvFamily::Messages), "messages");
-        assert!(missing.aliases(KvFamily::Messages).is_empty());
+        assert_eq!(missing.aliases(KvFamily::Messages).len(), 0);
     }
 
     #[test]

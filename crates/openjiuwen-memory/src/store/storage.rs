@@ -63,6 +63,7 @@ impl MemoryStorage {
     }
 
     /// The prefix layout every derived key uses.
+    #[cfg_attr(not(test), allow(dead_code))] // read by the prefix-layout tests; no in-crate caller yet
     pub(crate) fn prefixes(&self) -> &KvPrefixRegistry {
         &self.prefixes
     }
@@ -831,13 +832,13 @@ mod tests {
             .set_variable(&scope, None, "theme", "dark")
             .await
             .expect("set variable");
-        let stored = stores
+        let written = stores
             .kv
             .get(&keys::variable_key_in(&prefixes, &scope, "theme"))
             .await
             .expect("read current key")
             .expect("current key exists");
-        assert_eq!(stored.as_str(), Some("dark"));
+        assert_eq!(written.as_str(), Some("dark"));
         assert_eq!(
             storage
                 .get_variable(&scope, None, "theme")
@@ -903,13 +904,13 @@ mod tests {
             MemoryStorage::with_prefixes(stores.clone(), renamed(KvFamily::Records, "MEMV2"));
         let record = record("rec-1", "Alice prefers dark mode", 0);
         storage.put_record(&record).await.expect("put");
-        let stored = stores
+        let written = stores
             .kv
             .get("MEMV2/alice/ws/rec-1")
             .await
             .expect("read custom key")
             .expect("custom key exists");
-        assert!(stored.as_str().is_some());
+        assert!(written.as_str().is_some());
         let restored = storage
             .get_record(&scope(), "rec-1")
             .await
