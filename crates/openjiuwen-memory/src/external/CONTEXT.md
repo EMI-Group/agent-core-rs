@@ -1,4 +1,4 @@
-# openjiuwen-memory/src/external — memory-provider SPI, registry, vendor stubs
+# openjiuwen-memory/src/external — memory-provider SPI, tool rail, registry, vendor stubs
 
 ## Intent
 
@@ -6,7 +6,7 @@ The pluggable external memory-provider seam for the Rust rewrite of openJiuwen, 
 The in-process engine (`crate::engine`) stays the default backend; a provider lets a deployment delegate the same record surface to a remote service, a vendor SDK, or a custom backend without changing callers.
 The Rust SPI is record oriented (`add`, `search`, `get`, `update`, `delete`, `list`, `clear`, `health`) because it adapts `MemoryScope`/`MemoryRecord`/`NewMemory`/`SearchOptions` directly, and it carries Python's tool rail (`get_tool_schemas`, `handle_tool_call`, `prefetch`, `sync_turn`, `system_prompt_block`, `on_session_end`, `is_available`, `is_initialized`) as provided trait methods over that record surface.
 No network client exists in this crate: vendor transports are deferred and every vendor path is a typed `Error::Unsupported`, never a silent no-op.
-This directory has no child directories; the four modules are listed in the Routing Table.
+This directory has no child directories; the five modules are listed in the Routing Table.
 
 ## API Surface
 
