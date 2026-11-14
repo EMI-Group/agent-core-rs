@@ -43,7 +43,7 @@ const FORBIDDEN_PERMISSIONS: [&str; 4] =
 /// Licenses a generated package may declare.
 const ALLOWED_LICENSES: [&str; 4] = ["Apache-2.0", "BSD-3-Clause", "MIT", "Proprietary"];
 /// Tokens embedded script text may never contain (Python's `_FORBIDDEN_CODE_TOKENS`).
-const FORBIDDEN_CODE_TOKENS: [&str; 5] =
+pub(crate) const FORBIDDEN_CODE_TOKENS: [&str; 5] =
     ["import os", "import sys", "subprocess", "eval(", "exec("];
 /// The review check that only warrants human review when it is the sole failure.
 const META_NAMING_CHECK: &str = "meta_naming";
@@ -330,9 +330,11 @@ fn check_materials(pack: &SkillPack) -> ReviewCheck {
 /// Checks that the package embeds no forbidden script text.
 ///
 /// Mirrors Python's `_check_code_safety`: generated or embedded script text may
-/// not contain `import os`, `import sys`, `subprocess`, `eval(`, or `exec(`.
-/// The scan is case-insensitive and covers every rendered artifact, in artifact
-/// name order.
+/// not contain `import os`, `import sys`, `subprocess`, `eval(`, or `exec(`, and
+/// a generated `SwarmFlow` script must also pass
+/// [`validate_generated_script`](crate::flow::codegen::validate_generated_script).
+/// The token scan is case-insensitive and covers every rendered artifact, in
+/// artifact name order.
 fn check_code_safety(pack: &SkillPack) -> ReviewCheck {
     let mut reasons = Vec::new();
     for (name, text) in &pack.artifacts {
@@ -341,6 +343,11 @@ fn check_code_safety(pack: &SkillPack) -> ReviewCheck {
             if lowered.contains(token) {
                 reasons.push(format!("forbidden token in {name}: {token}"));
             }
+        }
+    }
+    if let Some(script) = &pack.swarmflow_script {
+        if let Err(error) = crate::flow::codegen::validate_generated_script(script) {
+            reasons.push(format!("swarmflow_script: {}", error.message()));
         }
     }
     check("code_safety", reasons)
@@ -376,7 +383,10 @@ fn check_artifact_paths(pack: &SkillPack) -> ReviewCheck {
 }
 
 /// Returns why `name` escapes the package root, or `None` when it is contained.
-fn escaping_material_path(name: &str) -> Option<String> {
+///
+/// Shared with [`SkillPack::save`](crate::flow::pack::SkillPack::save), so the
+/// writer accepts exactly the relative paths the review gate allows.
+pub(crate) fn escaping_material_path(name: &str) -> Option<String> {
     if name.trim().is_empty() {
         return Some("material path is blank".to_string());
     }

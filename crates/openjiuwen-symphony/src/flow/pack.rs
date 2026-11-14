@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{validation, Error, Result};
+use crate::flow::codegen::{
+    extend_materials, generate_swarmflow_script, insert_script_artifact, read_script_artifact,
+};
 use crate::flow::engine::FlowEngine;
 use crate::flow::model::{
     content_hash, is_valid_meta_name, normalize_meta_name, ExperienceRecipe, TraceNode,
@@ -79,6 +82,16 @@ pub struct SkillPack {
     pub steps: Vec<SkillPackStep>,
     /// The rendered artifacts, keyed by file name.
     pub artifacts: BTreeMap<String, String>,
+    /// The generated `SwarmFlow` script, when the recipe yielded one.
+    ///
+    /// The script is also rendered as the `swarmflow/run.py` artifact and enters
+    /// the canonical materials under the `swarmflow_script` key, so it
+    /// participates in the content-addressed package id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarmflow_script: Option<String>,
+    /// The recipe's applicability trigger conditions (empty when undeclared).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub trigger_conditions: String,
     /// Declared permissions; a generated pack declares none.
     pub permissions: Vec<String>,
     /// The declared license; a generated pack is `Proprietary`.
@@ -97,6 +110,8 @@ impl Default for SkillPack {
             description: String::new(),
             steps: Vec::new(),
             artifacts: BTreeMap::new(),
+            swarmflow_script: None,
+            trigger_conditions: String::new(),
             permissions: Vec::new(),
             license: String::new(),
         }
@@ -108,17 +123,25 @@ impl SkillPack {
     ///
     /// The materials cover the package name, description, target kind, recipe
     /// id, and every ordered step; the package id, artifacts, permissions, and
-    /// license are deliberately excluded.
+    /// license are deliberately excluded. The generated `SwarmFlow` script and the
+    /// recipe's trigger conditions join the materials only when present, so a
+    /// pack without them keeps its previous content hash.
     #[must_use]
     pub fn materials(&self) -> Value {
         let steps = serde_json::to_value(&self.steps).unwrap_or_default();
-        serde_json::json!({
+        let mut materials = serde_json::json!({
             "recipe_id": self.recipe_id,
             "target_kind": self.target_kind,
             "name": self.name,
             "description": self.description,
             "steps": steps,
-        })
+        });
+        extend_materials(
+            &mut materials,
+            self.swarmflow_script.as_deref(),
+            &self.trigger_conditions,
+        );
+        materials
     }
 
     /// Returns the sha256 hex digest of the canonical materials.
@@ -156,7 +179,8 @@ impl SkillPack {
             .unwrap_or(&self.description)
     }
 
-    /// Renders the `SKILL.md` and `dependencies.yaml` artifacts.
+    /// Renders the `SKILL.md`, `dependencies.yaml`, and optional
+    /// `swarmflow/run.py` artifacts.
     #[must_use]
     pub fn render(&self) -> BTreeMap<String, String> {
         let mut artifacts = BTreeMap::new();
@@ -165,6 +189,7 @@ impl SkillPack {
             DEPENDENCIES_FILENAME.to_string(),
             self.render_dependencies_yaml(),
         );
+        insert_script_artifact(&mut artifacts, self.swarmflow_script.as_deref());
         artifacts
     }
 
@@ -373,6 +398,7 @@ impl SkillPack {
                 target_kind: self.target_kind.clone(),
                 name: self.name.clone(),
                 description: self.description.clone(),
+                trigger_conditions: self.trigger_conditions.clone(),
                 permissions: self.permissions.clone(),
                 license: self.license.clone(),
             }),
@@ -381,6 +407,9 @@ impl SkillPack {
     }
 
     /// Atomically writes every rendered artifact under `dir`.
+    ///
+    /// Nested artifact names (such as `swarmflow/run.py`) create their parent
+    /// directories; a name that escapes `dir` is rejected.
     ///
     /// # Errors
     ///
@@ -391,8 +420,8 @@ impl SkillPack {
         let directory = dir.as_ref();
         let artifacts = self.render();
         for (name, content) in &artifacts {
-            if name.is_empty() || name.contains('/') || name.contains('\\') {
-                return Err(validation("artifact", format!("unsafe file name `{name}`")));
+            if let Some(reason) = crate::flow::review::escaping_material_path(name) {
+                return Err(validation("artifact", reason));
             }
             atomic_write(&directory.join(name), content.as_bytes()).await?;
         }
@@ -433,6 +462,7 @@ impl SkillPack {
         validate_graph(graph.as_ref(), &front.skills)?;
         let steps = build_steps(manifest.capabilities, &front.skills, graph.as_ref())?;
         let header = manifest.package;
+        let swarmflow_script = read_script_artifact(directory).await?;
 
         let mut pack = SkillPack {
             schema_version: header.as_ref().map_or_else(
@@ -454,6 +484,10 @@ impl SkillPack {
             description: front.description,
             steps,
             artifacts: BTreeMap::new(),
+            swarmflow_script,
+            trigger_conditions: header
+                .as_ref()
+                .map_or_else(String::new, |value| value.trigger_conditions.clone()),
             permissions: header
                 .as_ref()
                 .map_or_else(Vec::new, |value| value.permissions.clone()),
@@ -474,6 +508,7 @@ impl SkillPack {
             .insert(SKILL_MD_FILENAME.to_string(), skill_text);
         pack.artifacts
             .insert(DEPENDENCIES_FILENAME.to_string(), dependencies_text);
+        insert_script_artifact(&mut pack.artifacts, pack.swarmflow_script.as_deref());
         Ok(pack)
     }
 
@@ -580,6 +615,7 @@ fn build_skill_pack(recipe: &ExperienceRecipe) -> Result<SkillPack> {
     } else {
         normalize_meta_name(&recipe.name, "skill-pack")
     };
+    let swarmflow_script = generate_swarmflow_script(recipe)?.source;
     let mut pack = SkillPack {
         schema_version: PACKAGE_SCHEMA_VERSION.to_string(),
         package_id: String::new(),
@@ -590,6 +626,8 @@ fn build_skill_pack(recipe: &ExperienceRecipe) -> Result<SkillPack> {
         description,
         steps,
         artifacts: BTreeMap::new(),
+        swarmflow_script: Some(swarmflow_script),
+        trigger_conditions: recipe.applicability_text("trigger_conditions").to_string(),
         permissions: Vec::new(),
         license: DEFAULT_LICENSE.to_string(),
     };
@@ -916,6 +954,9 @@ pub(crate) struct PackageHeader {
     /// The package description.
     #[serde(default)]
     pub description: String,
+    /// The recipe's applicability trigger conditions, when declared.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub trigger_conditions: String,
     /// The declared permissions.
     #[serde(default)]
     pub permissions: Vec<String>,
