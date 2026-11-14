@@ -63,6 +63,12 @@ impl LongTermMemory {
     pub async fn get_scope_config(&self, scope_id: &str) -> Result<Option<MemoryScopeConfig>>;
     pub async fn delete_scope_config(&self, scope_id: &str) -> Result<bool>;
 
+    // --- per-scope analyzer overrides (`overrides.rs`) ---
+    pub async fn set_scope_overrides(&self, scope_id: &str, spec: &ScopeAnalyzerOverrideSpec) -> Result<()>;
+    pub async fn get_scope_overrides(&self, scope_id: &str) -> Result<Option<ScopeAnalyzerOverrideSpec>>;
+    pub async fn delete_scope_overrides(&self, scope_id: &str) -> Result<bool>;
+    pub async fn resolve_scope_overrides(&self, scope: &MemoryScope) -> Result<ScopeAnalyzerOverrides>;
+
     // --- Python parity aliases ---
     pub async fn search_user_mem(&self, query: &str, num: usize, user_id: &str, scope_id: &str,
                                  threshold: f32) -> Result<Vec<RecallHit>>;
@@ -90,6 +96,11 @@ impl LongTermMemory {
 }
 ```
 
+Per-scope analyzer overrides (`overrides`):
+- `ScopeAnalyzerOverrideSpec` — the serializable document (`extractor`, `classifier`, `min_importance`, `max_facts`, `default_importance`, `stages`, `model`, `embedding`), `snake_case`, `#[serde(default)]`, tolerant of unknown fields; `new`, the `with_*` builders, `is_empty`, `validate`, and `resolve(&ScopeOverrideHandles) -> Result<ScopeAnalyzerOverrides>`.
+- `ScopeOverrideHandles` — the in-memory handles a spec's names resolve against (`model: Option<Arc<dyn Model>>`, `embedding: Option<Arc<dyn Embedding>>`); `Debug` reports names only, never credentials.
+- `RememberReport` gains `gated: Option<String>`: why the proactive stage withheld the write under a scope override (it stays `None` in the unconfigured path).
+
 ## Wiring Rules
 
 - `in_memory` / `local_file` / `sqlite` build `MemoryStores`, then call `build`.
@@ -113,9 +124,11 @@ impl LongTermMemory {
 - `clear_messages` deletes conversation history rows matching the filter (records and variables are untouched); cancellation is checked before the delete.
 - Variables: names are validated (non-empty, no `/`, no NUL). `get_variables(None)` lists all user-scope variables (not session variables); session variables are addressed by `scope.session_id`.
 - Scope config: `scope_id` validated like `MemoryScope`; JSON stored under `memory_scope_config/{scope_id}`.
+- Scope analyzer overrides (`overrides.rs`): the serializable `ScopeAnalyzerOverrideSpec` (`extractor`, `classifier`, `min_importance`, `max_facts`, `default_importance`, `stages`, `model`, `embedding`) is stored as JSON under `memory_scope_overrides/{scope_id}`; `set` validates the document's shape only, `get` rejects a mis-shaped payload with `Error::Validation` naming the scope, and `resolve_scope_overrides` resolves it against `ScopeOverrideHandles` (the engine's model/embedding, `Debug` reports names only). A named `model` the facade does not hold, or any embedding name that differs from the engine's, is `Error::Unsupported` naming the requested handle — the engine embedding is fixed at construction. `delete_scope_overrides` is separate: `delete_scope_config` keeps its signature and clears `memory_scope_config/{scope_id}` only.
 - `analyzer` defaults to `MemoryAnalyzer::from_engine(config, model)`: rules unless `config.extraction.extractor` asks for the LLM *and* a model is attached; `builder().analyzer(...)` replaces it (tests use this to inject a scripted extractor).
-- `remember(scope, input, options)`: `ExtractionInput` carries no scope, so the scope is an explicit parameter. Runs `analyzer.analyze(input, &options.call)`, writes every fact through `engine.add` (tags are preserved under the crate's `tags` metadata key because `to_new_memory` drops them), checks cancellation before each fact, counts `added`/`merged`/`skipped` from each `AddOutcome`, and surfaces `ExtractionResult::degraded` on `RememberReport::degraded`. A rejected write fails the call with the fact index/content and the engine message — never a silent drop.
-- `consolidate(scope, incoming, options)` validates the content, recalls candidates at `dedupe.candidate_top_k` with threshold `0.0` (a keyword-only blended score never clears a positive floor), converts `incoming` into one `ExtractedFact`, and delegates to `MemoryAnalyzer::consolidate` with `config.dedupe`. It returns a plan only; nothing is applied.
+- `remember(scope, input, options)` resolves the scope overrides and runs `StagedAnalyzer::from_engine(config, engine.model())` with `.with_overrides(resolved)` and `.with_dedupe(config.dedupe)`, so extraction, reasoning, and the proactive decision all see the effective (base + scope) configuration. It writes each fact through `engine.add` (tags are preserved under the crate's `tags` metadata key because `to_new_memory` drops them), checks cancellation before each fact, counts `added`/`merged`/`skipped` from each `AddOutcome`, and surfaces the staged `degraded` reason on `RememberReport::degraded`. A rejected write fails the call with the fact index/content and the engine message — never a silent drop.
+- `remember` keeps two documented stability rules: (a) a builder-injected analyzer keeps owning extraction while the scope carries no overrides (the staged pipeline cannot reach a custom `FactExtractor`), and (b) the proactive decision is advisory (every fact is written) unless overrides are in effect — then `should_write()` gates the batch, `writable_facts()` selects it, and `RememberReport::gated` names the decision's reason with nothing written.
+- `consolidate(scope, incoming, options)` validates the content, resolves the scope overrides, recalls candidates at `dedupe.candidate_top_k` with threshold `0.0` (a keyword-only blended score never clears a positive floor), converts `incoming` into one `ExtractedFact`, and delegates to `StagedAnalyzer::consolidate` (same engine config, scope overrides, `config.dedupe`). It returns a plan only; nothing is applied, and the plan is dedupe-policy work — the classifier is never consulted.
 - `provider()` returns an `EngineProvider` over the same engine — a stable SPI view, capabilities reflecting the attached embedding model.
 - `team_memory` / `team_memory_sqlite` build a team facade over its own store; `dreaming_in_memory` / `dreaming_sqlite` build a `DreamPlanner` with `NoopConsolidator` and `DreamConfig::default()` (they return `Result` because construction validates the config).
 - Nothing here starts a background task, timer, watcher, or purge: the caller owns `run_due`/`run_once`/`purge`, and no cross-process lease exists.
@@ -137,9 +150,12 @@ impl LongTermMemory {
 - `./recall.rs` → `search`, `recall`, `search_all`
 - `./messages.rs` → `add_messages`, `get_recent_messages`, `clear_messages`, extraction/fallback
 - `./variables.rs` → variable and scope-config methods
-- `./integrations.rs` → analyzer/remember/consolidate, provider SPI, team memory, dreaming, SQLite migration constructor, local coding bridge
+- `./overrides.rs` → `ScopeAnalyzerOverrideSpec`/`ScopeOverrideHandles`, persisted per-scope overrides, resolution, and the value the staged pipeline consumes
+- `./integrations.rs` → analyzer/remember/consolidate (staged pipeline + scope overrides), provider SPI, team memory, dreaming, SQLite migration constructor, local coding bridge
 
 ## Test Strategy
 
 - Thin facade tests cover constructor defaults, builder injection, Python aliases, page math, and `search_all` degradation when graph recall fails.
+- `overrides.rs` unit tests pin the spec's JSON round trip (unknown/absent fields), empty detection, scalar resolution, the typed `Unsupported` errors for unresolvable names, and persistence across in-memory, local-file, and SQLite facades (including a malformed stored payload).
+- `integrations.rs` unit tests pin the override→pipeline wiring: `max_facts` changing what `remember` writes, an empty spec matching the unconfigured run, the proactive gate reporting on `gated`, a degraded model fallback under an `llm` override, cancellation writing nothing, and `consolidate` resolving a scope classifier while still returning a plan only.
 - The heavy behavior suites live in `tests/` (`crud.rs`, `scoping.rs`, `recall.rs`, `dedupe.rs`, `graph.rs`, `lite.rs`, `lite_local.rs`, `sqlite.rs`, `analyzer_wiring.rs`, `external_provider.rs`, `team_memory.rs`, `dreaming.rs`, `migration.rs`).

@@ -28,15 +28,20 @@
 //! - `recall` — `search`, `recall`, and the combined memory/graph `search_all`.
 //! - `messages` — conversation history, extraction, and the heuristic fallback.
 //! - `variables` — variables and per-scope configuration.
+//! - `overrides` — per-scope analyzer/embedding overrides, persisted beside the scope
+//!   configuration.
 
 // The constructors mirror the Python `async` call sites even when they never await.
 #![allow(clippy::unused_async_trait_impl)]
 
 mod integrations;
 mod messages;
+mod overrides;
 mod recall;
 mod records;
 mod variables;
+
+pub use overrides::{ScopeAnalyzerOverrideSpec, ScopeOverrideHandles};
 
 use std::path::Path;
 use std::sync::Arc;
