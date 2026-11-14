@@ -14,6 +14,7 @@
 //! | a delivered message | exactly one buffered turn (the single turn seam) |
 //! | `stop` / `snapshot` | flush + export of `TEAM_MEMORY.md`, best-effort and idempotent |
 //! | a failing memory hook | logged, never fails `start`, a spawn, a shutdown or `stop` |
+//! | `TeamBuildDeps::with_memory_observer` | the injected observer replaces the built-in bridge on the metadata path |
 //!
 //! Every test is offline and deterministic: scripted harnesses, the recording workspace provider,
 //! temp directories and [`BOUND`]-limited waits.
@@ -23,7 +24,8 @@ use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_memory::record::CallOptions;
 use openjiuwen_memory::team::{
-    TeamExtraction, TeamMemoryExtractor, TeamMemoryFilter, TeamMemoryKind, TeamTranscript,
+    TeamExtraction, TeamMemoryEvent, TeamMemoryExtractor, TeamMemoryFilter, TeamMemoryKind,
+    TeamMemoryObserver, TeamTranscript,
 };
 use serde_json::json;
 
@@ -45,6 +47,34 @@ async fn opened(dir: &std::path::Path, team: &str) -> Arc<TeamMemoryWiring> {
     TeamMemoryWiring::open(team, MemoryConfig::default(), dir)
         .await
         .expect("the wiring did not open")
+}
+
+/// A team-memory observer that records the operations it sees, in order.
+#[derive(Default)]
+struct RecordingObserver {
+    seen: parking_lot::Mutex<Vec<String>>,
+}
+
+impl RecordingObserver {
+    /// The recorded `<operation>:<member>` entries, in arrival order.
+    fn entries(&self) -> Vec<String> {
+        self.seen.lock().clone()
+    }
+}
+
+impl TeamMemoryObserver for RecordingObserver {
+    fn observe(&self, event: &TeamMemoryEvent) {
+        self.seen.lock().push(format!(
+            "{}:{}",
+            event.operation.as_str(),
+            event.member_id.as_deref().unwrap_or("")
+        ));
+    }
+}
+
+/// Returns `observer` as the trait object the dependencies accept.
+fn arc(observer: &Arc<RecordingObserver>) -> Arc<dyn TeamMemoryObserver> {
+    Arc::clone(observer) as Arc<dyn TeamMemoryObserver>
 }
 
 /// Extractors that always fail, so the flush path can be exercised without a broker.
@@ -401,4 +431,118 @@ async fn the_member_contexts_carry_the_team_toolkit() {
             "{name} mounts the team's own toolkit"
         );
     }
+}
+
+#[tokio::test]
+async fn an_injected_observer_sees_the_operations_of_a_spawn() {
+    let recorder = Arc::new(RecordingObserver::default());
+    let injected = Arc::clone(&recorder);
+    let built = wire(
+        &memory_enabled(blueprint("alpha", "boss", &["dev-1"])),
+        move |deps| deps.with_memory_observer(arc(&injected)),
+    )
+    .await;
+    let wiring = built.agent.memory().expect("a wiring");
+    assert!(
+        Arc::ptr_eq(wiring.observer().expect("an observer"), &arc(&recorder)),
+        "the injected observer replaces the built-in bridge"
+    );
+    assert!(
+        wiring.config().observer.is_some(),
+        "the observer travels on the resolved configuration"
+    );
+    built.agent.start().await.unwrap();
+    built.agent.spawn_member("dev-1").await.unwrap();
+    let entries = recorder.entries();
+    assert!(
+        entries.iter().any(|entry| entry == "write:dev-1"),
+        "the join reaches the injected observer: {entries:?}"
+    );
+    built.agent.stop().await.unwrap();
+    if let Some(team_dir) = built
+        .agent
+        .memory()
+        .and_then(|wiring| wiring.document_path().parent().map(ToOwned::to_owned))
+        .and_then(|member_dir| member_dir.parent().map(ToOwned::to_owned))
+    {
+        let _ = tokio::fs::remove_dir_all(team_dir).await;
+    }
+}
+
+#[tokio::test]
+async fn a_build_without_an_injected_observer_keeps_the_built_in_bridge() {
+    let recorder = Arc::new(RecordingObserver::default());
+    let built = wire(&memory_enabled(blueprint("alpha", "boss", &[])), |deps| {
+        deps
+    })
+    .await;
+    let wiring = built.agent.memory().expect("a wiring");
+    assert!(
+        wiring.trace_enabled(),
+        "the default configuration is traced"
+    );
+    assert!(
+        wiring.config().observer.is_none(),
+        "nothing was injected, so the configuration carries no observer"
+    );
+    assert!(
+        !Arc::ptr_eq(wiring.observer().expect("an observer"), &arc(&recorder)),
+        "the built-in bridge is not the unused test observer"
+    );
+    built.agent.start().await.unwrap();
+    assert!(recorder.entries().is_empty());
+    built.agent.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_trace_false_block_attaches_nothing_even_with_an_injected_observer() {
+    let spec = with_metadata(
+        blueprint("alpha", "boss", &["dev-1"]),
+        MEMORY_METADATA_KEY,
+        json!({"trace": false}),
+    );
+    let recorder = Arc::new(RecordingObserver::default());
+    let injected = Arc::clone(&recorder);
+    let built = wire(&spec, move |deps| deps.with_memory_observer(arc(&injected))).await;
+    let wiring = built.agent.memory().expect("a wiring");
+    assert!(!wiring.trace_enabled());
+    assert!(wiring.observer().is_none());
+    assert!(wiring.memory().observer().is_none());
+    built.agent.start().await.unwrap();
+    built.agent.spawn_member("dev-1").await.unwrap();
+    assert!(
+        recorder.entries().is_empty(),
+        "the explicit `trace: false` switch wins over an injected observer"
+    );
+    built.agent.stop().await.unwrap();
+    if let Some(team_dir) = wiring
+        .document_path()
+        .parent()
+        .and_then(|member_dir| member_dir.parent())
+    {
+        let _ = tokio::fs::remove_dir_all(team_dir).await;
+    }
+}
+
+#[tokio::test]
+async fn an_injected_wiring_ignores_the_injected_observer() {
+    let dir = tempfile::tempdir().unwrap();
+    let injected_wiring = opened(dir.path(), "alpha").await;
+    let recorder = Arc::new(RecordingObserver::default());
+    let injected = Arc::clone(&recorder);
+    let built = wire(
+        &memory_enabled(blueprint("alpha", "boss", &[])),
+        move |deps| {
+            deps.with_memory(Arc::clone(&injected_wiring))
+                .with_memory_observer(arc(&injected))
+        },
+    )
+    .await;
+    let wiring = built.agent.memory().expect("the injected wiring");
+    assert!(
+        !Arc::ptr_eq(wiring.observer().expect("an observer"), &arc(&recorder)),
+        "the injected wiring keeps the observer it was opened with"
+    );
+    built.agent.start().await.unwrap();
+    assert!(recorder.entries().is_empty());
 }

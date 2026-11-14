@@ -50,6 +50,12 @@
 //! facade owns the observer for the wiring's lifetime; [`TeamMemoryWiring::observer`] keeps a second
 //! handle to the same object, and `trace: false` or a disabled configuration attaches none.
 //!
+//! A caller-supplied [`MemoryConfig::observer`] replaces that bridge entirely: set it on the
+//! configuration, or open through [`TeamMemoryWiring::open_with_observer`], and every operation
+//! goes to the caller's observer (the OTLP bridge on the `otlp` build, for instance) while
+//! [`MemoryConfig::otel_sink`] stays unused. There is no post-construction setter, because
+//! [`TeamMemory::with_observer`] consumes the facade.
+//!
 //! Two caveats belong here because they are visible from this node:
 //!
 //! - The bridge mints its trace from the team name
@@ -174,6 +180,37 @@ impl TeamMemoryWiring {
         let extractor: Arc<dyn TeamMemoryExtractor> =
             Arc::new(LlmTeamExtractor::new(model, TeamExtractConfig::default()));
         Self::build(team_id.into(), config, workspace_root.into(), extractor).await
+    }
+
+    /// Opens the wiring with `observer` attached to the facade instead of the crate's bridge.
+    ///
+    /// This is the convenience form of setting [`MemoryConfig::observer`] and calling
+    /// [`Self::open`]: the supplied observer — the OTLP bridge on the `otlp` build, or any other
+    /// sink — receives every observable operation and the built-in
+    /// [`MemorySpanObserver`](crate::observability::MemorySpanObserver) is not built at all, so a
+    /// configured [`MemoryConfig::otel_sink`] stays unused.
+    ///
+    /// [`MemoryConfig::trace`] still gates it: with `trace: false` the wiring attaches nothing and
+    /// the observer stays unused, exactly as it would through [`Self::open`].
+    ///
+    /// There is deliberately no post-construction setter:
+    /// [`TeamMemory::with_observer`](openjiuwen_memory::team::TeamMemory::with_observer) consumes
+    /// the facade, so an observer can only be chosen while the facade is being built.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`Self::open`].
+    pub async fn open_with_observer(
+        team_id: impl Into<String>,
+        config: MemoryConfig,
+        workspace_root: impl Into<PathBuf>,
+        observer: Arc<dyn TeamMemoryObserver>,
+    ) -> Result<Arc<Self>> {
+        let config = MemoryConfig {
+            observer: Some(observer),
+            ..config
+        };
+        Self::open(team_id, config, workspace_root).await
     }
 
     /// Builds the wiring, validating the ids, resolving the document, and importing it.
@@ -746,6 +783,84 @@ mod tests {
         assert!(!wiring.trace_enabled());
         assert!(wiring.observer().is_none());
         assert!(wiring.memory().observer().is_none());
+    }
+
+    /// A wiring observer that records the operations it sees, in order.
+    #[derive(Default)]
+    struct RecordingObserver {
+        seen: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl RecordingObserver {
+        fn operations(&self) -> Vec<String> {
+            self.seen.lock().clone()
+        }
+    }
+
+    impl TeamMemoryObserver for RecordingObserver {
+        fn observe(&self, event: &openjiuwen_memory::team::TeamMemoryEvent) {
+            self.seen.lock().push(event.operation.as_str().to_owned());
+        }
+    }
+
+    #[tokio::test]
+    async fn open_with_observer_replaces_the_built_in_bridge() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(RecordingObserver::default());
+        let wiring = TeamMemoryWiring::open_with_observer(
+            "team-1",
+            MemoryConfig::default(),
+            dir.path(),
+            Arc::clone(&recorder) as Arc<dyn TeamMemoryObserver>,
+        )
+        .await
+        .unwrap();
+        assert!(wiring.trace_enabled());
+        let observer = wiring.observer().expect("an observer");
+        assert!(
+            Arc::ptr_eq(
+                observer,
+                &(Arc::clone(&recorder) as Arc<dyn TeamMemoryObserver>)
+            ),
+            "the supplied observer is attached verbatim"
+        );
+        assert!(Arc::ptr_eq(
+            observer,
+            wiring.memory().observer().expect("the facade holds it")
+        ));
+        assert_eq!(
+            wiring.config().observer.as_ref().map(Arc::as_ptr),
+            Some(Arc::as_ptr(
+                &(Arc::clone(&recorder) as Arc<dyn TeamMemoryObserver>)
+            ))
+        );
+        wiring.on_member_join("dev-1").await.unwrap();
+        assert_eq!(recorder.operations(), vec!["write".to_owned()]);
+        assert_eq!(stored(&wiring).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn open_with_observer_still_honours_trace_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(RecordingObserver::default());
+        let config = MemoryConfig {
+            trace: false,
+            ..MemoryConfig::default()
+        };
+        let wiring = TeamMemoryWiring::open_with_observer(
+            "team-1",
+            config,
+            dir.path(),
+            Arc::clone(&recorder) as Arc<dyn TeamMemoryObserver>,
+        )
+        .await
+        .unwrap();
+        assert!(!wiring.trace_enabled());
+        assert!(wiring.observer().is_none());
+        assert!(wiring.memory().observer().is_none());
+        wiring.on_member_join("dev-1").await.unwrap();
+        assert!(recorder.operations().is_empty());
+        assert_eq!(stored(&wiring).await.len(), 1);
     }
 
     #[tokio::test]

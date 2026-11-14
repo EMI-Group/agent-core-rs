@@ -2,7 +2,8 @@
 //!
 //! [`TeamBuildDeps`] is the single injection point of the runtime: a harness factory that
 //! materializes one harness per member, the persisted-state store, the workspace provider, the
-//! team language, and the optional team-shared checkpoint store and team-memory wiring. The Python reference reaches the same objects through module-level imports and
+//! team language, and the optional team-shared checkpoint store, team-memory wiring and
+//! team-memory observer. The Python reference reaches the same objects through module-level imports and
 //! `TeamAgent.__init__` keyword arguments; this port threads them explicitly so a test can build a
 //! runtime without touching the environment or the filesystem.
 //!
@@ -29,6 +30,7 @@ use crate::observability::ObservabilityHooks;
 use crate::schema::Language;
 use crate::storage::{InMemoryTeamStore, TeamStore};
 use crate::workspace::{LocalWorkspaceProvider, MemberWorkspaceLayout, WorkspaceProvider};
+use openjiuwen_memory::team::TeamMemoryObserver;
 
 /// Directory under the system temporary directory that backs the default workspace provider.
 const DEFAULT_WORKSPACE_DIR: &str = "openjiuwen-agent-teams";
@@ -85,6 +87,15 @@ pub struct TeamBuildDeps {
     /// The resolved wiring is written back here before the leader harness is built, so the leader
     /// and every spawned teammate mount their tools from the same team scope.
     pub memory: Option<Arc<TeamMemoryWiring>>,
+    /// Team-memory observer the host wants on the resolved wiring (e.g. the OTLP bridge).
+    ///
+    /// [`TeamBuildDeps::with_memory_observer`] sets it; the build path copies it onto
+    /// [`MemoryConfig::observer`] of the metadata-resolved configuration before that wiring is
+    /// opened, so it replaces the crate's built-in `MemorySpanObserver` bridge. It is applied only
+    /// on the metadata path: an injected [`TeamBuildDeps::memory`] is used verbatim and this
+    /// observer is ignored (logged once at debug), because the facade of an existing wiring cannot
+    /// be re-observed.
+    pub memory_observer: Option<Arc<dyn TeamMemoryObserver>>,
 }
 
 impl TeamBuildDeps {
@@ -216,6 +227,30 @@ impl TeamBuildDeps {
         self.memory.is_some()
     }
 
+    /// Injects the team-memory observer the metadata-resolved wiring should carry.
+    ///
+    /// The build path copies it onto
+    /// [`MemoryConfig::observer`](crate::memory::MemoryConfig::observer) before opening the wiring
+    /// `metadata["memory"]` selects, so the host's observer — the OTLP bridge, for instance —
+    /// replaces the crate's built-in bridge while the rest of the configuration stays as parsed.
+    /// An injected [`TeamBuildDeps::memory`] is used verbatim and ignores it.
+    #[must_use]
+    pub fn with_memory_observer(self, observer: Arc<dyn TeamMemoryObserver>) -> Self {
+        Self {
+            memory_observer: Some(observer),
+            ..self
+        }
+    }
+
+    /// Returns `true` when a host injected a team-memory observer.
+    ///
+    /// The build path applies an injected observer only on the metadata path; an injected wiring
+    /// is used verbatim, so the flag is independent of [`TeamBuildDeps::has_injected_memory`].
+    #[must_use]
+    pub fn has_memory_observer(&self) -> bool {
+        self.memory_observer.is_some()
+    }
+
     /// Resolves the declared language to its wire value, falling back to `cn`.
     ///
     /// Python parity: `resolve_language`, which treats an absent or unknown value as the default
@@ -241,6 +276,7 @@ impl Default for TeamBuildDeps {
             routing: None,
             checkpoints: None,
             memory: None,
+            memory_observer: None,
         }
     }
 }
@@ -267,6 +303,7 @@ impl fmt::Debug for TeamBuildDeps {
                 "memory",
                 &self.memory.as_ref().map(|memory| memory.team_id()),
             )
+            .field("memory_observer", &self.memory_observer.is_some())
             .finish()
     }
 }
@@ -432,6 +469,31 @@ mod tests {
         assert!(deps.checkpoints.is_none());
         assert!(format!("{deps:?}").contains("memory: Some(\"team-1\")"));
     }
+
+    #[test]
+    fn with_memory_observer_overrides_only_the_observer() {
+        let base = TeamBuildDeps::default();
+        let observer: Arc<dyn TeamMemoryObserver> = Arc::new(openjiuwen_memory::team::NoopObserver);
+        let deps = base.clone().with_memory_observer(Arc::clone(&observer));
+        let injected = deps
+            .memory_observer
+            .as_ref()
+            .expect("the observer was injected");
+        assert!(Arc::ptr_eq(injected, &observer));
+        assert!(deps.has_memory_observer());
+        assert!(!base.has_memory_observer());
+        assert!(
+            !deps.has_injected_memory(),
+            "an observer is not a wiring: the metadata path still resolves one"
+        );
+        assert!(Arc::ptr_eq(&deps.harness_factory, &base.harness_factory));
+        assert!(Arc::ptr_eq(&deps.store, &base.store));
+        assert!(Arc::ptr_eq(&deps.workspace, &base.workspace));
+        assert!(deps.memory.is_none());
+        assert!(format!("{deps:?}").contains("memory_observer: true"));
+        assert!(format!("{base:?}").contains("memory_observer: false"));
+    }
+
     #[test]
     fn resolved_language_accepts_wire_values_and_falls_back() {
         let cases = [

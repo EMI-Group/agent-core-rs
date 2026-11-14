@@ -10,7 +10,11 @@
 //!    `metadata["memory"]` block is then logged and ignored, like an injected store), else a
 //!    configured `metadata["memory"]` block opens one, else the team runs without memory. A block
 //!    that is configured but says `{"enabled": false}` allocates **no** wiring, so nothing is
-//!    written and no hook runs.
+//!    written and no hook runs. An injected
+//!    [`TeamBuildDeps::memory_observer`](super::deps::TeamBuildDeps::memory_observer) is copied
+//!    onto the parsed configuration's
+//!    [`observer`](crate::memory::MemoryConfig::observer) before the wiring is opened; with an
+//!    injected wiring it is ignored.
 //! 2. **Lifecycle hooks** — the `warn!`-and-continue pass-throughs ([`session_started`],
 //!    [`member_joined`], [`member_left`], [`finish`], [`export_document`]). Memory is advisory for
 //!    a run: a hook failure is logged with the team (and member) and never fails the lifecycle
@@ -47,6 +51,11 @@ const LOG_TARGET: &str = "openjiuwen_agent_teams::runtime::memory";
 /// `workspace_root` is the leader's workspace, so the default `TEAM_MEMORY.md` document lives at
 /// `<leader workspace>/TEAM_MEMORY.md` (a `store.dir` configuration overrides it).
 ///
+/// A [`TeamBuildDeps::memory_observer`] injection is copied onto
+/// [`MemoryConfig::observer`](crate::memory::MemoryConfig::observer) of the metadata-resolved
+/// configuration, so the host's observer replaces the crate's built-in bridge; an injected wiring
+/// is used verbatim and the observer is then ignored (one `debug!`).
+///
 /// # Errors
 ///
 /// [`Error::Validation`](openjiuwen_common::error::Error::Validation) when a configured team id or
@@ -71,12 +80,20 @@ pub(crate) async fn resolve_memory(
                  ignored"
             );
         }
+        if deps.has_memory_observer() {
+            debug!(
+                target: LOG_TARGET,
+                team = team_name,
+                "the injected team memory wiring is used verbatim; the injected team-memory \
+                 observer is ignored (an existing facade cannot be re-observed)"
+            );
+        }
         return Ok(Some(Arc::clone(injected)));
     }
     if !configured {
         return Ok(None);
     }
-    let config = memory_config(spec);
+    let mut config = memory_config(spec);
     if !config.enabled {
         debug!(
             target: LOG_TARGET,
@@ -85,6 +102,7 @@ pub(crate) async fn resolve_memory(
         );
         return Ok(None);
     }
+    config.observer = deps.memory_observer.clone();
     let wiring = TeamMemoryWiring::open(team_name, config, workspace_root).await?;
     debug!(
         target: LOG_TARGET,
@@ -331,6 +349,84 @@ mod tests {
         .expect("the injected wiring");
         assert!(Arc::ptr_eq(&injected, &wiring));
         assert_eq!(wiring.team_id(), "injected-team");
+    }
+
+    /// A test observer that records the operations it sees, in order.
+    #[derive(Default)]
+    struct RecordingObserver {
+        seen: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl RecordingObserver {
+        fn operations(&self) -> Vec<String> {
+            self.seen.lock().clone()
+        }
+    }
+
+    impl openjiuwen_memory::team::TeamMemoryObserver for RecordingObserver {
+        fn observe(&self, event: &openjiuwen_memory::team::TeamMemoryEvent) {
+            self.seen.lock().push(event.operation.as_str().to_owned());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_injected_observer_lands_on_the_metadata_resolved_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(RecordingObserver::default());
+        let deps = deps().with_memory_observer(
+            Arc::clone(&recorder) as Arc<dyn openjiuwen_memory::team::TeamMemoryObserver>
+        );
+        assert!(deps.has_memory_observer());
+        let wiring = resolve_memory(
+            &spec_with(serde_json::json!({})),
+            &deps,
+            "mem-team",
+            dir.path(),
+        )
+        .await
+        .unwrap()
+        .expect("a configured team has memory");
+        let observer = wiring.observer().expect("the injected observer");
+        assert!(Arc::ptr_eq(
+            observer,
+            &(Arc::clone(&recorder) as Arc<dyn openjiuwen_memory::team::TeamMemoryObserver>)
+        ));
+        wiring.on_member_join("dev-1").await.unwrap();
+        assert_eq!(recorder.operations(), vec!["write".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn an_injected_wiring_ignores_the_injected_observer() {
+        let dir = tempfile::tempdir().unwrap();
+        let injected = TeamMemoryWiring::open("injected-team", MemoryConfig::default(), dir.path())
+            .await
+            .unwrap();
+        let recorder = Arc::new(RecordingObserver::default());
+        let deps = deps()
+            .with_memory(Arc::clone(&injected))
+            .with_memory_observer(
+                Arc::clone(&recorder) as Arc<dyn openjiuwen_memory::team::TeamMemoryObserver>
+            );
+        let wiring = resolve_memory(
+            &spec_with(serde_json::json!({})),
+            &deps,
+            "mem-team",
+            dir.path(),
+        )
+        .await
+        .unwrap()
+        .expect("the injected wiring");
+        assert!(Arc::ptr_eq(&injected, &wiring));
+        let observer = wiring.observer().expect("the wiring's own observer");
+        assert!(
+            !Arc::ptr_eq(
+                observer,
+                &(Arc::clone(&recorder) as Arc<dyn openjiuwen_memory::team::TeamMemoryObserver>)
+            ),
+            "the injected wiring keeps the observer it was opened with"
+        );
+        wiring.on_member_join("dev-1").await.unwrap();
+        assert!(recorder.operations().is_empty());
     }
 
     #[test]

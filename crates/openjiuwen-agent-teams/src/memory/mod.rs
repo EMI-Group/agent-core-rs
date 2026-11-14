@@ -24,6 +24,7 @@
 //! assert!(config.enabled);
 //! assert!(config.trace);
 //! assert!(config.otel_sink.is_none());
+//! assert!(config.observer.is_none());
 //! assert!(!config.store.is_file());
 //! assert_eq!(config.store, MemoryStoreConfig::Memory);
 //! assert!(config.validate().is_ok());
@@ -35,6 +36,11 @@
 //! observable operation: one `memory.{operation}` span and one structured `tracing` event at
 //! target `openjiuwen_agent_teams::memory` per operation, plus — on the `otel` build — one
 //! `SpanRecord` in the sink [`MemoryConfig::otel_sink`] carries.
+//!
+//! A host that owns its own sink supplies [`MemoryConfig::observer`] instead (the OTLP bridge on
+//! the `otlp` build, for instance), or opens through
+//! [`TeamMemoryWiring::open_with_observer`](crate::memory::TeamMemoryWiring::open_with_observer):
+//! the supplied observer replaces the crate's bridge, and `trace: false` still attaches nothing.
 //!
 //! Two honest limitations:
 //!

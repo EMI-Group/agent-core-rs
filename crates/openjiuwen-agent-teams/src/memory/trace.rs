@@ -15,6 +15,15 @@
 //! `SpanRecord` per operation to the [`OtelSpanSink`] the configuration carries, which keeps the
 //! whole trace inspectable in process.
 //!
+//! # A caller-supplied observer
+//!
+//! [`MemoryConfig::observer`] lets a host attach its own
+//! [`TeamMemoryObserver`] — the OTLP bridge on the `otlp` build, or any other sink — and it wins
+//! over the built-in [`MemorySpanObserver`]: the crate's bridge is then not built at all, so
+//! [`MemoryConfig::otel_sink`] stays unused. The precedence is
+//! `enabled` → `trace` → `observer` → built-in bridge, which means a `trace: false` wiring attaches
+//! nothing even when an observer is supplied: the explicit switch is the last word.
+//!
 //! # The trace caveat
 //!
 //! The bridge mints its trace from the team name
@@ -98,23 +107,44 @@ pub fn facade(
 
 /// Builds the observer `config` asks for, or `None` when nothing should be observed.
 ///
-/// A disabled configuration or `trace: false` answers `None`; otherwise the observer roots a fresh
-/// `team.{team_id}` trace and, on the `otel` build, writes to [`MemoryConfig::otel_sink`] when one
-/// is configured.
+/// Precedence:
+///
+/// 1. a disabled configuration answers `None`;
+/// 2. `trace: false` answers `None` too — the explicit switch wins, so a caller-supplied
+///    [`MemoryConfig::observer`] is *not* attached to an untraced wiring;
+/// 3. a caller-supplied [`MemoryConfig::observer`] wins over the crate's own bridge (a configured
+///    [`MemoryConfig::otel_sink`] is then unused, because the built-in bridge is what writes to it);
+/// 4. otherwise the bridge roots a fresh `team.{team_id}` trace and, on the `otel` build, writes to
+///    [`MemoryConfig::otel_sink`] when one is configured.
 #[must_use]
 pub fn observer_for(team_id: &str, config: &MemoryConfig) -> Option<Arc<dyn TeamMemoryObserver>> {
     if !config.enabled {
-        return None;
-    }
-    if !config.trace {
-        if config.otel_sink.is_some() {
+        if config.observer.is_some() {
             debug!(
                 target: LOG_TARGET,
                 team = team_id,
-                "team memory tracing is off; the configured span sink stays untouched"
+                "team memory is disabled; the supplied observer stays unused"
             );
         }
         return None;
+    }
+    if !config.trace {
+        if config.otel_sink.is_some() || config.observer.is_some() {
+            debug!(
+                target: LOG_TARGET,
+                team = team_id,
+                "team memory tracing is off; the configured span sink and observer stay untouched"
+            );
+        }
+        return None;
+    }
+    if let Some(observer) = config.observer.as_ref() {
+        debug!(
+            target: LOG_TARGET,
+            team = team_id,
+            "attaching the caller-supplied team-memory observer"
+        );
+        return Some(Arc::clone(observer));
     }
     Some(Arc::new(build_observer(team_id, config)))
 }
@@ -226,6 +256,114 @@ mod tests {
         let config = MemoryConfig::default();
         assert!(config.otel_sink.is_none());
         assert!(observer_for("team-1", &config).is_some());
+    }
+
+    /// A test observer that records the operations it sees, in order.
+    #[derive(Default)]
+    struct RecordingObserver {
+        seen: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl RecordingObserver {
+        fn operations(&self) -> Vec<String> {
+            self.seen.lock().clone()
+        }
+    }
+
+    impl TeamMemoryObserver for RecordingObserver {
+        fn observe(&self, event: &openjiuwen_memory::team::TeamMemoryEvent) {
+            self.seen.lock().push(event.operation.as_str().to_owned());
+        }
+    }
+
+    /// Returns a config carrying `observer` and the default switches.
+    fn with_observer(observer: Arc<dyn TeamMemoryObserver>) -> MemoryConfig {
+        MemoryConfig {
+            observer: Some(observer),
+            ..MemoryConfig::default()
+        }
+    }
+
+    #[test]
+    fn an_injected_observer_wins_over_the_built_in_bridge() {
+        let recorder = Arc::new(RecordingObserver::default());
+        let config = with_observer(Arc::clone(&recorder) as Arc<dyn TeamMemoryObserver>);
+        let observer = observer_for("team-1", &config).expect("the supplied observer");
+        assert!(
+            Arc::ptr_eq(
+                &observer,
+                &(Arc::clone(&recorder) as Arc<dyn TeamMemoryObserver>)
+            ),
+            "the caller's observer is attached verbatim"
+        );
+        observer.observe(&openjiuwen_memory::team::TeamMemoryEvent::new(
+            openjiuwen_memory::team::TeamMemoryOperation::Write,
+            "team-1",
+        ));
+        assert_eq!(recorder.operations(), vec!["write".to_owned()]);
+    }
+
+    #[test]
+    fn a_facade_built_from_an_injected_observer_holds_that_very_observer() {
+        let recorder = Arc::new(RecordingObserver::default());
+        let config = with_observer(Arc::clone(&recorder) as Arc<dyn TeamMemoryObserver>);
+        let (memory, observer) = facade("team-1", &config);
+        let observer = observer.expect("the supplied observer");
+        let held = memory.observer().expect("the facade holds it");
+        assert!(Arc::ptr_eq(&observer, held));
+        assert!(Arc::ptr_eq(
+            &observer,
+            &(Arc::clone(&recorder) as Arc<dyn TeamMemoryObserver>)
+        ));
+    }
+
+    #[test]
+    fn trace_false_does_not_apply_an_injected_observer() {
+        let recorder = Arc::new(RecordingObserver::default());
+        let config = MemoryConfig {
+            trace: false,
+            ..with_observer(Arc::clone(&recorder) as Arc<dyn TeamMemoryObserver>)
+        };
+        assert!(observer_for("team-1", &config).is_none());
+        let (memory, observer) = facade("team-1", &config);
+        assert!(observer.is_none());
+        assert!(memory.observer().is_none());
+        assert!(recorder.operations().is_empty());
+    }
+
+    #[test]
+    fn a_disabled_configuration_does_not_apply_an_injected_observer() {
+        let recorder = Arc::new(RecordingObserver::default());
+        let config = MemoryConfig {
+            enabled: false,
+            ..with_observer(Arc::clone(&recorder) as Arc<dyn TeamMemoryObserver>)
+        };
+        assert!(config.trace);
+        assert!(observer_for("team-1", &config).is_none());
+        let (memory, observer) = facade("team-1", &config);
+        assert!(observer.is_none());
+        assert!(memory.observer().is_none());
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn an_injected_observer_leaves_the_configured_sink_to_the_built_in_bridge() {
+        let sink = Arc::new(OtelSpanSink::new(4));
+        let recorder = Arc::new(RecordingObserver::default());
+        let config = MemoryConfig {
+            otel_sink: Some(Arc::clone(&sink)),
+            ..with_observer(Arc::clone(&recorder) as Arc<dyn TeamMemoryObserver>)
+        };
+        let observer = observer_for("team-1", &config).expect("the supplied observer");
+        observer.observe(&openjiuwen_memory::team::TeamMemoryEvent::new(
+            openjiuwen_memory::team::TeamMemoryOperation::Search,
+            "team-1",
+        ));
+        assert_eq!(recorder.operations(), vec!["search".to_owned()]);
+        assert!(
+            sink.is_empty(),
+            "the sink belongs to the built-in bridge, which an injected observer replaces"
+        );
     }
 
     #[cfg(feature = "otel")]

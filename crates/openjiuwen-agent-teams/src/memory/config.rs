@@ -32,14 +32,15 @@
 //! `trace` is the only observability switch: it selects whether the wiring attaches the crate's
 //! team-memory observer to the facade (see
 //! [`trace`](crate::memory::trace)). The in-memory span sink
-//! ([`MemoryConfig::otel_sink`]) is a process-local handle, so it is not part of the metadata
-//! schema and is never serialized.
+//! ([`MemoryConfig::otel_sink`]) and the caller-supplied observer
+//! ([`MemoryConfig::observer`]) are process-local handles, so neither is part of the metadata
+//! schema and neither is ever serialized.
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_memory::team::TeamMemoryHookConfig;
+use openjiuwen_memory::team::{TeamMemoryHookConfig, TeamMemoryObserver};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use tracing::warn;
@@ -226,9 +227,9 @@ impl fmt::Display for MemoryExtractorKind {
 /// working configuration (memory on, rule extractor, document exported on stop and imported on
 /// build, every operation traced).
 ///
-/// `Debug` and `PartialEq` are hand-written because the `otel` sink is a shared handle: it is
-/// reported as "present" rather than dumped, and two configurations are equal only when they hold
-/// the *same* sink ([`Arc::ptr_eq`]).
+/// `Debug` and `PartialEq` are hand-written because the `otel` sink and the observer are shared
+/// handles: each is reported as "present" rather than dumped, and two configurations are equal
+/// only when they hold the *same* handle ([`Arc::ptr_eq`]).
 ///
 /// The booleans are independent switches for unrelated parts of the wiring (the master switch, the
 /// two document passes, tracing), not a state machine, so grouping them into enums would flatten
@@ -252,7 +253,8 @@ pub struct MemoryConfig {
     /// When `true` (the default) the wiring attaches a
     /// [`MemorySpanObserver`](crate::observability::MemorySpanObserver) to the facade, so each
     /// operation becomes one `memory.{operation}` span plus one structured `tracing` event. A
-    /// disabled configuration attaches no observer whatever this says.
+    /// disabled configuration attaches no observer whatever this says, and `false` attaches
+    /// nothing at all — not even a caller-supplied [`MemoryConfig::observer`].
     pub trace: bool,
     /// The in-memory span sink the observer also writes to on the `otel` build.
     ///
@@ -261,6 +263,21 @@ pub struct MemoryConfig {
     /// the sink type is uninhabited and the slot always stays `None`.
     #[serde(skip)]
     pub otel_sink: Option<Arc<OtelSpanSink>>,
+    /// A caller-supplied observer, which wins over the built-in
+    /// [`MemorySpanObserver`](crate::observability::MemorySpanObserver) bridge.
+    ///
+    /// The field is the host's way to attach its own sink — in particular the OTLP bridge
+    /// (`OtlpMemoryObserver`, feature `otlp`) — without rebuilding the facade itself. It is applied
+    /// by [`observer_for`](crate::memory::trace::observer_for) where the facade is built, because
+    /// [`TeamMemory::with_observer`](openjiuwen_memory::team::TeamMemory::with_observer) consumes
+    /// the facade; [`MemoryConfig::trace`] still gates it, so a `trace: false` wiring attaches
+    /// nothing even when an observer is supplied.
+    ///
+    /// Never serialized and never parsed from metadata: an observer is a process-local handle, and
+    /// [`memory_config`] always sets it to `None`. The field exists on every build, like
+    /// [`MemoryConfig::otel_sink`].
+    #[serde(skip)]
+    pub observer: Option<Arc<dyn TeamMemoryObserver>>,
     /// The lifecycle-hook switches and importances handed to the engine.
     pub hooks: TeamMemoryHookConfig,
 }
@@ -276,6 +293,7 @@ impl fmt::Debug for MemoryConfig {
             .field("import_on_build", &self.import_on_build)
             .field("trace", &self.trace)
             .field("has_otel_sink", &self.otel_sink.is_some())
+            .field("has_observer", &self.observer.is_some())
             .field("hooks", &self.hooks)
             .finish()
     }
@@ -295,6 +313,11 @@ impl PartialEq for MemoryConfig {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                 _ => false,
             }
+            && match (self.observer.as_ref(), other.observer.as_ref()) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
     }
 }
 
@@ -308,6 +331,7 @@ impl Default for MemoryConfig {
             import_on_build: true,
             trace: true,
             otel_sink: None,
+            observer: None,
             hooks: TeamMemoryHookConfig::default(),
         }
     }
@@ -316,9 +340,9 @@ impl Default for MemoryConfig {
 impl MemoryConfig {
     /// Validates the hook switches and the store directory.
     ///
-    /// [`MemoryConfig::otel_sink`] is deliberately not validated: it is a process-local handle
-    /// rather than user input, every build carries the field, and without the `otel` feature it can
-    /// never be `Some`.
+    /// [`MemoryConfig::otel_sink`] and [`MemoryConfig::observer`] are deliberately not validated:
+    /// they are process-local handles rather than user input, every build carries both fields, and
+    /// without the `otel` feature the sink can never be `Some`.
     ///
     /// # Errors
     ///
@@ -373,6 +397,7 @@ fn parse_block(spec: &TeamAgentSpec, map: &serde_json::Map<String, Value>) -> Me
         import_on_build: parse_bool(spec, map, "import_on_build", default.import_on_build),
         trace: parse_bool(spec, map, "trace", default.trace),
         otel_sink: None,
+        observer: None,
         hooks: parse_hooks(spec, map.get("hooks")),
     }
 }
@@ -690,6 +715,52 @@ mod tests {
         // A configuration decoded from JSON carries no sink.
         let decoded: MemoryConfig = serde_json::from_value(encoded).unwrap();
         assert!(decoded.otel_sink.is_none());
+    }
+
+    #[test]
+    fn the_observer_slot_is_never_serialized() {
+        let encoded = serde_json::to_value(MemoryConfig::default()).unwrap();
+        let object = encoded.as_object().unwrap();
+        assert!(!object.contains_key("observer"), "{encoded}");
+        // A configuration parsed from metadata carries no observer either.
+        let spec = spec_with(json!({"trace": true}));
+        assert!(memory_config(&spec).observer.is_none());
+        let decoded: MemoryConfig = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.observer.is_none());
+    }
+
+    /// A no-op observer, so the slot can be populated without a sink.
+    struct SilentObserver;
+
+    impl openjiuwen_memory::team::TeamMemoryObserver for SilentObserver {
+        fn observe(&self, _event: &openjiuwen_memory::team::TeamMemoryEvent) {}
+    }
+
+    #[test]
+    fn the_hand_written_debug_and_partial_eq_cover_the_observer() {
+        let first: Arc<dyn openjiuwen_memory::team::TeamMemoryObserver> = Arc::new(SilentObserver);
+        let configured = MemoryConfig {
+            observer: Some(Arc::clone(&first)),
+            ..MemoryConfig::default()
+        };
+        let rendered = format!("{configured:?}");
+        assert!(rendered.contains("has_observer: true"), "{rendered}");
+        assert!(
+            !rendered.contains("SilentObserver"),
+            "the observer is reported as a flag, not dumped: {rendered}"
+        );
+        // Cloning keeps the same handle, so the two configurations are equal.
+        assert_eq!(configured, configured.clone());
+        // A different observer is a different configuration, even of the same type.
+        let other = MemoryConfig {
+            observer: Some(Arc::new(SilentObserver)),
+            ..MemoryConfig::default()
+        };
+        assert_ne!(configured, other);
+        // None versus Some is never equal, and the default has none.
+        assert_ne!(configured, MemoryConfig::default());
+        assert!(MemoryConfig::default().observer.is_none());
+        assert!(format!("{:?}", MemoryConfig::default()).contains("has_observer: false"));
     }
 
     #[test]
