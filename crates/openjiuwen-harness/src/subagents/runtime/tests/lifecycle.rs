@@ -102,10 +102,25 @@ impl SubagentLifecycleHook for FailingBeforeEvict {
     }
 }
 
+/// What the reentrant hook observed while it held no runtime lock.
+#[derive(Debug, Clone, PartialEq)]
+struct Probe {
+    /// Instance the event described.
+    subagent_id: String,
+    /// Status the evicted instance still reported from inside `BeforeEvict`.
+    status: SubagentStatus,
+    /// Live instances `list()` returned from inside the hook.
+    live: usize,
+    /// Outcome of the hook's own `record_activity` call.
+    recorded: Option<u64>,
+}
+
 /// Hook that calls back into the runtime from inside `BeforeEvict`.
 struct ReentrantHook {
     /// Filled after the runtime is created (the hook needs a handle to it).
     runtime: Arc<Mutex<Option<Arc<SubAgentRuntime>>>>,
+    /// What the hook observed, asserted by the test afterwards.
+    probes: Arc<Mutex<Vec<Probe>>>,
 }
 
 #[async_trait::async_trait]
@@ -120,15 +135,20 @@ impl SubagentLifecycleHook for ReentrantHook {
             .lock()
             .clone()
             .expect("the runtime handle is installed before the spawn");
-        assert_eq!(runtime.list().len(), 1);
         assert!(runtime.activity_summary(&event.subagent_id).is_some());
-        runtime.record_activity(
+        let recorded = runtime.record_activity(
             &event.subagent_id,
             ActivityKind::ToolCall,
             "probe",
             None,
             None,
         )?;
+        self.probes.lock().push(Probe {
+            subagent_id: event.subagent_id.clone(),
+            status: runtime.get_status(&event.subagent_id),
+            live: runtime.list().len(),
+            recorded,
+        });
         Ok(())
     }
 }
@@ -203,8 +223,15 @@ async fn hooks_observe_spawn_ready_before_evict_close_in_order() {
 
 #[tokio::test]
 async fn a_failing_before_evict_hook_is_contained() {
+    // The failing hook is registered first, so the recording hook only sees `BeforeEvict`/`Close`
+    // if the pass continued past the failure.
+    let (hook, seen) = RecordingHook::new("recording");
     let runtime = build_runtime(&["worker"], FakeFactory::new(Behavior::Echo))
-        .with_lifecycle_hooks(LifecycleHooks::new().with_hook(Arc::new(FailingBeforeEvict)));
+        .with_lifecycle_hooks(
+            LifecycleHooks::new()
+                .with_hook(Arc::new(FailingBeforeEvict))
+                .with_hook(Arc::new(hook)),
+        );
     let id = spawn(&runtime, "worker", "task").await;
     wait_one(&runtime, &id).await;
 
@@ -228,6 +255,19 @@ async fn a_failing_before_evict_hook_is_contained() {
             .and_then(|frames| frames.last().map(|frame| frame.kind)),
         Some(ActivityKind::Evicted)
     );
+    // The failing hook did not abort the pass: the sibling hook observed every stage, including
+    // the `BeforeEvict` the failing hook refused and the `Close` after the tombstone.
+    let observed = calls_for(&seen, LifecycleStage::Spawn);
+    assert_eq!(observed.len(), 1);
+    assert_eq!(calls_for(&seen, LifecycleStage::Ready).len(), 1);
+    let before_evict = calls_for(&seen, LifecycleStage::BeforeEvict);
+    assert_eq!(before_evict.len(), 1);
+    assert_eq!(before_evict[0].subagent_id, id);
+    assert_eq!(before_evict[0].status, SubagentStatus::Completed);
+    let closes = calls_for(&seen, LifecycleStage::Close);
+    assert_eq!(closes.len(), 1);
+    assert_eq!(closes[0].reason.as_deref(), Some(EVICTION_REASON));
+    assert_eq!(closes[0].status, SubagentStatus::Closed);
 }
 
 #[tokio::test]
@@ -302,9 +342,11 @@ async fn capacity_pressure_eviction_fires_close_with_evicted_only() {
 #[tokio::test]
 async fn a_hook_may_call_back_into_the_runtime_without_deadlock() {
     let slot: Arc<Mutex<Option<Arc<SubAgentRuntime>>>> = Arc::new(Mutex::new(None));
+    let probes: Arc<Mutex<Vec<Probe>>> = Arc::new(Mutex::new(Vec::new()));
     let runtime = build_runtime(&["worker"], FakeFactory::new(Behavior::Echo))
         .with_lifecycle_hooks(LifecycleHooks::new().with_hook(Arc::new(ReentrantHook {
             runtime: Arc::clone(&slot),
+            probes: Arc::clone(&probes),
         })));
     let runtime = Arc::new(runtime);
     *slot.lock() = Some(Arc::clone(&runtime));
@@ -316,6 +358,39 @@ async fn a_hook_may_call_back_into_the_runtime_without_deadlock() {
         .expect("the reentrant hook must not deadlock")
         .expect("the eviction succeeds");
     assert_eq!(previous, SubagentStatus::Completed);
+
+    // The hook saw the instance before the tombstone was written, and its own recording call was
+    // suppressed because the completed turn had already made the stream terminal.
+    assert_eq!(
+        *probes.lock(),
+        vec![Probe {
+            subagent_id: id.clone(),
+            status: SubagentStatus::Completed,
+            live: 1,
+            recorded: None,
+        }]
+    );
+    let frames = runtime.activity(&id).expect("the tombstone exists");
+    assert_eq!(
+        frames.last().map(|frame| frame.kind),
+        Some(ActivityKind::Evicted)
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.kind == ActivityKind::ToolCall),
+        "a terminal stream suppresses the hook's frame"
+    );
+    assert_eq!(
+        runtime
+            .transcript(&id)
+            .and_then(|entries| entries.last().map(|entry| entry.kind)),
+        Some(TranscriptKind::Evicted)
+    );
+    assert_eq!(
+        runtime.get_metadata(&id).map(|m| m.closed_reason),
+        Some(Some(EVICTION_REASON.to_owned()))
+    );
 }
 
 #[tokio::test]
