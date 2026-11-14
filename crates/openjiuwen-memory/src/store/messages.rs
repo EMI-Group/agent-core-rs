@@ -116,7 +116,6 @@ impl MessageStore {
         if messages.is_empty() {
             return Ok(Vec::new());
         }
-        let rfc3339 = timestamp.to_rfc3339();
         let mut stored = Vec::with_capacity(messages.len());
         let mut documents = Vec::with_capacity(messages.len());
         for message in messages {
@@ -124,24 +123,15 @@ impl MessageStore {
             let role = message.role.as_str().to_owned();
             let id = derived_message_id(&content, &role, timestamp);
             let message = StoredMessage {
-                id: id.clone(),
                 user_id: scope.user_id.clone(),
                 scope_id: scope.scope_id.clone(),
                 session_id: scope.session_id.clone(),
                 role,
                 content,
                 timestamp,
+                id,
             };
-            let mut document = Document::new(id)
-                .with_field(FIELD_USER_ID, message.user_id.clone())
-                .with_field(FIELD_SCOPE_ID, message.scope_id.clone())
-                .with_field(FIELD_ROLE, message.role.clone())
-                .with_field(FIELD_CONTENT, message.content.clone())
-                .with_field(FIELD_TIMESTAMP, rfc3339.clone());
-            if let Some(session_id) = &message.session_id {
-                document = document.with_field(FIELD_SESSION_ID, session_id.clone());
-            }
-            documents.push(document);
+            documents.push(stored_document(&message));
             stored.push(message);
         }
         self.document.upsert(self.collection(), documents).await?;
@@ -207,6 +197,24 @@ pub(crate) fn derived_message_id(content: &str, role: &str, timestamp: DateTime<
     let millis = timestamp.timestamp_millis();
     let digest = fnv1a_64(format!("{content}{role}{millis}").as_bytes());
     format!("msg_{digest:016x}_{millis}")
+}
+
+/// Builds the stored document of one message (the shape [`MessageStore::append`] writes).
+///
+/// This is the single source of the document layout: the append path and the
+/// `migration::message` legacy-row import both go through it, so the two can never
+/// disagree on field names, the timestamp encoding, or the optional `session_id`.
+pub(crate) fn stored_document(message: &StoredMessage) -> Document {
+    let mut document = Document::new(message.id.clone())
+        .with_field(FIELD_USER_ID, message.user_id.clone())
+        .with_field(FIELD_SCOPE_ID, message.scope_id.clone())
+        .with_field(FIELD_ROLE, message.role.clone())
+        .with_field(FIELD_CONTENT, message.content.clone())
+        .with_field(FIELD_TIMESTAMP, message.timestamp.to_rfc3339());
+    if let Some(session_id) = &message.session_id {
+        document = document.with_field(FIELD_SESSION_ID, session_id.clone());
+    }
+    document
 }
 
 /// Computes the 64-bit FNV-1a hash of `bytes`.
