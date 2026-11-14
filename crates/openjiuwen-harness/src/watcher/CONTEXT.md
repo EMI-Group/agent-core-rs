@@ -84,6 +84,7 @@ Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path ins
 - `pub(crate) DropReporter` — `new(interval)`, `pending(&DropCounters)`, `next_deadline(&DropCounters, now) -> Option<Instant>` (never in the past), `report(..) -> bool` (throttled to one notice per stage per interval) and `flush(..) -> bool` (ignores the throttle; used on shutdown).
 - Both bounded queues use **drop-newest**: an item arriving while the queue is full is discarded, so admitted items keep FIFO order; a synchronous OS callback cannot implement drop-oldest without blocking.
 - Every drop is counted, logged at `debug` with its reason, logged once at `warn` per notice, and published as `WatchUpdate::Dropped`; a sustained overflow yields one notice per interval, never an error storm.
+- The notice interval is the configured debounce window with a 50 ms floor (`MIN_DROP_NOTICE_INTERVAL` in `backend.rs`), so a tiny window cannot raise the notice rate without bound.
 - A drop notice means the received deltas are incomplete: consumers must reload from disk instead of applying them.
 - `#[cfg(feature = "notify")] pub(crate) push_raw(&mpsc::Sender<notify::Result<notify::Event>>, &DropCounters, notify::Result<notify::Event>) -> bool` — the callback's only work: `try_send`, counting a `Full` error and ignoring a `Closed` one (shutdown, not a drop).
 
