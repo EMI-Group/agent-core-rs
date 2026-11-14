@@ -14,14 +14,16 @@
 //! - [`ModelTokenCounter`] and [`SelectedTokenizer`] implement the
 //!   [`TokenCounter`] seam used by the rest of the workspace.
 //!
-//! Native `tokenizer.json` artifacts need the `HuggingFace` `tokenizers` runtime,
-//! which is not available offline; [`load_native_tokenizer`] reports that as a
-//! typed [`Error::Unsupported`] instead of silently degrading.
-
-use std::sync::OnceLock;
+//! Native `tokenizer.json` artifacts are decoded in pure Rust by
+//! [`NativeTokenizer`], so [`load_native_tokenizer`] needs neither the
+//! `HuggingFace` `tokenizers` runtime nor network access; a `tiktoken` `.model`
+//! file is still reported as a typed [`Error::Unsupported`].
+use std::sync::{Arc, OnceLock};
 
 pub mod artifacts;
 pub mod native;
+
+pub use native::{byte_level_alphabet, NativeTokenizer, NativeTokenizerKind};
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::prompt::{ApproxTokenCounter, BaseMessage, TokenCounter};
@@ -136,7 +138,8 @@ pub enum TokenizerEngine {
     Auto,
     /// Use a `tiktoken` BPE vocabulary.
     Tiktoken,
-    /// Use a native `tokenizer.json` artifact (deferred offline).
+    /// Use a native `tokenizer.json` artifact, which the selector does not
+    /// resolve itself: load it with [`load_native_tokenizer`].
     Native,
 }
 
@@ -173,10 +176,11 @@ impl TokenizerSource {
 
 /// A declared tokenizer for one provider/model or one model family.
 ///
-/// Specs are declarative metadata: the offline resolver can satisfy `tiktoken`
-/// and `auto` engines, but a `native` engine needs an artifact runtime that is
-/// deferred (see [`load_native_tokenizer`]). Every field is optional except the
-/// provider/model pair, and unknown JSON fields are ignored.
+/// Specs are declarative metadata: the selector can satisfy `tiktoken` and
+/// `auto` engines, but it does not resolve a `native` artifact from the spec;
+/// [`TokenizerSpec::artifact_path`] is there for a caller that loads it with
+/// [`load_native_tokenizer`]. Every field is optional except the provider/model
+/// pair, and unknown JSON fields are ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct TokenizerSpec {
@@ -686,6 +690,8 @@ enum SelectedBacking {
     Bpe(ModelEncoding),
     /// A characters-per-token estimate.
     Approx(ApproxTokenCounter),
+    /// A native `tokenizer.json` artifact.
+    Native(Arc<NativeTokenizer>),
 }
 
 /// The token counter chosen by [`TokenizerSelector`].
@@ -740,6 +746,28 @@ impl SelectedTokenizer {
             model,
             tokenizer: None,
             fallback_reason,
+        }
+    }
+
+    /// Builds a native-artifact-backed selection.
+    ///
+    /// The count is exact for the artifact the caller loaded, so
+    /// [`SelectedTokenizer::source`] reports
+    /// [`TokenizerSource::NativeTokenizer`], [`SelectedTokenizer::estimated`]
+    /// is `false` and there is no fallback reason. `tokenizer` names the
+    /// artifact (its id, else the path it was read from).
+    #[must_use]
+    pub fn from_native(
+        native: Arc<NativeTokenizer>,
+        model: Option<String>,
+        tokenizer: Option<String>,
+    ) -> Self {
+        Self {
+            backing: SelectedBacking::Native(native),
+            source: TokenizerSource::NativeTokenizer,
+            model,
+            tokenizer,
+            fallback_reason: None,
         }
     }
 
@@ -821,6 +849,7 @@ impl TokenCounter for SelectedTokenizer {
                     .count_text(text),
             },
             SelectedBacking::Approx(counter) => counter.count_text(text),
+            SelectedBacking::Native(native) => native.count_text(text),
         }
     }
 }
@@ -1039,18 +1068,43 @@ fn non_empty(value: String) -> Option<String> {
 
 /// Loads a native `tokenizer.json` artifact.
 ///
+/// The file is read once, here; the returned selection then counts entirely in
+/// memory, so this constructor is a one-off per context/model binding and never
+/// a hot path.
+///
 /// # Errors
 ///
-/// Always returns [`Error::Unsupported`]: loading a `HuggingFace` `tokenizers`
-/// artifact needs a runtime that is not available offline. The path is never
-/// read; use [`ModelTokenCounter`] or the selector's approximate fallback
-/// instead.
+/// - [`Error::NotFound`] when `path` does not exist;
+/// - [`Error::Validation`] when the file cannot be read or is not a valid
+///   `tokenizer.json`;
+/// - [`Error::Unsupported`] when the artifact declares a model type this crate
+///   does not decode, or when `path` is a `tiktoken` `.model` file (a different
+///   artifact format, not implemented here).
 pub fn load_native_tokenizer(path: impl AsRef<std::path::Path>) -> Result<SelectedTokenizer> {
-    // Keep the path in the signature so callers can switch over without an API
-    // change, but never touch the filesystem: this is a documented deferral.
-    let _ = path.as_ref();
-    Err(Error::Unsupported(
-        "native tokenizer.json loading requires the HuggingFace tokenizers runtime; use the tiktoken or approximate counter"
-            .to_owned(),
+    let path = path.as_ref();
+    let display = path.display().to_string();
+    if !path.exists() {
+        return Err(Error::NotFound(format!(
+            "native tokenizer artifact not found: {display}"
+        )));
+    }
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "model")
+    {
+        return Err(Error::Unsupported(format!(
+            "{display} is a tiktoken `.model` artifact; only `tokenizer.json` artifacts are decoded here"
+        )));
+    }
+    let native = NativeTokenizer::load(path)?;
+    let tokenizer = Some(
+        native
+            .tokenizer_id()
+            .map_or_else(|| display.clone(), str::to_owned),
+    );
+    Ok(SelectedTokenizer::from_native(
+        Arc::new(native),
+        None,
+        tokenizer,
     ))
 }
