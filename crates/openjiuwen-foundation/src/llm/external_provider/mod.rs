@@ -13,7 +13,8 @@
 //! process-global registry is what the free functions
 //! ([`create_auth_provider`], [`create_model_catalog`], …) drive.
 //!
-//! The built-in [`OpenAiAccountAuthManager`] and [`OpenAiAccountModelCatalog`]
+//! The built-in [`OpenAiAccountAuthManager`](openai_account::OpenAiAccountAuthManager)
+//! and [`OpenAiAccountModelCatalog`](openai_account::OpenAiAccountModelCatalog)
 //! are wired into [`ExternalProviderRegistry::with_builtins`], so lookups work
 //! without an explicit registration.
 //!
