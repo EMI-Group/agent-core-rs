@@ -34,7 +34,12 @@
 //!   `memories_json`, because the persisted record is family-agnostic.
 //! * Python derives a memory's embedding from separate `title`/`description`/
 //!   `content` fields and stores it in Milvus; this port embeds
-//!   [`ranking::scoring_text`] into an in-process [`super::MemoryVectorStore`].
+//!   [`ranking::scoring_text`] into a
+//!   [`VectorIndex`](super::memory_store::VectorIndex) — in process memory by
+//!   default, or a kernel vector-store collection
+//!   ([`super::kernel_vector_index::KernelVectorIndex`]) when
+//!   [`TaskMemoryConfig::vector_backend`] selects one and the service is built
+//!   with a store.
 //!
 //! Python counterparts: `tests/unit_tests/extensions/context_evolver/`
 //! (`test_retrieve_flow.py`, `test_summary_flow.py`); the live flows are skipped
@@ -43,7 +48,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
+use openjiuwen_core::foundation::store::VectorStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -65,6 +71,9 @@ pub use llm::LlmTaskMemoryService;
 /// The tracing target shared by this module tree.
 pub(crate) const LOG_TARGET: &str = "openjiuwen_extensions::context_evolver::service";
 
+/// The collection a store-backed index writes to when the configuration names
+/// no collection of its own.
+pub const DEFAULT_VECTOR_COLLECTION: &str = "context_evolver_memories";
 /// Default for [`TaskMemoryConfig::top_k`] (Python retrieves a handful of
 /// memories, not the whole store).
 const DEFAULT_TOP_K: usize = 5;
@@ -81,6 +90,71 @@ const DEFAULT_HASHING_DIMS: usize = 256;
 pub(crate) const LEXICAL_WEIGHT: f32 = 0.7;
 /// Weight of the (clamped) cosine score in the blended ranking.
 pub(crate) const COSINE_WEIGHT: f32 = 0.3;
+
+/// Where a service's memory index lives.
+///
+/// [`VectorBackend::InMemory`] (the default) keeps the embeddings in process
+/// memory through [`MemoryVectorStore`](super::memory_store::MemoryVectorStore),
+/// which is what Python does in its
+/// development and test configuration. [`VectorBackend::VectorStore`] keeps
+/// them in a collection of a kernel `VectorStore` handed to the service
+/// ([`KernelVectorIndex`](super::kernel_vector_index::KernelVectorIndex)), which
+/// is the shape of Python's `Milvus` deployment:
+/// the index survives the process, and several processes can score against it.
+///
+/// The variant only names the destination — the store instance itself is
+/// supplied at construction
+/// ([`DeterministicTaskMemoryService::with_vector_store`] or
+/// [`create_task_memory_service_with_vector_store`]) — so a configuration stays
+/// plain data and round-trips through JSON:
+///
+/// ```
+/// use openjiuwen_extensions::context_evolver::{Algo, TaskMemoryConfig, VectorBackend};
+///
+/// let config = TaskMemoryConfig::new(Algo::Reme).with_vector_backend(
+///     VectorBackend::VectorStore { collection: "memories".into() },
+/// );
+/// let encoded = serde_json::to_string(&config).unwrap();
+/// assert!(encoded.contains("\"vector_store\""));
+/// assert_eq!(
+///     TaskMemoryConfig::new(Algo::Ace).vector_backend,
+///     VectorBackend::InMemory
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VectorBackend {
+    /// The in-process cosine index ([`MemoryVectorStore`]).
+    InMemory,
+    /// A collection of the kernel `VectorStore` handed to the service.
+    VectorStore {
+        /// Collection name inside that store.
+        collection: String,
+    },
+}
+
+impl VectorBackend {
+    /// The collection a store-backed index writes to.
+    ///
+    /// [`VectorBackend::InMemory`] reports
+    /// [`DEFAULT_VECTOR_COLLECTION`], the name a service uses when it is handed
+    /// a `VectorStore` while its configuration still selects the in-process
+    /// backend.
+    #[must_use]
+    pub fn collection(&self) -> &str {
+        match self {
+            Self::InMemory => DEFAULT_VECTOR_COLLECTION,
+            Self::VectorStore { collection } => collection,
+        }
+    }
+}
+
+impl Default for VectorBackend {
+    /// The in-process index, Python's development default.
+    fn default() -> Self {
+        Self::InMemory
+    }
+}
 
 /// Knobs shared by every `context_evolver` service.
 ///
@@ -110,6 +184,8 @@ pub struct TaskMemoryConfig {
     pub ace_bullet_limit: usize,
     /// Hits scoring below this value are dropped (default `0.0`).
     pub min_score: f32,
+    /// Where the memory index lives (default [`VectorBackend::InMemory`]).
+    pub vector_backend: VectorBackend,
 }
 
 impl TaskMemoryConfig {
@@ -122,6 +198,7 @@ impl TaskMemoryConfig {
             candidate_limit: DEFAULT_CANDIDATE_LIMIT,
             ace_bullet_limit: DEFAULT_ACE_BULLET_LIMIT,
             min_score: DEFAULT_MIN_SCORE,
+            vector_backend: VectorBackend::default(),
         }
     }
 
@@ -143,6 +220,19 @@ impl TaskMemoryConfig {
     #[must_use]
     pub fn with_ace_bullet_limit(mut self, ace_bullet_limit: usize) -> Self {
         self.ace_bullet_limit = clamp_limit(ace_bullet_limit);
+        self
+    }
+
+    /// Selects where the memory index lives.
+    ///
+    /// Supplying [`VectorBackend::VectorStore`] makes the deterministic service
+    /// require a store at construction: until
+    /// [`DeterministicTaskMemoryService::with_vector_store`] is called, every
+    /// scoring attempt answers [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported)
+    /// instead of silently scoring in process memory.
+    #[must_use]
+    pub fn with_vector_backend(mut self, vector_backend: VectorBackend) -> Self {
+        self.vector_backend = vector_backend;
         self
     }
 
@@ -316,6 +406,12 @@ impl fmt::Debug for MemoryBackend {
 /// [`MemoryBackend::Llm`] builds a [`LlmTaskMemoryService`] over `config`, the
 /// supplied completion backend, and `store`, so retrieve/summarize become model
 /// calls; [`MemoryBackend::Unsupported`] builds the documented deferred default.
+///
+/// The returned service scores in process memory, so a `config` whose
+/// [`TaskMemoryConfig::vector_backend`] selects
+/// [`VectorBackend::VectorStore`] has no store wired and fails every scoring
+/// attempt with [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported);
+/// use [`create_task_memory_service_with_vector_store`] to supply one.
 #[must_use]
 pub fn create_task_memory_service(
     config: TaskMemoryConfig,
@@ -332,6 +428,42 @@ pub fn create_task_memory_service(
             Arc::new(LlmTaskMemoryService::new(config, completion, store))
         }
         MemoryBackend::Unsupported => Arc::new(UnsupportedTaskMemoryService::new(config.algo)),
+    }
+}
+
+/// Builds the [`TaskMemoryService`] selected by `backend` over a vector store.
+///
+/// This is [`create_task_memory_service`] with the memory index placed in
+/// `vector_store`: [`MemoryBackend::Deterministic`] scores through a
+/// [`KernelVectorIndex`](super::kernel_vector_index::KernelVectorIndex) over the
+/// collection named by `config`'s [`TaskMemoryConfig::vector_backend`] (the
+/// in-process backend falls back to [`DEFAULT_VECTOR_COLLECTION`]), so the index
+/// survives a rebuild of the service over the same store.
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] for a blank collection name and
+/// [`Error::Unsupported`] for [`MemoryBackend::Llm`]: the model-driven service
+/// ranks by the reply's order and never scores with a vector index, so handing
+/// it a store would silently ignore the store. [`MemoryBackend::Unsupported`]
+/// still builds the documented deferred default, because it never scores.
+#[allow(clippy::needless_pass_by_value)] // Mirrors `create_task_memory_service`'s signature.
+pub fn create_task_memory_service_with_vector_store(
+    config: TaskMemoryConfig,
+    backend: MemoryBackend,
+    store: Arc<dyn MemoryStore>,
+    vector_store: Arc<dyn VectorStore>,
+) -> Result<Arc<dyn TaskMemoryService>> {
+    match backend {
+        MemoryBackend::Deterministic => Ok(Arc::new(
+            DeterministicTaskMemoryService::new(config.algo, config, store)
+                .with_vector_store(vector_store)?,
+        )),
+        MemoryBackend::Llm(_) => Err(Error::unsupported(
+            "the model-driven memory service ranks by the reply's order and never scores with a \
+             vector index; hand the vector store to the deterministic backend instead",
+        )),
+        MemoryBackend::Unsupported => Ok(Arc::new(UnsupportedTaskMemoryService::new(config.algo))),
     }
 }
 
@@ -435,6 +567,7 @@ mod tests {
     use crate::context_evolver::prompt::RetrievedHit;
     use crate::context_evolver::{AddMemoryRequest, InMemoryMemoryStore, RetrieveRequest};
     use openjiuwen_common::error::ErrorKind;
+    use openjiuwen_core::foundation::store::InMemoryVectorStore;
 
     fn record(id: &str, content: &str) -> MemoryRecord {
         MemoryRecord {
@@ -674,5 +807,97 @@ mod tests {
         assert_eq!(collapse("abcdef", 6), "abcdef");
         assert_eq!(collapse("abcdefg", 6), "abcde…");
         assert_eq!(collapse("héllo wörld", 4), "hél…");
+    }
+    #[test]
+    fn vector_backend_defaults_to_in_memory_and_round_trips() {
+        let config = TaskMemoryConfig::new(Algo::Reme);
+        assert_eq!(config.vector_backend, VectorBackend::InMemory);
+        assert_eq!(
+            config.vector_backend.collection(),
+            DEFAULT_VECTOR_COLLECTION
+        );
+
+        let config = config.with_vector_backend(VectorBackend::VectorStore {
+            collection: "memories".into(),
+        });
+        assert_eq!(config.vector_backend.collection(), "memories");
+        let encoded = serde_json::to_string(&config).unwrap();
+        assert!(encoded.contains(r#""kind":"vector_store""#), "{encoded}");
+        let decoded: TaskMemoryConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, config);
+        // Omitted in JSON means the in-process default.
+        let partial: TaskMemoryConfig = serde_json::from_str(r#"{"algo": "reme"}"#).unwrap();
+        assert_eq!(partial.vector_backend, VectorBackend::InMemory);
+    }
+
+    #[tokio::test]
+    async fn the_store_backed_factory_wires_the_deterministic_backend_only() {
+        // `Deterministic` accepts the store and scores through it.
+        let store = Arc::new(InMemoryMemoryStore::new());
+        let service = create_task_memory_service_with_vector_store(
+            TaskMemoryConfig::new(Algo::Reme),
+            MemoryBackend::Deterministic,
+            store.clone(),
+            Arc::new(InMemoryVectorStore::new()),
+        )
+        .unwrap();
+        service
+            .add_memory(
+                "user",
+                AddMemoryRequest {
+                    content: "alpha beta".to_string(),
+                    ..AddMemoryRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let response = service
+            .retrieve(RetrieveRequest {
+                user_id: "user".into(),
+                query: "alpha".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.status, "success");
+        assert_ne!(response.memory_string, "");
+
+        // The model-driven service ranks by the reply's order, so a store would
+        // be ignored: that is an error, not a silent no-op.
+        let error = create_task_memory_service_with_vector_store(
+            TaskMemoryConfig::new(Algo::Reme),
+            MemoryBackend::Llm(Arc::new(ScriptedCompletion::new([
+                r#"{"ranked_indices": [0]}"#,
+            ]))),
+            store,
+            Arc::new(InMemoryVectorStore::new()),
+        )
+        .err()
+        .expect("the llm backend never scores through a vector store");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            error.message().contains("deterministic backend"),
+            "{}",
+            error.message()
+        );
+
+        // The deferred default still builds, because it never scores.
+        let deferred = create_task_memory_service_with_vector_store(
+            TaskMemoryConfig::new(Algo::Ace),
+            MemoryBackend::Unsupported,
+            Arc::new(InMemoryMemoryStore::new()),
+            Arc::new(InMemoryVectorStore::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            deferred
+                .retrieve(RetrieveRequest {
+                    user_id: "user".into(),
+                    query: "anything".into(),
+                })
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Unsupported
+        );
     }
 }

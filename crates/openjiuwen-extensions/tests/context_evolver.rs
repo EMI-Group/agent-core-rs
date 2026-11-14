@@ -18,12 +18,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use openjiuwen_common::error::ErrorKind;
+use openjiuwen_core::foundation::store::{InMemoryVectorStore, VectorStore};
 use openjiuwen_extensions::context_evolver::{
     create_task_memory_service, generate_memory_id, normalize_algo_name, AddMemoryRequest, Algo,
-    AlgoFamily, ChatCompletionConfig, InMemoryMemoryStore, JsonFileMemoryStore, MemoryBackend,
-    MemoryDraft, MemoryRecord, MemoryStore, OpenAiChatCompletion, RetrieveRequest,
-    ScriptedCompletion, SummarizeRequest, TaskMemoryConfig, TaskMemoryService,
-    UnsupportedTaskMemoryService,
+    AlgoFamily, ChatCompletionConfig, DeterministicTaskMemoryService, HashingEmbedding,
+    InMemoryMemoryStore, JsonFileMemoryStore, KernelVectorIndex, MemoryBackend, MemoryDraft,
+    MemoryRecord, MemoryStore, OpenAiChatCompletion, RetrieveRequest, ScriptedCompletion,
+    SummarizeRequest, TaskMemoryConfig, TaskMemoryService, UnsupportedTaskMemoryService,
+    VectorBackend, VectorIndex, VectorNode, DEFAULT_VECTOR_COLLECTION,
 };
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
@@ -996,4 +998,140 @@ async fn scripted_completion_records_the_prompts_and_persists_the_reply() {
     assert_eq!(loaded.len(), 1);
     assert_eq!(loaded[0].content, experience);
     assert_eq!(completion.call_count(), 1);
+}
+
+// --- store-backed scoring ---------------------------------------------------
+//
+// Python counterpart: `extensions/context_evolver/retrieve/task/*/run.py` scores
+// memories through `Milvus`, a path its own suite only runs with credentials;
+// these tests pin the same seam offline over a kernel `VectorStore`.
+/// The `{"memories": [...]}` `(id, score)` pairs of a retrieve response.
+fn scored_entries(response: &Value) -> Vec<(String, f64)> {
+    response["memories"]
+        .as_array()
+        .expect("memories")
+        .iter()
+        .map(|memory| {
+            (
+                memory["id"].as_str().expect("id").to_string(),
+                memory["score"].as_f64().expect("score"),
+            )
+        })
+        .collect()
+}
+/// Seeds the offline memories and returns an in-process deterministic service.
+async fn seeded_service(store: Arc<dyn MemoryStore>) -> DeterministicTaskMemoryService {
+    let service =
+        DeterministicTaskMemoryService::new(Algo::Reme, TaskMemoryConfig::new(Algo::Reme), store)
+            .with_embedding(Arc::new(HashingEmbedding::default()));
+    for content in [
+        RIPGREP_MEMORY,
+        "Always page through results with a stable cursor.",
+        "Cache the embedding model, not the vectors.",
+    ] {
+        service.add_memory(USER, memory(content)).await.unwrap();
+    }
+    service
+}
+/// Retrieves the offline memories for `RANK_QUERY` under `user`.
+async fn rank(service: &dyn TaskMemoryService, user: &str) -> Value {
+    service
+        .retrieve(RetrieveRequest {
+            user_id: user.into(),
+            query: RANK_QUERY.into(),
+        })
+        .await
+        .unwrap()
+        .retrieved_memory
+}
+#[tokio::test]
+async fn vector_store_backend_scores_like_the_in_process_index_and_survives_a_rebuild() {
+    let memories: Arc<dyn MemoryStore> = Arc::new(InMemoryMemoryStore::new());
+    let in_process = seeded_service(Arc::clone(&memories)).await;
+    let expected = scored_entries(&rank(&in_process, USER).await);
+    assert_eq!(expected.len(), 3);
+
+    let vector_store: Arc<dyn VectorStore> = Arc::new(InMemoryVectorStore::new());
+    let config =
+        TaskMemoryConfig::new(Algo::Reme).with_vector_backend(VectorBackend::VectorStore {
+            collection: "memories".into(),
+        });
+    let store_backed =
+        DeterministicTaskMemoryService::new(Algo::Reme, config.clone(), Arc::clone(&memories))
+            .with_embedding(Arc::new(HashingEmbedding::default()))
+            .with_vector_store(vector_store.clone())
+            .unwrap();
+    let actual = scored_entries(&rank(&store_backed, USER).await);
+    assert_eq!(
+        actual.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+        expected.iter().map(|(id, _)| id).collect::<Vec<_>>()
+    );
+    for ((_, stored), (_, in_process)) in actual.iter().zip(&expected) {
+        assert!(
+            (stored - in_process).abs() < 1e-5,
+            "store-backed {stored} vs in-process {in_process}"
+        );
+    }
+
+    // The service was rebuilt over the same store, which now holds the nodes the
+    // first one upserted; it ranks identically without recreating the collection.
+    let rebuilt = DeterministicTaskMemoryService::new(Algo::Reme, config, memories)
+        .with_embedding(Arc::new(HashingEmbedding::default()))
+        .with_vector_store(vector_store.clone())
+        .unwrap();
+    assert_eq!(scored_entries(&rank(&rebuilt, USER).await), actual);
+}
+#[tokio::test]
+async fn store_backed_index_reports_unknown_collections_and_dimension_mismatches() {
+    let index = KernelVectorIndex::new(
+        Arc::new(InMemoryVectorStore::new()) as Arc<dyn VectorStore>,
+        "memories",
+    )
+    .unwrap();
+    let error = index.search(&[1.0, 0.0], 1).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert!(error.message().contains("memories"), "{}", error.message());
+
+    index
+        .upsert(vec![VectorNode::new("a", vec![1.0, 0.0])])
+        .await
+        .unwrap();
+    let error = index
+        .upsert(vec![VectorNode::new("b", vec![1.0, 0.0, 0.0])])
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(
+        error.message().contains("3-dimension") && error.message().contains("2-dimension"),
+        "{}",
+        error.message()
+    );
+    assert_eq!(
+        index.search(&[1.0], 1).await.unwrap_err().kind(),
+        ErrorKind::Validation
+    );
+}
+#[tokio::test]
+async fn default_configuration_keeps_the_in_process_index() {
+    assert_eq!(
+        TaskMemoryConfig::default().vector_backend,
+        VectorBackend::InMemory
+    );
+    assert_eq!(
+        VectorBackend::InMemory.collection(),
+        DEFAULT_VECTOR_COLLECTION
+    );
+    let configured =
+        TaskMemoryConfig::new(Algo::Reme).with_vector_backend(VectorBackend::VectorStore {
+            collection: "memories".into(),
+        });
+    assert_eq!(configured.vector_backend.collection(), "memories");
+    let decoded: TaskMemoryConfig =
+        serde_json::from_str(&serde_json::to_string(&configured).unwrap()).unwrap();
+    assert_eq!(decoded, configured);
+
+    // The default factory still scores in process memory, with no store in
+    // sight, exactly as before the seam existed.
+    let service = seeded_service(Arc::new(InMemoryMemoryStore::new())).await;
+    assert_eq!(scored_entries(&rank(&service, USER).await).len(), 3);
 }

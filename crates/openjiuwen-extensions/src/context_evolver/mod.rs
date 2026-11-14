@@ -36,13 +36,15 @@ use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod kernel_vector_index;
 pub mod memory_store;
 pub mod prompt;
 pub mod record;
 pub mod service;
 pub mod store;
 
-pub use memory_store::{MemoryVectorStore, ScoredNode, VectorNode};
+pub use kernel_vector_index::{KernelVectorIndex, EMBEDDING_FIELD, ID_FIELD, METADATA_FIELD};
+pub use memory_store::{MemoryVectorStore, ScoredNode, VectorIndex, VectorNode};
 pub use prompt::{
     parse_retrieve, parse_summarize, parse_trajectories, render_memory_string, retrieve_prompt,
     summarize_prompt, PromptPair, RetrievedHit, SummaryDraft, SummaryOperation, Trajectory,
@@ -50,8 +52,9 @@ pub use prompt::{
 };
 pub use record::{generate_memory_id, MemoryDraft, MemoryRecord};
 pub use service::{
-    create_task_memory_service, DeterministicTaskMemoryService, HashingEmbedding,
-    LlmTaskMemoryService, MemoryBackend, MemoryEmbedding, TaskMemoryConfig,
+    create_task_memory_service, create_task_memory_service_with_vector_store,
+    DeterministicTaskMemoryService, HashingEmbedding, LlmTaskMemoryService, MemoryBackend,
+    MemoryEmbedding, TaskMemoryConfig, VectorBackend, DEFAULT_VECTOR_COLLECTION,
 };
 pub use store::{InMemoryMemoryStore, JsonFileMemoryStore, MemoryStore};
 

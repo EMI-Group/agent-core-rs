@@ -9,8 +9,10 @@
 //!
 //! * **retrieve** ranks the user's stored memories lexically
 //!   ([`super::ranking`]) and, when an embedding backend is configured, blends
-//!   in a cosine signal (`0.7 * lexical + 0.3 * cosine`) computed over an
-//!   in-process [`MemoryVectorStore`]. ACE is
+//!   in a cosine signal (`0.7 * lexical + 0.3 * cosine`) computed over the
+//!   service's [`VectorIndex`] — in process memory by default
+//!   ([`MemoryVectorStore`]), or a kernel vector-store collection when
+//!   [`DeterministicTaskMemoryService::with_vector_store`] wired one. ACE is
 //!   unranked exactly like Python's playbook load: id order, every hit `1.0`,
 //!   capped at [`TaskMemoryConfig::ace_bullet_limit`].
 //! * **summarize** is *extractive*: every trajectory becomes one memory whose
@@ -53,14 +55,18 @@ use tracing::debug;
 use super::super::prompt::{parse_trajectories, render_memory_string, RetrievedHit, Trajectory};
 use super::super::record::{generate_memory_id, MemoryDraft, MemoryRecord};
 use super::super::store::MemoryStore;
+use openjiuwen_core::foundation::store::VectorStore;
+
+use super::super::kernel_vector_index::KernelVectorIndex;
+use super::super::memory_store::{MemoryVectorStore, UnwiredVectorIndex, VectorIndex};
 use super::super::{
-    AddMemoryRequest, Algo, MemoryVectorStore, RetrieveRequest, RetrieveResponse, SummarizeRequest,
-    SummarizeResponse, TaskMemoryService,
+    AddMemoryRequest, Algo, RetrieveRequest, RetrieveResponse, SummarizeRequest, SummarizeResponse,
+    TaskMemoryService,
 };
 use super::ranking;
 use super::{
-    collapse, finalize_hits, memories_json, MemoryEmbedding, TaskMemoryConfig, COSINE_WEIGHT,
-    LEXICAL_WEIGHT, LOG_TARGET,
+    collapse, finalize_hits, memories_json, MemoryEmbedding, TaskMemoryConfig, VectorBackend,
+    COSINE_WEIGHT, LEXICAL_WEIGHT, LOG_TARGET,
 };
 
 /// The `status` every successful response card carries (Python's literal).
@@ -131,6 +137,10 @@ pub struct DeterministicTaskMemoryService {
     store: Arc<dyn MemoryStore>,
     /// Optional cosine signal; `None` means lexical ranking only.
     embedding: Option<Arc<dyn MemoryEmbedding>>,
+    /// Scoring seam: in-process by default, or a kernel vector-store
+    /// collection when [`DeterministicTaskMemoryService::with_vector_store`]
+    /// wired one.
+    index: Arc<dyn VectorIndex>,
 }
 
 impl DeterministicTaskMemoryService {
@@ -139,15 +149,30 @@ impl DeterministicTaskMemoryService {
     /// The `algo` argument wins over [`TaskMemoryConfig::algo`], so
     /// `algo`/`config.algo` never disagree; every other knob comes from `config`.
     /// Call [`DeterministicTaskMemoryService::with_embedding`] to add the cosine
-    /// signal.
+    /// signal and [`DeterministicTaskMemoryService::with_vector_store`] to keep
+    /// the index outside process memory.
+    ///
+    /// A `config` whose [`TaskMemoryConfig::vector_backend`] selects
+    /// [`VectorBackend::VectorStore`] starts with an *unwired* index: scoring
+    /// answers [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported)
+    /// naming the collection until [`DeterministicTaskMemoryService::with_vector_store`]
+    /// supplies the store, so a missing store never degrades silently to the
+    /// in-process index.
     #[must_use]
     pub fn new(algo: Algo, mut config: TaskMemoryConfig, store: Arc<dyn MemoryStore>) -> Self {
         config.algo = algo;
+        let index: Arc<dyn VectorIndex> = match &config.vector_backend {
+            VectorBackend::InMemory => Arc::new(MemoryVectorStore::new()),
+            VectorBackend::VectorStore { collection } => {
+                Arc::new(UnwiredVectorIndex::new(collection.clone()))
+            }
+        };
         Self {
             algo,
             config,
             store,
             embedding: None,
+            index,
         }
     }
 
@@ -156,6 +181,39 @@ impl DeterministicTaskMemoryService {
     pub fn with_embedding(mut self, embedding: Arc<dyn MemoryEmbedding>) -> Self {
         self.embedding = Some(embedding);
         self
+    }
+
+    /// Scores through `index` instead of the in-process memory index.
+    ///
+    /// The service shares the index behind the [`Arc`], so several services
+    /// rescores against one index, and an index over a durable backend keeps
+    /// its nodes across a rebuild.
+    #[must_use]
+    pub fn with_vector_index(mut self, index: Arc<dyn VectorIndex>) -> Self {
+        self.index = index;
+        self
+    }
+
+    /// Keeps the memory index in `vector_store`, in the collection named by
+    /// [`TaskMemoryConfig::vector_backend`].
+    ///
+    /// This is the store-backed deployment: the embeddings live in the store's
+    /// collection ([`KernelVectorIndex`]) rather than in process memory, so a
+    /// service rebuilt over the same store keeps ranking against them. The
+    /// configuration falls back to
+    /// [`DEFAULT_VECTOR_COLLECTION`](super::DEFAULT_VECTOR_COLLECTION) when it
+    /// still selects [`VectorBackend::InMemory`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`](openjiuwen_common::error::Error::Validation)
+    /// when the configured collection name is blank.
+    pub fn with_vector_store(mut self, vector_store: Arc<dyn VectorStore>) -> Result<Self> {
+        self.index = Arc::new(KernelVectorIndex::new(
+            vector_store,
+            self.config.vector_backend.collection(),
+        )?);
+        Ok(self)
     }
 
     /// The algorithm this service renders and prefixes ids with.
@@ -187,8 +245,11 @@ impl DeterministicTaskMemoryService {
     /// Blends the lexical scores in `hits` with embedding cosine similarity.
     ///
     /// One vector per record (the embedding of [`ranking::scoring_text`]) is
-    /// upserted into a fresh [`MemoryVectorStore`], the query is embedded once,
-    /// and every hit is rescored:
+    /// upserted into the service's index (in process memory by default, or the
+    /// kernel collection wired with
+    /// [`DeterministicTaskMemoryService::with_vector_store`]), the query is
+    /// embedded once, the current record ids are rescored, and every hit is
+    /// rescored:
     ///
     /// * `0.7 * lexical + 0.3 * cosine.max(0.0)` normally;
     /// * `cosine.max(0.0)` when every lexical score is `0.0`, because the query
@@ -204,15 +265,15 @@ impl DeterministicTaskMemoryService {
         records: &[MemoryRecord],
         embedding: &dyn MemoryEmbedding,
     ) -> Result<Vec<RetrievedHit>> {
-        let index = MemoryVectorStore::new();
         let mut nodes = Vec::with_capacity(records.len());
         for record in records {
             let text = ranking::scoring_text(record);
             nodes.push(record.to_vector_node(embedding.embed(&text).await?));
         }
-        index.upsert(nodes).await?;
+        self.index.upsert(nodes).await?;
         let query_vector = embedding.embed(query).await?;
-        let scored = index.search(&query_vector, records.len()).await?;
+        let ids: Vec<String> = records.iter().map(|record| record.id.clone()).collect();
+        let scored = self.index.search_ids(&query_vector, &ids).await?;
         let cosines: BTreeMap<&str, f32> = scored
             .iter()
             .map(|scored| (scored.node.id.as_str(), scored.score))
@@ -873,5 +934,36 @@ mod tests {
         let loaded = service.load_memories("user").unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].content, "persisted");
+    }
+
+    #[tokio::test]
+    async fn a_store_backed_configuration_without_a_store_fails_loudly() {
+        let config =
+            TaskMemoryConfig::new(Algo::Reme).with_vector_backend(VectorBackend::VectorStore {
+                collection: "memories".into(),
+            });
+        let service = DeterministicTaskMemoryService::new(
+            Algo::Reme,
+            config,
+            Arc::new(InMemoryMemoryStore::new()),
+        )
+        .with_embedding(Arc::new(super::super::HashingEmbedding::default()));
+        service
+            .store
+            .upsert(record("a", "user", "alpha beta"))
+            .await
+            .unwrap();
+        // The configuration names a collection but no `VectorStore` was wired:
+        // scoring reports it instead of silently using process memory.
+        let error = service
+            .retrieve(request("user", "alpha"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            error.message().contains("memories") && error.message().contains("with_vector_store"),
+            "{}",
+            error.message()
+        );
     }
 }

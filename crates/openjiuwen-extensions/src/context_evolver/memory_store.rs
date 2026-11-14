@@ -1,4 +1,4 @@
-//! In-memory cosine vector index over memory nodes.
+//! Cosine vector index over memory nodes: the in-process scoring seam.
 //!
 //! Ports `openjiuwen/extensions/context_evolver/core/vector_store/memory_vector_store.py`,
 //! the `numpy`-backed store Python uses for development and tests. The Rust
@@ -11,15 +11,26 @@
 //! [`Vec`], so equal-score ties are returned in insertion order and results are
 //! deterministic across runs.
 //!
+//! [`VectorIndex`] is the scoring seam both backends satisfy:
+//! [`MemoryVectorStore`] keeps the nodes in process memory (the default), and
+//! [`KernelVectorIndex`](super::kernel_vector_index::KernelVectorIndex) keeps
+//! them in any kernel
+//! [`VectorStore`](openjiuwen_core::foundation::store::VectorStore) collection
+//! (in-memory, local JSON files, `Elasticsearch`, or a vendor `Milvus` adapter
+//! registered with the kernel), so a memory index can outlive the process that
+//! built it. Both report raw cosine similarities, so ranking and blending are
+//! unchanged when the backend is swapped.
+//!
 //! # Deviation from Python
 //!
 //! Python scores an empty query against an empty vector as `0.0` (the zero-norm
 //! short-circuit fires first). This port returns `1.0` for two empty vectors:
 //! they are identical, and the contract for this crate states that behavior
 //! explicitly.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,6 +76,73 @@ pub struct ScoredNode {
     pub node: VectorNode,
     /// Cosine similarity between the query and [`VectorNode::embedding`].
     pub score: f32,
+}
+
+/// The scoring seam a service ranks memories with.
+///
+/// Two backends ship: [`MemoryVectorStore`] (in-process, the default) and
+/// [`KernelVectorIndex`](super::kernel_vector_index::KernelVectorIndex) (a
+/// kernel vector-store collection, so the index can be persisted and shared
+/// across processes). Both report *raw* cosine similarities in `[-1.0, 1.0]`,
+/// rank descending with deterministic ties (insertion order here, primary key
+/// ascending in the store-backed index), and treat an empty vector as
+/// described on [`cosine_similarity`], so a service's blended scores and its
+/// final ordering do not depend on which backend answers.
+///
+/// The trait is object safe and every method takes `&self`, so a service holds
+/// it as an `Arc<dyn VectorIndex>` and several services can share one index.
+#[async_trait]
+pub trait VectorIndex: std::fmt::Debug + Send + Sync {
+    /// Inserts or replaces nodes by id, returning the number processed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for an empty id (and, for a store-backed
+    /// index, for an empty or inconsistent embedding dimension).
+    async fn upsert(&self, nodes: Vec<VectorNode>) -> Result<usize>;
+
+    /// Returns the `top_k` nodes closest to `query`, descending by score.
+    ///
+    /// # Errors
+    ///
+    /// A store-backed index reports the backend's failure (a missing
+    /// collection is [`Error::NotFound`], a query of the wrong dimension is
+    /// [`Error::Validation`]).
+    async fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<ScoredNode>>;
+
+    /// Searches only the nodes matching every entry of `metadata`.
+    ///
+    /// Keys are exact dotted paths, as documented on
+    /// [`MemoryVectorStore::search_with_metadata`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`VectorIndex::search`].
+    async fn search_with_metadata(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        metadata: &BTreeMap<String, Value>,
+    ) -> Result<Vec<ScoredNode>>;
+
+    /// Scores `query` against exactly the nodes named by `ids`.
+    ///
+    /// Naming an id the index does not hold is not an error: it simply does not
+    /// appear in the result. This is how a service rescores the records it just
+    /// loaded without ranking stale nodes left behind by removed memories.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`VectorIndex::search`].
+    async fn search_ids(&self, query: &[f32], ids: &[String]) -> Result<Vec<ScoredNode>>;
+
+    /// Removes every node from the index.
+    ///
+    /// # Errors
+    ///
+    /// A store-backed index reports the backend's failure. Clearing an index
+    /// that holds nothing succeeds.
+    async fn clear(&self) -> Result<()>;
 }
 
 /// An insertion-ordered, in-memory cosine index over [`VectorNode`]s.
@@ -152,13 +230,25 @@ impl MemoryVectorStore {
         top_k: usize,
         metadata: &BTreeMap<String, Value>,
     ) -> Result<Vec<ScoredNode>> {
+        Ok(self
+            .rank_matching(query, top_k, |node| metadata_matches(node, metadata))
+            .await)
+    }
+
+    /// Scores every node `accepts` keeps, descending, truncated to `top_k`.
+    ///
+    /// The sort is stable, so equal scores keep insertion order.
+    async fn rank_matching<F>(&self, query: &[f32], top_k: usize, accepts: F) -> Vec<ScoredNode>
+    where
+        F: Fn(&VectorNode) -> bool,
+    {
         if top_k == 0 {
-            return Ok(Vec::new());
+            return Vec::new();
         }
         let stored = self.nodes.read().await;
         let mut ranked: Vec<ScoredNode> = stored
             .iter()
-            .filter(|node| metadata_matches(node, metadata))
+            .filter(|node| accepts(node))
             .map(|node| ScoredNode {
                 node: node.clone(),
                 score: cosine_similarity(query, node.embedding.as_slice()),
@@ -167,7 +257,7 @@ impl MemoryVectorStore {
         drop(stored);
         ranked.sort_by(|left, right| right.score.total_cmp(&left.score));
         ranked.truncate(top_k);
-        Ok(ranked)
+        ranked
     }
 
     /// Returns the number of stored nodes.
@@ -191,6 +281,101 @@ impl MemoryVectorStore {
 impl Default for MemoryVectorStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[async_trait]
+impl VectorIndex for MemoryVectorStore {
+    async fn upsert(&self, nodes: Vec<VectorNode>) -> Result<usize> {
+        MemoryVectorStore::upsert(self, nodes).await
+    }
+
+    async fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<ScoredNode>> {
+        MemoryVectorStore::search(self, query, top_k).await
+    }
+
+    async fn search_with_metadata(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        metadata: &BTreeMap<String, Value>,
+    ) -> Result<Vec<ScoredNode>> {
+        MemoryVectorStore::search_with_metadata(self, query, top_k, metadata).await
+    }
+
+    async fn search_ids(&self, query: &[f32], ids: &[String]) -> Result<Vec<ScoredNode>> {
+        let wanted: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
+        Ok(self
+            .rank_matching(query, wanted.len(), |node| {
+                wanted.contains(node.id.as_str())
+            })
+            .await)
+    }
+
+    async fn clear(&self) -> Result<()> {
+        MemoryVectorStore::clear(self).await;
+        Ok(())
+    }
+}
+
+/// The index of a service configured for a store-backed index that no
+/// `VectorStore` was wired into.
+///
+/// [`DeterministicTaskMemoryService`](super::service::DeterministicTaskMemoryService)
+/// selects this index when its [`TaskMemoryConfig`](super::service::TaskMemoryConfig)
+/// names a `VectorStore` collection but construction supplied no store, so a
+/// misconfiguration fails loudly with [`Error::Unsupported`] instead of
+/// silently scoring in process memory.
+#[derive(Debug, Clone)]
+pub(crate) struct UnwiredVectorIndex {
+    /// The collection the configuration named.
+    collection: String,
+}
+
+impl UnwiredVectorIndex {
+    /// Builds the stub for `collection`.
+    pub(crate) fn new(collection: impl Into<String>) -> Self {
+        Self {
+            collection: collection.into(),
+        }
+    }
+
+    /// The typed error every method answers with.
+    fn error(&self) -> Error {
+        Error::unsupported(format!(
+            "the memory index is configured for vector store collection {:?} but no VectorStore \
+             was wired; build the service with `DeterministicTaskMemoryService::with_vector_store` \
+             or `create_task_memory_service_with_vector_store`",
+            self.collection
+        ))
+    }
+}
+
+#[async_trait]
+impl VectorIndex for UnwiredVectorIndex {
+    async fn upsert(&self, _nodes: Vec<VectorNode>) -> Result<usize> {
+        Err(self.error())
+    }
+
+    async fn search(&self, _query: &[f32], _top_k: usize) -> Result<Vec<ScoredNode>> {
+        Err(self.error())
+    }
+
+    async fn search_with_metadata(
+        &self,
+        _query: &[f32],
+        _top_k: usize,
+        _metadata: &BTreeMap<String, Value>,
+    ) -> Result<Vec<ScoredNode>> {
+        Err(self.error())
+    }
+
+    async fn search_ids(&self, _query: &[f32], _ids: &[String]) -> Result<Vec<ScoredNode>> {
+        Err(self.error())
+    }
+
+    async fn clear(&self) -> Result<()> {
+        Err(self.error())
     }
 }
 
