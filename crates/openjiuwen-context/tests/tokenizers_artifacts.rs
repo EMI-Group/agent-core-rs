@@ -1178,8 +1178,12 @@ fn an_undecoded_artifact_degrades_with_the_named_reason() {
         warning.contains(TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE),
         "the warning names the typed error: {warning}"
     );
-    // The warning carries the compact code the manager reports; the declared
-    // model type travels with the full message.
+    // The warning carries the manager's full typed message, so the declared
+    // model type reaches the operator instead of only the compact code.
+    assert!(
+        warning.contains("UnigramV2"),
+        "the warning names the declared model type: {warning}"
+    );
     let manager = selector.artifact_manager().expect("manager");
     assert_eq!(
         manager.last_error().as_deref(),

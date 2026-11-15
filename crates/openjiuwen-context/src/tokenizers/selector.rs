@@ -310,7 +310,8 @@ impl TokenizerSelector {
             return ArtifactAttempt::Failed(None);
         };
         let Some(path) = manager.resolve_cached(spec) else {
-            return Self::refused_artifact(spec, manager.last_error());
+            let refusal = manager.last_error_detail().or_else(|| manager.last_error());
+            return Self::refused_artifact(spec, refusal);
         };
         let artifact_display = path.display().to_string();
         let native = match native::load_artifact_file(&path, &artifact_display) {
@@ -540,7 +541,7 @@ fn declared_artifact(spec: &TokenizerSpec) -> String {
 ///
 /// The kind is chosen by file extension (`.model` or `.json`), then by content
 /// sniffing, exactly as [`artifacts::TokenizerArtifactManager`] validates a
-/// resolved artifact — see [`native::load_artifact_file`].
+/// resolved artifact — see `native::load_artifact_file`.
 ///
 /// # Errors
 ///
