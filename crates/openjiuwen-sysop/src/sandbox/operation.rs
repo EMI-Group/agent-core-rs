@@ -950,7 +950,7 @@ mod tests {
             .create_fs("aio_http_test", &endpoint, &gateway)
             .unwrap();
         let result = fs.read_file(ReadFileParams::text("x")).await;
-        assert_eq!(result.code, 199_007);
+        assert_eq!(result.code, 199_012);
         assert!(result.message.contains("sandbox gateway error"));
     }
 }

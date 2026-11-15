@@ -254,8 +254,14 @@ impl SysOperation {
     ///
     /// # Errors
     ///
-    /// See [`SandboxLifecycle::release`]: 199008 when the launcher fails and
-    /// `ErrorKind::Unsupported` when the recorded launcher type is no longer registered.
+    /// See [`SandboxLifecycle::release`]: 199008 when the launcher fails, and
+    /// `ErrorKind::Unsupported` when the recorded launcher type is no longer registered
+    /// **or when the launcher cannot perform the requested teardown at all**. The second
+    /// case is the important one: a launcher that has no way to `delete`/`pause` a container
+    /// (the built-in `pre_deploy` launcher, for instance) reports `Unsupported` instead of
+    /// returning `Ok(())`, because a silent success would leave the container running while
+    /// the caller believed it was gone. The record stays in the lifecycle, so the call can
+    /// be retried or swept later.
     pub async fn release_sandbox(&self) -> Result<()> {
         let Some(binding) = self.sandbox.as_ref() else {
             tracing::debug!(

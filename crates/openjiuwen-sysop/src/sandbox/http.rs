@@ -26,8 +26,33 @@
 //! [`HttpSandboxGateway::probe`] is the **only** method that performs network I/O: it
 //! sends a `GET` to the endpoint `base_url` and reports whether the gateway answers with a
 //! 2xx status. [`HttpSandboxGateway::invoke`] — and therefore every backend method —
-//! returns [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
-//! without touching the network, naming the gap.
+//! returns [`ErrorKind::Unsupported`] without touching the network, naming the gap.
+//!
+//! # Failure mapping
+//!
+//! Every backend method returns an [`OpResult`], so a failure is a value, not an error.
+//! Two codes are used, and they are now distinguishable:
+//!
+//! | Cause | `code` | `message` |
+//! |---|---|---|
+//! | the gateway cannot perform the operation at all ([`ErrorKind::Unsupported`], every method today) | [`SysOpStatus::Unsupported`] (`199012`, **Rust-only**) | `sandbox gateway error, operation: <method>, reason: <the Unsupported message>` |
+//! | parameter serialization, a real gateway error, `response.code != 0`, a missing or undecodable `data` | [`SysOpStatus::SandboxGatewayError`] (`199007`) | the matching Python gateway template |
+//!
+//! Both rows use the Python `sandbox gateway error, operation: <method>, reason: <reason>`
+//! envelope, so message/log compatibility is untouched; only the numeric code carries the
+//! distinction. [`OpResult::into_result`] turns `199012` into [`ErrorKind::Unsupported`]
+//! and every other failure code into a generic [`ErrorKind::SysOp`].
+//!
+//! Streaming calls behave the same way: a stream that hits an `Unsupported` gateway yields
+//! exactly one error chunk with code `199012` (never a successful chunk before or after it).
+//!
+//! # Errors and Unsupported
+//!
+//! A caller inspecting an [`OpResult`] can now separate the two questions "is this
+//! capability implemented here?" (`code == 199012`, reason naming the gap) and "did the
+//! gateway fail?" (`code == 199007`). Nothing changes for a successful call, for a
+//! provider-side failure (`response.code != 0`), or for an undecodable payload: they keep
+//! the code, message, and ordering they had before.
 //!
 //! # Deferred gaps
 //!
@@ -42,7 +67,8 @@
 //!   [`crate::code::types`] result type.
 //! - The streaming wire format: a streamed call invokes provider method
 //!   `"<method>_stream"` and expects a JSON array of chunks, which no provider in this
-//!   build can return, so in practice exactly one error chunk is yielded.
+//!   build can return, so in practice exactly one error chunk with code `199012`
+//!   ([`SysOpStatus::Unsupported`]) is yielded.
 //! - Auth injection policy: [`SandboxGatewayConfig::auth_headers`] and
 //!   [`SandboxGatewayConfig::auth_query_params`] are carried but never applied, printed,
 //!   or logged; where and how they attach to a request is part of the external contract.
@@ -71,7 +97,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::error::{Error, ErrorKind, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
@@ -135,9 +161,8 @@ impl HttpSandboxGateway {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::Transport`](openjiuwen_common::error::ErrorKind::Transport)
-    /// when the underlying [`reqwest::Client`] cannot be built (for example an invalid
-    /// user agent or TLS backend initialization failure).
+    /// Returns [`ErrorKind::Transport`] when the underlying [`reqwest::Client`] cannot be
+    /// built (for example an invalid user agent or TLS backend initialization failure).
     pub fn new(endpoint: SandboxEndpoint, config: SandboxGatewayConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(effective_timeout_secs(&config)))
@@ -170,14 +195,15 @@ impl HttpSandboxGateway {
     /// Forwards one request to the sandbox provider.
     ///
     /// The remote protocol is not implemented, so this always fails with
-    /// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported) and
-    /// performs **no** network I/O. See the module documentation for the concrete gaps.
+    /// [`ErrorKind::Unsupported`] and performs **no** network I/O. See the module
+    /// documentation for the concrete gaps.
     ///
     /// # Errors
     ///
-    /// Always returns
-    /// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported) until
-    /// the external AIO container contract is implemented.
+    /// Always returns [`ErrorKind::Unsupported`] until the external AIO container contract
+    /// is implemented. Through the forwarding backends this error becomes an [`OpResult`]
+    /// with code [`SysOpStatus::Unsupported`] (`199012`) — distinct from a real gateway
+    /// failure (`199007`) — carrying this message as the `reason`.
     // The async signature is the eventual provider-call shape; today it returns at once.
     #[allow(clippy::unused_async)]
     #[allow(clippy::unused_async_trait_impl)]
@@ -206,11 +232,9 @@ impl HttpSandboxGateway {
     ///
     /// # Errors
     ///
-    /// - [`ErrorKind::Transport`](openjiuwen_common::error::ErrorKind::Transport) when
-    ///   `base_url` is empty or blank, when the request cannot be sent, or when the
-    ///   gateway answers with a non-2xx status.
-    /// - [`ErrorKind::Timeout`](openjiuwen_common::error::ErrorKind::Timeout) when the
-    ///   request exceeds the configured timeout.
+    /// - [`ErrorKind::Transport`] when `base_url` is empty or blank, when the request
+    ///   cannot be sent, or when the gateway answers with a non-2xx status.
+    /// - [`ErrorKind::Timeout`] when the request exceeds the configured timeout.
     pub async fn probe(&self) -> Result<SandboxEndpoint> {
         let url = self.endpoint.base_url.trim();
         if url.is_empty() {
@@ -420,15 +444,36 @@ impl CodeOperation for HttpCodeOperation {
     }
 }
 
+/// Maps one gateway invocation error onto an [`OpResult`], keeping a capability gap typed.
+///
+/// | error kind | `code` | message |
+/// |---|---|---|
+/// | [`ErrorKind::Unsupported`] | [`SysOpStatus::Unsupported`] (`199012`, Rust-only) | `sandbox gateway error, operation: <method>, reason: <the Unsupported message>` |
+/// | any other kind | [`SysOpStatus::SandboxGatewayError`] (`199007`) | `sandbox gateway error, operation: <method>, reason: <the error's message>` |
+///
+/// The text is identical in both rows: only the code separates "this gateway cannot do
+/// it at all" from "the gateway failed", and the `Unsupported` message (which names the
+/// missing capability) is always kept as the reason.
+fn gateway_failure<T>(method: &str, error: &Error) -> OpResult<T> {
+    if error.kind() == ErrorKind::Unsupported {
+        return crate::result::unsupported_failure(method, &error.message());
+    }
+    OpResult::failure(
+        SysOpStatus::SandboxGatewayError,
+        sandbox_gateway_message(method, &error.message()),
+    )
+}
+
 /// Maps one gateway round-trip onto an [`OpResult`].
 ///
-/// Failure mapping (every failure is a value with code
-/// [`SysOpStatus::SandboxGatewayError`] and the Python gateway message template):
+/// The invocation error goes through [`gateway_failure`]; every response failure is a
+/// value with code [`SysOpStatus::SandboxGatewayError`] (`199007`) and the Python gateway
+/// message template:
 ///
 /// | Cause | `reason` in `sandbox gateway error, operation: <method>, reason: ...` |
 /// |---|---|
 /// | parameter serialization | `failed to serialize params: <error>` |
-/// | [`HttpSandboxGateway::invoke`] error | the shared error's message |
+/// | [`HttpSandboxGateway::invoke`] error | the shared error's message (`199012` when the error is `Unsupported`) |
 /// | `response.code != 0` | `provider returned code <code>: <message>` |
 /// | `data` cannot be deserialized | `invalid provider payload: <error>` |
 /// | `data` is absent | `invalid provider payload: provider returned no data` |
@@ -444,15 +489,17 @@ async fn invoke_value<D: DeserializeOwned>(
         params,
         isolation_key: gateway.endpoint().isolation_key.clone(),
     };
-    let response = match gateway.invoke(request).await {
-        Ok(response) => response,
-        Err(error) => {
-            return OpResult::failure(
-                SysOpStatus::SandboxGatewayError,
-                sandbox_gateway_message(method, &error.message()),
-            );
-        }
-    };
+    match gateway.invoke(request).await {
+        Ok(response) => response_value(method, response),
+        Err(error) => gateway_failure(method, &error),
+    }
+}
+
+/// Maps a successful round-trip's [`GatewayResponse`] onto an [`OpResult`].
+///
+/// Unchanged Python behaviour: a non-zero `code` and a missing or undecodable payload are
+/// [`SysOpStatus::SandboxGatewayError`] (`199007`) values, never a capability gap.
+fn response_value<D: DeserializeOwned>(method: &str, response: GatewayResponse) -> OpResult<D> {
     if !response.is_success() {
         return OpResult::failure(
             SysOpStatus::SandboxGatewayError,
@@ -498,6 +545,10 @@ where
 }
 
 /// Like [`invoke_param`], dropping the named top-level fields before serialization.
+///
+/// A serialization failure is a genuine failure of this call (the parameter struct could
+/// not be encoded), so it keeps code [`SysOpStatus::SandboxGatewayError`] (`199007`) and
+/// is never reported as a capability gap.
 async fn invoke_param_stripping<P, D>(
     gateway: &HttpSandboxGateway,
     op_type: &str,
@@ -530,9 +581,12 @@ where
 /// returned chunk array.
 ///
 /// The remote streaming wire format is deferred, so in practice the single invocation
-/// fails and exactly one error chunk is yielded. On success each array element is yielded
-/// as its own [`OpResult::success`], and the stream ends; it never yields a failure after
-/// a successful element.
+/// fails and exactly one error chunk is yielded. That chunk carries the [`OpResult`] code
+/// of the failed invocation unchanged: [`SysOpStatus::Unsupported`] (`199012`) when the
+/// gateway cannot stream at all, [`SysOpStatus::SandboxGatewayError`] (`199007`) when the
+/// streaming call itself failed. On success each array element is yielded as its own
+/// [`OpResult::success`], and the stream ends; it never yields a failure after a successful
+/// element.
 fn stream_param<P, T>(
     gateway: Arc<HttpSandboxGateway>,
     op_type: &'static str,
@@ -582,9 +636,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`ErrorKind::Transport`](openjiuwen_common::error::ErrorKind::Transport) when
-/// `endpoint.base_url` is empty or blank, and propagates any registration error that is
-/// not a duplicate.
+/// Returns [`ErrorKind::Transport`] when `endpoint.base_url` is empty or blank, and
+/// propagates any registration error that is not a duplicate.
 pub fn install(
     registry: &SandboxProviderRegistry,
     sandbox_type: &str,
@@ -721,7 +774,8 @@ mod tests {
             .unwrap();
         assert!(fs.supports_conditional_write());
         let result = fs.read_file(ReadFileParams::text("x")).await;
-        assert_eq!(result.code, 199_007);
+        assert_eq!(result.code, 199_012);
+        assert_eq!(result.status(), Some(SysOpStatus::Unsupported));
         assert!(result
             .message
             .contains("sandbox gateway error, operation: read_file"));
@@ -801,10 +855,13 @@ mod tests {
             .unwrap();
         let mut chunks = shell.execute_cmd_stream(ShellExecParams::new("echo hi"));
         let first = chunks.next().await.unwrap();
-        assert_eq!(first.code, 199_007);
+        assert_eq!(first.code, 199_012);
+        assert_eq!(first.status(), Some(SysOpStatus::Unsupported));
         assert!(first
             .message
             .contains("sandbox gateway error, operation: execute_cmd_stream"));
+        // The reason still names the gap the gateway reported.
+        assert!(first.message.contains("not implemented"));
         assert!(chunks.next().await.is_none());
 
         let fs = registry
@@ -816,11 +873,113 @@ mod tests {
             .unwrap();
         let mut chunks = fs.read_file_stream(ReadFileParams::text("x"));
         let first = chunks.next().await.unwrap();
-        assert_eq!(first.code, 199_007);
+        assert_eq!(first.code, 199_012);
         assert!(first
             .message
             .contains("sandbox gateway error, operation: read_file_stream"));
         assert!(chunks.next().await.is_none());
+    }
+
+    #[test]
+    fn gateway_failure_marks_an_unsupported_error_as_a_capability_gap() {
+        let error = Error::unsupported("streaming invoke is not supported by the HTTP gateway");
+        let result = gateway_failure::<u32>("read_file", &error);
+        assert_eq!(result.code, 199_012);
+        assert_eq!(result.status(), Some(SysOpStatus::Unsupported));
+        assert!(result.data().is_none());
+        assert_eq!(
+            result.message,
+            "sandbox gateway error, operation: read_file, reason: \
+             streaming invoke is not supported by the HTTP gateway"
+        );
+        // The typed kind survives the `Result` conversion.
+        let error = result.into_result().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(error
+            .message()
+            .contains("streaming invoke is not supported"));
+    }
+
+    #[test]
+    fn gateway_failure_keeps_real_gateway_failures_at_199007() {
+        for error in [
+            Error::sys_op("gateway closed the connection"),
+            Error::transport("connection refused"),
+            Error::timeout("gateway timed out"),
+        ] {
+            let kind = error.kind();
+            let result = gateway_failure::<u32>("execute_cmd", &error);
+            assert_eq!(result.code, 199_007, "kind {kind:?} must stay 199007");
+            assert_eq!(result.status(), Some(SysOpStatus::SandboxGatewayError));
+            assert_eq!(
+                result.message,
+                format!(
+                    "sandbox gateway error, operation: execute_cmd, reason: {}",
+                    error.message()
+                )
+            );
+            assert_eq!(result.into_result().unwrap_err().kind(), ErrorKind::SysOp);
+        }
+    }
+
+    #[test]
+    fn response_value_keeps_the_success_path_unchanged() {
+        let response = GatewayResponse {
+            code: 0,
+            message: "success".to_string(),
+            data: Some(serde_json::json!(7)),
+        };
+        let result = response_value::<u32>("read_file", response);
+        assert_eq!(result.code, 0);
+        assert_eq!(result.message, "success");
+        assert_eq!(result.data(), Some(&7));
+    }
+
+    #[test]
+    fn response_value_keeps_provider_failures_at_199007() {
+        let failure = response_value::<u32>(
+            "read_file",
+            GatewayResponse {
+                code: 5,
+                message: "container gone".to_string(),
+                data: Some(serde_json::json!(7)),
+            },
+        );
+        assert_eq!(failure.code, 199_007);
+        assert_eq!(
+            failure.message,
+            "sandbox gateway error, operation: read_file, reason: \
+             provider returned code 5: container gone"
+        );
+        assert!(failure.data().is_none());
+
+        let missing = response_value::<u32>(
+            "read_file",
+            GatewayResponse {
+                code: 0,
+                message: "success".to_string(),
+                data: None,
+            },
+        );
+        assert_eq!(missing.code, 199_007);
+        assert_eq!(
+            missing.message,
+            "sandbox gateway error, operation: read_file, reason: \
+             invalid provider payload: provider returned no data"
+        );
+
+        let undecodable = response_value::<u32>(
+            "read_file",
+            GatewayResponse {
+                code: 0,
+                message: "success".to_string(),
+                data: Some(serde_json::json!({"not": "a u32"})),
+            },
+        );
+        assert_eq!(undecodable.code, 199_007);
+        assert!(undecodable.message.starts_with(
+            "sandbox gateway error, operation: read_file, reason: invalid provider payload: "
+        ));
     }
 
     /// The single network test in this module; ignored so the offline suite stays hermetic.
