@@ -34,6 +34,7 @@ use crate::schema::{MemberStatus, TaskFilter, TaskGraphSpec, TaskStatus};
 
 use super::backend::TeamBackend;
 use super::spec_meta::AttachConfig;
+use super::tool_dispatch;
 
 /// How long shutdown waits for the accept loop before aborting it.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
@@ -91,9 +92,15 @@ impl AttachHost {
 
 /// [`AttachHandler`] over one team's backend.
 ///
-/// The handler acts as the team's leader: it sends mail as the leader, creates tasks as the leader
-/// and completes/claims tasks as the leader. `InvokeTool` is rejected — in-process tool invocation
-/// is not part of the attach contract yet.
+/// The handler acts as the team's leader for mail, task creation/claim/completion **and** tool
+/// invocation: everything it does, it does as the leader.
+///
+/// `InvokeTool` runs one of the four member-facing team tools (`view_task`, `claim_task`,
+/// `verify_task`, `send_message`) through the shared in-process dispatcher (`super::tool_dispatch`)
+/// and answers with the tool's own wire shape, the same answer `crate::skill`'s store-backed client
+/// produces. An unknown tool name is answered as [`ErrorKind::NotFound`] and bad arguments as
+/// [`ErrorKind::Validation`], both in band as an [`AttachError`], so the connection survives a
+/// rejected call.
 pub struct BackendAttachHandler {
     backend: Arc<TeamBackend>,
     leader: String,
@@ -297,12 +304,16 @@ impl BackendAttachHandler {
             .map_err(|error| Self::map(&error))?;
         to_data(&mutation.task)
     }
-    /// Rejects tool invocation: not part of the attach contract yet.
-    fn invoke_tool(name: &str) -> AttachResult<Value> {
-        Err(AttachError::new(
-            ErrorKind::Unsupported,
-            format!("invoke_tool '{name}' is not supported by the in-process attach handler"),
-        ))
+    /// Dispatches one team tool call as the team leader.
+    ///
+    /// The answer is the tool's own wire shape; a rejected call is an in-band [`AttachError`]
+    /// carrying [`ErrorKind::NotFound`] for an unknown tool and [`ErrorKind::Validation`] for bad
+    /// arguments.
+    async fn invoke_tool(&self, name: &str, arguments: &Value) -> AttachResult<Value> {
+        let value = tool_dispatch::dispatch_tool(&self.backend, &self.leader, name, arguments)
+            .await
+            .map_err(|error| Self::map(&error))?;
+        to_data(&value)
     }
     /// Replies with the team snapshot including its tasks.
     async fn snapshot(&self) -> AttachResult<Value> {
@@ -347,7 +358,7 @@ impl AttachHandler for BackendAttachHandler {
             } => self.update_task(&task_id, title, content).await,
             AttachOp::ClaimTask { task_id } => self.claim(&task_id).await,
             AttachOp::CompleteTask { task_id } => self.complete(&task_id).await,
-            AttachOp::InvokeTool { name, .. } => Self::invoke_tool(&name),
+            AttachOp::InvokeTool { name, arguments } => self.invoke_tool(&name, &arguments).await,
             AttachOp::Snapshot => self.snapshot().await,
             AttachOp::StopTeam => Ok(self.stop_team()),
         }

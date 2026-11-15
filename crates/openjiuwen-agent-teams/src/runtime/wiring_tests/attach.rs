@@ -7,8 +7,9 @@
 //! backend, and `stop`/`stop_team` remove the socket again. These cases drive that wiring over real
 //! short-path sockets in a temp directory, through the real
 //! [`AttachClient`](crate::attach::AttachClient): the roster, mail, the task board and the snapshot
-//! all come back over the wire, `invoke_tool` is refused in-band, and the bind-failure policy
-//! (`required` or not) is pinned.
+//! all come back over the wire, `invoke_tool` dispatches the member-facing team tools through the
+//! shared in-process dispatcher (an unknown tool or bad arguments answer in band), and the
+//! bind-failure policy (`required` or not) is pinned.
 //!
 //! Whole file is `#![cfg(unix)]`: on other targets `AttachServer::bind`/`serve` return
 //! `Error::Unsupported` and there is no transport to test, so the module compiles to nothing.
@@ -136,16 +137,77 @@ async fn metadata_binds_and_serves_every_backend_op() {
         1,
         "the completed task is on the board"
     );
-    let refused = client
+    let viewed = client
+        .invoke_tool("view_task", json!({"status": "completed"}))
+        .await
+        .expect("view_task is a member-facing team tool");
+    let rows = viewed.as_array().expect("view_task answers a task list");
+    assert_eq!(rows.len(), 1, "the board holds exactly the completed task");
+    assert_eq!(rows[0]["task_id"].as_str(), Some(task_id.as_str()));
+    assert_eq!(rows[0]["title"], json!("Write"));
+    let unknown = client
         .invoke_tool("shell", json!({"cmd": "true"}))
         .await
-        .expect_err("invoke_tool is not part of the attach contract");
-    assert_eq!(refused.kind, ErrorKind::Unsupported, "{}", refused.message);
+        .expect_err("shell is not a team tool");
+    assert_eq!(unknown.kind, ErrorKind::NotFound, "{}", unknown.message);
+    assert!(
+        unknown.message.contains("shell"),
+        "the message names the unknown tool: {}",
+        unknown.message
+    );
+    let bad_arguments = client
+        .invoke_tool("claim_task", json!({}))
+        .await
+        .expect_err("claim_task needs a task id");
+    assert_eq!(
+        bad_arguments.kind,
+        ErrorKind::Validation,
+        "{}",
+        bad_arguments.message
+    );
     let missing = client
         .member_status("ghost")
         .await
         .expect_err("ghost is not on the roster");
     assert_eq!(missing.kind, ErrorKind::NotFound, "{}", missing.message);
+    wiring.agent.stop().await.expect("stop");
+}
+#[tokio::test]
+async fn invoke_tool_sends_a_message_as_the_leader() {
+    let (_dir, socket) = socket_in_tempdir();
+    let wiring = wire(&attached_team(&socket), |deps| deps).await;
+    wiring.agent.start().await.expect("the team did not start");
+    let mut client = connect(&socket).await;
+    let reply = client
+        .invoke_tool("send_message", json!({"to": "dev-1", "content": "hi"}))
+        .await
+        .expect("send_message is a member-facing team tool");
+    assert_eq!(reply["ok"], json!(true));
+    assert!(
+        reply["reason"].is_null(),
+        "an applied send carries no reason: {reply}"
+    );
+    let message_id = reply["message_id"]
+        .as_str()
+        .expect("a message id")
+        .to_owned();
+    assert_ne!(message_id, "", "the reply names the stored row");
+    assert_eq!(
+        client.read_inbox().await.expect("read_inbox"),
+        "",
+        "the leader sends, so its own inbox stays empty"
+    );
+    let unread = wiring
+        .agent
+        .backend()
+        .unread("dev-1")
+        .await
+        .expect("dev-1's mailbox");
+    assert_eq!(unread.len(), 1, "the tool wrote exactly one row");
+    assert_eq!(unread[0].message_id, message_id);
+    assert_eq!(unread[0].from_member_name, "boss", "the op acts as leader");
+    assert_eq!(unread[0].to_member_name.as_deref(), Some("dev-1"));
+    assert_eq!(unread[0].content, "hi");
     wiring.agent.stop().await.expect("stop");
 }
 #[tokio::test]

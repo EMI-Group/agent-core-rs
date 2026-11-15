@@ -268,6 +268,16 @@ pub struct TeamHealth { pub team_name: String, pub started: bool,
 impl TeamBackend { pub fn health(&self) -> TeamHealth; }   // always `started: false`
 impl TeamAgent { pub fn health(&self) -> TeamHealth; }     // `started` from the handle
 
+// member_roles.rs (`pub(crate)`) — role capabilities shared by the spawn paths
+pub(crate) const fn has_local_harness(role: TeamRole) -> bool;             // false only for PassiveHuman
+pub(crate) fn in_process_refusal(member_name: &str, role: TeamRole) -> Error;   // Error::Unsupported
+
+// tool_dispatch.rs (`pub(crate)`) — the in-process team-tool dispatcher
+pub(crate) const TEAM_TOOL_NAMES: [&str; 4] = ["view_task", "claim_task", "verify_task", "send_message"];
+pub(crate) fn is_supported_tool(name: &str) -> bool;
+pub(crate) async fn dispatch_tool(backend: &TeamBackend, member: &str, name: &str, arguments: &Value) -> Result<Value>;
+pub(crate) fn render_tool_output(value: &Value) -> Value;                 // strings verbatim, else compact JSON
+
 // pool.rs / manager.rs / adapter.rs — listed in the routing table below
 ```
 
@@ -296,6 +306,16 @@ Per-kind launch shapes (`process`, `external_cli`, `ssh`) live in `src/member/CO
 shapes (`OrganizationSpec`, `DelegationRules`, `OrgTaskSpec`) live in `src/org/CONTEXT.md`.
 `TeamBuildDeps` adds only *injection* hooks: `with_observability_hook`, `with_kv_cache`, `with_routing`, `with_checkpoint_store`, `with_memory`, `with_memory_observer`.
 It has no monitor/org/attach builder — those come from the metadata; `monitor_stream` is the monitor knob.
+
+### Member roles and in-process spawning
+
+`member_roles::has_local_harness` is the one role→capability switch: `Leader`, `Teammate`, `HumanAgent`, `BridgeAgent`, `Worker` and `ExternalCli` own a local harness, `PassiveHuman` does not (Python's `TeamRole.PASSIVE_HUMAN` has no harness at all, so no startup, restart or recovery path may spawn a runtime for it).
+Both spawn paths gate on that helper instead of comparing against `TeamRole::Teammate`: `TeamAgent::spawn_member` (after its leader branch) and `TeamMemberSpawner::spawn`'s in-process path (after the `!options.kind.is_in_process()` early return, so a child-process member never reaches it).
+A role with no local harness is `Error::Unsupported` through `member_roles::in_process_refusal`, whose message names the member, the wire role and the Python rule.
+`auto_start_all` skips the leader, every non-`Unstarted` row and every member without a local harness, so a passive human is never swept into a spawn and never produces an error there.
+`effective_spec` passes the member's real role to `TeamModelRouter::effective_spec_for`; the router memoizes per member name, so the role is a hint for the selection, not a second key.
+This port has no member mailbox pump: mailbox/task/org events steer the leader only (`leader.rs`), so a `Worker`'s single-shot stateless contract, a `HumanAgent` avatar's own loop and `TeamRole::is_coordinated_member` are not exercised by the runtime.
+Cross-node limitation: `PredefinedMemberSpec::into_member_spec` (schema node, out of scope here) collapses `BridgeAgent` and `ExternalCli` entries to `TeamRole::Teammate`, and no spec entry declares a `Worker`, so the only roster roles reachable today are `Leader`, `Teammate`, `HumanAgent` and `PassiveHuman`.
 
 ### Checkpoint wiring
 
@@ -378,13 +398,26 @@ Mail is acknowledged only after the leader flush succeeded: `flush` restores the
 message ids stay unread and are retried on the next run/settle.
 A team with no organisation block keeps the flat board (`org()` is `None`, `create_org_task` and `delegate_org_task` are `Error::Config`, while a hop the router refuses inside a configured organisation is `Validation`).
 
+### Delivery and tool dispatch
+
+`deliver` routes by payload kind: `HumanAgent` → inbox push (when HITL is on) plus one persisted mailbox row; `Operator`/`GroupChat`/`GodView` → the interaction gate, then one persisted row addressed to the leader; `HumanAgentToolCall` → the gate, then the relayed tool call; `ExternalTeam` → `DeliverResult::unsupported("external_team_transport")` because this build ships no distributed transport.
+A relayed call is Python's `_dispatch_tool`: gate first (`gate_closed`/`not_active` are returned unchanged), then `inbox.is_enabled()` (`human_agent_not_enabled`), then roster membership (`unknown_human_agent:<name>`), then `member.role() == PassiveHuman` (`tool_passthrough_avatar_not_supported` — an avatar keeps its own governed LLM tool loop), then the tool name (`unknown_tool:<tool>`), then the dispatch.
+On success the answer is `DeliverResult { ok: true, message_id: None, reason: None, output: render_tool_output(&value), data: value }`, so `data` is the tool's raw JSON and `output` its rendered text.
+A dispatch error keeps the token prefix stable for callers: `ErrorKind::Validation` → `invalid_arguments:<tool>`, anything else → `tool_failed:<tool>`; the human-readable detail stays in a `debug!`/`warn!` log rather than in the token.
+`tool_dispatch` is the in-process counterpart of `crate::skill`'s store-backed client and answers the same four tools with the same wire shapes: `view_task` (`action` = `list` by default, plus `claimable`, `get`, `in_review`, `note`) → row arrays / the task detail / `null`; `claim_task` (`status` = `claimed`|`completed`) → `{ok, reason}`; `verify_task` (`decision` = `pass`|`fail`, optional `feedback`) → `{ok, task_id, decision, feedback}`; `send_message` (`to`, `content`) → `{ok, message_id, reason}`.
+A board refusal is an answer, not an error: `claim` returns its own `ok: false`, and `complete`'s `Err` (not the assignee, stale content, wrong status) is turned into `{ok: false, reason}`; only a transport/publish failure propagates.
+The dispatcher never validates roster membership — its callers do (a relayed call checks the passive human; the attach handler acts as the leader) — and an unknown tool name is `Error::NotFound`.
+
 ### Attach policy
 
 `start()` binds the host after the messager and the leader runtime started, and only once.
 `AttachHost` serves one request/response `AttachOp` per connection through `BackendAttachHandler`, which maps
 each op onto the backend: `list_members`, `member_status`, `read_inbox`, `send_member`, `broadcast`,
 `list_tasks`, `claimable_tasks`, `task_detail`, `create_task`, `update_task`, `claim_task`, `complete_task`,
-`invoke_tool`, `snapshot`, `stop_team` (cancels the run token and answers `{"stopping": true}`).
+`invoke_tool` (dispatches one of the four member-facing team tools as the leader through
+`tool_dispatch::dispatch_tool`, answers with the tool's own wire shape, and maps an unknown tool to `NotFound`
+and bad arguments to `Validation`, both in band as an `AttachError` so the connection survives a rejected call),
+`snapshot`, `stop_team` (cancels the run token and answers `{"stopping": true}`).
 A bind failure is **not fatal**: it is logged (`warn!`) and the team runs without the socket, unless the config
 sets `required: true`, in which case `start()` returns the error (a `SysOp` error when the socket directory
 cannot be created) and the started flag is rolled back.
@@ -444,7 +477,8 @@ config therefore just logs.
 1. `parse_initial_input(inputs, roster)` → `leader_query` + `deliveries`.
 2. Each delivery is handed to `deliver` without touching the leader runtime: `HumanAgent` → inbox push +
    persisted message row + `message` event; `Operator`/`GroupChat`/`GodView` → gate + leader mailbox;
-   `ExternalTeam` → `DeliverResult::unsupported`.
+   `HumanAgentToolCall` → gate + one relayed team-tool call executed under the passive human's identity
+   (see §"Delivery and tool dispatch"); `ExternalTeam` → `DeliverResult::unsupported("external_team_transport")`.
 3. `start()` (idempotent): messager start, the team-memory session install (`on_session_start`, `warn!`-and-
    continue), leader `MemberRuntime::start(None)` — which restores the stored checkpoint envelope for the
    leader's `(derived session, card id)` when one exists — attach bind (see policy), `signals.team_started`.
@@ -534,10 +568,12 @@ a new session instead of being rebuilt.
 - `./wiring_tests.rs` → wiring test root (`Wiring` harness, `with_metadata`, `wait_until`, `take_monitor`, `monitor_kinds`)
 - `./wiring_tests/` → the eight wiring suites (spawn_modes, routing, kv_affinity, signals, organization, workspace, attach, checkpoints)
 - `./checkpoints.rs` → per-member checkpoint identity and store resolution (`member_card_id`, `team_checkpoint_store`, `member_checkpoint_store`, `wire_runtime`, `CHECKPOINT_DIR`)
+- `./member_roles.rs` → role capabilities: `has_local_harness`, `in_process_refusal`
 - `./memory_bind.rs` → team-memory resolution (`pub(crate) async fn resolve_memory`) and the `warn!`-and-continue lifecycle pass-throughs (`is_live`, `session_started`, `member_joined`, `member_left`, `finish`, `export_document`)
 - `./dispatch.rs` → `RunActionKind`, `RunAction`, `LiveTeamState`, `decide_run_action`
 - `./initial_input.rs` → `InitialInput`, `parse_initial_input`
 - `./backend.rs` → `TeamBackend` (members, mail, events, tasks, snapshot, signals, org handle)
+- `./tool_dispatch.rs` → the in-process team-tool dispatcher: `TEAM_TOOL_NAMES`, `dispatch_tool`, `render_tool_output`
 - `./health.rs` → `TeamHealth` / `MemberHealth`, the `alive` rule and the roster projection
 - `./build.rs` → the `SpecBuild` implementation and every build-only helper (store resolution, leader record, harness, observer, roster rows, bus wiring, org install)
 - `./spawner.rs` → `TeamMemberSpawner` (`MemberSpawner` over the harness factory, spawn options, fork, routing, child spawners)
@@ -593,10 +629,22 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   `{"input":{"query":…}}` and plain-string inputs.
 - `backend.rs`: mail routing (direct one row + one `message` event, broadcast one row, multicast N rows),
   member bookkeeping, task listing, snapshot ordering, `post_event` sender stamping, task signals.
+- `member_roles.rs`: `has_local_harness` pins all seven `TeamRole` variants against an exhaustive per-role
+  expectation, and `in_process_refusal` asserts the exact `Unsupported` message and its wire-to-Python role
+  naming.
+- `tool_dispatch.rs`: each tool's success shape (`view_task`'s five actions and projected rows, `claim_task`
+  claim and completion, `verify_task` verdict and feedback, `send_message`'s single readable row), board
+  refusals as `ok: false` answers, an unknown tool (`NotFound`), missing arguments (`Validation`), and
+  `render_tool_output`.
 - `team_agent/tests.rs`: build (leader card `<team>_<leader>`, missing `agents["leader"]` → validation), unknown
   member → `not_found`, spawn → `ready`, factory error → `unstarted`, shutdown per lifetime,
   `auto_start_all`, `create_task` leader-only, workspace isolation per member, attach bind policy, and the
-  workspace lifecycle (`stop`/`shutdown_member` release exactly once, a failed release is logged).
+  workspace lifecycle (`stop`/`shutdown_member` release exactly once, a failed release is logged); a passive human
+  is refused by `spawn_member` (`Unsupported`, no workspace request, no factory call) and skipped by
+  `auto_start_all`, a human agent spawns to `Ready`, and the five relayed-tool-call cases (success under the
+  passive human's identity, `human_agent_not_enabled`, `unknown_human_agent:<name>` and
+  `tool_passthrough_avatar_not_supported`, `unknown_tool`/`invalid_arguments`/`tool_failed`, and the gate's
+  `not_active`/`gate_closed`).
 - `leader.rs` / `./tests/`: invoke with an immediate fake answer and an empty board → exactly one
   `team.completed` marker last, exactly one `team_completed` bus event carrying the team name and
   `reason: "settled"`, and the leader answer in `AgentOutput.output`; an open task keeps the stream
@@ -606,7 +654,7 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   `stop_team` tearing the attach socket down.
 - `adapter.rs`: `team_id() == team_name`, `agent_count()`, `invoke` delegation, `kind() == "agent_teams"`.
 
-`./wiring_tests/` (84 tests, one module per wiring point; the shared `Wiring` harness builds a team over a
+`./wiring_tests/` (85 tests, one module per wiring point; the shared `Wiring` harness builds a team over a
 `ScriptedFactory` + `RecordingWorkspaceProvider` and returns the agent, the factory and the workspace):
 
 - `spawn_modes.rs` (9): the default blueprint stays in-process; `metadata["spawn"]` selects
@@ -628,9 +676,11 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   failed leader flush leaves the mail unacknowledged (a `FailingHarness` whose `send` errors).
 - `workspace.rs` (6): `IsolationMode` reads a bare string and the object shape; the default is `None` for the
   leader and teammates; a worktree team still builds and spawns (both members request `Worktree`).
-- `attach.rs` (10, `#![cfg(unix)]`): no configuration means no socket; metadata and
+- `attach.rs` (11, `#![cfg(unix)]`): no configuration means no socket; metadata and
   `OPENJIUWEN_TEAM_SOCKET` both parse (metadata wins); a real bind serves every `AttachOp` through
-  `BackendAttachHandler`; `stop_team` acknowledges and cancels the run token; an unbindable socket is not
+  `BackendAttachHandler` (including the unknown-tool `NotFound` and bad-arguments `Validation` cases of
+  `invoke_tool`); `invoke_tool` with `send_message` writes one row as the leader while the leader's own inbox
+  stays empty; `stop_team` acknowledges and cancels the run token; an unbindable socket is not
   fatal while `required: true` fails the start; `stop` and the manager's `stop_team` remove the file and
   later calls fail.
 - `checkpoints.rs` (11): the default build pins one `"memory"` team store while a `file` config pins none;
@@ -647,8 +697,8 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   sees a spawn's write, while a build without one keeps the bridge, `{"trace": false}` attaches nothing even
   when an observer is injected, and an injected wiring keeps its own observer.
 
-Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` (1411 lib
-tests in the default build, 1430 with `--features sqlite`, 1439 with `--all-features`, plus 219 integration
+Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` (1548 lib
+tests in the default build, 1601 with `--all-features`, plus 219 integration
 tests over 15 binaries),
 `cargo test -p openjiuwen-agent-teams --no-default-features`,
 `cargo test -p openjiuwen-agent-teams --features sqlite`, `cargo clippy -p openjiuwen-agent-teams
@@ -663,6 +713,13 @@ tests over 15 binaries),
 - Team members are spawned through the injected `MemberHarnessFactory` for the in-process path and through
   the `src/member/` child-process spawners for `process`/`external_cli`/`ssh`; nothing in this module builds a
   DeepAgent directly.
+- The spawn gate is role-driven: never reintroduce a `== TeamRole::Teammate` comparison; ask
+  `member_roles::has_local_harness`, and remember `TeamRole::is_coordinated_member` is not consumed by this
+  node's runtime.
+- `src/schema`'s `PredefinedMemberSpec::into_member_spec` collapses `BridgeAgent`/`ExternalCli` to `Teammate`
+  and no entry declares a `Worker`, so widening the reachable roster roles is the schema node's job.
+- A relayed tool call's failure tokens are a caller-facing contract: keep the part before `:` stable and put the
+  detail in a log, never in the token.
 - `TeamSpec` (not `TeamAgentSpec`) is what the running team carries, mirroring Python's runtime mirror.
 - `TeamAgent` has no direct `store()` accessor: a test or host reaches the store through `TeamAgent::backend().store()` (`backend.rs:177`), reads mail through `TeamBackend::unread`/`mark_read` and the board through `TeamBackend::tasks()`/`list_tasks`.
 - `TeamBuildDeps.store` is an `Arc<dyn TeamStore>` field (`deps.rs:49`), set by `with_store`; the default is `InMemoryTeamStore` (`deps.rs:150`) and `--features sqlite` users inject `SqliteTeamStore` instead of a `StorageSpec`-like value.
@@ -709,7 +766,9 @@ tests over 15 binaries),
 - `deps.store_injected` is the only store-resolution switch: `with_store` sets it, `default()`/`new()` clear it. Adding a second way to supply a store would silently diverge from `resolve_store`.
 - `crates/openjiuwen-e2e/tests/team_backend.rs` still asserts that completion is stream-only (`all(|event| event.event_type != "team_completed")`); a settled run now also publishes `team_completed` on `TeamTopic::Team`, so that assertion belongs to the e2e owner and must be inverted there — this crate cannot edit it.
 - `src/schema/CONTEXT.md` (schema node) still says the leader loop emits no completion bus event; that node owns the correction.
-- A settled run publishes the bus event after the stream marker is sent, so a caller that reads the bus alone sees completion strictly after the frame; a publish failure is logged and never fails the run. `blueprint`,
+- A settled run publishes the bus event after the stream marker is sent, so a caller that reads the bus alone
+  sees completion strictly after the frame; a publish failure is logged and never fails the run.
+- The offline test kit (`team_agent/test_support`) is `blueprint`,
   `deps`, `built`, `ScriptedFactory` (`failing_for`/`hanging_for`/`calls`/`harness`), `ScriptedHarness`
   (`calls`/`sends`, answers `done: <member>` by default), `RecordingWorkspaceProvider` (`requests`, `releases`/`released_names`, `fail_releases`).
 - `team_agent/` is split by concern (`mod.rs` handle, `lifecycle.rs`, `members.rs` plus the small
@@ -729,17 +788,6 @@ tests over 15 binaries),
   per-tool spans. The monitor stream has no TUI/consumer here.
 - The organisation layer is in-process only: no cross-process org messaging, summary teams, runtime
   swarmflow lanes or org-level observability; the chart shapes and their semantics belong to `src/org/`.
-- Team memory is in-process and per-team: no cross-team/hub sync, no LLM-backed extractor here (an
-  `extractor: "llm"` block degrades to the rules — drive `open_with_model` yourself for the LLM path), no
-  distributed store, and the document is the only durable artefact (this crate does not enable the
-  `openjiuwen-memory` `sqlite` feature). The hooks are advisory by design, so a broken memory store never
-  fails a start, spawn, shutdown or stop.
-- A roster removal that bypasses `shutdown_member` (`TeamBackend::remove_member`) records no handoff note: the
-  hook is async and the removal seam is sync, and the documented restart path is
-  `shutdown_member` → `remove_member` → `spawn_member`, so the leave hook already ran.
-- Child-process members receive the leader's `metadata["checkpoint"]` block through
-  `MemberSpawnRequest::with_checkpoint_config` (the two `OPENJIUWEN_MEMBER_CHECKPOINT*` env vars); team memory
-  is *not* transported to a child, which mounts no toolkit of its own.
 - Team memory is in-process and per-team: no cross-team/hub sync, no LLM-backed extractor on the build path
   (an `extractor: "llm"` block degrades to the rules — `TeamMemoryWiring::open_with_model` is the seam), no
   distributed store, and the `TEAM_MEMORY.md` document is the only durable artefact (this crate does not enable
@@ -765,3 +813,6 @@ tests over 15 binaries),
   forwards the KV env (vendor CLI protocols, remote SSH daemons and OS-process pooling stay there).
 - Worktree isolation is delegated to `src/workspace/`; the remote worktree backend and team-workspace
   artifact versioning are deferred there.
+- Member-side coordination is not wired: there is no member mailbox pump (mailbox/task/org events steer the
+  leader only), a `Worker` therefore never gets its single shot and `TeamRole::is_coordinated_member` is unused
+  by the runtime.
