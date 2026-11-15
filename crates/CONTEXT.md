@@ -17,7 +17,7 @@ Python package `openjiuwen.<pkg>` maps to crate `openjiuwen-<pkg>`; `openjiuwen-
 | `openjiuwen-foundation` | 1 | messages/prompts, LLM clients and `Model` (OpenAI-compatible/Anthropic/Responses/DashScope, OAuth, the external-provider registry, `purpose`/`metadata` hints), tools + MCP (stdio/SSE/HTTP/OpenAPI) with `ToolInfo` flat accessors, storage backends (memory/file/SQLite/Redis/S3/Chroma/Milvus/Elasticsearch) | Implemented |
 | `openjiuwen-session` | 1 | sessions, scoped state, streaming frames, HITL interactions, memory/file/SQLite/Redis checkpointers, disk store, VCS history, tracer | Subset |
 | `openjiuwen-graph` | 1 | Pregel/BSP graph execution engine (builder, supersteps, routing, resume, Mermaid) | Implemented |
-| `openjiuwen-retrieval` | 1 | documents, DOCX/XLSX/PDF/PPTX/ODT parsing from paths or in-memory bytes, chunking, embeddings, in-memory store, BM25 plus dense/sparse/hybrid/graph/agentic retrievers, query rewriting, triple/graph extraction, knowledge base | Subset |
+| `openjiuwen-retrieval` | 1 | documents, DOCX/XLSX/PDF/PPTX/ODT parsing from paths or in-memory bytes, chunking, embeddings, in-memory store, BM25 plus dense/sparse/hybrid/graph/agentic retrievers, query rewriting, triple/graph extraction, knowledge base, and config types whose every field is read by its owner or rejected with a typed error (`RerankerConfig::validate` guards `DashScopeReranker::new`, `InMemoryVectorStore::from_config` rejects a `database_name` and a non-`cosine` metric) | Subset |
 | `openjiuwen-sysop` | 1 | local filesystem/shell/code operations (flock, PTY, CJK decoding), sandbox launcher lifecycle and provider registry | Subset |
 | `openjiuwen-workflow` | 2 | workflow builder, control-flow built-ins plus sub-workflow, HTTP-request, questioner, intent-detection, ReAct, retrieval, memory and tool components, `${node.field}` data flow, run engine | Subset |
 | `openjiuwen-context` | 2 | context windows, token accounting and usage telemetry, native tokenizer loading with the artefact manager, provider window policies, compressor/offload processor families plus rule compression, adaptive ladders, recall archives, reload hints and full-compact reinjection | Subset |
@@ -27,7 +27,7 @@ Python package `openjiuwen.<pkg>` maps to crate `openjiuwen-<pkg>`; `openjiuwen-
 | `openjiuwen-multiagent` | 3 | `BaseTeam`, team runtime, in-process + Redis Streams transports with a subscription registry, routing/inbox filters, handoff/supervisor/agents-as-tools strategies, member checkpoints | Implemented |
 | `openjiuwen-runner` | 4 | `Runner`, `ResourceMgr` with five managers, callback framework, message queue with `QueueStats`, spawn seam/registry and monitored handles, team pool, HITL hub, monitor, dreaming service | Implemented |
 | `openjiuwen-core` | 4 | kernel umbrella: Python-shaped module path table over the concrete kernel crates | Implemented |
-| `openjiuwen-harness` | 5 | DeepAgent task loop, workspace, permissions, 35 model-facing tools (LSP, worktree, web/search, cron, MCP resources/subscriptions, goal, discovery), rails incl. MoA/personal-context/heartbeat/KV-cache, prompts, subagents with activity/eviction/lifecycle, skills, persistent agent and resume APIs, the `notify` watcher, spec/plugins, native protocol impl, CLI logic | Subset |
+| `openjiuwen-harness` | 5 | DeepAgent task loop, workspace, permissions, 35 model-facing tools (LSP, worktree, web/search, cron, MCP resources/subscriptions, goal, discovery) whose eight memory tools run on the `WorkspaceMemoryBackend` that `DeepAgentBuilder::build` mounts by default, rails incl. MoA/personal-context/heartbeat/KV-cache, prompts, subagents with activity/eviction/lifecycle and the production `RuntimeSubAgentSpawner` (reachable as `DeepAgent::subagent_spawner()`), skills, a persistent agent that journals every turn when `DeepAgentConfig::persistent_agent` is on, resume APIs plus `Repl::with_session_id`, the `notify` watcher, spec/plugins, native protocol impl, CLI logic | Subset |
 | `openjiuwen-extensions` | 5 | A2A, OTel tracer (OTLP/HTTP JSON + protobuf, Grafana Cloud/local push, Langfuse), the `observability` utilities package, checkpointer/store/MQ/sysop adapters (Redis KV/document/vector, Elasticsearch vector/document, sandbox teardown and conditional writes), DashScope reranker, `context_evolver` | Subset |
 | `openjiuwen-dev-tools` | 5 | prompt builder, skill creator/evaluator, agent builder, tune optimizers/trainer | Subset |
 | `openjiuwen-symphony` | 5 | capability-asset engine: registry, BM25/semantic search, capability graph, `SkillFs` discovery toolkits, flow distillation/codegen/render, planner/executor, evaluation and trace metrics, experience index, mutation journal, observation revisions, matcher/normalization, capability-tree build and retrieval runtime | Subset |
@@ -37,10 +37,10 @@ Python package `openjiuwen.<pkg>` maps to crate `openjiuwen-<pkg>`; `openjiuwen-
 | `openjiuwen-auto-harness` | 6 | pure facade over `openjiuwen-rsi::auto_harness` | Implemented |
 | `openjiuwen-agent-teams` | 6 | leader/teammate runtime, task board, mailbox, HITL, SQLite team store, process/external-CLI/SSH members with checkpoint env vars, org layer, Unix-socket attach, team-memory wiring and OTLP memory observer, skill CLI + MCP server | Subset |
 | `openjiuwen` | 7 | top-level umbrella: module aliases for every public tree plus a curated `prelude` | Implemented |
-| `openjiuwen-cli` | 7 | binary `openjiuwen` (`run`, `chat`, `lsp`, `cron`, `team`, `watch`, `sessions`, `auto-harness`, with `run`/`chat` `--resume`/`--continue`) — thin process boundary over `openjiuwen-harness` | Implemented |
+| `openjiuwen-cli` | 7 | binary `openjiuwen` (`run`, `chat`, `lsp`, `cron`, `team`, `watch`, `sessions`, `auto-harness`, with `run`/`chat` `--resume`/`--continue`) — thin process boundary over `openjiuwen-harness`; `sessions` lists/shows/prunes a three-store catalogue (CLI session records, persistent-agent execution journals, persistent-agent session records), `run --resume`/`--continue` replays a resolved session through `ResumedTurn` and keeps that session id, while `chat --resume` seeds the REPL transcript (`Repl::seed_history`) into a fresh `cli-*` session | Implemented |
 | `openjiuwen-test-support` | dev | loopback mock LLM server, scripted model, fixtures, JSON/eventual helpers | Implemented |
-| `openjiuwen-e2e` | dev | cross-crate scenario suite (26 test binaries, 125 scenarios) | Implemented |
-| `openjiuwen-examples` | dev | 26 runnable examples plus the offline smoke test that executes them | Implemented |
+| `openjiuwen-e2e` | dev | cross-crate scenario suite (26 test binaries, 125 test functions; 114 pass with default features, 124 with `sqlite,a2a,otel`) | Implemented |
+| `openjiuwen-examples` | dev | 26 runnable examples (25 of them run in the default offline smoke; `11` needs `a2a`) plus the 15 library unit tests that guard the shared support harness | Implemented |
 
 ## Status Legend
 
@@ -64,7 +64,7 @@ Deferred areas per crate, condensed from each crate's own `CONTEXT.md` gap secti
 | `openjiuwen-memory` | external providers' SDK transports/session-mapping/circuit breakers (record-only SPI), Alembic-style migrations and dialect handling, the AES at-rest codec and multi-node KV locks, provider-specific analyzer tuning and the LLM redundancy checker, the Milvus-backed graph stack with LLM dedupe/merge, `sqlite_vec` ANN and Python's lite schema, the ML salience backend, background dream lease heartbeats/fencing and timer-driven retention, team tool registration/prompt injection and embedding-based team recall, SQL message pagination parity |
 | `openjiuwen-security` | `LocalModelBackend::analyze` (no inference runtime), moderation transports beyond OpenAI/Azure/Aliyun, batching and streaming moderation, the runner-owned global registration helper |
 | `openjiuwen-agent` | the `before_steering_drain` rail hook, the process-global callback framework, KV-cache Redis/distributed backends and vendor prefetch/offload transports, memory-provider backends (bridged only), tokenizer artifacts and window policies (owned by `openjiuwen-context`), controller timeout/history limits and Python's reasoner/proactive/reflector config, the ML-backed Metis learner and subset approval, Python's manifest/skill packages as prompt sources |
-| `openjiuwen-harness` | browser/CUA/mobile presets and agents, the OTel exporter (seam only), model-backed multimodal tools and vendor search backends, LSP `.gitignore` filtering/server auto-discovery/formatter-rename, cron `wake`/`at`/`every` forms/payload delivery/`W`/run-output capture, MCP server-pushed subscriptions and pagination, Python's worktree lifecycle policies and symlink handling, subagent stream-milestone projection and cross-process sweepers, MoA `jev_routed`, persistent-agent remote handoff/budget service/archive tools, personal-context vendor fetchers, KV-cache Redis backends, watcher target add/remove and cross-process locking, Python's dynamic plugin execution model |
+| `openjiuwen-harness` | browser/CUA/mobile presets and agents, the OTel exporter (seam only), model-backed multimodal tools and vendor search backends, LSP `.gitignore` filtering/server auto-discovery/formatter-rename, cron `wake`/`at`/`every` forms/payload delivery/`W`/run-output capture, MCP server-pushed subscriptions and pagination, Python's worktree lifecycle policies and symlink handling, subagent stream-milestone projection and cross-process sweepers, MoA `jev_routed`, persistent-agent remote/distributed handoff, model-backed window summarisation, the budget service and archive tools, personal-context vendor fetchers, KV-cache Redis backends, watcher target add/remove and cross-process locking, Python's dynamic plugin execution model |
 | `openjiuwen-extensions` | OTLP/gRPC framing, `rediss://` TLS and Redis cluster slot routing, the Gauss/PostgreSQL document store, the Pulsar and ZeroMQ transports, AIO container teardown, cross-process conditional-write atomicity, Redis vector ranking (brute force, no RediSearch), Milvus-backed `context_evolver` scoring, Elasticsearch credentials on the vector adapter, and the `observability` SDK-adapter layer (`setup`/`demand`/`runtime`, span-record/contextvar fan-out, monkey-patched instrumentation, the compression→trajectory bridge) |
 | `openjiuwen-dev-tools` | zip/gzip unpacking beyond stored/DEFLATE, Playwright/JS rendering and vision judging, agent-builder pipeline extras (intention detector, clarifier, three-pass designer, DL refine, reflection loop, platform retrieval, streaming), `tune` dataset samplers/`chat_agent` adapters/`optimizer/adopt` services, `skill_evaluator`'s `create_subagent` orchestration, human-readable eval reports |
 | `openjiuwen-symphony` | the faiss/sentence-transformers experience index, transformers/vLLM logit branch selection, GCS service-account signing and Azure AD client credentials, LLM/faiss grouping and tree-build paths, Python's matcher file lock and pending-merge batching, the retrieval search-term families and the agent-facing retrieval toolkit, and discovery's filesystem caches/index states |
@@ -76,7 +76,7 @@ Deferred areas per crate, condensed from each crate's own `CONTEXT.md` gap secti
 | `openjiuwen-multiagent` | the Pulsar transport, Redis cluster/Sentinel topologies, stream housekeeping (`XTRIM`)/`XPENDING` fallback, Python's `drunner`/`RemoteAgent` factories and reply-topic routing, and the distributed team event bus |
 | `openjiuwen-runner` | distributed mode (Pulsar/ZeroMQ/MQ envelopes/`RemoteAgent`, `RemoteProtocol::A2a`), Python's `python -m` child bootstrap and the process pool, team-pool extras (OS-process/external-CLI/SSH members, cross-process attach, monitor TUI, org layer), in-loop HITL gate enforcement and answering auth, monitor persistence/exports, resource-manager and callback-framework extras, `ReadWriteLockManager`, and spawner introspection/live deadline re-tuning |
 | `openjiuwen-macros` | sync and generator tool handlers and `Args:` doc-block parameter descriptions (handlers are async-only; `schemars` owns descriptions) |
-| `openjiuwen-cli` | non-dry `auto-harness run` and `verify-ext` (no RSI evaluation runner or extension loader), `team`'s `invoke_tool` op, MCP/OTel-backed harness surfaces, and execution-journal resume for the interactive REPL (it seeds history but cannot adopt the persisted session id) |
+| `openjiuwen-cli` | non-dry `auto-harness run` and `verify-ext` (no RSI evaluation runner or extension loader), `team`'s `invoke_tool` op, MCP/OTel-backed harness surfaces, and session-id adoption for `chat --resume` (the harness offers `Repl::with_session_id`, but this crate still seeds the transcript with `Repl::seed_history` into a fresh `cli-*` session) |
 
 ## Dependency Layers
 
@@ -162,7 +162,7 @@ Default builds need no network and no external service; every feature except the
 | `openjiuwen` | `notify` | no | forwards `harness/notify` (the workspace watcher) |
 | `openjiuwen` | `sqlite` | no | forwards the foundation/session/memory/extensions/symphony/agent-teams SQLite backends |
 | `openjiuwen` | `a2a` | no | forwards `openjiuwen-extensions/a2a` |
-| `openjiuwen` | `mcp` | no | forwards `openjiuwen-extensions/mcp` |
+| `openjiuwen` | `mcp` | no | forwards `openjiuwen-extensions/mcp` only — MCP client/server tooling is already compiled through `openjiuwen-foundation`'s default `mcp` feature and no umbrella feature can turn it off |
 | `openjiuwen` | `redis` | no | forwards `openjiuwen-extensions/redis` + `openjiuwen-agent-evolving/redis` |
 | `openjiuwen` | `pulsar` | no | forwards `openjiuwen-extensions/pulsar` |
 | `openjiuwen` | `distributed` | no | forwards `openjiuwen-agent-teams/distributed` |
@@ -179,15 +179,16 @@ Default builds need no network and no external service; every feature except the
 
 Note: nothing in the workspace enables `vendor`, so a consumer wanting vendor providers must depend on `openjiuwen-harness-providers` directly.
 `openjiuwen-cli` enables `openjiuwen-harness/notify` unconditionally, so the binary's `watch` and `chat --watch` commands are always compiled.
-`openjiuwen-agent-teams` keeps `otel` (in-memory seam) and `otlp` (extensions bridge) as separate features; the umbrella mirrors that split.
+`openjiuwen-agent-teams` keeps `otel` (in-memory seam) and `otlp` (extensions bridge) as separate features; the umbrella mirrors that split, and the optional `openjiuwen-extensions` dependency behind `otlp` is declared with `features = ["otel"]`.
 `openjiuwen-core`'s four forwarders cover the entire gated kernel surface, and the umbrella forwards them plus the product-layer features.
 
 ## Test Conventions
 
 - Unit tests live beside the module (`#[cfg(test)] mod tests`) and are documented in that module's `CONTEXT.md`.
-- Integration tests live in `crates/<crate>/tests/` as one binary per file (394 `tests/*.rs` files today; `openjiuwen` keeps only `tests/module_paths.rs`, `openjiuwen-core` adds `tests/feature_forwarding.rs`, and `openjiuwen-examples/tests/examples_offline.rs` runs every example binary offline).
+- Integration tests live in `crates/<crate>/tests/` as one binary per file (399 `tests/*.rs` files today; `openjiuwen` keeps only `tests/module_paths.rs`, `openjiuwen-core` adds `tests/feature_forwarding.rs`, and `openjiuwen-examples/tests/examples_offline.rs` runs every example binary offline).
 - Every crate has a `tests/` directory (30 of 30), with scenario-specific helpers in a nested `tests/support/mod.rs` that is not itself a suite.
 - Cross-crate scenarios live only in `openjiuwen-e2e/tests/`: 26 scenario binaries holding 125 test functions, with bounded helpers in `tests/support/mod.rs`.
+- The examples crate runs 25 of its 26 examples in the default offline smoke (`11_a2a_server_client` is `required-features = ["a2a"]`, so a default run records it as skipped) and keeps 15 library unit tests over the shared support harness (`support::mode`, `support::logging`, `support::banner`).
 - 124 e2e scenarios pass with `--features sqlite,a2a,otel` and 114 with default features; exactly one is a documented `#[ignore]` (`cli_binary.rs`'s process-level binary-resolution test).
 - Workspace-wide there are five `#[ignore]` attributes: that e2e case, three hermetic protocol-child helpers in `openjiuwen-runner` (re-executed by their own suites, so the attribute is load-bearing), and one live-sandbox-gateway probe in `openjiuwen-sysop`.
 - `openjiuwen-test-support` supplies the shared fakes: loopback `MockLlmServer`, `ScriptedModel`, temp-workspace/env fixtures, JSON assertions, eventual-consistency helpers.
@@ -223,7 +224,7 @@ Note: nothing in the workspace enables `vendor`, so a consumer wanting vendor pr
 ### Harness
 
 - `./openjiuwen-harness-protocol/` → provider-neutral harness SPI (traits, events, results, streams)
-- `./openjiuwen-harness/` → DeepAgent task loop, rails, workspace, permissions, tools, LSP, worktree, cron, watcher, subagents, skills, persistent agent, prompts, native protocol, CLI logic
+- `./openjiuwen-harness/` → DeepAgent task loop, rails, workspace, permissions, tools (the eight memory tools run on `WorkspaceMemoryBackend`), LSP, worktree, cron, watcher, subagents (`RuntimeSubAgentSpawner`), skills, persistent agent with per-turn journaling, prompts, native protocol, CLI logic
 - `./openjiuwen-harness-providers/` → provider registry/factory, `native` and `native_v2` providers, `HarnessIOAdapter`, vendor CLI adapters
 - `./openjiuwen/` → top-level umbrella re-exporting every public module tree and the `prelude`
 
@@ -241,7 +242,7 @@ Note: nothing in the workspace enables `vendor`, so a consumer wanting vendor pr
 
 ### Tooling and CLI
 
-- `./openjiuwen-cli/` → binary `openjiuwen` (`run`, `chat`, `lsp`, `cron`, `team`, `watch`, `sessions`, `auto-harness`, with `run`/`chat` `--resume`/`--continue`)
+- `./openjiuwen-cli/` → binary `openjiuwen` (`run`, `chat`, `lsp`, `cron`, `team`, `watch`, `sessions`, `auto-harness`, with `run`/`chat` `--resume`/`--continue` and the three-store session catalogue)
 - `./openjiuwen-dev-tools/` → prompt builder, skill creator/evaluator, agent builder, tune optimizers
 
 ### Test infrastructure
