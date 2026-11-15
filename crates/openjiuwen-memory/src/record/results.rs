@@ -72,6 +72,11 @@ pub struct MemoryStats {
 ///
 /// Python returns a dict of per-kind unit lists plus extracted variables; this type
 /// keeps that shape so callers can inspect one kind at a time.
+///
+/// Besides the records, the result reports what did *not* produce a record, so a call
+/// that stored nothing because everything was a duplicate or because model extraction
+/// failed is distinguishable from a call that found nothing to store:
+/// [`AddMemResult::skipped`], [`AddMemResult::deleted`], and [`AddMemResult::degraded`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct AddMemResult {
@@ -87,6 +92,25 @@ pub struct AddMemResult {
     pub summary: Vec<MemoryRecord>,
     /// Coding-memory records.
     pub coding: Vec<MemoryRecord>,
+    /// Number of candidate memories the dedupe policy dropped (`DedupePolicy::Skip`).
+    ///
+    /// These inputs were valid memories that were already stored, so nothing was written
+    /// for them; a nonzero count with no records still means the call did something.
+    pub skipped: usize,
+    /// Number of existing records a write deleted before storing the replacement.
+    ///
+    /// A replace-style write removes the row it supersedes; a nonzero count makes that
+    /// deletion visible even when only the replacement record is returned.
+    pub deleted: usize,
+    /// Why model-assisted extraction degraded to the deterministic heuristic path.
+    ///
+    /// `None` when extraction never needed a fallback: no model is attached, extraction
+    /// is disabled, the model payload was applied, or there was nothing to extract.
+    /// `Some(reason)` when the model call or its payload failed (including a payload
+    /// carrying neither a fact nor a variable) and the heuristics produced the records.
+    /// The reason names the failure so a degraded turn is visible in logs and results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
 }
 impl AddMemResult {
     /// Iterates every record in kind order (`user_profile`, `semantic`, `episodic`,
@@ -100,6 +124,10 @@ impl AddMemResult {
             .chain(self.coding.iter())
     }
     /// Total number of records across all kinds.
+    ///
+    /// The [`AddMemResult::skipped`], [`AddMemResult::deleted`], and
+    /// [`AddMemResult::degraded`] bookkeeping does not contribute: they describe what
+    /// happened around the records, not records themselves.
     #[must_use]
     pub fn len(&self) -> usize {
         self.user_profile.len()
@@ -109,6 +137,9 @@ impl AddMemResult {
             + self.coding.len()
     }
     /// Returns `true` when no record was produced (variables may still be present).
+    ///
+    /// A call that skipped duplicates or deleted replaced rows still counts as empty
+    /// here; read [`AddMemResult::skipped`] and [`AddMemResult::deleted`] for that.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -205,5 +236,38 @@ mod tests {
         assert_eq!(json["variables"]["theme"], serde_json::json!("dark"));
         let restored: AddMemResult = serde_json::from_value(json).unwrap();
         assert_eq!(restored, result);
+    }
+    #[test]
+    fn add_mem_result_bookkeeping_round_trips_and_stays_backward_compatible() {
+        let mut result = AddMemResult {
+            skipped: 2,
+            deleted: 1,
+            degraded: Some("model extraction failed".to_owned()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["skipped"], serde_json::json!(2));
+        assert_eq!(json["deleted"], serde_json::json!(1));
+        assert_eq!(
+            json["degraded"],
+            serde_json::json!("model extraction failed")
+        );
+        // Bookkeeping is not a record: `len`/`is_empty` keep their documented meaning.
+        assert_eq!(result.len(), 0);
+        assert!(result.is_empty());
+        let restored: AddMemResult = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, result);
+
+        // A healthy result omits the reason and decodes a legacy payload that lacks
+        // every bookkeeping field.
+        result.degraded = None;
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.get("degraded").is_none(), "expected no degraded field");
+        let legacy: AddMemResult =
+            serde_json::from_value(serde_json::json!({"variables": {"theme": "dark"}})).unwrap();
+        assert_eq!(legacy.skipped, 0);
+        assert_eq!(legacy.deleted, 0);
+        assert!(legacy.degraded.is_none());
+        assert!(legacy.is_empty());
     }
 }
