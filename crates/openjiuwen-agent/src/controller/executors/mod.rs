@@ -32,6 +32,7 @@ use super::schema::{
     ControllerOutputChunk, ControllerOutputPayload, DataFrame, Intent, OutputKind, Task,
     TaskResult, TaskStatus,
 };
+use crate::controller::history::HistoryEntry;
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_session::Session;
@@ -74,6 +75,17 @@ const WORKFLOW_DESCRIPTION: &str = "runs a workflow";
 /// selects on it and returns early. A dispatch with no scheduler around it
 /// (`TaskScheduler::dispatch`, `BaseController`) installs a fresh,
 /// never-cancelled token.
+///
+/// [`history`](Self::history) is the conversation the turn that dispatched the
+/// task has recorded so far, oldest first and already trimmed to
+/// [`ControllerConfig::history_limit`](crate::controller::ControllerConfig::history_limit),
+/// so an executor can prompt a model with the same context intent recognition
+/// saw. A background-scheduler run starts from no turn, so its history is
+/// empty.
+///
+/// [`expose_reasoning`](Self::expose_reasoning) tells the executor whether to
+/// capture the model's reasoning into [`TaskResult::reasoning`]; it is `false`
+/// by default, which means no executor may capture anything.
 #[derive(Clone, Default)]
 pub struct TaskContext<'a> {
     /// Session shared by the dispatched tasks, when the caller has one.
@@ -82,16 +94,27 @@ pub struct TaskContext<'a> {
     pub controller_id: &'a str,
     /// Stop signal of the dispatch; never cancelled unless a scheduler asks.
     pub cancellation: CancellationToken,
+    /// Conversation history of the dispatching turn, oldest first.
+    ///
+    /// Empty for a background-scheduler run: the scheduler has no turn.
+    pub history: Vec<HistoryEntry>,
+    /// Whether the executor should capture reasoning into
+    /// [`TaskResult::reasoning`]; `false` captures nothing.
+    pub expose_reasoning: bool,
 }
 
 impl<'a> TaskContext<'a> {
     /// Builds a context for `session` owned by `controller_id`.
+    ///
+    /// The history is empty and reasoning capture is off.
     #[must_use]
     pub fn new(session: Option<Arc<dyn Session>>, controller_id: &'a str) -> Self {
         Self {
             session,
             controller_id,
             cancellation: CancellationToken::new(),
+            history: Vec::new(),
+            expose_reasoning: false,
         }
     }
 
@@ -103,6 +126,20 @@ impl<'a> TaskContext<'a> {
     #[must_use]
     pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
         self.cancellation = token;
+        self
+    }
+
+    /// Sets the conversation history of the dispatching turn (oldest first).
+    #[must_use]
+    pub fn with_history(mut self, history: Vec<HistoryEntry>) -> Self {
+        self.history = history;
+        self
+    }
+
+    /// Sets whether the executor should capture reasoning.
+    #[must_use]
+    pub fn with_expose_reasoning(mut self, expose: bool) -> Self {
+        self.expose_reasoning = expose;
         self
     }
 
@@ -312,6 +349,19 @@ impl TaskRun {
                 }
             }
             Err(error) => error.to_string(),
+        }
+    }
+
+    /// Reasoning text the executor captured, when the run reported a result.
+    ///
+    /// Returns the executor's [`TaskResult::reasoning`] verbatim (empty text
+    /// included) and `None` when the executor captured nothing or the
+    /// scheduler recorded an [`Err`] instead of a result.
+    #[must_use]
+    pub fn reasoning(&self) -> Option<&str> {
+        match &self.result {
+            Ok(result) => result.reasoning.as_deref(),
+            Err(_) => None,
         }
     }
 
@@ -597,6 +647,50 @@ mod tests {
         assert!(with_session.require_session().is_ok());
     }
 
+    #[test]
+    fn task_context_defaults_to_no_history_and_no_reasoning() {
+        let default = TaskContext::default();
+        assert_eq!(default.history.len(), 0);
+        assert!(!default.expose_reasoning);
+        let built = ctx();
+        assert_eq!(built.history.len(), 0);
+        assert!(!built.expose_reasoning);
+        let configured = ctx()
+            .with_history(vec![
+                HistoryEntry::user("hi"),
+                HistoryEntry::assistant("hello"),
+            ])
+            .with_expose_reasoning(true);
+        assert_eq!(configured.history.len(), 2);
+        assert_eq!(configured.history[0].text, "hi");
+        assert_eq!(
+            configured.history[1].role,
+            crate::controller::HistoryRole::Assistant
+        );
+        assert!(configured.expose_reasoning);
+        // The builders are chainable on a cloned context and stay independent.
+        let cloned = configured.clone();
+        assert!(cloned.expose_reasoning);
+        assert_eq!(cloned.history.len(), 2);
+    }
+    #[test]
+    fn task_run_reasoning_reads_only_successful_results() {
+        let run = TaskRun {
+            task: task("t1", AGENT_TASK_TYPE, "do it"),
+            result: Ok(TaskResult::text("done").with_reasoning("why")),
+        };
+        assert_eq!(run.reasoning(), Some("why"));
+        let plain = TaskRun {
+            task: task("t2", AGENT_TASK_TYPE, "do it"),
+            result: Ok(TaskResult::text("done")),
+        };
+        assert_eq!(plain.reasoning(), None);
+        let failed = TaskRun {
+            task: task("t3", AGENT_TASK_TYPE, "do it"),
+            result: Err(Error::validation("boom")),
+        };
+        assert_eq!(failed.reasoning(), None);
+    }
     #[test]
     fn registry_adds_replaces_and_removes() {
         let mut registry = TaskExecutorRegistry::new();
