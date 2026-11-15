@@ -30,6 +30,11 @@ enum Outcome {
     Completed(&'static str),
     /// A completed result carrying one frame (exercises `record_outputs`).
     WithFrames,
+    /// A completed result carrying one frame and reasoning (exercises the
+    /// exposed-reasoning chunk).
+    WithFramesAndReasoning(&'static str),
+    /// A completed result carrying reasoning but no frames.
+    WithReasoning(&'static str),
     /// A failed result carrying the message.
     Failed(&'static str),
     /// An interrupted result.
@@ -134,6 +139,15 @@ impl TaskExecutor for TestExecutor {
                 data: vec![DataFrame::text("frame")],
                 ..TaskResult::default()
             }),
+            Outcome::WithFramesAndReasoning(reasoning) => Ok(TaskResult {
+                status: TaskStatus::Completed,
+                data: vec![DataFrame::text("frame")],
+                ..TaskResult::default()
+            }
+            .with_reasoning(reasoning)),
+            Outcome::WithReasoning(reasoning) => {
+                Ok(TaskResult::text("done").with_reasoning(reasoning))
+            }
             Outcome::Failed(message) => Ok(TaskResult::failed(message)),
             Outcome::InputRequired => Ok(TaskResult::input_required(vec![DataFrame::text("more")])),
             Outcome::Error(message) => Err(Error::validation(message)),
@@ -734,6 +748,110 @@ async fn executor_outcomes_map_onto_task_statuses() {
     let payload = framed_task.outputs[0].payload.clone().expect("payload");
     assert_eq!(payload.kind, OutputKind::TaskCompletion);
     assert!(framed_task.outputs[0].last_chunk);
+}
+
+#[tokio::test]
+async fn exposed_reasoning_is_appended_before_the_terminal_chunk() {
+    let executor =
+        shared(TestExecutor::new(TASK_TYPE).with_outcome(Outcome::WithFramesAndReasoning("why")));
+    let fixture = Fixture::new(
+        ControllerConfig {
+            expose_reasoning: true,
+            ..config()
+        },
+        vec![Arc::clone(&executor) as Arc<dyn TaskExecutor>],
+    );
+    fixture.add("t1", TASK_TYPE);
+
+    fixture.scheduler.scan_once().await;
+    fixture.scheduler.wait_until_idle().await;
+
+    let task = fixture.manager.task("t1").expect("task is stored");
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert_eq!(task.outputs.len(), 2, "{:?}", task.outputs);
+    let reasoning = task.outputs[0].payload.clone().expect("payload");
+    assert_eq!(reasoning.kind, OutputKind::Reasoning);
+    assert_eq!(reasoning.data, vec![DataFrame::text("why")]);
+    assert!(!task.outputs[0].last_chunk);
+    let terminal = task.outputs[1].payload.clone().expect("payload");
+    assert_eq!(terminal.kind, OutputKind::TaskCompletion);
+    assert_eq!(terminal.data, vec![DataFrame::text("frame")]);
+    assert!(task.outputs[1].last_chunk);
+}
+
+#[tokio::test]
+async fn reasoning_is_dropped_when_not_exposed() {
+    let executor =
+        shared(TestExecutor::new(TASK_TYPE).with_outcome(Outcome::WithFramesAndReasoning("why")));
+    let fixture = Fixture::new(
+        config(),
+        vec![Arc::clone(&executor) as Arc<dyn TaskExecutor>],
+    );
+    fixture.add("t1", TASK_TYPE);
+
+    fixture.scheduler.scan_once().await;
+    fixture.scheduler.wait_until_idle().await;
+
+    let task = fixture.manager.task("t1").expect("task is stored");
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert_eq!(task.outputs.len(), 1, "{:?}", task.outputs);
+    let payload = task.outputs[0].payload.clone().expect("payload");
+    assert_eq!(payload.kind, OutputKind::TaskCompletion);
+    assert_eq!(payload.data, vec![DataFrame::text("frame")]);
+    assert!(task.outputs[0].last_chunk);
+    assert!(
+        task.outputs.iter().all(|chunk| chunk
+            .payload
+            .as_ref()
+            .is_none_or(|payload| payload.kind != OutputKind::Reasoning)),
+        "reasoning must not reach a frame: {:?}",
+        task.outputs
+    );
+}
+
+#[tokio::test]
+async fn reasoning_without_frames_is_recorded_alone_when_exposed() {
+    let exposed = Fixture::new(
+        ControllerConfig {
+            expose_reasoning: true,
+            ..config()
+        },
+        vec![
+            Arc::new(TestExecutor::new(TASK_TYPE).with_outcome(Outcome::WithReasoning("why")))
+                as Arc<dyn TaskExecutor>,
+        ],
+    );
+    exposed.add("t1", TASK_TYPE);
+    exposed.scheduler.scan_once().await;
+    exposed.scheduler.wait_until_idle().await;
+
+    let task = exposed.manager.task("t1").expect("task is stored");
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert_eq!(task.outputs.len(), 1, "{:?}", task.outputs);
+    let payload = task.outputs[0].payload.clone().expect("payload");
+    assert_eq!(payload.kind, OutputKind::Reasoning);
+    assert_eq!(payload.data, vec![DataFrame::text("why")]);
+    assert!(task.outputs[0].last_chunk);
+
+    let hidden = Fixture::new(
+        config(),
+        vec![
+            Arc::new(TestExecutor::new(TASK_TYPE).with_outcome(Outcome::WithReasoning("why")))
+                as Arc<dyn TaskExecutor>,
+        ],
+    );
+    hidden.add("t1", TASK_TYPE);
+    hidden.scheduler.scan_once().await;
+    hidden.scheduler.wait_until_idle().await;
+
+    let task = hidden.manager.task("t1").expect("task is stored");
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert_eq!(
+        task.outputs.len(),
+        0,
+        "no data and no exposed reasoning appends nothing: {:?}",
+        task.outputs
+    );
 }
 
 #[tokio::test]
