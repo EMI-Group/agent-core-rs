@@ -8,8 +8,11 @@ Ports the queue half of Python `openjiuwen/core/single_agent/rail/base.py` (`pus
 ## API Surface
 
 - `SteeringMessage` — `{text, source, metadata}` snake_case serde type; `new`, `with_source`, `with_metadata`, `is_empty`, `to_message` (a `user` `BaseMessage`; metadata rides under `STEERING_METADATA_KEY = "_openjiuwen_steering"`).
-- `SteeringQueue` — cheaply cloned `Arc<Mutex<VecDeque<..>>>` FIFO; `new`, `push`, `push_text`, `drain`, `drain_messages`, `snapshot`, `len`, `is_empty`, `clear`, `drain_prompt`.
-- `drain_prompt` joins drained texts with `"\n\n"` and returns `None` when nothing was queued; it is the helper the loop calls at its safe point.
+- `SteeringQueue` — cheaply cloned `Arc<Mutex<VecDeque<..>>>` FIFO; `new`, `push`, `push_text`, `drain`, `drain_limit`, `drain_messages`, `snapshot`, `len`, `is_empty`, `clear`, `drain_prompt`.
+- `drain_limit(Option<usize>)` removes at most `max(1, n)` messages, oldest first, so `Some(0)` still makes progress and `None` drains the whole backlog (Python's `drain_steering(limit)` cap).
+- A capped drain skips blank messages without spending the cap, and every message beyond the cap stays queued in order for the next `drain`/`drain_limit`.
+- `drain_prompt` joins drained texts with `"\n\n"` and returns `None` when nothing was queued; it is the standalone text-block renderer over `drain`.
+- The `ReAct` loop drains through `drain_limit` at its steering-drain point, so a cap supplied by a rail is honoured.
 
 ## Constraints
 
