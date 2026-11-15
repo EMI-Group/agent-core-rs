@@ -433,6 +433,10 @@ pub async fn run_once(options: &CliOptions, args: &RunArgs, io: &CliIo) -> Resul
 ///
 /// See the module docs for the per-format output shapes.
 ///
+/// This resolves the prompt, builds the agent and creates the run's CLI session
+/// record, then hands the turn to `stream_run`, which owns streaming, rendering
+/// and the transcript append.
+///
 /// # Errors
 ///
 /// Returns [`Error::Validation`] for an empty prompt, and whatever agent
@@ -453,10 +457,47 @@ pub async fn run_with_model(
         tracing::warn!(%error, "failed to create CLI session record");
     }
 
+    stream_run(
+        options,
+        args,
+        io,
+        &agent,
+        &session,
+        &run_session_id,
+        &prompt,
+    )
+    .await
+}
+
+/// Streams one agent turn, renders it per `args.output_format` and records it in
+/// the CLI session.
+///
+/// It owns the per-turn body: streaming `prompt` through `agent` on `session`,
+/// rendering every chunk (to `io` for `text`, buffered for `json`, one line per
+/// chunk plus a terminal result line for `stream-json`), building the
+/// [`RunOutcome`], writing the format's terminal output, and appending the user and
+/// assistant messages to the CLI session record of `session_id` (warn-only, so a
+/// failed write never loses the answer).
+///
+/// Session-record *creation* stays with the caller: `SessionStore::new_session`
+/// truncates an existing record, so only a caller starting a fresh run may call it.
+///
+/// # Errors
+///
+/// Returns the stream error, and any render or terminal-write failure.
+pub(crate) async fn stream_run(
+    options: &CliOptions,
+    args: &RunArgs,
+    io: &CliIo,
+    agent: &Arc<DeepAgent>,
+    session: &Arc<dyn Session>,
+    session_id: &str,
+    prompt: &str,
+) -> Result<RunOutcome> {
     // Plain output stays byte-identical: colour is only on when the handle says so.
     let mut render = RenderState::styled(io.is_color());
     let mut chunks = 0_usize;
-    let mut stream = agent.stream(json!({"query": prompt}), Some(session));
+    let mut stream = agent.stream(json!({"query": prompt}), Some(Arc::clone(session)));
     while let Some(item) = stream.next().await {
         let chunk = item?;
         chunks += 1;
@@ -476,7 +517,7 @@ pub async fn run_with_model(
         answer: render.answer().to_owned(),
         result_type: render.result_type().to_owned(),
         usage: render.usage.clone(),
-        session_id: run_session_id.clone(),
+        session_id: session_id.to_owned(),
         chunks,
     };
 
@@ -493,10 +534,11 @@ pub async fn run_with_model(
         }
     }
 
-    if let Err(error) = store.append_message(&run_session_id, ROLE_USER, &prompt) {
+    let store = options.sessions();
+    if let Err(error) = store.append_message(session_id, ROLE_USER, prompt) {
         tracing::warn!(%error, "failed to persist CLI user message");
     }
-    if let Err(error) = store.append_message(&run_session_id, ROLE_ASSISTANT, &outcome.answer) {
+    if let Err(error) = store.append_message(session_id, ROLE_ASSISTANT, &outcome.answer) {
         tracing::warn!(%error, "failed to persist CLI assistant message");
     }
 
