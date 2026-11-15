@@ -20,8 +20,7 @@
 //!    [`PENDING_FLUSH_THRESHOLD`] items are pending, or when the caller calls
 //!    [`ExperienceCollector::flush`].
 //!
-//! The clustering embedder defaults to
-//! [`HashEmbedding`](openjiuwen_retrieval::HashEmbedding) — the crate's deterministic
+//! The clustering embedder defaults to [`HashEmbedding`] — the crate's deterministic
 //! offline embedder — and the k-means tunables to [`ClusterConfig::default`]; a caller with
 //! a model installs it with [`ExperienceCollector::with_embedding`] and can narrow the
 //! bounds with [`ExperienceCollector::with_cluster_config`]. A failing embedding call is
@@ -42,9 +41,7 @@ use serde::{Deserialize, Serialize};
 use openjiuwen_retrieval::{Embedding, HashEmbedding};
 
 use crate::error::Result;
-use crate::experience::cluster::{
-    cluster_traces_with_embedding, normalized_skills, ClusterConfig,
-};
+use crate::experience::cluster::{cluster_traces_with_embedding, normalized_skills, ClusterConfig};
 use crate::experience::ranking::query_terms;
 use crate::experience::trace::TraceRecord;
 use crate::experience::{merge_item, ExperienceBank, ExperienceIndex, ExperienceItem};
@@ -143,7 +140,7 @@ impl ExperienceCollector {
     /// Builds a collector that flushes into `sink`.
     ///
     /// Traces are clustered with
-    /// [`HashEmbedding`](openjiuwen_retrieval::HashEmbedding) and
+    /// [`HashEmbedding`] and
     /// [`ClusterConfig::default`]; use [`ExperienceCollector::with_embedding`] and
     /// [`ExperienceCollector::with_cluster_config`] to change that.
     #[must_use]
@@ -171,7 +168,7 @@ impl ExperienceCollector {
     /// Replaces the embedder the clustering stage uses.
     ///
     /// A caller with a model installs it here; without one the collector keeps the
-    /// deterministic offline [`HashEmbedding`](openjiuwen_retrieval::HashEmbedding).
+    /// deterministic offline [`HashEmbedding`].
     #[must_use]
     pub fn with_embedding(mut self, embedding: Arc<dyn Embedding>) -> Self {
         self.embedding = embedding;
@@ -222,8 +219,7 @@ impl ExperienceCollector {
             .cloned()
             .collect();
         let dropped = records.len() - candidates.len();
-        let derived =
-            items_from_traces(&candidates, self.embedding.as_ref(), &self.config).await?;
+        let derived = items_from_traces(&candidates, self.embedding.as_ref(), &self.config).await?;
         let produced = derived.len();
 
         let mut snapshot = None;
@@ -313,24 +309,22 @@ async fn items_from_traces(
     embedding: &dyn Embedding,
     config: &ClusterConfig,
 ) -> Result<Vec<ExperienceItem>> {
-    Ok(
-        cluster_traces_with_embedding(records, embedding, config)
-            .await?
-            .into_iter()
-            .map(|cluster| {
-                ExperienceItem::new(cluster.pattern)
-                    .with_query_examples(
-                        cluster
-                            .query_examples
-                            .iter()
-                            .take(QUERY_EXAMPLES_COUNT)
-                            .cloned(),
-                    )
-                    .with_skill_ids(cluster.skill_ids)
-                    .with_success_count(cluster.success_count.max(1))
-            })
-            .collect(),
-    )
+    Ok(cluster_traces_with_embedding(records, embedding, config)
+        .await?
+        .into_iter()
+        .map(|cluster| {
+            ExperienceItem::new(cluster.pattern)
+                .with_query_examples(
+                    cluster
+                        .query_examples
+                        .iter()
+                        .take(QUERY_EXAMPLES_COUNT)
+                        .cloned(),
+                )
+                .with_skill_ids(cluster.skill_ids)
+                .with_success_count(cluster.success_count.max(1))
+        })
+        .collect())
 }
 
 /// Finds the first buffered item `incoming` may merge into.
@@ -365,7 +359,7 @@ fn jaccard(left: &BTreeSet<String>, right: &BTreeSet<String>) -> f64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 mod tests {
     use super::*;
 
@@ -425,5 +419,206 @@ mod tests {
         let other_skills = ExperienceItem::new("alpha bravo charlie").with_skill_ids(["b"]);
         let pending = vec![first, other_skills];
         assert_eq!(merge_target(&pending, &candidate), Some(0));
+    }
+
+    /// An embedder delegating to [`HashEmbedding`] and counting the batch calls.
+    struct CountingEmbedding {
+        inner: HashEmbedding,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingEmbedding {
+        fn new() -> Self {
+            Self {
+                inner: HashEmbedding::new(16),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Embedding for CountingEmbedding {
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+
+        fn dimension_hint(&self) -> Option<usize> {
+            self.inner.dimension_hint()
+        }
+
+        async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+            self.inner.embed_query(text).await
+        }
+
+        async fn embed_documents(
+            &self,
+            texts: &[String],
+            batch_size: Option<usize>,
+        ) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.embed_documents(texts, batch_size).await
+        }
+    }
+
+    /// An embedder that always fails, standing in for an unavailable model.
+    struct FailingEmbedding;
+
+    #[async_trait]
+    impl Embedding for FailingEmbedding {
+        fn model_name(&self) -> &'static str {
+            "failing"
+        }
+
+        async fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
+            Err(crate::error::Error::retrieval("embedder unavailable"))
+        }
+
+        async fn embed_documents(
+            &self,
+            _texts: &[String],
+            _batch_size: Option<usize>,
+        ) -> Result<Vec<Vec<f32>>> {
+            Err(crate::error::Error::retrieval("embedder unavailable"))
+        }
+    }
+
+    #[tokio::test]
+    async fn with_embedding_installs_the_supplied_embedder() {
+        let counting = Arc::new(CountingEmbedding::new());
+        let bank = Arc::new(ExperienceBank::new());
+        let collector = ExperienceCollector::for_bank(Arc::clone(&bank))
+            .with_embedding(Arc::clone(&counting) as Arc<dyn Embedding>);
+        assert_eq!(collector.embedding().model_name(), "hash-embedding");
+        assert_eq!(*collector.cluster_config(), ClusterConfig::default());
+        assert_eq!(counting.calls(), 0);
+
+        assert_eq!(
+            collector
+                .add(&[record("t1", "summarize the report", &["summarizer"])])
+                .await
+                .expect("add"),
+            1
+        );
+        assert_eq!(counting.calls(), 1);
+        assert_eq!(collector.flush().await.expect("flush"), 1);
+        assert_eq!(bank.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn with_cluster_config_is_honoured() {
+        let bank = Arc::new(ExperienceBank::new());
+        let config = ClusterConfig {
+            max_clusters: 1,
+            ..ClusterConfig::default()
+        };
+        let collector =
+            ExperienceCollector::for_bank(Arc::clone(&bank)).with_cluster_config(config);
+        assert_eq!(collector.cluster_config().max_clusters, 1);
+        assert_eq!(
+            collector
+                .add(&[
+                    record("t1", "alpha request", &["a"]),
+                    record("t2", "beta request", &["a"]),
+                ])
+                .await
+                .expect("add"),
+            1
+        );
+        assert_eq!(collector.pending(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_embedder_leaves_the_collector_untouched() {
+        let bank = Arc::new(ExperienceBank::new());
+        let collector = ExperienceCollector::for_bank(Arc::clone(&bank))
+            .with_embedding(Arc::new(FailingEmbedding));
+        let error = collector
+            .add(&[record("t1", "summarize the report", &["summarizer"])])
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("embedder unavailable"), "{error}");
+        assert_eq!(collector.pending(), 0);
+        assert_eq!(collector.stats(), CollectorStats::default());
+        assert!(bank.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_invalid_cluster_config_is_returned_not_swallowed() {
+        let collector = ExperienceCollector::for_bank(Arc::new(ExperienceBank::new()))
+            .with_cluster_config(ClusterConfig {
+                min_clusters: 0,
+                ..ClusterConfig::default()
+            });
+        let error = collector
+            .add(&[record("t1", "summarize the report", &["summarizer"])])
+            .await
+            .unwrap_err();
+        assert!(error.message().starts_with("min_clusters"), "{error}");
+        assert_eq!(collector.pending(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_embedding_pipeline_feeds_the_bank() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path().join("sessions").join("sess");
+        tokio::fs::create_dir_all(&session).await.expect("mkdir");
+        tokio::fs::write(session.join("metadata.json"), br#"{"status":"ok"}"#)
+            .await
+            .expect("metadata");
+        tokio::fs::write(
+            session.join("history.json"),
+            serde_json::to_vec(&serde_json::json!([
+                {
+                    "request_id": "r1",
+                    "role": "user",
+                    "content": "Summarize the quarterly report"
+                },
+                {
+                    "request_id": "r1",
+                    "role": "assistant",
+                    "event_type": "chat.tool_call",
+                    "tool_call": {
+                        "name": "skill_tool",
+                        "arguments": {"skill_name": "summarizer"}
+                    }
+                }
+            ]))
+            .expect("encode history"),
+        )
+        .await
+        .expect("history");
+
+        let store = crate::experience::trace::TraceStore::open(dir.path())
+            .await
+            .expect("open store");
+        let records = store.parse_all_sessions().await.expect("parse");
+        let clusters = cluster_traces_with_embedding(
+            &records,
+            &HashEmbedding::default(),
+            &ClusterConfig::default(),
+        )
+        .await
+        .expect("cluster");
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].skill_ids, vec!["summarizer"]);
+
+        let bank = Arc::new(ExperienceBank::new());
+        let collector = ExperienceCollector::for_bank(Arc::clone(&bank))
+            .with_embedding(Arc::new(HashEmbedding::default()));
+        assert_eq!(collector.add(&records).await.expect("add"), 1);
+        assert_eq!(collector.flush().await.expect("flush"), 1);
+
+        let hits = bank
+            .search("summarize quarterly report", 5)
+            .await
+            .expect("search");
+        assert!(!hits.is_empty());
+        assert!(hits[0].item.has_skill("summarizer"));
+        assert_eq!(hits[0].item.query_pattern, "Summarize the quarterly report");
+        assert_eq!(hits[0].item.query_examples.len(), 1);
     }
 }

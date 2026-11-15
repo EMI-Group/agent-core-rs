@@ -4,7 +4,7 @@
 //! Python groups traces by their skill set and then runs FAISS K-Means over the query
 //! embeddings. This port keeps that two-stage shape and replaces faiss with a small,
 //! deterministic k-means over the vectors of the
-//! [`Embedding`](openjiuwen_retrieval::Embedding) seam:
+//! [`Embedding`] seam:
 //!
 //! 1. **Skill stage** — traces are grouped by their sorted, deduped skill set. A trace with
 //!    no skills forms its own skill-less group (the collector drops such traces before
@@ -23,21 +23,20 @@
 //! # Two entry points, one algorithm
 //!
 //! [`cluster_traces`] is the synchronous offline path: it runs the same k-means over
-//! [`HashEmbedding`](openjiuwen_retrieval::HashEmbedding) vectors with
-//! [`ClusterConfig::default`]. [`cluster_traces_with_embedding`] takes the caller's own
+//! [`HashEmbedding`] vectors with [`ClusterConfig::default`].
+//! [`cluster_traces_with_embedding`] takes the caller's own
 //! embedder and reports failures. The chosen embedder is the only difference between them —
 //! the synchronous path never substitutes a lexical measure for the vectors, so a caller
 //! that wants a model's semantic clusters must call the asynchronous entry point. There is
 //! therefore no silent quality switch between the two.
 //!
 //! `HashEmbedding`'s futures are pure and ready on their first poll, so [`cluster_traces`]
-//! drives [`cluster_traces_with_embedding`] through a single-poll helper built on an
-//! `Arc`-based `std::task::Wake` waker and `Box::pin`: no `unsafe`, no private runtime and
-//! no `futures` crate. Should a poll ever come back pending — impossible for
-//! `HashEmbedding`, because this path never constructs a future that awaits real I/O — the
-//! function logs a `tracing::warn!` and clusters over zero vectors instead of panicking.
-//! The same fallback covers an embedding error, which `HashEmbedding` cannot produce
-//! either.
+//! drives [`cluster_traces_with_embedding`] through a single-poll helper built on
+//! [`Waker::noop`] and `Box::pin`: no `unsafe`, no private runtime and no `futures` crate.
+//! Should a poll ever come back pending — impossible for `HashEmbedding`, because this path
+//! never constructs a future that awaits real I/O — the function logs a `tracing::warn!`
+//! and clusters over zero vectors instead of panicking. The same fallback covers an
+//! embedding error, which `HashEmbedding` cannot produce either.
 //!
 //! # Determinism rules
 //!
@@ -54,8 +53,7 @@
 //! * A mean vector that cancels to zero keeps the cluster's previous centroid.
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -159,7 +157,10 @@ impl ClusterConfig {
             return Err(validation("max_iterations", "must be at least 1"));
         }
         if !self.epsilon.is_finite() || self.epsilon < 0.0 {
-            return Err(validation("epsilon", "must be a finite non-negative number"));
+            return Err(validation(
+                "epsilon",
+                "must be a finite non-negative number",
+            ));
         }
         if let Some(threshold) = self.centroid_merge_threshold {
             if !threshold.is_finite() || !(-1.0..=1.0).contains(&threshold) {
@@ -193,7 +194,7 @@ pub struct ClusteredQuery {
 ///
 /// This is the synchronous offline path: it runs the same k-means as
 /// [`cluster_traces_with_embedding`] over
-/// [`HashEmbedding`](openjiuwen_retrieval::HashEmbedding) vectors with
+/// [`HashEmbedding`] vectors with
 /// [`ClusterConfig::default`]. `HashEmbedding`'s futures are ready on their first poll, so a
 /// single poll of the asynchronous entry point completes; a pending poll or an embedding
 /// error (neither of which `HashEmbedding` can produce) is logged with `tracing::warn!` and
@@ -382,7 +383,11 @@ fn lookup_vector(vectors: &HashMap<String, Vec<f32>>, query: &str) -> Vec<f32> {
 /// `ceil(sqrt(n / 2))` is Python's faiss k-means default, clamped to
 /// [`ClusterConfig::min_clusters`] and `min(max_clusters, n)`; a caller overrides it by
 /// narrowing those bounds. One member yields one cluster and nine members yield three.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn target_clusters(n: usize, config: &ClusterConfig) -> usize {
     if n == 0 {
         return 0;
@@ -582,7 +587,7 @@ fn reseed_empty(
         };
         used[position] = true;
         counts[assignments[position]] -= 1;
-        centroids[cluster] = vectors[position].clone();
+        centroids[cluster].clone_from(&vectors[position]);
     }
 }
 
@@ -623,7 +628,11 @@ fn merge_lists(
 }
 
 /// Builds the public cluster record: pattern, members, examples, and success count.
-fn cluster_record(skill_ids: &[String], points: &[QueryPoint<'_>], list: &[usize]) -> ClusteredQuery {
+fn cluster_record(
+    skill_ids: &[String],
+    points: &[QueryPoint<'_>],
+    list: &[usize],
+) -> ClusteredQuery {
     let mut member_ids: Vec<String> = list
         .iter()
         .map(|index| points[*index].record.trace_id.clone())
@@ -702,10 +711,7 @@ fn mean_vector(points: &[QueryPoint<'_>], list: &[usize]) -> Vec<f32> {
 
 /// The squared euclidean distance of two vectors, tolerating a differing length.
 fn squared_distance(left: &[f64], right: &[f64]) -> f64 {
-    left.iter()
-        .zip(right)
-        .map(|(a, b)| (a - b) * (a - b))
-        .sum()
+    left.iter().zip(right).map(|(a, b)| (a - b) * (a - b)).sum()
 }
 
 /// The unit vector of `vector`, or `fallback` when `vector` carries no direction.
@@ -745,20 +751,12 @@ fn to_f64(vector: &[f32]) -> Vec<f64> {
     vector.iter().map(|value| f64::from(*value)).collect()
 }
 
-/// A waker that does nothing, used by [`poll_ready`].
-struct NoopWaker;
-
-impl Wake for NoopWaker {
-    fn wake(self: Arc<Self>) {}
-}
-
 /// Polls `future` exactly once and answers its output when it is ready.
 ///
-/// Only futures that never await real I/O may use this: the caller has no runtime to drive
-/// them and a wake does nothing here.
+/// The waker is [`Waker::noop`], because the caller has no runtime to drive the future and
+/// nothing in this path awaits real I/O: a wake could only ever be spurious.
 fn poll_ready<F: Future>(future: F) -> Option<F::Output> {
-    let waker = Waker::from(Arc::new(NoopWaker));
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(Waker::noop());
     let mut future = Box::pin(future);
     match future.as_mut().poll(&mut context) {
         Poll::Ready(output) => Some(output),
@@ -784,7 +782,12 @@ pub(crate) fn normalized_skills(skill_ids: &[String]) -> Vec<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::float_cmp,
+    clippy::assert_is_empty
+)]
 mod tests {
     use super::*;
 
@@ -818,7 +821,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Embedding for ScriptedEmbedding {
-        fn model_name(&self) -> &str {
+        fn model_name(&self) -> &'static str {
             "scripted"
         }
 
@@ -846,14 +849,15 @@ mod tests {
         assert_eq!(target_clusters(2, &config), 1);
         assert_eq!(target_clusters(8, &config), 2);
         assert_eq!(target_clusters(9, &config), 3);
-        assert_eq!(target_clusters(64, &config), DEFAULT_MAX_CLUSTERS);
+        assert_eq!(target_clusters(64, &config), 6);
+        assert_eq!(target_clusters(256, &config), DEFAULT_MAX_CLUSTERS);
 
         let bounded = ClusterConfig {
             max_clusters: 2,
             min_clusters: 1,
             ..ClusterConfig::default()
         };
-        assert_eq!(target_clusters(64, &bounded), 2);
+        assert_eq!(target_clusters(256, &bounded), 2);
 
         let forced = ClusterConfig {
             max_clusters: 4,
@@ -957,16 +961,17 @@ mod tests {
             record("t5", "beta", &["a"], true),
             record("t6", "beta", &["a"], true),
         ];
-        let embedder = ScriptedEmbedding::new(&[
-            ("alpha", [1.0, 0.0, 0.0]),
-            ("beta", [0.0, 0.9, 0.435]),
-        ]);
+        let embedder =
+            ScriptedEmbedding::new(&[("alpha", [1.0, 0.0, 0.0]), ("beta", [0.0, 0.9, 0.435])]);
         let config = ClusterConfig::default();
         let clusters = cluster_traces_with_embedding(&records, &embedder, &config)
             .await
             .unwrap();
         // n = 6 gives k = ceil(sqrt(3)) = 2.
         assert_eq!(clusters.len(), 2);
+        // Sorted by (skill_ids, pattern): "alpha" precedes "beta".
+        assert_eq!(clusters[0].pattern, "alpha");
+        assert_eq!(clusters[1].pattern, "beta");
         let alpha = clusters
             .iter()
             .find(|cluster| cluster.members.contains(&"t1".to_string()))
@@ -988,7 +993,7 @@ mod tests {
             .iter()
             .flat_map(|cluster| cluster.members.iter().map(String::as_str))
             .collect();
-        seen.sort();
+        seen.sort_unstable();
         assert_eq!(seen, vec!["t1", "t2", "t3", "t4", "t5", "t6"]);
         assert_eq!(
             clusters,
@@ -1004,7 +1009,8 @@ mod tests {
             record("t1", "alpha", &["a"], true),
             record("t2", "beta", &["a"], true),
         ];
-        let embedder = ScriptedEmbedding::new(&[("alpha", [1.0, 0.0, 0.0]), ("beta", [0.0, 1.0, 0.0])]);
+        let embedder =
+            ScriptedEmbedding::new(&[("alpha", [1.0, 0.0, 0.0]), ("beta", [0.0, 1.0, 0.0])]);
         let collapsed = ClusterConfig {
             max_clusters: 1,
             ..ClusterConfig::default()
@@ -1061,7 +1067,7 @@ mod tests {
 
     #[test]
     fn identical_centroids_merge_at_threshold_one() {
-        let records = vec![
+        let records = [
             record("t1", "same", &["a"], true),
             record("t2", "same", &["a"], true),
         ];
@@ -1124,9 +1130,10 @@ mod tests {
         ];
         let embedder =
             ScriptedEmbedding::new(&[("alpha", [1.0, 0.0, 0.0]), ("beta", [0.0, 1.0, 0.0])]);
-        let clusters = cluster_traces_with_embedding(&records, &embedder, &ClusterConfig::default())
-            .await
-            .unwrap();
+        let clusters =
+            cluster_traces_with_embedding(&records, &embedder, &ClusterConfig::default())
+                .await
+                .unwrap();
         assert_eq!(clusters.len(), 2);
         assert_eq!(clusters[0].skill_ids, vec!["a"]);
         assert_eq!(clusters[0].members, vec!["t1", "t2"]);
