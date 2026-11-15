@@ -76,6 +76,9 @@ pub use mcp_subscription_tool::{
 pub use mcp_subscriptions::{
     FakeMcpResourceSubscriptionProvider, McpResourceEvent, McpResourceSink,
     McpResourceSubscriptionProvider, McpResourceSubscriptions, McpSubscriptionInfo,
+    NotificationOutcome, LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED, LIVE_CLIENT_UNSUBSCRIBE_UNSUPPORTED,
+    RESOURCE_LIST_CHANGED_METHOD, RESOURCE_LIST_CHANGED_METHOD_SHORT, RESOURCE_UPDATED_METHOD,
+    RESOURCE_UPDATED_METHOD_SHORT,
 };
 pub use media::{
     AudioMetadata, AudioMetadataArgs, AudioMetadataTool, Cursor, Failure, ImageMetadata,

@@ -9,9 +9,10 @@
 //! agent id, session id, role, query, answer summary, tool-call count, iteration
 //! count, status and the start/finish timestamps. Three rules keep it safe:
 //!
-//! - **bounded** — every text field is clipped to [`MAX_TEXT_CHARS`], one line never
-//!   exceeds [`MAX_ENTRY_CHARS`] and the file keeps itself under [`MAX_FILE_BYTES`]
-//!   by dropping its oldest half once the bound is reached;
+//! - **bounded** — every text field is clipped ([`MAX_TEXT_CHARS`] for the query and
+//!   answer, [`MAX_ID_CHARS`] for the identifiers), one line never exceeds
+//!   [`MAX_ENTRY_CHARS`] and the file keeps itself under [`MAX_FILE_BYTES`] by dropping
+//!   its oldest half once the bound is reached;
 //! - **warn-only** — an IO failure is logged through `tracing` and never fails the
 //!   turn, exactly like the persistent-agent journal;
 //! - **stateless** — the journal is created per invocation from the configuration, so
@@ -27,6 +28,11 @@ use crate::schema::DeepAgentConfig;
 
 /// Longest query/answer text kept in one entry, in characters.
 pub(crate) const MAX_TEXT_CHARS: usize = 1024;
+/// Longest identifier (agent id, session id, role) kept in one entry, in characters.
+///
+/// Identifiers are clipped too: a pathological id must not push a line past
+/// [`MAX_ENTRY_CHARS`] on its own.
+pub(crate) const MAX_ID_CHARS: usize = 256;
 
 /// Longest single JSONL line, in characters.
 pub(crate) const MAX_ENTRY_CHARS: usize = 4096;
@@ -144,9 +150,9 @@ impl InvocationJournal {
     /// Renders and appends one record; a write failure is warn-only.
     async fn append(&self, record: &TurnRecord<'_>) {
         let line = render_entry(&self.meta, record, self.started_ms, now_ms());
-        if let Err(error) = append_bounded(&self.path, &line, MAX_FILE_BYTES).await {
+        if let Err(error) = append_bounded(self.path(), &line, MAX_FILE_BYTES).await {
             tracing::warn!(
-                path = %self.path.display(),
+                path = %self.path().display(),
                 error = %error,
                 "failed to write the invocation journal entry"
             );
@@ -156,9 +162,11 @@ impl InvocationJournal {
 
 /// Renders one JSONL entry for `record`.
 ///
-/// Text fields are clipped to [`MAX_TEXT_CHARS`]; if the rendered line still exceeds
-/// [`MAX_ENTRY_CHARS`] (pathological ids), the query and answer are dropped so the
-/// line stays readable JSON. The result never contains a newline.
+/// Text fields are clipped ([`MAX_TEXT_CHARS`] for the query and answer, [`MAX_ID_CHARS`]
+/// for the identifiers); if the rendered line still exceeds [`MAX_ENTRY_CHARS`]
+/// (pathological ids), the query and answer are first shortened and then dropped so the
+/// line stays readable JSON. Any degradation marks the entry `"truncated": true`. The
+/// result never contains a newline.
 #[must_use]
 pub(crate) fn render_entry(
     meta: &InvocationMeta,
@@ -166,10 +174,15 @@ pub(crate) fn render_entry(
     started_ms: u128,
     finished_ms: u128,
 ) -> String {
+    let agent_id = clip(&meta.agent_id, MAX_ID_CHARS);
+    let session_id = clip(&meta.session_id, MAX_ID_CHARS);
+    let role = clip(&meta.role, MAX_ID_CHARS);
+    let mut degraded =
+        agent_id != meta.agent_id || session_id != meta.session_id || role != meta.role;
     let mut entry = json!({
-        "agent_id": meta.agent_id,
-        "session_id": meta.session_id,
-        "role": meta.role,
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "role": role,
         "query": clip(&meta.query, MAX_TEXT_CHARS),
         "answer": clip(record.answer, MAX_TEXT_CHARS),
         "status": record.status,
@@ -184,11 +197,17 @@ pub(crate) fn render_entry(
             map.insert("query".to_string(), json!(clip(&meta.query, 32)));
             map.insert("answer".to_string(), json!(clip(record.answer, 32)));
         }
+        degraded = true;
     }
     if serialize_len(&entry) > MAX_ENTRY_CHARS {
         if let Some(map) = entry.as_object_mut() {
             map.remove("query");
             map.remove("answer");
+        }
+        degraded = true;
+    }
+    if degraded {
+        if let Some(map) = entry.as_object_mut() {
             map.insert("truncated".to_string(), json!(true));
         }
     }
@@ -202,7 +221,7 @@ pub(crate) fn render_entry(
 async fn append_bounded(path: &Path, line: &str, max_bytes: u64) -> std::io::Result<()> {
     if let Ok(metadata) = tokio::fs::metadata(path).await {
         if metadata.len() >= max_bytes {
-            trim_oldest(path).await?;
+            trim_oldest(path, max_bytes).await?;
         }
     }
     let mut file = tokio::fs::OpenOptions::new()
@@ -215,10 +234,10 @@ async fn append_bounded(path: &Path, line: &str, max_bytes: u64) -> std::io::Res
     file.flush().await
 }
 
-/// Rewrites `path` with the newest whole lines that fit in half of [`MAX_FILE_BYTES`].
-async fn trim_oldest(path: &Path) -> std::io::Result<()> {
+/// Rewrites `path` with the newest whole lines that fit in half of `max_bytes`.
+async fn trim_oldest(path: &Path, max_bytes: u64) -> std::io::Result<()> {
     let content = tokio::fs::read_to_string(path).await?;
-    let budget = usize::try_from(MAX_FILE_BYTES / 2).unwrap_or(usize::MAX);
+    let budget = usize::try_from(max_bytes / 2).unwrap_or(usize::MAX);
     let mut kept: Vec<&str> = Vec::new();
     let mut size = 0;
     for line in content.lines().rev() {

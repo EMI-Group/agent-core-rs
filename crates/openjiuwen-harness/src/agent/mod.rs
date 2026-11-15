@@ -274,6 +274,19 @@ impl DeepAgent {
     pub fn config(&self) -> DeepAgentConfig {
         self.config.read().clone()
     }
+    /// Returns the cards of the tools currently mounted on this agent.
+    ///
+    /// The cards are what the model sees (and what the tools prompt section is built
+    /// from), so a host can assert the mounted surface without reaching into the kernel
+    /// agent: the twenty core tools, whatever
+    /// [`DeepAgentConfig::enable_task_planning`] and the sub-agent mode add, and the
+    /// caller-supplied tools. Config gating happens at build time, so the set never
+    /// changes behind a caller's back except through
+    /// [`DeepAgentBuilder`].
+    #[must_use]
+    pub fn tool_cards(&self) -> Vec<ToolCard> {
+        self.tool_cards.read().clone()
+    }
 
     /// Wires the agent and resolves its model when that has not happened yet.
     ///

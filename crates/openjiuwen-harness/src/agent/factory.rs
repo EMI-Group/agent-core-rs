@@ -702,7 +702,9 @@ mod tests {
         let agent = create_deep_agent(
             Arc::new(ScriptedModel::text("hi")),
             None,
-            None,
+            // The persistent runtime surface is opt-in (`enable_subagent_runtime`); only
+            // `task_tool` is mounted by default.
+            Some(DeepAgentConfig::default().with_enable_subagent_runtime(true)),
             Vec::new(),
             Vec::new(),
             Some(Workspace::for_language(temp.workspace(), "en")),

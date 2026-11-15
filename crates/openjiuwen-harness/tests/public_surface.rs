@@ -683,3 +683,47 @@ async fn resume_surface_comes_from_the_crate_root() -> Result<()> {
     );
     Ok(())
 }
+
+/// The completion seam, the notification outcomes and their named methods resolve flat.
+///
+/// All of them were added after the flat surface was first pinned, so this test spells them
+/// through `openjiuwen_harness::…` only: a dropped `pub use` fails to compile here while the
+/// canonical module paths stay green.
+#[test]
+fn the_completion_seam_and_the_mcp_notification_surface_resolve_flat() {
+    use openjiuwen_harness::{
+        CompletionFn, CompletionSummarizer, NotificationOutcome, LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED,
+        LIVE_CLIENT_UNSUBSCRIBE_UNSUPPORTED, RESOURCE_LIST_CHANGED_METHOD,
+        RESOURCE_LIST_CHANGED_METHOD_SHORT, RESOURCE_UPDATED_METHOD, RESOURCE_UPDATED_METHOD_SHORT,
+    };
+    // The summariser takes the documented synchronous seam and bounds its answer.
+    let summariser = CompletionSummarizer::new(|prompt: &str| {
+        Ok::<String, openjiuwen_common::error::Error>(format!("{} chars", prompt.len()))
+    });
+    assert_eq!(summariser.max_chars(), 4096);
+    assert_ne!(summariser.prompt(&[]), "");
+    // A host may also hold the shared seam type itself.
+    let shared: Arc<CompletionFn> = Arc::new(|_prompt: &str| Ok("shared".to_string()));
+    assert_eq!(shared("x").expect("the seam answers"), "shared");
+    // The notification outcomes keep their accessors and the method constants agree.
+    let ignored = NotificationOutcome::IgnoredMethod {
+        method: RESOURCE_LIST_CHANGED_METHOD.to_string(),
+    };
+    assert!(!ignored.is_published());
+    assert_eq!(ignored.uri(), None);
+    let published = NotificationOutcome::Published {
+        uri: "file:///notes.md".to_string(),
+        sequence: 1,
+        reason: RESOURCE_UPDATED_METHOD.to_string(),
+    };
+    assert!(published.is_published());
+    assert_eq!(published.uri(), Some("file:///notes.md"));
+    assert!(RESOURCE_UPDATED_METHOD.ends_with(RESOURCE_UPDATED_METHOD_SHORT));
+    assert!(RESOURCE_LIST_CHANGED_METHOD.ends_with(RESOURCE_LIST_CHANGED_METHOD_SHORT));
+    // The two live-client refusals name the concrete gap and stay distinct.
+    assert!(LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED.contains("resources/subscribe"));
+    assert_ne!(
+        LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED,
+        LIVE_CLIENT_UNSUBSCRIBE_UNSUPPORTED
+    );
+}

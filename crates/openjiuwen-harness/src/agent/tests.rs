@@ -646,7 +646,12 @@ async fn factory_wires_subagents_permissions_and_a_temp_workspace() {
     let agent = create_deep_agent(
         Arc::new(model),
         None,
-        Some(DeepAgentConfig::default().with_add_general_purpose_agent(true)),
+        Some(
+            DeepAgentConfig::default()
+                .with_add_general_purpose_agent(true)
+                // The persistent runtime surface is opt-in; only `task_tool` is mounted by default.
+                .with_enable_subagent_runtime(true),
+        ),
         vec![echo.clone() as Arc<dyn Tool>],
         Vec::new(),
         Some(workspace.clone()),
