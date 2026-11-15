@@ -241,6 +241,40 @@ fn otel_is_reachable_through_the_extensions_alias() {
 }
 
 #[test]
+fn core_alias_exposes_the_newest_agent_context_and_llm_trees() {
+    // `single_agent` is a blanket glob of `openjiuwen-agent`, so the modules the crate
+    // grew stay reachable under the Python spelling.
+    same_paths! {
+        openjiuwen::core::single_agent::memory_provider::ProviderMemoryRail => openjiuwen_agent::memory_provider::ProviderMemoryRail,
+        openjiuwen::core::single_agent::usage::UsageTelemetry => openjiuwen_agent::usage::UsageTelemetry,
+        openjiuwen::core::single_agent::controller::ControllerAgent => openjiuwen_agent::controller::ControllerAgent,
+        openjiuwen::core::single_agent::kv_cache::KVCacheRuntimeConfig => openjiuwen_agent::kv_cache::KVCacheRuntimeConfig,
+        openjiuwen::core::single_agent::operator::ToolCallOperator => openjiuwen_agent::operator::ToolCallOperator,
+        openjiuwen::core::single_agent::prompt_pack::PromptPack => openjiuwen_agent::prompt_pack::PromptPack,
+    }
+    // Context engine: usage accounting, compression telemetry, window policy, tokenizers.
+    same_paths! {
+        openjiuwen::core::context_engine::usage::ContextUsageAnalyzer => openjiuwen_context::usage::ContextUsageAnalyzer,
+        openjiuwen::core::context_engine::telemetry::ContextCompressionState => openjiuwen_context::telemetry::ContextCompressionState,
+        openjiuwen::core::context_engine::policy::ContextWindowChange => openjiuwen_context::policy::ContextWindowChange,
+        openjiuwen::core::context_engine::policy::ContextWindowPolicy => openjiuwen_context::policy::ContextWindowPolicy,
+        openjiuwen::core::context_engine::tokenizers::TokenizerSpec => openjiuwen_context::tokenizers::TokenizerSpec,
+    }
+    // Foundation LLM: the external-provider registry and the `Responses` transport helpers.
+    same_paths! {
+        openjiuwen::core::foundation::llm::external_provider::ExternalProviderRegistry => openjiuwen_foundation::llm::external_provider::ExternalProviderRegistry,
+        openjiuwen::core::foundation::llm::responses::ResponsesStreamState => openjiuwen_foundation::llm::responses::ResponsesStreamState,
+    }
+    // Runner and teams: the dreaming service and the team-memory configuration. (`core::memory`'s
+    // `lite`/`dreaming`/`team`/`external` trees are already asserted in
+    // `every_public_module_tree_is_reachable`.)
+    same_paths! {
+        openjiuwen::core::runner::dreaming::DreamService => openjiuwen_runner::dreaming::DreamService,
+        openjiuwen::agent_teams::memory::MemoryConfig => openjiuwen_agent_teams::memory::MemoryConfig,
+    }
+}
+
+#[test]
 fn crate_name_is_the_python_package_root() {
     assert_eq!(openjiuwen::crate_name(), "openjiuwen");
 }
@@ -427,6 +461,49 @@ fn redis_feature_reaches_the_store_surface() {
         openjiuwen::extensions::store::redis::RedisStore => openjiuwen_extensions::store::redis::RedisStore,
         openjiuwen::extensions::store::redis::RedisStoreConfig => openjiuwen_extensions::store::redis::RedisStoreConfig,
     }
+}
+
+#[cfg(feature = "redis")]
+#[test]
+fn redis_feature_also_reaches_the_agent_evolving_store() {
+    // The umbrella's `redis` feature forwards both halves: the extensions' store surface
+    // and the RL online service's Redis-backed `OnlineStore`. Nothing here connects.
+    same_paths! {
+        openjiuwen::agent_evolving::online::redis_store::RedisOnlineStore => openjiuwen_agent_evolving::online::RedisOnlineStore,
+        openjiuwen::agent_evolving::online::redis_store::RedisOnlineStoreOptions => openjiuwen_agent_evolving::online::RedisOnlineStoreOptions,
+    }
+}
+
+#[cfg(feature = "otlp")]
+#[test]
+fn otlp_feature_reaches_the_team_memory_bridge() {
+    // `otlp` is separate from `otel`: agent-teams keeps the in-memory/tracing seam and the
+    // real OTLP memory bridge behind two features.
+    same_paths! {
+        openjiuwen::agent_teams::observability::otlp::OtlpMemoryObserver => openjiuwen_agent_teams::observability::otlp::OtlpMemoryObserver,
+    }
+    // The constructor takes `impl Into<String>`, so the coercion to a higher-ranked `fn(&str)`
+    // is rejected; the identity check instead instantiates it at `String`, which stays a plain
+    // function-pointer comparison of the two paths.
+    let umbrella: fn(
+        String,
+    )
+        -> Result<openjiuwen::agent_teams::observability::otlp::OtlpMemoryObserver> =
+        openjiuwen::agent_teams::observability::otlp::otlp_memory_observer;
+    let concrete: fn(
+        String,
+    )
+        -> Result<openjiuwen_agent_teams::observability::otlp::OtlpMemoryObserver> =
+        openjiuwen_agent_teams::observability::otlp::otlp_memory_observer;
+    assert!(std::ptr::eq(umbrella as *const (), concrete as *const ()));
+    // The crate-wide baseline is still "no exporter"; the constructor builds over a private
+    // in-memory provider, so nothing touches the network.
+    const { assert!(!openjiuwen::agent_teams::observability::OTLP_EXPORT_AVAILABLE) };
+    let observer = openjiuwen::agent_teams::observability::otlp::otlp_memory_observer("s-1");
+    assert!(
+        observer.is_ok(),
+        "the private in-memory memory provider builds"
+    );
 }
 
 #[cfg(feature = "pulsar")]
