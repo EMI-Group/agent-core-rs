@@ -7,11 +7,11 @@
 //!
 //! # An opt-in extra artifact
 //!
-//! `tree_index.html` is **not** one of the files a build publishes: the artifact contract
-//! is the three files written by
+//! `tree_index.html` is **not** part of the artifact contract: that contract is the three
+//! files written by
 //! [`write_index`](crate::retrieval::artifacts::write_index) — `tree_index.yaml`,
-//! `catalog.jsonl` and `manifest.json`. The visualizer is opt-in, nothing in a build calls
-//! it, and it writes its single extra file next to those three.
+//! `catalog.jsonl` and `manifest.json`. The visualizer is opt-in, and a build writes its
+//! single extra file next to those three only when `BuildOptions::write_html` asks for it.
 //!
 //! # Derived data, never read back
 //!

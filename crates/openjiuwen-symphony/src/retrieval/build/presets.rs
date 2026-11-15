@@ -15,9 +15,9 @@
 //!
 //! # Override semantics
 //!
-//! A caller-supplied preset wins over the grouping substitute: the build stage assigns
+//! A caller-supplied preset wins over every grouping strategy: the build stage assigns
 //! items onto the preset's paths and derives only the leaf `cid`s, so a curated taxonomy
-//! is never re-arranged by the deterministic grouping. That is why `TreePreset::flatten`
+//! is never re-arranged by the rule, embedding or model grouping. That is why `TreePreset::flatten`
 //! treats an explicit `cid` as authoritative even when it does not look like its parent's
 //! `cid` plus one segment.
 //!

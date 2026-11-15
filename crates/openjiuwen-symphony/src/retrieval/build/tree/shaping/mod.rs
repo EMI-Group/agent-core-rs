@@ -8,7 +8,7 @@
 //!
 //! | Stage | What the model does | Deterministic fallback |
 //! | --- | --- | --- |
-//! | [`one_shot`](crate::retrieval::build::tree::shaping::one_shot) | places every item in one prompt | [`group_items`](crate::retrieval::build::grouping::group_items) |
+//! | [`one_shot`](crate::retrieval::build::tree::shaping::one_shot) | places every item in one prompt | [`group_items`] |
 //! | [`expansion`](crate::retrieval::build::tree::shaping::expansion) | splits one skeleton branch per prompt, breadth first | that branch's own subtree |
 //! | [`repair`](crate::retrieval::build::tree::shaping::repair) | minimally fixes a node list the schema guard rejected | empty-branch pruning |
 //! | [`equivalence`](crate::retrieval::build::tree::shaping::equivalence) | merges semantically equal sibling branches | normalized-name collapsing |
@@ -58,7 +58,7 @@
 //! No reply is trusted, and every stage applies the same normalisation before returning:
 //!
 //! - every segment is slugged with
-//!   [`slug_term`](crate::retrieval::build::tree_text::slug_term) and blank or repeated
+//!   [`slug_term`] and blank or repeated
 //!   segments are dropped;
 //! - a path keeps at most `max_depth - 1` segments, because the tree root occupies depth
 //!   1;

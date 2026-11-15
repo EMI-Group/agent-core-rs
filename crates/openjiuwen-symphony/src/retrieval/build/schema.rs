@@ -27,7 +27,7 @@
 //! `FIXED_ROOT_CATEGORIES` is Python's `FIXED_ROOT_CATEGORIES` with the same eight root
 //! ids and the same four children each. The **ids are the behavioural contract** — they
 //! become `cid` segments and preset paths — while `name` and `description` are display
-//! text only: the Rust build groups items deterministically and no model reads them.
+//! text only: the Rust build derives and validates the ids and never sends them to a model.
 //! Root names are Python's Chinese display names verbatim; child names are title-cased
 //! forms of their ids.
 

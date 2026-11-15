@@ -2,7 +2,7 @@
 //!
 //! Python's `build/tree/expansion.py` grows an existing tree level by level with a model.
 //! This stage ports that walk over a skeleton of
-//! [`GroupAssignment`](crate::retrieval::build::grouping::GroupAssignment)s: the
+//! [`GroupAssignment`]s: the
 //! deterministic grouping has already placed every item, and the model gets to split one
 //! branch at a time.
 //!

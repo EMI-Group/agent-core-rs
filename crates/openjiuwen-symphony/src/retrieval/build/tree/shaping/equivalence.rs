@@ -8,7 +8,7 @@
 //! # The deterministic pre-pass
 //!
 //! Sibling segments are grouped by
-//! [`normalize_name_key`](crate::model::naming::normalize_name_key), and every group is
+//! [`normalize_name_key`], and every group is
 //! rewritten onto its lexicographically smallest member, so `PDF Fill`, `pdf_fill` and
 //! `pdf-fill` become one branch. The canonical segment is a property of the group rather
 //! than of the first insertion, so a rerun over the stage's own output changes nothing.
