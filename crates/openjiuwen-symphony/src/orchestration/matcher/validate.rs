@@ -16,7 +16,7 @@
 //!    string flag never becomes truthy by coercion.
 //! 2. **expansion** — a compact item becomes a full match: `candidate_id` from the
 //!    candidate key, `source_id`/`target_id` swapped for `direction: "reverse"`,
-//!    `relation_type` always [`CAN_FEED`](crate::graph::CAN_FEED),
+//!    `relation_type` always [`CAN_FEED`],
 //!    `method` always `llm_ontology_match`, and `supporting_fields` derived from that
 //!    direction's evidence. A non-object item, an unknown id, a repeated id, a direction
 //!    other than `forward`/`reverse`, or a direction without evidence is dropped with a
@@ -24,7 +24,7 @@
 //!    passed through to validation instead of being dropped (a Rust-only leniency, so a
 //!    caller may hand in an already-normalized item).
 //! 3. **validation** — endpoints must belong to a candidate, the relation is always
-//!    [`CAN_FEED`](crate::graph::CAN_FEED), the confidence must parse as a number
+//!    [`CAN_FEED`], the confidence must parse as a number
 //!    (unparseable → `0` plus an error) and is clamped into `[0, 1]` (out of range → error,
 //!    clamped value kept), the item is matched to its candidate by `candidate_id` and then
 //!    by the `(source, target)` pair in either orientation, and `can_feed` supporting
@@ -287,7 +287,7 @@ pub struct ValidatedMatch {
     pub source_id: String,
     /// The qualified id of the consuming capability.
     pub target_id: String,
-    /// The relation kind; always [`CAN_FEED`](crate::graph::CAN_FEED).
+    /// The relation kind; always [`CAN_FEED`].
     pub relation: String,
     /// The clamped confidence in `[0.0, 1.0]`.
     pub confidence: f64,
@@ -369,8 +369,7 @@ impl MatchThresholds {
         Self { can_feed }
     }
 
-    /// The threshold of one relation; an unknown relation needs certainty
-    /// ([`FALLBACK_THRESHOLD`]).
+    /// The threshold of one relation; an unknown relation needs certainty (`1.0`).
     #[must_use]
     pub fn threshold(&self, relation: &str) -> f64 {
         if relation == CAN_FEED {
@@ -428,7 +427,7 @@ pub fn parse_match_response_with_evidence(
         };
     };
     let (matches, validation_diagnostics) =
-        validate_matches(&items, candidates, evidence, thresholds);
+        validate_matches(&items, candidates, evidence, *thresholds);
     diagnostics.extend(validation_diagnostics);
     MatchOutcome {
         matches,
@@ -667,7 +666,7 @@ fn validate_matches(
     items: &[Value],
     candidates: &[RelationCandidate],
     evidence: &CandidateEvidence,
-    thresholds: &MatchThresholds,
+    thresholds: MatchThresholds,
 ) -> (Vec<ValidatedMatch>, Vec<GraphDiagnostic>) {
     let endpoints: BTreeSet<&str> = candidates
         .iter()
@@ -714,7 +713,7 @@ fn normalize_match(
     by_key: &BTreeMap<String, &RelationCandidate>,
     by_pair: &BTreeMap<(&str, &str), &RelationCandidate>,
     evidence: &CandidateEvidence,
-    thresholds: &MatchThresholds,
+    thresholds: MatchThresholds,
 ) -> (ValidatedMatch, Vec<GraphDiagnostic>) {
     let source_id = scalar_text(object.get("source_id"));
     let target_id = scalar_text(object.get("target_id"));
@@ -745,12 +744,11 @@ fn normalize_match(
     if candidate.is_none() {
         errors.push("match does not correspond to an input candidate".to_string());
     }
-    let confidence = match confidence_of(object.get("confidence")) {
-        Some(confidence) => confidence,
-        None => {
-            errors.push("confidence is not numeric".to_string());
-            0.0
-        }
+    let confidence = if let Some(confidence) = confidence_of(object.get("confidence")) {
+        confidence
+    } else {
+        errors.push("confidence is not numeric".to_string());
+        0.0
     };
     let confidence = if (0.0..=1.0).contains(&confidence) {
         confidence
@@ -787,7 +785,7 @@ fn normalize_match(
     let accepted = errors.is_empty() && confidence >= thresholds.threshold(&relation);
     let diagnostics = diagnostics_for(
         object,
-        &resolved_candidate_id,
+        resolved_candidate_id.as_deref(),
         &source_id,
         &errors,
         accepted,
@@ -863,7 +861,7 @@ fn check_supporting_fields(
 /// The diagnostics of one validated match.
 fn diagnostics_for(
     object: &Map<String, Value>,
-    candidate_id: &Option<String>,
+    candidate_id: Option<&str>,
     source_id: &str,
     errors: &[String],
     accepted: bool,

@@ -31,7 +31,7 @@
 //!   renders the compact document, and
 //!   [`matcher::parse_match_response`](crate::orchestration::matcher::parse_match_response)
 //!   expands and validates the reply. It never calls a model itself; the model-calling side
-//!   is [`llm::OntologyMatcher`](crate::llm::OntologyMatcher).
+//!   is [`llm::OntologyMatcher`].
 //!
 //! Every ordering in this module is explicit: candidates sort by strategy rank,
 //! confidence, source, and target; plans rank on a fixed tuple; graph node ids are

@@ -2,7 +2,7 @@
 //!
 //! Ports Python `openjiuwen.symphony.orchestration.graph.matcher.protocol`'s
 //! `build_match_request` and its evidence compaction. A request is one compact JSON
-//! document, one entry per [`RelationCandidate`](crate::orchestration::RelationCandidate):
+//! document, one entry per [`RelationCandidate`]:
 //!
 //! ```json
 //! {"candidates":[{"id":"c1",
@@ -29,7 +29,7 @@
 //!
 //! Python's candidate generator attaches an `evidence` dict with the exact
 //! `source_outputs`, `target_inputs` and `port_mappings` it matched.
-//! [`RelationCandidate`](crate::orchestration::RelationCandidate) carries only the matched
+//! [`RelationCandidate`] carries only the matched
 //! IO names plus the strategy, so the directional evidence is derived from the two
 //! [`CapabilityDescriptor`]s instead:
 //!

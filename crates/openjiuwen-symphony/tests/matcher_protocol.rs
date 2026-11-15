@@ -3,7 +3,7 @@
 //! Every test is offline and deterministic: no model is called, timestamps never appear,
 //! and the only ordering used is the payload order or a sorted collection.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 
 use openjiuwen_symphony::graph::CAN_FEED;
 use openjiuwen_symphony::llm::ontology::{OntologyMatch, METHOD_LLM};
