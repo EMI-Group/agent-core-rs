@@ -76,7 +76,7 @@ use crate::retrieval::build::schema::{
     DIAGNOSTIC_MISSING_PARENT,
 };
 use crate::retrieval::build::tree;
-use crate::retrieval::build::tree_text::sort_nodes;
+use crate::retrieval::build::tree_text::{slug_term, sort_nodes};
 use crate::retrieval::types::{
     CatalogRecord, IndexManifest, IndexNode, RetrieverItem, DEFAULT_ITEM_TYPE, META_CONTENT,
     META_DONT_SELECT_WHEN, META_SELECT_WHEN, MODE_FULL, TREE_INDEX_FILENAME,
@@ -180,11 +180,39 @@ impl BuildConfig {
     /// The configured [`BuildConfig::grouping`] is cloned as-is, except that a preset's
     /// [`paths`](crate::retrieval::build::presets::TreePreset::paths) replace the taxonomy,
     /// so the curated branch paths win over the paths the grouping stage would derive.
+    ///
+    /// A preset path that starts at the configured
+    /// [`root_segment`](GroupingConfig::root_segment) — compared by [`slug_term`],
+    /// case-insensitively — has that leading segment stripped before it becomes a taxonomy
+    /// path. The grouping stage already places every path *below* the root, so without the
+    /// strip a preset rooted at `Skills` would publish doubled cids such as
+    /// `Skills.skills.documents`.
+    /// Paths that become empty are dropped, and the result is sorted and deduplicated.
     #[must_use]
     pub fn effective_grouping(&self) -> GroupingConfig {
         let mut grouping = self.grouping.clone();
         if let Some(preset) = self.preset.as_ref() {
-            grouping.taxonomy = preset.paths();
+            let root = slug_term(&grouping.root_segment, "root");
+            let mut taxonomy: Vec<Vec<String>> = preset
+                .paths()
+                .into_iter()
+                .filter_map(|mut path| {
+                    let rooted = path.first().is_some_and(|segment| {
+                        slug_term(segment, "root").eq_ignore_ascii_case(&root)
+                    });
+                    if rooted {
+                        path.remove(0);
+                    }
+                    if path.is_empty() {
+                        None
+                    } else {
+                        Some(path)
+                    }
+                })
+                .collect();
+            taxonomy.sort();
+            taxonomy.dedup();
+            grouping.taxonomy = taxonomy;
         }
         grouping
     }
@@ -1215,14 +1243,10 @@ mod tests {
         assert_eq!(
             config.effective_grouping().taxonomy,
             vec![
-                vec!["Skills".to_string()],
-                vec!["Skills".to_string(), "Documents".to_string()],
-                vec![
-                    "Skills".to_string(),
-                    "Documents".to_string(),
-                    "Files".to_string()
-                ],
-            ]
+                vec!["Documents".to_string()],
+                vec!["Documents".to_string(), "Files".to_string()],
+            ],
+            "the preset's root segment is stripped: the grouping stage adds it back"
         );
 
         let report = IndexBuilder::build(
@@ -1241,8 +1265,61 @@ mod tests {
             .iter()
             .find(|node| node.is_leaf())
             .expect("the single item has a leaf");
-        assert_eq!(leaf.cid, "Skills.skills.documents.files.pdffill");
-        assert!(cids(&builder).contains(&"Skills.skills.documents.files".to_string()));
+        assert_eq!(leaf.cid, "Skills.documents.files.pdffill");
+        assert!(cids(&builder).contains(&"Skills.documents.files".to_string()));
+        assert!(
+            !cids(&builder)
+                .iter()
+                .any(|cid| cid == "Skills.skills" || cid.starts_with("Skills.skills.")),
+            "a preset rooted at Skills must not produce doubled cids: {:?}",
+            cids(&builder)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preset_rooted_below_the_root_segment_stays_under_the_root() {
+        let dir = tempdir().unwrap();
+        let preset = TreePreset {
+            nodes: vec![PresetNode {
+                cid: "documents".to_string(),
+                node_type: NODE_TYPE_BRANCH.to_string(),
+                description: "Documents".to_string(),
+                children: vec![PresetNode {
+                    cid: "documents.pdf-fill".to_string(),
+                    node_type: NODE_TYPE_BRANCH.to_string(),
+                    description: "PDF forms".to_string(),
+                    ..PresetNode::default()
+                }],
+                ..PresetNode::default()
+            }],
+        };
+        let config = BuildConfig::new().with_preset(preset);
+        assert_eq!(
+            config.effective_grouping().taxonomy,
+            vec![
+                vec!["documents".to_string()],
+                vec!["documents".to_string(), "pdf-fill".to_string()],
+            ],
+            "a preset that does not start at the root segment is kept verbatim"
+        );
+
+        IndexBuilder::build(
+            sources(vec![item("PdfFill", "PDF Fill", "documents/pdf")]),
+            dir.path(),
+            config,
+        )
+        .await
+        .unwrap();
+        let builder = IndexBuilder::open(dir.path(), BuildConfig::new())
+            .await
+            .unwrap();
+        let leaf = builder
+            .nodes()
+            .iter()
+            .find(|node| node.is_leaf())
+            .expect("the single item has a leaf");
+        assert_eq!(leaf.cid, "Skills.documents.pdf-fill.pdffill");
+        assert!(cids(&builder).contains(&"Skills.documents.pdf-fill".to_string()));
     }
 
     #[tokio::test]

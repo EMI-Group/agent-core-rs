@@ -489,10 +489,22 @@ async fn a_nested_preset_with_blank_child_cids_wins_over_the_classification() {
         .collect();
     assert_eq!(leaves.len(), 1);
     assert_eq!(
-        leaves[0].cid, "Skills.skills.documents.pdf-forms.pdffill",
+        leaves[0].cid, "Skills.documents.pdf-forms.pdffill",
         "the leaf sits on the preset path, not on the classification path"
     );
-    assert!(cids(&builder).contains(&"Skills.skills.documents.pdf-forms".to_string()));
+    assert!(cids(&builder).contains(&"Skills.documents.pdf-forms".to_string()));
+    assert!(
+        !cids(&builder).contains(&"Skills.skills.documents.pdf-forms".to_string()),
+        "the preset's leading Skills root is not repeated below the tree root: {:?}",
+        cids(&builder)
+    );
+    assert!(
+        !cids(&builder)
+            .iter()
+            .any(|cid| cid == "Skills.skills" || cid.starts_with("Skills.skills.")),
+        "no doubled root segment anywhere in the tree: {:?}",
+        cids(&builder)
+    );
 }
 
 #[tokio::test]
