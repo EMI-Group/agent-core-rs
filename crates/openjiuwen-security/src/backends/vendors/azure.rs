@@ -12,7 +12,8 @@
 //! bearer token) and the configured categories, and empty text is safe without
 //! an `HTTP` call. Scanned text and blocklist terms never appear in `details`,
 //! logs, or errors; the tests drive recorded `text:analyze` fixtures through a
-//! loopback server, so the suite stays offline.
+//! loopback server, so the suite stays offline. A reply that does not carry the
+//! analysis schema is a validation error rather than a safe verdict.
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::BTreeMap;
@@ -235,17 +236,23 @@ impl AzureContentSafetyBackend {
     /// The category with the highest severity names the risk; ties keep the
     /// first category in wire order. When no detected risk carries a category
     /// name, the configured [`AzureContentSafetyConfig::risk_type`] is used.
+    /// A reply is only graded when it carries the analysis schema: a non-empty
+    /// `categoriesAnalysis` array holding at least one object with a
+    /// `severity` member. Severities that are `0`, negative, fractional, or
+    /// non-numeric keep the documented value mapping (outliers clamp into
+    /// `0..=7`, unreadable values count as `0`) and never error.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] when `categoriesAnalysis` is missing, empty,
-    /// or not an array.
+    /// Returns [`Error::Validation`] naming the required fields when the reply
+    /// does not match the analysis schema; the message never repeats any part
+    /// of the payload.
     pub fn parse_response(&self, response: &Value) -> Result<RiskAssessment> {
         let analysis = response
             .get("categoriesAnalysis")
             .and_then(Value::as_array)
-            .filter(|entries| !entries.is_empty())
-            .ok_or_else(no_category_analysis)?;
+            .filter(|entries| entries.iter().any(is_grading_entry))
+            .ok_or_else(unrecognized_reply)?;
 
         let mut category_severities = BTreeMap::new();
         let mut max_severity = 0_u32;
@@ -395,9 +402,27 @@ impl GuardrailBackend for AzureContentSafetyBackend {
     }
 }
 
-/// Builds the error reported when a response carries no usable analysis.
-fn no_category_analysis() -> Error {
-    Error::transport("azure content safety returned no category analysis")
+/// Builds the error reported when a `2xx` body does not match the
+/// `text:analyze` schema.
+///
+/// Naming the fields keeps the mismatch actionable without repeating any part
+/// of the payload, and the validation kind makes the pipeline block under the
+/// fail-closed default instead of treating the reply as a clean verdict.
+fn unrecognized_reply() -> Error {
+    Error::validation(
+        "azure content safety reply does not match the text:analyze schema: expected a non-empty \
+         `categoriesAnalysis` array holding at least one `{category, severity}` entry",
+    )
+}
+
+/// Whether a `categoriesAnalysis` entry is one the adapter can grade.
+///
+/// An entry counts when it is an object carrying a `severity` member; its
+/// optional `category` name and the value of `severity` are read tolerantly by
+/// [`severity_of`], so a reply without any such entry is an unrecognized
+/// schema rather than an all-zero (safe) analysis.
+fn is_grading_entry(entry: &Value) -> bool {
+    entry.is_object() && entry.get("severity").is_some()
 }
 
 /// Maps a clamped severity to its risk level.
@@ -808,20 +833,43 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_empty_category_analysis_is_a_transport_error() {
+    fn unrecognized_reply_shapes_are_validation_errors() {
         let backend = offline_backend();
         for response in [
+            json!({}),
             json!({"blocklistsMatch": []}),
+            json!({"blocklistsMatch": [{"blocklistItemText": "secret-term"}]}),
             json!({"categoriesAnalysis": []}),
             json!({"categoriesAnalysis": "Hate"}),
             json!({"categoriesAnalysis": null}),
+            json!({"categoriesAnalysis": [{}]}),
+            json!({"categoriesAnalysis": [1, 2]}),
+            json!({"categoriesAnalysis": [{"category": "Hate"}]}),
         ] {
             let error = backend.parse_response(&response).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::Transport, "{response}");
-            assert!(
-                error.to_string().contains("no category analysis"),
-                "{error}"
-            );
+            assert_eq!(error.kind(), ErrorKind::Validation, "{response}: {error}");
+            let message = error.to_string();
+            assert!(message.contains("azure content safety reply"), "{message}");
+            assert!(message.contains("categoriesAnalysis"), "{message}");
+            assert!(message.contains("severity"), "{message}");
+            assert!(!message.contains("secret-term"), "{message}");
+            assert!(!message.contains(&response.to_string()), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_recognized_benign_reply_is_a_safe_assessment() {
+        let backend = offline_backend();
+        for response in [
+            json!({"categoriesAnalysis": [{"category": "Hate", "severity": 0}]}),
+            json!({"categoriesAnalysis": [{"category": "Hate", "severity": 0}], "blocklistsMatch": []}),
+            json!({"categoriesAnalysis": [{"severity": 0}, {"category": "Violence", "severity": 0.0}]}),
+        ] {
+            let assessment = backend.parse_response(&response).unwrap();
+            assert!(!assessment.has_risk, "{response}");
+            assert_eq!(assessment.risk_level, RiskLevel::Safe, "{response}");
+            assert_eq!(assessment.risk_type, None, "{response}");
+            assert_eq!(assessment.details, None, "{response}");
         }
     }
 

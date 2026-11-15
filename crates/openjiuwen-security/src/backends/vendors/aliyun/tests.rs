@@ -519,22 +519,13 @@ fn parse_response_safe_and_code_errors() {
         assert!(assessment.risk_type.is_none());
         assert!(assessment.details.is_none());
     }
-    for reply in [
-        json!({"Code": 200, "Data": {"Result": []}}),
-        json!({"Code": 200, "Data": {}}),
-        json!({"Code": 200}),
-    ] {
+    for reply in [json!({"Code": 200, "Data": {"Result": []}})] {
         let assessment = offline_backend().parse_response(&reply).unwrap();
         assert!(!assessment.has_risk, "reply {reply}");
         assert_eq!(assessment.risk_level, RiskLevel::Safe);
     }
 
-    for reply in [
-        json!({"Code": 500, "Message": "internal error"}),
-        json!({"Message": "missing code"}),
-        json!({"Code": "200"}),
-        json!({"Code": 500.5}),
-    ] {
+    for reply in [json!({"Code": 500, "Message": "internal error"})] {
         let error = offline_backend().parse_response(&reply).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Transport, "reply {reply}");
     }
@@ -547,4 +538,51 @@ fn parse_response_safe_and_code_errors() {
             .contains("aliyun green returned code 500: bad request"),
         "{error}"
     );
+}
+
+#[test]
+fn unrecognized_reply_shapes_are_validation_errors() {
+    for reply in [
+        json!({}),
+        json!({"Message": "missing code"}),
+        json!({"Code": "200"}),
+        json!({"Code": 500.5}),
+        json!({"Code": null}),
+        json!({"Code": 200}),
+        json!({"Code": 200, "Data": {}}),
+        json!({"Code": 200, "Data": null}),
+        json!({"Code": 200, "Data": "nonLabel"}),
+        json!({"Code": 200, "Data": {"Reason": "vendor reason must stay private"}}),
+        json!({"Data": {"Labels": "nonLabel", "Result": []}}),
+    ] {
+        let error = offline_backend().parse_response(&reply).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            ErrorKind::Validation,
+            "reply {reply}: {error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("aliyun green reply"), "{message}");
+        assert!(message.contains("`Code`"), "{message}");
+        assert!(message.contains("`Data`"), "{message}");
+        assert!(message.contains("`Labels`"), "{message}");
+        assert!(!message.contains("vendor reason"), "{message}");
+        assert!(!message.contains(&reply.to_string()), "{message}");
+    }
+}
+
+#[test]
+fn a_recognized_benign_reply_is_a_safe_assessment() {
+    for reply in [
+        json!({"Code": 200, "Data": {"Labels": "nonLabel", "Result": []}}),
+        json!({"Code": 200, "Data": {"Labels": ""}}),
+        json!({"Code": 200, "Data": {"Result": []}}),
+    ] {
+        let assessment = offline_backend().parse_response(&reply).unwrap();
+        assert!(!assessment.has_risk, "reply {reply}");
+        assert_eq!(assessment.risk_level, RiskLevel::Safe, "reply {reply}");
+        assert_eq!(assessment.risk_type, None, "reply {reply}");
+        assert_eq!(assessment.confidence, 1.0, "reply {reply}");
+        assert_eq!(assessment.details, None, "reply {reply}");
+    }
 }
