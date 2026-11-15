@@ -31,16 +31,27 @@ impl MemoryEngine {
     pub fn has_embedding(&self) -> bool;
 
     pub async fn add(&self, scope: &MemoryScope, memory: NewMemory, options: &AddOptions) -> Result<AddOutcome>;
+    pub async fn add_with_embedding(&self, scope: &MemoryScope, memory: NewMemory, options: &AddOptions,
+                                    embedding: Option<&Arc<dyn Embedding>>) -> Result<AddOutcome>;
     pub async fn add_many(&self, scope: &MemoryScope, memories: Vec<NewMemory>, options: &AddOptions) -> Result<AddOutcome>;
+    pub async fn add_many_with_embedding(&self, scope: &MemoryScope, memories: Vec<NewMemory>, options: &AddOptions,
+                                         embedding: Option<&Arc<dyn Embedding>>) -> Result<AddOutcome>;
     pub async fn get(&self, scope: &MemoryScope, id: &str) -> Result<Option<MemoryRecord>>;
     pub async fn update(&self, scope: &MemoryScope, id: &str, patch: MemoryUpdate, options: &CallOptions) -> Result<MemoryRecord>;
+    pub async fn update_with_embedding(&self, scope: &MemoryScope, id: &str, patch: MemoryUpdate, options: &CallOptions,
+                                       embedding: Option<&Arc<dyn Embedding>>) -> Result<MemoryRecord>;
     pub async fn delete(&self, scope: &MemoryScope, id: &str) -> Result<bool>;
     pub async fn clear(&self, filter: &MemoryFilter, options: &CallOptions) -> Result<usize>;
     pub async fn list(&self, filter: &MemoryFilter) -> Result<Vec<MemoryRecord>>;
     pub async fn search(&self, scope: &MemoryScope, query: &str, options: &SearchOptions) -> Result<Vec<RecallHit>>;
+    pub async fn search_with_embedding(&self, scope: &MemoryScope, query: &str, options: &SearchOptions,
+                                       embedding: Option<&Arc<dyn Embedding>>) -> Result<Vec<RecallHit>>;
     pub async fn stats(&self, filter: &MemoryFilter) -> Result<MemoryStats>;
 
     pub async fn write_variable(&self, scope: &MemoryScope, name: &str, value: &str, options: &AddOptions) -> Result<VariableWrite>;
+    pub async fn write_variable_with_embedding(&self, scope: &MemoryScope, name: &str, value: &str,
+                                               options: &AddOptions,
+                                               embedding: Option<&Arc<dyn Embedding>>) -> Result<VariableWrite>;
     pub async fn delete_variable_everywhere(&self, scope: &MemoryScope, name: &str) -> Result<bool>;
     pub async fn variable_records(&self, scope: &MemoryScope) -> Result<Vec<MemoryRecord>>;
 }
@@ -48,12 +59,15 @@ impl MemoryEngine {
 pub struct VariableWrite { pub record_id: String, pub created: bool }  // serde
 ```
 
+The `*_with_embedding` variants carry the handle a per-scope override resolved to: `Some` uses it instead of the engine's embedder, `None` means the engine's own model, so a direct engine call keeps its documented behaviour while the facade can serve one scope with another embedder.
+
 ## Write Path
 
 1. `scope.validate()`; `memory.validate()`; reject `MemoryType::Variable` (`Error::Validation`).
 2. Acquire the per-scope async write lock keyed by `(user_id, scope_id)`; release after the operation. `parking_lot` only guards the lock map and is dropped before `.await`.
 3. Build a `MemoryRecord` (new id via `record::new_memory_id`, timestamps now, `importance = memory.importance.unwrap_or(config.importance_default)`, scope copied, metadata/source/timestamp from the input).
 4. Dedupe candidates (unless `options.dedupe == Some(DedupePolicy::Add)` or `config.dedupe.enabled == false`): embed the content (if embedding available and not `skip_embedding`) and run `search` over the same scope with `top_k = config.dedupe.candidate_top_k`, `mode = Hybrid`, threshold `0`. Compare with `recall::dedupe::find_duplicate`.
+   - A scan that fails for any reason other than cancellation/timeout still writes the record and sets `AddOutcome::degraded` to the reason, so "the scope had no duplicates" is distinguishable from "the scope could not be scanned"; `Error::Cancelled`/`Error::Timeout` abort instead.
    - `Merge` => persist `merge_records(existing, incoming, now)` (same key, new embedding), outcome `merged`.
    - `Skip` => no write, outcome `skipped` (id of the incoming record).
    - `Replace` => delete the existing record+embedding, write the incoming record under the existing id, outcome `merged`.
@@ -80,7 +94,7 @@ pub struct VariableWrite { pub record_id: String, pub created: bool }  // serde
 2. `kinds = options.kinds` or `config.searchable_kinds`; filter to `is_searchable`, with one exception: `MemoryType::Variable` is kept when a caller names it explicitly (the configuration rejects it in `searchable_kinds`, so no default or configured recall selects it).
 3. Build candidates:
    - `Semantic`/`Hybrid` with embedding: for each kind call `storage.search_embeddings(scope, kind, query_vec, candidate_k)` where `candidate_k = min(max(top_k * candidate_multiplier as usize, top_k), max_candidates)`. Fetch records by `(id)` via `storage.get_record` (the vector store has no payload). Missing records (stale index) are skipped with a warning.
-   - `Keyword` or no embedding: `storage.list_records` for the scope+kinds, limited to `max_candidates` by timestamp desc; `similarity = None`. If `mode == Semantic` and no embedding => `Error::Unsupported("semantic search requires an embedding model")`.
+   - `Keyword` or no embedding: `storage.list_records` for the scope+kinds, limited to `max_candidates` by timestamp desc; `similarity = None`. The scan scores only the `ranking.max_candidates` newest records and a `tracing::warn!` on target `openjiuwen_memory::engine` names the cap, the pool size and how many records went unscored, so a truncated scope is never mistaken for a small one. If `mode == Semantic` and no embedding => `Error::Unsupported("semantic search requires an embedding model")`.
 4. Rank with `recall::pipeline::rank(candidates, query, now, &config.ranking)`.
 5. Filter `score >= options.threshold`; take `top_k`; apply `options.token_budget.or(config.token_budget)` via `trim_to_token_budget`.
 6. Update `last_access`/`access_count` for the returned records **best-effort** (write failures are logged at `warn`, never fail a search). Do not mutate `updated_at` on access.
@@ -90,7 +104,8 @@ An empty query is `Error::Validation`.
 
 ## Update / Delete / Clear
 
-- `update`: load the record (`NotFound` if absent), validate the patch, apply content/kind/importance/metadata merge/source, re-embed when content changed, `updated_at = now`, persist. `kind == Variable` is rejected.
+- `update`: load the record (`NotFound` if absent), validate the patch, apply content/kind/importance/metadata merge/source, re-embed when content changed, `updated_at = now`, persist. `kind == Variable` or `kind == Unknown` is rejected.
+- A kind change moves the vector to the new kind's collection, and a failed re-index restores the previous state instead of leaving a half-migrated record: when the previous kind's vector was already deleted, the previous record row and its re-computed vector are put back (row first, so a failing re-embedding still leaves the previous JSON), and the returned error keeps its kind with context naming the record, the attempted and previous kinds, and whether the restore succeeded.
 - `delete`: load, delete KV + embedding, return `true` when the record existed.
 - `clear(filter)`: list matching records (prefix scan), delete each record+embedding; returns the count. `filter.kinds` empty means every memory kind except `Variable` projections; variables/messages are otherwise cleared by the facade/store methods, not `clear`.
 - `list(filter)`: storage listing (timestamp desc), no scoring.
@@ -109,7 +124,7 @@ An empty query is `Error::Validation`.
 
 - One `tokio::sync::Mutex` per `(user_id, scope_id)`; the map is guarded by `parking_lot::Mutex<HashMap<(String,String), Arc<tokio::sync::Mutex<()>>>>` and cloned out before awaiting.
 - Reads are lock-free (storage operations are internally synchronized). Two concurrent writes to one scope serialize; different scopes run in parallel.
-- Embedding dimension is cached in a `tokio::sync::OnceCell<usize>` initialized from `Embedding::dimension()`; vector collection creation uses it.
+- Embedding dimension is cached per embedding model name in a `parking_lot::Mutex<HashMap<String, usize>>` filled from `Embedding::dimension()`; vector collection creation and the post-embedding length check use the cache entry of the model that produced the vector, so several embedders of different dimensions coexist in one engine.
 - `MemoryEngine` is `Send + Sync + 'static` and used as `Arc<MemoryEngine>`.
 
 ## Constraints
@@ -117,7 +132,7 @@ An empty query is `Error::Validation`.
 - Errors: validation `Error::Validation`, missing update `Error::NotFound`, semantic-without-embedding `Error::Unsupported`, cancellation `Error::Cancelled`; embedding/storage errors propagate.
 - Never hold a std/parking_lot lock across `.await`.
 - No ranking formula duplicated here: call `recall` functions.
-- A failed embedding never leaves a record committed; a failed dedupe search degrades to "no candidates" with a `warn` (dedupe is best-effort, Python parity).
+- A failed embedding never leaves a record committed; a failed dedupe search degrades to "no candidates" with a `warn` and an `AddOutcome::degraded` reason (dedupe is best-effort, Python parity), while cancellation/timeout abort the write.
 - `add` of an empty/whitespace content is rejected; content is not trimmed (preserve caller text) but blank detection uses `trim()`.
 - A variable write is not atomic across its two representations: the KV entry is written after embedding and before the projection, so a failed projection write leaves the KV value (the Python-authoritative entry) in place and no half-indexed record.
 
@@ -133,7 +148,7 @@ An empty query is `Error::Validation`.
 
 ## Test Strategy
 
-- Module tests: duplicate policy matrix, failed-index rollback, blank content, same-scope lock serialization is covered indirectly by concurrent add tests in `tests/crud.rs`.
+- Module tests: duplicate policy matrix, failed-index rollback, blank content, a failed candidate scan reported on `AddOutcome::degraded`, a kind-changing update restoring the previous record and vector, the keyword-scan cap warning, same-scope lock serialization is covered indirectly by concurrent add tests in `tests/crud.rs`.
 - `variables.rs` tests: KV entry plus one projection, session namespace, in-place rewrite (creation time preserved, `created == false`), forbidden names, invalid names, deleting both representations plus the vector, ascending/scope-isolated listing, unfiltered `list`/`stats`/`clear` exclusion with explicit-kind inclusion, `clear` counts and KV survival, explicit-kind recall, no merge with ordinary records, cancellation, unreadable-row repair, id determinism, `VariableWrite` JSON, and SQLite persistence across a reopen (feature `sqlite`).
 - `mod.rs` tests: the `includes_record`/`includes_variables` predicate matrix (an unfiltered filter hides `Variable` and keeps every other kind, an explicit `Variable` kind includes it).
 - Integration tests: `tests/crud.rs` (write/read/update/delete/clear/stats), `tests/recall.rs` (pipeline, thresholds, budgets, keyword fallback), `tests/dedupe.rs`, `tests/scoping.rs`.
