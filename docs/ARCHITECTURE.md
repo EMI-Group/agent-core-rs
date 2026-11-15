@@ -328,7 +328,38 @@ The real exporter is separate: `otel::OtelTraceSink` implements the kernel `Trac
 `persistent_agent::ExecutionCatalog` is the on-disk index keyed by execution id: `new(root, capacity)`, `path_for(&self, execution_id: &str) -> PathBuf`, `async fn list(&self) -> Result<Vec<ExecutionSummary>>` and `async fn open(&self, execution_id: &str) -> Result<ExecutionLog>`.
 `persistent_agent::resume(store, logs, links, binding: &SessionBinding, request_id, continuation, assembler: &WindowAssembler)` builds a `ResumePlan` — serde-serializable both ways — carrying `record`, `cursor`, `window`, `chain`, `background` and `digest`, with `seed_messages()`/`seed_history()` for replay; the module never appends log entries itself, the rails do.
 `ResumePlan` is a value, so a host can persist or forward it; the CLI resumes through `cli::run_with_model_resumed`, the counterpart of `cli::run_with_model`.
+`DeepAgent` journals its own turns when `DeepAgentConfig::persistent_agent` is on (default off): `ExecutionRecorder::for_workspace(workspace).begin(PersistentRunConfig::new(card id, session id), query)` opens one entry per turn, `finish(status, Some(&output.output))` closes it, and `save_session(messages, state)` rewrites the `PersistentSessionRecord`; both writes are best effort, so a journal failure is logged and the answer still returns.
+Journal appends call `sync_all`, so a returned append survives a killed process or a power loss.
+The CLI always enables the flag and pins the agent id to `openjiuwen-cli`, because the session binding is `(agent_id, session_id)` and a per-process uuid would make `--resume` look for a record the previous process never wrote.
+`Repl::with_session_id` adopts a persisted id — the kernel session is rebuilt around it and the existing `<home>/sessions/<id>.json` record is appended to, never truncated — while the one-shot `run --resume` path builds a `ResumedTurn` and calls `cli::run_once_resumed`.
+Two deviations remain: recording is per turn rather than per model or tool call, and resume stays host-driven, since the harness never calls `resume` or seeds history on its own.
 The runner has no resume entry point of its own: `Runner` exposes only `run_agent(_streaming)`, `run_workflow(_streaming)` and `run_agent_team(_streaming)`.
+
+### 2.13 Harness host seams (`openjiuwen-harness`)
+
+```rust
+#[async_trait]
+pub trait MemoryToolBackend: Send + Sync {
+    async fn search(&self, request: MemorySearchRequest) -> Result<Value>;
+    async fn read(&self, scope: MemoryScope, path: &str, offset: usize, limit: Option<usize>) -> Result<MemoryReadData>;
+    async fn write(&self, scope: MemoryScope, path: &str, content: &str, append: bool) -> Result<MemoryWriteData>;
+    async fn edit(&self, scope: MemoryScope, path: &str, old_text: &str, new_text: &str) -> Result<MemoryEditData>;
+}
+
+#[async_trait]
+pub trait SubAgentSpawner: Send + Sync {
+    async fn spawn(&self, request: SpawnRequest) -> Result<SubAgentHandle>;
+    async fn wait(&self, id: &str, timeout: Option<Duration>) -> Result<SubAgentStatus>;
+    async fn list(&self) -> Result<Vec<SubAgentStatus>>;
+    async fn send_input(&self, id: &str, input: String) -> Result<()>;
+    async fn close(&self, id: &str) -> Result<()>;
+}
+```
+
+`WorkspaceMemoryBackend` is the production `MemoryToolBackend`: it maps Python's model paths onto workspace nodes (`USER.md`, `<memory>/MEMORY.md`, `<memory>/daily_memory/YYYY-MM-DD.md`, coding `*.md`), resolves every path through `Workspace::resolve` so a symlink escaping the workspace is `Error::Security`, and answers `search` with a deterministic keyword scan that reports `provider: "local"`, `search_mode: "keyword_only"` and `embedding_available: false`.
+`ToolRegistry::with_workspace_memory` installs it, `ToolRegistry::with_memory` substitutes a host backend, and `DeepAgentBuilder::build` mounts it by default; a registry without a backend answers the memory tools with `success=false` and `memory tool backend is not configured`.
+`RuntimeSubAgentSpawner` is the production `SubAgentSpawner` over `SubAgentRuntime`: a semaphore of `limit` permits taken with `try_acquire_owned` makes an over-limit `spawn` fail immediately with `Error::Validation`, the permit is held until the instance reaches a terminal status, and one cancellation token per instance is cancelled by `close` before the runtime is asked to close (a running turn still refuses to close).
+`DeepAgentBuilder` mounts it as the default subagent rail, so `SubagentRail::with_spawner` always has a real implementor.
 
 ## 3. Async and streaming model
 
@@ -374,18 +405,22 @@ Default builds need no network and no external service; every feature except the
 | `openjiuwen-core` | `otel`, `sqlite`, `sandbox`, `live-tests` | no | Forwarders to session/foundation/memory/sysop; they cover the whole gated kernel surface. |
 | `openjiuwen-extensions` | `a2a` | no | A2A client/server, wire types, harness bridge. |
 | `openjiuwen-extensions` | `otel` | no | Real OTel SDK provider, `OtelTraceSink`, handlers, tracing layer, `observability::{file_exporter, transforming}`. |
-| `openjiuwen-extensions` | `sqlite`, `redis`, `pulsar` | no | SQLite checkpointer/store, Redis KV/document/vector stores + checkpointer, Pulsar queue surface (constructs then rejects). |
+| `openjiuwen-extensions` | `sqlite`, `redis`, `pulsar` | no | SQLite checkpointer/store, Redis KV/document/vector stores + checkpointer, Pulsar queue surface (constructs then rejects). The Redis stores and checkpointer validate their configuration at construction and open the connection lazily on first use; `rediss://` and cluster redirection are typed `Unsupported` at that point. |
 | `openjiuwen-extensions` | `mcp` | no | `rmcp` dependency only — no source file reads it (dead gate). |
 | `openjiuwen-harness` | `native` | yes | Empty marker; no source reads it. |
-| `openjiuwen-harness` | `browser`, `cua`, `mobile`, `notify` | no | Documented `Unsupported` subagent presets; `notify` pulls `notify` and gates `watcher::backend`, without which `start` is a typed `Unsupported`. |
+| `openjiuwen-harness` | `browser`, `cua`, `mobile`, `notify` | no | Documented `Unsupported` subagent presets; `notify` pulls `notify` and gates `watcher/backend.rs`, without which `WorkspaceWatcher::start` answers a typed `Unsupported` naming the feature. |
 | `openjiuwen-harness-providers` | `native` | yes | The in-process DeepAgent harness provider. |
 | `openjiuwen-harness-providers` | `vendor`, `native-v2` | no | Registers `claudecode`/`codex`/`dsh` over `vendor_cli`; adds the team-hosted `native_v2` provider (pulls `openjiuwen-agent-teams`). |
 | `openjiuwen-agent-teams` | `mcp` | yes | The `openjiuwen-team-mcp` stdio MCP server binary. |
 | `openjiuwen-agent-teams` | `sqlite`, `otel`, `distributed`, `otlp` | no | `SqliteTeamStore`; in-memory/tracing OTel seam; distributed `Messager` seams that reject at construction; `OtlpMemoryObserver` over `openjiuwen-extensions/otel`. |
 | `openjiuwen-symphony` | `sqlite` | no | `KvAssetStore::sqlite` and `SqliteExperienceStore`. |
 | `openjiuwen-agent-evolving` | `redis` | no | `RedisOnlineStore` (cluster/`rediss://` rejected); the HTTP router still hard-wires `MemoryOnlineStore`. |
-| `openjiuwen` | `native` | yes | Forwards `harness/native` + `harness-providers/native`. |
-| `openjiuwen` | `native-v2`, `vendor`, `browser`, `cua`, `mobile`, `notify`, `sqlite`, `a2a`, `mcp`, `redis`, `pulsar`, `distributed`, `otel`, `otlp`, `sandbox`, `live-tests` | no | One forwarder each to the owning crate; `sqlite` fans out over foundation, session, memory, extensions, symphony and agent-teams, `otlp` forwards only `agent-teams/otlp` (the team-memory bridge), and `live-tests` forwards the foundation/core/harness/providers/teams/extensions gates. |
+| `openjiuwen` | `native` | yes | Forwards `harness/native` (an empty marker in the harness, which no source reads) and `harness-providers/native` (the real in-process DeepAgent provider). |
+| `openjiuwen` | `notify` | no | Forwards `harness/notify`; without it `WorkspaceWatcher::start` answers a typed `Unsupported`, and `openjiuwen-cli` enables the feature directly so the binary's `--watch` always compiles in. |
+| `openjiuwen` | `native-v2`, `vendor`, `browser`, `cua`, `mobile`, `sqlite`, `a2a`, `pulsar`, `distributed`, `otel`, `otlp`, `sandbox` | no | One forwarder each to the owning crate; `sqlite` fans out over foundation, session, memory, extensions, symphony and agent-teams, `otlp` forwards only `agent-teams/otlp` (the team-memory bridge), and `browser`/`cua`/`mobile` forward the harness presets. |
+| `openjiuwen` | `mcp` | no | Forwards `extensions/mcp`, which is a dead gate: it pulls `rmcp` and `tokio-stream` while no source file reads the feature. |
+| `openjiuwen` | `redis` | no | Forwards `extensions/redis` (Redis checkpointer and KV/document/vector stores, built lazily) and `agent-evolving/redis` (the online RL store). |
+| `openjiuwen` | `live-tests` | no | Forwards the empty `live-tests` gates of foundation, core, harness, harness-providers, agent-teams and extensions; no source file reads them. |
 | `openjiuwen-e2e` | `a2a`, `otel`, `sqlite` | no | Enable the `a2a_roundtrip`, `plugin_observability` and sqlite-gated scenario cases. |
 | `openjiuwen-examples` | `a2a`, `mcp` | no | Compile example 11; `mcp` is a marker only (MCP is always compiled through foundation's default). |
 
@@ -398,9 +433,9 @@ Default builds need no network and no external service; every feature except the
 ## 6. Testing infrastructure
 
 - `openjiuwen-test-support` is dev-only (`publish = false`, never a library dependency) and holds 152 tests of its own: a loopback `MockLlmServer` (axum, OpenAI-compatible, chat completions + SSE + tool calls + scripted responses), `ScriptedModel`/`MockCompletion` fakes, temporary workspace/home/env/session fixtures, JSON assertions (`assert_json_eq`, `assert_json_subset`, `assert_json_pointer_eq`, `assert_json_roundtrip`, `first_difference`), eventual-consistency polling, and a `wiremock` re-export; there is no card snapshot store.
-- Integration tests are one binary per file: 394 top-level `tests/*.rs` files workspace-wide (368 outside `openjiuwen-e2e`); the umbrellas keep only path/feature checks (`openjiuwen/tests/module_paths.rs`, `openjiuwen-core/tests/{module_paths,feature_forwarding}.rs`).
+- Integration tests are one binary per file: 399 top-level `tests/*.rs` files workspace-wide (373 outside `openjiuwen-e2e`); the umbrellas keep only path/feature checks (`openjiuwen/tests/module_paths.rs`, `openjiuwen-core/tests/{module_paths,feature_forwarding}.rs`).
 - `openjiuwen-e2e` holds 26 scenario binaries with 125 scenarios, all cross-crate, with bounded helpers (`BOUND` = 10 s, `within`, `collect_bounded`) in `tests/support/mod.rs`.
-- `openjiuwen-examples` has 26 example binaries plus `tests/examples_offline.rs`, which runs every example through the offline harness.
+- `openjiuwen-examples` has 26 example binaries, 15 `src/support/` unit tests, and `tests/examples_offline.rs`, which runs 25 examples through the offline harness by default and 26 with `--features a2a` (example 11).
 - Everything is offline and deterministic by default: scripted models or the loopback server, temp directories, loopback sockets, no credentials, no wall-clock ordering.
 - Deferred areas are proven, not just documented: dedicated suites assert `Error::Unsupported` and its message (for example `openjiuwen-dev-tools/tests/deferred_surface.rs`, `openjiuwen-symphony/tests/deferred.rs`, `openjiuwen-agent-evolving/tests/rl.rs`, `openjiuwen-extensions/tests/observability_deferred.rs`, `openjiuwen-rsi/tests/deferred.rs`).
 - `default-members` lists the 27 library and binary crates, so a bare `cargo test` skips the three development crates; the Makefile gates pass `--workspace` (or `-p`) and therefore include them.
