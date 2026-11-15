@@ -31,7 +31,7 @@
 //! [`ShapingConfig::max_calls`](crate::retrieval::build::tree::shaping::ShapingConfig::max_calls)
 //! at `0`, the stage never calls a model and reports provenance
 //! [`Skipped`](crate::retrieval::build::tree::shaping::ShapingProvenance::Skipped) with the
-//! deterministic grouping ([`group_items`](crate::retrieval::build::grouping::group_items)).
+//! deterministic grouping ([`group_items`]).
 //! When a model *is* called but the call fails or the reply is unusable, the same grouping
 //! answers with provenance
 //! [`DeterministicFallback`](crate::retrieval::build::tree::shaping::ShapingProvenance::DeterministicFallback)
