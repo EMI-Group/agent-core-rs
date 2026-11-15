@@ -85,7 +85,7 @@ use crate::persistent_agent::{
     ActiveExecution, ExecutionRecorder, FinalStatus as RecordStatus, PersistentRunConfig,
 };
 use crate::prompts::{mode_instructions, SectionName};
-use crate::rails::{HarnessRail, HarnessRailAdapter, HarnessRailRegistry};
+use crate::rails::{HarnessRail, HarnessRailAdapter, HarnessRailRegistry, SubAgentSpawner};
 use crate::schema::{
     AgentMode, DeepAgentConfig, DeepAgentState, InputDispatchMode, InteractionEvent,
     InteractionPhase, PlanModeState, SendInputRequest,
@@ -153,6 +153,8 @@ pub struct DeepAgent {
     permission_host: Arc<dyn PermissionHost>,
     /// Sub-agent runtime, when sub-agents are mounted.
     subagent_runtime: Arc<RwLock<Option<Arc<SubAgentRuntime>>>>,
+    /// Delegation seam wired into the default subagent rail, when the builder registered it.
+    subagent_spawner: Option<Arc<dyn SubAgentSpawner>>,
     /// Resolved model, supplied by the builder or built lazily.
     model: Arc<RwLock<Option<Arc<dyn Model>>>>,
     /// Whether the lazy-wiring decision has been claimed.
@@ -210,6 +212,7 @@ impl DeepAgent {
             permission: None,
             permission_host: Arc::new(crate::permission::NoopPermissionHost),
             subagent_runtime: Arc::new(RwLock::new(None)),
+            subagent_spawner: None,
             model: Arc::new(RwLock::new(None)),
             initialized: Arc::new(AtomicBool::new(false)),
             wired: Arc::new(AtomicBool::new(false)),
@@ -489,6 +492,21 @@ impl DeepAgent {
     #[must_use]
     pub fn rails(&self) -> &HarnessRailRegistry {
         &self.rails
+    }
+
+    /// Returns the production sub-agent seam wired into the default subagent rail.
+    ///
+    /// [`DeepAgentBuilder`] registers a
+    /// [`RuntimeSubAgentSpawner`](crate::subagents::RuntimeSubAgentSpawner) over the sub-agent
+    /// runtime it mounts, so hosts can delegate through [`SubAgentSpawner`] without owning the
+    /// runtime.
+    ///
+    /// `None` when sub-agents are not mounted (`subagents` is empty and
+    /// `add_general_purpose_agent` is off), and when the caller supplied its own
+    /// `subagent` rail — a caller rail always wins.
+    #[must_use]
+    pub fn subagent_spawner(&self) -> Option<Arc<dyn SubAgentSpawner>> {
+        self.subagent_spawner.clone()
     }
 
     /// Returns and removes the interaction events rails have queued so far.

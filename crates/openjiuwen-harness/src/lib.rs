@@ -97,7 +97,7 @@ pub use tools::{
     McpSubscriptionInfo, MediaKind, MemoryToolBackend, ReadMcpResourceArgs, ReadMcpResourceTool,
     ReqwestFetcher, SearchBackend, SearchResult, SubmitGoalReportArgs, SubmitGoalReportTool,
     SubscriptionAction, TokenUsage, ToolIndex, ToolRegistry, ToolSearchArgs, ToolSearchHit,
-    ToolSearchTool, UserAsker, WebSearchArgs, WebSearchTool,
+    ToolSearchTool, UserAsker, WebSearchArgs, WebSearchTool, WorkspaceMemoryBackend,
 };
 
 // --- rails -----------------------------------------------------------------
@@ -182,15 +182,15 @@ pub use subagents::{
     ActivitySubscription, ActivitySummary, ActivityThrottle, CallbackLifecycleHook, Clock,
     EvictionSchedulerConfig, EvictionSchedulerHandle, EvictionSchedulerStats, LifecycleCallback,
     LifecycleFailure, LifecycleHooks, LifecycleReport, LifecycleStage, LoadReport, LruCandidate,
-    ManualClock, PersistedSubAgentBuckets, PersistedSubAgentRecord, ResumeReport, SpawnBudget,
-    SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentPreset, SubAgentQuota, SubAgentRegistry,
-    SubAgentRuntime, SubAgentSpawnRequest, SubAgentSpec, SubagentActivity, SubagentEviction,
-    SubagentLifecycleEvent, SubagentLifecycleHook, SubagentMetadata, SubagentStatus,
-    SubagentTranscriptTool, SweepReport, SystemClock, TaskTool, TranscriptBuffer,
-    TranscriptChannel, TranscriptEntry, TranscriptKind, TranscriptSubscription, TranscriptSummary,
-    DEFAULT_ACTIVITY_CAPACITY, DEFAULT_ACTIVITY_TEXT_MAX_LEN, DEFAULT_ACTIVITY_THROTTLE_MS,
-    DEFAULT_EVICTION_INTERVAL, DEFAULT_IDLE_TTL_MS, DEFAULT_TRANSCRIPT_CAPACITY,
-    DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY,
+    ManualClock, PersistedSubAgentBuckets, PersistedSubAgentRecord, ResumeReport,
+    RuntimeSubAgentSpawner, SpawnBudget, SubAgentFactory, SubAgentId, SubAgentOutcome,
+    SubAgentPreset, SubAgentQuota, SubAgentRegistry, SubAgentRuntime, SubAgentSpawnRequest,
+    SubAgentSpec, SubagentActivity, SubagentEviction, SubagentLifecycleEvent,
+    SubagentLifecycleHook, SubagentMetadata, SubagentStatus, SubagentTranscriptTool, SweepReport,
+    SystemClock, TaskTool, TranscriptBuffer, TranscriptChannel, TranscriptEntry, TranscriptKind,
+    TranscriptSubscription, TranscriptSummary, DEFAULT_ACTIVITY_CAPACITY,
+    DEFAULT_ACTIVITY_TEXT_MAX_LEN, DEFAULT_ACTIVITY_THROTTLE_MS, DEFAULT_EVICTION_INTERVAL,
+    DEFAULT_IDLE_TTL_MS, DEFAULT_TRANSCRIPT_CAPACITY, DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY,
 };
 
 // --- skills ----------------------------------------------------------------

@@ -54,7 +54,7 @@ const SECURITY_RAIL_NAME: &str = "security";
 const SKILLS_RAIL_NAME: &str = "skills";
 
 /// Name of the default subagent rail.
-const SUBAGENT_RAIL_NAME: &str = "subagent";
+pub(crate) const SUBAGENT_RAIL_NAME: &str = "subagent";
 
 /// Name of the default goal rail.
 pub(crate) const GOAL_RAIL_NAME: &str = "goal";

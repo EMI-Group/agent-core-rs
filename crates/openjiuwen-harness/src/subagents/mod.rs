@@ -14,6 +14,7 @@
 //! to a file bucket through [`persistence`].
 mod presets;
 mod runtime;
+mod spawner;
 mod subagent_tools;
 mod task_tool;
 #[cfg(test)]
@@ -55,6 +56,7 @@ pub use runtime::{
     LoadReport, ResumeReport, SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentRuntime,
     SubAgentSpawnRequest, SubagentEviction, SubagentMetadata, SubagentStatus, EVICTION_REASON,
 };
+pub use spawner::RuntimeSubAgentSpawner;
 pub use subagent_tools::{
     subagent_tools, subagent_tools_with_transcript, SubagentCloseTool, SubagentListTool,
     SubagentResumeTool, SubagentSendInputTool, SubagentSpawnTool, SubagentTranscriptTool,
