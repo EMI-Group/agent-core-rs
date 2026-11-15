@@ -1,9 +1,26 @@
-//! A minimal RESP2 client over [`tokio::net::TcpStream`].
+//! A minimal RESP2 client over plain TCP or TLS.
 //!
 //! [`RedisConnection`] owns one socket, performs the `AUTH`/`SELECT` handshake on
 //! connect, and turns a server error frame into an [`Error`]. There is no
 //! connection pool: callers serialize access to one connection (the key-value
 //! backend holds it behind a [`tokio::sync::Mutex`]).
+//!
+//! # Transport
+//!
+//! [`RedisConnection::connect`] and [`RedisConnection::connect_with_timeout`]
+//! speak cleartext RESP over [`tokio::net::TcpStream`] (`redis://`).
+//! [`RedisConnection::connect_tls`] and [`RedisConnection::connect_tls_with_timeout`]
+//! first connect the same way, then run a `tokio-rustls` client handshake over it
+//! (`rediss://`).
+//! Both are hidden behind the internal `RedisStream` transport, so every method
+//! above the transport is shared.
+//!
+//! The TLS client trusts the certificate authorities bundled in
+//! [`webpki_roots::TLS_SERVER_ROOTS`] only: there is no custom-CA bundle, no
+//! certificate pinning and no `insecure-skip-verify` switch. The server name is
+//! the host of the configured `addr` (a literal IP address is used as an
+//! `IpAddress` server name, so no SNI extension is sent for it). The
+//! configuration's timeout covers the TCP connect and the TLS handshake together.
 //!
 //! # Reconnect and retry rule
 //!
@@ -21,11 +38,20 @@
 //! Every reconnect re-runs the handshake, so `AUTH` and `SELECT` are replayed.
 
 use std::fmt;
+use std::io;
+use std::net::IpAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::TlsConnector;
 
 use openjiuwen_common::error::{Error, Result};
 
@@ -73,10 +99,12 @@ pub struct RedisConnection {
     auth: RedisAuth,
     /// Database selected by every handshake.
     db: Option<u32>,
+    /// Whether the socket is wrapped in TLS.
+    tls: bool,
     /// Per-operation timeout.
     timeout: Duration,
     /// The live socket, or `None` after a connection-level failure.
-    stream: Option<BufReader<TcpStream>>,
+    stream: Option<BufReader<RedisStream>>,
     /// Frames read from the socket but not yet consumed.
     decoder: Decoder,
 }
@@ -86,6 +114,7 @@ impl fmt::Debug for RedisConnection {
         formatter
             .debug_struct("RedisConnection")
             .field("addr", &self.addr)
+            .field("tls", &self.tls)
             .field("authenticated", &self.auth.is_some())
             .field("db", &self.db)
             .field("timeout", &self.timeout)
@@ -95,22 +124,58 @@ impl fmt::Debug for RedisConnection {
 }
 
 impl RedisConnection {
-    /// Connects, authenticates, and selects `db`, using [`DEFAULT_TIMEOUT`].
+    /// Connects, authenticates, and selects `db` over cleartext TCP, using
+    /// [`DEFAULT_TIMEOUT`].
     pub async fn connect(addr: &str, auth: RedisAuth, db: Option<u32>) -> Result<Self> {
         Self::connect_with_timeout(addr, auth, db, DEFAULT_TIMEOUT).await
     }
 
-    /// Connects, authenticates, and selects `db` with an explicit timeout.
+    /// Connects, authenticates, and selects `db` over cleartext TCP with an
+    /// explicit timeout.
     pub async fn connect_with_timeout(
         addr: &str,
         auth: RedisAuth,
         db: Option<u32>,
         timeout: Duration,
     ) -> Result<Self> {
+        Self::with_options(addr, auth, db, false, timeout).await
+    }
+
+    /// Connects, authenticates, and selects `db` over TLS (`rediss://`), using
+    /// [`DEFAULT_TIMEOUT`].
+    pub async fn connect_tls(addr: &str, auth: RedisAuth, db: Option<u32>) -> Result<Self> {
+        Self::connect_tls_with_timeout(addr, auth, db, DEFAULT_TIMEOUT).await
+    }
+
+    /// Connects, authenticates, and selects `db` over TLS (`rediss://`) with an
+    /// explicit timeout.
+    ///
+    /// The timeout covers the TCP connect and the TLS handshake together. The TLS
+    /// client trusts only the bundled [`webpki_roots::TLS_SERVER_ROOTS`]; a host
+    /// of `addr` that is neither a DNS name nor an IP address is an
+    /// [`Error::Config`](openjiuwen_common::error::Error).
+    pub async fn connect_tls_with_timeout(
+        addr: &str,
+        auth: RedisAuth,
+        db: Option<u32>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::with_options(addr, auth, db, true, timeout).await
+    }
+
+    /// Builds a connection and opens it with the requested transport.
+    async fn with_options(
+        addr: &str,
+        auth: RedisAuth,
+        db: Option<u32>,
+        tls: bool,
+        timeout: Duration,
+    ) -> Result<Self> {
         let mut connection = Self {
             addr: addr.to_string(),
             auth,
             db,
+            tls,
             timeout,
             stream: None,
             decoder: Decoder::new(),
@@ -122,6 +187,11 @@ impl RedisConnection {
     /// The `host:port` this connection targets.
     pub fn addr(&self) -> &str {
         &self.addr
+    }
+
+    /// Whether this connection speaks TLS (`rediss://`).
+    pub fn is_tls(&self) -> bool {
+        self.tls
     }
 
     /// Whether the socket is currently open.
@@ -254,27 +324,53 @@ impl RedisConnection {
         self.open().await
     }
 
-    /// Connects the socket and runs the handshake.
+    /// Connects the socket (running the TLS handshake when configured) and then
+    /// replays the handshake.
     async fn open(&mut self) -> Result<()> {
-        let stream = match tokio::time::timeout(self.timeout, TcpStream::connect(&self.addr)).await
-        {
+        let addr = self.addr.clone();
+        let timeout = self.timeout;
+        let stream = match tokio::time::timeout(timeout, Self::dial(&addr, self.tls)).await {
             Err(_) => {
                 return Err(Error::timeout(format!(
-                    "redis connect to {} timed out after {:?}",
-                    self.addr, self.timeout
+                    "redis connect to {addr} timed out after {timeout:?}"
                 )))
             }
-            Ok(Err(error)) => {
-                return Err(Error::external(std::io::Error::new(
-                    error.kind(),
-                    format!("redis connect to {} failed: {error}", self.addr),
-                )))
-            }
+            Ok(Err(error)) => return Err(error),
             Ok(Ok(stream)) => stream,
         };
         self.stream = Some(BufReader::new(stream));
         self.decoder = Decoder::new();
         self.handshake().await
+    }
+
+    /// Opens the transport: a plain TCP socket, or a TLS session over it.
+    ///
+    /// The TLS server name and client configuration are resolved before the TCP
+    /// connect, so an unusable host is an [`Error::Config`] rather than a DNS
+    /// failure. The caller wraps this in the connection timeout, which therefore
+    /// covers the TCP connect and the TLS handshake together.
+    async fn dial(addr: &str, tls: bool) -> Result<RedisStream> {
+        // Resolve the TLS pieces first: an unusable host never opens a socket.
+        let tls = if tls {
+            Some((server_name(host_of(addr))?, tls_connector()?))
+        } else {
+            None
+        };
+        let tcp = TcpStream::connect(addr).await.map_err(|error| {
+            Error::external(io::Error::new(
+                error.kind(),
+                format!("redis connect to {addr} failed: {error}"),
+            ))
+        })?;
+        let Some((server_name, connector)) = tls else {
+            return Ok(RedisStream::Plain(tcp));
+        };
+        let stream = connector.connect(server_name, tcp).await.map_err(|error| {
+            Error::external(io::Error::other(format!(
+                "redis TLS handshake with {addr} failed: {error}"
+            )))
+        })?;
+        Ok(RedisStream::Tls(Box::pin(stream)))
     }
 
     /// Replays `AUTH` and `SELECT` on a freshly opened socket.
@@ -428,6 +524,103 @@ struct AttemptError {
     error: Error,
     /// `true` once the whole request was written to the socket.
     wrote: bool,
+}
+
+/// The transport under a [`RedisConnection`].
+enum RedisStream {
+    /// A cleartext `redis://` socket.
+    Plain(TcpStream),
+    /// A `rediss://` session: a TLS client over the TCP socket.
+    Tls(Pin<Box<TlsStream<TcpStream>>>),
+}
+
+impl AsyncRead for RedisStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.as_mut().get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => stream.as_mut().poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for RedisStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.as_mut().get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => stream.as_mut().poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.as_mut().get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => stream.as_mut().poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.as_mut().get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => stream.as_mut().poll_shutdown(cx),
+        }
+    }
+}
+
+/// Returns the host part of a `host:port` endpoint, stripping IPv6 brackets.
+fn host_of(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some((host, _)) = rest.split_once(']') {
+            return host;
+        }
+    }
+    // A bare IP literal (notably an unbracketed IPv6 address) has no port to cut.
+    if addr.parse::<IpAddr>().is_ok() {
+        return addr;
+    }
+    match addr.rsplit_once(':') {
+        Some((host, _port)) => host,
+        None => addr,
+    }
+}
+
+/// Resolves the TLS server name (the SNI value) of `host`.
+///
+/// A literal IP address becomes [`ServerName::IpAddress`], which sends no SNI
+/// extension; everything else must be a valid DNS name.
+fn server_name(host: &str) -> Result<ServerName<'static>> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(ServerName::IpAddress(ip.into()));
+    }
+    ServerName::try_from(host.to_owned()).map_err(|_| {
+        Error::config(format!(
+            "redis TLS host {host:?} is not a valid DNS name or IP address"
+        ))
+    })
+}
+
+/// Builds the TLS client of a `rediss://` connection.
+///
+/// The roots are the certificate authorities bundled in
+/// [`webpki_roots::TLS_SERVER_ROOTS`]; a custom-CA bundle, certificate pinning and
+/// `insecure-skip-verify` are deliberately unavailable.
+fn tls_connector() -> Result<TlsConnector> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| Error::config(format!("redis TLS configuration failed: {error}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
 }
 
 /// Whether `args` names a command that is safe to re-send after a lost reply.
