@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::tune::base::Case;
+use crate::tune::tool::RunTelemetry;
 
 /// Offset basis of the 64-bit FNV-1a hash.
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -299,6 +300,11 @@ pub struct CaseResult {
     pub error: Option<String>,
     /// Whether the case was part of the held-out set.
     pub hidden: bool,
+    /// What this case's run cost, as measured by the caller's evaluator.
+    ///
+    /// Absent fields mean *not reported* rather than zero, so a case that
+    /// reported nothing keeps [`RunTelemetry::default`].
+    pub telemetry: RunTelemetry,
 }
 
 impl CaseResult {
@@ -326,6 +332,13 @@ impl CaseResult {
         self
     }
 
+    /// Sets what the case's run cost.
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: RunTelemetry) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
     /// Whether the case ran without an error.
     #[must_use]
     pub fn ok(&self) -> bool {
@@ -345,14 +358,28 @@ impl CaseResult {
 pub struct Execution {
     /// The candidate that produced this execution.
     pub candidate: PromptCandidate,
-    /// The run's wall-clock latency, reported by the caller.
+    /// The run's wall-clock latency, as supplied by the caller.
+    ///
+    /// A legacy field kept for wire compatibility: it is only consulted when
+    /// [`Execution::telemetry`] reports no latency (see
+    /// [`Execution::measured_latency_s`]).
     pub latency_ms: f64,
-    /// The run's total token usage, reported by the caller.
+    /// The run's total token usage, as supplied by the caller.
+    ///
+    /// A legacy field kept for wire compatibility: it is only consulted when
+    /// [`Execution::telemetry`] reports no token counts (see
+    /// [`Execution::measured_total_tokens`]).
     pub total_tokens: u64,
     /// The failure, when the whole run failed.
     pub error: Option<String>,
     /// The per-case results, visible and hidden.
     pub results: Vec<CaseResult>,
+    /// What the run cost, as measured by the caller's evaluator.
+    ///
+    /// Absent fields mean *not reported* rather than zero, so an evaluator that
+    /// measures nothing leaves this at [`RunTelemetry::default`] and the legacy
+    /// `latency_ms`/`total_tokens` fields stay authoritative.
+    pub telemetry: RunTelemetry,
 }
 
 impl Execution {
@@ -371,10 +398,38 @@ impl Execution {
         self.results.push(result);
     }
 
-    /// The latency in seconds.
+    /// The latency in seconds, from the legacy caller-supplied field only.
     #[must_use]
     pub fn latency_s(&self) -> f64 {
         self.latency_ms / 1000.0
+    }
+
+    /// The latency in seconds, preferring the measured telemetry.
+    ///
+    /// Uses [`Execution::telemetry`]'s latency when it was reported, otherwise
+    /// falls back to the legacy caller-supplied `latency_ms`. Both are zero when
+    /// nothing was reported at all, matching [`Execution::latency_s`].
+    #[must_use]
+    pub fn measured_latency_s(&self) -> f64 {
+        self.telemetry.latency_ms.unwrap_or(self.latency_ms) / 1000.0
+    }
+
+    /// The total tokens, preferring the measured telemetry.
+    ///
+    /// Uses [`RunTelemetry::total_tokens`] when either token side was reported,
+    /// otherwise falls back to the legacy caller-supplied `total_tokens`.
+    #[must_use]
+    pub fn measured_total_tokens(&self) -> u64 {
+        self.telemetry.total_tokens().unwrap_or(self.total_tokens)
+    }
+
+    /// The measured monetary cost of the run, when the caller reported one.
+    ///
+    /// There is no legacy cost field, so an absent measurement stays absent
+    /// rather than being inferred from tokens.
+    #[must_use]
+    pub fn measured_cost(&self) -> Option<f64> {
+        self.telemetry.cost
     }
 
     /// The non-held-out results, in run order.
@@ -867,15 +922,129 @@ mod tests {
             total_tokens: 5,
             error: None,
             results: vec![CaseResult::new("c", "o").with_score(0.5)],
+            telemetry: RunTelemetry::default(),
         };
         let value = serde_json::to_value(&execution).unwrap();
         assert_eq!(value["latency_ms"], json!(10.0));
         assert_eq!(value["total_tokens"], json!(5));
+        assert_eq!(value["telemetry"]["latency_ms"], Value::Null);
         assert_eq!(value["results"][0]["case_id"], json!("c"));
         assert_eq!(
             value["candidate"]["candidate_id"],
             json!(execution.candidate.candidate_id)
         );
+    }
+
+    #[test]
+    fn measured_accessors_prefer_telemetry_over_legacy_fields() {
+        let mut execution = Execution::new(PromptCandidate::new("p", ""));
+        execution.latency_ms = 4000.0;
+        execution.total_tokens = 4000;
+        // Nothing measured: the legacy caller-supplied fields win.
+        assert!((execution.measured_latency_s() - 4.0).abs() < 1e-12);
+        assert_eq!(execution.measured_total_tokens(), 4000);
+        assert_eq!(execution.measured_cost(), None);
+
+        execution.telemetry = RunTelemetry::default()
+            .with_latency_ms(2000.0)
+            .with_prompt_tokens(300)
+            .with_completion_tokens(700)
+            .with_cost(0.25);
+        assert!((execution.measured_latency_s() - 2.0).abs() < 1e-12);
+        assert_eq!(execution.measured_total_tokens(), 1000);
+        assert_eq!(execution.measured_cost(), Some(0.25));
+        // The legacy view still reports the legacy field.
+        assert!((execution.latency_s() - 4.0).abs() < 1e-12);
+        assert_eq!(execution.total_tokens, 4000);
+    }
+
+    #[test]
+    fn measured_zero_wins_over_a_non_zero_legacy_value() {
+        let mut execution = Execution::new(PromptCandidate::new("p", ""));
+        execution.latency_ms = 9000.0;
+        execution.total_tokens = 9000;
+        execution.telemetry = RunTelemetry::default()
+            .with_latency_ms(0.0)
+            .with_prompt_tokens(0)
+            .with_cost(0.0);
+
+        assert_eq!(execution.measured_latency_s(), 0.0);
+        assert_eq!(execution.measured_total_tokens(), 0);
+        assert_eq!(execution.measured_cost(), Some(0.0));
+    }
+
+    #[test]
+    fn telemetry_round_trips_beside_the_legacy_keys() {
+        let mut execution = Execution::new(PromptCandidate::new("p", ""));
+        execution.latency_ms = 10.0;
+        execution.total_tokens = 5;
+        execution.telemetry = RunTelemetry::default()
+            .with_latency_ms(12.5)
+            .with_prompt_tokens(4)
+            .with_completion_tokens(6)
+            .with_cost(0.5);
+        let value = serde_json::to_value(&execution).unwrap();
+        assert_eq!(value["latency_ms"], json!(10.0));
+        assert_eq!(value["total_tokens"], json!(5));
+        assert_eq!(value["telemetry"]["latency_ms"], json!(12.5));
+        assert_eq!(value["telemetry"]["prompt_tokens"], json!(4));
+        assert_eq!(value["telemetry"]["completion_tokens"], json!(6));
+        assert_eq!(value["telemetry"]["cost"], json!(0.5));
+
+        let parsed: Execution = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, execution);
+        assert_eq!(parsed.measured_total_tokens(), 10);
+    }
+
+    #[test]
+    fn old_payloads_without_telemetry_leave_it_absent() {
+        let payload = json!({
+            "candidate": {"prompt": "p", "candidate_id": "abc", "rationale": ""},
+            "latency_ms": 2500.0,
+            "total_tokens": 800,
+            "results": [{"case_id": "c", "output": "o", "score": 0.5}],
+        });
+        let execution: Execution = serde_json::from_value(payload).unwrap();
+        assert_eq!(execution.telemetry, RunTelemetry::default());
+        assert!(execution.telemetry.is_empty());
+        assert!((execution.measured_latency_s() - 2.5).abs() < 1e-12);
+        assert_eq!(execution.measured_total_tokens(), 800);
+        assert_eq!(execution.measured_cost(), None);
+        assert_eq!(
+            execution.results[0].telemetry,
+            RunTelemetry::default(),
+            "a case result without telemetry keeps the default"
+        );
+    }
+
+    #[test]
+    fn case_result_telemetry_defaults_and_round_trips() {
+        let result = CaseResult::new("c", "out");
+        assert!(result.telemetry.is_empty());
+        assert_eq!(
+            result,
+            result.clone().with_telemetry(RunTelemetry::default())
+        );
+        assert_eq!(CaseResult::blank().telemetry, RunTelemetry::default());
+
+        let measured = result.with_telemetry(
+            RunTelemetry::default()
+                .with_latency_ms(20.0)
+                .with_completion_tokens(9),
+        );
+        assert_eq!(measured.telemetry.latency_ms, Some(20.0));
+        assert_eq!(measured.telemetry.total_tokens(), Some(9));
+        assert_eq!(measured.output, "out");
+
+        let value = serde_json::to_value(&measured).unwrap();
+        assert_eq!(value["telemetry"]["latency_ms"], json!(20.0));
+        assert_eq!(value["telemetry"]["completion_tokens"], json!(9));
+        let parsed: CaseResult = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, measured);
+
+        let legacy: CaseResult =
+            serde_json::from_value(json!({"case_id": "c", "output": "o", "score": 0.2})).unwrap();
+        assert!(legacy.telemetry.is_empty());
     }
 
     #[test]
