@@ -29,7 +29,7 @@ Exactly the canonical surface, re-exported at the crate root; no new items excep
 - Dependency is `openjiuwen-rsi` only (plus the workspace lints); add a dependency only when the facade itself needs it.
 - `#![forbid(unsafe_code)]`; library code defines no `unsafe`, no globals, and no I/O.
 - `src/lib.rs` also carries `#![allow(clippy::module_name_repetitions)]` (the crate root intentionally repeats `auto_harness`) and `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]`.
-- `Cargo.toml` is 17 lines: `publish = false`, metadata inherited from `[workspace.package]` (version `0.1.0`, edition 2021, rust-version 1.85, license, repository, authors), one path dependency `openjiuwen-rsi.workspace = true`, an empty `[features] default = []`, and `[lints] workspace = true`; no dev-dependencies, no build script, no `description`/`keywords`.
+- `Cargo.toml` is 16 lines: `publish = false`, metadata inherited from `[workspace.package]` (version `0.1.0`, edition 2021, rust-version 1.85, license, repository, authors), one path dependency `openjiuwen-rsi.workspace = true`, an empty `[features] default = []`, and `[lints] workspace = true`; no dev-dependencies, no build script, no `description`/`keywords`.
 - The integration test therefore reaches the canonical crate through that ordinary dependency — there is no separate dev-dependency on `openjiuwen-rsi`.
 - The `openjiuwen` umbrella consumes the facade directly: `pub use openjiuwen_auto_harness as auto_harness;` (`crates/openjiuwen/src/lib.rs:130`); no other crate depends on it.
 - All behaviour contracts (errors, async, serde, logging, determinism) are inherited from `openjiuwen-rsi`; do not document or assert different ones here.
