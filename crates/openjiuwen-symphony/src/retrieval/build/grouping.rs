@@ -622,7 +622,7 @@ fn place_assignments(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Config`](crate::error::Error) for a missing embedder or model under
+/// Returns [`Error::Config`] for a missing embedder or model under
 /// [`FallbackMode::Error`], the model's own
 /// [`Error::Llm`] or the embedder's error when its call fails under
 /// that mode, and any placement error of the shared pipeline.

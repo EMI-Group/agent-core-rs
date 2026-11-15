@@ -179,7 +179,7 @@ pub fn resolve_clusters(config: &GroupingConfig, item_count: usize) -> usize {
 /// # Errors
 ///
 /// Returns the embedder's own error, and
-/// [`Error::retrieval`](crate::error::Error) when the embedder answers a number of vectors
+/// [`Error::retrieval`] when the embedder answers a number of vectors
 /// that differs from the number of items.
 pub async fn cluster_paths(
     items: &[SourceItem],

@@ -39,7 +39,7 @@
 //! object, and a reply that assigns no known item are three distinct
 //! [`Error::llm`](crate::error::Error) messages, each prefixed with `STAGE`. Deciding whether
 //! that failure should degrade to a deterministic grouping is the caller's job (its
-//! [`FallbackMode`](crate::llm::FallbackMode)), not this module's. An empty inventory is
+//! [the fallback mode](crate::llm::FallbackMode)), not this module's. An empty inventory is
 //! answered with no assignments and no model call.
 
 use std::collections::BTreeSet;
@@ -98,7 +98,7 @@ struct GroupingRequest {
 ///
 /// # Errors
 ///
-/// Returns [`Error::llm`](crate::error::Error) naming [`STAGE`] when the inventory holds more
+/// Returns [`Error::llm`] naming [`STAGE`] when the inventory holds more
 /// than [`MAX_REQUEST_ITEMS`] items, or when the payload cannot be serialized.
 pub fn render_request(items: &[SourceItem], config: &GroupingConfig) -> Result<String> {
     if items.len() > MAX_REQUEST_ITEMS {
@@ -209,7 +209,7 @@ fn reply_path(group: &Value, limit: usize) -> Vec<String> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::llm`](crate::error::Error) naming [`STAGE`] when the request cannot be
+/// Returns [`Error::llm`] naming [`STAGE`] when the request cannot be
 /// rendered, when the call fails, when the reply holds no usable JSON object, or when the
 /// reply assigns no known item. This module never substitutes a lexical grouping.
 pub async fn group_paths(
