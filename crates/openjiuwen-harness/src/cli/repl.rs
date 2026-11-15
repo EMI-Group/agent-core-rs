@@ -319,6 +319,26 @@ impl Repl {
         &self.session_id
     }
 
+    /// Adopts a persisted session id instead of minting a new one.
+    ///
+    /// The kernel session is rebuilt around `id`, so every following
+    /// [`Repl::run_turn`] continues that kernel session and the REPL record
+    /// [`Repl::run_turn`] maintains is the existing `<home>/sessions/<id>.json`
+    /// — appended to, never truncated (unlike [`Repl::start_new_session`]). The
+    /// caller owns the transcript: seed it from a
+    /// [`ResumePlan`](crate::persistent_agent::ResumePlan) with
+    /// [`Repl::seed_history`] *before* the first turn, after any
+    /// [`DeepAgent::configure`](crate::agent::DeepAgent::configure).
+    ///
+    /// Nothing is created on disk here: adopting an id whose record does not
+    /// exist simply starts a new transcript under that id.
+    #[must_use]
+    pub fn with_session_id(mut self, id: impl Into<String>) -> Self {
+        self.session_id = id.into();
+        self.session = new_session(&self.session_id);
+        self
+    }
+
     /// Runs the REPL until the user exits or the input ends.
     ///
     /// A failed turn is reported on the terminal and never ends the loop; only

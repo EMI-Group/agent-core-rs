@@ -24,12 +24,12 @@ use openjiuwen_harness::cli::{
 };
 use openjiuwen_harness::{
     hand_off, resume, run_with_model_resumed, Capacity, Continuation, DistributedHandoff,
-    EntryPayload, ExecutionCatalog, ExecutionIdentity, ExecutionLink, ExecutionLinkSource,
-    ExecutionLog, ExecutionSummary, FileLinkStore, FileSessionStore, FinalStatus, LinkRelation,
-    LogCapacity, ManualClock, ModelUsage, OutputFormat, PersistentAgentLayout,
-    PersistentSessionRecord, RecordEnding, RemoteHandoff, ResumePlan, ResumedTurn, RootLogSource,
-    SessionBinding, SessionStateStore, SessionSummary, ShareFile, ShareMode, SharedFileEntry,
-    WindowAssembler, Workspace,
+    EntryKind, EntryPayload, ExecutionCatalog, ExecutionIdentity, ExecutionLink,
+    ExecutionLinkSource, ExecutionLog, ExecutionLogSource, ExecutionSummary, FileLinkStore,
+    FileSessionStore, FinalStatus, LinkRelation, LogCapacity, ManualClock, ModelUsage,
+    OutputFormat, PersistentAgentLayout, PersistentSessionRecord, RecordEnding, RemoteHandoff,
+    ResumePlan, ResumedTurn, RootLogSource, SessionBinding, SessionStateStore, SessionSummary,
+    ShareFile, ShareMode, SharedFileEntry, WindowAssembler, Workspace,
 };
 use openjiuwen_test_support::ScriptedModel;
 
@@ -326,18 +326,6 @@ async fn deferred_handoff_transports_are_typed_unsupported() -> Result<()> {
 /// CLI session id the restart scenario continues (the kernel session and the record share it).
 const CLI_SESSION_ID: &str = "session-restart";
 
-/// Host namespace the journalled execution lives in.
-const NAMESPACE: &str = "host";
-
-/// Agent id of the CLI session, i.e. the agent half of its [`SessionBinding`].
-const AGENT_ID: &str = "cli-agent";
-
-/// Execution id of the journalled first turn.
-const EXECUTION_ID: &str = "exec-cli-1";
-
-/// Request id of the journalled first turn.
-const FIRST_REQUEST: &str = "req-1";
-
 /// Request id of the continued turn.
 const SECOND_REQUEST: &str = "req-2";
 
@@ -402,27 +390,23 @@ fn cli_options(root: &std::path::Path) -> Result<CliOptions> {
     Ok(options)
 }
 
-/// The `(agent, session)` pair the restart scenario persists and resumes.
-fn cli_binding() -> Result<SessionBinding> {
-    Ok(SessionBinding::new(AGENT_ID, CLI_SESSION_ID)?)
-}
-
-/// The journalled execution of the first turn.
-fn cli_identity() -> Result<ExecutionIdentity> {
-    Ok(ExecutionIdentity::new(
-        NAMESPACE,
-        AGENT_ID,
-        CLI_SESSION_ID,
-        FIRST_REQUEST,
-        EXECUTION_ID,
-        "cli",
+/// The `(agent, session)` pair the CLI recorded the first turn under.
+///
+/// The CLI mints its agent card id per process, so the pair is read back from the catalogued
+/// execution rather than rebuilt from a constant: rediscovering it is exactly what a restarted
+/// host does.
+fn binding_of(execution: &ExecutionSummary) -> Result<SessionBinding> {
+    Ok(SessionBinding::new(
+        execution.agent_id.clone(),
+        execution.session_id.clone(),
     )?)
 }
 
-/// Runs the first turn through the CLI and journals it as a persistent execution.
+/// Runs the first turn through the CLI, which journals it as a persistent execution.
 ///
-/// Every handle — the agent, the model, the journal, the session store and the link store — is
-/// dropped when this returns, which is the simulated process restart the scenario reopens from.
+/// Every handle — the agent, the model, the journal and the session store — is dropped when this
+/// returns, which is the simulated process restart the scenario reopens from. Nothing is written
+/// by hand: the assertions below prove the CLI itself journalled the turn.
 async fn run_first_turn(root: &std::path::Path, layout: &PersistentAgentLayout) -> Result<()> {
     let options = cli_options(root)?;
     let io = silent_io();
@@ -443,47 +427,36 @@ async fn run_first_turn(root: &std::path::Path, layout: &PersistentAgentLayout) 
         "unexpected first-turn outcome: {outcome:?}"
     );
 
-    // The journal a host keeps for that turn: the same two texts, in order, so the window it
-    // rebuilds is the conversation the CLI record holds.
-    let identity = cli_identity()?;
-    let log = ExecutionLog::open_with_clock(
-        layout.logs_root().join(identity.directory_name()),
-        identity.clone(),
-        LogCapacity::default(),
-        clock(),
-    )
-    .await?;
-    log.append(EntryPayload::execution_started(FIRST_QUESTION))
+    // The turn is on disk without any help: one execution with the goal, the answer and the
+    // outcome, plus the session record the resume path loads.
+    let executions = ExecutionCatalog::new(layout.logs_root(), LogCapacity::default())
+        .list()
         .await?;
-    log.append(EntryPayload::model_turn(
-        "mc_1",
-        FIRST_ANSWER,
-        ModelUsage::known(12, 6),
-    ))
-    .await?;
-    log.append(EntryPayload::execution_final(FinalStatus::Completed, None))
+    ensure!(
+        executions.len() == 1,
+        "the CLI turn must journal exactly one execution, got {}",
+        executions.len()
+    );
+    let log = RootLogSource::new(layout.logs_root(), LogCapacity::default())
+        .open_log(&executions[0].execution_id)
         .await?;
-
-    let binding = cli_binding()?;
-    let store = FileSessionStore::new(layout.sessions_root());
-    let mut record = PersistentSessionRecord::new(&binding)?;
-    record.messages = vec![BaseMessage::user(FIRST_QUESTION)];
-    let record = record.with_ending(RecordEnding {
-        outcome: "completed".to_owned(),
-        request_id: FIRST_REQUEST.to_owned(),
-        execution_id: EXECUTION_ID.to_owned(),
-        ..RecordEnding::default()
-    })?;
-    store.save(&record).await?;
-
-    let links = FileLinkStore::new(layout.links_root());
-    links
-        .write_link(&ExecutionLink::from_identity(
-            &identity,
-            None,
-            LinkRelation::First,
-        )?)
-        .await?;
+    let entries = log.read().await?.entries;
+    ensure!(
+        entries.len() == 3
+            && entries[0].kind() == EntryKind::ExecutionStarted
+            && entries[1].kind() == EntryKind::ModelTurn
+            && entries[2].kind() == EntryKind::ExecutionFinal,
+        "the CLI must journal goal, answer and outcome"
+    );
+    let sessions = FileSessionStore::new(layout.sessions_root()).list().await?;
+    ensure!(
+        sessions.len() == 1 && sessions[0].binding.session_id == CLI_SESSION_ID,
+        "the CLI turn must persist the session record: {sessions:?}"
+    );
+    ensure!(
+        sessions[0].binding.agent_id == executions[0].agent_id,
+        "the record and the journal must agree on the agent id"
+    );
     Ok(())
 }
 
@@ -493,23 +466,16 @@ struct Rediscovered {
     execution: ExecutionSummary,
     /// The catalogued session record of the conversation.
     session: SessionSummary,
-    /// The plan rebuilt from the journal, the record and the link chain.
+    /// The `(agent, session)` pair both are stored under.
+    binding: SessionBinding,
+    /// The plan rebuilt from the journal and the record.
     plan: ResumePlan,
 }
 
 /// Enumerates the executions and session records of `layout` and resolves the resume plan.
-async fn rediscover(
-    layout: &PersistentAgentLayout,
-    binding: &SessionBinding,
-) -> Result<Rediscovered> {
+async fn rediscover(layout: &PersistentAgentLayout) -> Result<Rediscovered> {
     let catalog =
         ExecutionCatalog::new(layout.logs_root(), LogCapacity::default()).with_clock(clock());
-    let log_dir = layout.logs_root().join(cli_identity()?.directory_name());
-    ensure!(
-        catalog.path_for(EXECUTION_ID) == log_dir,
-        "the catalogue must use the journal layout the host wrote: {}",
-        catalog.path_for(EXECUTION_ID).display()
-    );
     let executions = catalog.list().await?;
     ensure!(
         executions.len() == 1,
@@ -520,6 +486,7 @@ async fn rediscover(
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("the catalogued execution must be listed"))?;
+    let binding = binding_of(&execution)?;
 
     let store = FileSessionStore::new(layout.sessions_root());
     let sessions = store.list().await?;
@@ -532,20 +499,25 @@ async fn rediscover(
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("the persisted session record must be listed"))?;
+    ensure!(
+        session.binding == binding,
+        "the record and the journal must be rediscovered together"
+    );
 
     let plan = resume(
         &store,
         &RootLogSource::new(layout.logs_root(), LogCapacity::default()).with_clock(clock()),
         &FileLinkStore::new(layout.links_root()),
-        binding,
+        &binding,
         SECOND_REQUEST,
-        &Continuation::new(EXECUTION_ID, Some("finish the job"), 4)?,
+        &Continuation::new(execution.execution_id.clone(), Some("finish the job"), 4)?,
         &WindowAssembler::new(Capacity::default()),
     )
     .await?;
     Ok(Rediscovered {
         execution,
         session,
+        binding,
         plan,
     })
 }
@@ -583,11 +555,11 @@ fn assert_rediscovered(
 ) -> Result<ResumePlan> {
     let execution = &discovered.execution;
     ensure!(
-        execution.execution_id == EXECUTION_ID
-            && execution.namespace_id == NAMESPACE
-            && execution.agent_id == AGENT_ID
+        execution.execution_id.starts_with("exec_")
+            && execution.namespace_id == "deepagent"
+            && execution.agent_id == binding.agent_id
             && execution.session_id == CLI_SESSION_ID
-            && execution.request_id == FIRST_REQUEST,
+            && execution.request_id.starts_with("req_"),
         "the summary must carry the execution identity: {execution:?}"
     );
     ensure!(
@@ -595,8 +567,8 @@ fn assert_rediscovered(
         "the reopened journal must stay readable: {execution:?}"
     );
     ensure!(
-        execution.created_at == "2023-11-14T22:13:20.000Z",
-        "the journal is stamped by the frozen clock, got {}",
+        chrono::DateTime::parse_from_rfc3339(&execution.created_at).is_ok(),
+        "the journal is stamped with an RFC 3339 instant, got {}",
         execution.created_at
     );
 
@@ -630,7 +602,7 @@ fn assert_rediscovered(
         "the resumed record keeps the continuation cursor"
     );
     ensure!(
-        plan.background.contains(EXECUTION_ID),
+        plan.background.contains(&discovered.execution.execution_id),
         "the continuation prompt names the recovered execution"
     );
 
@@ -667,10 +639,9 @@ async fn a_host_restart_resumes_the_journalled_cli_session() -> Result<()> {
 
     // --- the restart: only the directory tree survives -------------------------
     let options = cli_options(root.path())?;
-    let binding = cli_binding()?;
-    let discovered = rediscover(&layout, &binding).await?;
+    let discovered = rediscover(&layout).await?;
     // The host's own persisted copy of the plan, parsed back from its JSON form.
-    let plan = assert_rediscovered(&discovered, &layout, &binding)?;
+    let plan = assert_rediscovered(&discovered, &layout, &discovered.binding)?;
 
     // --- process two: continue the session from the parsed plan ---------------
     let model = ScriptedModel::text(SECOND_ANSWER);

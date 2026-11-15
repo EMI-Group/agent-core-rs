@@ -6,12 +6,14 @@
 //! helpers used by every store.
 use std::fmt;
 use std::io;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use openjiuwen_common::error::{Error, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::io::AsyncWriteExt as _;
 
 /// Maximum length, in Unicode scalar values, of an identifier.
 pub const IDENTIFIER_MAX_CHARS: usize = 512;
@@ -168,9 +170,20 @@ pub async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         }
     }
     let temporary = temporary_path(path);
-    tokio::fs::write(&temporary, bytes)
+    let mut file = tokio::fs::File::create(&temporary)
         .await
         .map_err(|error| fail(&error))?;
+    if let Err(error) = file.write_all(bytes).await {
+        drop(file);
+        return Err(fail(&error));
+    }
+    // Flush the bytes to the device before the rename publishes them, so the rename never makes a
+    // half-written file visible.
+    if let Err(error) = file.sync_all().await {
+        drop(file);
+        return Err(fail(&error));
+    }
+    drop(file);
     if let Err(error) = tokio::fs::rename(&temporary, path).await {
         if let Err(cleanup) = tokio::fs::remove_file(&temporary).await {
             tracing::debug!(
@@ -227,7 +240,12 @@ pub(crate) fn atomic_write_blocking(path: &Path, bytes: &[u8]) -> Result<()> {
         }
     }
     let temporary = temporary_path(path);
-    std::fs::write(&temporary, bytes).map_err(|error| fail(&error))?;
+    {
+        let mut file = std::fs::File::create(&temporary).map_err(|error| fail(&error))?;
+        file.write_all(bytes).map_err(|error| fail(&error))?;
+        // Same rule as `atomic_write`: the bytes reach the device before the rename publishes them.
+        file.sync_all().map_err(|error| fail(&error))?;
+    }
     if let Err(error) = std::fs::rename(&temporary, path) {
         if let Err(cleanup) = std::fs::remove_file(&temporary) {
             tracing::debug!(

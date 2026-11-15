@@ -21,6 +21,7 @@ pub mod identity;
 pub mod layout;
 pub mod log;
 pub mod rails;
+pub mod recording;
 pub mod session;
 pub mod share_file;
 pub mod util;
@@ -55,6 +56,10 @@ pub use log::{
 pub use rails::{
     deterministic_model_call_id, is_read_only_tool, ExecutionRecordRail, ModelAdmission,
     ModelCallGate, ModelCallRail, ToolRecordPolicy, MODEL_CALL_ID_EXTRA_KEY, READ_ONLY_TOOLS,
+};
+pub use recording::{
+    fresh_id, ActiveExecution, ExecutionRecorder, PersistentRunConfig, DEFAULT_NAMESPACE_ID,
+    DEFAULT_SOURCE_REF, SESSION_ENDING_OUTCOME, USAGE_UNKNOWN_REASON,
 };
 pub use session::{
     patch_stopped_calls, CheckpointKind, ContinuationCursor, FileSessionStore,

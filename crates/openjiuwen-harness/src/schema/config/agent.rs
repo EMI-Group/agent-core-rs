@@ -154,6 +154,15 @@ pub struct DeepAgentConfig {
     /// Directory for bounded per-invocation logs.
     #[schemars(with = "Option<String>")]
     pub invocation_log_dir: Option<PathBuf>,
+    /// Journal every turn as a resumable persistent-agent execution.
+    ///
+    /// Additive Rust switch (Python records executions through the persistent-agent host instead):
+    /// when `true`, a turn appends its goal, answer and terminal status to an
+    /// [`ExecutionLog`](crate::persistent_agent::ExecutionLog) under the workspace's
+    /// `persistent_agent/logs` node and rewrites the persisted session record, so
+    /// [`resume`](crate::persistent_agent::resume) can rebuild the window later. Recording
+    /// failures are logged and never fail the turn.
+    pub persistent_agent: bool,
 }
 
 impl Default for DeepAgentConfig {
@@ -196,6 +205,7 @@ impl Default for DeepAgentConfig {
             skill_budget_max_skills: None,
             skill_budget_max_total_chars: None,
             invocation_log_dir: None,
+            persistent_agent: false,
         }
     }
 }
@@ -499,6 +509,13 @@ impl DeepAgentConfig {
     #[must_use]
     pub fn with_invocation_log_dir(mut self, invocation_log_dir: Option<PathBuf>) -> Self {
         self.invocation_log_dir = invocation_log_dir;
+        self
+    }
+
+    /// Overrides whether every turn is journaled as a resumable execution.
+    #[must_use]
+    pub fn with_persistent_agent(mut self, persistent_agent: bool) -> Self {
+        self.persistent_agent = persistent_agent;
         self
     }
 }

@@ -511,9 +511,10 @@ impl ExecutionLog {
     /// Appends one payload and returns the persisted entry.
     ///
     /// The active segment is rotated first when it already reached `max_entries` lines or
-    /// `max_bytes` bytes. The counters advance only after the line was written. Appends and
-    /// rotations are serialized on the blocking pool, so concurrent appends still receive
-    /// contiguous, unique sequence numbers.
+    /// `max_bytes` bytes. The counters advance only after the line was written and flushed to the
+    /// storage device (`sync_all`), so a returned append survives a killed process or a power loss.
+    /// Appends and rotations are serialized on the blocking pool, so concurrent appends still
+    /// receive contiguous, unique sequence numbers.
     ///
     /// # Errors
     /// `Error::Validation` when the entry cannot be encoded, and `Error::Session` when the segment
@@ -722,6 +723,10 @@ fn append_entry(parts: &LogParts, payload: EntryPayload) -> Result<ExecutionEntr
         .map_err(|error| io_error(&path, "open", &error))?;
     file.write_all(line.as_bytes())
         .map_err(|error| io_error(&path, "append to", &error))?;
+    // `write_all` only hands the bytes to the kernel, so a crash could still lose the line. Sync
+    // before the counters advance, so an append that returned is durable.
+    file.sync_all()
+        .map_err(|error| io_error(&path, "sync", &error))?;
     let mut state = parts.write_state.lock();
     state.next_seq = seq.saturating_add(1);
     state.lines = state.lines.saturating_add(1);

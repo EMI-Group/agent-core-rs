@@ -31,6 +31,10 @@ Execution journal (`log`):
 - `LogDigest { entries, first_seq, last_seq, counts, tool_outcomes, input_tokens, output_tokens, unknown_usage, missing_ranges, skipped_invalid, duplicates_removed }` with `summary()`; `counts` is keyed by `EntryKind` and `tool_outcomes` by the status's snake-case spelling.
 - `Replay { cursor, entries, digest, truncated }`, `LogCursor { next_seq, last_seq, generation }`.
 - `LOG_ENCODING = "pa-jsonl/1"`, `LOG_ENTRY_FILE = "entries.jsonl"`, `LOG_META_FILE = "meta.json"`.
+Live recording (`recording`):
+- `PersistentRunConfig { agent_id, session_id, request_id, namespace_id, source_ref, capacity }` with `new(agent_id, session_id)` and `with_request_id`/`with_namespace_id`/`with_source_ref`/`with_capacity`; `identity()` fills the optional ids (`DEFAULT_NAMESPACE_ID`/`DEFAULT_SOURCE_REF`, a fresh `req_…`/`exec_…` through `fresh_id`).
+- `ExecutionRecorder { layout, capacity }` with `new(PersistentAgentLayout)`, `for_workspace(&Workspace)`, `with_capacity`, `layout`, `capacity` and `begin(&PersistentRunConfig, query) -> ActiveExecution`, which opens `<logs root>/<execution directory name>` and appends `ExecutionStarted`.
+- `ActiveExecution { log, identity, store, model_turns }` with `log`, `identity`, `execution_id`, `binding`, `store`, `record_model_turn(text)` (`ModelTurn` with `deterministic_model_call_id` and `USAGE_UNKNOWN_REASON` usage), `finish(FinalStatus, Option<&str>)` (an answer `ModelTurn` plus `ExecutionFinal` with the output bounded to `DETAIL_LIMIT`), `save_session(messages, state)` (record plus a `SESSION_ENDING_OUTCOME` ending) and `persist_session(&PersistentSessionRecord)`.
 
 Session state (`session`):
 - `PersistentSessionRecord` persists Python's keys: `schema_version`, `agent_id`, `session_id`, `messages`, `interruption`, `auto_confirm`, `deepagent_state`, `checkpoint`, `last_group_message_id`, `current_window_id`, `window_seq`, `last_rollover`, `ending`.
@@ -115,6 +119,7 @@ Re-exports:
 
 - `./mod.rs` → module docs, module declarations, flat re-exports, `#[cfg(test)] mod tests`
 - `./layout.rs` → `PersistentAgentLayout` (base + `logs_root`/`sessions_root`/`links_root`) and the workspace-node rule the stores share
+- `./recording.rs` → the live binding of journal + session record for one running turn (`ExecutionRecorder`, `ActiveExecution`, `PersistentRunConfig`)
 - `./catalog.rs` → `ExecutionCatalog`/`ExecutionSummary` enumeration over a log root (best-effort list, deterministic order, open by id)
 - `./util.rs` → canonical JSON, digests, percent encoding/decoding, identifier checks, atomic file helpers
 - `./identity.rs` → `ExecutionIdentity`, `SessionBinding`, session key scheme, `LinkRelation`
@@ -132,7 +137,8 @@ Re-exports:
 
 ## Design Decisions
 
-- The execution journal is the durability boundary: a resumed session replays the JSONL instead of trusting an in-memory transcript, so a crash between appends loses at most the last partial line.
+- The execution journal is the durability boundary: a resumed session replays the JSONL instead of trusting an in-memory transcript, so a crash between appends loses at most the last partial line, and every completed append is `sync_all`-flushed before its sequence number is published.
+- `recording` is the only place that writes a journal and a session record for a *live* turn; `DeepAgent` drives it behind `DeepAgentConfig::persistent_agent` (`Driver::begin_recording`/`finish_recording`), and every recording failure is logged rather than propagated, so journaling never costs a turn its answer.
 - One `parking_lot::Mutex` guards `next_seq`/`lines`/`bytes`/`generation` and is only held for the in-memory reads and mutations; a second `parking_lot` gate serializes the file operations, and both are only ever taken on the blocking pool, so no async task holds a lock across an `.await` and no disk IO runs on the async runtime.
 - Every journal file operation (open scan, append, rotate, read, replay, metadata write) runs through `tokio::task::spawn_blocking`; the operation gate serializes appends and rotations there, so concurrent appends still produce contiguous, unique sequence numbers.
 - `util::truncate_chars` treats `max_chars` as a hard budget: the ellipsis replaces the last kept character, so a truncated result is exactly `max_chars` characters, `0` yields an empty string and `1` yields `…` alone.
@@ -143,7 +149,7 @@ Re-exports:
 - Opening recomputes the counters by scanning the segments and rewrites `meta.json`, so reopening is idempotent and a stale metadata generation never loses entries.
 - A read skips empty, unparseable, zero-`seq` and non-RFC-3339 lines into `skipped_invalid`, collapses exact duplicates by `digest()`, drops a whole sequence group whose members disagree, and reports gaps from `1` before retention trimming.
 - A torn trailing line stays in place rather than being truncated: the next append opens the file in append mode, and the invalid line is skipped by every later read.
-- Appends are one `O_APPEND` `write_all` per line with no `fsync`/`flush` anywhere in the module, so durability is process-crash level: a killed process can leave a torn tail line that every later read skips, an OS-level crash can lose the tail entries that were never flushed.
+- An append is one `O_APPEND` `write_all` followed by `File::sync_all`, and the atomic JSON writes (`atomic_write`, `atomic_write_blocking`) sync the temporary file before the rename, so a returned write survives a killed process and an OS crash; only a torn tail written by a process killed mid-`write_all` can be skipped by a later read, and the directory entry itself is not synced.
 - `LogDigest::tool_outcomes` is keyed by the status's snake-case string because `ToolStatus` is not `Ord`, which keeps the map serde-serializable and its rendering deterministic.
 - `LogSnapshot::replay()` reports `generation = 0` because a snapshot does not carry the segment counter; `ExecutionLog::cursor()` and `ExecutionLog::replay()` report the live value.
 - `ExecutionLog::for_workspace`, `next_seq` and `cursor` are async because each reads the same write mutex an append takes.

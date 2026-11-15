@@ -65,8 +65,12 @@ use std::time::Duration;
 
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use openjiuwen_agent::{resolve_session, Agent, AgentCard, AgentChunk, AgentOutput, ReActAgent};
+use openjiuwen_agent::usage::MAIN_CONTEXT_ID;
+use openjiuwen_agent::{
+    resolve_session, Agent, AgentCard, AgentChunk, AgentOutput, ReActAgent, ResultType,
+};
 use openjiuwen_common::error::{Error, Result};
+use openjiuwen_context::ModelContext;
 use openjiuwen_foundation::llm::Model;
 use openjiuwen_foundation::tool::{Tool, ToolCard};
 use openjiuwen_session::Session;
@@ -77,6 +81,9 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::permission::{PermissionEngine, PermissionHost};
+use crate::persistent_agent::{
+    ActiveExecution, ExecutionRecorder, FinalStatus as RecordStatus, PersistentRunConfig,
+};
 use crate::prompts::{mode_instructions, SectionName};
 use crate::rails::{HarnessRail, HarnessRailAdapter, HarnessRailRegistry};
 use crate::schema::{
@@ -759,6 +766,7 @@ impl Driver {
         let interactive = normalized.get("query").is_some_and(Value::is_object);
         let task_loop =
             config.enable_task_loop && config.max_iterations_hard_limit.is_none() && !interactive;
+        let recording = self.begin_recording(normalized, session).await;
         let output = if task_loop {
             self.run_task_loop(normalized, session.clone(), loaded, stream_tx)
                 .await?
@@ -773,7 +781,69 @@ impl Driver {
             // lost to a persistence hiccup.
             tracing::warn!(error = %error, "failed to persist the DeepAgent state");
         }
+        if let Some(active) = recording {
+            self.finish_recording(&active, session, &output).await;
+        }
         Ok(output)
+    }
+
+    /// Opens this turn's persistent-agent execution journal, when configured.
+    ///
+    /// Returns `None` when [`DeepAgentConfig::persistent_agent`] is off, and also when the journal
+    /// cannot be opened: recording is an observation of the turn, never a precondition for it, so
+    /// a failure is logged and the turn runs unrecorded (the same policy
+    /// [`Self::persist_state`] follows).
+    async fn begin_recording(
+        &self,
+        normalized: &Value,
+        session: &Arc<dyn Session>,
+    ) -> Option<ActiveExecution> {
+        let config = self.config.read().clone();
+        if !config.persistent_agent {
+            return None;
+        }
+        let run = PersistentRunConfig::new(self.card.id.clone(), session.id());
+        let recorder = ExecutionRecorder::for_workspace(&config.workspace);
+        match recorder.begin(&run, &recorded_query(normalized)).await {
+            Ok(active) => Some(active),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to open the persistent-agent journal");
+                None
+            }
+        }
+    }
+
+    /// Records the turn's outcome and rewrites the persisted session record.
+    ///
+    /// Both writes are best effort: a failure is logged and never propagated, because the answer
+    /// the caller already holds must not be replaced by a recording error.
+    async fn finish_recording(
+        &self,
+        active: &ActiveExecution,
+        session: &Arc<dyn Session>,
+        output: &AgentOutput,
+    ) {
+        let status = if matches!(output.result_type, ResultType::Answer) {
+            RecordStatus::Completed
+        } else {
+            RecordStatus::Failed
+        };
+        if let Err(error) = active.finish(status, Some(&output.output)).await {
+            tracing::warn!(error = %error, "failed to finalise the persistent-agent journal");
+        }
+        let messages = match self
+            .inner
+            .context_engine()
+            .get_context(session.id(), MAIN_CONTEXT_ID)
+            .await
+        {
+            Some(context) => context.messages().await,
+            None => Vec::new(),
+        };
+        let state = serde_json::to_value(self.last_state.lock().clone()).ok();
+        if let Err(error) = active.save_session(messages, state).await {
+            tracing::warn!(error = %error, "failed to save the persistent-agent session record");
+        }
     }
 
     /// Executes `normalized` through the outer task loop.
@@ -896,6 +966,28 @@ impl Driver {
         let state = self.collect_state(base);
         *self.last_state.lock() = state.clone();
         state_store::save_state(session.as_ref(), &state).await
+    }
+}
+
+/// Returns the goal text a persistent-agent journal records for `normalized`.
+///
+/// [`normalize_inputs`] leaves the query as either the user's string or an interactive object (an
+/// interruption reply). A string is recorded verbatim; an object is rendered from its first
+/// textual field, falling back to its compact JSON so an interruption reply still journals
+/// something a reader can identify.
+fn recorded_query(normalized: &Value) -> String {
+    match normalized.get("query") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Object(map)) => {
+            for key in ["content", "text", "query"] {
+                if let Some(text) = map.get(key).and_then(Value::as_str) {
+                    return text.to_string();
+                }
+            }
+            Value::Object(map.clone()).to_string()
+        }
+        Some(other) => other.to_string(),
+        None => String::new(),
     }
 }
 

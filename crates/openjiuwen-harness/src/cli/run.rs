@@ -292,6 +292,8 @@ pub async fn build_agent_with(
         model_provider: Some(options.provider.clone()),
         api_key: options.api_key.clone(),
         api_base: options.api_base.clone(),
+        // The CLI journals every turn, so `openjiuwen chat --resume` has a window to rebuild.
+        persistent_agent: true,
         ..DeepAgentConfig::default()
     }
     .with_system_prompt(instructions.system_prompt());
