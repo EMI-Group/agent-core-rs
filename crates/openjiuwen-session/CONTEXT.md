@@ -384,6 +384,8 @@ pub struct SpanHandle; // id / trace_id / set_inputs / set_outputs / set_metadat
 - `session_controller` defers the downstream link graph (`downstreams/`, `ChainSession`), data-container/permission policies, and the process-global `GlobalSessionController` singleton.
 - `vcs` defers git and other external backends, event/WAL (`e<N>`) references, `rewind`/`fork`, codecs, and context-engine adapters.
 - Redis has no cluster, Sentinel, or TLS support (`rediss://` is `Error::Unsupported`) and no pipelining: commands are serialized over one connection per checkpointer.
+- A cluster/Sentinel URL is not detected: `ConnectionTarget::parse` (`checkpoint/resp.rs`) takes a comma-separated host list as one host, so `connect` fails as a transport `Error::Session` instead of reporting `Unsupported`.
+- `rediss://` is offline-implementable as-is: `rustls 0.23` and `tokio-rustls 0.26` are already `Cargo.lock` entries present in the local registry cache, so TLS needs no new fetch (M: wrap the `TcpStream` in `tokio_rustls` and thread a TLS flag through `RespConnection`).
 - Tracer extensions: the per-session sink hook exists, but the real OTel SDK sink lives in `openjiuwen-extensions`; there is no process-global handler registry — sinks are injected per session.
 - Python's `SubWorkflowSession` also inherits the host node's `node_name`; the Rust port has no node-name concept, so `entity_name` stays the component id (the executable id matches Python's: `a`, or `a.b` under a nested node).
 - Concrete sessions checkpoint only the trace position the installed sink observes since it was created or rebased, so a resumed session's `frame_count` continues from the checkpointed baseline.
