@@ -1,20 +1,40 @@
-//! A dependency-free RESP2 client for the Redis checkpoint backend.
+//! A dependency-light RESP2 client for the Redis checkpoint backend.
 //!
 //! Python's checkpointer family delegates its remote variant to the `redis`
-//! client library; the Rust port keeps the workspace offline and dependency-free
-//! by speaking the RESP2 wire protocol directly over
-//! [`tokio::net::TcpStream`]: command arrays of bulk strings out, and simple
+//! client library; the Rust port keeps the workspace offline by speaking the
+//! RESP2 wire protocol directly: command arrays of bulk strings out, and simple
 //! strings, error replies, integers, bulk strings, and (nested) arrays in.
 //!
 //! Only the subset the checkpointer needs is implemented. Supported URL forms
-//! are `redis://[user[:password]@]host[:port][/db]`; `rediss://` (TLS) reports
-//! [`openjiuwen_common::error::ErrorKind::Unsupported`] instead of silently
-//! connecting in the clear.
+//! are `redis://[user[:password]@]host[:port][/db]` over a plain TCP socket and
+//! `rediss://[user[:password]@]host[:port][/db]` over TLS. The TLS variant is
+//! implemented by the private `resp_tls` sibling module: it verifies the server
+//! against the compiled-in `webpki_roots` roots plus the optional CA file a
+//! caller passes to [`RespConnection::connect_with_ca_file`], and its failures
+//! are [`openjiuwen_common::error::ErrorKind::Session`] errors naming the host.
 #![allow(clippy::module_name_repetitions)]
 
+use std::path::Path;
+
 use openjiuwen_common::error::{Error, Result};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::TcpStream;
+
+// `resp.rs` is a file module, so a sibling source file needs an explicit path.
+#[path = "resp_tls.rs"]
+mod resp_tls;
+
+/// The transport a [`RespConnection`] reads and writes: a plain socket or a
+/// TLS session over one.
+pub(crate) trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+/// The boxed transport [`RespConnection`] stores, so the plaintext and TLS
+/// paths share one code path.
+type BoxStream = Box<dyn AsyncReadWrite>;
 
 /// The largest bulk string the client accepts (512 MiB).
 const MAX_BULK_LENGTH: usize = 512 * 1024 * 1024;
@@ -316,30 +336,76 @@ fn parse_integer(field: &str) -> std::result::Result<i64, ReadError> {
         .map_err(|_| ReadError::protocol(format!("malformed RESP integer {field:?}")))
 }
 
-/// A single RESP2 connection: one buffered socket, used sequentially.
+/// A single RESP2 connection: one buffered transport, used sequentially.
 ///
 /// The connection is not multiplexed; [`RespConnection::command`] writes one
 /// command and reads its reply, so a connection must not be shared across
 /// concurrent callers (the checkpointer serializes access through a mutex).
-#[derive(Debug)]
+/// The transport is a plain TCP socket for `redis://` and a TLS session over
+/// one for `rediss://`; both are boxed behind one reader, so the codec and the
+/// command path are identical for the two schemes.
 pub struct RespConnection {
-    stream: BufReader<TcpStream>,
+    stream: BufReader<BoxStream>,
+    tls: bool,
     broken: bool,
+}
+
+impl std::fmt::Debug for RespConnection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RespConnection")
+            .field("transport", &if self.tls { "tls" } else { "plaintext" })
+            .field("broken", &self.broken)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RespConnection {
     /// Connects to `url` and completes the handshake (`AUTH` when credentials
     /// are present, `SELECT` when the path names a database).
     ///
+    /// A `rediss://` URL dials over TLS and trusts the compiled-in webpki roots
+    /// only; use [`RespConnection::connect_with_ca_file`] to add a private CA.
+    ///
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for a
-    /// malformed URL, [`openjiuwen_common::error::ErrorKind::Unsupported`] for
-    /// `rediss://`, and [`openjiuwen_common::error::ErrorKind::Session`] when
-    /// the connection or the handshake fails.
+    /// malformed URL and [`openjiuwen_common::error::ErrorKind::Session`] when
+    /// the connection, the TLS handshake, or the protocol handshake fails.
     pub async fn connect(url: &str) -> Result<Self> {
+        Self::connect_with_ca_file(url, None).await
+    }
+
+    /// Connects to `url`, adding the root certificates in `ca_file` to the
+    /// trust store of a `rediss://` connection.
+    ///
+    /// The certificate file is read before the socket is dialed, so a broken
+    /// file fails before any network traffic. A `ca_file` paired with a
+    /// `redis://` URL is a validation error rather than a silent no-op: a
+    /// clear-text connection has no TLS layer to verify against it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for a
+    /// malformed URL, a malformed CA file, or a CA file without a `rediss://`
+    /// URL, and [`openjiuwen_common::error::ErrorKind::Session`] when the CA
+    /// file cannot be read, the connection cannot be dialed, the TLS handshake
+    /// fails (an untrusted certificate, a server that is not speaking TLS), or
+    /// the protocol handshake fails.
+    pub async fn connect_with_ca_file(url: &str, ca_file: Option<&Path>) -> Result<Self> {
         let target = ConnectionTarget::parse(url)?;
-        let stream = TcpStream::connect((target.host.as_str(), target.port))
+        if ca_file.is_some() && !target.tls {
+            return Err(Error::validation(format!(
+                "the redis url {url:?} is clear text, so a TLS CA file cannot be used with it; \
+                 use rediss://"
+            )));
+        }
+        let config = if target.tls {
+            Some(resp_tls::client_config(&target.host, ca_file).await?)
+        } else {
+            None
+        };
+        let socket = TcpStream::connect((target.host.as_str(), target.port))
             .await
             .map_err(|error| {
                 Error::session(format!(
@@ -347,8 +413,13 @@ impl RespConnection {
                     target.host, target.port
                 ))
             })?;
+        let stream: BoxStream = match config {
+            Some(config) => Box::new(resp_tls::handshake(socket, &target.host, config).await?),
+            None => Box::new(socket),
+        };
         let mut connection = Self {
             stream: BufReader::new(stream),
+            tls: target.tls,
             broken: false,
         };
         if let Some(password) = target.password.as_deref() {
@@ -364,6 +435,23 @@ impl RespConnection {
             connection.select_database(database).await?;
         }
         Ok(connection)
+    }
+
+    /// Reports whether `url` selects the TLS transport (`rediss://`) instead of
+    /// the clear-text one (`redis://`), without dialing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for a
+    /// malformed URL.
+    pub fn uses_tls(url: &str) -> Result<bool> {
+        ConnectionTarget::parse(url).map(|target| target.tls)
+    }
+
+    /// Reports whether this connection speaks TLS.
+    #[must_use]
+    pub fn is_tls(&self) -> bool {
+        self.tls
     }
 
     /// Reports whether a transport failure has already invalidated this
@@ -422,7 +510,7 @@ impl RespConnection {
     }
 }
 
-/// A parsed `redis://` URL.
+/// A parsed `redis://` or `rediss://` URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConnectionTarget {
     host: String,
@@ -430,25 +518,28 @@ struct ConnectionTarget {
     username: Option<String>,
     password: Option<String>,
     database: Option<u32>,
+    /// `true` for `rediss://` (TLS), `false` for `redis://` (clear text).
+    tls: bool,
 }
 
 impl ConnectionTarget {
-    /// Parses `redis://[user[:password]@]host[:port][/db]`.
+    /// Parses `[redis|rediss]://[user[:password]@]host[:port][/db]`.
     fn parse(url: &str) -> Result<Self> {
         let trimmed = url.trim();
         if trimmed.is_empty() {
             return Err(Error::validation(
-                "redis url must not be empty; expected redis://host[:port][/db]",
+                "redis url must not be empty; expected redis://host[:port][/db] or \
+                 rediss://host[:port][/db]",
             ));
         }
-        let Some(rest) = trimmed.strip_prefix("redis://") else {
-            if trimmed.starts_with("rediss://") {
-                return Err(Error::unsupported(
-                    "rediss (TLS) is not supported; use redis://",
-                ));
-            }
+        let (tls, rest) = if let Some(rest) = trimmed.strip_prefix("rediss://") {
+            (true, rest)
+        } else if let Some(rest) = trimmed.strip_prefix("redis://") {
+            (false, rest)
+        } else {
             return Err(Error::validation(format!(
-                "unsupported redis url {trimmed:?}; expected redis://host[:port][/db]"
+                "unsupported redis url {trimmed:?}; expected redis://host[:port][/db] or \
+                 rediss://host[:port][/db]"
             )));
         };
         let (authority, path) = match rest.split_once('/') {
@@ -490,6 +581,7 @@ impl ConnectionTarget {
             username,
             password,
             database,
+            tls,
         })
     }
 }
@@ -652,20 +744,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unsupported_and_malformed_urls() {
-        assert_eq!(
-            RespConnection::connect("rediss://localhost:6379")
-                .await
-                .unwrap_err()
-                .kind(),
-            ErrorKind::Unsupported
-        );
+    async fn rejects_malformed_urls() {
         for malformed in [
             "",
             "http://localhost:6379",
             "redis://localhost:not-a-port",
             "redis://localhost:6379/not-a-database",
             "redis://:6379",
+            "rediss://localhost:not-a-port",
+            "rediss://localhost:6379/not-a-database",
+            "rediss://:6379",
         ] {
             assert_eq!(
                 RespConnection::connect(malformed).await.unwrap_err().kind(),
@@ -683,6 +771,7 @@ mod tests {
         assert_eq!(target.username, None);
         assert_eq!(target.password, None);
         assert_eq!(target.database, None);
+        assert!(!target.tls);
 
         let target = ConnectionTarget::parse("redis://user:secret@cache:6380/3").unwrap();
         assert_eq!(target.host, "cache");
@@ -690,6 +779,7 @@ mod tests {
         assert_eq!(target.username.as_deref(), Some("user"));
         assert_eq!(target.password.as_deref(), Some("secret"));
         assert_eq!(target.database, Some(3));
+        assert!(!target.tls);
 
         let target = ConnectionTarget::parse("redis://secret@cache/").unwrap();
         assert_eq!(target.host, "cache");
@@ -701,5 +791,80 @@ mod tests {
         assert_eq!(target.host, "::1");
         assert_eq!(target.port, 6390);
         assert_eq!(target.database, Some(1));
+        assert!(!target.tls);
+    }
+
+    #[test]
+    fn parses_tls_targets() {
+        let target = ConnectionTarget::parse("rediss://localhost").unwrap();
+        assert_eq!(target.host, "localhost");
+        assert_eq!(target.port, 6379, "rediss keeps the default redis port");
+        assert!(target.tls);
+
+        let target = ConnectionTarget::parse("rediss://user:secret@cache:6380/3").unwrap();
+        assert_eq!(target.host, "cache");
+        assert_eq!(target.port, 6380);
+        assert_eq!(target.username.as_deref(), Some("user"));
+        assert_eq!(target.password.as_deref(), Some("secret"));
+        assert_eq!(target.database, Some(3));
+        assert!(target.tls);
+
+        let target = ConnectionTarget::parse("rediss://secret@[::1]:6390/1").unwrap();
+        assert_eq!(target.host, "::1");
+        assert_eq!(target.port, 6390);
+        assert_eq!(target.username, None);
+        assert_eq!(target.password.as_deref(), Some("secret"));
+        assert_eq!(target.database, Some(1));
+        assert!(target.tls);
+
+        // The scheme is case-sensitive, like Python's `redis` client and
+        // `url::Url` are not: an unknown scheme stays a validation error.
+        assert_eq!(
+            ConnectionTarget::parse("REDIS://localhost")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Validation
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_a_ca_file_without_a_tls_url() {
+        // Rejected before dialing, so no server is needed: a clear-text URL has
+        // no TLS layer the extra anchors could verify.
+        let error = RespConnection::connect_with_ca_file(
+            "redis://localhost:6379",
+            Some(std::path::Path::new("/etc/ssl/private-ca.pem")),
+        )
+        .await
+        .expect_err("a CA file on a plaintext url must be rejected");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.to_string().contains("rediss"), "{error}");
+    }
+
+    #[test]
+    fn reports_the_scheme_without_dialing() {
+        assert!(RespConnection::uses_tls("rediss://cache:6379").unwrap());
+        assert!(!RespConnection::uses_tls("redis://cache:6379").unwrap());
+        assert!(!RespConnection::uses_tls(" redis://cache:6379 ").unwrap());
+        assert_eq!(
+            RespConnection::uses_tls("cache:6379").unwrap_err().kind(),
+            ErrorKind::Validation
+        );
+    }
+
+    #[test]
+    fn debug_output_reports_the_transport() {
+        // The transport is asserted through `Debug` over an in-memory duplex
+        // stream, so the shape is pinned without any network traffic.
+        let (stream, _peer) = tokio::io::duplex(32);
+        let connection = super::RespConnection {
+            stream: tokio::io::BufReader::new(Box::new(stream)),
+            tls: true,
+            broken: false,
+        };
+        assert!(connection.is_tls());
+        let debug = format!("{connection:?}");
+        assert!(debug.contains("transport: \"tls\""), "{debug}");
+        assert!(!debug.contains("password"), "{debug}");
     }
 }
