@@ -118,6 +118,19 @@ enum HubSource {
     Local,
 }
 
+/// One recorded resolution failure: the compact code and the typed message.
+///
+/// The two are kept apart because they answer different questions: the code is
+/// what a caller matches on, and the message is what a human needs when the
+/// downgrade is unexpected.
+#[derive(Debug, Clone)]
+struct RecordedFailure {
+    /// The compact code a caller matches on.
+    code: String,
+    /// The whole typed message, when the failure carried one.
+    detail: Option<String>,
+}
+
 /// Resolves, validates and caches native tokenizer artefacts.
 ///
 /// ```
@@ -142,7 +155,7 @@ pub struct TokenizerArtifactManager {
     /// Per-request timeout.
     request_timeout: Duration,
     /// Compact code of the last failed resolution.
-    last_error: Mutex<Option<String>>,
+    last_error: Mutex<Option<RecordedFailure>>,
 }
 
 impl Default for TokenizerArtifactManager {
@@ -159,7 +172,7 @@ impl Clone for TokenizerArtifactManager {
             offline: self.offline,
             endpoint: self.endpoint.clone(),
             request_timeout: self.request_timeout,
-            last_error: Mutex::new(self.last_error()),
+            last_error: Mutex::new(self.slot().clone()),
         }
     }
 }
@@ -276,12 +289,36 @@ impl TokenizerArtifactManager {
         self.request_timeout
     }
 
-    /// The reason of the last failed resolution, if the last one failed.
+    /// The compact code of the last failed resolution, if the last one failed.
     ///
-    /// The value starts with one of [`ARTIFACT_ERROR_CODES`]: a typed failure keeps its whole message, so a `provider_official` spec reports the vendor and tokenizer id it needs an adapter for, while a failure the manager decides itself (a disabled download, a missing local artefact) is just the code.
+    /// The value is always one of [`ARTIFACT_ERROR_CODES`], so a caller can
+    /// match on it: a failure the manager decides itself (a disabled download, a
+    /// missing local artefact, a refused URL) reports its gate, and a typed
+    /// failure reports the code its message starts with. A `provider_official`
+    /// spec therefore reports [`PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE`]
+    /// here, while [`TokenizerArtifactManager::last_error_detail`] names the
+    /// vendor and the tokenizer id that need an adapter.
     #[must_use]
     pub fn last_error(&self) -> Option<String> {
-        self.slot().clone()
+        self.slot().as_ref().map(|failure| failure.code.clone())
+    }
+
+    /// The whole message of the last failed resolution, when it carried one.
+    ///
+    /// A typed failure keeps its message — with the compact code still prefixed,
+    /// so `detail.starts_with(code)` holds — because the detail is what explains
+    /// a downgrade: the vendor a `provider_official` spec needs an adapter for,
+    /// the model type a body declared, the status a hub answered. A failure the
+    /// manager decides itself has no detail and returns `None`; read
+    /// [`TokenizerArtifactManager::last_error`] for its code.
+    ///
+    /// The accessor clones the message, because the slot sits behind a mutex and
+    /// cannot hand out a borrow; compare it with `as_deref()`.
+    #[must_use]
+    pub fn last_error_detail(&self) -> Option<String> {
+        self.slot()
+            .as_ref()
+            .and_then(|failure| failure.detail.clone())
     }
 
     /// The cache path a download of `spec` writes, when it has a hub source.
@@ -308,7 +345,7 @@ impl TokenizerArtifactManager {
     ///
     /// The order matches Python's manager: an `artifact_path` (file or directory), then a `tokenizer_id` that exists on disk, then validation, then the hub source; `://` ids are refused before any source is considered.
     /// Failures return `None` and record the reason read back through [`TokenizerArtifactManager::last_error`], and the call never panics.
-    /// A `provider_official` spec names the vendor and tokenizer id it could not resolve, and a downloaded artefact this crate cannot decode records `tokenizer_model_type_unsupported` with the declared model type, so neither failure looks like a cache miss.
+    /// A `provider_official` spec names the vendor and tokenizer id it could not resolve, and a downloaded artefact this crate cannot decode records `tokenizer_model_type_unsupported` with the declared model type, so neither failure looks like a cache miss; [`TokenizerArtifactManager::last_error`] reports the code and [`TokenizerArtifactManager::last_error_detail`] the detail.
     /// Every returned path is validated for existence, the declared digest and the body, at a cost of one local parse per resolution.
     /// Unlike Python this method is `async`, because a download uses the workspace HTTP client; it performs no I/O at all when downloads are off.
     pub async fn resolve(&self, spec: &TokenizerSpec) -> Option<PathBuf> {
@@ -675,7 +712,7 @@ impl TokenizerArtifactManager {
     }
 
     /// The error slot; a poisoned lock still yields the last value.
-    fn slot(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<RecordedFailure>> {
         self.last_error
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -686,19 +723,27 @@ impl TokenizerArtifactManager {
         *self.slot() = None;
     }
 
-    /// Records a compact failure code.
+    /// Records a compact failure code with no detail.
     fn set_error(&self, code: &str) {
-        *self.slot() = Some(code.to_owned());
+        *self.slot() = Some(RecordedFailure {
+            code: code.to_owned(),
+            detail: None,
+        });
     }
 
-    /// Records the whole message of `error`, code included.
+    /// Records the code and the whole message of `error`.
     ///
-    /// A typed failure keeps its detail — the vendor a `provider_official` spec
-    /// needs, the model type a body declared, the status a hub answered — so
-    /// [`TokenizerArtifactManager::last_error`] explains the downgrade instead of
-    /// only labelling it.
+    /// The code stays as [`TokenizerArtifactManager::last_error`] reports it and
+    /// the message keeps the detail — the vendor a `provider_official` spec needs,
+    /// the model type a body declared, the status a hub answered — so
+    /// [`TokenizerArtifactManager::last_error_detail`] explains the downgrade
+    /// instead of only labelling it.
     fn set_message(&self, error: &Error) {
-        *self.slot() = Some(error.message().into_owned());
+        let detail = error.message().into_owned();
+        *self.slot() = Some(RecordedFailure {
+            code: code_of(error).to_owned(),
+            detail: Some(detail),
+        });
     }
 
     /// Records a compact failure code and returns `None`.
@@ -717,6 +762,33 @@ impl TokenizerArtifactManager {
     fn record(&self, error: Error) -> Error {
         self.set_message(&error);
         error
+    }
+}
+
+/// The compact code a typed failure reports.
+///
+/// Every message this module builds starts with its compact code, so the code is
+/// the listed entry the message begins with (either the whole message or its
+/// `": "`-prefixed head). A failure that carries no code — a lock timeout, an OS
+/// error — reports [`TOKENIZER_DOWNLOAD_FAILED_CODE`], because it happened on the
+/// download path, and an `Unsupported` failure reports
+/// [`TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE`], the only typed refusal of that kind
+/// here.
+fn code_of(error: &Error) -> &'static str {
+    let message = error.message();
+    let message = message.as_ref();
+    let labelled = ARTIFACT_ERROR_CODES.iter().copied().find(|code| {
+        message == *code
+            || message
+                .strip_prefix(*code)
+                .is_some_and(|rest| rest.starts_with(':'))
+    });
+    if let Some(code) = labelled {
+        return code;
+    }
+    match error.kind() {
+        ErrorKind::Unsupported => TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE,
+        _ => TOKENIZER_DOWNLOAD_FAILED_CODE,
     }
 }
 
@@ -924,10 +996,15 @@ mod tests {
             )),
             None
         );
-        let recorded = manager.last_error().expect("adapter message");
+        assert_eq!(
+            manager.last_error().as_deref(),
+            Some(PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE),
+            "the code is the compact one a caller matches on"
+        );
+        let recorded = manager.last_error_detail().expect("adapter message");
         assert!(
             recorded.starts_with(PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE),
-            "the message keeps its compact code: {recorded}"
+            "the detail keeps its compact code: {recorded}"
         );
         assert_eq!(
             manager.resolve_cached(&spec("local", "tok", TokenizerEngine::Native)),
@@ -936,6 +1013,35 @@ mod tests {
         assert_eq!(
             manager.last_error().as_deref(),
             Some(LOCAL_ARTIFACT_MISSING_CODE)
+        );
+        assert_eq!(
+            manager.last_error_detail(),
+            None,
+            "a manager-decided failure carries no typed detail"
+        );
+    }
+
+    #[test]
+    fn a_typed_failure_reports_its_code_and_its_detail() {
+        let code = code_of(&Error::NotFound(format!(
+            "{TOKENIZER_REVISION_UNAVAILABLE_CODE}: HTTP 404"
+        )));
+        assert_eq!(code, TOKENIZER_REVISION_UNAVAILABLE_CODE);
+        // A bare code is its own code, and an unlabelled failure is a download
+        // failure rather than a guess.
+        assert_eq!(
+            code_of(&Error::Validation(
+                TOKENIZER_SHA256_MISMATCH_CODE.to_owned()
+            )),
+            TOKENIZER_SHA256_MISMATCH_CODE
+        );
+        assert_eq!(
+            code_of(&Error::Timeout("the lock was not released".to_owned())),
+            TOKENIZER_DOWNLOAD_FAILED_CODE
+        );
+        assert_eq!(
+            code_of(&Error::Unsupported("no adapter".to_owned())),
+            TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE
         );
     }
 

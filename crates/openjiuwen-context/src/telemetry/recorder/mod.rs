@@ -161,12 +161,18 @@ impl Default for TokenProvenance {
 }
 
 /// One measured token count together with how it was produced.
+///
+/// The recorder builds one of these per measured history, so a reader of a
+/// `context.compression_state` record can tell a real count from an estimate
+/// without re-measuring: `tokens` is the number the record publishes and
+/// `provenance` says which counter produced it and whether that number is an
+/// estimate.
 #[derive(Debug, Clone)]
-struct MeasuredTokens {
+pub struct MeasuredTokens {
     /// The measured or estimated total.
-    tokens: usize,
+    pub tokens: usize,
     /// How `tokens` was produced.
-    provenance: TokenProvenance,
+    pub provenance: TokenProvenance,
 }
 
 /// The counter a recorder measures with, plus what it knows about it.

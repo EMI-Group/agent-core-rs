@@ -25,13 +25,13 @@
 //!   messages after the anchor stay verbatim. When the store holds no usable
 //!   notes — none at all, an empty set, or notes anchored on a message that has
 //!   left the history — the configured
-//!   [`SessionMemoryAgent`](crate::session_memory_agent::SessionMemoryAgent)
+//!   [`SessionMemoryAgent`]
 //!   extracts a note set over the active history, commits it to the store, and
 //!   the branch continues with it. The model call this costs is the reason the
 //!   branch is preferred at all: it replaces the whole active history with a
 //!   short notes block. A branch that cannot run at all (no store, no agent, no
 //!   replaceable prefix) reports
-//!   [`FullCompactProcessor::refuse_session_memory`]'s reason and the summary
+//!   `FullCompactProcessor::refuse_session_memory`'s reason and the summary
 //!   path below takes over.
 //! - **Model summary** — otherwise the active part is trimmed to
 //!   [`FullCompactProcessorConfig::compression_call_max_tokens`] by dropping whole
@@ -336,7 +336,7 @@ pub struct FullCompactProcessor {
     ///
     /// `None` means the session-memory branch can only reinject committed notes;
     /// when the store is empty it then reports
-    /// [`NO_SESSION_MEMORY_AGENT`] instead of doing nothing.
+    /// `NO_SESSION_MEMORY_AGENT` instead of doing nothing.
     pub session_memory_agent: Option<Arc<SessionMemoryAgent>>,
     /// Host-rendered state sections reinjected after an accepted compaction.
     pub reinjection: Option<Arc<SnapshotRegistry>>,

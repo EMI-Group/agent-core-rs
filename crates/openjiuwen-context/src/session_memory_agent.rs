@@ -393,8 +393,8 @@ fn file_tokens(line: &str) -> Vec<String> {
 /// `## Open Questions` entry, and every file-looking token becomes a `## Files`
 /// entry.
 ///
-/// Every entry is one trimmed line clipped to [`OFFLINE_ENTRY_MAX_CHARS`], each
-/// section keeps at most [`OFFLINE_MAX_ENTRIES`] entries, and duplicates are
+/// Every entry is one trimmed line clipped to `OFFLINE_ENTRY_MAX_CHARS`, each
+/// section keeps at most `OFFLINE_MAX_ENTRIES` entries, and duplicates are
 /// dropped. The result never exceeds `max_chars` characters and starts with
 /// [`OFFLINE_NOTES_TITLE`]; a transcript with nothing to note yields an empty
 /// string rather than a title-only document.
@@ -879,6 +879,16 @@ impl SessionMemoryAgent {
     }
 }
 
+/// Builds a whole-file reply from a directive body and the reply lines after it.
+fn direct_replace_body(body: &str, rest: &[&str]) -> String {
+    let mut out = body.to_owned();
+    for line in rest {
+        out.push('\n');
+        out.push_str(line);
+    }
+    strip_code_fence(&out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1062,14 +1072,4 @@ mod tests {
         let prompt = direct.render_prompt(&notes(""), &[BaseMessage::user("hi")]);
         assert_eq!(prompt[0].text(), SESSION_MEMORY_DIRECT_SYSTEM_PROMPT);
     }
-}
-
-/// Builds a whole-file reply from a directive body and the reply lines after it.
-fn direct_replace_body(body: &str, rest: &[&str]) -> String {
-    let mut out = body.to_owned();
-    for line in rest {
-        out.push('\n');
-        out.push_str(line);
-    }
-    strip_code_fence(&out)
 }

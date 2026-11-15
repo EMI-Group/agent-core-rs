@@ -47,7 +47,8 @@ pub mod state;
 
 pub use recorder::{
     format_timestamp, modified_messages, CompressionStateSink, ContextProcessorStateInput,
-    ContextProcessorStateRecorder, RecordingSink, TokenProvenance, DEFAULT_HISTORY_LIMIT,
+    ContextProcessorStateRecorder, MeasuredTokens, RecordingSink, TokenProvenance,
+    DEFAULT_HISTORY_LIMIT,
 };
 pub use scope::{
     apply_operation, current_compression_operation, current_compression_operation_id,

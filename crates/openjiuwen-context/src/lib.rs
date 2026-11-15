@@ -155,8 +155,8 @@ pub use telemetry::{
     with_operation_scope, CompressionOperation, CompressionStatePhase, CompressionStateSink,
     CompressionStateStatus, ContextCompressionMetric, ContextCompressionModifiedMessage,
     ContextCompressionSaved, ContextCompressionState, ContextCompressionUsage,
-    ContextProcessorStateInput, ContextProcessorStateRecorder, RecordingSink, TokenProvenance,
-    COMPACTION_PURPOSE, CONTEXT_COMPRESSION_STATE_TYPE, CONTEXT_OPERATION_ID_KEY,
+    ContextProcessorStateInput, ContextProcessorStateRecorder, MeasuredTokens, RecordingSink,
+    TokenProvenance, COMPACTION_PURPOSE, CONTEXT_COMPRESSION_STATE_TYPE, CONTEXT_OPERATION_ID_KEY,
     REQUEST_PURPOSE_KEY,
 };
 pub use tokens::{check_budget, count_message, count_messages, TokenBudget};

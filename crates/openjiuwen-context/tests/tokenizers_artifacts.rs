@@ -538,10 +538,17 @@ async fn a_404_records_the_revision_code() {
     spec.revision = Some("missing".to_owned());
 
     assert_eq!(manager.resolve(&spec).await, None);
-    let recorded = manager.last_error().expect("a 404 is recorded");
+    assert_eq!(
+        manager.last_error().as_deref(),
+        Some(TOKENIZER_REVISION_UNAVAILABLE_CODE),
+        "the code is the compact one a caller matches on"
+    );
+    let recorded = manager
+        .last_error_detail()
+        .expect("the typed 404 message is recorded");
     assert!(
         recorded.starts_with(TOKENIZER_REVISION_UNAVAILABLE_CODE),
-        "the message keeps the code and the detail: {recorded}"
+        "the detail keeps its compact code and the status: {recorded}"
     );
     assert!(recorded.contains("404"), "{recorded}");
     let error = manager.download(&spec).await.expect_err("404 is an error");
@@ -579,13 +586,18 @@ async fn an_unreachable_endpoint_records_the_network_code() {
         .with_request_timeout(Duration::from_millis(500));
     let spec = hub_spec("huggingface", "acme/tok", TokenizerEngine::Native);
     assert_eq!(manager.resolve(&spec).await, None);
+    assert_eq!(
+        manager.last_error().as_deref(),
+        Some(TOKENIZER_NETWORK_UNAVAILABLE_CODE)
+    );
     let recorded = manager
-        .last_error()
+        .last_error_detail()
         .expect("an unreachable hub is recorded");
     assert!(
         recorded.starts_with(TOKENIZER_NETWORK_UNAVAILABLE_CODE),
         "{recorded}"
     );
+    assert!(recorded.contains("127.0.0.1:1"), "{recorded}");
 }
 
 #[tokio::test]
@@ -611,11 +623,18 @@ async fn a_malformed_body_is_a_typed_error_and_leaves_no_file() {
         "no partial artefact may be left behind"
     );
     assert_eq!(manager.resolve(&spec).await, None);
-    let recorded = manager.last_error().expect("a malformed body is recorded");
+    assert_eq!(
+        manager.last_error().as_deref(),
+        Some(TOKENIZER_DOWNLOAD_FAILED_CODE)
+    );
+    let recorded = manager
+        .last_error_detail()
+        .expect("a malformed body is recorded");
     assert!(
         recorded.starts_with(TOKENIZER_DOWNLOAD_FAILED_CODE),
         "{recorded}"
     );
+    assert!(recorded.contains("not a usable tokenizer"), "{recorded}");
 }
 
 /// A well-formed document whose model type this crate does not decode.
@@ -651,7 +670,15 @@ async fn a_downloaded_body_of_an_undecoded_model_type_is_a_typed_error() {
     assert!(error.message().contains("UnigramV2"), "{error}");
     assert!(error.message().contains("acme/tok"), "{error}");
     let message = error.message().into_owned();
-    assert_eq!(manager.last_error().as_deref(), Some(message.as_str()));
+    assert_eq!(
+        manager.last_error().as_deref(),
+        Some(MODEL_TYPE_UNSUPPORTED_CODE),
+        "the code is the compact one a caller matches on"
+    );
+    assert_eq!(
+        manager.last_error_detail().as_deref(),
+        Some(message.as_str())
+    );
     assert!(
         find_files(cache.path(), "tokenizer.json").is_empty(),
         "an artefact this loader cannot decode is not cached"
@@ -659,7 +686,13 @@ async fn a_downloaded_body_of_an_undecoded_model_type_is_a_typed_error() {
 
     // The resolving call reports the same typed reason instead of a silent miss.
     assert_eq!(manager.resolve(&spec).await, None);
-    let recorded = manager.last_error().expect("the model type is recorded");
+    assert_eq!(
+        manager.last_error().as_deref(),
+        Some(MODEL_TYPE_UNSUPPORTED_CODE)
+    );
+    let recorded = manager
+        .last_error_detail()
+        .expect("the model type is recorded");
     assert!(
         recorded.starts_with(MODEL_TYPE_UNSUPPORTED_CODE),
         "{recorded}"
@@ -874,12 +907,17 @@ async fn a_provider_official_spec_names_the_vendor_and_the_tokenizer() {
     let manager = offline_manager(dir.path());
     let spec = hub_spec("provider_official", "acme/tok", TokenizerEngine::Native);
     assert_eq!(manager.resolve(&spec).await, None);
+    assert_eq!(
+        manager.last_error().as_deref(),
+        Some(PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE),
+        "the code is the compact one a caller matches on"
+    );
     let recorded = manager
-        .last_error()
+        .last_error_detail()
         .expect("the adapter message is recorded");
     assert!(
         recorded.starts_with(PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE),
-        "the message keeps its compact code: {recorded}"
+        "the detail keeps its compact code: {recorded}"
     );
     assert!(recorded.contains("acme"), "the vendor is named: {recorded}");
     assert!(
@@ -893,7 +931,15 @@ async fn a_provider_official_spec_names_the_vendor_and_the_tokenizer() {
 
     // The synchronous rung reports the same reason.
     assert_eq!(manager.resolve_cached(&spec), None);
-    assert_eq!(manager.last_error().as_deref(), Some(recorded.as_str()));
+    assert_eq!(
+        manager.last_error().as_deref(),
+        Some(PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE)
+    );
+    assert_eq!(
+        manager.last_error_detail().as_deref(),
+        Some(recorded.as_str()),
+        "the synchronous rung records the same vendor message"
+    );
 
     let enabled = manager.with_enable_download(true);
     let error = enabled.download(&spec).await.expect_err("no adapter");
@@ -1035,7 +1081,13 @@ fn a_hand_placed_artifact_of_an_undecoded_model_type_is_refused() {
     let spec = local_spec(&file, TokenizerEngine::Native);
 
     assert_eq!(manager.resolve_cached(&spec), None);
-    let recorded = manager.last_error().expect("the model type is recorded");
+    assert_eq!(
+        manager.last_error().as_deref(),
+        Some(TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE)
+    );
+    let recorded = manager
+        .last_error_detail()
+        .expect("the model type is recorded");
     assert!(
         recorded.starts_with(TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE),
         "{recorded}"
@@ -1059,7 +1111,13 @@ async fn a_hand_placed_hub_artifact_of_an_undecoded_model_type_is_refused() {
     let spec = hub_spec("huggingface", "acme/tok", TokenizerEngine::Native);
 
     assert_eq!(manager.resolve_cached(&spec), None);
-    let recorded = manager.last_error().expect("the model type is recorded");
+    assert_eq!(
+        manager.last_error().as_deref(),
+        Some(TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE)
+    );
+    let recorded = manager
+        .last_error_detail()
+        .expect("the model type is recorded");
     assert!(
         recorded.starts_with(TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE),
         "{recorded}"
@@ -1071,7 +1129,13 @@ async fn a_hand_placed_hub_artifact_of_an_undecoded_model_type_is_refused() {
 
     // The asynchronous rung refuses it for the same typed reason.
     assert_eq!(manager.resolve(&spec).await, None);
-    let recorded = manager.last_error().expect("the model type is recorded");
+    assert_eq!(
+        manager.last_error().as_deref(),
+        Some(TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE)
+    );
+    let recorded = manager
+        .last_error_detail()
+        .expect("the model type is recorded");
     assert!(
         recorded.starts_with(TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE),
         "{recorded}"
@@ -1114,9 +1178,19 @@ fn an_undecoded_artifact_degrades_with_the_named_reason() {
         warning.contains(TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE),
         "the warning names the typed error: {warning}"
     );
+    // The warning carries the compact code the manager reports; the declared
+    // model type travels with the full message.
+    let manager = selector.artifact_manager().expect("manager");
+    assert_eq!(
+        manager.last_error().as_deref(),
+        Some(TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE)
+    );
+    let detail = manager
+        .last_error_detail()
+        .expect("the refused artifact keeps its typed detail");
     assert!(
-        warning.contains("UnigramV2"),
-        "the warning carries the declared model type: {warning}"
+        detail.contains("UnigramV2"),
+        "the detail carries the declared model type: {detail}"
     );
 }
 
