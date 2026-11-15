@@ -63,6 +63,7 @@ Adapters `document::{TeamMemoryDocument, TEAM_MEMORY_FILE, truncate_for_prompt}`
 - Dependencies: `openjiuwen-{common,foundation,retrieval,sysop}`, serde/serde_json, async-trait, tokio/tokio-util, futures, tracing, uuid, chrono, parking_lot, notify, nix, regex; `sqlx` only under `sqlite`; HTTP through `openjiuwen_common::http` (no direct `reqwest`); dev: `openjiuwen-test-support`, `tempfile`, `wiremock`.
 - Features: `default = []`; `sqlite` enables `sqlx` and `openjiuwen-foundation/sqlite`. All SQL is behind it (`memory_schema_version`, `dream_jobs`, `team_memories`, fact-keyed `coding_facts_fts`); every non-`sqlite` path must compile and be tested without it.
 - Cross-process coordination is advisory file locking only (`#[cfg(unix)]` `flock` via `openjiuwen_sysop::fs::lock`; elsewhere `FileLock`/`FileKvLock` are typed `Unsupported`): no daemon, broker or background process.
+- File-tree management is fixed-layout: `lite::local::LocalCodingMemory` owns `<root>/MEMORY.md` (plus optional `USER.md`, `facts/`, `sessions/`, `daily_memory/`, `.memory/`) and every read/write is keyed by fact name, session id + date, or rollup date — no API reads or writes an arbitrary path under the root, and none offers offset/limit reads.
 - Default features compile and test offline: no network, API key or wall-clock ordering; vendor tests use `wiremock`; `openjiuwen-test-support` is a dev-dependency only.
 
 ## Design Decisions
