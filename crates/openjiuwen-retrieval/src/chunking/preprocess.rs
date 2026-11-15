@@ -44,7 +44,7 @@ const PROTECTED_SYMBOLS: &str = "，。！？；：“”‘’（）【】《�
 /// The character run Python's redundant-symbol pattern removes.
 ///
 /// Kept public for documentation and tests; the compiled form is cached in
-/// [`redundant_run_pattern`].
+/// the private `redundant_run_pattern`.
 pub const REDUNDANT_RUN_PATTERN: &str = r"[^\w\s#*_\-|]{2,}";
 
 /// Processes text before it reaches a chunker.
@@ -76,7 +76,10 @@ impl TextPreprocessor for WhitespaceNormalizer {
         if text.is_empty() {
             return String::new();
         }
-        whitespace_pattern().replace_all(text, " ").trim().to_owned()
+        whitespace_pattern()
+            .replace_all(text, " ")
+            .trim()
+            .to_owned()
     }
 }
 
@@ -108,18 +111,21 @@ impl URLEmailRemover {
     }
 
     /// Configures whether URLs (and bare domains) are removed.
+    #[must_use]
     pub fn with_remove_urls(mut self, remove_urls: bool) -> Self {
         self.remove_urls = remove_urls;
         self
     }
 
     /// Configures whether e-mail addresses are removed.
+    #[must_use]
     pub fn with_remove_emails(mut self, remove_emails: bool) -> Self {
         self.remove_emails = remove_emails;
         self
     }
 
     /// Configures the literal replacement text.
+    #[must_use]
     pub fn with_replacement(mut self, replacement: impl Into<String>) -> Self {
         self.replacement = replacement.into();
         self
@@ -188,6 +194,7 @@ impl SpecialCharacterNormalizer {
     }
 
     /// Sets the characters removed from the text (Python's `chars_to_remove`).
+    #[must_use]
     pub fn with_chars_to_remove(mut self, chars_to_remove: impl Into<String>) -> Self {
         self.chars_to_remove = chars_to_remove.into();
         self
@@ -196,6 +203,7 @@ impl SpecialCharacterNormalizer {
     /// Sets the whole replacement map (Python's `chars_to_replace` dict).
     ///
     /// Pairs are applied in order, each as a plain substring replacement.
+    #[must_use]
     pub fn with_chars_to_replace(
         mut self,
         chars_to_replace: impl IntoIterator<Item = (String, String)>,
@@ -205,11 +213,8 @@ impl SpecialCharacterNormalizer {
     }
 
     /// Adds one `from` → `to` mapping, appended after the existing ones.
-    pub fn with_replacement(
-        mut self,
-        from: impl Into<String>,
-        to: impl Into<String>,
-    ) -> Self {
+    #[must_use]
+    pub fn with_replacement(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
         self.chars_to_replace.push((from.into(), to.into()));
         self
     }
@@ -406,7 +411,10 @@ mod tests {
     fn whitespace_normalizer_collapses_runs_and_trims() {
         let normalizer = WhitespaceNormalizer::new();
         assert_eq!(normalizer.process("This is a test"), "This is a test");
-        assert_eq!(normalizer.process("This   is    a     test"), "This is a test");
+        assert_eq!(
+            normalizer.process("This   is    a     test"),
+            "This is a test"
+        );
         assert_eq!(normalizer.process("This\nis\na\ntest"), "This is a test");
         assert_eq!(normalizer.process("This\tis\ta\ttest"), "This is a test");
         assert_eq!(
@@ -470,10 +478,7 @@ mod tests {
             "Contact test@example.io"
         );
         // A `.com` address still matches Python's bare-domain URL pattern.
-        assert_eq!(
-            emails_off.process("Contact test@example.com"),
-            "Contact "
-        );
+        assert_eq!(emails_off.process("Contact test@example.com"), "Contact ");
 
         // The replacement is inserted literally: `$` is not a group reference.
         let literal = URLEmailRemover::new().with_replacement("$1\\");
@@ -502,7 +507,7 @@ mod tests {
         assert_eq!(cleaned, "Testtextwithcontrol");
         assert_eq!(normalizer.process(""), "");
         assert_eq!(normalizer.chars_to_remove(), "");
-        assert!(normalizer.chars_to_replace().is_empty());
+        assert_eq!(normalizer.chars_to_replace().len(), 0);
     }
 
     #[test]
@@ -553,7 +558,10 @@ mod tests {
         assert_eq!(normalizer.process("!!！"), "");
         // Markdown markers are never redundant symbols.
         assert_eq!(normalizer.process("## Heading"), "## Heading");
-        assert_eq!(normalizer.process("**bold** and _italic_"), "**bold** and _italic_");
+        assert_eq!(
+            normalizer.process("**bold** and _italic_"),
+            "**bold** and _italic_"
+        );
         assert_eq!(normalizer.process("a | b | c"), "a | b | c");
         assert_eq!(normalizer.process("---"), "---");
     }
@@ -580,12 +588,12 @@ mod tests {
     #[test]
     fn pipeline_order_is_observable() {
         let mut pipeline = PreprocessingPipeline::default();
-        pipeline.add_preprocessor(Box::new(SpecialCharacterNormalizer::new().with_replacement(
-            "a", "b",
-        )));
-        pipeline.add_preprocessor(Box::new(SpecialCharacterNormalizer::new().with_replacement(
-            "b", "c",
-        )));
+        pipeline.add_preprocessor(Box::new(
+            SpecialCharacterNormalizer::new().with_replacement("a", "b"),
+        ));
+        pipeline.add_preprocessor(Box::new(
+            SpecialCharacterNormalizer::new().with_replacement("b", "c"),
+        ));
         assert_eq!(pipeline.len(), 2);
         // The first preprocessor rewrites `a` to `b`, the second rewrites `b` to `c`.
         assert_eq!(pipeline.process("aaa"), "ccc");

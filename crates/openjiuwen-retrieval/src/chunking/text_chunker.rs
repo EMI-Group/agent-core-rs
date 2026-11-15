@@ -10,9 +10,7 @@ use std::str::FromStr;
 
 use openjiuwen_common::error::{Error, Result};
 
-use crate::common::{
-    Document, TextChunk, DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
-};
+use crate::common::{Document, TextChunk, DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE};
 
 use super::preprocess::PreprocessingPipeline;
 use super::{stamp_chunks, CharChunker, Chunker, TokenChunker};
@@ -65,7 +63,7 @@ impl FromStr for ChunkUnit {
 /// Fixed size chunker that preprocesses text before splitting it.
 ///
 /// Preprocessing happens here and nowhere else: [`CharChunker`],
-/// [`TokenChunker`], and [`HybridChunker`] never touch the text they receive, so
+/// [`TokenChunker`], and [`crate::chunking::HybridChunker`] never touch the text they receive, so
 /// a chunker used without this facade splits documents verbatim. An empty
 /// pipeline (the default) is therefore a plain fixed-size chunker.
 ///
@@ -128,6 +126,7 @@ impl TextChunker {
     }
 
     /// Replaces the preprocessing pipeline, keeping the window parameters.
+    #[must_use]
     pub fn with_pipeline(mut self, pipeline: PreprocessingPipeline) -> Self {
         self.pipeline = pipeline;
         self
@@ -214,7 +213,7 @@ impl fmt::Debug for TextChunker {
             .field("chunk_overlap", &self.chunk_overlap)
             .field("chunk_unit", &self.unit)
             .field("pipeline", &self.pipeline)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -268,11 +267,14 @@ mod tests {
 
     #[test]
     fn character_windows_delegate_to_the_char_chunker() {
-        let chunker = TextChunker::new(4, 0, ChunkUnit::Char, PreprocessingPipeline::default())
-            .unwrap();
+        let chunker =
+            TextChunker::new(4, 0, ChunkUnit::Char, PreprocessingPipeline::default()).unwrap();
         assert_eq!(
             chunker.chunk_text("abcdefgh").unwrap(),
-            CharChunker::new(4, 0).unwrap().chunk_text("abcdefgh").unwrap()
+            CharChunker::new(4, 0)
+                .unwrap()
+                .chunk_text("abcdefgh")
+                .unwrap()
         );
         assert_eq!(chunker.chunk_text("abcdefgh").unwrap(), ["abcd", "efgh"]);
     }
@@ -283,8 +285,8 @@ mod tests {
             TextChunker::new(2, 0, ChunkUnit::Token, PreprocessingPipeline::default()).unwrap();
         assert_eq!(chunker.chunk_text("a b c").unwrap(), ["a b", "c"]);
         assert_eq!(chunker.chunk_unit(), ChunkUnit::Token);
-        let with_overlap = TextChunker::new(3, 1, ChunkUnit::Token, PreprocessingPipeline::default())
-            .unwrap();
+        let with_overlap =
+            TextChunker::new(3, 1, ChunkUnit::Token, PreprocessingPipeline::default()).unwrap();
         assert_eq!(with_overlap.chunk_size(), 3);
         assert_eq!(with_overlap.chunk_overlap(), 1);
     }
@@ -309,7 +311,9 @@ mod tests {
         let pipeline = PreprocessingPipeline::new(vec![Box::new(URLEmailRemover::new())]);
         let chunker = TextChunker::new(2, 0, ChunkUnit::Token, pipeline).unwrap();
         assert_eq!(
-            chunker.chunk_text("one http://example.com two three").unwrap(),
+            chunker
+                .chunk_text("one http://example.com two three")
+                .unwrap(),
             ["one two", "three"]
         );
     }
@@ -359,7 +363,7 @@ mod tests {
         let chunks = chunker
             .chunk_documents(&[Document::with_id("doc-1", "abc")])
             .unwrap();
-        assert!(chunks.is_empty());
+        assert_eq!(chunks, Vec::<TextChunk>::new());
         assert_eq!(chunker.chunk_text("abc").unwrap(), Vec::<String>::new());
     }
 
@@ -368,7 +372,9 @@ mod tests {
         let chunker = TextChunker::from_options(32, 0, ChunkUnit::Char, true, true).unwrap();
         assert_eq!(chunker.pipeline().len(), 2);
         assert_eq!(
-            chunker.chunk_text("Visit   http://example.com   now").unwrap(),
+            chunker
+                .chunk_text("Visit   http://example.com   now")
+                .unwrap(),
             ["Visit  now"]
         );
         let plain = TextChunker::from_options(32, 0, ChunkUnit::Char, false, false).unwrap();
@@ -378,11 +384,9 @@ mod tests {
     #[test]
     fn invalid_windows_are_rejected_for_both_units() {
         for unit in [ChunkUnit::Char, ChunkUnit::Token] {
-            let error =
-                TextChunker::new(0, 0, unit, PreprocessingPipeline::default()).unwrap_err();
+            let error = TextChunker::new(0, 0, unit, PreprocessingPipeline::default()).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::Validation);
-            let error =
-                TextChunker::new(4, 4, unit, PreprocessingPipeline::default()).unwrap_err();
+            let error = TextChunker::new(4, 4, unit, PreprocessingPipeline::default()).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::Validation);
         }
     }

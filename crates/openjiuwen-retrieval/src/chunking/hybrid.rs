@@ -138,7 +138,8 @@ mod tests {
     fn default_predicate_matches_row_and_column_units_only() {
         let row = Document::with_id("1", "a").metadata_entry("source_type", json!("row"));
         let column = Document::with_id("2", "a").metadata_entry("source_type", json!("column"));
-        let paragraph = Document::with_id("3", "a").metadata_entry("source_type", json!("paragraph"));
+        let paragraph =
+            Document::with_id("3", "a").metadata_entry("source_type", json!("paragraph"));
         let titled = Document::with_id("4", "a").metadata_entry("title", json!("hello"));
         let bare = Document::with_id("5", "a");
         assert!(default_no_split(&row));
@@ -206,7 +207,9 @@ mod tests {
             "This is a long document that should be split into multiple chunks by the inner chunker",
         )
         .metadata_entry("title", json!("test"));
-        let chunks = chunker.chunk_documents(&[document.clone()]).unwrap();
+        let chunks = chunker
+            .chunk_documents(std::slice::from_ref(&document))
+            .unwrap();
         let inner_chunks = CharChunker::new(10, 2)
             .unwrap()
             .chunk_documents(&[document])
@@ -239,8 +242,10 @@ mod tests {
             Document::with_id("col1", "列名: 部门").metadata_entry("source_type", json!("column")),
         ];
         let chunks = chunker.chunk_documents(&documents).unwrap();
-        let row_chunks: Vec<&TextChunk> =
-            chunks.iter().filter(|chunk| chunk.doc_id == "row1").collect();
+        let row_chunks: Vec<&TextChunk> = chunks
+            .iter()
+            .filter(|chunk| chunk.doc_id == "row1")
+            .collect();
         let column_chunks: Vec<&TextChunk> = chunks
             .iter()
             .filter(|chunk| chunk.doc_id == "col1")
@@ -252,8 +257,14 @@ mod tests {
         assert_eq!(row_chunks.len(), 1);
         assert_eq!(column_chunks.len(), 1);
         assert!(document_chunks.len() > 1);
-        assert_eq!(chunks.first().map(|chunk| chunk.doc_id.as_str()), Some("row1"));
-        assert_eq!(chunks.last().map(|chunk| chunk.doc_id.as_str()), Some("col1"));
+        assert_eq!(
+            chunks.first().map(|chunk| chunk.doc_id.as_str()),
+            Some("row1")
+        );
+        assert_eq!(
+            chunks.last().map(|chunk| chunk.doc_id.as_str()),
+            Some("col1")
+        );
     }
 
     #[test]
@@ -263,7 +274,9 @@ mod tests {
         for text in ["   ", ""] {
             let document =
                 Document::with_id("row1", text).metadata_entry("source_type", json!("row"));
-            let chunks = chunker.chunk_documents(std::slice::from_ref(&document)).unwrap();
+            let chunks = chunker
+                .chunk_documents(std::slice::from_ref(&document))
+                .unwrap();
             let inner_chunks = inner
                 .chunk_documents(std::slice::from_ref(&document))
                 .unwrap();
@@ -278,10 +291,10 @@ mod tests {
             assert_eq!(texts, inner_texts);
         }
         let empty = Document::with_id("row1", "").metadata_entry("source_type", json!("row"));
-        assert!(chunker
+        let empty_chunks = chunker
             .chunk_documents(std::slice::from_ref(&empty))
-            .unwrap()
-            .is_empty());
+            .unwrap();
+        assert_eq!(empty_chunks, Vec::<TextChunk>::new());
     }
 
     #[test]
@@ -307,6 +320,6 @@ mod tests {
     #[test]
     fn empty_input_yields_no_chunks() {
         let chunks = hybrid(512, 50).chunk_documents(&[]).unwrap();
-        assert!(chunks.is_empty());
+        assert_eq!(chunks, Vec::<TextChunk>::new());
     }
 }

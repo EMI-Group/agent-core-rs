@@ -3,7 +3,8 @@
 //!
 //! Ports the behavior of the Python chunker tests in
 //! `tests/unit_tests/core/retrieval/indexing/chunker/` (`test_char_chunker.py`,
-//! the recursive splitter, and the chunker registry) plus the chunk-stamping
+//! the recursive splitter, the chunker registry, `test_hybrid_chunker.py`,
+//! `test_text_preprocessor.py`, and `test_chunking.py`) plus the chunk-stamping
 //! contract of the base `Chunker.chunk_documents`.
 //! Every assertion is offline and deterministic: generated ids are only checked
 //! for shape and uniqueness, never for a concrete value.
@@ -15,6 +16,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use openjiuwen_common::error::{ErrorKind, Result};
+use openjiuwen_retrieval::chunking::{
+    default_no_split, ChunkUnit, HybridChunker, PreprocessingPipeline, SpecialCharacterNormalizer,
+    TextChunker, TextPreprocessor, URLEmailRemover, WhitespaceNormalizer,
+};
 use openjiuwen_retrieval::{
     CharChunker, Chunker, ChunkerFactory, ChunkerRegistry, Document, RecursiveCharChunker,
     TextChunk, TokenChunker, DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
@@ -51,6 +56,36 @@ fn assert_all_within_char_budget(chunks: &[String], size: usize) {
 /// Asserts chunk metadata carries the documented stamping keys.
 fn stamped_u64(chunk: &TextChunk, key: &str) -> Option<u64> {
     chunk.metadata.get(key).and_then(Value::as_u64)
+}
+
+/// A `HybridChunker` over character windows, using the default no-split rule.
+fn hybrid(size: usize, overlap: usize) -> HybridChunker {
+    HybridChunker::new(Arc::new(CharChunker::new(size, overlap).unwrap()))
+}
+
+/// Asserts the `chunker_documents` stamping contract of one chunk.
+fn assert_stamped(chunk: &TextChunk, chunk_index: u64, total_chunks: u64) {
+    assert_eq!(
+        chunk.metadata.get("chunk_index"),
+        Some(&json!(chunk_index)),
+        "chunk_index of {:?}",
+        chunk.text
+    );
+    assert_eq!(
+        chunk.metadata.get("total_chunks"),
+        Some(&json!(total_chunks)),
+        "total_chunks of {:?}",
+        chunk.text
+    );
+    assert_eq!(
+        chunk.metadata.get("chunk_id"),
+        Some(&json!(chunk.id.clone()))
+    );
+    assert!(
+        Uuid::parse_str(&chunk.id).is_ok(),
+        "{} is not a uuid",
+        chunk.id
+    );
 }
 
 #[test]
@@ -261,7 +296,7 @@ fn registry_defaults_create_every_builtin_chunker() {
     let registry = ChunkerRegistry::with_defaults();
     let sample = "alpha beta gamma";
 
-    for name in ["char", "fixed", "recursive", "token"] {
+    for name in ["char", "fixed", "hybrid", "recursive", "token"] {
         assert!(registry.contains(name), "{name} must be registered");
         let chunker = registry.create(name, 5, 0).unwrap();
         assert_eq!(chunker.chunk_size(), 5, "{name} size");
@@ -291,10 +326,10 @@ fn registry_defaults_create_every_builtin_chunker() {
 fn registry_rejects_unknown_names_and_duplicate_registrations() {
     let registry = ChunkerRegistry::with_defaults();
     // `create` returns `Error::Unsupported` for an unregistered name.
-    let unknown = registry.create("hybrid", 8, 2).err().unwrap();
+    let unknown = registry.create("semantic", 8, 2).err().unwrap();
     assert_eq!(unknown.kind(), ErrorKind::Unsupported);
-    assert!(unknown.to_string().contains("unknown chunker: hybrid"));
-    assert!(!registry.contains("hybrid"));
+    assert!(unknown.to_string().contains("unknown chunker: semantic"));
+    assert!(!registry.contains("semantic"));
 
     // Registering an existing name is a validation error.
     let mut registry = ChunkerRegistry::with_defaults();
@@ -363,4 +398,473 @@ fn chunk_documents_stamps_metadata_across_documents() {
     // Chunk identifiers are fresh uuids, unique across all documents.
     let ids: HashSet<&String> = chunks.iter().map(|chunk| &chunk.id).collect();
     assert_eq!(ids.len(), chunks.len());
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid chunker, text preprocessors, and the preprocessing `TextChunker`.
+//
+// Ports `test_hybrid_chunker.py`, `test_text_preprocessor.py`, and
+// `test_chunking.py` through the public crate surface.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hybrid_chunker_keeps_row_and_column_units_whole() {
+    let chunker = hybrid(10, 2);
+    let row = Document::with_id("row-1", "  姓名: 张三, 部门: 研发, 工号: 1001  ")
+        .metadata_entry("source_type", json!("row"))
+        .metadata_entry("sheet_name", json!("Sheet1"))
+        .metadata_entry("row_index", json!(2));
+    let column = Document::with_id("col-1", " 列名: 姓名。取值: 张三, 李四, 王五 ")
+        .metadata_entry("source_type", json!("column"))
+        .metadata_entry("column_name", json!("姓名"));
+
+    // The default predicate is exactly the table-unit rule.
+    assert!(chunker.should_keep_whole(&row));
+    assert!(chunker.should_keep_whole(&column));
+    assert!(default_no_split(&row));
+    assert!(!default_no_split(&Document::with_id("doc-1", "text")));
+    assert!(!default_no_split(
+        &Document::with_id("doc-2", "text").metadata_entry("source_type", json!("paragraph"))
+    ));
+
+    let chunks = chunker.chunk_documents(&[row, column]).unwrap();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].doc_id, "row-1");
+    // The single chunk holds the trimmed document text, even though it is far
+    // longer than the ten character window.
+    assert_eq!(chunks[0].text, "姓名: 张三, 部门: 研发, 工号: 1001");
+    assert_eq!(chunks[1].doc_id, "col-1");
+    assert_eq!(chunks[1].text, "列名: 姓名。取值: 张三, 李四, 王五");
+    for chunk in &chunks {
+        assert_stamped(chunk, 0, 1);
+        assert!(chunk.embedding.is_none());
+    }
+
+    // Document metadata survives, including the keys the loaders stamp.
+    assert_eq!(chunks[0].metadata.get("source_type"), Some(&json!("row")));
+    assert_eq!(chunks[0].metadata.get("sheet_name"), Some(&json!("Sheet1")));
+    assert_eq!(chunks[0].metadata.get("row_index"), Some(&json!(2)));
+    assert_eq!(
+        chunks[1].metadata.get("source_type"),
+        Some(&json!("column"))
+    );
+    assert_eq!(chunks[1].metadata.get("column_name"), Some(&json!("姓名")));
+    assert_ne!(chunks[0].id, chunks[1].id);
+}
+
+#[test]
+fn hybrid_chunker_delegates_other_documents_with_document_relative_indices() {
+    let chunker = hybrid(10, 2);
+    let document = Document::with_id(
+        "doc-1",
+        "This is a long paragraph that the inner chunker has to split",
+    )
+    .metadata_entry("source_type", json!("paragraph"))
+    .metadata_entry("title", json!("Test"));
+    assert!(!chunker.should_keep_whole(&document));
+    assert_eq!(chunker.inner().chunk_size(), 10);
+    assert_eq!(chunker.chunk_size(), 10);
+    assert_eq!(chunker.chunk_overlap(), 2);
+
+    let chunks = chunker
+        .chunk_documents(std::slice::from_ref(&document))
+        .unwrap();
+    let inner_chunks = CharChunker::new(10, 2)
+        .unwrap()
+        .chunk_documents(&[document])
+        .unwrap();
+    assert!(chunks.len() > 1);
+    assert_eq!(chunks.len(), inner_chunks.len());
+    // Delegation is byte-identical to the inner chunker, and the indices stay
+    // document-relative.
+    assert_eq!(chunks.len(), inner_chunks.len());
+    let total = u64::try_from(chunks.len()).unwrap();
+    for (index, (chunk, inner)) in chunks.iter().zip(inner_chunks.iter()).enumerate() {
+        assert_eq!(chunk.text, inner.text);
+        assert_eq!(chunk.doc_id, "doc-1");
+        assert_stamped(chunk, u64::try_from(index).unwrap(), total);
+        assert_eq!(chunk.metadata.get("source_type"), Some(&json!("paragraph")));
+        assert_eq!(chunk.metadata.get("title"), Some(&json!("Test")));
+    }
+}
+
+#[test]
+fn hybrid_chunker_text_split_ignores_the_predicate() {
+    // The predicate only sees whole documents, so `chunk_text` is the inner split.
+    let chunker = hybrid(10, 2);
+    let text = "a text that is long enough for the inner chunker to split";
+    assert_eq!(
+        chunker.chunk_text(text).unwrap(),
+        CharChunker::new(10, 2).unwrap().chunk_text(text).unwrap()
+    );
+    assert!(chunker.chunk_text(text).unwrap().len() > 1);
+}
+
+#[test]
+fn hybrid_chunker_delegates_blank_matched_documents() {
+    let chunker = hybrid(512, 50);
+    let inner = CharChunker::new(512, 50).unwrap();
+    let spaces = Document::with_id("row-blank", "    ").metadata_entry("source_type", json!("row"));
+    assert!(chunker.should_keep_whole(&spaces));
+
+    // Nothing is trimmed: the inner chunker keeps its untrimmed window.
+    let chunks = chunker
+        .chunk_documents(std::slice::from_ref(&spaces))
+        .unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].text, "    ");
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<&str>>(),
+        inner
+            .chunk_documents(&[spaces])
+            .unwrap()
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<&str>>()
+    );
+
+    // An empty matched document yields no chunk at all.
+    let empty = Document::with_id("row-empty", "").metadata_entry("source_type", json!("row"));
+    let empty_chunks = chunker
+        .chunk_documents(std::slice::from_ref(&empty))
+        .unwrap();
+    assert_eq!(empty_chunks, Vec::<TextChunk>::new());
+}
+
+#[test]
+fn hybrid_chunker_custom_predicate_overrides_the_default() {
+    let chunker = HybridChunker::with_predicate(
+        Arc::new(CharChunker::new(10, 2).unwrap()),
+        Arc::new(|document: &Document| document.metadata.get("keep_whole") == Some(&json!(true))),
+    );
+    let keep = Document::with_id("keep", "  a short document kept whole  ")
+        .metadata_entry("keep_whole", json!(true));
+    let split = Document::with_id(
+        "split",
+        "A row document that is long enough to be split by the inner chunker",
+    )
+    .metadata_entry("source_type", json!("row"));
+
+    assert!(chunker.should_keep_whole(&keep));
+    // The default row/column rule no longer applies.
+    assert!(!chunker.should_keep_whole(&split));
+
+    let chunks = chunker.chunk_documents(&[keep, split]).unwrap();
+    let kept: Vec<&TextChunk> = chunks
+        .iter()
+        .filter(|chunk| chunk.doc_id == "keep")
+        .collect();
+    let split_chunks: Vec<&TextChunk> = chunks
+        .iter()
+        .filter(|chunk| chunk.doc_id == "split")
+        .collect();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].text, "a short document kept whole");
+    assert_stamped(kept[0], 0, 1);
+    assert!(split_chunks.len() > 1);
+    let total = u64::try_from(split_chunks.len()).unwrap();
+    for (index, chunk) in split_chunks.iter().enumerate() {
+        assert_stamped(chunk, u64::try_from(index).unwrap(), total);
+    }
+    // Input order is preserved.
+    assert_eq!(
+        chunks.first().map(|chunk| chunk.doc_id.as_str()),
+        Some("keep")
+    );
+    assert_eq!(
+        chunks.last().map(|chunk| chunk.doc_id.as_str()),
+        Some("split")
+    );
+}
+
+#[test]
+fn registry_builds_the_hybrid_chunker_from_defaults() {
+    let registry = ChunkerRegistry::with_defaults();
+    assert!(registry.contains("hybrid"));
+    assert!(registry.contains(" HYBRID "));
+
+    let chunker = registry.create("hybrid", 12, 3).unwrap();
+    assert_eq!(chunker.chunk_size(), 12);
+    assert_eq!(chunker.chunk_overlap(), 3);
+
+    // The factory wraps a character window with the default no-split rule.
+    let row = Document::with_id(
+        "row-1",
+        "  a row that is much longer than the twelve character window  ",
+    )
+    .metadata_entry("source_type", json!("row"));
+    let chunks = chunker.chunk_documents(std::slice::from_ref(&row)).unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0].text,
+        "a row that is much longer than the twelve character window"
+    );
+    assert_stamped(&chunks[0], 0, 1);
+
+    // A non-table document goes through the character window.
+    let text = "alpha beta gamma";
+    let alias = registry.create(" HYBRID ", 5, 0).unwrap();
+    assert_eq!(alias.chunk_size(), 5);
+    assert_eq!(alias.chunk_overlap(), 0);
+    assert_eq!(
+        alias.chunk_text(text).unwrap(),
+        ["alpha", " beta", " gamm", "a"]
+    );
+}
+
+#[test]
+fn whitespace_normalizer_collapses_runs_and_trims_the_ends() {
+    let normalizer = WhitespaceNormalizer::new();
+    assert_eq!(normalizer.process("This is a test"), "This is a test");
+    assert_eq!(
+        normalizer.process("  This \t is\n\n a   test  "),
+        "This is a test"
+    );
+    assert_eq!(normalizer.process("\t\n "), "");
+    assert_eq!(normalizer.process(""), "");
+}
+
+#[test]
+fn url_email_remover_drops_urls_domains_and_mail_addresses() {
+    let remover = URLEmailRemover::new();
+    assert!(remover.remove_urls());
+    assert!(remover.remove_emails());
+    assert_eq!(remover.replacement(), "");
+    assert_eq!(
+        remover.process("Visit https://example.com/docs today"),
+        "Visit  today"
+    );
+    assert_eq!(
+        remover.process("See www.example.org for more"),
+        "See  for more"
+    );
+    // A bare domain without a scheme is removed as well.
+    assert_eq!(remover.process("See example.com for more"), "See  for more");
+    assert_eq!(
+        remover.process("Contact test@example.com today"),
+        "Contact  today"
+    );
+    assert_eq!(remover.process(""), "");
+
+    // The replacement text is inserted literally, never as an expansion template.
+    let tagged = URLEmailRemover::new().with_replacement("[gone]");
+    assert_eq!(tagged.replacement(), "[gone]");
+    assert_eq!(
+        tagged.process("Visit http://example.com now"),
+        "Visit [gone] now"
+    );
+    let literal = URLEmailRemover::new().with_replacement("$$");
+    assert_eq!(
+        literal.process("Visit http://example.com now"),
+        "Visit $$ now"
+    );
+
+    let emails_only = URLEmailRemover::new().with_remove_urls(false);
+    assert!(!emails_only.remove_urls());
+    assert!(emails_only.remove_emails());
+    assert_eq!(
+        emails_only.process("mail test@example.com about example.com"),
+        "mail  about example.com"
+    );
+}
+
+#[test]
+fn special_character_normalizer_strips_control_and_redundant_symbols() {
+    let normalizer = SpecialCharacterNormalizer::new();
+    assert_eq!(normalizer.chars_to_remove(), "");
+    assert_eq!(normalizer.chars_to_replace().len(), 0);
+
+    // Control characters go first.
+    assert_eq!(normalizer.process("a\u{0}b\u{1F}c\u{7F}d"), "abcd");
+    // Runs of two or more redundant symbols are removed; a single one is kept.
+    assert_eq!(normalizer.process("hello!!!world"), "helloworld");
+    assert_eq!(normalizer.process("a~~~b"), "ab");
+    assert_eq!(normalizer.process("hello!world"), "hello!world");
+    assert_eq!(normalizer.process("a~b"), "a~b");
+
+    // CJK punctuation at the start of a run is protected, its removable suffix
+    // still goes away.
+    assert_eq!(normalizer.process("你好！！世界"), "你好！！世界");
+    assert_eq!(normalizer.process("你好！！！!!!"), "你好！！！");
+    assert_eq!(normalizer.process("看，。！"), "看，。！");
+
+    // Markdown markers are never redundant symbols.
+    assert_eq!(normalizer.process("## Heading"), "## Heading");
+    assert_eq!(
+        normalizer.process("**bold** and _italic_"),
+        "**bold** and _italic_"
+    );
+    assert_eq!(normalizer.process("a | b | c"), "a | b | c");
+    assert_eq!(normalizer.process("---"), "---");
+
+    // Configured replacements run in order, then configured removals.
+    let configured = SpecialCharacterNormalizer::new()
+        .with_chars_to_remove("~")
+        .with_replacement("Mr.", "Mister");
+    assert_eq!(configured.chars_to_remove(), "~");
+    assert_eq!(
+        configured.chars_to_replace(),
+        [("Mr.".to_owned(), "Mister".to_owned())]
+    );
+    assert_eq!(configured.process("Mr. Smith~"), "Mister Smith");
+    let mapped = SpecialCharacterNormalizer::new().with_chars_to_replace([
+        ("a".to_owned(), "A".to_owned()),
+        ("A".to_owned(), "b".to_owned()),
+    ]);
+    assert_eq!(mapped.process("aaa"), "bbb");
+}
+
+#[test]
+fn pipeline_applies_preprocessors_in_order_and_from_options_counts_them() {
+    let ordered = PreprocessingPipeline::new(vec![
+        Box::new(SpecialCharacterNormalizer::new().with_replacement("a", "b")),
+        Box::new(SpecialCharacterNormalizer::new().with_replacement("b", "c")),
+    ]);
+    assert_eq!(ordered.len(), 2);
+    assert!(!ordered.is_empty());
+    // The first stage's output feeds the second stage.
+    assert_eq!(ordered.process("aaa"), "ccc");
+
+    let reversed = PreprocessingPipeline::new(vec![
+        Box::new(SpecialCharacterNormalizer::new().with_replacement("b", "c")),
+        Box::new(SpecialCharacterNormalizer::new().with_replacement("a", "b")),
+    ]);
+    assert_eq!(reversed.process("aaa"), "bbb");
+
+    // Whitespace collapse first, then URL removal, so the surrounding spaces stay.
+    let mut pipeline = PreprocessingPipeline::new(vec![Box::new(WhitespaceNormalizer::new())]);
+    pipeline.add_preprocessor(Box::new(URLEmailRemover::new()));
+    assert_eq!(pipeline.len(), 2);
+    assert_eq!(
+        pipeline.process("Visit   http://example.com   now"),
+        "Visit  now"
+    );
+
+    assert!(PreprocessingPipeline::from_options(false, false).is_empty());
+    assert_eq!(PreprocessingPipeline::from_options(false, false).len(), 0);
+    assert_eq!(PreprocessingPipeline::from_options(true, false).len(), 1);
+    assert_eq!(PreprocessingPipeline::from_options(false, true).len(), 1);
+    let both = PreprocessingPipeline::from_options(true, true);
+    assert_eq!(both.len(), 2);
+    assert_eq!(
+        both.process("Visit   http://example.com   now"),
+        "Visit  now"
+    );
+
+    // An empty pipeline is the identity.
+    assert_eq!(
+        PreprocessingPipeline::default().process("  untouched  "),
+        "  untouched  "
+    );
+}
+
+#[test]
+fn text_chunker_preprocesses_before_char_windowing() {
+    let chunker = TextChunker::new(
+        4,
+        0,
+        ChunkUnit::Char,
+        PreprocessingPipeline::from_options(true, false),
+    )
+    .unwrap();
+    assert_eq!(chunker.chunk_unit(), ChunkUnit::Char);
+    assert_eq!(chunker.chunk_size(), 4);
+    assert_eq!(chunker.chunk_overlap(), 0);
+    assert_eq!(chunker.pipeline().len(), 1);
+
+    let chunks = chunker.chunk_text("abc   def\t\tghi").unwrap();
+    assert_eq!(chunks, ["abc ", "def ", "ghi"]);
+    // The windows are taken over the preprocessed text.
+    assert_eq!(chunks.concat(), "abc def ghi");
+}
+
+#[test]
+fn text_chunker_preprocesses_before_token_windowing() {
+    let pipeline = PreprocessingPipeline::new(vec![Box::new(URLEmailRemover::new())]);
+    let chunker = TextChunker::new(2, 0, ChunkUnit::Token, pipeline).unwrap();
+    assert_eq!(chunker.chunk_unit(), ChunkUnit::Token);
+    assert_eq!(
+        chunker
+            .chunk_text("one http://example.com two three")
+            .unwrap(),
+        ["one two", "three"]
+    );
+
+    // The same pipeline built through the option flags.
+    let mail = TextChunker::from_options(3, 1, ChunkUnit::Token, false, true).unwrap();
+    assert_eq!(
+        mail.chunk_text("one test@example.com two three four")
+            .unwrap(),
+        ["one two three", "three four"]
+    );
+}
+
+#[test]
+fn text_chunker_stamps_chunks_per_document() {
+    let chunker = TextChunker::new(
+        4,
+        0,
+        ChunkUnit::Char,
+        PreprocessingPipeline::from_options(true, false),
+    )
+    .unwrap();
+    // The pipeline trims the padded document before it is split.
+    let first = Document::with_id("doc-a", "  abcdefgh  ").metadata_entry("source", json!("int"));
+    let second = Document::with_id("doc-b", "uvwxyz");
+
+    let chunks = chunker.chunk_documents(&[first, second]).unwrap();
+    let texts: Vec<&str> = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
+    assert_eq!(texts, ["abcd", "efgh", "uvwx", "yz"]);
+    let doc_ids: Vec<&str> = chunks.iter().map(|chunk| chunk.doc_id.as_str()).collect();
+    assert_eq!(doc_ids, ["doc-a", "doc-a", "doc-b", "doc-b"]);
+    let indexes: Vec<Option<u64>> = chunks
+        .iter()
+        .map(|chunk| stamped_u64(chunk, "chunk_index"))
+        .collect();
+    assert_eq!(indexes, [Some(0), Some(1), Some(0), Some(1)]);
+
+    for (chunk, (index, total)) in chunks.iter().zip([(0, 2), (1, 2), (0, 2), (1, 2)]) {
+        assert_stamped(chunk, index, total);
+        assert!(chunk.embedding.is_none());
+    }
+    assert_eq!(chunks[0].metadata.get("source"), Some(&json!("int")));
+    let ids: HashSet<&String> = chunks.iter().map(|chunk| &chunk.id).collect();
+    assert_eq!(ids.len(), chunks.len());
+}
+
+#[test]
+fn text_chunker_default_is_a_plain_char_window_and_pipelines_can_empty_a_document() {
+    let plain = TextChunker::default();
+    assert_eq!(plain.chunk_size(), DEFAULT_CHUNK_SIZE);
+    assert_eq!(plain.chunk_overlap(), DEFAULT_CHUNK_OVERLAP);
+    assert_eq!(plain.chunk_unit(), ChunkUnit::Char);
+    assert!(plain.pipeline().is_empty());
+    assert_eq!(plain.chunk_text("abcdefgh").unwrap(), ["abcdefgh"]);
+
+    // A pipeline that removes the whole text leaves no chunk behind.
+    let pipeline = PreprocessingPipeline::new(vec![Box::new(
+        SpecialCharacterNormalizer::new().with_chars_to_remove("abc"),
+    )]);
+    let chunker = TextChunker::new(4, 0, ChunkUnit::Char, pipeline).unwrap();
+    let removed = chunker
+        .chunk_documents(&[Document::with_id("doc-1", "abc")])
+        .unwrap();
+    assert_eq!(removed, Vec::<TextChunk>::new());
+    assert_eq!(chunker.chunk_text("abc").unwrap(), Vec::<String>::new());
+
+    // So does whitespace-only input once the whitespace is normalized away.
+    let trimming = TextChunker::new(
+        4,
+        0,
+        ChunkUnit::Char,
+        PreprocessingPipeline::from_options(true, false),
+    )
+    .unwrap();
+    let blank = trimming
+        .chunk_documents(&[Document::with_id("doc-2", " \n\t ")])
+        .unwrap();
+    assert_eq!(blank, Vec::<TextChunk>::new());
 }
