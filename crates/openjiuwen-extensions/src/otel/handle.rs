@@ -16,7 +16,7 @@
 //!   [`ExporterType::None`] return an inactive handle: that is the documented
 //!   no-op seam, and [`TracerHandle::is_active`] returning `false` is its
 //!   signal. [`ExporterType::Otlp`] and [`ExporterType::File`] answer
-//!   [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported)
+//!   [the unsupported error](openjiuwen_common::error::Error::Unsupported)
 //!   instead, naming the missing `otel` cargo feature: a collector endpoint or
 //!   a traces directory is a request to export telemetry, and this build has
 //!   no provider and no exporter to serve it, so those two never degrade
@@ -297,8 +297,7 @@ impl TracerHandle {
 /// Initializes the tracer, without the `otel` feature.
 ///
 /// The configuration is validated first, so an invalid setting (for example a
-/// `sample_rate` outside `0.0..=1.0`) answers
-/// [`Error::Validation`](openjiuwen_common::error::Error::Validation) for every
+/// `sample_rate` outside `0.0..=1.0`) answers [`Error::Validation`] for every
 /// exporter type. The exporter type then decides:
 ///
 /// - [`ExporterType::Memory`], [`ExporterType::Console`] and
@@ -307,10 +306,9 @@ impl TracerHandle {
 ///   documented no-op seam — without the SDK there is no in-process capture and
 ///   no console sink to attach;
 /// - [`ExporterType::Otlp`] and [`ExporterType::File`] answer
-///   [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported),
-///   naming the missing `otel` cargo feature and the exporter types that do
-///   work here. Neither a collector endpoint nor a traces directory is ever
-///   accepted and silently ignored.
+///   [`Error::Unsupported`], naming the missing `otel` cargo feature and the
+///   exporter types that do work here. Neither a collector endpoint nor a
+///   traces directory is ever accepted and silently ignored.
 ///
 /// # Errors
 ///
