@@ -38,17 +38,18 @@
 //! table — lives in the private `mapping` module so this file stays a client
 //! plus the shared helpers.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::http::{HttpClient, HttpClientConfig, HttpRequest, HttpResponse};
 use openjiuwen_common::security::SecretString;
 
-use crate::store::document::validate_collection;
+use crate::store::document::{validate_collection, SortOrder};
 use crate::store::vector::Metric;
 
 pub mod document;
@@ -83,6 +84,9 @@ pub(crate) const ERROR_BODY_EXCERPT: usize = 200;
 /// silently truncated result; the cap is Elasticsearch's default
 /// `index.max_result_window`.
 pub(crate) const MAX_SCAN_DOCUMENTS: usize = 10_000;
+
+/// `tracing` target of the warnings of both adapters.
+const LOG_TARGET: &str = "openjiuwen_foundation::store::external::elasticsearch";
 
 /// Configuration of an Elasticsearch backend.
 ///
@@ -338,6 +342,109 @@ impl ElasticsearchClient {
             Err(failure(&response, context))
         }
     }
+
+    /// Runs one [`SearchScan`], handing every page of fresh hits to `on_page`.
+    ///
+    /// Every request asks for at most [`SEARCH_PAGE_SIZE`] documents sorted by
+    /// the scan's `sort` and continues from the `sort` values of the previous
+    /// page, so a deep read costs one request per page instead of deep
+    /// `from`/`size` paging. Hits repeated across pages are dropped before
+    /// `on_page` sees them, and a missing index (404) reads as no documents.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Validation` when a full page carries no `sort` values (paging
+    /// cannot continue) or repeats documents (the cursor does not advance), and
+    /// `Error::Unsupported` — after a `tracing::warn!` naming the cap and the
+    /// filter — when the scan would need more than [`MAX_SCAN_DOCUMENTS`]
+    /// documents, rather than reporting the matches of a truncated window.
+    pub(crate) async fn scan<F>(&self, scan: SearchScan<'_>, mut on_page: F) -> Result<()>
+    where
+        F: FnMut(Vec<SearchHit>) -> Result<()>,
+    {
+        let SearchScan {
+            index,
+            query,
+            sort,
+            needed,
+            filter,
+        } = scan;
+        let path = self.path(index, "/_search");
+        // The read stops one document past the cap, which is what tells "exactly
+        // the cap" apart from "more than the cap".
+        let stop = needed
+            .unwrap_or(usize::MAX)
+            .min(MAX_SCAN_DOCUMENTS.saturating_add(1));
+        let mut gathered = 0usize;
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut cursor: Option<Value> = None;
+        while gathered < stop {
+            let size = SEARCH_PAGE_SIZE.min(stop - gathered);
+            let mut body = json!({
+                "query": &query,
+                "_source": true,
+                "size": size,
+                "sort": &sort,
+            });
+            if let (Some(cursor), Some(object)) = (&cursor, body.as_object_mut()) {
+                object.insert("search_after".to_string(), cursor.clone());
+            }
+            let response = self
+                .send_raw(HttpRequest::post(self.url(&path)).json(&body)?)
+                .await?;
+            match response.status {
+                404 => break,
+                200..=299 => {}
+                _ => return Err(failure(&response, "paging documents")),
+            }
+            let (page, next) = search_hits(&response.json()?)?;
+            let page_len = page.len();
+            let fresh: Vec<SearchHit> = page
+                .into_iter()
+                .filter(|hit| seen.insert(hit.id.clone()))
+                .collect();
+            let fresh_len = fresh.len();
+            if !fresh.is_empty() {
+                on_page(fresh)?;
+            }
+            gathered += fresh_len;
+            if page_len < size {
+                // A short page is the last one.
+                break;
+            }
+            if gathered >= stop {
+                break;
+            }
+            if fresh_len == 0 {
+                return Err(Error::validation(format!(
+                    "Elasticsearch paging of index `{index}` did not advance: the page after \
+                     `search_after` {cursor:?} repeated documents (filter: {filter})"
+                )));
+            }
+            let Some(next) = next else {
+                return Err(Error::validation(format!(
+                    "Elasticsearch paging of index `{index}` cannot continue: a full page carries \
+                     no `sort` values for `search_after` (filter: {filter})"
+                )));
+            };
+            cursor = Some(next);
+        }
+        if gathered > MAX_SCAN_DOCUMENTS {
+            tracing::warn!(
+                target: LOG_TARGET,
+                index = %index,
+                cap = MAX_SCAN_DOCUMENTS,
+                filter = %filter,
+                "an Elasticsearch read reached the supported document cap",
+            );
+            return Err(Error::unsupported(format!(
+                "Elasticsearch read of index `{index}` needs more than the supported cap of \
+                 {MAX_SCAN_DOCUMENTS} documents for filter {filter}; narrow the filter or pass an \
+                 explicit `limit`"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Trims and checks the endpoint, and rejects an empty index prefix.
@@ -443,6 +550,111 @@ pub(crate) fn encode_segment(segment: &str) -> String {
         }
     }
     encoded
+}
+
+/// One hit of a `_search` response, reduced to what both adapters need.
+pub(crate) struct SearchHit {
+    /// The document key, i.e. Elasticsearch's `_id`.
+    pub(crate) id: String,
+    /// The stored document, i.e. its `_source` object.
+    pub(crate) source: Map<String, Value>,
+}
+
+/// One `search_after` scan over one index, run by
+/// [`ElasticsearchClient::scan`].
+///
+/// Both adapters page through the shared scan, so the page size, the hard cap
+/// and the non-progress guards cannot drift between them.
+pub(crate) struct SearchScan<'a> {
+    /// Index the scan reads.
+    pub(crate) index: &'a str,
+    /// Query DSL of every request: a translated filter or `{"match_all":{}}`.
+    pub(crate) query: Value,
+    /// Total order of the scan; its last criterion must be unique per document.
+    pub(crate) sort: Value,
+    /// Documents the caller needs; `None` reads until the index is exhausted.
+    pub(crate) needed: Option<usize>,
+    /// The store-level filter, interpolated into the error messages.
+    pub(crate) filter: &'a Value,
+}
+
+/// The sort clause of a paged `_search` request: the caller's criteria plus
+/// the keyword key field as the stable tiebreaker.
+///
+/// `search_after` needs a total order that does not shift between requests, so
+/// `key_field` closes the clause whenever the caller's criteria do not already
+/// name it. Every criterion keeps its direction and places documents missing the
+/// field first for [`SortOrder::Asc`] and last for [`SortOrder::Desc`], which is
+/// the order [`run_query`](crate::store::document::run_query) produces.
+pub(crate) fn stable_sort(order_by: &[(String, SortOrder)], key_field: &str) -> Value {
+    let mut criteria: Vec<Value> = order_by
+        .iter()
+        .map(|(field, order)| {
+            let (order, missing) = match order {
+                SortOrder::Asc => ("asc", "_first"),
+                SortOrder::Desc => ("desc", "_last"),
+            };
+            let mut criterion = Map::new();
+            criterion.insert(
+                field.clone(),
+                json!({"order": order, "missing": missing, "unmapped_type": "keyword"}),
+            );
+            Value::Object(criterion)
+        })
+        .collect();
+    if !order_by.iter().any(|(field, _)| field == key_field) {
+        criteria.push(
+            json!({key_field: {"order": "asc", "missing": "_last", "unmapped_type": "keyword"}}),
+        );
+    }
+    Value::Array(criteria)
+}
+
+/// The hits of a `_search` response and the `search_after` cursor of its last
+/// hit, in the order the server returned them.
+///
+/// The cursor is the hit's `sort` value array, which is exactly what the next
+/// request has to send back; it is `None` when the server returned no `sort`
+/// values (a response that cannot be continued). A hit without an `_id` or
+/// without an object `_source` is a malformed response and fails with
+/// [`Error::Validation`].
+pub(crate) fn search_hits(payload: &Value) -> Result<(Vec<SearchHit>, Option<Value>)> {
+    let Some(hits) = payload
+        .get("hits")
+        .and_then(|hits| hits.get("hits"))
+        .and_then(Value::as_array)
+    else {
+        return Ok((Vec::new(), None));
+    };
+    let mut page: Vec<SearchHit> = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let id = hit.get("_id").and_then(Value::as_str).ok_or_else(|| {
+            Error::validation(format!(
+                "Elasticsearch search hit is missing its `_id`: {}",
+                excerpt(&hit.to_string())
+            ))
+        })?;
+        let source = hit
+            .get("_source")
+            .and_then(Value::as_object)
+            .cloned()
+            .ok_or_else(|| {
+                Error::validation(format!(
+                    "Elasticsearch search hit {id:?} has no object `_source`: {}",
+                    excerpt(&hit.to_string())
+                ))
+            })?;
+        page.push(SearchHit {
+            id: id.to_string(),
+            source,
+        });
+    }
+    let cursor = hits
+        .last()
+        .and_then(|hit| hit.get("sort"))
+        .filter(|sort| sort.is_array())
+        .cloned();
+    Ok((page, cursor))
 }
 
 #[cfg(test)]

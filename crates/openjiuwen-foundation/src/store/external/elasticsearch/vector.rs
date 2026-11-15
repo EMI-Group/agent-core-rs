@@ -64,8 +64,8 @@ use openjiuwen_common::http::{HttpClient, HttpRequest};
 
 use super::query::translate;
 use super::{
-    create_index_body, failure, index_names_from, schema_from_index, ElasticsearchClient,
-    ElasticsearchConfig, SEARCH_PAGE_SIZE,
+    create_index_body, failure, index_names_from, schema_from_index, stable_sort,
+    ElasticsearchClient, ElasticsearchConfig, SearchScan, LOG_TARGET, MAX_SCAN_DOCUMENTS,
 };
 use crate::store::vector::{
     collection_not_found, CollectionSchema, FieldSchema, VectorDataType, VectorQuery,
@@ -169,31 +169,55 @@ impl ElasticsearchVectorStore {
     }
 
     /// Collects, page by page, the ids of the documents `filters` matches.
-    async fn collect_matching_ids(&self, index: &str, filters: &Value) -> Result<BTreeSet<String>> {
+    ///
+    /// The service cannot express `filters`, so the scan reads the whole index
+    /// with `{"match_all": {}}` through the shared [`SearchScan`] — at most
+    /// [`SEARCH_PAGE_SIZE`](super::SEARCH_PAGE_SIZE) documents per request,
+    /// sorted by the collection's keyword primary key and continued from the
+    /// previous page's `sort` values — and re-checks every hit locally with
+    /// [`crate::store::filter::matches`].
+    ///
+    /// # Errors
+    ///
+    /// `Error::Validation` when the schema declares no primary key or the scan
+    /// stops advancing, and `Error::Unsupported` — after a `tracing::warn!`
+    /// naming the cap and the filter — when the collection needs more than
+    /// [`MAX_SCAN_DOCUMENTS`] documents, rather than deleting a truncated set.
+    async fn collect_matching_ids(
+        &self,
+        index: &str,
+        schema: &CollectionSchema,
+        filters: &Value,
+    ) -> Result<BTreeSet<String>> {
+        let primary = primary_key_field(schema)?;
+        tracing::warn!(
+            target: LOG_TARGET,
+            index = %index,
+            filter = %filters,
+            cap = MAX_SCAN_DOCUMENTS,
+            "a filter Elasticsearch cannot express falls back to a local scan",
+        );
         let mut collected: BTreeSet<String> = BTreeSet::new();
-        let mut offset = 0usize;
-        loop {
-            let body = json!({
-                "query": {"match_all": {}},
-                "_source": true,
-                "size": SEARCH_PAGE_SIZE,
-                "from": offset,
-                "sort": ["_doc"],
-            });
-            let payload = self.send_search(index, &body).await?;
-            let page = page_hits(&payload);
-            let fresh = page
-                .iter()
-                .filter(|(id, source)| {
-                    crate::store::filter::matches(filters, &Value::Object(source.clone()))
-                        && collected.insert(id.clone())
-                })
-                .count();
-            if page.len() < SEARCH_PAGE_SIZE || fresh == 0 {
-                return Ok(collected);
-            }
-            offset += page.len();
-        }
+        self.client
+            .scan(
+                SearchScan {
+                    index,
+                    query: json!({"match_all": {}}),
+                    sort: stable_sort(&[], &primary.name),
+                    needed: None,
+                    filter: filters,
+                },
+                |page| {
+                    for hit in page {
+                        if crate::store::filter::matches(filters, &Value::Object(hit.source)) {
+                            collected.insert(hit.id);
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
+        Ok(collected)
     }
 
     /// Deletes the documents `keys` with one bulk request, counting the removals.
@@ -371,10 +395,10 @@ impl VectorStore for ElasticsearchVectorStore {
 
     async fn delete_docs_by_filters(&self, collection: &str, filters: &Value) -> Result<usize> {
         let index = self.client.index_name(collection)?;
-        if !self.collection_exists(collection).await? {
-            return Err(collection_not_found(collection));
-        }
         if let Some(query) = translate(filters) {
+            if !self.collection_exists(collection).await? {
+                return Err(collection_not_found(collection));
+            }
             let body = json!({"query": query});
             let request = HttpRequest::post(
                 self.client
@@ -389,7 +413,10 @@ impl VectorStore for ElasticsearchVectorStore {
                 .and_then(|deleted| usize::try_from(deleted).ok())
                 .unwrap_or(0));
         }
-        let keys = self.collect_matching_ids(&index, filters).await?;
+        // The local fallback orders the scan by the primary key, so it needs the
+        // schema; a missing collection is reported here as not found.
+        let schema = self.require_schema(collection).await?;
+        let keys = self.collect_matching_ids(&index, &schema, filters).await?;
         if keys.is_empty() {
             return Ok(0);
         }
@@ -444,20 +471,14 @@ struct BulkFailure {
     reason: String,
 }
 
-/// The `_id` and `_source` of every hit of a `_search` response.
-fn page_hits(payload: &Value) -> Vec<(String, Map<String, Value>)> {
-    hits_of(payload)
-        .iter()
-        .map(|hit| {
-            let id = hit.get("_id").map_or_else(String::new, id_text);
-            let source = hit
-                .get("_source")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            (id, source)
-        })
-        .collect()
+/// The primary-key field of `schema`.
+///
+/// Every search and every locally filtered read orders documents by it, so a
+/// schema without a primary key cannot be served.
+fn primary_key_field(schema: &CollectionSchema) -> Result<&FieldSchema> {
+    schema
+        .primary_key()
+        .ok_or_else(|| Error::validation("collection schema declares no primary key field"))
 }
 
 /// The `hits.hits` array of a `_search` response.
@@ -531,9 +552,7 @@ fn parse_hits(
     recheck: bool,
     top_k: usize,
 ) -> Result<Vec<VectorSearchResult>> {
-    let primary = schema
-        .primary_key()
-        .ok_or_else(|| Error::validation("collection schema declares no primary key field"))?;
+    let primary = primary_key_field(schema)?;
     let mut ranked: Vec<(f32, String, Map<String, Value>)> = Vec::new();
     for hit in hits_of(payload) {
         let id = hit.get("_id").map_or_else(String::new, id_text);
@@ -621,9 +640,7 @@ fn prepare_docs(
     schema: &CollectionSchema,
     docs: Vec<Map<String, Value>>,
 ) -> Result<Vec<PreparedDoc>> {
-    let primary = schema
-        .primary_key()
-        .ok_or_else(|| Error::validation("collection schema declares no primary key field"))?;
+    let primary = primary_key_field(schema)?;
     let mut prepared: Vec<PreparedDoc> = Vec::with_capacity(docs.len());
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for (position, raw) in docs.into_iter().enumerate() {

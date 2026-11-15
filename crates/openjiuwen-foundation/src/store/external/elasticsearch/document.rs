@@ -61,8 +61,6 @@
 //! [`Error::Validation`](openjiuwen_common::error::Error) before any request is
 //! sent.
 
-use std::collections::BTreeSet;
-
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
@@ -71,12 +69,10 @@ use openjiuwen_common::http::{HttpClient, HttpRequest};
 
 use super::query;
 use super::{
-    encode_segment, failure, index_names_from, ElasticsearchClient, ElasticsearchConfig,
-    MAX_SCAN_DOCUMENTS, SEARCH_PAGE_SIZE,
+    encode_segment, failure, index_names_from, stable_sort, ElasticsearchClient,
+    ElasticsearchConfig, SearchScan, MAX_SCAN_DOCUMENTS,
 };
-use crate::store::document::{
-    matching, run_query, Document, DocumentStore, Query, SortOrder, ID_FIELD,
-};
+use crate::store::document::{matching, run_query, Document, DocumentStore, Query, ID_FIELD};
 
 #[cfg(test)]
 mod tests;
@@ -100,38 +96,6 @@ fn index_body() -> Value {
 fn is_already_exists(body: &str) -> bool {
     let lowered = body.to_lowercase();
     lowered.contains("resource_already_exists_exception") || lowered.contains("already exists")
-}
-
-/// The `sort` clause of a paged `_search` request: the caller's criteria plus
-/// the keyword primary key as the stable tiebreaker.
-///
-/// `search_after` needs a total order that does not shift between requests, so
-/// [`ID_FIELD`] closes the clause whenever the caller's criteria do not already
-/// name it. Every criterion keeps its direction and places documents missing the
-/// field first for [`SortOrder::Asc`] and last for [`SortOrder::Desc`], which is
-/// the order [`run_query`](crate::store::document::run_query) produces.
-fn stable_sort(order_by: &[(String, SortOrder)]) -> Value {
-    let mut criteria: Vec<Value> = order_by
-        .iter()
-        .map(|(field, order)| {
-            let (order, missing) = match order {
-                SortOrder::Asc => ("asc", "_first"),
-                SortOrder::Desc => ("desc", "_last"),
-            };
-            let mut criterion = Map::new();
-            criterion.insert(
-                field.clone(),
-                json!({"order": order, "missing": missing, "unmapped_type": "keyword"}),
-            );
-            Value::Object(criterion)
-        })
-        .collect();
-    if !order_by.iter().any(|(field, _)| field == ID_FIELD) {
-        criteria.push(
-            json!({ID_FIELD: {"order": "asc", "missing": "_last", "unmapped_type": "keyword"}}),
-        );
-    }
-    Value::Array(criteria)
 }
 
 /// Writes one compact JSON line of an NDJSON bulk body.
@@ -210,21 +174,26 @@ fn bulk_failure(payload: &Value, index: &str) -> Option<Error> {
     )))
 }
 
-/// Rebuilds a [`Document`] from one document source, defaulting the id.
+/// Rebuilds a [`Document`] from one `_source` object, defaulting the id.
 ///
 /// `_source` is the flat [`Document::to_value`] view; when it has no `id`
 /// member, `fallback_id` (the response's `_id`) supplies it.
+fn document_from_fields(mut fields: Map<String, Value>, fallback_id: &str) -> Result<Document> {
+    fields
+        .entry(ID_FIELD.to_string())
+        .or_insert_with(|| Value::String(fallback_id.to_string()));
+    Document::from_value(Value::Object(fields))
+}
+
+/// Rebuilds a [`Document`] from one document source, defaulting the id.
 fn document_from_source(source: &Value, fallback_id: &str) -> Result<Document> {
-    let Some(mut fields) = source.as_object().cloned() else {
+    let Some(fields) = source.as_object().cloned() else {
         return Err(Error::validation(format!(
             "Elasticsearch returned a non-object document source: {}",
             super::excerpt(&source.to_string())
         )));
     };
-    fields
-        .entry(ID_FIELD.to_string())
-        .or_insert_with(|| Value::String(fallback_id.to_string()));
-    Document::from_value(Value::Object(fields))
+    document_from_fields(fields, fallback_id)
 }
 
 /// Rebuilds a [`Document`] from one search hit or from a `GET /_doc/{id}` body.
@@ -240,40 +209,6 @@ fn document_from_body(payload: &Value, fallback_id: &str) -> Result<Document> {
         ))
     })?;
     document_from_source(source, id)
-}
-
-/// The documents of a `_search` response and the `search_after` cursor of its
-/// last hit, in the order the server returned them.
-///
-/// The cursor is the hit's `sort` value array, which is exactly what the next
-/// request has to send back; it is `None` when the server returned no `sort`
-/// values (a response that cannot be continued).
-fn search_page(payload: &Value) -> Result<(Vec<Document>, Option<Value>)> {
-    let Some(hits) = payload
-        .get("hits")
-        .and_then(|hits| hits.get("hits"))
-        .and_then(Value::as_array)
-    else {
-        return Ok((Vec::new(), None));
-    };
-    let documents = hits
-        .iter()
-        .map(|hit| {
-            let id = hit.get("_id").and_then(Value::as_str).ok_or_else(|| {
-                Error::validation(format!(
-                    "Elasticsearch search hit is missing its `_id`: {}",
-                    super::excerpt(&hit.to_string())
-                ))
-            })?;
-            document_from_body(hit, id)
-        })
-        .collect::<Result<Vec<Document>>>()?;
-    let cursor = hits
-        .last()
-        .and_then(|hit| hit.get("sort"))
-        .filter(|sort| sort.is_array())
-        .cloned();
-    Ok((documents, cursor))
 }
 
 /// The `usize` value of a numeric member of a response, `0` when absent.
@@ -363,20 +298,20 @@ impl ElasticsearchDocumentStore {
 
     /// Reads the documents of `query` with `search_after` pagination.
     ///
-    /// Every request asks for at most [`SEARCH_PAGE_SIZE`] documents sorted by
-    /// `sort` and continues from the `sort` values of the previous page, so a
-    /// deep page costs one request per page instead of deep `from`/`size`
-    /// paging. `needed` stops the read once that many documents were assembled
-    /// (`offset + limit` of a query); `None` reads until the index is exhausted.
-    /// A missing index (404) reads as no documents.
+    /// Every request asks for at most [`SEARCH_PAGE_SIZE`](super::SEARCH_PAGE_SIZE)
+    /// documents sorted by `sort` and continues from the `sort` values of the
+    /// previous page (the shared [`SearchScan`]), so a deep page costs one
+    /// request per page instead of deep `from`/`size` paging. `needed` stops the
+    /// read once that many documents were assembled (`offset + limit` of a
+    /// query); `None` reads until the index is exhausted. A missing index (404)
+    /// reads as no documents.
     ///
     /// # Errors
     ///
-    /// `Error::Validation` when a full page carries no `sort` values (paging
-    /// cannot continue) or repeats documents (the cursor does not advance), and
-    /// `Error::Unsupported` — after a `tracing::warn!` naming the cap and the
-    /// filter — when the read would need more than [`MAX_SCAN_DOCUMENTS`]
-    /// documents, rather than returning a silently truncated list.
+    /// Propagates the paging errors of [`ElasticsearchClient::scan`] — the
+    /// non-progress guards and the
+    /// [`MAX_SCAN_DOCUMENTS`](super::MAX_SCAN_DOCUMENTS) cap — and the document
+    /// parsing errors of a malformed hit.
     async fn paged_documents(
         &self,
         index: &str,
@@ -385,79 +320,24 @@ impl ElasticsearchDocumentStore {
         needed: Option<usize>,
         filter: &Value,
     ) -> Result<Vec<Document>> {
-        let path = self.client.path(index, "/_search");
-        // The read stops one document past the cap, which is what tells "exactly
-        // the cap" apart from "more than the cap".
-        let stop = needed
-            .unwrap_or(usize::MAX)
-            .min(MAX_SCAN_DOCUMENTS.saturating_add(1));
         let mut documents: Vec<Document> = Vec::new();
-        let mut seen: BTreeSet<String> = BTreeSet::new();
-        let mut cursor: Option<Value> = None;
-        while documents.len() < stop {
-            let size = SEARCH_PAGE_SIZE.min(stop - documents.len());
-            let mut body = json!({
-                "query": query,
-                "_source": true,
-                "size": size,
-                "sort": sort,
-            });
-            if let (Some(cursor), Some(object)) = (&cursor, body.as_object_mut()) {
-                object.insert("search_after".to_string(), cursor.clone());
-            }
-            let response = self
-                .client
-                .send_raw(HttpRequest::post(self.client.url(&path)).json(&body)?)
-                .await?;
-            match response.status {
-                404 => break,
-                200..=299 => {}
-                _ => return Err(failure(&response, "paging documents")),
-            }
-            let (page, next) = search_page(&response.json()?)?;
-            let page_len = page.len();
-            let mut fresh = 0usize;
-            for document in page {
-                if seen.insert(document.id.clone()) {
-                    documents.push(document);
-                    fresh += 1;
-                }
-            }
-            if page_len < size {
-                // A short page is the last one.
-                break;
-            }
-            if documents.len() >= stop {
-                break;
-            }
-            if fresh == 0 {
-                return Err(Error::validation(format!(
-                    "Elasticsearch paging of index `{index}` did not advance: the page after \
-                     `search_after` {cursor:?} repeated documents (filter: {filter})"
-                )));
-            }
-            let Some(next) = next else {
-                return Err(Error::validation(format!(
-                    "Elasticsearch paging of index `{index}` cannot continue: a full page carries \
-                     no `sort` values for `search_after` (filter: {filter})"
-                )));
-            };
-            cursor = Some(next);
-        }
-        if documents.len() > MAX_SCAN_DOCUMENTS {
-            tracing::warn!(
-                target: LOG_TARGET,
-                index = %index,
-                cap = MAX_SCAN_DOCUMENTS,
-                filter = %filter,
-                "an Elasticsearch read reached the supported document cap",
-            );
-            return Err(Error::unsupported(format!(
-                "Elasticsearch read of index `{index}` needs more than the supported cap of \
-                 {MAX_SCAN_DOCUMENTS} documents for filter {filter}; narrow the filter or pass an \
-                 explicit `limit`"
-            )));
-        }
+        self.client
+            .scan(
+                SearchScan {
+                    index,
+                    query: query.clone(),
+                    sort: sort.clone(),
+                    needed,
+                    filter,
+                },
+                |page| {
+                    for hit in page {
+                        documents.push(document_from_fields(hit.source, &hit.id)?);
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
         Ok(documents)
     }
 
@@ -485,7 +365,7 @@ impl ElasticsearchDocumentStore {
             .paged_documents(
                 index,
                 &json!({"match_all": {}}),
-                &stable_sort(&[]),
+                &stable_sort(&[], ID_FIELD),
                 None,
                 filter,
             )
@@ -591,7 +471,7 @@ impl DocumentStore for ElasticsearchDocumentStore {
             .paged_documents(
                 &index,
                 &translated,
-                &stable_sort(&query_spec.order_by),
+                &stable_sort(&query_spec.order_by, ID_FIELD),
                 query_spec
                     .limit
                     .map(|limit| query_spec.offset.saturating_add(limit)),
