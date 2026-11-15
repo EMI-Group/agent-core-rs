@@ -127,7 +127,7 @@ The mutation bank is an ordered, marker-identified list (step-by-step reasoning,
 - `iterations` counts rounds actually run (beam rounds, greedy steps, epochs, or prompt-search rounds), so an early stop is visible as a smaller number; an already-sufficient seed reports `0`.
 - `Trainer::train` is `async` although Python's is synchronous, because the instruction optimizer it drives may call a model; the reported score is always measured on the validation split so a train-overfitting candidate cannot win.
 - `num_examples == 0` is a documented no-op returning the prompt with its measured score, matching Python's "skip do example optimization" branch.
-- Python's `random.shuffle`/`random.sample` and `random.choice` strategy coin flip are replaced by seeded or deterministic selection so a run is reproducible; shuffling lives in `loader.rs` (xorshift64*) and `ParameterSearcher` repeats the same generator privately so the crate needs no random-number dependency.
+- Python's `random.shuffle`/`random.sample` and `random.choice` strategy coin flip are replaced by seeded or deterministic selection so a run is reproducible; every seeded shuffle in the module runs on the one `Rng64` xorshift64* generator in `prng.rs`, so the crate needs no random-number dependency.
 - `ParameterSearcher` never reads a variable that only exists inside its loop: an empty candidate space (every alternative is the baseline) returns the baseline with `evaluated == 0` and empty `best_cases`, where Python raises `UnboundLocalError`.
 - Scores are clamped into `0.0..=1.0` and float comparisons use a `1e-12` tolerance, so a custom scorer returning a wild value cannot panic `EvaluatedCase::new`.
 - `placeholders` and the `ensure_placeholders` repair mirror Python's `PromptAssembler` input keys and its "append the missing `{{name}}` lines" repair, without pulling in the prompt assembler.
@@ -174,7 +174,8 @@ The mutation bank is an ordered, marker-identified list (step-by-step reasoning,
 ## Routing Table
 
 - `./base.rs` → `Case`, `EvaluatedCase`, validation, JSON round-trips
-- `./loader.rs` → `CaseLoader`, seeded PRNG, shuffle, split, iteration
+- `./loader.rs` → `CaseLoader`, shuffle, split, iteration
+- `./prng.rs` → the crate-private `Rng64` xorshift64* generator and the Fisher-Yates shuffle every seeded path in the module shares
 - `./tool.rs` → `ToolStub`/`ToolStubs`, `ToolCallRecord`/`ToolTrace`, `RunTelemetry`, `RunOutcome`, tool handlers
 - `./evaluator/` → the evaluator seam with its traced/untraced and telemetry-carrying contract (`evaluator/CONTEXT.md`)
 - `./evaluator/CONTEXT.md` → evaluator intent, traced/telemetry API surface, tool-execution constraints, design decisions

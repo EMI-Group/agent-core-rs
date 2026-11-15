@@ -2,58 +2,15 @@
 //! shuffling and train/test splitting.
 //!
 //! Ports `CaseLoader` from the Python `openjiuwen/dev_tools/tune/`. The Python
-//! loader uses `random.shuffle`; here the shuffle is driven by a small,
-//! self-contained `xorshift64*` generator so the same seed always yields the
-//! same order and the crate needs no random-number dependency.
+//! loader uses `random.shuffle`; here the shuffle is driven by the module's one
+//! `Rng64` `xorshift64*` generator (in `tune::prng`) so the same seed always
+//! yields the same order and the crate needs no random-number dependency.
 
 use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::tune::base::Case;
-
-/// A deterministic `xorshift64*` generator used by [`CaseLoader::shuffle`].
-///
-/// The algorithm is Marsaglia's xorshift64 shifted through a 64-bit multiply,
-/// which is plenty for a reproducible permutation and keeps the crate free of
-/// external random-number dependencies.
-struct Rng64 {
-    /// The generator state; never zero after construction.
-    state: u64,
-}
-
-impl Rng64 {
-    /// Seed the generator; seed `0` is remapped to the golden-ratio constant
-    /// because xorshift requires a non-zero state.
-    fn new(seed: u64) -> Self {
-        Self {
-            state: if seed == 0 {
-                0x9E37_79B9_7F4A_7C15
-            } else {
-                seed
-            },
-        }
-    }
-
-    /// The next pseudo-random 64-bit word.
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.state = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    /// A pseudo-random index in `0..bound`.
-    ///
-    /// The modulo bias is irrelevant for shuffling a short case list.
-    fn below(&mut self, bound: usize) -> usize {
-        if bound <= 1 {
-            return 0;
-        }
-        (self.next_u64() % bound as u64) as usize
-    }
-}
+use crate::tune::prng::Rng64;
 
 /// A collection of tuning [`Case`]s.
 ///
@@ -116,16 +73,13 @@ impl CaseLoader {
 
     /// Returns a copy of the loader with the cases in a shuffled order.
     ///
-    /// A deterministic Fisher-Yates shuffle: the same `random_seed` always
-    /// produces the same permutation of the same cases.
+    /// A deterministic Fisher-Yates shuffle driven by the module's shared
+    /// `Rng64` generator: the same `random_seed` always produces the same
+    /// permutation of the same cases.
     #[must_use]
     pub fn shuffle(&self, random_seed: u64) -> Self {
         let mut cases = self.cases.clone();
-        let mut rng = Rng64::new(random_seed);
-        for i in (1..cases.len()).rev() {
-            let j = rng.below(i + 1);
-            cases.swap(i, j);
-        }
+        Rng64::new(random_seed).shuffle(&mut cases);
         Self { cases }
     }
 
