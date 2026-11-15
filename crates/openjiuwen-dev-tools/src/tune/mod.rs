@@ -118,6 +118,13 @@ pub use optimizer::{
     DEFAULT_POLICY_TEMPERATURE, DEFAULT_SEARCH_CANDIDATE_PROMPTS, DEFAULT_SEARCH_MAX_ITERATIONS,
 };
 pub use optimizer::{
+    describe_gradient_context, render_gradient, select_bad_cases, select_good_cases, AdoptConfig,
+    AdoptDecision, AdoptMemory, AdoptOutcome, AdoptPolicy, AdoptReason, AdoptService,
+    DeterministicGradientPolicy, GradientPolicy, DEFAULT_ADOPT_MAX_DRIFT,
+    DEFAULT_ADOPT_MIN_CORRECTNESS, DEFAULT_ADOPT_MIN_GAIN, DEFAULT_ADOPT_MIN_HISTORY,
+    DEFAULT_BAD_CASES_SAMPLE_NUM,
+};
+pub use optimizer::{
     DEFAULT_EARLY_STOP_SCORE, DEFAULT_EXAMPLE_NUM, DEFAULT_ITERATION_NUM, DEFAULT_PARALLEL_NUM,
     MAX_EXAMPLE_NUM, MAX_ITERATION_NUM, MAX_PARALLEL_NUM, MIN_EXAMPLE_NUM, MIN_ITERATION_NUM,
     MIN_PARALLEL_NUM,

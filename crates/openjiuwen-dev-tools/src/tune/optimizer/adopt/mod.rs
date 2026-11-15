@@ -40,11 +40,7 @@
 //!
 //! # Example
 //!
-//! The snippet is a usage sketch rather than a compiled doctest: it reaches the
-//! family through `openjiuwen_dev_tools::tune`, which re-exports it only once the
-//! module wiring outside this node lists it.
-//!
-//! ```text
+//! ```
 //! use openjiuwen_dev_tools::tune::{
 //!     AdoptPolicy, AdoptReason, AdoptService, PromptCandidate, PromptTaskSpec,
 //! };
@@ -79,14 +75,6 @@
 //! }
 //! ```
 
-// The family is re-exported by the optimizer facade (`pub use adopt::*;` in
-// `../optimizer.rs`), but `crate::tune` still lists its re-exports explicitly, so
-// nothing here is reachable from outside the crate yet. Keeping the real `pub`
-// visibility (rather than `pub(crate)`) is deliberate: the surface is the
-// deliverable. Both lints fall silent as soon as `crate::tune` re-exports the
-// family; this allow exists only for that window.
-#![allow(dead_code, unreachable_pub)]
-
 mod cases;
 mod gradient;
 mod memory;
@@ -98,21 +86,13 @@ mod support;
 #[cfg(test)]
 mod tests;
 
-// A `pub use` of an item nothing can reach yet counts as unused; the same missing
-// wiring as the module-level allow above, so it is silenced per statement rather
-// than for the whole module (a genuinely unused import must still warn).
-#[allow(unused_imports)]
 pub use cases::{
     describe_gradient_context, select_bad_cases, select_good_cases, DEFAULT_BAD_CASES_SAMPLE_NUM,
 };
-#[allow(unused_imports)]
 pub use gradient::{render_gradient, DeterministicGradientPolicy, GradientPolicy};
-#[allow(unused_imports)]
 pub use memory::AdoptMemory;
-#[allow(unused_imports)]
 pub use policy::{
     AdoptConfig, AdoptDecision, AdoptPolicy, AdoptReason, DEFAULT_ADOPT_MAX_DRIFT,
     DEFAULT_ADOPT_MIN_CORRECTNESS, DEFAULT_ADOPT_MIN_GAIN, DEFAULT_ADOPT_MIN_HISTORY,
 };
-#[allow(unused_imports)]
 pub use service::{AdoptOutcome, AdoptService};
