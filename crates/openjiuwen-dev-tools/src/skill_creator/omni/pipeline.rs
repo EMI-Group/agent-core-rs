@@ -2,7 +2,8 @@
 //!
 //! Ports stages 1–5 of the Python `skill_omni_creation/scripts/` without browser
 //! automation, image decoding, or binary storage: [`OmniCreation::scrape`] turns
-//! an HTML, plain-text, or `tar` page into a [`ScrapedPage`];
+//! an HTML, plain-text, `tar`, or binary-document page into a [`ScrapedPage`]
+//! (the document route lives in `documents`);
 //! [`OmniCreation::download`] fetches the bounded image and subpage candidates
 //! and applies the deterministic [`super::filter`] rules there (there is no
 //! separate filtering stage that could be skipped); [`OmniCreation::generate`]
@@ -49,6 +50,7 @@ use crate::skill_creator::{SkillBundle, SkillDefinition, SkillResource};
 use crate::util::extract_json_fence;
 
 use self::assets::{image_resource, image_target};
+use self::documents::{document_page, is_document};
 use self::page::{archive_page, html_page};
 use super::archive::{self, ArchiveFormat, ArchiveUnpacker};
 use super::fetch::Fetcher;
@@ -392,16 +394,24 @@ impl OmniCreation {
     /// URL. A `tar` body is unpacked and read as markdown: file entries with
     /// valid UTF-8 and no NUL byte in their first 512 bytes contribute text,
     /// ATX headings (`#`…`######` plus a space), and fenced code blocks; the
-    /// title is the first level-1 heading. Any other body is treated as plain
-    /// text.
+    /// title is the first level-1 heading. A resource that names a document the
+    /// kernel's retrieval loaders read (`PDF`, `DOCX`, `XLSX`, `PPTX`, `ODT`, and
+    /// the text, Markdown, `CSV`/`TSV`, and `JSON` formats — by URL suffix, else
+    /// by `content-type`) is extracted by
+    /// `documents` instead, so a usable page can come from a
+    /// binary document. An office document is a `ZIP` container, so such a
+    /// resource is dispatched to its loader before the archive reader unpacks the
+    /// package parts as text. Any other body is treated as plain text.
     ///
     /// # Errors
     ///
     /// Returns [`Error::validation`](openjiuwen_common::error::Error::validation)
-    /// for an invalid configuration or a page with no text, headings, links, or
-    /// images; [`Error::unsupported`](openjiuwen_common::error::Error::unsupported)
-    /// for a `bzip2`, `xz`, or `zstd` page input, whose decoder is not bundled
-    /// (the message names the codec); and whatever the [`Fetcher`] reports.
+    /// for an invalid configuration, a page with no text, headings, links, or
+    /// images, or a declared document format whose loader and plain-text
+    /// fallback both carry nothing (the message names the URL and the format);
+    /// [`Error::unsupported`](openjiuwen_common::error::Error::unsupported) for a
+    /// `bzip2`, `xz`, or `zstd` page input, whose decoder is not bundled (the
+    /// message names the codec); and whatever the [`Fetcher`] reports.
     pub async fn scrape(&self, url: &str) -> Result<ScrapedPage> {
         self.config.validate()?;
         let resource = self.fetcher.fetch(url).await?;
@@ -411,6 +421,20 @@ impl OmniCreation {
             resource.final_url.clone()
         };
         let page = match archive::detect(&resource.body) {
+            // An office document (`DOCX`/`XLSX`/`PPTX`/`ODT`) is itself a ZIP
+            // container, so a resource that names one is handed to its document
+            // loader instead of having the package parts unpacked as text. The
+            // archive route below stays the fallback when the name is ambiguous.
+            Some(ArchiveFormat::Zip)
+                if is_document(&final_url, resource.content_type.as_deref()) =>
+            {
+                if let Some(page) = document_page(&resource, &final_url).await? {
+                    page
+                } else {
+                    let entries = ArchiveUnpacker::unpack_auto(&resource.body)?;
+                    archive_page(&final_url, &entries)
+                }
+            }
             // `tar` is unpacked in-process; `zip`/`gzip` propagate their typed
             // validation errors from `unpack_auto`, and `bzip2`/`xz`/`zstd`
             // propagate its typed `Unsupported` error naming the codec instead
@@ -427,11 +451,17 @@ impl OmniCreation {
                 archive_page(&final_url, &entries)
             }
             None if resource.is_html() => html_page(&resource, &final_url),
-            None => ScrapedPage {
-                url: final_url,
-                text: resource.text(),
-                ..ScrapedPage::default()
-            },
+            None => {
+                if let Some(page) = document_page(&resource, &final_url).await? {
+                    page
+                } else {
+                    ScrapedPage {
+                        url: final_url,
+                        text: resource.text(),
+                        ..ScrapedPage::default()
+                    }
+                }
+            }
         };
         if page.is_blank() {
             return Err(Error::validation(format!(
@@ -916,6 +946,7 @@ impl OmniCreation {
 }
 
 pub(crate) mod assets;
+pub(crate) mod documents;
 pub(crate) mod page;
 
 #[cfg(test)]

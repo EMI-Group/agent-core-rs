@@ -1,4 +1,5 @@
-//! Source-to-[`ScrapedPage`] builders: HTML extraction and `tar` archive text.
+//! Source-to-[`ScrapedPage`] builders: HTML extraction, `tar` archive text, and
+//! the markdown collectors the document route shares.
 //!
 //! The fetch, the format detection, and the blank-page guard stay in
 //! [`super::OmniCreation::scrape`]; these helpers turn the already-fetched
@@ -72,7 +73,7 @@ fn looks_binary(bytes: &[u8]) -> bool {
 }
 
 /// Collects markdown ATX headings (`#`…`######` plus a space) from `text`.
-fn collect_markdown_headings(text: &str, headings: &mut Vec<Heading>) {
+pub(super) fn collect_markdown_headings(text: &str, headings: &mut Vec<Heading>) {
     for line in text.lines() {
         let trimmed = line.trim_start();
         let hashes = trimmed.bytes().take_while(|byte| *byte == b'#').count();
@@ -97,7 +98,7 @@ fn collect_markdown_headings(text: &str, headings: &mut Vec<Heading>) {
 }
 
 /// Collects triple-backtick fenced code blocks from `text`, dropping the info string.
-fn collect_fenced_blocks(text: &str, blocks: &mut Vec<String>) {
+pub(super) fn collect_fenced_blocks(text: &str, blocks: &mut Vec<String>) {
     let mut open: Option<Vec<&str>> = None;
     for line in text.lines() {
         if line.trim_start().starts_with("```") {

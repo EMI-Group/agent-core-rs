@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use openjiuwen_common::error::ErrorKind;
+use openjiuwen_core::retrieval::loaders::fixtures;
 use openjiuwen_test_support::{ScriptedModel, ScriptedTurn, TempWorkspace};
 use serde_json::json;
 
@@ -891,4 +893,140 @@ async fn model_generation_without_images_has_no_image_references() {
         1,
         "{instructions}"
     );
+}
+
+/// The binary-document route of the scrape stage: a fetched `PDF` becomes a page
+/// even though its bytes carry no markdown.
+#[tokio::test]
+async fn pdf_page_input_is_extracted_by_the_loader() {
+    let url = "https://example.com/files/paper.pdf";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(
+        url,
+        "application/pdf",
+        fixtures::pdf_document(&fixtures::plain_stream("BT (Hello PDF) Tj ET")),
+    );
+    let page = OmniCreation::new(Arc::new(fetcher))
+        .scrape(url)
+        .await
+        .expect("scrapes the PDF");
+    assert_eq!(page.url, url);
+    assert!(page.text.contains("Hello PDF"), "{:?}", page.text);
+    assert_eq!(page.title, "paper");
+    assert_eq!(page.description, "");
+    assert_eq!(page.headings, Vec::new());
+    assert_eq!(page.links, Vec::new());
+    assert_eq!(page.images, Vec::new());
+}
+
+/// A `DOCX` is a `ZIP` container, so the document route has to win over the
+/// generic archive reader: the page holds the Word body, not the package parts.
+#[tokio::test]
+async fn docx_page_input_is_extracted_instead_of_being_unpacked_as_an_archive() {
+    let url = "https://example.com/files/notes.docx";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(
+        url,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        fixtures::docx_document(&["Intro", "Body"]).expect("builds a docx"),
+    );
+    let page = OmniCreation::new(Arc::new(fetcher))
+        .scrape(url)
+        .await
+        .expect("scrapes the DOCX");
+    assert_eq!(page.text, "Intro\nBody");
+    assert_eq!(page.title, "notes");
+    assert_eq!(page.headings, Vec::new());
+}
+
+/// A URL without a suffix still dispatches when the `content-type` names a
+/// document format.
+#[tokio::test]
+async fn a_document_without_a_suffix_dispatches_on_the_content_type() {
+    let url = "https://example.com/files/download";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(
+        url,
+        "application/pdf; charset=binary",
+        fixtures::pdf_document(&fixtures::plain_stream("BT (Typed PDF) Tj ET")),
+    );
+    let page = OmniCreation::new(Arc::new(fetcher))
+        .scrape(url)
+        .await
+        .expect("scrapes by content type");
+    assert!(page.text.contains("Typed PDF"), "{:?}", page.text);
+    assert_eq!(page.title, "download");
+}
+
+/// A failed loader is never fatal: the bytes are read as plain text instead.
+#[tokio::test]
+async fn a_corrupt_document_page_falls_back_to_plain_text() {
+    let url = "https://example.com/files/broken.pdf";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(url, "application/pdf", b"plain words, not a pdf".to_vec());
+    let page = OmniCreation::new(Arc::new(fetcher))
+        .scrape(url)
+        .await
+        .expect("a corrupt document still yields its text");
+    assert_eq!(page.text, "plain words, not a pdf");
+    assert_eq!(page.title, "");
+}
+
+/// A document that yields nothing, even as text, is unusable input whose error
+/// names the URL and the format.
+#[tokio::test]
+async fn a_document_page_with_no_text_names_the_url_and_format() {
+    let url = "https://example.com/files/empty.pdf";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(url, "application/pdf", b" \n\t\n".to_vec());
+    let error = OmniCreation::new(Arc::new(fetcher))
+        .scrape(url)
+        .await
+        .expect_err("a blank document");
+    assert_eq!(error.kind(), ErrorKind::Validation, "{error}");
+    let message = error.to_string();
+    assert!(message.contains("extracted no text"), "{message}");
+    assert!(message.contains(url), "{message}");
+    assert!(message.contains(".pdf"), "{message}");
+}
+
+/// The HTML and archive routes keep their precedence over the document route.
+#[tokio::test]
+async fn html_and_archive_routes_keep_their_precedence() {
+    let html_url = "https://example.com/files/page.pdf";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_html(html_url, main_html());
+    let page = OmniCreation::new(Arc::new(fetcher))
+        .scrape(html_url)
+        .await
+        .expect("scrapes the HTML page");
+    assert_eq!(page.title, "Install the Widget");
+    assert_eq!(page.description, "Learn to install the widget.");
+    assert_eq!(page.headings.len(), 2);
+    assert_eq!(page.links.len(), 1);
+    assert_eq!(page.images.len(), 1);
+    assert!(
+        page.text.contains("Download the package"),
+        "{:?}",
+        page.text
+    );
+
+    let tar_url = "https://example.com/skill.tar";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(tar_url, "application/x-tar", tar_archive());
+    let page = OmniCreation::new(Arc::new(fetcher))
+        .scrape(tar_url)
+        .await
+        .expect("scrapes the archive");
+    assert_eq!(page.title, "Install");
+    assert_eq!(
+        page.headings,
+        vec![Heading {
+            level: 1,
+            text: "Install".to_owned(),
+        }]
+    );
+    assert_eq!(page.code_blocks, vec!["cargo install widget".to_owned()]);
+    assert!(page.text.contains("Run the installer."));
+    assert!(!page.text.contains("logo"), "binary entry must be skipped");
 }
