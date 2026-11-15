@@ -11,8 +11,8 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 
 - `src/lib.rs` — marker module (`crate_name()`); the crate has no runtime API.
 - `tests/support/mod.rs` — the cross-scenario helper contract: `BOUND` (10 s per-await deadline), `within(what, future)`, `collect_bounded(stream, max)`. Scenario-specific fixtures stay in `openjiuwen-test-support` or beside the scenario.
-- Test binaries (each `tests/*.rs` is its own binary; no `[[test]]` entries), 24 of them:
-  `kernel_flow`, `workflow_components`, `context_engine`, `context_tokenizers`, `retrieval_pipeline`, `memory_recall`, `memory_dreaming`, `team_memory`, `deep_agent`, `harness_cli_tools`, `provider_native`, `team_flow`, `team_backend`, `runner_subprocess`, `runner_hosting`, `federation_transports`, `a2a_roundtrip`, `symphony_plan`, `symphony_artifacts`, `self_improvement`, `evaluation_ledger`, `plugin_observability`, `cli_binary`.
+- Test binaries (each `tests/*.rs` is its own binary; no `[[test]]` entries), 25 of them:
+  `kernel_flow`, `workflow_components`, `context_engine`, `context_tokenizers`, `retrieval_pipeline`, `memory_recall`, `memory_dreaming`, `team_memory`, `deep_agent`, `harness_cli_tools`, `provider_native`, `team_flow`, `team_backend`, `runner_subprocess`, `runner_hosting`, `federation_transports`, `a2a_roundtrip`, `symphony_plan`, `symphony_artifacts`, `self_improvement`, `evaluation_ledger`, `plugin_observability`, `watcher_reload`, `cli_binary`.
 - Features: `default = []`;
   `a2a` (enables `openjiuwen/a2a` + `openjiuwen-extensions/a2a`, gates `a2a_roundtrip.rs`);
   `otel` (enables `openjiuwen/otel` + `openjiuwen-extensions/otel`, gates `plugin_observability.rs`);
@@ -25,7 +25,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 
 ## Scenario Matrix
 
-112 test functions across 24 scenario binaries: 111 pass with `--features sqlite,a2a,otel` (102 with default features), and exactly 1 documented `#[ignore]`.
+116 test functions across 25 scenario binaries: 115 pass with `--features sqlite,a2a,otel` (106 with default features), and exactly 1 documented `#[ignore]`.
 
 | Binary | Scenario | Crates / seams exercised |
 |---|---|---|
@@ -131,6 +131,10 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 | `plugin_observability.rs` (3, feature `otel`) | Team-memory hook events observed by a recording observer are projected onto spans and exported OTLP/HTTP JSON to a loopback collector: path, content type, resource attributes, scope name, span names/order/kind, ids and team attributes | `openjiuwen::core::memory::team` hooks + `extensions::otel::{OtelTraceSink, TracerHandle}`, `wiremock` |
 | `plugin_observability.rs` | A 500 collector yields exactly one POST per batch, no retry, and a clean bounded shutdown | OTLP exporter failure surface |
 | `plugin_observability.rs` | Two flushes export two ordered batches sharing the session trace id; `OtlpEncoding` fixes the path and content type | `OtlpEncoding`, `traces_url` |
+| `watcher_reload.rs` (4) | One `ReloadHub` with `instruction`/`skills`/`broken`/`recorder`/`mcp` in registration order: an `InstructionFile` event runs only the interested handlers (a failing `FnReloadHandler` does not block the next and surfaces one `ReloadFailure`), `Other` runs nothing | `openjiuwen::harness::watcher::{ReloadHub, FnReloadHandler, InstructionReloadHandler, SkillsReloadHandler, McpConfigReloadHandler, WatchEvent, WatchTargetKind}` |
+| `watcher_reload.rs` | A rewritten `IDENTITY.md` reaches `system_prompt()`; new home and workspace `OPENJIUWEN.md` files join after it in `documents()` (user memory before project memory) | `InstructionReloader`, `InstructionFiles::{documents, system_prompt}`, `InstructionSource` |
+| `watcher_reload.rs` | Skills: first dispatch discovers the two pre-existing roots, a third directory appears on `Created`, a removed one disappears on `Removed`, and `skills_state.json` disables a skill in `library()` while discovery keeps it | `SkillLibraryReloader`, `SkillLibrary` (`add_root`, `is_disabled`), `SKILLS_STATE_FILENAME` |
+| `watcher_reload.rs` | MCP: workspace `mcp.json` wins over home by server name, a rewrite adds a server, deleting it falls back to home, and corrupting the remaining file yields one `config` failure while `servers()` keeps the last good snapshot | `McpConfigReloader::{new, reload, current, servers}`, `McpServerConfig` |
 | `cli_binary.rs` (5 + 1 ignored) | `run_with_model` one-shot: `text`, `json`, `stream-json` output contracts | `openjiuwen-harness` `cli` (`run_with_model`, `CliIo`, `OutputFormat`) |
 | `cli_binary.rs` | Pre-run validation (option resolution, blank prompt) rejects before any model call | `CliOptions::resolve_with`, `Cli::dispatch` |
 | `cli_binary.rs` | Process-boundary `--version`/`--help` — `#[ignore]`d, see Known Gaps | `openjiuwen-cli` binary, resolved at runtime |
@@ -177,6 +181,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 - `./tests/runner_subprocess.rs` → runner subprocess spawn seam: self-executing NDJSON child, request/reply, health, graceful shutdown, typed transport/validation errors
 - `./tests/agent_usage_events.rs` → `context.usage` / `llm_usage` frames, provider-usage normalization, session cache aggregation
 - `./tests/plugin_observability.rs` → team-memory events projected to OTLP/HTTP spans against a loopback collector (feature `otel`)
+- `./tests/watcher_reload.rs` → watcher reload hub dispatch routing, instruction/MCP/skills reload bodies (no `notify` feature, events built by hand)
 - `./tests/cli_binary.rs` → harness CLI layer (one-shot output formats, pre-run validation, process boundary)
 - `./tests/support/mod.rs` → cross-scenario deadline and stream helpers (`BOUND`, `within`, `collect_bounded`)
 - `./Cargo.toml` → manifest, test-only dependency set, `a2a`/`otel`/`sqlite` features
@@ -203,6 +208,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 - `axum`/`tower` are intentionally absent: the A2A scenario uses a real loopback socket (`A2aServer::serve_in_background` + `A2aClient`) instead of an in-process `tower::ServiceExt::oneshot` harness, so the transport, the JSON-RPC envelope and the SSE framing are all exercised.
 - Non-LLM HTTP fakes use `openjiuwen_test_support::wiremock`; set bodies with `set_body_raw(body, mime)` because `set_body_string` forces `text/plain`.
 - `reqwest` is a direct dependency for the agent-card endpoint (the A2A client itself lives in `openjiuwen-extensions`).
+- `watcher_reload.rs` never starts `WorkspaceWatcher` and never enables the `notify` feature: the hub/handler/dispatch path is always compiled, so the scenario builds its own `WatchEvent` literals and calls `ReloadHub::dispatch` directly.
 
 ## Known Behaviours
 
