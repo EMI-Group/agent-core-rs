@@ -6,6 +6,11 @@
 //! `workspace/configuration` request during `initialize` (many real servers do), publishes
 //! diagnostics after every open/change, and records every received message, so tests can
 //! assert ordering and versions without a real language server or an installed binary.
+//!
+//! Diagnostics are scripted per document name: `stale_pull` and `late_full` answer `unchanged`
+//! before a baseline exists, `pristine` answers a clean full report, `rejects_pull` answers
+//! `-32601`, and everything else answers a full report with one error. `spawn_with_capabilities`
+//! lets a test advertise a capability subset (for example without `diagnosticProvider`).
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -95,9 +100,17 @@ impl FakeServer {
 
 /// Spawns a fake server over `stream` and returns its handle.
 pub(crate) fn spawn(stream: DuplexStream) -> FakeServer {
+    spawn_with_capabilities(stream, capabilities())
+}
+
+/// Spawns a fake server that advertises `capabilities` instead of the default set.
+///
+/// Used by the diagnostics tests: a server that does not advertise `diagnosticProvider` must
+/// make the tool report a missing capability rather than a clean file.
+pub(crate) fn spawn_with_capabilities(stream: DuplexStream, capabilities: Value) -> FakeServer {
     let received = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&received);
-    let handle = tokio::spawn(async move { run(stream, log).await });
+    let handle = tokio::spawn(async move { run(stream, log, capabilities).await });
     FakeServer { received, handle }
 }
 
@@ -211,7 +224,7 @@ fn diagnostics_notification(method: &str, message: &Value) -> Option<Value> {
 }
 
 /// The server loop.
-async fn run(stream: DuplexStream, received: Arc<Mutex<Vec<Value>>>) {
+async fn run(stream: DuplexStream, received: Arc<Mutex<Vec<Value>>>, capabilities: Value) {
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = MessageReader::new(read);
     // Per-document `textDocument/diagnostic` counts, used by the scripted "the first answer is
@@ -262,7 +275,7 @@ async fn run(stream: DuplexStream, received: Arc<Mutex<Vec<Value>>>) {
                     Ok(Some(answer)) => received.lock().push(answer),
                     Ok(None) | Err(_) => break,
                 }
-                response(id, json!({ "capabilities": capabilities() }))
+                response(id, json!({ "capabilities": capabilities.clone() }))
             }
             "shutdown" => response(id, Value::Null),
             "textDocument/hover" => response(
@@ -488,6 +501,16 @@ async fn run(stream: DuplexStream, received: Arc<Mutex<Vec<Value>>>) {
                 } else if uri.contains("late_full") && attempt == 1 {
                     // First answer is a bogus `unchanged`; the forced full pull gets items.
                     response(id, json!({ "kind": "unchanged", "resultId": "late" }))
+                } else if uri.contains("pristine") {
+                    // A genuine clean report: a full answer with no items.
+                    response(
+                        id,
+                        json!({ "kind": "full", "resultId": "clean", "items": [] }),
+                    )
+                } else if uri.contains("rejects_pull") {
+                    // The server advertises the capability but rejects the method. The typed
+                    // code carries no "method not found" text, like `typedonly`.
+                    error(id, &LspError::new(-32601, "no handler registered"))
                 } else {
                     match previous {
                         Some("r1") => {

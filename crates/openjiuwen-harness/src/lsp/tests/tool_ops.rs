@@ -1,5 +1,5 @@
 //! `LspTool` tests for the actions added in the final integration phase: implementation,
-//! call hierarchy and diagnostics (push, pull and "none").
+//! call hierarchy and diagnostics (push, pull, capability failures and "no server").
 //!
 //! Everything runs against the in-process fake server, so no language server is required.
 use std::path::Path;
@@ -16,8 +16,17 @@ use super::fake_server::{self, FakeServer};
 
 /// Builds a tool wired to a fresh fake server, rooted at `workspace`.
 fn build_tool(workspace: &Path, timeout: Duration) -> (LspTool, FakeServer) {
+    build_tool_advertising(workspace, timeout, fake_server::capabilities())
+}
+
+/// Builds a tool whose fake server advertises `capabilities` instead of the default set.
+fn build_tool_advertising(
+    workspace: &Path,
+    timeout: Duration,
+    capabilities: Value,
+) -> (LspTool, FakeServer) {
     let (transport, peer) = ChannelTransport::new(64 * 1024);
-    let server = fake_server::spawn(peer);
+    let server = fake_server::spawn_with_capabilities(peer, capabilities);
     let config = LspToolConfig::default()
         .with_language("en")
         .with_workspace_root(workspace)
@@ -310,7 +319,7 @@ async fn diagnostics_without_a_path_drain_every_buffered_file() {
 }
 
 #[tokio::test]
-async fn diagnostics_without_a_server_and_without_push_data_report_none() {
+async fn diagnostics_without_a_server_report_the_diagnostics_as_unknown() {
     let dir = tempfile::tempdir().unwrap();
     write_source(dir.path(), "fn main() {}\n").await;
     let tool = LspTool::new(
@@ -323,13 +332,120 @@ async fn diagnostics_without_a_server_and_without_push_data_report_none() {
         json!({"action": "diagnostics", "path": "src/lib.rs"}),
     )
     .await;
+    // Informational, not an error: nothing failed, there is nothing to retry. The payload still
+    // has to say that the diagnostics are unknown, and `source` must never claim a pull.
     assert_eq!(payload["success"], json!(true), "{payload}");
     assert_eq!(payload["data"]["source"], json!("none"));
-    assert_eq!(payload["data"]["result"], json!("No diagnostics found."));
     assert_eq!(payload["data"]["diagnostics"], json!([]));
+    let result = payload["data"]["result"].as_str().unwrap();
+    assert!(result.contains("No language server"), "{result}");
+    assert!(result.contains("unknown"), "{result}");
+    assert!(
+        !result.contains("No diagnostics found."),
+        "no server must not read as a clean file: {result}"
+    );
+    assert!(tool.render_for_llm(&payload).contains("are unknown"));
+}
+
+#[tokio::test]
+async fn a_clean_full_report_is_a_success_with_an_empty_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_file(dir.path(), "pristine.rs", "fn main() {}\n").await;
+    let (tool, _server) = build_tool(dir.path(), Duration::from_secs(2));
+    // The fake publishes one warning on `didOpen`; drop it so the call has to pull.
+    let opened = open_document(&tool, &path).await;
+    assert_eq!(opened["success"], json!(true), "{opened}");
+    tool.diagnostics().clear();
+
+    let payload = call(&tool, json!({"action": "diagnostics", "path": &path})).await;
+    assert_eq!(payload["success"], json!(true), "{payload}");
+    assert_eq!(payload["data"]["source"], json!("pull"));
+    assert_eq!(payload["data"]["diagnostics"], json!([]));
+    assert_eq!(payload["data"]["result"], json!("No diagnostics found."));
+    assert!(payload["data"].get("stale").is_none(), "{payload}");
     assert!(tool
         .render_for_llm(&payload)
         .contains("No diagnostics found."));
+}
+
+#[tokio::test]
+async fn an_unadvertised_diagnostic_capability_is_a_typed_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_file(dir.path(), "lib.rs", "fn main() {}\n").await;
+    let mut capabilities = fake_server::capabilities();
+    capabilities
+        .as_object_mut()
+        .unwrap()
+        .remove("diagnosticProvider");
+    let (tool, server) = build_tool_advertising(dir.path(), Duration::from_secs(2), capabilities);
+
+    let payload = call(&tool, json!({"action": "diagnostics", "path": &path})).await;
+    assert_eq!(
+        payload["success"],
+        json!(false),
+        "a missing capability must not read as a clean file: {payload}"
+    );
+    let error = payload["error"].as_str().unwrap();
+    assert!(
+        error.contains("not supported")
+            && error.contains("does not advertise textDocument/diagnostic"),
+        "{error}"
+    );
+    assert!(error.contains("unknown, not clean"), "{error}");
+    assert_eq!(payload["data"]["action"], json!("diagnostics"));
+    assert!(
+        payload["data"]["file_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("lib.rs"),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["data"]["capability"],
+        json!("textDocument/diagnostic")
+    );
+    assert!(
+        payload["data"].get("diagnostics").is_none(),
+        "no diagnostics are fabricated for an unsupported capability: {payload}"
+    );
+    assert!(!tool
+        .render_for_llm(&payload)
+        .contains("No diagnostics found."));
+    assert!(
+        !server
+            .methods()
+            .iter()
+            .any(|method| method == "textDocument/diagnostic"),
+        "the tool asks no server for a method it does not advertise"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_diagnostic_method_is_a_typed_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_file(dir.path(), "rejects_pull.rs", "fn main() {}\n").await;
+    let (tool, server) = build_tool(dir.path(), Duration::from_secs(2));
+    let opened = open_document(&tool, &path).await;
+    assert_eq!(opened["success"], json!(true), "{opened}");
+    tool.diagnostics().clear();
+
+    // The server advertises `diagnosticProvider` but answers `-32601` with no textual hint, so
+    // only the typed code classifies it; either way it must not read as "no problems".
+    let payload = call(&tool, json!({"action": "diagnostics", "path": &path})).await;
+    assert_eq!(payload["success"], json!(false), "{payload}");
+    let error = payload["error"].as_str().unwrap();
+    assert!(error.contains("textDocument/diagnostic"), "{error}");
+    assert!(error.contains("unknown, not clean"), "{error}");
+    assert_eq!(payload["data"]["action"], json!("diagnostics"));
+    assert_eq!(
+        payload["data"]["capability"],
+        json!("textDocument/diagnostic")
+    );
+    assert!(payload["data"].get("diagnostics").is_none(), "{payload}");
+    assert!(!tool
+        .render_for_llm(&payload)
+        .contains("No diagnostics found."));
+    assert_eq!(pull_requests(&server).len(), 1, "exactly one pull attempt");
 }
 
 /// The pull requests the fake server received, in order.

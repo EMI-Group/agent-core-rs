@@ -5,12 +5,29 @@
 //! retries the operation. Failures are string messages that the tool turns into a
 //! `success=false` payload: `invoke` never returns `Err` for model input.
 //!
-//! Diagnostics are best effort: push data buffered by the
-//! [`DiagnosticRegistry`](super::DiagnosticRegistry) wins, an empty buffer falls back to a
-//! `textDocument/diagnostic` pull (when the server advertises it), and "nothing anywhere" is a
-//! success payload with `source: "none"` rather than an error. An `unchanged` pull answer with
-//! no cached full report triggers one extra full pull; if the server still refuses to report in
-//! full, the payload carries `stale: true` instead of a silently empty list.
+//! # Diagnostics
+//!
+//! Push data buffered by the [`DiagnosticRegistry`](super::DiagnosticRegistry) wins; an empty
+//! buffer falls back to a `textDocument/diagnostic` pull. A missing capability is never
+//! reported as a clean file:
+//!
+//! - A server that does not advertise `textDocument/diagnostic`, or that rejects it with
+//!   `-32601`, yields a `success=false` payload whose error names the missing capability; no
+//!   diagnostics are fabricated for it.
+//! - A full report with no items is the only "clean" answer: `success=true`, an empty list and
+//!   `source: "pull"`.
+//! - "No language server resolved for this file" stays an informational `success=true` payload
+//!   with `source: "none"` and a `result` that says the diagnostics are unknown; because
+//!   `source` is never `"pull"` there, a caller can tell "no server" from "the server says
+//!   clean".
+//!
+//! An `unchanged` pull answer with no cached full report triggers one extra full pull; if the
+//! server still refuses to report in full, the payload carries `stale: true` instead of a
+//! silently empty list.
+//!
+//! A `diagnostics` call without a `path` does not pull: it drains the push buffer
+//! (`DiagnosticRegistry::drain`), so an empty answer means "nothing was buffered", never "the
+//! files are clean".
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -275,7 +292,10 @@ impl LspTool {
         }
     }
 
-    /// Answers a `diagnostics` call: push buffer first, then a pull, then "none".
+    /// Answers a `diagnostics` call: push buffer first, then a pull.
+    ///
+    /// A server that cannot pull leaves a typed `success=false` payload; only a genuinely empty
+    /// full report (or "no server resolved at all", with `source: "none"`) is a success.
     async fn diagnostics_action(&self, args: &LspArgs) -> ToolResult<ToolPayload> {
         let Some(raw) = args.path.as_deref().filter(|path| !path.is_empty()) else {
             return Ok(self.drain_diagnostics_payload());
@@ -308,6 +328,10 @@ impl LspTool {
     }
 
     /// Pulls diagnostics for one file when no push data is buffered.
+    ///
+    /// Only a server that both advertises `textDocument/diagnostic` and answers with a report
+    /// produces a diagnostics payload. A missing capability, a `-32601` answer and "no server
+    /// resolved" are three distinct outcomes, and none of them reads as "the file is clean".
     async fn pull_diagnostics(
         &self,
         path: &Path,
@@ -315,11 +339,12 @@ impl LspTool {
         file_path: String,
     ) -> ToolResult<ToolPayload> {
         let Ok(resolved) = self.resolve_server(Some(path)).await else {
-            return Ok(no_diagnostics_payload(&file_path));
+            // No language server at all: informational, explicitly not a clean report.
+            return Ok(no_server_diagnostics_payload(&file_path));
         };
-        let Ok(supervisor) = self.supervisor(&resolved) else {
-            return Ok(no_diagnostics_payload(&file_path));
-        };
+        let supervisor = self
+            .supervisor(&resolved)
+            .map_err(|error| error.message().into_owned())?;
         let source = self.read_source(path).await?;
         let language_id = self.language_for(&resolved);
         let document = uri.to_owned();
@@ -360,13 +385,21 @@ impl LspTool {
             Ok(outcome) => outcome,
             Err(error) => {
                 if is_method_not_found(&error) {
-                    return Ok(no_diagnostics_payload(&file_path));
+                    // The server advertises diagnostics but rejects the method: report the
+                    // missing capability instead of an empty (and misleadingly clean) list.
+                    return Ok(unsupported_diagnostics_payload(
+                        &file_path,
+                        "it rejected textDocument/diagnostic as an unknown method (-32601)",
+                    ));
                 }
                 return Err(map_client_error(&error, LspAction::Diagnostics.method()));
             }
         };
         match outcome {
-            PullOutcome::Unsupported => Ok(no_diagnostics_payload(&file_path)),
+            PullOutcome::Unsupported => Ok(unsupported_diagnostics_payload(
+                &file_path,
+                "it does not advertise textDocument/diagnostic",
+            )),
             PullOutcome::Report(report) => {
                 let diagnostics = match report.kind {
                     DiagnosticReportKind::Full => {
@@ -556,9 +589,42 @@ fn diagnostics_payload(file_path: &str, diagnostics: &[Diagnostic], source: &str
     }))
 }
 
-/// Builds the success payload used when no diagnostics of any kind are available.
-fn no_diagnostics_payload(file_path: &str) -> ToolPayload {
-    diagnostics_payload(file_path, &[], "none")
+/// Builds the informational payload used when no language server resolved for `file_path`.
+///
+/// This is deliberately `success=true`: nothing failed and the model has nothing to retry. It
+/// must still never read as a clean report, so `source` is `"none"` (never `"push"`/`"pull"`),
+/// `diagnostics` stays empty and the rendered `result` says the diagnostics are unknown. A
+/// caller distinguishes it from "the server says clean" by `source` and by that text.
+fn no_server_diagnostics_payload(file_path: &str) -> ToolPayload {
+    ToolPayload::ok(json!({
+        "action": LspAction::Diagnostics.as_str(),
+        "file_path": file_path,
+        "result": format!(
+            "No language server is resolved for {file_path}, so its diagnostics are unknown \
+             (this is not a clean report)."
+        ),
+        "diagnostics": Vec::<Diagnostic>::new(),
+        "source": "none",
+    }))
+}
+
+/// Builds the `success=false` payload for a server that cannot deliver pull diagnostics.
+///
+/// `detail` completes the sentence "Diagnostics are not supported by this language server: …".
+/// No diagnostics list is attached: reporting an empty one here is exactly the false-success
+/// answer this payload replaces.
+fn unsupported_diagnostics_payload(file_path: &str, detail: &str) -> ToolPayload {
+    ToolPayload::fail_with_data(
+        format!(
+            "Diagnostics are not supported by this language server: {detail}; the diagnostics \
+             of {file_path} are unknown, not clean."
+        ),
+        json!({
+            "action": LspAction::Diagnostics.as_str(),
+            "file_path": file_path,
+            "capability": LspAction::Diagnostics.method(),
+        }),
+    )
 }
 
 /// Builds the payload for a server that answered `unchanged` with no baseline to apply it to.
