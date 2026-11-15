@@ -72,14 +72,17 @@
 //!
 //! # Graph observation
 //!
-//! When [`SymphonyConfig::graph_artifact_root`] names a directory, the runtime also owns a
+//! When [`SymphonyConfig::graph_artifact_root`](crate::runtime::SymphonyConfig::graph_artifact_root)
+//! names a directory, the runtime also owns a
 //! [`GraphObservationService`](crate::observation::service::GraphObservationService) rooted
-//! beside the graph revisions: [`SymphonyRuntime::submit_observation`] appends caller-supplied
-//! evidence and derives the merged overlay, [`SymphonyRuntime::observation_snapshot`] reads it,
-//! and [`SymphonyRuntime::flush_observations`] reports a deferred projection failure. The
-//! append-only evidence log needs a directory, so an in-memory runtime has no observation
-//! service and all three methods return
-//! [`Error::Unsupported`](crate::error::Error::Unsupported).
+//! beside the graph revisions:
+//! [`submit_observation`](crate::runtime::SymphonyRuntime::submit_observation) appends
+//! caller-supplied evidence and derives the merged overlay,
+//! [`observation_snapshot`](crate::runtime::SymphonyRuntime::observation_snapshot) reads it,
+//! and [`flush_observations`](crate::runtime::SymphonyRuntime::flush_observations) reports a
+//! deferred projection failure. The append-only evidence log needs a directory, so an
+//! in-memory runtime has no observation service and all three methods return
+//! [`Error::Unsupported`].
 //!
 //! A second [`tokio::sync::Mutex`] (`semantic_sync`) serializes semantic (re)indexing. It
 //! may span the registry snapshot read plus the embedding calls — that serialization is
@@ -116,7 +119,7 @@ use crate::artifact::{
     FileGraphArtifactStore, GraphArtifactStatus, GraphArtifactStore, GraphRevision,
     MemoryGraphArtifactStore,
 };
-use crate::error::{unsupported, validation, Error, Result};
+use crate::error::{unsupported, validation, Result};
 use crate::graph::CapabilityGraph;
 use crate::model::{CapabilityDescriptor, CapabilityKey};
 use crate::observation::contracts::{GraphEvolutionInput, GraphSnapshot, ObservationReceipt};
@@ -833,17 +836,15 @@ impl SymphonyRuntime {
     /// The service qualifies the payload against the static revision it names, appends one row
     /// to the evidence log below [`SymphonyConfig::graph_artifact_root`], and rebinds the
     /// scope's merged overlay, so a later [`Self::observation_snapshot`] sees the observed
-    /// weights. Works in every lifecycle state: evidence describes what a task did, not what
-    /// the engine is doing.
+    /// weights. Works in every lifecycle state: evidence describes what a task did.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Unsupported`](crate::error::Error::Unsupported) when no
-    /// [`SymphonyConfig::graph_artifact_root`] is configured, and the service's errors —
-    /// [`Error::Validation`](crate::error::Error::Validation) for a contract violation or a
-    /// reused `evidence_id`, [`Error::NotFound`](crate::error::Error::NotFound) when no static
-    /// revision has been published, and [`Error::External`](crate::error::Error::External)
-    /// when the log cannot be appended to.
+    /// [`SymphonyConfig::graph_artifact_root`] is configured, plus the service's
+    /// [`Error::Validation`](crate::error::Error::Validation),
+    /// [`Error::NotFound`](crate::error::Error::NotFound) and
+    /// [`Error::External`](crate::error::Error::External) failures.
     pub async fn submit_observation(
         &self,
         input: &GraphEvolutionInput,
@@ -862,8 +863,7 @@ impl SymphonyRuntime {
     /// Returns [`Error::Unsupported`](crate::error::Error::Unsupported) when no
     /// [`SymphonyConfig::graph_artifact_root`] is configured, and the service's errors —
     /// notably [`Error::NotFound`](crate::error::Error::NotFound) for an unknown static or
-    /// merged revision, and [`Error::External`](crate::error::Error::External) for unreadable
-    /// documents.
+    /// merged revision.
     pub async fn observation_snapshot(
         &self,
         graph_scope_id: &str,
@@ -884,8 +884,7 @@ impl SymphonyRuntime {
     /// # Errors
     ///
     /// Returns [`Error::Unsupported`](crate::error::Error::Unsupported) when no
-    /// [`SymphonyConfig::graph_artifact_root`] is configured, otherwise the stored projection
-    /// error.
+    /// [`SymphonyConfig::graph_artifact_root`] is configured, otherwise the stored error.
     pub async fn flush_observations(&self) -> Result<()> {
         self.require_observation()?.flush().await
     }
@@ -1063,7 +1062,7 @@ fn qualified_ids(descriptors: &[CapabilityDescriptor]) -> Vec<String> {
 }
 
 /// The error an observation call reports when the runtime has no filesystem artifact root.
-fn observation_unavailable() -> Error {
+fn observation_unavailable() -> crate::error::Error {
     unsupported("graph observation requires a configured `graph_artifact_root`")
 }
 
