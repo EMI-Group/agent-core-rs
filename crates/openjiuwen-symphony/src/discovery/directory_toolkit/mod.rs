@@ -2,10 +2,8 @@
 //! [`SkillFs`](crate::discovery::SkillFs) catalog.
 //!
 //! Ports Python `openjiuwen.symphony.discovery.directory_toolkit`: the virtual category
-//! tree, the pinned row renderers with their output budgeting, and the full
-//! argument-validation pass. The execution engine (operation dispatch, pagination
-//! cursors, search/read assembly, pipelines applied to rendered rows) is the next layer
-//! and lives in a sibling module that builds on these three.
+//! tree, the pinned row renderers with their output budgeting, the full
+//! argument-validation pass, the operation engine, and the top-level toolkit.
 //!
 //! | module | Python source | role |
 //! | --- | --- | --- |
@@ -13,6 +11,8 @@
 //! | [`render`] | `directory_toolkit.py` row/summary/budget helpers | pinned row text, summary headers, `compact`/`append_note`, the metadata card, `fit_rows` |
 //! | [`validate`](validate::validate) | `directory_toolkit.py` argument layer | the typed request, the six enums, every per-field rule, and Python's simple-shape defaults |
 //! | [`matcher`] | Python `str.casefold`/`fnmatch`/`==` | case folding, glob matching, literal match ranking |
+//! | [`ops`] | `directory_toolkit.py` `_list`/`_search`/`_read`/`_apply_pipeline` | operation dispatch, multi-query search assembly, snippets, pipelines |
+//! | [`toolkit`](toolkit::SkillIndexToolkit) | `directory_toolkit.py` `InstalledSkillsDirectoryToolkit` | the model-facing tool: `invoke`/`execute`, the card, pagination cursors, the notice cursor |
 //!
 //! # Design
 //!
@@ -48,11 +48,18 @@
 //! model.
 
 pub mod matcher;
+pub mod ops;
 pub mod render;
+pub mod toolkit;
 pub mod validate;
 pub mod view;
 
 pub use matcher::{case_fold, glob_match, has_wildcard, literal_match_rank};
+pub use ops::{
+    apply_pipeline, content_hits, entry_hits, execute_list, execute_read, execute_search,
+    matched_snippets, resolve_read_skills, search_categories, validate_request, Execution,
+    PipelineOutcome,
+};
 pub use render::{
     append_note, bounded_summary_line, candidate_tokens, compact, directory_description,
     empty_message, fit_rows, inline_text, list_row, metadata_card, row_count, safe_match_snippet,
@@ -60,6 +67,10 @@ pub use render::{
     ListView, ResponseSummary, Row, CATEGORY_DESCRIPTION_CHARS, CATEGORY_ROUTING_CHARS,
     CATEGORY_ROW_PREFIX, SEARCH_CATEGORY_DESCRIPTION_CHARS, SELECT_WHEN_CHARS, SHORTENED_MARKER,
     SKILL_DESCRIPTION_CHARS,
+};
+pub use toolkit::{
+    tool_input_schema, SkillIndexConfig, SkillIndexResult, SkillIndexToolCard, SkillIndexToolkit,
+    CURSOR_MAX_CHARS, MAX_CURSORS, SKILL_INDEX_TOOL_NAME,
 };
 pub use validate::{
     apply_simple_defaults, output_budget, validate, validate_category_paths, validate_identifiers,
