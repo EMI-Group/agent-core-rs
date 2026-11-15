@@ -326,24 +326,31 @@ async fn interact_pause_and_stop_address_one_pooled_run() {
     assert_eq!(status.session_id.as_deref(), Some("hitl-session"));
     assert!(runner.agent_team_status("nobody", "s-1").is_none());
 
-    // Pause/resume are coordination signals on the run's gate.
-    runner
+    // Pause/resume are refused: nothing can suspend the in-flight invocation.
+    let pause = runner
         .pause_agent_team("hitl-crew", "hitl-session")
         .await
-        .unwrap();
-    assert_eq!(
-        runner.team_pool().get(&key).expect("live").state,
-        RunPhase::Paused
+        .expect_err("a live pooled run cannot be paused");
+    assert_eq!(pause.kind(), ErrorKind::Unsupported);
+    assert!(
+        pause.to_string().contains("InteractGate") && pause.to_string().contains("cancel"),
+        "the refusal names the missing seam and the alternative: {pause}"
     );
-    runner
+    let resume = runner
         .resume_agent_team("hitl-crew", "hitl-session")
         .await
-        .unwrap();
+        .expect_err("a live pooled run cannot be resumed");
+    assert_eq!(resume.kind(), ErrorKind::Unsupported);
+    let live = runner.team_pool().get(&key).expect("live");
     assert_eq!(
-        runner.team_pool().get(&key).expect("live").state,
-        RunPhase::Running
+        live.state,
+        RunPhase::Running,
+        "the refusal changed no phase"
     );
+    assert!(!live.gate_closed, "the refusal left the gate open");
     let missing = runner.pause_agent_team("nobody", "s-1").await.unwrap_err();
+    assert_eq!(missing.kind(), ErrorKind::NotFound);
+    let missing = runner.resume_agent_team("nobody", "s-1").await.unwrap_err();
     assert_eq!(missing.kind(), ErrorKind::NotFound);
 
     // Stopping cancels the blocked run; a second stop is a no-op `false`.

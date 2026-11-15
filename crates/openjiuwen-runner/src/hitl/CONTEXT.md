@@ -1,10 +1,10 @@
 # hitl/ — runner-level human-in-the-loop hub
 
 ## Intent
-Brokers a host UI against the runs a runner is executing: the live-run registry, a bounded inbox of inbound human payloads per run, answering the interaction requests a run's session published, pause/resume/cancel coordination signals, and best-effort mirroring into a `RunMonitor`.
+Brokers a host UI against the runs a runner is executing: the live-run registry, a bounded inbox of inbound human payloads per run, answering the interaction requests a run's session published, cancellation, typed pause/resume refusals, and best-effort mirroring into a `RunMonitor`.
 Python correspondence: `team_runner.py`'s `interact_agent_team` (payload delivery to an active team runtime, returning a `DeliverResult`), `register_human_agent_inbound` (the team→user channel the `InteractKind` variants model), and `pause_agent_team` / `stop_agent_team`.
 `InteractPayload` is the Rust union of `GodViewMessage` / `OperatorMessage` / `HumanAgentMessage` / `GroupChatMessage`, plus `InteractKind::Text` for Python's bare-string shorthand.
-Pause and resume are status/coordination signals: they flip the hub's state and gate and mirror the monitor, but they do not suspend an agent or team loop.
+Pause and resume are refused with `Error::Unsupported` for a live run: this build has no mid-flight suspension seam (Python's in-loop `InteractGate` is deferred), so a pause that reported `Ok` would have paused nothing, and the refusal changes no phase, gate, or monitor event.
 The hub is in-process only: no MQ/websocket/Pulsar transport, no reply-topic routing, no authentication of who may answer.
 
 ## API Surface
@@ -84,15 +84,15 @@ The crate root re-exports these items from `openjiuwen_runner::hitl` (added by t
 - `deliver` visits runs in sorted run-id order; both target fields unset (or no match) is `MissingTarget`, a run whose sender is gone is `NoInbox`, and a closed or full inbox is `Closed` (a closed inbox also drops the dead sender, so later deliveries report `NoInbox`).
 - `take_inbox` hands out the receiver once per run; a second call and an unknown run return `None`.
 - `answer` resolves an indexed pending id through its run's session (propagating the session's error verbatim and leaving the id pending), otherwise tries every attached session in sorted run-id order and returns `Error::NotFound("interaction '<id>' is not pending on any active run")` when none accepts it.
-- `pause`: `Paused` is idempotent, `Cancelled` is `Error::Validation("run '<id>' has already been cancelled")`, and any live state becomes `Paused` with a closed gate.
-- `resume`: `Running` is idempotent, `Cancelled` is the same validation, and `Paused`/`Queued` become `Running` with an open gate.
+- `pause`/`resume`: an unknown id is `Error::NotFound("run '<id>' is not registered")`, `Cancelled` is `Error::Validation("run '<id>' has already been cancelled")`, a completed/failed run is `Error::Validation("run '<id>' has already finished")`, and a live run is `Error::Unsupported` from `crate::error::no_suspension_seam`, naming the missing suspension seam and pointing at `cancel`.
+- A refused `pause`/`resume` changes nothing: the entry keeps its phase and gate, and no monitor event is published.
 - `cancel`: already `Cancelled` is idempotent; otherwise it trips the run's token, resolves every pending interaction with `InteractionResponse::cancel` carrying `"run cancelled"`, clears the pending set, sets `Cancelled` with a closed gate, and mirrors `RunPhase::Cancelled`.
 - `cancel` is synchronous: the cancellation responses are delivered on a detached task, so a waiter observes its `Cancel` decision asynchronously (outside a runtime nothing is delivered and a warning is logged).
 - `close_interactions` resolves every pending id with `InteractionResponse::cancel` carrying the given reason, clears the pending sets first, logs per-session failures, and returns `Ok(())` (also for an empty hub).
 - `pending` returns sorted ids (unknown run: empty) and `pending_all` returns every registered run's sorted ids sorted by run id, including runs with no pending ids.
 - `list_active` returns every registered run sorted by run id; a cancelled run stays listed until it is unregistered.
 - `ActiveRunInfo::queued` counts the pending interaction ids the hub observed, not the inbox depth.
-- Monitor mirroring is best-effort: a rejected transition (a run already finished or evicted) is logged with `tracing::warn!` (target `openjiuwen_runner::hitl`) and never fails a hub operation.
+- Monitor mirroring is best-effort: `register` tracks and `cancel` finishes; a rejected transition (a run already finished or evicted) is logged with `tracing::warn!`/`tracing::debug!` (target `openjiuwen_runner::hitl`) and never fails a hub operation.
 - `attach_monitor` swaps the mirrored monitor at runtime and returns the previous one; it is what `Runner::set_monitor` uses to re-point the installed hub, and `with_monitor` is its builder form.
 - The monitor sits behind a `parking_lot::RwLock` read for the length of one mirror call; a clone copies the setting it was made with, so re-pointing the original never retroacts onto an earlier clone.
 
@@ -108,7 +108,7 @@ The crate root re-exports these items from `openjiuwen_runner::hitl` (added by t
 
 ## Routing Table
 - `./mod.rs` → module docs, re-exports (public items and the crate-internal bridge), `TARGET`/`CANCEL_REASON`, hub error wording (`not_registered`, `already_cancelled`, `already_finished`), and the hub/payload/target/bridge unit tests
-- `./hub.rs` → `InteractionHub`, `INBOX_CAPACITY`, the internal `Entry`/`Inner` table, delivery, answering, pause/resume/cancel, listings
+- `./hub.rs` → `InteractionHub`, `INBOX_CAPACITY`, the internal `Entry`/`Inner` table, delivery, answering, cancel, the pause/resume refusals, listings
 - `./bridge.rs` → `ActiveRunSpec`, `ActiveRunInfo`, `RunHandle`, `RunBinding`, `bind_run`, `watch_pending`, `spawn_cancellations`
 - `./payload.rs` → `InteractKind`, `InteractPayload` and their builders
 - `./target.rs` → `RunTarget`, `DeliverResult`
@@ -118,7 +118,7 @@ The crate root re-exports these items from `openjiuwen_runner::hitl` (added by t
 
 ## Notes & Deferrals
 - No MQ/websocket/Pulsar transport between processes, no reply-topic routing, no `RemoteAgent` detection, and no A2A adapter for interactions.
-- No `InteractGate` enforcement inside the agent/team loop: pause/resume only flip hub state and the gate flag.
+- No `InteractGate` enforcement inside the agent/team loop, which is why `pause`/`resume` are typed refusals rather than state flips; `cancel` is the working way to stop a run.
 - No OS-process members, no team-member spawning, no worktree or SSH transport, and no team pools/monitors over the hub.
 - No authentication or ACL on who may answer an interaction or deliver a payload.
 - Hub state is in memory and lost when the hub is dropped; nothing survives a process restart.

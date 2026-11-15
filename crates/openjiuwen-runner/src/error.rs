@@ -79,6 +79,23 @@ pub fn distributed_mode() -> Error {
     )
 }
 
+/// A pause or resume of a live run: `Error::Unsupported`, naming what is missing.
+///
+/// Nothing in this build can suspend an in-flight invocation: the in-process team
+/// strategy owns no mid-flight suspension seam and Python's in-loop `InteractGate`
+/// is deferred, so a pause that reported `Ok` would have paused nothing. `action`
+/// is the refused verb (`"pause"` / `"resume"`) and `run_id` the run it addressed,
+/// so the message says exactly which call was refused. The hint names `cancel`,
+/// which really does stop a run by tripping its `CancellationToken`.
+pub fn no_suspension_seam(action: &str, run_id: &str) -> Error {
+    unsupported(
+        &format!("`{action}` on live run '{run_id}'"),
+        "this build has no mid-flight suspension seam (an in-loop `InteractGate` is \
+         deferred), so nothing can suspend or restart the invocation; call `cancel` \
+         (it trips the run's `CancellationToken`) when a run must stop",
+    )
+}
+
 /// A session of the wrong kind for an operation: `Error::Validation`.
 pub fn invalid_session(message: impl Into<String>) -> Error {
     Error::Validation(message.into())
@@ -192,6 +209,19 @@ mod tests {
             "A2A",
             "deferred",
         ] {
+            assert!(
+                message.contains(expected),
+                "`{message}` should name {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_run_pause_names_the_missing_seam_and_the_alternative() {
+        let error = no_suspension_seam("pause", "run-1");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.to_string();
+        for expected in ["`pause`", "run-1", "InteractGate", "cancel", "deferred"] {
             assert!(
                 message.contains(expected),
                 "`{message}` should name {expected}"

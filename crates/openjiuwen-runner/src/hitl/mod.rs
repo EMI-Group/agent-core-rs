@@ -4,8 +4,8 @@
 //! executing. It keeps the live-run registry ([`ActiveRunInfo`]), delivers inbound
 //! human payloads to a run's bounded inbox ([`InteractionHub::deliver`]), answers
 //! the interaction requests a run's session published ([`InteractionHub::answer`]),
-//! and exposes pause/resume/cancel as coordination signals
-//! ([`InteractionHub::pause`], [`InteractionHub::resume`],
+//! and exposes pause/resume as typed refusals next to a working
+//! [`InteractionHub::cancel`] ([`InteractionHub::pause`], [`InteractionHub::resume`],
 //! [`InteractionHub::cancel`]).
 //!
 //! **Python correspondence.** The hub is the Rust form of `team_runner.py`'s
@@ -16,11 +16,15 @@
 //! Python's `GodViewMessage` / `OperatorMessage` / `HumanAgentMessage` /
 //! `GroupChatMessage`, plus [`InteractKind::Text`] for the bare-string shorthand.
 //!
-//! **Signals, not a scheduler.** [`InteractionHub::pause`] and
-//! [`InteractionHub::resume`] flip the run's hub state and close/open its gate so a
-//! host can coordinate and render; they do not suspend the agent or team loop.
-//! In-loop gate enforcement is Python's `InteractGate`, which is deferred (see
-//! `CONTEXT.md`).
+//! **Refused, not pretended.** [`InteractionHub::pause`] and
+//! [`InteractionHub::resume`] answer [`Error::Unsupported`] for a live run: this
+//! build has no mid-flight suspension seam (Python's in-loop `InteractGate` is
+//! deferred), so a pause that reported `Ok` would have paused nothing. The refusal
+//! changes no state — no phase, no gate, no monitor transition — and a host that
+//! must stop a run calls [`InteractionHub::cancel`], which trips the run's own
+//! cancellation token. [`Error::NotFound`] (unknown id),
+//! [`Error::Validation`] (already cancelled / already finished) keep their
+//! meaning.
 //!
 //! **In-process only.** The hub lives in the runner process: there is no message
 //! queue, websocket, or Pulsar transport between processes, no reply-topic
@@ -272,29 +276,57 @@ mod tests {
     }
 
     #[test]
-    fn pause_and_resume_flip_the_state_and_gate() {
+    fn pause_and_resume_refuse_a_live_run_without_changing_it() {
         let hub = InteractionHub::new();
         let handle = hub.register(spec("assistant", Some("s-1")));
-        let run_id = handle.run_id();
+        let run_id = handle.run_id().to_string();
 
-        hub.pause(run_id).unwrap();
+        for (action, result) in [
+            ("pause", hub.pause(&run_id)),
+            ("resume", hub.resume(&run_id)),
+        ] {
+            let error = result.expect_err("a live run cannot be suspended");
+            assert_eq!(error.kind(), ErrorKind::Unsupported);
+            let message = error.to_string();
+            for expected in [
+                format!("`{action}`"),
+                run_id.clone(),
+                "InteractGate".to_owned(),
+            ] {
+                assert!(
+                    message.contains(&expected),
+                    "`{message}` should name {expected}"
+                );
+            }
+        }
+
         let info = hub.list_active().remove(0);
-        assert_eq!(info.state, RunPhase::Paused);
-        assert!(info.gate_closed);
-        hub.pause(run_id).unwrap();
-        assert_eq!(hub.list_active()[0].state, RunPhase::Paused);
+        assert_eq!(info.state, RunPhase::Queued, "the refusal changed no phase");
+        assert!(!info.gate_closed, "the refusal left the gate open");
+    }
 
-        hub.resume(run_id).unwrap();
+    #[test]
+    fn a_refused_pause_leaves_the_run_cancellable() {
+        let hub = InteractionHub::new();
+        let token = CancellationToken::new();
+        let handle = hub.register(ActiveRunSpec {
+            cancellation: Some(token.clone()),
+            ..spec("assistant", Some("s-1"))
+        });
+        let run_id = handle.run_id().to_string();
+
+        assert_eq!(
+            hub.pause(&run_id).unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+        hub.cancel(&run_id).unwrap();
+        assert!(
+            token.is_cancelled(),
+            "cancel still trips the run's own token"
+        );
         let info = hub.list_active().remove(0);
-        assert_eq!(info.state, RunPhase::Running);
-        assert!(!info.gate_closed);
-        hub.resume(run_id).unwrap();
-        assert_eq!(hub.list_active()[0].state, RunPhase::Running);
-
-        let queued = hub.register(spec("other", None));
-        hub.resume(queued.run_id()).unwrap();
-        assert_eq!(hub.list_active()[1].state, RunPhase::Running);
-        assert!(!hub.list_active()[1].gate_closed);
+        assert_eq!(info.state, RunPhase::Cancelled);
+        assert!(info.gate_closed, "cancel closes the gate");
     }
 
     #[test]
@@ -427,18 +459,22 @@ mod tests {
         });
         assert_eq!(monitor.history(handle.run_id()).unwrap().len(), 1);
 
-        hub.pause(handle.run_id()).unwrap();
-        hub.resume(handle.run_id()).unwrap();
+        // A refused pause/resume publishes no monitor event either.
+        assert_eq!(
+            hub.pause(handle.run_id()).unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            hub.resume(handle.run_id()).unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
         let phases: Vec<RunPhase> = monitor
             .history(handle.run_id())
             .unwrap()
             .into_iter()
             .map(|event| event.phase)
             .collect();
-        assert_eq!(
-            phases,
-            vec![RunPhase::Queued, RunPhase::Paused, RunPhase::Running]
-        );
+        assert_eq!(phases, vec![RunPhase::Queued]);
     }
 
     #[test]
@@ -464,8 +500,12 @@ mod tests {
             .finish(handle.run_id(), RunOutcome::completed())
             .unwrap();
 
-        hub.pause(handle.run_id()).unwrap();
-        assert_eq!(hub.list_active()[0].state, RunPhase::Paused);
+        // A refused pause does not touch the hub's own state either.
+        assert_eq!(
+            hub.pause(handle.run_id()).unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+        assert_eq!(hub.list_active()[0].state, RunPhase::Queued);
         assert_eq!(
             monitor.snapshot(handle.run_id()).unwrap().phase,
             RunPhase::Completed,

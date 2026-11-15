@@ -20,7 +20,8 @@
 //! - [`RunMonitor`] — bounded per-run phase/outcome tracking with a broadcast
 //!   event stream ([`RunEvent`]);
 //! - [`InteractionHub`] — runner-level human-in-the-loop delivery, interaction
-//!   answering, and pause/resume/cancel signals for live runs;
+//!   answering, and cancellation for live runs (pause/resume answer a typed
+//!   `Error::Unsupported`, because nothing can suspend an in-flight invocation);
 //! - [`TeamPool`] — the in-process team runtime pool with admission, leases,
 //!   bounded concurrency, idle eviction, and payload buffering;
 //! - the spawn seam ([`AgentSpawner`], [`SpawnSpec`], [`SpawnMessage`]), with
