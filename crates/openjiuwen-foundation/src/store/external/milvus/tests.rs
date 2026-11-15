@@ -364,6 +364,7 @@ async fn insert_sends_the_typed_fields_and_generates_auto_ids() {
         data
     })
     .await;
+    mount_ok(&server, ENTITIES_QUERY, json!([])).await;
     mount_ok(&server, ENTITIES_INSERT, json!({"insertCount": 1})).await;
     assert_eq!(
         store(&server).get_schema("docs").await.expect("describe"),
@@ -438,6 +439,7 @@ async fn insert_rejects_invalid_documents_without_writing() {
 async fn insert_falls_back_to_the_document_count() {
     let server = MockServer::start().await;
     mount_describe(&server, "docs", describe_data()).await;
+    mount_ok(&server, ENTITIES_QUERY, json!([])).await;
     mount_ok(&server, ENTITIES_INSERT, json!({})).await;
 
     let docs = [
@@ -451,6 +453,100 @@ async fn insert_falls_back_to_the_document_count() {
     assert_eq!(
         store(&server).add_docs("docs", docs).await.expect("insert"),
         2
+    );
+}
+
+#[tokio::test]
+async fn insert_probes_the_primary_keys_before_writing() {
+    let server = MockServer::start().await;
+    mount_describe(&server, "docs", describe_data()).await;
+    Mock::given(method("POST"))
+        .and(path(ENTITIES_QUERY))
+        .and(body_json(json!({
+            "collectionName": "docs",
+            "filter": "id in [\"a\", \"b\"]",
+            "outputFields": ["id"],
+            "limit": 2,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code": 0, "data": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_ok(&server, ENTITIES_INSERT, json!({"insertCount": 2})).await;
+    let docs = [
+        json!({"id": "a", "embedding": [1.0, 0.0]}),
+        json!({"id": "b", "embedding": [0.0, 1.0]}),
+    ]
+    .iter()
+    .map(|doc| doc.as_object().cloned().unwrap_or_default())
+    .collect();
+    assert_eq!(
+        store(&server).add_docs("docs", docs).await.expect("insert"),
+        2
+    );
+}
+
+#[tokio::test]
+async fn insert_rejects_primary_keys_the_collection_already_stores() {
+    let server = MockServer::start().await;
+    mount_describe(&server, "docs", describe_data()).await;
+    Mock::given(method("POST"))
+        .and(path(ENTITIES_QUERY))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "data": [{"id": "a"}],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let docs = [
+        json!({"id": "a", "embedding": [1.0, 0.0]}),
+        json!({"id": "b", "embedding": [0.0, 1.0]}),
+    ]
+    .iter()
+    .map(|doc| doc.as_object().cloned().unwrap_or_default())
+    .collect();
+    let error = store(&server)
+        .add_docs("docs", docs)
+        .await
+        .expect_err("duplicate primary key");
+    assert_eq!(error.kind(), ErrorKind::Validation, "{error}");
+    let message = error.to_string();
+    assert!(message.contains("\"a\""), "{message}");
+    assert!(message.contains("already stored"), "{message}");
+    assert!(
+        message.contains("reject_duplicate_primary_keys"),
+        "{message}"
+    );
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != ENTITIES_INSERT),
+        "a duplicate primary key must not reach the insert: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn insert_can_skip_the_duplicate_probe() {
+    let server = MockServer::start().await;
+    mount_describe(&server, "docs", describe_data()).await;
+    mount_ok(&server, ENTITIES_INSERT, json!({"insertCount": 1})).await;
+    let store = MilvusVectorStore::new(
+        MilvusConfig::new(server.uri()).with_reject_duplicate_primary_keys(false),
+    )
+    .expect("build store");
+    let docs = vec![json!({"id": "a", "embedding": [1.0, 0.0]})
+        .as_object()
+        .cloned()
+        .unwrap_or_default()];
+    assert_eq!(store.add_docs("docs", docs).await.expect("insert"), 1);
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != ENTITIES_QUERY),
+        "the probe is off: {requests:?}"
     );
 }
 
