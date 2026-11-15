@@ -78,7 +78,7 @@ Inline turns carry plain text as their `content`; neighbours are read from the p
 - `./request.rs` → body assembly, reasoning-plan wiring and legacy-control precedence, `max_tokens` caps, `normalize_api_base`
 - `./convert.rs` → message projection, mid-conversation system partition, tools/tool_choice, images
 - `./cache.rs` → cache-control marker, the three anchors, transient-tail detection, `extra` knobs
-- `./response.rs` → non-streaming response parsing (`content` blocks → `BaseMessage`, `stop_reason`, usage)
+- `./response.rs` → non-streaming response parsing (`content` blocks → `BaseMessage`, preserved thinking blocks, `stop_reason`, usage)
 - `./stream.rs` → SSE event state machine (`content_block_*`, `message_*`, tool-input buffering)
 - `./request/tests.rs` → body projection tests
 - `./request/cache_tests.rs` → cache-anchor tests
