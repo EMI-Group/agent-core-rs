@@ -30,6 +30,7 @@ Deterministic data and scoring (re-exported at `openjiuwen_dev_tools::skill_eval
 - `SafetyRule` — `pattern`, `dimension`, `severity`, `message`, `auto_fail: Option<AutoFailCode>`; `SafetyRule::new(pattern, dimension, severity, message)` and `with_auto_fail(code)`.
 - `CaseRunner` (`async fn run(&self, &EvalCase, &SkillDefinition) -> Result<String>`), `ScriptedCaseRunner`, `ModelCaseRunner`.
 - `EvaluatorConfig` — `design_weight` 0.40, `functional_weight` 0.60, `safety_gate_threshold` 0.80, `safety_rules`, `partial_threshold` 0.50 (parity only; status derivation does not consult it).
+- `safety_gate_threshold` reaches only the deterministic `scan_safety` path; `evaluate_with_judge*` pins `judge_scoring::SAFETY_GATE_THRESHOLD` (0.80), so a different configured gate has no effect on a judged run and the report's `gate_threshold` shows the pinned value.
 - `SkillEvaluator` — `new(runner)`, `with_config`, `scripted`, `runner`, `config`, `evaluate`, `evaluate_at`, plus the judged path below.
 
 LLM judge (`skill_evaluator::judge_scoring`):
@@ -167,6 +168,9 @@ A writer creates missing directories, reports a non-directory target as `Error::
 - Python's deterministic AF1–AF5 detectors — auto-fail codes come from caller-supplied `SafetyRule::with_auto_fail` rules or the judge, because the regex scan has no hardcoded-credential/exfiltration detectors.
 - The human-readable reports (`llm_judge_report.md`, `final_report.md`, `pipeline_report.md`, `skill_safety_report.md`) and the `skill_tester_cases.json`/`run-N/` test scaffolding — only the four machine-readable JSON artifacts are written.
 - `run_eval_query.py`'s environment-driven model construction (`API_BASE`, `API_KEY`, `MODEL_NAME`, `MODEL_PROVIDER`, `LLM_SSL_VERIFY`, `FILES_BASE_DIR`, `MAX_ITERATIONS`) — configuration stays with the caller, and `files_base_dir`/`max_iterations` are explicit `QueryRequest` fields.
+- `QueryRequest.max_iterations` is announced in the query prompt only; no iteration budget is enforced, and the prompt's "You may use tools when necessary" line has no tool channel behind it.
+- `EvalCase::files` is carried in the model but never consumed: no evaluator, runner, or harness path materializes or passes case input files, so a case declaring files runs without them and without an error.
+- `EvalRun::report` accepts a blank timestamp string (unlike `QueryRequest`, which rejects one), so a harness-only report can carry an empty `timestamp`.
 - ISO-8601 timestamp rendering — `FunctionalReport::timestamp` stays epoch milliseconds.
 
 ## Routing Table
