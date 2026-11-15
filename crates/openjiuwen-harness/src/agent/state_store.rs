@@ -94,6 +94,51 @@ pub async fn save_state(session: &dyn Session, state: &DeepAgentState) -> Result
     session.update_state(Value::Object(patch)).await
 }
 
+/// Replaces the persisted `deepagent` lane with a verbatim JSON payload.
+///
+/// This is the resume-side counterpart of [`save_state`]: a host that
+/// reconstructed the state itself (for example the `state` JSON of a
+/// `persistent_agent::ResumePlan`) can install it without going through
+/// [`DeepAgentState`]. Unlike [`save_state`] the payload is stored verbatim —
+/// the keys and types are the host's and are never validated against the
+/// schema; [`load_state`] still decodes it leniently.
+///
+/// Replace semantics match [`save_state`] and Python's `update_dict`: the lane
+/// is deleted first (`{deepagent: null}`) and the object is then written into
+/// the now-absent path. The session store would otherwise deep-merge the two
+/// objects, leaving keys of the previous payload behind; deleting first also
+/// keeps explicit nulls in `state`.
+///
+/// # Errors
+///
+/// Returns [`Error::validation`] when `state` is not a JSON object, and
+/// [`Error::session`] when a session write fails.
+pub async fn seed_state(session: &dyn Session, state: Value) -> Result<()> {
+    if !state.is_object() {
+        return Err(Error::validation(
+            "seeded deepagent state must be a JSON object",
+        ));
+    }
+    session
+        .update_state(delete_state_patch())
+        .await
+        .map_err(|error| {
+            Error::session(format!(
+                "failed to clear session state {SESSION_STATE_KEY:?} before seeding: {error}"
+            ))
+        })?;
+    let mut patch = Map::new();
+    patch.insert(SESSION_STATE_KEY.to_string(), state);
+    session
+        .update_state(Value::Object(patch))
+        .await
+        .map_err(|error| {
+            Error::session(format!(
+                "failed to seed session state {SESSION_STATE_KEY:?}: {error}"
+            ))
+        })
+}
+
 /// A patch that deletes [`SESSION_STATE_KEY`] (`null` patch value = delete).
 fn delete_state_patch() -> Value {
     let mut patch = Map::new();

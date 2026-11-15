@@ -23,6 +23,9 @@
 //!   that forwards drained events to the invocation stream
 //! - `round` — input normalization, [`RoundState`] and the task-loop
 //!   [`RoundExecutorHandle`]
+//! - `seed` — [`DeepAgent::seed_history`] and [`seed_state`]: pushing a
+//!   persisted transcript into the kernel `"main"` conversation context and a
+//!   host-built `deepagent` state payload into a session
 //! - `state_store` — the session-persisted [`DeepAgentState`]
 //! - `subagent_factory` — the default [`crate::subagents::SubAgentFactory`]
 //!   and sub-agent tool wiring
@@ -50,6 +53,7 @@ mod factory;
 mod prompt_rail;
 mod rail_events;
 mod round;
+mod seed;
 mod state_store;
 mod subagent_factory;
 #[cfg(test)]
@@ -95,7 +99,7 @@ pub use rail_events::{
     RAIL_EVENTS_EXTRA_PREFIX, RAIL_EVENT_DRAIN_NAME, RAIL_EVENT_DRAIN_PRIORITY,
 };
 pub use round::{normalize_inputs, RoundExecutorHandle, RoundState};
-pub use state_store::{clear_state, load_state, save_state, SESSION_STATE_KEY};
+pub use state_store::{clear_state, load_state, save_state, seed_state, SESSION_STATE_KEY};
 pub use subagent_factory::DeepAgentSubAgentFactory;
 
 /// Error message of a second concurrent invocation.
