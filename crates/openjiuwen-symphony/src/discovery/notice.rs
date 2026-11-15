@@ -188,12 +188,37 @@ fn render_reminder(
     if added.is_empty() {
         return None;
     }
-    let mut rows: Vec<(String, String)> = added
+    let rows: Vec<(String, String)> = added
         .iter()
         .map(|worker_id| reminder_row(worker_id, inventory))
         .collect();
-    rows.sort_by_cached_key(|(name, _)| (name.to_lowercase(), name.clone()));
-    let rendered_rows = rows
+    render_reminder_rows(&rows, max_chars, tool_name)
+}
+
+/// Renders Python's `_render_reminder` from `(name, description)` rows.
+///
+/// The rows are sorted by `(name.to_lowercase(), name)` — Python's `casefold` order plus
+/// a total tie-break — joined by newlines, and wrapped in the exact
+/// `<system-reminder>` block. When `max_chars` is `0` or the block is longer than
+/// `max_chars`, the compact "`N` new skills are available" form is rendered instead.
+/// `None` when `rows` is empty.
+///
+/// Both [`render_reminder`] and the incremental notice session layer
+/// (`crate::discovery::toolkit`) call this, so the two notice paths emit byte-identical
+/// reminders.
+pub(crate) fn render_reminder_rows(
+    rows: &[(String, String)],
+    max_chars: usize,
+    tool_name: &str,
+) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    let mut ordered = rows.to_vec();
+    ordered.sort_by_cached_key(|(name, description)| {
+        (name.to_lowercase(), name.clone(), description.clone())
+    });
+    let rendered_rows = ordered
         .iter()
         .map(|(name, description)| format!("- {name}: {description}"))
         .collect::<Vec<_>>()
@@ -211,7 +236,7 @@ fn render_reminder(
         "<system-reminder>\n\
          {} new skills are available. Use `{tool_name}` to search the current catalog.\n\
          </system-reminder>",
-        added.len()
+        rows.len()
     ))
 }
 
@@ -233,13 +258,18 @@ fn reminder_row(worker_id: &str, inventory: &SkillInventory) -> (String, String)
 }
 
 /// Python's `_safe_text`: collapse whitespace and escape angle brackets.
-fn safe_text(value: &str) -> String {
+///
+/// Shared with the incremental notice session layer (`crate::discovery::toolkit`) so a
+/// card is normalized identically on both paths.
+pub(crate) fn safe_text(value: &str) -> String {
     let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed.replace('<', "&lt;").replace('>', "&gt;")
 }
 
 /// Python's `textwrap.shorten(text, width, placeholder="...")`.
-fn shorten_description(text: &str, width: usize) -> String {
+///
+/// Shared with the incremental notice session layer (`crate::discovery::toolkit`).
+pub(crate) fn shorten_description(text: &str, width: usize) -> String {
     let placeholder = "...";
     if text.chars().count() <= width {
         return text.to_string();
