@@ -28,6 +28,7 @@ mod cli;
 mod cron;
 mod extras;
 mod lsp;
+mod sessions;
 mod team;
 mod watch;
 
