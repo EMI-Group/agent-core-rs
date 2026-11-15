@@ -41,7 +41,7 @@
 //! | `core::memory::{lite, analyzer, external, team, dreaming, store}` | coding memory, extraction/consolidation, external providers, team memory, dreaming, pluggable stores (the `sqlite` constructor is behind the `sqlite` feature) |
 //! | `core::retrieval::{sparse, rewrite, graph, multimodal, parsing}` | BM25, query rewriting, graph/multimodal/parsed retrieval |
 //! | `core::sys_operation::sandbox::provider` | sandbox provider registry (the `sandbox` transport is behind the `sandbox` feature) |
-//! | `harness::{lsp, spec, worktree, subagents, tools}` | LSP client, spec registry, git worktrees, subagents, built-in tool catalog (the `browser`/`cua`/`mobile` presets are behind the matching features and report `Unsupported`) |
+//! | `harness::{lsp, spec, worktree, subagents, tools, watcher}` | LSP client, spec registry, git worktrees, subagents, built-in tool catalog, debounced workspace watcher (the `browser`/`cua`/`mobile` presets are behind the matching features and report `Unsupported`; `watcher::WorkspaceWatcher::start` needs the `notify` feature and reports `Unsupported` without it) |
 //! | `harness_providers::providers::{native, native_v2, vendor, claudecode, codex, dsh}` | the built-in provider table: `native` is always compiled in, `native_v2` is behind the `native-v2` feature, the vendor tree (`vendor`, `claudecode`, `codex`, `dsh`) is behind the `vendor` feature |
 //! | `agent_teams::{attach, org, monitor, models, kv_cache, memory, observability, storage}` | cross-process attach (`attach` is feature-free; its transport seams are not), org namespacing, member cache affinity, model routing, monitoring, team memory configuration, tools and wiring, observability (the `OTel` sink is behind the `otel` feature, the OTLP memory bridge behind `otlp`), team stores (the SQLite store is behind the `sqlite` feature) |
 //! | `core::single_agent::{memory_provider, usage, policy, prompt_pack}` | provider-memory rail and tools, usage telemetry, client-tool/exposure policy, prompt packs (`core::{controller, kv_cache, operator}` above are the same crate's other top-level packages) |
@@ -70,13 +70,13 @@
 //!
 //! | Feature | Default | Forwards to | Effect |
 //! | --- | --- | --- | --- |
-//! | `native` | yes | `openjiuwen-harness/native`, `openjiuwen-harness-providers/native` | in-process native `DeepAgent` harness and provider |
+//! | `native` | yes | `openjiuwen-harness/native`, `openjiuwen-harness-providers/native` | the in-process `native` provider (that is the half which really gates source); `openjiuwen-harness/native` is an empty marker — no source reads it and the native `DeepAgent` harness is always compiled |
 //! | `native-v2` | no | `openjiuwen-harness-providers/native-v2` | the agent-teams-hosted `native_v2` provider (`harness_providers::providers::native_v2`) |
 //! | `vendor` | no | `openjiuwen-harness-providers/vendor` | registers the vendor providers `claudecode`, `codex`, `dsh` (each still answers `Unsupported` when driven) |
 //! | `browser` | no | `openjiuwen-harness/browser` | the `browser` subagent preset, which reports its missing implementation as `Unsupported` |
 //! | `cua` | no | `openjiuwen-harness/cua` | the `cua` subagent preset, which reports its missing implementation as `Unsupported` |
 //! | `mobile` | no | `openjiuwen-harness/mobile` | the `mobile` subagent preset, which reports its missing implementation as `Unsupported` |
-//! | `notify` | no | `openjiuwen-harness/notify` | activates the workspace file-watcher dependency (no umbrella-visible type) |
+//! | `notify` | no | `openjiuwen-harness/notify` | compiles the harness's `notify`-backed watcher backend, so `harness::watcher::WorkspaceWatcher::start` really arms an OS watcher; without the feature the watcher API still resolves and `start` answers `Unsupported` (the `openjiuwen` binary enables the harness feature on its own, so its `watch` and `chat --watch` commands never depend on this forward) |
 //!
 //! ## Storage backends
 //!
@@ -89,9 +89,9 @@
 //! | Feature | Default | Forwards to | Effect |
 //! | --- | --- | --- | --- |
 //! | `a2a` | no | `openjiuwen-extensions/a2a` | Agent-to-Agent client/server modules |
-//! | `mcp` | no | `openjiuwen-extensions/mcp` | the extensions' MCP adapter surface (it currently gates no source; agent-teams' MCP server is always built) |
-//! | `redis` | no | `openjiuwen-extensions/redis`, `openjiuwen-agent-evolving/redis` | the extensions' Redis store surface (construction returns `Unsupported`) and the RL online service's Redis-backed `OnlineStore` (`agent_evolving::online::{RedisOnlineStore, RedisOnlineStoreOptions}`; `rediss://` TLS and cluster stay `Unsupported`) |
-//! | `pulsar` | no | `openjiuwen-extensions/pulsar` | the Pulsar message-queue surface, whose construction returns `Unsupported` |
+//! | `mcp` | no | `openjiuwen-extensions/mcp` | activates that crate's optional `rmcp`/`tokio-stream` dependencies only: it gates no source there and exposes no `extensions::mcp` module, while agent-teams' MCP server is compiled regardless because that crate's `mcp` default applies |
+//! | `redis` | no | `openjiuwen-extensions/redis`, `openjiuwen-agent-evolving/redis` | the extensions' Redis KV/document/vector stores and `RedisCheckpointer` over its in-crate RESP client (`redis://` connects lazily; `rediss://` TLS and cluster slot routing stay `Unsupported`), plus the RL online service's Redis-backed `OnlineStore` (`agent_evolving::online::{RedisOnlineStore, RedisOnlineStoreOptions}`, likewise `Unsupported` for TLS and cluster) |
+//! | `pulsar` | no | `openjiuwen-extensions/pulsar` | the extensions' Pulsar message-queue module, whose construction always returns `Unsupported` (no broker client is vendored) |
 //! | `distributed` | no | `openjiuwen-agent-teams/distributed` | the distributed `PyZmqMessager` seam, which rejects at construction |
 //!
 //! ## Observability, sandbox, test gates
@@ -100,8 +100,8 @@
 //! | --- | --- | --- | --- |
 //! | `otel` | no | `openjiuwen-extensions/otel`, `openjiuwen-core/otel`, `openjiuwen-session/otel`, `openjiuwen-agent-teams/otel` | live OpenTelemetry exporters and sink, the kernel trace-sink hook (`core::session::install_trace_sink` really installs the sink), and the team `OTel` span sink (`agent_teams::observability::OtelSpanSink`) |
 //! | `otlp` | no | `openjiuwen-agent-teams/otlp` | the team-memory OTLP bridge (`agent_teams::observability::{OtlpMemoryObserver, otlp_memory_observer}`), which forwards memory events into `openjiuwen-extensions`' `OtelTraceSink`; it also turns on that crate's `otel` feature transitively, while `OTLP_EXPORT_AVAILABLE` stays `false` |
-//! | `sandbox` | no | `openjiuwen-sysop/sandbox` | the sandbox provider transport (`core::sys_operation::sandbox`) |
-//! | `live-tests` | no | `openjiuwen-foundation/live-tests`, `openjiuwen-harness/live-tests`, `openjiuwen-harness-providers/live-tests`, `openjiuwen-agent-teams/live-tests`, `openjiuwen-extensions/live-tests`, `openjiuwen-core/live-tests` | opt-in network/vendor test gates (`openjiuwen-core/live-tests` only re-forwards the foundation gate) |
+//! | `sandbox` | no | `openjiuwen-sysop/sandbox` | compiles the `reqwest`-backed HTTP sandbox transport behind `core::sys_operation::sandbox` and registers it in the provider registry; without it the sandbox configuration and registry still compile, only the HTTP provider is absent |
+//! | `live-tests` | no | `openjiuwen-foundation/live-tests`, `openjiuwen-harness/live-tests`, `openjiuwen-harness-providers/live-tests`, `openjiuwen-agent-teams/live-tests`, `openjiuwen-extensions/live-tests`, `openjiuwen-core/live-tests` | empty opt-in gates — no source path and no test in this workspace reads them; the forward only pins one switch for a downstream consumer (`openjiuwen-core/live-tests` re-forwards the foundation gate) |
 //!
 //! # Getting started
 //!
