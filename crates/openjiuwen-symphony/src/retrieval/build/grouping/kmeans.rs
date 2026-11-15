@@ -2,7 +2,7 @@
 //!
 //! Ports the clustering half of Python `openjiuwen.symphony.retrieval.build.tree.grouping`
 //! (its `faiss.Kmeans` call and the `n_clusters` derivation next to it) onto
-//! `openjiuwen-retrieval`'s [`Embedding`](openjiuwen_retrieval::Embedding) trait, so
+//! `openjiuwen-retrieval`'s [`Embedding`] trait, so
 //! [`GroupingStrategy::Kmeans`] and [`GroupingStrategy::FaissKmeans`] group items without
 //! faiss, numpy or a completion model.
 //!

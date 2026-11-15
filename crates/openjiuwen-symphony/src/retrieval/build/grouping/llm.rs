@@ -7,7 +7,7 @@
 //! describes the inventory and its bounds,
 //! [`parse_reply`](crate::retrieval::build::grouping::llm::parse_reply) validates the answer,
 //! and [`group_paths`](crate::retrieval::build::grouping::llm::group_paths) joins them over
-//! the crate's [`CompletionModel`](crate::llm::CompletionModel) seam.
+//! the crate's [`CompletionModel`] seam.
 //!
 //! # The prompt contract
 //!
