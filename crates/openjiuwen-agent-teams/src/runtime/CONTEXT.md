@@ -766,7 +766,9 @@ tests over 15 binaries),
 - `deps.store_injected` is the only store-resolution switch: `with_store` sets it, `default()`/`new()` clear it. Adding a second way to supply a store would silently diverge from `resolve_store`.
 - `crates/openjiuwen-e2e/tests/team_backend.rs` still asserts that completion is stream-only (`all(|event| event.event_type != "team_completed")`); a settled run now also publishes `team_completed` on `TeamTopic::Team`, so that assertion belongs to the e2e owner and must be inverted there — this crate cannot edit it.
 - `src/schema/CONTEXT.md` (schema node) still says the leader loop emits no completion bus event; that node owns the correction.
-- A settled run publishes the bus event after the stream marker is sent, so a caller that reads the bus alone sees completion strictly after the frame; a publish failure is logged and never fails the run. `blueprint`,
+- A settled run publishes the bus event after the stream marker is sent, so a caller that reads the bus alone
+  sees completion strictly after the frame; a publish failure is logged and never fails the run.
+- The offline test kit (`team_agent/test_support`) is `blueprint`,
   `deps`, `built`, `ScriptedFactory` (`failing_for`/`hanging_for`/`calls`/`harness`), `ScriptedHarness`
   (`calls`/`sends`, answers `done: <member>` by default), `RecordingWorkspaceProvider` (`requests`, `releases`/`released_names`, `fail_releases`).
 - `team_agent/` is split by concern (`mod.rs` handle, `lifecycle.rs`, `members.rs` plus the small
@@ -786,17 +788,6 @@ tests over 15 binaries),
   per-tool spans. The monitor stream has no TUI/consumer here.
 - The organisation layer is in-process only: no cross-process org messaging, summary teams, runtime
   swarmflow lanes or org-level observability; the chart shapes and their semantics belong to `src/org/`.
-- Team memory is in-process and per-team: no cross-team/hub sync, no LLM-backed extractor here (an
-  `extractor: "llm"` block degrades to the rules — drive `open_with_model` yourself for the LLM path), no
-  distributed store, and the document is the only durable artefact (this crate does not enable the
-  `openjiuwen-memory` `sqlite` feature). The hooks are advisory by design, so a broken memory store never
-  fails a start, spawn, shutdown or stop.
-- A roster removal that bypasses `shutdown_member` (`TeamBackend::remove_member`) records no handoff note: the
-  hook is async and the removal seam is sync, and the documented restart path is
-  `shutdown_member` → `remove_member` → `spawn_member`, so the leave hook already ran.
-- Child-process members receive the leader's `metadata["checkpoint"]` block through
-  `MemberSpawnRequest::with_checkpoint_config` (the two `OPENJIUWEN_MEMBER_CHECKPOINT*` env vars); team memory
-  is *not* transported to a child, which mounts no toolkit of its own.
 - Team memory is in-process and per-team: no cross-team/hub sync, no LLM-backed extractor on the build path
   (an `extractor: "llm"` block degrades to the rules — `TeamMemoryWiring::open_with_model` is the seam), no
   distributed store, and the `TEAM_MEMORY.md` document is the only durable artefact (this crate does not enable
