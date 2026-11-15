@@ -124,6 +124,10 @@ pub struct TracerHandle {
     /// Exporter snapshot, present only for [`ExporterType::Memory`].
     #[cfg(feature = "otel")]
     capture: Option<Arc<CaptureExporter>>,
+    /// Trace-file exporter, present only for [`ExporterType::File`], so a host
+    /// can observe whether span export is actually reaching disk.
+    #[cfg(feature = "otel")]
+    file: Option<TraceFileExporter>,
     /// Set by the first [`TracerHandle::shutdown`] call.
     #[cfg(feature = "otel")]
     shutdown: AtomicBool,
@@ -254,6 +258,22 @@ impl TracerHandle {
         self.capture.clone()
     }
 
+    /// Returns the trace-file exporter, present only when the configuration
+    /// asked for [`ExporterType::File`].
+    ///
+    /// The handle shares the exporter's state with the provider, so the
+    /// counters it exposes — `dropped_spans`, `failed_exports`, `last_error` —
+    /// report what the live exporter is doing. [`ExporterType::File`] export is
+    /// deliberately fail-open (telemetry must never break the caller), so these
+    /// accessors are how a host learns that spans are not reaching disk.
+    ///
+    /// [`ExporterType::File`]: super::config::ExporterType::File
+    #[cfg(feature = "otel")]
+    #[must_use]
+    pub fn file_exporter(&self) -> Option<&TraceFileExporter> {
+        self.file.as_ref()
+    }
+
     /// Reports whether [`Self::shutdown`] already ran (feature builds only).
     #[cfg(feature = "otel")]
     fn is_shutdown(&self) -> bool {
@@ -272,6 +292,8 @@ impl TracerHandle {
             #[cfg(feature = "otel")]
             capture: None,
             #[cfg(feature = "otel")]
+            file: None,
+            #[cfg(feature = "otel")]
             shutdown: AtomicBool::new(false),
         }
     }
@@ -283,12 +305,14 @@ impl TracerHandle {
         provider: SdkTracerProvider,
         tracer: SdkTracer,
         capture: Option<Arc<CaptureExporter>>,
+        file: Option<TraceFileExporter>,
     ) -> Self {
         Self {
             config,
             provider: Some(provider),
             tracer: Some(tracer),
             capture,
+            file,
             shutdown: AtomicBool::new(false),
         }
     }
@@ -362,7 +386,7 @@ pub fn init_otel_tracer(config: OtelTracerConfig) -> Result<TracerHandle> {
             let exporter = otlp_exporter(&config)?;
             let provider = build_provider(&config, exporter)?;
             let tracer = provider.tracer(config.tracer_name.clone());
-            Ok(TracerHandle::active(config, provider, tracer, None))
+            Ok(TracerHandle::active(config, provider, tracer, None, None))
         }
         ExporterType::Memory => {
             let capture = Arc::new(CaptureExporter::new());
@@ -373,22 +397,32 @@ pub fn init_otel_tracer(config: OtelTracerConfig) -> Result<TracerHandle> {
                 provider,
                 tracer,
                 Some(capture),
+                None,
             ))
         }
         ExporterType::Console => {
             let provider = build_provider(&config, ConsoleExporter)?;
             let tracer = provider.tracer(config.tracer_name.clone());
-            Ok(TracerHandle::active(config, provider, tracer, None))
+            Ok(TracerHandle::active(config, provider, tracer, None, None))
         }
         ExporterType::File => {
-            let provider = build_provider(&config, TraceFileExporter::from_config(&config))?;
+            // One exporter, two handles: the provider drives it and the handle
+            // keeps it so a host can read its failure counters.
+            let exporter = TraceFileExporter::from_config(&config);
+            let provider = build_provider(&config, exporter.clone())?;
             let tracer = provider.tracer(config.tracer_name.clone());
-            Ok(TracerHandle::active(config, provider, tracer, None))
+            Ok(TracerHandle::active(
+                config,
+                provider,
+                tracer,
+                None,
+                Some(exporter),
+            ))
         }
         ExporterType::None => {
             let provider = build_provider_without_exporter(&config)?;
             let tracer = provider.tracer(config.tracer_name.clone());
-            Ok(TracerHandle::active(config, provider, tracer, None))
+            Ok(TracerHandle::active(config, provider, tracer, None, None))
         }
     }
 }
@@ -418,7 +452,7 @@ where
     config.validate()?;
     let provider = build_provider(&config, exporter)?;
     let tracer = provider.tracer(config.tracer_name.clone());
-    Ok(TracerHandle::active(config, provider, tracer, None))
+    Ok(TracerHandle::active(config, provider, tracer, None, None))
 }
 
 /// Builds the OTLP/HTTP exporter described by `config`.
@@ -526,9 +560,31 @@ mod tests {
         let handle = init_otel_tracer(config).unwrap();
         assert!(handle.is_active());
         assert_eq!(handle.config().exporter_type, ExporterType::File);
+        // The handle carries the exporter so a host can observe span loss.
+        let exporter = handle
+            .file_exporter()
+            .expect("a File handle exposes its exporter");
+        assert_eq!(exporter.root_dir(), dir.path());
+        assert_eq!(exporter.dropped_spans(), 0);
+        assert_eq!(exporter.failed_exports(), 0);
+        assert_eq!(exporter.last_error(), None);
         handle.force_flush();
         handle.shutdown();
         assert!(!handle.is_active());
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn non_file_handles_expose_no_file_exporter() {
+        for exporter_type in [
+            ExporterType::Memory,
+            ExporterType::Console,
+            ExporterType::None,
+        ] {
+            let config = OtelTracerConfig::default().with_exporter_type(exporter_type);
+            let handle = init_otel_tracer(config).unwrap();
+            assert!(handle.file_exporter().is_none(), "{exporter_type:?}");
+        }
     }
 
     #[cfg(not(feature = "otel"))]

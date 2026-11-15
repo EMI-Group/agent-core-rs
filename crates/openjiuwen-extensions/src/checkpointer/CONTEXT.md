@@ -89,7 +89,7 @@ pub mod redis {
 - This module never re-implements kernel backends; `build_checkpointer` delegates to `create_checkpointer`.
 - No Redis driver dependency: the `redis` feature adds no crate, only the in-crate client and this backend.
 - Only `src/checkpointer/redis.rs` and the module docs change here; `src/redis/**` is consumed as-is.
-- Errors: `Error::Validation` for bad ids/URLs, `Error::Session` for encode/decode failures, `Error::Transport`/`Timeout` from the client, `Error::Unsupported` for TLS and cluster redirection.
+- Errors: `Error::Validation` for bad ids/URLs, `Error::Session` for encode/decode failures, `Error::Transport`/`Timeout` from the client (including TLS handshake and cluster-redirection failures).
 - No payload or credential is logged; refresh failures log at `debug` with the session id only.
 - All public items documented; files ≤ ~1000 lines.
 
@@ -97,13 +97,13 @@ pub mod redis {
 
 - Unit tests beside `mod.rs`: `CheckpointerKind::InMemory` builds a working checkpointer and a save/load round-trip succeeds; `File` without a path is `ErrorKind::Validation`; the sqlite branch is asserted only under `--features sqlite`.
 - `redis` config tests (no server): all four schemes accepted, missing/`http://` rejected, cluster inference and explicit override, `connection_url` marker stripping, `connection_args` carried through, Python-field JSON round-trip, `new` URL validation, glob escaping, TTL second rounding, redacting `Debug`.
-- `redis` live tests against `crate::redis::testsupport::FakeRedis`: full-field save/load round-trip, explicit ids, invalid-id validation, missing checkpoint/session results, newest-first `list` plus `latest`, `delete` vs `release` (including the `session-1`/`session-10` prefix case), stale-index cleanup, undecodable payloads, TTL on save, TTL refresh on read and its absence without `refresh_on_read`, `connect`/`create`, TLS rejection, cluster `MOVED` rejection, unreachable port, and `connection_args` credentials.
+- `redis` live tests against `crate::redis::testsupport::FakeRedis`: full-field save/load round-trip, explicit ids, invalid-id validation, missing checkpoint/session results, newest-first `list` plus `latest`, `delete` vs `release` (including the `session-1`/`session-10` prefix case), stale-index cleanup, undecodable payloads, TTL on save, TTL refresh on read and its absence without `refresh_on_read`, `connect`/`create`, cluster `MOVED` following, unreachable port, and `connection_args` credentials.
 - Python counterparts named in comments: `tests/unit_tests/extensions/checkpointer/test_redis_checkpointer.py`, `test_redis_checkpointer_provider.py`.
 
 ## Remaining Deferrals
 
-- `rediss://`/`rediss+cluster://` return `Error::Unsupported` naming TLS: the workspace vendors no TLS stack.
-- Cluster slot routing and `MOVED`/`ASK` following return `Error::Unsupported`; a cluster URL connects to one node with cluster mode recorded.
+- `rediss://`/`rediss+cluster://` work through the crate's client: the TLS handshake verifies the server against the web PKI (`tokio-rustls` + `webpki-roots`, both locked offline), so no TLS error is returned for a valid certificate chain.
+- Cluster URLs verify the seed as a cluster node and follow one `MOVED`/`ASK` redirection per command, so slot routing is real rather than recorded-and-ignored.
 - Python's pickle payload format and `{session_id}:agent:{agent_id}:agent_state_blobs` key layout are intentionally replaced by the JSON payload plus sorted-set index described above.
 
 ## Routing Table

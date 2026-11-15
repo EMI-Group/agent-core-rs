@@ -54,6 +54,8 @@ use super::credentials::ElasticsearchCredentials;
 /// per-collection metric registry, so every index uses cosine similarity — the
 /// kernel's default [`Metric`].
 const STORE_METRIC: Metric = Metric::Cosine;
+/// `tracing` target for transport-level diagnostics.
+const LOG_TARGET: &str = "openjiuwen_extensions::store::elasticsearch";
 
 /// The `dense_vector.similarity` Elasticsearch expects for a kernel [`Metric`].
 pub(crate) fn similarity_for(metric: Metric) -> &'static str {
@@ -491,10 +493,20 @@ fn property(field: &FieldSchema, dimension: usize) -> Value {
 /// property named `id` (or else the first non-vector property) becomes the
 /// primary key, and `dynamic != "strict"` becomes `enable_dynamic_field`.
 /// Returns `None` only when the mapping declares no `properties` object.
+///
+/// A stored schema that does not decode is reported at `warn` and then rebuilt
+/// from `properties`: the index exists either way, so failing would strand a
+/// readable collection, and reconstructing silently would hide a corrupt schema
+/// (the rebuilt one loses fields the mapping cannot describe).
 pub(crate) fn schema_from_mappings(mappings: &Value) -> Option<CollectionSchema> {
     if let Some(stored) = mappings.pointer("/_meta/openjiuwen_schema") {
-        if let Ok(schema) = serde_json::from_value::<CollectionSchema>(stored.clone()) {
-            return Some(schema);
+        match serde_json::from_value::<CollectionSchema>(stored.clone()) {
+            Ok(schema) => return Some(schema),
+            Err(error) => tracing::warn!(
+                target: LOG_TARGET,
+                %error,
+                "the stored openjiuwen schema does not decode; reconstructing it from the index mapping"
+            ),
         }
     }
     let properties = mappings.get("properties")?.as_object()?;
@@ -741,9 +753,27 @@ fn range_query(field: &str, bound: &str, value: &Value) -> Value {
 }
 
 /// Maps a non-2xx response onto the kernel error taxonomy.
+///
+/// The response body carries the server's explanation, so a body that cannot be
+/// read is named in the error instead of degrading into "no response body".
 async fn response_error(response: reqwest::Response, operation: &str) -> Error {
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::debug!(
+                target: LOG_TARGET,
+                operation,
+                %error,
+                "the elasticsearch error response body could not be read"
+            );
+            return status_error(
+                status.as_u16(),
+                operation,
+                &format!("<the response body could not be read: {error}>"),
+            );
+        }
+    };
     status_error(status.as_u16(), operation, &body)
 }
 

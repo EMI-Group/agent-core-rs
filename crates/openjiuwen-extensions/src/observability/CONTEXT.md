@@ -40,8 +40,10 @@ export-path utilities around it.
   `reset_global_http_instrumentation_for_tests`, `register_span_consumer`, `publish_span_snapshot`,
   `publish_stream_frame`, `emit_context_window_commit`, `emit_compaction_window_commit`, and the
   three `*_DEFERRED_REASON` strings each of them carries.
-- `file_exporter` (`otel`) — `TraceFileExporter::{new, from_config}` implementing `SpanExporter`;
-  behind `ExporterType::File` with `OtelTracerConfig::{traces_dir, file_retention_days}`.
+- `file_exporter` (`otel`) — `TraceFileExporter::{new, from_config}` implementing `SpanExporter`,
+  with `dropped_spans()`, `failed_exports()` and `last_error()` reporting lost telemetry;
+  behind `ExporterType::File` with `OtelTracerConfig::{traces_dir, file_retention_days}`, and
+  reachable from the live handle through `TracerHandle::file_exporter`.
 - `transforming` (`otel`) — `SpanTransform` (blanket impl for closures), `clone_span_with_attributes`,
   `TransformingSpanExporter::{new, inner, transform}`.
 
@@ -56,7 +58,9 @@ export-path utilities around it.
 - `logical_bytes` in `AddressedSequence` measures the addressed value as Python measures it, not
   the rebuilt string; the rebuilt length is a different number.
 - `file_exporter` is the one sanctioned file-write seam: appends are serialized behind one mutex
-  and every I/O failure is logged and swallowed, because telemetry must never fail the caller.
+  and export stays infallible, because telemetry must never fail the caller — but no loss is
+  silent: every failed export and every dropped span increments a counter and stores the reason
+  in `last_error()`, so a host polls the handle's `file_exporter()` to learn that export is broken.
   The file name uses `chrono::Local`, matching Python's local-date rollover.
 - `transforming` loses no telemetry: a failing transform logs and exports the original span.
 - Files ≤ ~1000 lines; `project_semconv.rs` is at the baseline and is a flat constant table, which

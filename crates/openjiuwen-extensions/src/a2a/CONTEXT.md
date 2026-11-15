@@ -197,7 +197,7 @@ pub fn message_role_name(role: MessageRole) -> &'static str;
 - Construction validation: `card_path`, `rpc_path`, and `rest_path` must start with `/`; a REST base must be non-empty and absolute and must not collide with `card_path`/`rpc_path` (violations are `Error::Config`, never a router panic).
 - Errors map to `Error::Transport` (HTTP/SSE), `Error::Timeout`, `Error::Validation` (card/inputs/JSON-RPC params), `Error::NotFound` (JSON-RPC `TASK_NOT_FOUND`), `Error::Unsupported` (`METHOD_NOT_FOUND`/gRPC), `Error::Config` (client construction and invalid mount paths).
 - Serde: wire structs are camelCase with unknown fields tolerated and unset `Option`s omitted; enums serialize proto strings (`ROLE_USER`, `TASK_STATE_WORKING`) and decode tolerantly (bare suffix, snake_case, camelCase, `cancelled`, unknown → `Unspecified`). Empty maps serialize as `{}`.
-- Logging: `tracing` only (targets `openjiuwen_extensions::*`); payload contents never logged above `debug`.
+- Logging: `tracing` only (targets `openjiuwen_extensions::*`); payload contents never logged above `debug`, except a `message` member that does not decode: the server reports it at `warn` because the request is then answered from the synthesized message and the caller's parts are lost.
 - Files ≤ ~1000 lines; the server lives in `./server/` with one file per concern.
 
 ## Test Strategy

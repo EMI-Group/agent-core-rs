@@ -78,6 +78,12 @@ impl ElasticsearchCredentials {
 }
 
 /// The endpoint without userinfo, query, fragment, or trailing slash.
+///
+/// The userinfo setters can only fail for a cannot-be-a-base URL, which an
+/// Elasticsearch endpoint never is (the configuration decoder rejects every
+/// scheme but `http`/`https`), so their result carries no information and the
+/// credentials cannot survive into the returned endpoint — the value that
+/// reaches request URLs and logs.
 pub(crate) fn endpoint_without_userinfo(parsed: &Url) -> String {
     let mut stripped = parsed.clone();
     let _ = stripped.set_username("");

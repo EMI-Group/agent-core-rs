@@ -157,7 +157,7 @@ struct PoppedSandbox {
 pub(crate) async fn teardown(selector: &SandboxSelector) -> Result<TeardownReport> {
     require_selection(PROVIDER, selector)?;
     let mut report = TeardownReport::new(PROVIDER);
-    for entry in pop_cached(selector).await {
+    for entry in pop_cached(selector, &mut report).await {
         let request = entry
             .http
             .request(reqwest::Method::DELETE, &sandbox_url(&entry.sandbox_id));
@@ -192,7 +192,10 @@ pub(crate) async fn teardown(selector: &SandboxSelector) -> Result<TeardownRepor
 /// `sandbox_id` additionally matches a cache value; when a shared key is given
 /// but its entry is gone, the id is released through a client rebuilt from that
 /// key's base URL (Python's fallback, including the environment bearer token).
-async fn pop_cached(selector: &SandboxSelector) -> Vec<PoppedSandbox> {
+/// A client that cannot be rebuilt there is recorded in `report` as a failed
+/// release instead of being dropped: the caller asked for that container to be
+/// deleted, so an empty report would claim a release that never happened.
+async fn pop_cached(selector: &SandboxSelector, report: &mut TeardownReport) -> Vec<PoppedSandbox> {
     let mut popped = Vec::new();
     {
         let mut shared = shared_sandbox_ids().lock().await;
@@ -233,12 +236,26 @@ async fn pop_cached(selector: &SandboxSelector) -> Vec<PoppedSandbox> {
             selector.shared_key.as_deref(),
             non_blank(selector.sandbox_id.as_deref()),
         ) {
-            if let Ok(http) = client_for_base_url(key.split('|').next().unwrap_or_default()) {
-                popped.push(PoppedSandbox {
+            match client_for_base_url(key.split('|').next().unwrap_or_default()) {
+                Ok(http) => popped.push(PoppedSandbox {
                     key: key.to_string(),
                     sandbox_id: id,
                     http,
-                });
+                }),
+                Err(error) => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        provider = PROVIDER,
+                        key = %key,
+                        %error,
+                        "jiuwenbox sandbox release could not build a client for the uncached id"
+                    );
+                    report.record_failure(
+                        key.to_string(),
+                        id,
+                        format!("could not build the delete client: {error}"),
+                    );
+                }
             }
         }
     }

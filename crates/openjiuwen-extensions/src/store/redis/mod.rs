@@ -185,10 +185,11 @@ impl RedisConnection {
     /// # Errors
     ///
     /// Surfaces the client's connection error
-    /// ([`ErrorKind::Transport`](openjiuwen_common::error::ErrorKind::Transport),
-    /// [`ErrorKind::Timeout`](openjiuwen_common::error::ErrorKind::Timeout), or
-    /// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
-    /// for TLS and cluster redirections).
+    /// ([`ErrorKind::Transport`](openjiuwen_common::error::ErrorKind::Transport)
+    /// for I/O and TLS failures,
+    /// [`ErrorKind::Timeout`](openjiuwen_common::error::ErrorKind::Timeout), and
+    /// [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+    /// for a malformed URL or a cluster-mode connection to a non-cluster node).
     pub(crate) async fn client(&self) -> Result<&Client> {
         self.client
             .get_or_try_init(|| async {

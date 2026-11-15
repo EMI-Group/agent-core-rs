@@ -125,6 +125,7 @@ impl TracerHandle {
     pub fn tracer(&self) -> Option<SdkTracer>;
     pub fn provider(&self) -> Option<&SdkTracerProvider>;
     pub fn capture(&self) -> Option<Arc<CaptureExporter>>;
+    pub fn file_exporter(&self) -> Option<&TraceFileExporter>;  // Some only for ExporterType::File
 }
 pub fn init_otel_tracer(config: OtelTracerConfig) -> Result<TracerHandle>;
 // without `otel`: validates the config, returns an inactive handle for Memory/Console/None

@@ -1,4 +1,4 @@
-//! Redis checkpointer (single-node, live backend).
+//! Redis checkpointer (live backend over the in-tree RESP client).
 //!
 //! Ports `openjiuwen/extensions/checkpointer/redis/` (v0.1.20): Python's
 //! `RedisCheckpointerProvider` registers the `redis` checkpointer kind, and

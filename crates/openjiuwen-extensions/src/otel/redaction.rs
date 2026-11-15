@@ -147,9 +147,11 @@ impl<'a> Redactor<'a> {
         system_prompt: bool,
     ) -> String {
         let redacted = self.walk(value, field, system_prompt);
-        // Serializing a `Value` cannot fail: it contains neither non-string map
-        // keys nor non-finite numbers.
-        serde_json::to_string(&redacted).unwrap_or_default()
+        // `Value`'s `Display` is the same compact JSON `serde_json::to_string`
+        // writes, and it is infallible: a `Value` contains neither non-string map
+        // keys nor non-finite numbers, so this can never degrade to an empty
+        // string.
+        redacted.to_string()
     }
 
     /// Recursive worker behind [`Self::redact_json`].
@@ -204,7 +206,7 @@ fn text_of(value: Option<&Value>) -> String {
     match value {
         None => String::new(),
         Some(Value::String(text)) => text.clone(),
-        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+        Some(other) => other.to_string(),
     }
 }
 

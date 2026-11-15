@@ -108,6 +108,7 @@ All three providers are always compiled — no Cargo feature gates them — and 
 - AIO has no container-delete API (the gateway owns the container lifetime and reaps idle containers), so `shutdown_remote("aio", ..)` is `ErrorKind::Unsupported` naming the gateway — no endpoint is invented and no request is issued.
 - Selection is by `shared_key`, `sandbox_id`, base URL, or `all()` (drain the whole process cache); a `sandbox_id`-only selector is `Unsupported` for YuanRong, because an ADX environment id carries no base URL to send the delete to. A cache-key miss with a `sandbox_id` still deletes through that key's base URL.
 - The cache entry is popped before the request, so a failed delete never leaves a stale id behind; a backend instance that already resolved an id keeps its own copy (Python's per-instance `_sandbox_id`), so its next operation recreates the container.
+- Rebuilding a popped entry's delete client can fail (the cached base URL no longer parses); that path records a `TeardownFailure` naming the client build instead of dropping the entry silently, so every popped container is either in `deleted` or in `failed`.
 - `shutdown_remote_all` never fails on AIO: it reports the gateway reason in that report's `unsupported` field and tears the other two down.
 
 ## Conditional Writes
