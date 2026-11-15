@@ -1,35 +1,41 @@
 //! Grouping of scanned items into tree branches.
 //!
 //! Ports the grouping stage of Python `openjiuwen.symphony.retrieval.build.tree`
-//! (`grouping.py`, `builder.py`, `preset_writer.py`, openJiuwen SDK v0.1.20) as a
-//! deterministic, inspectable substitute for its model-driven core.
+//! (`grouping.py`, `builder.py`, `preset_writer.py`, openJiuwen SDK v0.1.20) as three
+//! interchangeable strategy families: inspectable rules, embedding-backed k-means and a
+//! model-guided round trip.
 //!
-//! # Why a substitute
+//! # Strategy families
 //!
-//! Python derives the branch path of a skill with an LLM: `grouping.py` renders every
-//! batch of skills into `GROUP_DISCOVERY_PROMPT`, asks the model for group definitions,
-//! merges the discovery passes with `GROUP_MERGE_PROMPT`, and then assigns each skill
-//! with `SKILL_ASSIGNMENT_PROMPT` — retried, repaired, and (optionally) clustered with
-//! faiss k-means when the count is large. Neither the model nor faiss exists offline, and
-//! neither is reproducible: the same skills can land in different buckets on two runs.
+//! [`GroupingStrategy`](crate::retrieval::build::grouping::GroupingStrategy) names six
+//! strategies, and every one of them is implemented; the strategy table is:
 //!
-//! The port therefore derives each item's branch path with plain, inspectable rules —
-//! the classification path, then the item's first tag, then its leading name token — and
-//! then enforces Python's structural bounds (`BRANCHING_FACTOR`, `MAX_DEPTH`) with a
-//! bottom-up rebalancing pass. The strategies `LlmGrouping`, `FaissKmeans` and `Kmeans`
-//! (see [`GroupingStrategy`](crate::retrieval::build::grouping::GroupingStrategy)) keep
-//! Python's names and report [`unsupported`](crate::error::unsupported) instead of
-//! pretending to group.
+//! | Family | Strategies | Needs | Implementation |
+//! | --- | --- | --- | --- |
+//! | rule | `Deterministic`, `CategoryPath`, `NameTokens` | nothing | this module |
+//! | embedding | `Kmeans`, `FaissKmeans` | an embedding model | [`kmeans`](crate::retrieval::build::grouping::kmeans) |
+//! | model | `LlmGrouping` | a completion model | [`llm`](crate::retrieval::build::grouping::llm) |
 //!
-//! # Algorithm
+//! [`requires_runtime`](crate::retrieval::build::grouping::GroupingStrategy::requires_runtime)
+//! answers which family needs a supplied runtime.
+//! The synchronous [`group_items`](crate::retrieval::build::grouping::group_items) runs only
+//! the three rule strategies and reports a typed
+//! [`Error::Unsupported`](crate::error::Error::Unsupported) naming the strategy for the three
+//! runtime strategies, because a synchronous entry point cannot await a model.
+//! The async [`group_items_with`](crate::retrieval::build::grouping::group_items_with) runs
+//! all six through a [`GroupingRuntime`](crate::retrieval::build::grouping::GroupingRuntime)
+//! and reports how the paths were derived in its
+//! [`GroupingProvenance`](crate::retrieval::build::grouping::GroupingProvenance).
 //!
-//! [`group_items`](crate::retrieval::build::grouping::group_items) runs five steps, all
-//! deterministic (no clock, no hash-map order: items are iterated in `worker_id` order and
-//! every map and set here is a `BTreeMap` or a `BTreeSet`):
+//! # Deterministic placement pipeline
 //!
-//! 1. **Candidate segments.** For the `Deterministic` and `CategoryPath` strategies the
-//!    path comes from the item's `classification` when non-blank: it splits on `.`, `/`,
-//!    `>`, `|` and `,`, every chunk is slugged with
+//! Every strategy's candidate paths go through one shared, deterministic pipeline (no clock,
+//! no hash-map order: items are iterated in `worker_id` order and every map and set here is a
+//! `BTreeMap` or a `BTreeSet`):
+//!
+//! 1. **Candidate segments.** A rule strategy derives them: for `Deterministic` and
+//!    `CategoryPath` the path comes from the item's `classification` when non-blank: it
+//!    splits on `.`, `/`, `>`, `|` and `,`, every chunk is slugged with
 //!    [`slug_term`](crate::retrieval::build::tree_text::slug_term), and blank or repeated
 //!    chunks are dropped. A blank classification falls back to the item's first non-blank
 //!    tag, then (`Deterministic` only) to the item's leading name token: the first
@@ -38,11 +44,23 @@
 //!    routing-noise word such as `tool` or `helper`. The `NameTokens` strategy applies
 //!    only that last rule. An item with nothing usable is placed under
 //!    [`GENERAL_SEGMENT`](crate::retrieval::build::grouping::GENERAL_SEGMENT).
-//! 2. **Depth truncation.** The path is cut to `max_depth - 1` segments, because the tree
+//!    The embedding and model strategies have no rule of their own: their candidates are
+//!    the cluster labels of [`kmeans`](crate::retrieval::build::grouping::kmeans) or the
+//!    reply's paths from [`llm`](crate::retrieval::build::grouping::llm).
+//! 2. **Taxonomy override.** When
+//!    [`GroupingConfig::taxonomy`](crate::retrieval::build::grouping::GroupingConfig::taxonomy)
+//!    is non-empty, an item is instead assigned to the preset path with the highest token
+//!    overlap ([`text_tokens`](crate::retrieval::build::tree_text::text_tokens)) between
+//!    its candidate segments and the preset segments, tie-broken by the longer path, then by
+//!    the lexicographically smallest joined path. A preset path with no overlap at all
+//!    leaves the item directly under the root.
+//!    The override applies to every strategy's candidate path, so a runtime strategy is
+//!    bound by the same preset as the rule strategies.
+//! 3. **Depth truncation.** The path is cut to `max_depth - 1` segments, because the tree
 //!    root already occupies depth 1 (Python's `MAX_DEPTH` counts the root the same way).
-//! 3. **Segment tree.** Items are inserted into a segment trie keyed by the slugged
+//! 4. **Segment tree.** Items are inserted into a segment trie keyed by the slugged
 //!    segments, so items sharing a prefix share a branch.
-//! 4. **Rebalancing.** Each node is fixed bottom-up: more than `max_children` child
+//! 5. **Rebalancing.** Each node is fixed bottom-up: more than `max_children` child
 //!    branches keep their first `max_children - 1` segments in sorted order and fold the
 //!    remainder into one
 //!    [`OTHER_SEGMENT`](crate::retrieval::build::grouping::OTHER_SEGMENT) child; more than
@@ -52,27 +70,36 @@
 //!    children of at most `max_children` items each. Both bounds need a free level below
 //!    the node, so at `max_depth` they are soft — the same place Python's builder stops
 //!    splitting.
-//! 5. **Taxonomy override.** When
-//!    [`GroupingConfig::taxonomy`](crate::retrieval::build::grouping::GroupingConfig::taxonomy)
-//!    is non-empty, an item is instead assigned to the preset path with the highest token
-//!    overlap ([`text_tokens`](crate::retrieval::build::tree_text::text_tokens)) between
-//!    its derived segments and the preset segments, tie-broken by the longer path, then by
-//!    the lexicographically smallest joined path. A preset path with no overlap at all
-//!    leaves the item directly under the root.
 //!
 //! The result is one
 //! [`GroupAssignment`](crate::retrieval::build::grouping::GroupAssignment) per item,
 //! ordered by `worker_id`, whose `path` excludes the tree root and contains `cid`-ready
 //! slug segments — exactly what
 //! [`build_nodes`](crate::retrieval::build::tree::build_nodes) consumes.
+//!
+//! # Fallbacks
+//!
+//! [`group_items_with`](crate::retrieval::build::grouping::group_items_with) never reports a
+//! model or embedding failure as a success: under
+//! [`FallbackMode::Deterministic`](crate::llm::FallbackMode::Deterministic) (the default) a
+//! missing or failing runtime degrades to the deterministic rule and the outcome's
+//! provenance says
+//! [`GroupingProvenance::DeterministicFallback`](crate::retrieval::build::grouping::GroupingProvenance::DeterministicFallback),
+//! while under [`FallbackMode::Error`](crate::llm::FallbackMode::Error) the failure surfaces —
+//! a missing runtime as an [`Error::Config`](crate::error::Error::Config) naming the builder
+//! to use, a failing one as its own error.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::sync::Arc;
 
+use openjiuwen_retrieval::Embedding;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{unsupported, Result};
+use crate::error::{unsupported, validation, Error, Result};
+use crate::llm::{CompletionModel, FallbackMode};
 use crate::model::naming::normalize_name_key;
 use crate::retrieval::build::scanner::SourceItem;
 use crate::retrieval::build::tree_text::{slug_term, text_tokens};
@@ -116,11 +143,14 @@ pub enum GroupingStrategy {
     CategoryPath,
     /// Leading name tokens only, ignoring classification and tags.
     NameTokens,
-    /// Python's two-phase LLM grouping — a typed deferral.
+    /// Python's two-phase LLM grouping, backed by
+    /// [`llm`] — needs a completion model.
     LlmGrouping,
-    /// Python's faiss k-means clustering — a typed deferral.
+    /// Python's faiss k-means clustering, backed by
+    /// [`kmeans`] — needs an embedding model.
     FaissKmeans,
-    /// The spelling `Kmeans` maps to the same deferral as [`Self::FaissKmeans`].
+    /// The spelling `Kmeans` maps to the same embedding-backed clustering as
+    /// [`Self::FaissKmeans`].
     Kmeans,
 }
 
@@ -165,14 +195,28 @@ impl GroupingStrategy {
 
     /// Whether the crate can group items with this strategy.
     ///
-    /// The two model/ML strategies need a completion model or a faiss clusterer, so
-    /// [`group_items`] reports them as [`unsupported`].
+    /// Every strategy has an implementation now: the three rule strategies run inside this
+    /// module, [`kmeans`] backs the two k-means spellings and [`llm`] backs the model-guided
+    /// one. Which of them needs a runtime supplied by the caller is answered by
+    /// [`Self::requires_runtime`], not by this method.
     #[must_use]
     pub fn is_supported(&self) -> bool {
-        matches!(
-            self,
-            Self::Deterministic | Self::CategoryPath | Self::NameTokens
-        )
+        true
+    }
+
+    /// Whether the strategy needs a runtime supplied through
+    /// [`GroupingRuntime`].
+    ///
+    /// [`Self::Kmeans`] and [`Self::FaissKmeans`] need an
+    /// [`Embedding`] model, supplied with
+    /// [`GroupingRuntime::with_embedding`];
+    /// [`Self::LlmGrouping`] needs a
+    /// [`CompletionModel`], supplied with
+    /// [`GroupingRuntime::with_model`].
+    /// The three rule strategies need nothing and run offline.
+    #[must_use]
+    pub fn requires_runtime(&self) -> bool {
+        matches!(self, Self::LlmGrouping | Self::FaissKmeans | Self::Kmeans)
     }
 }
 
@@ -264,13 +308,140 @@ pub struct GroupAssignment {
     pub path: Vec<String>,
 }
 
+/// The models a runtime strategy may use, plus what to do when they are missing or fail.
+///
+/// A rule strategy never reads this runtime.
+/// `Kmeans`/`FaissKmeans` read [`Self::embedding`] and `LlmGrouping` reads [`Self::model`];
+/// [`Self::fallback`] decides whether a missing or failing runtime degrades to the
+/// deterministic rule ([`FallbackMode::Deterministic`], the default) or surfaces an error
+/// ([`FallbackMode::Error`]).
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use openjiuwen_retrieval::HashEmbedding;
+/// use openjiuwen_symphony::retrieval::build::grouping::GroupingRuntime;
+///
+/// let runtime = GroupingRuntime::new();
+/// assert!(runtime.is_empty());
+/// let runtime = runtime.with_embedding(Arc::new(HashEmbedding::new(8)));
+/// assert!(!runtime.is_empty());
+/// assert_eq!(runtime.embedding().map(|model| model.model_name()), Some("hash-embedding"));
+/// ```
+#[derive(Clone, Default)]
+pub struct GroupingRuntime {
+    /// The embedder `Kmeans`/`FaissKmeans` cluster with.
+    embedding: Option<Arc<dyn Embedding>>,
+    /// The completion model `LlmGrouping` asks.
+    model: Option<Arc<dyn CompletionModel>>,
+    /// What a missing or failing runtime does.
+    fallback: FallbackMode,
+}
+
+impl GroupingRuntime {
+    /// Builds an empty runtime with [`FallbackMode::Deterministic`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Supplies the embedder the k-means strategies cluster with.
+    #[must_use]
+    pub fn with_embedding(mut self, embedding: Arc<dyn Embedding>) -> Self {
+        self.embedding = Some(embedding);
+        self
+    }
+
+    /// Supplies the completion model the model-guided strategy asks.
+    #[must_use]
+    pub fn with_model(mut self, model: Arc<dyn CompletionModel>) -> Self {
+        self.model = Some(model);
+        self
+    }
+
+    /// Sets what a missing or failing runtime does.
+    #[must_use]
+    pub fn with_fallback(mut self, fallback: FallbackMode) -> Self {
+        self.fallback = fallback;
+        self
+    }
+
+    /// The supplied embedder, if any.
+    #[must_use]
+    pub fn embedding(&self) -> Option<&dyn Embedding> {
+        self.embedding.as_deref()
+    }
+
+    /// The supplied completion model, if any.
+    #[must_use]
+    pub fn model(&self) -> Option<&dyn CompletionModel> {
+        self.model.as_deref()
+    }
+
+    /// What a missing or failing runtime does.
+    #[must_use]
+    pub fn fallback(&self) -> FallbackMode {
+        self.fallback
+    }
+
+    /// Whether neither an embedder nor a model is supplied.
+    ///
+    /// The fallback mode alone does not make a runtime non-empty, because it changes what a
+    /// failure does rather than supplying the machinery a strategy needs.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.embedding.is_none() && self.model.is_none()
+    }
+}
+
+impl fmt::Debug for GroupingRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GroupingRuntime")
+            .field("embedding", &self.embedding().map(Embedding::model_name))
+            .field("model", &self.model().map(CompletionModel::name))
+            .field("fallback", &self.fallback)
+            .finish()
+    }
+}
+
+/// How a [`GroupingOutcome`]'s paths were derived.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupingProvenance {
+    /// A rule strategy derived the paths in-process, with no model call.
+    #[default]
+    Rule,
+    /// The supplied embedder clustered the items.
+    Embedding,
+    /// The supplied completion model wrote the paths.
+    Model,
+    /// A runtime strategy degraded to the deterministic rule after a missing or failed
+    /// runtime under [`FallbackMode::Deterministic`].
+    DeterministicFallback,
+}
+
+/// The assignments one grouping run produced, with how they were derived.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", default)]
+pub struct GroupingOutcome {
+    /// One placement per item the strategy placed, ordered by `worker_id`.
+    pub assignments: Vec<GroupAssignment>,
+    /// The strategy the caller asked for.
+    pub strategy: GroupingStrategy,
+    /// How `assignments` were derived.
+    pub provenance: GroupingProvenance,
+}
+
 /// Derives the category segments of one item (public for tests and diagnostics).
 ///
 /// The segments are slugged with [`slug_term`] and returned in path order, without the
 /// root and without depth truncation (that is [`group_items`]'s job). An item the chosen
-/// rule cannot classify gets `["general"]`, so the result is never empty for a supported
-/// strategy. For a deferred strategy no rule applies, so this total function answers with
-/// the deterministic rule while [`group_items`] reports the deferral.
+/// rule cannot classify gets `["general"]`, so the result is never empty. The model and
+/// embedding strategies have no rule of their own, so this total function answers with the
+/// deterministic rule for them, while
+/// [`group_items_with`] applies the
+/// strategy's own runtime.
 ///
 /// ```
 /// use openjiuwen_symphony::retrieval::build::grouping::{category_segments, GroupingStrategy};
@@ -286,10 +457,13 @@ pub struct GroupAssignment {
 /// ```
 #[must_use]
 pub fn category_segments(item: &SourceItem, strategy: GroupingStrategy) -> Vec<String> {
-    let effective = if strategy.is_supported() {
-        strategy
-    } else {
+    let effective = match strategy {
+        GroupingStrategy::CategoryPath => GroupingStrategy::CategoryPath,
+        GroupingStrategy::NameTokens => GroupingStrategy::NameTokens,
         GroupingStrategy::Deterministic
+        | GroupingStrategy::LlmGrouping
+        | GroupingStrategy::FaissKmeans
+        | GroupingStrategy::Kmeans => GroupingStrategy::Deterministic,
     };
     let mut segments = Vec::new();
     if matches!(
@@ -314,11 +488,11 @@ pub fn category_segments(item: &SourceItem, strategy: GroupingStrategy) -> Vec<S
     segments
 }
 
-/// The [`unsupported`] reason for a strategy this crate cannot run, or `None` for a
-/// strategy it can.
+/// The strategy-specific phrase naming the machinery a runtime strategy needs, or `None`
+/// for a rule strategy.
 ///
-/// The wording names the machinery the strategy actually needs, so an `llm_grouping` build
-/// does not report a k-means deferral.
+/// The wording names what the strategy actually needs, so an `llm_grouping` build does not
+/// report a k-means phrase.
 fn deferral_reason(strategy: GroupingStrategy) -> Option<&'static str> {
     match strategy {
         GroupingStrategy::LlmGrouping => Some("LLM-guided tree grouping"),
@@ -330,6 +504,16 @@ fn deferral_reason(strategy: GroupingStrategy) -> Option<&'static str> {
     }
 }
 
+/// The [`unsupported`] error the synchronous entry point reports for a runtime strategy.
+fn sync_deferral(strategy: GroupingStrategy) -> Error {
+    let reason = deferral_reason(strategy).unwrap_or("this grouping strategy");
+    unsupported(&format!(
+        "{reason} needs an embedding or completion model, so it is available only from \
+         `group_items_with` with a `GroupingRuntime`; the synchronous grouping entry point is \
+         part of openjiuwen-symphony's deferred scope"
+    ))
+}
+
 /// Places every item under the root; deterministic, sorted by `worker_id`.
 ///
 /// The returned assignments are ordered by `worker_id` (ties keep the caller's item
@@ -338,27 +522,64 @@ fn deferral_reason(strategy: GroupingStrategy) -> Option<&'static str> {
 /// # Errors
 ///
 /// [`GroupingStrategy::LlmGrouping`] needs a completion model and
-/// [`GroupingStrategy::FaissKmeans`]/[`GroupingStrategy::Kmeans`] a faiss clusterer, so
-/// they return [`unsupported`] (an
-/// [`Error::Unsupported`](crate::error::Error)) naming that strategy instead of grouping.
+/// [`GroupingStrategy::FaissKmeans`]/[`GroupingStrategy::Kmeans`] an embedding model, which a
+/// synchronous call cannot await, so they return [`unsupported`] (an
+/// [`Error::Unsupported`](crate::error::Error)) naming that strategy instead of grouping;
+/// use [`group_items_with`] for them.
 pub fn group_items(items: &[SourceItem], config: &GroupingConfig) -> Result<Vec<GroupAssignment>> {
-    if let Some(reason) = deferral_reason(config.strategy) {
-        return Err(unsupported(reason));
+    if config.strategy.requires_runtime() {
+        return Err(sync_deferral(config.strategy));
     }
-    let limits = Limits::from_config(config);
+    let ordered = sorted_items(items);
+    let candidates: Vec<GroupAssignment> = ordered
+        .iter()
+        .map(|item| GroupAssignment {
+            worker_id: item.worker_id.clone(),
+            path: category_segments(item, config.strategy),
+        })
+        .collect();
+    place_assignments(&ordered, config, &candidates)
+}
+
+/// The items sorted by `worker_id`, so two runs over the same inventory place them alike.
+fn sorted_items(items: &[SourceItem]) -> Vec<&SourceItem> {
     let mut ordered: Vec<&SourceItem> = items.iter().collect();
     ordered.sort_by(|left, right| left.worker_id.cmp(&right.worker_id));
+    ordered
+}
+
+/// Places one candidate path per item through the taxonomy override, the depth bound, the
+/// segment trie and the rebalancing pass.
+///
+/// `candidates[index]` belongs to `ordered[index]`; the returned assignments are in
+/// `ordered` order.
+fn place_assignments(
+    ordered: &[&SourceItem],
+    config: &GroupingConfig,
+    candidates: &[GroupAssignment],
+) -> Result<Vec<GroupAssignment>> {
+    if candidates.len() != ordered.len() {
+        return Err(validation(
+            "grouping candidates",
+            format!(
+                "expected one candidate per item ({}), got {}",
+                ordered.len(),
+                candidates.len()
+            ),
+        ));
+    }
+    let limits = Limits::from_config(config);
     let taxonomy = normalize_taxonomy(&config.taxonomy, limits);
     let mut root = SegmentNode::default();
-    for (index, item) in ordered.iter().enumerate() {
-        let mut segments = category_segments(item, config.strategy);
+    for (index, candidate) in candidates.iter().enumerate() {
+        let mut segments = candidate.path.clone();
         if !taxonomy.is_empty() {
             segments = match_taxonomy(&segments, &taxonomy);
         }
         segments.truncate(limits.max_depth.saturating_sub(1));
         root.insert(index, &segments);
     }
-    let root = rebalance(root, 1, &mut Vec::new(), &ordered, limits);
+    let root = rebalance(root, 1, &mut Vec::new(), ordered, limits);
     let mut paths = vec![Vec::new(); ordered.len()];
     collect_paths(&root, &mut Vec::new(), &mut paths);
     Ok(ordered
@@ -369,6 +590,193 @@ pub fn group_items(items: &[SourceItem], config: &GroupingConfig) -> Result<Vec<
             path: paths[index].clone(),
         })
         .collect())
+}
+
+/// Groups `items` with any strategy, awaiting whatever runtime the strategy needs.
+///
+/// Dispatch:
+///
+/// - `Deterministic`, `CategoryPath` and `NameTokens` run [`group_items`] and report
+///   [`GroupingProvenance::Rule`]; they never touch the runtime's model or embedder.
+/// - `Kmeans` and `FaissKmeans` cluster through
+///   [`kmeans::cluster_paths`] and
+///   report [`GroupingProvenance::Embedding`].
+/// - `LlmGrouping` asks
+///   [`llm::group_paths`] and reports
+///   [`GroupingProvenance::Model`]; the items the reply left unassigned get no placement.
+///
+/// Whatever the strategy produced, the candidate paths pass through the same
+/// `place_assignments` pipeline, so the taxonomy override, the `max_depth` cut and the
+/// `max_children` rebalancing apply to every strategy and a model reply can never bypass
+/// them.
+///
+/// # Fallbacks
+///
+/// A runtime strategy whose model or embedder is missing, or whose call fails, degrades to
+/// the deterministic rule when the runtime's
+/// [`FallbackMode`] is
+/// [`Deterministic`](crate::llm::FallbackMode::Deterministic): the second outcome is
+/// [`GroupingProvenance::DeterministicFallback`] with the strategy
+/// [`GroupingStrategy::Deterministic`], so no path reports a model failure as a success.
+/// Under [`Error`](crate::llm::FallbackMode::Error) the failure surfaces instead.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`](crate::error::Error) for a missing embedder or model under
+/// [`FallbackMode::Error`], the model's own
+/// [`Error::Llm`] or the embedder's error when its call fails under
+/// that mode, and any placement error of the shared pipeline.
+pub async fn group_items_with(
+    items: &[SourceItem],
+    config: &GroupingConfig,
+    runtime: &GroupingRuntime,
+) -> Result<GroupingOutcome> {
+    match config.strategy {
+        GroupingStrategy::Deterministic
+        | GroupingStrategy::CategoryPath
+        | GroupingStrategy::NameTokens => rule_outcome(items, config),
+        GroupingStrategy::Kmeans | GroupingStrategy::FaissKmeans => {
+            embedding_outcome(items, config, runtime).await
+        }
+        GroupingStrategy::LlmGrouping => model_outcome(items, config, runtime).await,
+    }
+}
+
+/// The outcome of a rule strategy.
+fn rule_outcome(items: &[SourceItem], config: &GroupingConfig) -> Result<GroupingOutcome> {
+    Ok(GroupingOutcome {
+        assignments: group_items(items, config)?,
+        strategy: config.strategy,
+        provenance: GroupingProvenance::Rule,
+    })
+}
+
+/// The outcome of the deterministic rule, reported as a fallback.
+fn deterministic_outcome(items: &[SourceItem], config: &GroupingConfig) -> Result<GroupingOutcome> {
+    let rule_config = config
+        .clone()
+        .with_strategy(GroupingStrategy::Deterministic);
+    Ok(GroupingOutcome {
+        assignments: group_items(items, &rule_config)?,
+        strategy: GroupingStrategy::Deterministic,
+        provenance: GroupingProvenance::DeterministicFallback,
+    })
+}
+
+/// What a runtime strategy does when its model or embedder is missing.
+fn missing_runtime(
+    items: &[SourceItem],
+    config: &GroupingConfig,
+    runtime: &GroupingRuntime,
+    message: &str,
+) -> Result<GroupingOutcome> {
+    match runtime.fallback() {
+        FallbackMode::Error => Err(Error::config(message.to_string())),
+        FallbackMode::Deterministic => {
+            tracing::warn!("{}; falling back to the deterministic rule", message);
+            deterministic_outcome(items, config)
+        }
+    }
+}
+
+/// What a runtime strategy does when its model or embedder fails.
+fn failed_runtime(
+    items: &[SourceItem],
+    config: &GroupingConfig,
+    runtime: &GroupingRuntime,
+    error: Error,
+    stage: &str,
+) -> Result<GroupingOutcome> {
+    match runtime.fallback() {
+        FallbackMode::Error => Err(error),
+        FallbackMode::Deterministic => {
+            tracing::warn!(
+                %error,
+                "the {} runtime failed; falling back to the deterministic rule",
+                stage
+            );
+            deterministic_outcome(items, config)
+        }
+    }
+}
+
+/// The message a k-means strategy reports when the runtime has no embedder.
+const MISSING_EMBEDDER: &str = "grouping runtime: k-means grouping needs an embedding model; \
+                                supply one with `GroupingRuntime::with_embedding`";
+/// The message the model-guided strategy reports when the runtime has no model.
+const MISSING_MODEL: &str = "grouping runtime: LLM-guided grouping needs a completion model; \
+                             supply one with `GroupingRuntime::with_model`";
+
+/// The outcome of `Kmeans`/`FaissKmeans`: the clustered paths, or the documented fallback.
+async fn embedding_outcome(
+    items: &[SourceItem],
+    config: &GroupingConfig,
+    runtime: &GroupingRuntime,
+) -> Result<GroupingOutcome> {
+    let Some(embedding) = runtime.embedding() else {
+        return missing_runtime(items, config, runtime, MISSING_EMBEDDER);
+    };
+    match kmeans::cluster_paths(items, config, embedding).await {
+        Ok(candidates) => {
+            let ordered = sorted_items(items);
+            place_outcome(&ordered, config, &candidates, GroupingProvenance::Embedding)
+        }
+        Err(error) => failed_runtime(items, config, runtime, error, "embedding grouping"),
+    }
+}
+
+/// The outcome of `LlmGrouping`: the reply's paths, or the documented fallback.
+async fn model_outcome(
+    items: &[SourceItem],
+    config: &GroupingConfig,
+    runtime: &GroupingRuntime,
+) -> Result<GroupingOutcome> {
+    let Some(model) = runtime.model() else {
+        return missing_runtime(items, config, runtime, MISSING_MODEL);
+    };
+    match llm::group_paths(items, config, model).await {
+        Ok(candidates) => {
+            let (ordered, placed) = assigned_items(items, &candidates);
+            place_outcome(&ordered, config, &placed, GroupingProvenance::Model)
+        }
+        Err(error) => failed_runtime(items, config, runtime, error, "model grouping"),
+    }
+}
+
+/// Places `candidates` over `ordered` and reports the requested strategy.
+fn place_outcome(
+    ordered: &[&SourceItem],
+    config: &GroupingConfig,
+    candidates: &[GroupAssignment],
+    provenance: GroupingProvenance,
+) -> Result<GroupingOutcome> {
+    Ok(GroupingOutcome {
+        assignments: place_assignments(ordered, config, candidates)?,
+        strategy: config.strategy,
+        provenance,
+    })
+}
+
+/// Pairs the items a model reply assigned with their assignment, both in `worker_id` order.
+fn assigned_items<'a>(
+    items: &'a [SourceItem],
+    candidates: &[GroupAssignment],
+) -> (Vec<&'a SourceItem>, Vec<GroupAssignment>) {
+    let mut by_id: BTreeMap<&str, &GroupAssignment> = BTreeMap::new();
+    for candidate in candidates {
+        by_id
+            .entry(candidate.worker_id.as_str())
+            .or_insert(candidate);
+    }
+    let mut ordered = Vec::new();
+    let mut placed = Vec::new();
+    for item in sorted_items(items) {
+        if let Some(candidate) = by_id.get(item.worker_id.as_str()) {
+            ordered.push(item);
+            placed.push((*candidate).clone());
+        }
+    }
+    (ordered, placed)
 }
 
 /// The branch/taxonomy bounds after normalization, so the algorithm never has to guard
@@ -659,8 +1067,10 @@ fn match_taxonomy(segments: &[String], taxonomy: &[Vec<String>]) -> Vec<String> 
 mod tests {
     use std::collections::BTreeMap;
 
+    use openjiuwen_retrieval::{HashEmbedding, StaticCompletionModel};
+
     use super::*;
-    use crate::error::is_unsupported;
+    use crate::error::{is_unsupported, ErrorKind};
     use crate::retrieval::types::RetrieverItem;
 
     fn item(worker_id: &str, name: &str, classification: &str, tags: &[&str]) -> SourceItem {
@@ -692,6 +1102,22 @@ mod tests {
             .iter()
             .map(|segment| (*segment).to_string())
             .collect()
+    }
+
+    /// The three-item inventory the runtime tests share.
+    fn inventory() -> Vec<SourceItem> {
+        vec![
+            item("a", "PDF Parser", "documents/pdf", &[]),
+            item("b", "Spreadsheet Reader", "documents/sheets", &[]),
+            item("c", "Chart Builder", "charts", &[]),
+        ]
+    }
+
+    /// A runtime with both a model and an embedder, for the "must not be consulted" pins.
+    fn full_runtime(model: &Arc<StaticCompletionModel>) -> GroupingRuntime {
+        GroupingRuntime::new()
+            .with_model(Arc::clone(model) as Arc<dyn CompletionModel>)
+            .with_embedding(Arc::new(HashEmbedding::new(8)))
     }
 
     #[test]
@@ -1019,14 +1445,40 @@ mod tests {
         );
         assert_eq!(GroupingStrategy::parse(""), GroupingStrategy::Deterministic);
         assert_eq!(GroupingStrategy::default(), GroupingStrategy::Deterministic);
-        assert!(GroupingStrategy::Deterministic.is_supported());
-        assert!(GroupingStrategy::CategoryPath.is_supported());
-        assert!(GroupingStrategy::NameTokens.is_supported());
-        assert!(!GroupingStrategy::LlmGrouping.is_supported());
     }
 
     #[test]
-    fn unsupported_strategies_report_the_deferral() {
+    fn strategy_parse_and_default() {
+        for strategy in [
+            GroupingStrategy::Deterministic,
+            GroupingStrategy::CategoryPath,
+            GroupingStrategy::NameTokens,
+        ] {
+            assert!(strategy.is_supported(), "{strategy:?} is implemented");
+            assert!(
+                !strategy.requires_runtime(),
+                "{strategy:?} needs no runtime"
+            );
+        }
+        for strategy in [
+            GroupingStrategy::LlmGrouping,
+            GroupingStrategy::FaissKmeans,
+            GroupingStrategy::Kmeans,
+        ] {
+            assert!(
+                strategy.is_supported(),
+                "{strategy:?} is implemented by its runtime module"
+            );
+            assert!(
+                strategy.requires_runtime(),
+                "{strategy:?} needs a supplied runtime"
+            );
+        }
+        assert_eq!(GroupingStrategy::default(), GroupingStrategy::Deterministic);
+    }
+
+    #[test]
+    fn runtime_strategies_are_sync_deferrals() {
         let items = vec![item("w", "Alpha", "docs", &[])];
         for (strategy, reason) in [
             (GroupingStrategy::LlmGrouping, "LLM-guided tree grouping"),
@@ -1036,7 +1488,20 @@ mod tests {
             let config = GroupingConfig::default().with_strategy(strategy);
             let error = group_items(&items, &config).unwrap_err();
             assert!(is_unsupported(&error), "{strategy:?}: {error}");
+            assert_eq!(error.kind(), ErrorKind::Unsupported);
             assert!(error.message().starts_with(reason), "{strategy:?}: {error}");
+            assert!(
+                error.message().contains("deferred"),
+                "{strategy:?}: {error}"
+            );
+            assert!(
+                error.message().contains("deferred scope"),
+                "{strategy:?}: {error}"
+            );
+            assert!(
+                error.message().contains("group_items_with"),
+                "{strategy:?} names the async entry point: {error}"
+            );
             assert!(
                 !error.message().contains("LLM/faiss"),
                 "{strategy:?} names one strategy: {error}"
@@ -1095,5 +1560,230 @@ mod tests {
             serde_json::from_str(r#"{"strategy": "name_tokens"}"#).unwrap();
         assert_eq!(tolerant.strategy, GroupingStrategy::NameTokens);
         assert_eq!(tolerant.max_children, DEFAULT_MAX_CHILDREN);
+    }
+
+    #[tokio::test]
+    async fn rule_strategies_report_rule_provenance_and_ignore_the_runtime() {
+        let items = inventory();
+        let model = Arc::new(StaticCompletionModel::single(r#"{"groups":[]}"#));
+        let runtime = full_runtime(&model);
+        for strategy in [
+            GroupingStrategy::Deterministic,
+            GroupingStrategy::CategoryPath,
+            GroupingStrategy::NameTokens,
+        ] {
+            let config = GroupingConfig::default().with_strategy(strategy);
+            let outcome = group_items_with(&items, &config, &runtime).await.unwrap();
+            assert_eq!(outcome.provenance, GroupingProvenance::Rule);
+            assert_eq!(outcome.strategy, strategy);
+            assert_eq!(outcome.assignments, group_items(&items, &config).unwrap());
+        }
+        assert_eq!(
+            model.call_count(),
+            0,
+            "a rule strategy must never call the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn kmeans_groups_through_the_embedding_runtime() {
+        let items = inventory();
+        let runtime = GroupingRuntime::new().with_embedding(Arc::new(HashEmbedding::new(16)));
+        let config = GroupingConfig::default()
+            .with_strategy(GroupingStrategy::Kmeans)
+            .with_max_children(2)
+            .with_max_depth(3);
+        let outcome = group_items_with(&items, &config, &runtime).await.unwrap();
+        assert_eq!(outcome.provenance, GroupingProvenance::Embedding);
+        assert_eq!(outcome.strategy, GroupingStrategy::Kmeans);
+        assert_eq!(outcome.assignments.len(), items.len());
+        let ids: Vec<&str> = outcome
+            .assignments
+            .iter()
+            .map(|assignment| assignment.worker_id.as_str())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "the assignments are ordered by worker_id");
+        for assignment in &outcome.assignments {
+            assert!(assignment.path.len() <= 2, "{:?}", assignment.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn kmeans_without_an_embedder_falls_back_deterministically() {
+        let items = inventory();
+        let runtime = GroupingRuntime::new();
+        assert!(runtime.is_empty());
+        let config = GroupingConfig::default().with_strategy(GroupingStrategy::Kmeans);
+        let outcome = group_items_with(&items, &config, &runtime).await.unwrap();
+        assert_eq!(outcome.strategy, GroupingStrategy::Deterministic);
+        assert_eq!(
+            outcome.provenance,
+            GroupingProvenance::DeterministicFallback
+        );
+        assert_eq!(
+            outcome.assignments,
+            group_items(&items, &GroupingConfig::default()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn kmeans_without_an_embedder_is_a_config_error_in_error_mode() {
+        let items = inventory();
+        let runtime = GroupingRuntime::new().with_fallback(FallbackMode::Error);
+        let config = GroupingConfig::default().with_strategy(GroupingStrategy::FaissKmeans);
+        let error = group_items_with(&items, &config, &runtime)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert!(error.message().contains("with_embedding"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn llm_grouping_uses_the_model_runtime() {
+        let items = inventory();
+        let reply = r#"{"groups":[{"path":["Documents","PDFs","Forms"],"worker_ids":["a","b"]}]}"#;
+        let runtime =
+            GroupingRuntime::new().with_model(Arc::new(StaticCompletionModel::single(reply)));
+        let config = GroupingConfig::default()
+            .with_strategy(GroupingStrategy::LlmGrouping)
+            .with_max_children(2)
+            .with_max_depth(3);
+        let outcome = group_items_with(&items, &config, &runtime).await.unwrap();
+        assert_eq!(outcome.provenance, GroupingProvenance::Model);
+        assert_eq!(outcome.strategy, GroupingStrategy::LlmGrouping);
+        assert_eq!(outcome.assignments.len(), 2, "c was left unassigned");
+        assert_eq!(
+            paths(&outcome.assignments),
+            vec![
+                ("a".to_string(), owned(&["documents", "pdfs"])),
+                ("b".to_string(), owned(&["documents", "pdfs"])),
+            ],
+            "the reply's three segments are cut to max_depth - 1"
+        );
+        for assignment in &outcome.assignments {
+            assert!(assignment.path.len() <= 2, "{:?}", assignment.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_grouping_falls_back_deterministically() {
+        let items = inventory();
+        let config = GroupingConfig::default().with_strategy(GroupingStrategy::LlmGrouping);
+        let outcome = group_items_with(&items, &config, &GroupingRuntime::new())
+            .await
+            .unwrap();
+        assert_eq!(outcome.strategy, GroupingStrategy::Deterministic);
+        assert_eq!(
+            outcome.provenance,
+            GroupingProvenance::DeterministicFallback
+        );
+        assert_eq!(
+            outcome.assignments,
+            group_items(&items, &GroupingConfig::default()).unwrap()
+        );
+
+        let scripted =
+            GroupingRuntime::new().with_model(Arc::new(StaticCompletionModel::single("not json")));
+        let outcome = group_items_with(&items, &config, &scripted).await.unwrap();
+        assert_eq!(outcome.strategy, GroupingStrategy::Deterministic);
+        assert_eq!(
+            outcome.provenance,
+            GroupingProvenance::DeterministicFallback
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_grouping_surfaces_an_unusable_reply_in_error_mode() {
+        let items = inventory();
+        let config = GroupingConfig::default().with_strategy(GroupingStrategy::LlmGrouping);
+
+        let missing = GroupingRuntime::new().with_fallback(FallbackMode::Error);
+        let error = group_items_with(&items, &config, &missing)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert!(error.message().contains("with_model"), "{error}");
+
+        let unusable = GroupingRuntime::new()
+            .with_model(Arc::new(StaticCompletionModel::single("not json")))
+            .with_fallback(FallbackMode::Error);
+        let error = group_items_with(&items, &config, &unusable)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Llm);
+        assert!(error.message().contains("llm_grouping"), "{error}");
+    }
+
+    #[test]
+    fn grouping_outcome_round_trips_and_provenance_is_snake_case() {
+        let outcome = GroupingOutcome {
+            assignments: vec![GroupAssignment {
+                worker_id: "w".to_string(),
+                path: owned(&["docs"]),
+            }],
+            strategy: GroupingStrategy::Kmeans,
+            provenance: GroupingProvenance::Model,
+        };
+        let encoded = serde_json::to_string(&outcome).unwrap();
+        assert!(encoded.contains("\"provenance\":\"model\""), "{encoded}");
+        assert!(encoded.contains("\"strategy\":\"kmeans\""), "{encoded}");
+        let decoded: GroupingOutcome = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, outcome);
+        let tolerant: GroupingOutcome = serde_json::from_str(r#"{"unknown": 1}"#).unwrap();
+        assert_eq!(tolerant, GroupingOutcome::default());
+        assert_eq!(tolerant.provenance, GroupingProvenance::Rule);
+        assert_eq!(tolerant.provenance, GroupingProvenance::default());
+        assert_eq!(tolerant.strategy, GroupingStrategy::Deterministic);
+
+        for (provenance, text) in [
+            (GroupingProvenance::Rule, "rule"),
+            (GroupingProvenance::Embedding, "embedding"),
+            (GroupingProvenance::Model, "model"),
+            (
+                GroupingProvenance::DeterministicFallback,
+                "deterministic_fallback",
+            ),
+        ] {
+            let quoted = format!("\"{text}\"");
+            assert_eq!(serde_json::to_string(&provenance).unwrap(), quoted);
+            assert_eq!(
+                serde_json::from_str::<GroupingProvenance>(&quoted).unwrap(),
+                provenance
+            );
+        }
+    }
+
+    #[test]
+    fn grouping_runtime_debug_names_the_model_and_embedder() {
+        let model = Arc::new(StaticCompletionModel::single("{}"));
+        let runtime = full_runtime(&model);
+        let debug = format!("{runtime:?}");
+        assert!(debug.contains("static-completion-model"), "{debug}");
+        assert!(debug.contains("hash-embedding"), "{debug}");
+        assert!(!runtime.is_empty());
+
+        let empty = GroupingRuntime::new();
+        assert!(empty.is_empty());
+        assert!(empty.embedding().is_none());
+        assert!(empty.model().is_none());
+        assert_eq!(empty.fallback(), FallbackMode::Deterministic);
+        assert!(!GroupingRuntime::new()
+            .with_embedding(Arc::new(HashEmbedding::new(8)))
+            .is_empty());
+        assert_eq!(
+            empty.with_fallback(FallbackMode::Error).fallback(),
+            FallbackMode::Error
+        );
+    }
+
+    #[test]
+    fn place_assignments_requires_one_candidate_per_item() {
+        let items = inventory();
+        let ordered = sorted_items(&items);
+        let error = place_assignments(&ordered, &GroupingConfig::default(), &[]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.message().contains("grouping candidates"), "{error}");
     }
 }
