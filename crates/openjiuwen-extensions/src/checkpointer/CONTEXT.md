@@ -2,10 +2,10 @@
 
 ## Intent
 
-Python's `extensions/checkpointer/redis/` registers a Redis provider with the core `CheckpointerFactory`; the memory/file/sqlite backends live in the kernel.
-Rust keeps that split: this module dispatches on the kernel's `CheckpointerConfig` to the kernel backends, and owns the Redis backend.
-The Redis backend is a live single-node implementation over the crate's in-tree RESP client (`crate::redis`), because the workspace vendors no Redis driver and builds offline.
-The kernel `CheckpointerKind` has no Redis variant, so `build_checkpointer` cannot return a Redis backend; construct one with `RedisCheckpointer::new` (lazy connect) or `connect`/`create` (eager connect plus `PING`).
+Python's `extensions/checkpointer/redis/` registers a Redis provider with the core `CheckpointerFactory`; the memory/file/sqlite backends live in the kernel, which also ships its own Redis checkpointer behind `CheckpointerKind::Redis`.
+Rust keeps that split: this module dispatches on the kernel's `CheckpointerConfig` to the kernel backends, and owns a second Redis backend over the crate's in-tree RESP client.
+The Redis backend here is a live single-node implementation over the crate's in-tree RESP client (`crate::redis`), because the workspace vendors no Redis driver and builds offline.
+The kernel factory's `CheckpointerKind::Redis` builds the kernel's own Redis checkpointer, so `build_checkpointer` never returns this module's backend; construct it with `RedisCheckpointer::new` (lazy connect) or `connect`/`create` (eager connect plus `PING`).
 Pick this node for any "checkpoint backend selection" or "Redis checkpointer" request.
 
 ## API Surface
@@ -18,7 +18,7 @@ pub use openjiuwen_core::session::checkpoint::{
 #[cfg(feature = "sqlite")]
 pub use openjiuwen_core::session::checkpoint::SqliteCheckpointer;
 
-/// Builds the checkpointer `config.kind` selects (`InMemory`/`File`/`Sqlite`),
+/// Builds the checkpointer `config.kind` selects (`InMemory`/`File`/`Redis`/`Sqlite`),
 /// delegating to `openjiuwen_core::session::checkpoint::create_checkpointer`.
 pub async fn build_checkpointer(config: &CheckpointerConfig) -> Result<Arc<dyn Checkpointer>>;
 
