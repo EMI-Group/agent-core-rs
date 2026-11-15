@@ -12,7 +12,9 @@
 //! input only skips that tool call (the loop turns the skip message into the
 //! tool result, so the model can react instead of the whole run dying).
 //! Guardrail *failures* (as opposed to findings) follow the pipeline policy:
-//! under the default `FailOpen` policy they are logged and the run continues.
+//! under the default `FailClosed` policy they block the call like a finding,
+//! and only an explicitly configured `FailOpen` policy logs them and lets the
+//! run continue.
 //!
 //! Never log prompt text, tool arguments/outputs, or memory content: the log
 //! lines here carry only guardrail names, risk types, and counts.
@@ -90,10 +92,12 @@ impl SecurityRail {
 
     /// Records guardrail *failures* when the outcome still allows the call.
     ///
-    /// Under the `FailOpen` policy the pipeline records an error instead of
-    /// blocking; the rail logs the failing guardrail names (never their
-    /// content) and lets the run continue. A blocked outcome is left to the
-    /// caller, which converts it into the stage-specific signal.
+    /// Under an explicitly configured `FailOpen` policy the pipeline records an
+    /// error instead of blocking; the rail logs the failing guardrail names
+    /// (never their content) and lets the run continue. Under the default
+    /// `FailClosed` policy the failure is already a blocking finding, so this
+    /// stays silent and leaves the outcome to the caller, which converts it
+    /// into the stage-specific signal.
     fn note_failures(outcome: &GuardrailOutcome, stage: &str) {
         if outcome.errors.is_empty() || outcome.is_blocked() {
             return;
@@ -237,7 +241,10 @@ mod tests {
     use openjiuwen_agent::{AgentInput, RailEvent, ToolCallResult};
     use openjiuwen_common::error::{Error, ErrorKind};
     use openjiuwen_foundation::{BaseMessage, ToolCall};
-    use openjiuwen_security::{Guardrail, GuardrailContext, GuardrailResult, RiskLevel, ScanStage};
+    use openjiuwen_security::{
+        FailurePolicy, Guardrail, GuardrailContext, GuardrailResult, RiskLevel, ScanStage,
+        SecurityPolicy,
+    };
     use serde_json::json;
 
     use super::*;
@@ -282,8 +289,16 @@ mod tests {
     }
 
     fn scripted(stages: Vec<ScanStage>, verdict: Verdict) -> (Arc<SecurityRail>, Arc<AtomicUsize>) {
+        scripted_with_policy(stages, verdict, SecurityPolicy::default())
+    }
+
+    fn scripted_with_policy(
+        stages: Vec<ScanStage>,
+        verdict: Verdict,
+        policy: SecurityPolicy,
+    ) -> (Arc<SecurityRail>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut pipeline = GuardrailPipeline::new();
+        let mut pipeline = GuardrailPipeline::new().with_policy(policy);
         pipeline.add(ScriptedGuardrail {
             stages,
             verdict,
@@ -499,11 +514,32 @@ mod tests {
 
     #[tokio::test]
     async fn failing_guardrail_is_swallowed_under_fail_open() {
-        let (rail, calls) = scripted(vec![ScanStage::UserInput], Verdict::Fail);
+        let policy = SecurityPolicy {
+            failure_policy: FailurePolicy::FailOpen,
+            ..SecurityPolicy::default()
+        };
+        let (rail, calls) = scripted_with_policy(vec![ScanStage::UserInput], Verdict::Fail, policy);
         let mut ctx = HarnessRailContext::for_event(RailEvent::BeforeInvoke);
         ctx.base.input = Some(input("scanned secret text"));
 
         rail.before_invoke(&mut ctx).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failing_guardrail_blocks_under_the_default_fail_closed_policy() {
+        assert_eq!(
+            SecurityPolicy::default().failure_policy,
+            FailurePolicy::FailClosed
+        );
+        let (rail, calls) = scripted(vec![ScanStage::UserInput], Verdict::Fail);
+        let mut ctx = HarnessRailContext::for_event(RailEvent::BeforeInvoke);
+        ctx.base.input = Some(input("scanned secret text"));
+
+        let error = rail.before_invoke(&mut ctx).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Security);
+        assert!(error.to_string().contains("guardrail_error"));
+        assert!(!error.to_string().contains("scanned secret text"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
