@@ -453,6 +453,48 @@ async fn a_rejected_publication_keeps_the_previous_index_intact() {
     assert_eq!(after, before, "the published index is untouched");
 }
 
+#[tokio::test]
+async fn a_manifest_count_that_does_not_describe_the_records_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, records, mut manifest) = small_index();
+    manifest.count = records.len() + 1;
+
+    let error = write_index(dir.path(), &nodes, &records, &manifest)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.message().contains("count"));
+    assert_no_artifacts(dir.path());
+}
+
+#[tokio::test]
+async fn a_blank_manifest_mode_or_item_type_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, records, mut manifest) = small_index();
+    manifest.mode = "  ".to_string();
+
+    let error = write_index(dir.path(), &nodes, &records, &manifest)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.message().contains("mode"));
+    assert_no_artifacts(dir.path());
+
+    let other = tempfile::tempdir().unwrap();
+    let (nodes, records, mut manifest) = small_index();
+    manifest.item_type.clear();
+
+    let error = write_index(other.path(), &nodes, &records, &manifest)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.message().contains("item_type"));
+    assert_no_artifacts(other.path());
+}
+
 // --------------------------------------------------------------------------------------
 // 8. Loading
 // --------------------------------------------------------------------------------------
@@ -565,6 +607,46 @@ async fn a_corrupt_catalog_line_is_a_validation_naming_the_file_and_line() {
     assert_eq!(error.kind(), ErrorKind::Validation);
     assert!(error.message().contains(CATALOG_FILENAME));
     assert!(error.message().contains("line 4"));
+}
+
+#[tokio::test]
+async fn a_catalog_cid_that_names_no_leaf_of_the_tree_is_rejected_on_load() {
+    let dir = tempfile::tempdir().unwrap();
+    IndexBuilder::build(sources(fixture()), dir.path(), BuildConfig::new())
+        .await
+        .unwrap();
+
+    let text = read_artifact(dir.path(), CATALOG_FILENAME);
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut record: Value = serde_json::from_str(&lines[0]).expect("the line is JSON");
+    record["cid"] = json!("Skills.web.doesnotexist");
+    lines[0] = record.to_string();
+    fs::write(
+        dir.path().join(CATALOG_FILENAME),
+        format!("{}\n", lines.join("\n")),
+    )
+    .unwrap();
+
+    // A Python-written manifest carries no content hash, so the leaf check is the only
+    // guard left against loading one build's catalog against another build's tree.
+    let mut manifest: Value = serde_json::from_str(&read_artifact(dir.path(), MANIFEST_FILENAME))
+        .expect("the manifest is JSON");
+    manifest["content_hash"] = json!("");
+    fs::write(
+        dir.path().join(MANIFEST_FILENAME),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let error = load_index(dir.path()).await.unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.message().contains(CATALOG_FILENAME));
+    assert!(
+        error.message().contains("Skills.web.doesnotexist"),
+        "the first offending cid is named: {}",
+        error.message()
+    );
 }
 
 #[tokio::test]

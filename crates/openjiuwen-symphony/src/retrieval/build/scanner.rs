@@ -14,6 +14,11 @@
 //! [`ItemSources::diagnostics`](crate::retrieval::build::scanner::ItemSources::diagnostics); one bad item never fails a whole scan. Only an
 //! unusable root (a skill directory that cannot be listed) is an error.
 //!
+//! Every source diagnoses a repeated worker id as a
+//! [`DIAGNOSTIC_DUPLICATE_ITEM_ID`](crate::retrieval::build::scanner::DIAGNOSTIC_DUPLICATE_ITEM_ID)
+//! warning and keeps the first item, so a duplicate reaches the caller instead of collapsing
+//! two leaves onto one catalog record.
+//!
 //! # Resolution rules
 //!
 //! - **Descriptors** — `worker_id` is the descriptor's `capability_id`, `content` its
@@ -247,27 +252,32 @@ impl ItemSources {
     /// Resolves capability descriptors into items.
     ///
     /// See the module docs for the field mapping; a descriptor with a blank
-    /// `capability_id` becomes a [`DIAGNOSTIC_MISSING_ITEM_ID`] error and is skipped.
+    /// `capability_id` becomes a [`DIAGNOSTIC_MISSING_ITEM_ID`] error and is skipped, and a
+    /// repeated `capability_id` becomes a [`DIAGNOSTIC_DUPLICATE_ITEM_ID`] warning with the
+    /// first descriptor kept.
     #[must_use]
     pub fn from_descriptors(items: impl IntoIterator<Item = CapabilityDescriptor>) -> Self {
         let mut sources = Self::new(DEFAULT_ITEM_TYPE);
+        let mut seen: BTreeSet<String> = BTreeSet::new();
         for descriptor in items {
             if let Some(item) = descriptor_item(&descriptor, &mut sources.diagnostics) {
-                push_path(&mut sources.item_paths, &item.skill_path);
-                sources.items.push(item);
+                push_unique_item(&mut sources, &mut seen, item);
             }
         }
         sources.finished()
     }
 
     /// Resolves a scanned [`SkillInventory`] into items, one per [`SkillRecord`].
+    ///
+    /// A record whose `worker_id` repeats an earlier one is a
+    /// [`DIAGNOSTIC_DUPLICATE_ITEM_ID`] warning, and the first record wins.
     #[must_use]
     pub fn from_inventory(inventory: &SkillInventory) -> Self {
         let mut sources = Self::new(ITEM_TYPE_SKILL);
+        let mut seen: BTreeSet<String> = BTreeSet::new();
         for record in &inventory.items {
             if let Some(item) = record_item(record, &mut sources.diagnostics) {
-                push_path(&mut sources.item_paths, &item.skill_path);
-                sources.items.push(item);
+                push_unique_item(&mut sources, &mut seen, item);
             }
         }
         sources.finished()
@@ -277,7 +287,9 @@ impl ItemSources {
     ///
     /// A relative `skill_path` is joined onto `root`, `content` is the markdown body
     /// after the front matter, and every [`SkillDiagnostic`] becomes a
-    /// [`SourceDiagnostic`]. `item_paths` holds the absolute `root` as its single entry.
+    /// [`SourceDiagnostic`]. Two discovered skills resolving to one worker id are a
+    /// [`DIAGNOSTIC_DUPLICATE_ITEM_ID`] warning, and the first skill wins.
+    /// `item_paths` holds the absolute `root` as its single entry.
     ///
     /// # Errors
     ///
@@ -295,11 +307,12 @@ impl ItemSources {
         for diagnostic in &discovery.diagnostics {
             sources.diagnostics.push(converted_diagnostic(diagnostic));
         }
+        let mut seen: BTreeSet<String> = BTreeSet::new();
         for skill in &discovery.skills {
             if let Some(mut item) = descriptor_item(&skill.descriptor, &mut sources.diagnostics) {
                 item.content = skill.body.trim().to_string();
                 item.skill_path = rooted_skill_path(&root, &item.skill_path);
-                sources.items.push(item);
+                push_unique_item(&mut sources, &mut seen, item);
             }
         }
         let absolute = tokio::fs::canonicalize(&root).await.unwrap_or(root);
@@ -519,7 +532,14 @@ pub fn normalize_item_type(raw: &str) -> Result<String> {
 }
 
 /// Normalizes an item type without rejecting an unknown one.
-fn lenient_item_type(raw: &str) -> String {
+///
+/// A blank value becomes [`DEFAULT_ITEM_TYPE`]; anything else is trimmed and lowercased as
+/// given. [`ItemSources::new`] and the index builder's
+/// [`new`](crate::retrieval::build::workflows::IndexBuilder::new) share this rule, so the two
+/// never disagree about what an unvalidated item type is; [`normalize_item_type`] is the
+/// validating entry point.
+#[must_use]
+pub fn lenient_item_type(raw: &str) -> String {
     let normalized = raw.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         DEFAULT_ITEM_TYPE.to_string()
@@ -736,6 +756,27 @@ fn push_path(paths: &mut Vec<String>, path: &str) {
         return;
     }
     paths.push(path.to_string());
+}
+
+/// Appends `item` unless its worker id is already present, diagnosing the duplicate.
+///
+/// The first item wins, exactly as [`ItemSources::from_jsonl`] and
+/// [`ItemSources::merge`] do, so a repeated worker id is reported everywhere instead of
+/// two leaves silently collapsing onto one catalog record.
+fn push_unique_item(sources: &mut ItemSources, seen: &mut BTreeSet<String>, item: SourceItem) {
+    if !seen.insert(item.worker_id.clone()) {
+        sources.diagnostics.push(SourceDiagnostic::warning(
+            DIAGNOSTIC_DUPLICATE_ITEM_ID,
+            item.worker_id.as_str(),
+            format!(
+                "duplicate item id `{}`; keeping the first item",
+                item.worker_id
+            ),
+        ));
+        return;
+    }
+    push_path(&mut sources.item_paths, &item.skill_path);
+    sources.items.push(item);
 }
 
 /// The usable id of one JSONL row, in priority order.

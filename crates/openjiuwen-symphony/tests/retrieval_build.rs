@@ -29,10 +29,10 @@ use openjiuwen_symphony::retrieval::build::scanner::{
 };
 use openjiuwen_symphony::retrieval::build::schema::{
     TreeSchema, DIAGNOSTIC_BLANK_LABEL, DIAGNOSTIC_CYCLE, DIAGNOSTIC_DUPLICATE_CID,
-    DIAGNOSTIC_EXCESSIVE_DEPTH, DIAGNOSTIC_MISSING_WORKER_ID,
+    DIAGNOSTIC_EXCESSIVE_DEPTH, DIAGNOSTIC_MISSING_WORKER_ID, DIAGNOSTIC_TOO_MANY_NODES,
 };
 use openjiuwen_symphony::retrieval::build::workflows::{BuildConfig, IndexBuilder};
-use openjiuwen_symphony::retrieval::types::{IndexNode, RetrieverItem};
+use openjiuwen_symphony::retrieval::types::{IndexNode, RetrieverItem, MODE_FULL};
 
 /// One scanned skill item: a name, a description, content, and a `store/<id>` inventory
 /// path, so a deletion can prune its inventory entry.
@@ -187,6 +187,81 @@ fn a_skill_inventory_becomes_one_item_per_record() {
         sources.item_paths,
         vec!["alpha/SKILL.md", "beta/SKILL.md"],
         "the inventory paths are carried in `worker_id` order"
+    );
+}
+
+#[test]
+fn a_repeated_descriptor_id_is_diagnosed_and_the_first_one_wins() {
+    let first = CapabilityDescriptor::new("skill", "pdf", "PDF Fill")
+        .with_description("fills pdf forms")
+        .with_semantic_content("# Body\nfills forms");
+    let second =
+        CapabilityDescriptor::new("skill", "pdf", "PDF Reader").with_description("reads pdf forms");
+
+    let sources = ItemSources::from_descriptors([first, second]);
+
+    assert_eq!(sources.worker_ids(), vec!["pdf"]);
+    assert_eq!(sources.items.len(), 1, "one leaf, one item");
+    assert_eq!(
+        sources.items[0].name, "PDF Fill",
+        "the first descriptor wins"
+    );
+    let duplicates: Vec<&str> = sources
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == DIAGNOSTIC_DUPLICATE_ITEM_ID)
+        .map(|diagnostic| diagnostic.subject.as_str())
+        .collect();
+    assert_eq!(duplicates, vec!["pdf"]);
+    let diagnostic = sources
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == DIAGNOSTIC_DUPLICATE_ITEM_ID)
+        .expect("the repeated id is reported");
+    assert!(
+        !diagnostic.is_error(),
+        "a duplicated id is a warning: the first descriptor is kept"
+    );
+}
+
+#[test]
+fn a_repeated_inventory_record_is_diagnosed_and_the_first_one_wins() {
+    let inventory = SkillInventory::new(vec![
+        SkillRecord::new("alpha", "Alpha")
+            .with_description("adds numbers")
+            .with_skill_file("alpha/SKILL.md"),
+        SkillRecord::new("alpha", "Alpha Again")
+            .with_description("overwrites the first")
+            .with_skill_file("beta/SKILL.md"),
+    ]);
+
+    let sources = ItemSources::from_inventory(&inventory);
+
+    assert_eq!(sources.worker_ids(), vec!["alpha"]);
+    assert_eq!(sources.items.len(), 1);
+    assert_eq!(
+        sources.items[0].name, "Alpha",
+        "the first record in worker_id then skill_file order wins"
+    );
+    assert_eq!(
+        sources.item_paths,
+        vec!["alpha/SKILL.md"],
+        "the dropped record contributes no inventory entry"
+    );
+    let duplicates: Vec<&str> = sources
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == DIAGNOSTIC_DUPLICATE_ITEM_ID)
+        .map(|diagnostic| diagnostic.subject.as_str())
+        .collect();
+    assert_eq!(duplicates, vec!["alpha"]);
+    assert!(
+        sources
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DIAGNOSTIC_DUPLICATE_ITEM_ID)
+            .all(|diagnostic| !diagnostic.is_error()),
+        "a duplicated id is a warning"
     );
 }
 
@@ -651,9 +726,89 @@ fn schema_reports_excessive_depth() {
     assert!(TreeSchema::new().validate_or_error(&nodes).is_ok());
 }
 
+#[tokio::test]
+async fn a_depth_or_size_bound_aborts_the_build_before_writing() {
+    let deep = tempfile::tempdir().unwrap();
+    let error = IndexBuilder::build(
+        sources(tools(2, "documents/pdf")),
+        deep.path(),
+        BuildConfig::new().with_schema(TreeSchema::new().with_max_depth(2)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(
+        error.message().contains(DIAGNOSTIC_EXCESSIVE_DEPTH),
+        "a tree deeper than `max_depth` must not be published: {}",
+        error.message()
+    );
+    assert_eq!(
+        fs::read_dir(deep.path()).unwrap().count(),
+        0,
+        "an over-deep build writes nothing"
+    );
+
+    let crowded = tempfile::tempdir().unwrap();
+    let error = IndexBuilder::build(
+        sources(tools(3, "documents")),
+        crowded.path(),
+        BuildConfig::new().with_schema(TreeSchema::new().with_max_nodes(3)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(
+        error.message().contains(DIAGNOSTIC_TOO_MANY_NODES),
+        "a tree larger than `max_nodes` must not be published: {}",
+        error.message()
+    );
+    assert_eq!(
+        fs::read_dir(crowded.path()).unwrap().count(),
+        0,
+        "an over-large build writes nothing"
+    );
+}
+
 // --------------------------------------------------------------------------------------
 // 7. Incremental patches
 // --------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_failed_add_leaves_the_builder_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    build_and_open(dir.path(), tools(3, "documents")).await;
+    let config = BuildConfig::new()
+        .with_grouping(GroupingConfig::default().with_strategy(GroupingStrategy::FaissKmeans));
+    let mut builder = IndexBuilder::open(dir.path(), config).await.unwrap();
+    let nodes = builder.nodes().to_vec();
+    let records = builder.records().to_vec();
+    let item_paths = builder.item_paths().to_vec();
+
+    // Re-adding an indexed id is the patch that used to drop the item's leaf and record
+    // *before* the grouping strategy refused to place it.
+    let error = builder
+        .add(&sources(vec![item("tool1", "Tool One", "documents/pdf")]))
+        .await
+        .unwrap_err();
+
+    assert!(is_unsupported(&error), "{error:?} was not Unsupported");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert_eq!(
+        builder.nodes(),
+        nodes.as_slice(),
+        "a failed add must not drop the node it was about to replace"
+    );
+    assert_eq!(
+        builder.records(),
+        records.as_slice(),
+        "a failed add must not drop the catalog record it was about to replace"
+    );
+    assert_eq!(
+        builder.item_paths(),
+        item_paths.as_slice(),
+        "a failed add must not extend the inventory"
+    );
+}
 
 #[tokio::test]
 async fn open_then_add_appends_a_leaf_and_a_record() {
@@ -944,7 +1099,7 @@ fn the_model_and_faiss_grouping_strategies_are_typed_deferrals() {
 }
 
 // --------------------------------------------------------------------------------------
-// 6. Atomic publication (the builder path)
+// 10. Atomic publication (the builder path of section 6)
 // --------------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -962,5 +1117,30 @@ async fn a_build_that_cannot_publish_leaves_no_artifact_behind() {
         fs::read_dir(dir.path()).unwrap().count(),
         0,
         "a rejected build writes nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_builder_whose_item_type_was_never_validated_cannot_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    let builder = IndexBuilder::new(BuildConfig::default().with_item_type(""));
+
+    let error = builder.write(dir.path(), MODE_FULL).await.unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(
+        error.message().contains("item_type"),
+        "the write names the field it refuses: {}",
+        error.message()
+    );
+    assert_eq!(
+        fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "an unloadable index is never published"
+    );
+    assert_eq!(
+        builder.item_type(),
+        "skill",
+        "the lenient rule fills a blank item type"
     );
 }

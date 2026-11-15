@@ -17,10 +17,12 @@
 //!    ([`build_nodes`](crate::retrieval::build::tree::build_nodes)) — the deterministic,
 //!    model-free tree of Python's fallback path.
 //! 3. Checks the tree ([`TreeSchema::validate`](crate::retrieval::build::schema::TreeSchema::validate)).
-//!    A `blank_cid`, `duplicate_cid`, `missing_parent` or `cycle` aborts the build before a
-//!    byte is written; every other code is advisory — kept in the report and logged.
+//!    A `blank_cid`, `duplicate_cid`, `missing_parent`, `cycle`, `excessive_depth` or
+//!    `too_many_nodes` aborts the build before a byte is written, because each of them
+//!    describes a tree this builder must not publish; every other code (`excessive_fan_out`,
+//!    `blank_label`, `missing_worker_id`) is advisory — kept in the report and logged.
 //! 4. Derives one catalog record per leaf that carries a `worker_id`, joined to its scanned
-//!    item by that id ([`catalog_record`](crate::retrieval::build::workflows::catalog_record)).
+//!    item by that id ([`catalog_record`](crate::retrieval::build::catalog::catalog_record)).
 //! 5. Publishes the three artifacts atomically through
 //!    [`write_index`](crate::retrieval::artifacts::write_index).
 //!
@@ -62,9 +64,8 @@ use tracing::{debug, warn};
 
 use crate::error::{validation, Error, Result};
 use crate::retrieval::artifacts::{catalog_content_hash, load_index, parse_tree_yaml, write_index};
-pub use crate::retrieval::build::catalog::catalog_record;
 use crate::retrieval::build::catalog::{
-    records_for_nodes, rekey_record, sort_records, sorted_records,
+    catalog_record, records_for_nodes, rekey_record, sort_records, sorted_records,
 };
 use crate::retrieval::build::grouping::{self, GroupingConfig};
 use crate::retrieval::build::presets::TreePreset;
@@ -73,7 +74,7 @@ use crate::retrieval::build::scanner::{
 };
 use crate::retrieval::build::schema::{
     TreeDiagnostic, TreeSchema, DIAGNOSTIC_BLANK_CID, DIAGNOSTIC_CYCLE, DIAGNOSTIC_DUPLICATE_CID,
-    DIAGNOSTIC_MISSING_PARENT,
+    DIAGNOSTIC_EXCESSIVE_DEPTH, DIAGNOSTIC_MISSING_PARENT, DIAGNOSTIC_TOO_MANY_NODES,
 };
 use crate::retrieval::build::tree;
 use crate::retrieval::build::tree_text::{slug_term, sort_nodes};
@@ -90,13 +91,20 @@ pub const DEFAULT_ESCALATION_RATIO: f64 = 0.25;
 
 /// The diagnostic codes that abort a build instead of merely being reported.
 ///
-/// Everything else [`TreeSchema::validate`] can report describes a tree that can still be
-/// published, so it is carried in the report and logged.
-const FATAL_TREE_CODES: [&str; 4] = [
+/// The first four make the tree unusable (a missing, repeated, dangling or circular `cid`),
+/// and the last two describe a tree that exceeded the shape the configuration allows: a
+/// node deeper than [`TreeSchema::max_depth`] and a node list longer than
+/// [`TreeSchema::max_nodes`] are both bounds the builder must not publish past.
+/// Everything else [`TreeSchema::validate`] can report (`excessive_fan_out`, `blank_label`,
+/// `missing_worker_id`) describes a tree that can still be published, so it is carried in
+/// the report and logged.
+const FATAL_TREE_CODES: [&str; 6] = [
     DIAGNOSTIC_BLANK_CID,
     DIAGNOSTIC_DUPLICATE_CID,
     DIAGNOSTIC_MISSING_PARENT,
     DIAGNOSTIC_CYCLE,
+    DIAGNOSTIC_EXCESSIVE_DEPTH,
+    DIAGNOSTIC_TOO_MANY_NODES,
 ];
 
 /// Build-time configuration: the offline knobs of Python's `BuildConfig`.
@@ -302,15 +310,15 @@ pub struct IndexBuilder {
 impl IndexBuilder {
     /// Builds an empty builder for `config`.
     ///
-    /// The item type is normalized leniently, so a caller can assemble a builder before
-    /// running [`BuildConfig::validate`].
+    /// The item type follows the scanner's lenient rule, so a caller can assemble a builder
+    /// before running [`BuildConfig::validate`]; [`IndexBuilder::write`] re-checks it.
     #[must_use]
     pub fn new(config: BuildConfig) -> Self {
         Self {
             nodes: Vec::new(),
             records: Vec::new(),
             item_paths: Vec::new(),
-            item_type: lenient_item_type(&config.item_type),
+            item_type: scanner::lenient_item_type(&config.item_type),
             config,
         }
     }
@@ -452,6 +460,10 @@ impl IndexBuilder {
     /// replaces the item: its previous leaf (and any branch only it filled) is pruned
     /// first, so no stale leaf survives the patch.
     ///
+    /// A patch is all or nothing: every item is placed with the grouping stage *before*
+    /// the first node or record is touched, so a strategy that cannot run offline leaves
+    /// the builder exactly as it was instead of dropping the item it failed on.
+    ///
     /// The item paths of `sources` are appended to the builder's inventory with
     /// order-preserving dedupe.
     ///
@@ -469,14 +481,21 @@ impl IndexBuilder {
             .collect();
         ordered.sort_by(|left, right| left.worker_id.cmp(&right.worker_id));
 
-        let mut added: Vec<String> = Vec::new();
+        // Placement is the only fallible stage of a patch, so it runs for every new item
+        // first; the mutations below cannot fail.
+        let mut placements: Vec<(&SourceItem, Vec<String>)> = Vec::with_capacity(ordered.len());
         for item in ordered {
-            let worker_id = item.worker_id.trim().to_string();
-            self.drop_worker(&worker_id);
             let assignments = grouping::group_items(std::slice::from_ref(item), &grouping)?;
             let path = assignments
                 .first()
                 .map_or_else(Vec::new, |assignment| assignment.path.clone());
+            placements.push((item, path));
+        }
+
+        let mut added: Vec<String> = Vec::with_capacity(placements.len());
+        for (item, path) in placements {
+            let worker_id = item.worker_id.trim().to_string();
+            self.drop_worker(&worker_id);
             let parent = tree::branch_chain(&mut self.nodes, &path, &grouping.root_segment);
             let mut used: BTreeSet<String> =
                 self.nodes.iter().map(|node| node.cid.clone()).collect();
@@ -676,21 +695,26 @@ impl IndexBuilder {
     /// Sorts and publishes the artifact set, returning the manifest written.
     ///
     /// The nodes are sorted by `(depth, cid)` and the records by `cid` as part of the
-    /// write, so the bytes on disk do not depend on the order the patches produced.
-    /// [`write_index`] creates the directory,
+    /// write, so the bytes on disk do not depend on the order the patches produced. The
+    /// configuration and the item type are validated first, so a builder assembled without
+    /// [`BuildConfig::validate`] cannot publish an index that
+    /// [`load_index`] would refuse. [`write_index`] creates the directory,
     /// validates the set before touching it, and replaces each file through a temp sibling
     /// plus rename, so a failed write leaves the previous index in place.
     ///
     /// # Errors
     ///
-    /// [`Error::Validation`] for a malformed node or record set,
-    /// [`Error::Config`] for an unusable target path, and [`Error::External`] for an I/O
-    /// failure.
+    /// [`Error::Validation`] for an invalid configuration, an unusable item type, or a
+    /// malformed node or record set, [`Error::Config`] for an unusable target path, and
+    /// [`Error::External`] for an I/O failure.
     pub async fn write(&self, output_dir: impl AsRef<Path>, mode: &str) -> Result<IndexManifest> {
+        self.config.validate()?;
+        let item_type = scanner::normalize_item_type(&self.item_type)?;
         let mut nodes = self.nodes.clone();
         sort_nodes(&mut nodes);
         let records = sorted_records(&self.records);
-        let manifest = self.manifest(mode);
+        let mut manifest = self.manifest(mode);
+        manifest.item_type = item_type;
         write_index(output_dir.as_ref(), &nodes, &records, &manifest).await?;
         Ok(manifest)
     }
@@ -765,14 +789,6 @@ fn resolve_item_type(source_item_type: &str, config: &BuildConfig) -> Result<Str
         source_item_type
     };
     scanner::normalize_item_type(raw)
-}
-
-/// The item type of a builder that has not validated its configuration yet.
-fn lenient_item_type(raw: &str) -> String {
-    match scanner::normalize_item_type(raw) {
-        Ok(item_type) => item_type,
-        Err(_) => raw.trim().to_ascii_lowercase(),
-    }
 }
 
 /// `changed / before.max(1)`, the ratio an incremental patch reports.
