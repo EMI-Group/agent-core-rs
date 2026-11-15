@@ -16,6 +16,7 @@ use super::super::config::ModelRequestConfig;
 use super::super::reasoning::{
     apply_reasoning_plan, resolve_reasoning_plan_for, ReasoningConfig, ReasoningProtocol,
 };
+use super::state;
 
 /// Suffix a caller may have left on `api_base` by pasting the full endpoint.
 const RESPONSES_SUFFIX: &str = "/responses";
@@ -24,7 +25,7 @@ const RESPONSES_SUFFIX: &str = "/responses";
 const REASONING_KEY: &str = "reasoning";
 
 /// Key of a nested extra body that must be flattened into the body root.
-const EXTRA_BODY_KEY: &str = "extra_body";
+pub(crate) const EXTRA_BODY_KEY: &str = "extra_body";
 
 /// Key that asks the provider to include encrypted reasoning content.
 const INCLUDE_REASONING_KEY: &str = "include_reasoning_encrypted_content";
@@ -152,6 +153,12 @@ pub fn convert_tools(tools: &[Value]) -> Vec<Value> {
 /// least one tool is configured. `include` asks for encrypted reasoning content
 /// when `extra.include_reasoning_encrypted_content` is `true`.
 ///
+/// Two further protocol fields come from the caller's hints: `max_tool_calls`
+/// (validated, forwarded for the service to enforce) and `previous_response_id`
+/// (explicit, or resolved from the client's session store). The
+/// `conversation_id` hint that scopes that store is client-side only and never
+/// reaches the body.
+///
 /// A provider-neutral reasoning intent ([`ModelRequestConfig::reasoning`] first,
 /// legacy `extra.reasoning` second) is resolved through
 /// [`ReasoningProtocol::Responses`](super::super::reasoning::ReasoningProtocol) and
@@ -171,9 +178,11 @@ pub fn convert_tools(tools: &[Value]) -> Vec<Value> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Config`] when [`ModelRequestConfig::model_name`] is empty and
-/// [`Error::Validation`] when the conversation is empty or a reasoning intent is
-/// malformed.
+/// Returns [`Error::Config`] when [`ModelRequestConfig::model_name`] is empty,
+/// [`Error::Validation`] when the conversation is empty, a reasoning intent is
+/// malformed, or `max_tool_calls`/`previous_response_id`/`conversation_id` is not
+/// the value its field accepts, and [`Error::Unsupported`] for `background` mode
+/// and hosted tools, which need the live `OpenAI` Responses service.
 pub fn build_responses_body(
     messages: &[BaseMessage],
     request: &ModelRequestConfig,
@@ -186,6 +195,7 @@ pub fn build_responses_body(
              (or the MODEL_NAME environment variable)",
         ));
     }
+    state::reject_unsupported(request)?;
 
     let (instructions, input) = convert_messages(messages)?;
 
@@ -260,6 +270,8 @@ pub fn build_responses_body(
         body.insert(REASONING_KEY.to_owned(), raw);
     }
 
+    state::apply_body_fields(&mut body, request)?;
+
     let extra = request.extra_without_internal_keys();
     if let Some(extra) = extra.as_object() {
         for (key, value) in expand_extra_body(extra, consumes_reasoning) {
@@ -312,11 +324,20 @@ fn include_reasoning_encrypted_content(request: &ModelRequestConfig) -> bool {
 ///
 /// Nested fields are laid down first and the outer keys win a collision, matching
 /// the Python `expand_nested_extra_body`; the consumed keys
-/// (`extra_body`, the reasoning intent, and the include toggle) are not forwarded.
+/// (`extra_body`, the reasoning intent, the include toggle, and the client-side
+/// conversation hints) are not forwarded.
 fn expand_extra_body(extra: &Map<String, Value>, consumes_reasoning: bool) -> Map<String, Value> {
     let mut expanded = Map::new();
     if let Some(Value::Object(nested)) = extra.get(EXTRA_BODY_KEY) {
         for (key, value) in nested {
+            if state::is_client_side_key(key) {
+                tracing::warn!(
+                    target: "openjiuwen_foundation::llm::responses",
+                    key,
+                    "dropping a client-side Responses hint nested in extra_body"
+                );
+                continue;
+            }
             expanded.insert(key.clone(), value.clone());
         }
     }
@@ -324,6 +345,7 @@ fn expand_extra_body(extra: &Map<String, Value>, consumes_reasoning: bool) -> Ma
         if key == EXTRA_BODY_KEY
             || key == INCLUDE_REASONING_KEY
             || (consumes_reasoning && key == REASONING_KEY)
+            || state::is_client_side_key(key)
         {
             continue;
         }

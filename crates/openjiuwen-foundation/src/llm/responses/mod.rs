@@ -36,11 +36,13 @@
 
 mod request;
 mod response;
+mod state;
 mod stream;
 
 #[cfg(test)]
 mod tests;
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use async_stream::try_stream;
@@ -62,6 +64,11 @@ use super::transport::{self, carries_payload, next_chunk, poll_budget, read_erro
 
 pub use request::{build_responses_body, convert_messages, convert_tools, normalize_api_base};
 pub use response::{parse_responses_response, parse_responses_usage};
+pub use state::{
+    conversation_key, max_tool_calls, previous_response_id, InMemoryResponsesSessionStore,
+    NoopResponsesSessionStore, ResponsesSessionStore, CONVERSATION_KEY,
+    DEFAULT_CONVERSATION_CAPACITY, MAX_TOOL_CALLS_KEY, PREVIOUS_RESPONSE_ID_KEY,
+};
 pub use stream::ResponsesStreamState;
 
 /// Header the account backend uses to scope a conversation.
@@ -84,6 +91,15 @@ const CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
 /// accepted when its [`api_mode`](ModelClientConfig::api_mode) is
 /// [`ApiMode::Responses`]; `openai_account` always speaks Responses. A pasted
 /// `/responses` suffix is stripped from `api_base`.
+///
+/// A client also owns its conversation state: the [`ResponsesSessionStore`] that
+/// maps a caller-supplied conversation key to the last response id (a fresh
+/// [`InMemoryResponsesSessionStore`], bounded and lost on restart) plus an optional
+/// client-wide conversation key. See
+/// [`with_session_store`](Self::with_session_store) and
+/// [`with_conversation_key`](Self::with_conversation_key); the store is never a
+/// process global, so nothing leaks between clients that were not explicitly
+/// handed the same store.
 #[derive(Debug, Clone)]
 pub struct OpenAiResponsesClient {
     /// Shared HTTP transport (retries, TLS, proxy, default headers).
@@ -98,6 +114,10 @@ pub struct OpenAiResponsesClient {
     provider: String,
     /// API base with trailing slashes and a pasted endpoint path removed.
     base_url: String,
+    /// Per-client conversation state for `previous_response_id`.
+    sessions: Arc<dyn ResponsesSessionStore>,
+    /// Conversation key used when a request carries none of its own.
+    conversation_key: Option<String>,
 }
 
 impl OpenAiResponsesClient {
@@ -156,7 +176,48 @@ impl OpenAiResponsesClient {
             profile,
             provider: profile.name.to_owned(),
             base_url,
+            sessions: Arc::new(InMemoryResponsesSessionStore::new()),
+            conversation_key: None,
         })
+    }
+
+    /// Replaces the conversation store this client resolves `previous_response_id`
+    /// from and records answered response ids into.
+    ///
+    /// The default is a fresh [`InMemoryResponsesSessionStore`] owned by this
+    /// client. Hand the same [`Arc`] to several clients to share conversation
+    /// history, or pass [`NoopResponsesSessionStore`] to keep no state at all (an
+    /// explicit `extra["previous_response_id"]` still reaches the wire). The store
+    /// is in-memory and per-instance: nothing is persisted, so a restart forgets
+    /// every conversation.
+    #[must_use]
+    pub fn with_session_store(mut self, sessions: Arc<dyn ResponsesSessionStore>) -> Self {
+        self.sessions = sessions;
+        self
+    }
+
+    /// Sets the conversation key used when a request carries no
+    /// [`conversation_id`](CONVERSATION_KEY) hint of its own.
+    ///
+    /// A request-level key always wins over this client-wide one. The key is a
+    /// client-side hint: it selects the store entry and never reaches a request
+    /// body.
+    #[must_use]
+    pub fn with_conversation_key(mut self, key: impl Into<String>) -> Self {
+        self.conversation_key = Some(key.into());
+        self
+    }
+
+    /// The conversation store this client uses.
+    #[must_use]
+    pub fn session_store(&self) -> Arc<dyn ResponsesSessionStore> {
+        Arc::clone(&self.sessions)
+    }
+
+    /// The client-wide conversation key, when one is configured.
+    #[must_use]
+    pub fn conversation_key(&self) -> Option<&str> {
+        self.conversation_key.as_deref()
     }
 
     /// Replaces the HTTP transport.
@@ -247,11 +308,22 @@ impl Model for OpenAiResponsesClient {
     /// this is the same path as the Python transport's `create_response`: force
     /// `stream: true`, decode every SSE event, and fold the chunks into one
     /// [`ChatResponse`] with a [`StreamAccumulator`].
+    ///
+    /// The conversation state is resolved first (`previous_response_id` from the
+    /// caller's hint or the client's store) and the answered response id is
+    /// recorded afterwards under the same conversation key, so the next call on
+    /// this client continues the conversation.
     async fn invoke(
         &self,
         messages: &[BaseMessage],
         request: &ModelRequestConfig,
     ) -> Result<ChatResponse> {
+        let conversation = state::resolve(
+            request,
+            self.conversation_key.as_deref(),
+            self.sessions.as_ref(),
+        )?;
+        let request = &conversation.request;
         let body = build_responses_body(messages, request, true)?;
         let url = self.endpoint();
         let http_request = self.build_request(url.clone(), request).json(&body)?;
@@ -288,8 +360,11 @@ impl Model for OpenAiResponsesClient {
             turn.finish_reason = Some(FinishReason::Stop);
         }
 
+        let response_id = state.response_id().map(str::to_owned);
+        conversation.record(self.sessions.as_ref(), response_id.as_deref());
+
         Ok(ChatResponse {
-            id: String::new(),
+            id: response_id.unwrap_or_default(),
             model: request.model_name.trim().to_owned(),
             choices: vec![Choice {
                 index: 0,
@@ -300,6 +375,12 @@ impl Model for OpenAiResponsesClient {
         })
     }
 
+    /// Streams one call, resolving and recording the conversation state.
+    ///
+    /// The stream resolves `previous_response_id` before it builds the body and
+    /// records the answered response id once the stream ends, so a streamed call
+    /// continues a conversation exactly like [`invoke`](Self::invoke). Resolution
+    /// errors (a malformed hint) surface as the first stream item.
     fn stream(
         &self,
         messages: Vec<BaseMessage>,
@@ -313,9 +394,14 @@ impl Model for OpenAiResponsesClient {
         let timeout = self.client.timeout;
         let first_chunk_timeout = self.client.stream_first_chunk_timeout;
         let idle_timeout = self.client.stream_idle_timeout;
+        let sessions = Arc::clone(&self.sessions);
+        let configured_key = self.conversation_key.clone();
 
         Box::pin(try_stream! {
-            let body = build_responses_body(&messages, &request, true)?;
+            let conversation =
+                state::resolve(&request, configured_key.as_deref(), sessions.as_ref())?;
+            let request = &conversation.request;
+            let body = build_responses_body(&messages, request, true)?;
             let url = transport::join_url(&base_url, path);
             let mut http_request = HttpRequest::post(url.clone())
                 .with_headers(headers)
@@ -327,7 +413,7 @@ impl Model for OpenAiResponsesClient {
             if let Some(timeout) = timeout {
                 http_request = http_request.timeout(timeout);
             }
-            if let Some(session) = session_id(&request) {
+            if let Some(session) = session_id(request) {
                 http_request = http_request
                     .header(SESSION_HEADER, session)
                     .header(CLIENT_REQUEST_ID_HEADER, session);
@@ -371,6 +457,8 @@ impl Model for OpenAiResponsesClient {
             for item in state.finish() {
                 yield item;
             }
+
+            conversation.record(sessions.as_ref(), state.response_id());
         })
     }
 }
