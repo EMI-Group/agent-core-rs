@@ -140,3 +140,114 @@ fn daily_names_match_only_iso_dates() {
     assert!(!is_daily_name("26-11-15.md"));
     assert!(!is_daily_name("2026-11-15.md.bak"));
 }
+#[tokio::test]
+async fn search_scopes_the_tree_and_filters_session_logs() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    for (path, text) in [
+        (
+            "memory/MEMORY.md",
+            "# Memory\n\nArgoCD deploys the service.",
+        ),
+        (
+            "memory/sessions/s1/log.jsonl",
+            "{\"text\":\"ArgoCD rollout\"}",
+        ),
+        (
+            "memory/sessions/s2/log.jsonl",
+            "{\"text\":\"ArgoCD rollback\"}",
+        ),
+        (
+            "coding_memory/build.md",
+            "---\nname: build\ndescription: d\ntype: project\n---\n\nArgoCD",
+        ),
+        ("USER.md", "# User\n\nArgoCD owner."),
+    ] {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("parent dir");
+        std::fs::write(path, text).expect("fixture");
+    }
+    let workspace = Workspace::for_language(dir.path(), "en");
+    let backend = WorkspaceMemoryBackend::new(workspace);
+
+    let request = |scope: MemoryScope, session_key: Option<&str>| MemorySearchRequest {
+        query: "argocd".to_owned(),
+        max_results: 20,
+        min_score: 0.0,
+        session_key: session_key.map(str::to_owned),
+        scope,
+    };
+
+    let memory = backend
+        .search(request(MemoryScope::Memory, None))
+        .await
+        .expect("memory search");
+    let paths: Vec<&str> = memory["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .filter_map(|hit| hit["path"].as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "USER.md",
+            "memory/MEMORY.md",
+            "memory/sessions/s1/log.jsonl",
+            "memory/sessions/s2/log.jsonl",
+        ],
+        "the long-term scope searches the memory tree plus USER.md"
+    );
+
+    let scoped = backend
+        .search(request(MemoryScope::Memory, Some("s1")))
+        .await
+        .expect("scoped search");
+    let paths: Vec<&str> = scoped["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .filter_map(|hit| hit["path"].as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "USER.md",
+            "memory/MEMORY.md",
+            "memory/sessions/s1/log.jsonl"
+        ],
+        "session_key keeps only its own transcript"
+    );
+
+    let coding = backend
+        .search(request(MemoryScope::CodingMemory, None))
+        .await
+        .expect("coding search");
+    let paths: Vec<&str> = coding["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .filter_map(|hit| hit["path"].as_str())
+        .collect();
+    assert_eq!(paths, ["coding_memory/build.md"]);
+}
+
+#[tokio::test]
+async fn search_of_a_missing_tree_is_empty_not_an_error() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let backend = WorkspaceMemoryBackend::new(Workspace::for_language(dir.path(), "en"));
+
+    for scope in [MemoryScope::Memory, MemoryScope::CodingMemory] {
+        let data = backend
+            .search(MemorySearchRequest {
+                query: "anything".to_owned(),
+                max_results: 5,
+                min_score: 0.0,
+                session_key: None,
+                scope,
+            })
+            .await
+            .expect("search of a missing tree");
+        assert_eq!(data["results"].as_array().map(Vec::len), Some(0));
+        assert_eq!(data["disabled"], serde_json::json!(false));
+    }
+}
