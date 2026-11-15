@@ -3,7 +3,7 @@
 //!
 //! Only capabilities that stay genuinely unported may report
 //! `ErrorKind::Unsupported`; everything else in this crate performs its work.
-//! This binary pins the two invariants that outlive individual modules:
+//! This binary pins the invariant that outlives individual modules:
 //!
 //! - the workflow DSL rejects the structural errors the builder and the
 //!   declarative generator rely on (no nodes, duplicate ids, unresolvable edge
@@ -11,9 +11,10 @@
 //!   and round-trips.
 //!
 //! Module-local suites own the checks for capabilities that stay deliberately
-//! deferred (for example the archive variants `skill_creator::omni` rejects:
-//! ZIP64, encrypted entries, and compression methods beyond stored/DEFLATE), so
-//! this binary stays focused on the DSL.
+//! deferred (for example the archive variants `skill_creator::omni` still
+//! rejects: the `bzip2`/`xz`/`zstd` codecs, `WinZip` AES and PKWARE strong
+//! encryption, an encrypted central directory, and zip/gzip compression methods
+//! beyond stored/DEFLATE), so this binary stays focused on the DSL.
 //!
 //! Everything here is offline and deterministic.
 use std::collections::BTreeMap;
