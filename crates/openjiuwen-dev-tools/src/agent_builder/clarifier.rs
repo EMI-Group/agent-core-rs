@@ -41,17 +41,40 @@
 //! stated — those two are the minimum a design needs. When it is not ready the
 //! question names the first missing piece in the order goal, input, output,
 //! tools, and `summary` lists the detected signals in that same fixed order.
+//!
+//! # Rounds, provenance, and streaming
+//!
+//! [`Clarifier::clarify`] is the single-pass verdict and is implemented as a
+//! one-round dialogue, so both entry points share one judgement.
+//! The bounded multi-turn loop ([`Clarifier::clarify_rounds`],
+//! [`Clarifier::clarify_rounds_with`]) asks the same judgement repeatedly over a
+//! working copy of the dialogue and terminates on [`ClarificationTermination`];
+//! it lives in [`rounds`].
+//! Every verdict records a [`StageProvenance`](super::outcome::StageProvenance)
+//! entry in [`Clarification::provenance`], so an accepted model answer, the
+//! offline heuristic, and a fallback after a failed model call are
+//! distinguishable, and a degraded verdict is logged at warn level.
+//! [`Clarifier::stream_clarify`] yields the same rounds one by one.
+
+pub mod rounds;
 
 use std::fmt;
 use std::sync::Arc;
 
-use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::error::Result;
 use openjiuwen_foundation::llm::{Model, ModelRequestConfig};
 use openjiuwen_foundation::BaseMessage;
 use serde::{Deserialize, Serialize};
 
 use super::history::HistoryManager;
+use super::outcome::{GenerationProvenance, GenerationSource};
+use super::progress::ProgressStage;
 use crate::util::extract_json_fence;
+
+pub use rounds::{
+    ClarificationDialogue, ClarificationRound, ClarificationTermination, ClarifyConfig,
+    ClarifyEvent, DEFAULT_MAX_CLARIFY_ROUNDS,
+};
 
 /// The instruction sent to the model when a clarifier has one.
 ///
@@ -157,7 +180,20 @@ pub struct Clarification {
     /// The detected requirement signals, in the fixed order
     /// `"goal, input, output, tools"` (empty when none was detected).
     pub summary: String,
+    /// Where the verdict came from, as one [`ProgressStage::Clarifying`] record.
+    pub provenance: GenerationProvenance,
 }
+
+/// The provenance detail recorded when no model is wired for a verdict.
+pub(crate) const NO_MODEL_DETAIL: &str = "no model configured; keyword heuristic";
+/// The provenance detail recorded when a wired model's call returns an error.
+pub(crate) const MODEL_CALL_FAILED: &str = "model call failed";
+/// The provenance detail recorded when a wired model answers without a choice.
+pub(crate) const MODEL_NO_CHOICES: &str = "model returned no choices";
+/// The provenance detail recorded when a model answer holds no JSON fence.
+pub(crate) const MODEL_NO_FENCE: &str = "answer had no JSON fence";
+/// The provenance detail recorded for an answer that breaks the answer contract.
+pub(crate) const MODEL_CONTRACT_MISMATCH: &str = "answer did not match the contract";
 
 /// The answer contract of the model path.
 ///
@@ -180,7 +216,9 @@ struct ClarificationAnswer {
 /// deterministic otherwise.
 ///
 /// The clarifier owns no session state: every call decides one request from the
-/// query plus the caller's [`HistoryManager`].
+/// query plus the caller's [`HistoryManager`]. It is [`Clone`], so a caller can
+/// move a copy into a stream.
+#[derive(Clone)]
 pub struct Clarifier {
     /// The model asked for a verdict, or `None` for the offline heuristic.
     model: Option<Arc<dyn Model>>,
@@ -214,22 +252,48 @@ impl Clarifier {
     /// document that is not an object with a boolean `ready` — is logged at
     /// debug level and falls back to the deterministic heuristic documented in
     /// the [module docs](self). Without a model, the heuristic answers directly.
+    /// The verdict records which of those paths produced it in
+    /// [`Clarification::provenance`].
+    ///
+    /// This is [`Clarifier::clarify_rounds_with`] with one round and no
+    /// responder, so a single-pass verdict and the first round of a dialogue are
+    /// always the same judgement.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] when `query` is empty or whitespace only.
+    /// Returns [`Error::Validation`](openjiuwen_common::error::Error::Validation)
+    /// when `query` is empty or whitespace only.
     pub async fn clarify(&self, query: &str, history: &HistoryManager) -> Result<Clarification> {
-        if query.trim().is_empty() {
-            return Err(Error::validation("query must not be blank"));
-        }
+        let dialogue = self
+            .clarify_rounds_with(query, history, &ClarifyConfig::new(1), |_| None)
+            .await?;
+        Ok(dialogue.clarification)
+    }
 
+    /// Judges one round: the model when one is wired, the heuristic otherwise.
+    ///
+    /// A wired model's unusable answer is a [`GenerationSource::Fallback`] over
+    /// the heuristic, never an error; the detail names the reason.
+    async fn judge(&self, query: &str, history: &HistoryManager) -> Judgement {
         if let Some(model) = self.model.as_ref() {
-            if let Some(clarification) = ask_model(model, query, history).await {
-                return Ok(clarification);
-            }
+            return match ask_model(model, query, history).await {
+                Ok(clarification) => Judgement {
+                    clarification,
+                    source: GenerationSource::Model,
+                    detail: String::new(),
+                },
+                Err(reason) => Judgement {
+                    clarification: deterministic(query, history),
+                    source: GenerationSource::Fallback,
+                    detail: reason.to_owned(),
+                },
+            };
         }
-
-        Ok(deterministic(query, history))
+        Judgement {
+            clarification: deterministic(query, history),
+            source: GenerationSource::Deterministic,
+            detail: NO_MODEL_DETAIL.to_owned(),
+        }
     }
 }
 
@@ -252,24 +316,47 @@ impl fmt::Debug for Clarifier {
     }
 }
 
-/// Asks the model for a verdict, returning `None` for any unusable answer.
+/// One round's verdict plus where it came from.
+///
+/// The verdict's own provenance is empty until the caller finalizes it, because
+/// a dialogue aggregates one record per round.
+pub(crate) struct Judgement {
+    /// The verdict itself, with an empty provenance.
+    pub(crate) clarification: Clarification,
+    /// Where this verdict came from.
+    pub(crate) source: GenerationSource,
+    /// A short note naming a fallback reason; empty for an accepted model
+    /// answer.
+    pub(crate) detail: String,
+}
+
+impl Judgement {
+    /// This verdict as one [`ProgressStage::Clarifying`] record.
+    pub(crate) fn provenance(&self) -> GenerationProvenance {
+        let mut provenance = GenerationProvenance::new();
+        provenance.record(ProgressStage::Clarifying, self.source, self.detail.clone());
+        provenance
+    }
+}
+
+/// Asks the model for a verdict, reporting the reason for an unusable answer.
 async fn ask_model(
     model: &Arc<dyn Model>,
     query: &str,
     history: &HistoryManager,
-) -> Option<Clarification> {
+) -> std::result::Result<Clarification, &'static str> {
     let messages = conversation(query, history);
     let request = ModelRequestConfig::new(model.model_name());
     let response = match model.invoke(&messages, &request).await {
         Ok(response) => response,
         Err(error) => {
             tracing::debug!(%error, "requirement clarifier model call failed");
-            return None;
+            return Err(MODEL_CALL_FAILED);
         }
     };
     let Some(choice) = response.choices.into_iter().next() else {
         tracing::debug!("requirement clarifier model returned no choices");
-        return None;
+        return Err(MODEL_NO_CHOICES);
     };
     parse_answer(&choice.message.text())
 }
@@ -291,22 +378,23 @@ fn conversation(query: &str, history: &HistoryManager) -> Vec<BaseMessage> {
 
 /// Parses a model answer into a [`Clarification`].
 ///
-/// Failures are logged and reported as `None` so the caller can fall back to the
-/// deterministic heuristic.
-fn parse_answer(text: &str) -> Option<Clarification> {
+/// Failures are logged and reported as the reason the caller falls back to the
+/// deterministic heuristic with.
+fn parse_answer(text: &str) -> std::result::Result<Clarification, &'static str> {
     let Some(value) = extract_json_fence(text) else {
         tracing::debug!("requirement clarifier answer has no JSON fence");
-        return None;
+        return Err(MODEL_NO_FENCE);
     };
     match serde_json::from_value::<ClarificationAnswer>(value) {
-        Ok(answer) => Some(Clarification {
+        Ok(answer) => Ok(Clarification {
             ready: answer.ready,
             question: answer.question.trim().to_owned(),
             summary: answer.summary.trim().to_owned(),
+            provenance: GenerationProvenance::new(),
         }),
         Err(error) => {
             tracing::debug!(%error, "requirement clarifier answer does not match the contract");
-            None
+            Err(MODEL_CONTRACT_MISMATCH)
         }
     }
 }
@@ -350,6 +438,7 @@ fn deterministic(query: &str, history: &HistoryManager) -> Clarification {
         ready,
         question,
         summary: signals.join(", "),
+        provenance: GenerationProvenance::new(),
     }
 }
 
@@ -386,6 +475,23 @@ mod tests {
     fn dynamic(model: &Arc<ScriptedModel>) -> Arc<dyn Model> {
         let cloned: Arc<ScriptedModel> = Arc::clone(model);
         cloned
+    }
+
+    /// One `clarifying` provenance record.
+    fn provenance_of(source: GenerationSource, detail: &str) -> GenerationProvenance {
+        let mut provenance = GenerationProvenance::new();
+        provenance.record(ProgressStage::Clarifying, source, detail);
+        provenance
+    }
+
+    /// The three Python-visible verdict fields, for comparing paths that differ
+    /// only in provenance.
+    fn verdict(clarification: &Clarification) -> (bool, String, String) {
+        (
+            clarification.ready,
+            clarification.question.clone(),
+            clarification.summary.clone(),
+        )
     }
 
     /// A history holding one request that states a goal and an output.
@@ -524,6 +630,7 @@ mod tests {
                 ready: false,
                 question: "Which model?".to_string(),
                 summary: "needs a model".to_string(),
+                provenance: provenance_of(GenerationSource::Model, ""),
             }
         );
         assert_eq!(model.call_count(), 1);
@@ -559,6 +666,7 @@ mod tests {
                 ready: true,
                 question: String::new(),
                 summary: "goal, output".to_string(),
+                provenance: provenance_of(GenerationSource::Model, ""),
             }
         );
         assert_eq!(model.call_count(), 1);
@@ -580,7 +688,16 @@ mod tests {
             .await
             .expect("clarify succeeds");
 
-        assert_eq!(from_model, from_heuristic);
+        assert_eq!(verdict(&from_model), verdict(&from_heuristic));
+        assert_eq!(
+            from_model.provenance,
+            provenance_of(GenerationSource::Fallback, MODEL_NO_FENCE)
+        );
+        assert_eq!(
+            from_heuristic.provenance,
+            provenance_of(GenerationSource::Deterministic, NO_MODEL_DETAIL)
+        );
+        assert!(from_model.provenance.has_fallback());
         assert_eq!(model.call_count(), 1);
     }
 
@@ -600,12 +717,14 @@ mod tests {
                 .await
                 .expect("clarify succeeds");
 
+            let heuristic = Clarifier::new()
+                .clarify("Build an agent.", &history)
+                .await
+                .expect("clarify succeeds");
+            assert_eq!(verdict(&clarification), verdict(&heuristic));
             assert_eq!(
-                clarification,
-                Clarifier::new()
-                    .clarify("Build an agent.", &history)
-                    .await
-                    .expect("clarify succeeds")
+                clarification.provenance.stages[0].source,
+                GenerationSource::Fallback
             );
             assert_eq!(model.call_count(), 1);
         }
@@ -625,12 +744,14 @@ mod tests {
         assert!(!clarification.ready);
         assert_eq!(clarification.question, OUTPUT_QUESTION);
         assert_eq!(
-            clarification,
-            Clarifier::new()
-                .clarify("Build an agent that reads the input.", &history)
-                .await
-                .expect("clarify succeeds")
+            clarification.provenance,
+            provenance_of(GenerationSource::Fallback, MODEL_CALL_FAILED)
         );
+        let heuristic = Clarifier::new()
+            .clarify("Build an agent that reads the input.", &history)
+            .await
+            .expect("clarify succeeds");
+        assert_eq!(verdict(&clarification), verdict(&heuristic));
         assert_eq!(model.call_count(), 1);
     }
 
@@ -658,6 +779,7 @@ mod tests {
             ready: false,
             question: "Which model?".to_string(),
             summary: "needs a model".to_string(),
+            provenance: provenance_of(GenerationSource::Model, ""),
         };
 
         let value = serde_json::to_value(&clarification).expect("serialize");
@@ -667,6 +789,9 @@ mod tests {
                 "ready": false,
                 "question": "Which model?",
                 "summary": "needs a model",
+                "provenance": {"stages": [
+                    {"stage": "clarifying", "source": "model", "detail": ""},
+                ]},
             })
         );
 
@@ -678,7 +803,18 @@ mod tests {
                 ready: false,
                 question: String::new(),
                 summary: String::new(),
+                provenance: GenerationProvenance::new(),
             }
         );
+
+        // Legacy JSON without `provenance` still parses, with no recorded stage.
+        let legacy: Clarification = serde_json::from_value(serde_json::json!({
+            "ready": true,
+            "question": "",
+            "summary": "goal, output",
+        }))
+        .expect("legacy JSON parses");
+        assert!(legacy.ready);
+        assert!(legacy.provenance.is_empty());
     }
 }
