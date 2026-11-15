@@ -4,32 +4,40 @@
 //! (`indexing/processor/parser/pdf_parser.py`) without `pdfplumber`: instead of
 //! a full PDF object model this module reads the content streams directly.
 //!
-//! What is supported:
+//! Every stream is run through the filter pipeline named by its dictionary
+//! (`/Filter` plus `/DecodeParms`), in the order the dictionary lists it:
 //!
-//! - uncompressed content streams and `/FlateDecode` (abbreviation `/Fl`)
-//!   streams, decoded with [`zlib_decompress`]; a stream whose payload cannot be
-//!   decoded is skipped with a `debug` log instead of failing the document;
-//! - the text operators `Tj`, `TJ` (string and kerning-number arrays, a space is
-//!   inserted when a negative adjustment exceeds [`KERNING_SPACE_THRESHOLD`]),
-//!   `'` and `"` (line break before the string), and the positioning operators
-//!   `Td`, `TD`, `T*`, `Tm`, `BT`, `ET` (line break);
-//! - PDF literal strings with escapes (`\n \r \t \b \f \( \) \\`), balanced
-//!   parentheses, line continuations, and octal escapes (`\ddd`), plus hex
-//!   strings (`<48656C6C6F>`); a UTF-16BE byte-order mark switches either form to
-//!   UTF-16BE, everything else is UTF-8 with a Latin-1 fallback;
-//! - text-only extraction: there is no OCR, font-metric reconstruction, or
-//!   layout analysis, matching the feature set the reference gets from
-//!   `page.extract_text()`.
+//! - the decodable filters — `ASCIIHexDecode`, `ASCII85Decode`,
+//!   `RunLengthDecode`, and `FlateDecode` (through [`zlib_decompress`]), long and
+//!   abbreviated (`/AHx`, `/A85`, `/RL`, `/Fl`) forms included — with predictors
+//!   `2` (`TIFF` differencing) and `10`..`15` (PNG row filters) undone after the
+//!   filter that names them;
+//! - an empty chain means the stream bytes are already the content stream.
 //!
-//! Deliberate limits, all reported as [`Error::Unsupported`] instead of silently
-//! returning nothing:
+//! The decoded bytes are then read with the text operators `Tj`, `TJ` (string and
+//! kerning-number arrays, a space is inserted when a negative adjustment exceeds
+//! [`KERNING_SPACE_THRESHOLD`]), `'` and `"` (line break before the string), and
+//! the positioning operators `Td`, `TD`, `T*`, `Tm`, `BT`, `ET` (line break).
+//! PDF literal strings are decoded with their escapes (`\n \r \t \b \f \( \)
+//! \\`), balanced parentheses, line continuations, and octal escapes (`\ddd`),
+//! plus hex strings (`<48656C6C6F>`); a UTF-16BE byte-order mark switches either
+//! form to UTF-16BE, everything else is UTF-8 with a Latin-1 fallback.
+//! Text-only extraction: there is no OCR, font-metric reconstruction, or layout
+//! analysis, matching the feature set the reference gets from
+//! `page.extract_text()`.
 //!
-//! - encrypted documents (`/Encrypt`);
-//! - compressed object streams (`/Type /ObjStm`), which would need xref parsing;
-//! - streams that only use another filter (`/ASCIIHexDecode`, `/LZWDecode`,
-//!   `/ASCII85Decode`, `/RunLengthDecode`, `/CCITTFaxDecode`, `/DCTDecode`,
-//!   `/JPXDecode`, `/JBIG2Decode`, `/Crypt`) are skipped with a `debug` log,
-//!   because none of them carry the text operators this module reads.
+//! Two kinds of stream are reported instead of silently disappearing:
+//!
+//! - image payload filters (`CCITTFaxDecode`, `DCTDecode`, `JPXDecode`,
+//!   `JBIG2Decode`), an unknown filter name, and a stream whose filter chain or
+//!   predictor cannot be undone are skipped and recorded in
+//!   [`PdfDocument::incomplete`], [`PdfDocument::skipped_filters`], and
+//!   [`PdfDocument::skipped_streams`] with a `warn` log, so the caller learns the
+//!   text is partial instead of trusting an empty page;
+//! - documents that cannot be read at all are [`Error::Unsupported`]: encrypted
+//!   documents (`/Encrypt`), compressed object streams (`/Type /ObjStm`, which
+//!   would need xref parsing), `/LZWDecode` and `/Crypt` streams (the extraction
+//!   cannot continue past them), and an unsupported predictor value or bit depth.
 //!
 //! Page order is stream order, since no cross-reference table is parsed: one
 //! [`PdfDocument::pages`] entry per decoded content stream, in file order. A
@@ -39,10 +47,14 @@
 use std::path::Path;
 
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_common::logging::debug;
+use openjiuwen_common::logging::warn;
 use serde::{Deserialize, Serialize};
 
-use super::inflate::{zlib_decompress, DEFAULT_MAX_OUTPUT_BYTES};
+use super::inflate::DEFAULT_MAX_OUTPUT_BYTES;
+
+mod dictionary;
+mod filters;
+mod predictor;
 
 /// A `TJ` kerning adjustment more negative than this (thousandths of a text-space
 /// unit) is rendered as a space.
@@ -74,6 +86,15 @@ pub struct PdfDocument {
     pub page_count: usize,
     /// `true` when at least one page yielded text.
     pub has_text: bool,
+    /// `true` when at least one stream was skipped, so `text` is partial.
+    ///
+    /// Skipped streams are image payloads, unknown filters, and payloads whose
+    /// filter chain or predictor could not be undone.
+    pub incomplete: bool,
+    /// Filters of the skipped streams, deduplicated in first-seen order.
+    pub skipped_filters: Vec<String>,
+    /// One record per skipped stream, naming its 0-based ordinal and the reason.
+    pub skipped_streams: Vec<String>,
 }
 
 impl PdfDocument {
@@ -97,10 +118,12 @@ impl PdfParser {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] for encrypted documents, object streams, and
-    /// unsupported stream filters (only when a stream carrying text uses one);
-    /// streams that merely fail to decode are skipped with a `debug` log. A
-    /// text-free document is not an error.
+    /// [`Error::Unsupported`] for encrypted documents, object streams, the
+    /// undecodable `/LZWDecode` and `/Crypt` filters, and a predictor value or
+    /// bit depth this crate does not implement. Streams that are skipped instead
+    /// (image payloads, unknown filters, undecodable payloads) are reported
+    /// through [`PdfDocument::incomplete`] and its two record fields. A text-free
+    /// document is not an error.
     pub fn parse_bytes(&self, bytes: &[u8]) -> Result<PdfDocument> {
         if contains_token(bytes, b"/Encrypt") {
             return Err(Error::Unsupported(
@@ -114,8 +137,12 @@ impl PdfParser {
                     .to_owned(),
             ));
         }
-        let pages = Self::extract_pages(bytes);
-        let pages: Vec<String> = pages.iter().map(|page| page.trim().to_owned()).collect();
+        let extracted = Self::extract_streams(bytes)?;
+        let pages: Vec<String> = extracted
+            .pages
+            .iter()
+            .map(|page| page.trim().to_owned())
+            .collect();
         let text = pages
             .iter()
             .filter(|page| !page.is_empty())
@@ -127,6 +154,9 @@ impl PdfParser {
             page_count: pages.len(),
             text,
             pages,
+            incomplete: !extracted.skipped_streams.is_empty(),
+            skipped_filters: extracted.skipped_filters,
+            skipped_streams: extracted.skipped_streams,
         })
     }
 
@@ -149,10 +179,17 @@ impl PdfParser {
         self.parse_bytes(&bytes)
     }
 
-    /// Walks every `stream … endstream` region in file order.
-    fn extract_pages(bytes: &[u8]) -> Vec<String> {
-        let mut pages = Vec::new();
+    /// Walks every `stream … endstream` region in file order and decodes it.
+    ///
+    /// # Errors
+    ///
+    /// The document-level errors of [`PdfParser::parse_bytes`]: an LZW or `Crypt`
+    /// filter, an unsupported predictor, or a predictor whose `validate` rejects
+    /// its parameters.
+    fn extract_streams(bytes: &[u8]) -> Result<ExtractedStreams> {
+        let mut extracted = ExtractedStreams::default();
         let mut cursor = 0usize;
+        let mut ordinal = 0usize;
         while let Some(stream_start) = find_subslice(bytes, b"stream", cursor) {
             let Some(data_start) = stream_data_start(bytes, stream_start) else {
                 cursor = stream_start + b"stream".len();
@@ -164,63 +201,105 @@ impl PdfParser {
             let data_end = trim_stream_end(bytes, data_start, relative_end);
             let dictionary = stream_dictionary(bytes, stream_start);
             cursor = relative_end + b"endstream".len();
-            match classify_stream(dictionary) {
-                StreamEncoding::Unsupported(filter) => {
-                    debug!("skipping PDF stream with the unsupported filter {filter}");
-                }
-                StreamEncoding::Plain => pages.push(extract_text(&bytes[data_start..data_end])),
-                StreamEncoding::Flate => {
-                    match zlib_decompress(&bytes[data_start..data_end], DEFAULT_MAX_OUTPUT_BYTES) {
-                        Ok(decoded) => pages.push(extract_text(&decoded)),
-                        Err(error) => debug!("skipping undecodable PDF stream: {error}"),
-                    }
+            let index = ordinal;
+            ordinal += 1;
+
+            let chain = dictionary::parse_filter_chain(dictionary);
+            let parms = dictionary::parse_decode_parms(dictionary);
+            for params in parms.iter().flatten() {
+                params.validate()?;
+            }
+            if let Some(filter) = chain.iter().find(|filter| filter.aborts_extraction()) {
+                return Err(Error::Unsupported(format!(
+                    "PDF stream filter {} cannot be decoded: text extraction cannot continue",
+                    filter.name()
+                )));
+            }
+            if let Some(filter) = chain.iter().find(|filter| filter.is_image_payload()) {
+                let reason = format!(
+                    "image payload filter {} cannot carry text operators",
+                    filter.name()
+                );
+                extracted.record_skipped(index, &chain, &reason);
+                continue;
+            }
+
+            let data = &bytes[data_start..data_end];
+            match decode_stream(data, &chain, &parms) {
+                Ok(decoded) => extracted.pages.push(extract_text(&decoded)),
+                Err(StreamFailure { filter, error }) => {
+                    let reason = format!("{filter} decode failed: {error}");
+                    extracted.record_skipped(index, &chain, &reason);
                 }
             }
         }
-        pages
+        Ok(extracted)
     }
 }
 
-/// How a stream's filters are handled.
-enum StreamEncoding {
-    /// No (supported) filter: the bytes are the content stream.
-    Plain,
-    /// `/FlateDecode`: the content stream is `zlib`-compressed.
-    Flate,
-    /// A filter this module cannot read; the name is reported by the log.
-    Unsupported(&'static str),
+/// Streams decoded by one document pass, plus the skipped-stream accounting.
+#[derive(Debug, Default)]
+struct ExtractedStreams {
+    /// Decoded content-stream texts, in file order.
+    pages: Vec<String>,
+    /// Filters of the skipped streams, deduplicated in first-seen order.
+    skipped_filters: Vec<String>,
+    /// One human-readable record per skipped stream.
+    skipped_streams: Vec<String>,
 }
 
-/// Filters that never carry the text operators this module interprets.
-const UNSUPPORTED_FILTERS: [(&[u8], &str); 12] = [
-    (b"/ASCIIHexDecode", "ASCIIHexDecode"),
-    (b"/AHx", "ASCIIHexDecode"),
-    (b"/ASCII85Decode", "ASCII85Decode"),
-    (b"/A85", "ASCII85Decode"),
-    (b"/LZWDecode", "LZWDecode"),
-    (b"/LZW", "LZWDecode"),
-    (b"/RunLengthDecode", "RunLengthDecode"),
-    (b"/RL", "RunLengthDecode"),
-    (b"/CCITTFaxDecode", "CCITTFaxDecode"),
-    (b"/DCTDecode", "DCTDecode"),
-    (b"/JPXDecode", "JPXDecode"),
-    (b"/JBIG2Decode", "JBIG2Decode"),
-];
-
-/// Returns how the stream described by `dictionary` should be decoded.
-fn classify_stream(dictionary: &[u8]) -> StreamEncoding {
-    for (token, name) in UNSUPPORTED_FILTERS {
-        if contains_token(dictionary, token) {
-            return StreamEncoding::Unsupported(name);
+impl ExtractedStreams {
+    /// Records a skipped stream and logs it.
+    fn record_skipped(&mut self, index: usize, chain: &[filters::Filter], reason: &str) {
+        for filter in chain {
+            let name = filter.name().to_owned();
+            if !self.skipped_filters.contains(&name) {
+                self.skipped_filters.push(name);
+            }
         }
+        warn!(stream = index, reason, "skipping PDF stream");
+        self.skipped_streams
+            .push(format!("stream {index}: {reason}"));
     }
-    if contains_token(dictionary, b"/Crypt") {
-        return StreamEncoding::Unsupported("Crypt");
+}
+
+/// One failed filter step, naming the filter that could not be undone.
+struct StreamFailure {
+    /// Display name of the filter whose step failed.
+    filter: String,
+    /// Error that made the step fail.
+    error: Error,
+}
+
+/// Folds the filter chain and its predictors over one stream payload.
+fn decode_stream(
+    data: &[u8],
+    chain: &[filters::Filter],
+    parms: &[Option<predictor::PredictorParams>],
+) -> std::result::Result<Vec<u8>, StreamFailure> {
+    let mut current: Option<Vec<u8>> = None;
+    for (index, filter) in chain.iter().enumerate() {
+        let input = current.as_deref().unwrap_or(data);
+        let mut decoded =
+            filters::decode(filter, input, DEFAULT_MAX_OUTPUT_BYTES).map_err(|error| {
+                StreamFailure {
+                    filter: filter.name().to_owned(),
+                    error,
+                }
+            })?;
+        let params = parms.get(index).copied().flatten().unwrap_or_default();
+        if !params.is_identity() {
+            decoded =
+                predictor::apply(&decoded, &params, DEFAULT_MAX_OUTPUT_BYTES).map_err(|error| {
+                    StreamFailure {
+                        filter: filter.name().to_owned(),
+                        error,
+                    }
+                })?;
+        }
+        current = Some(decoded);
     }
-    if contains_token(dictionary, b"/FlateDecode") || contains_token(dictionary, b"/Fl") {
-        return StreamEncoding::Flate;
-    }
-    StreamEncoding::Plain
+    Ok(current.unwrap_or_else(|| data.to_vec()))
 }
 
 /// Returns `true` when the file declares a compressed object stream.
