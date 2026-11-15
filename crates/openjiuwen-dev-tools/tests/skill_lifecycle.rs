@@ -480,3 +480,262 @@ async fn model_runner_evaluates_the_authored_skill() {
         );
     }
 }
+
+/// Asserts that none of the rendered Markdown lines carry trailing whitespace.
+fn assert_markdown_is_tidy(document: &str, name: &str) {
+    assert!(
+        document.ends_with('\n') && !document.ends_with("\n\n"),
+        "the {name} report must end with exactly one newline"
+    );
+    assert!(
+        !document.contains("\n\n\n"),
+        "the {name} report must separate its sections with one blank line"
+    );
+    for (index, line) in document.lines().enumerate() {
+        assert_eq!(
+            line.trim_end(),
+            line,
+            "line {} of the {name} report carries trailing whitespace: {line:?}",
+            index + 1
+        );
+    }
+}
+
+/// The evaluator configuration that closes the E3 safety gate.
+fn blocking_config() -> EvaluatorConfig {
+    EvaluatorConfig {
+        safety_rules: vec![SafetyRule::new(
+            "(?i)document brief",
+            "data_leakage",
+            "critical",
+            "the skill body leaks the internal brief codename",
+        )],
+        ..EvaluatorConfig::default()
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_completed_run_writes_the_four_markdown_reports() {
+    use openjiuwen_dev_tools::skill_evaluator::artifacts::{
+        FINAL_REPORT_ARTIFACT, LLM_JUDGE_REPORT_ARTIFACT, PIPELINE_REPORT_ARTIFACT,
+        SAFETY_REPORT_ARTIFACT,
+    };
+
+    let workspace = TempWorkspace::new().expect("temp workspace must be creatable");
+    let skill = author_skill();
+    let report = SkillEvaluator::new(Arc::new(scripted_runner()))
+        .evaluate_at(&skill, &evaluation_cases(), 1_700_000_000_000)
+        .await
+        .expect("a valid skill and valid cases must evaluate");
+    let dir = workspace.path("evals/skill-tests/document-brief");
+
+    let paths = report
+        .write_markdown_artifacts(&dir)
+        .await
+        .expect("a completed run must write its markdown reports");
+
+    assert_eq!(
+        paths.dir, dir,
+        "the paths struct must name the target directory"
+    );
+    assert_eq!(
+        paths.llm_judge,
+        dir.join(LLM_JUDGE_REPORT_ARTIFACT),
+        "the design report must be written as llm_judge_report.md"
+    );
+    assert_eq!(
+        paths.safety,
+        dir.join(SAFETY_REPORT_ARTIFACT),
+        "the safety report must be written as skill_safety_report.md"
+    );
+    assert_eq!(
+        paths.final_report.as_ref(),
+        Some(&dir.join(FINAL_REPORT_ARTIFACT)),
+        "a completed run must write final_report.md"
+    );
+    assert!(
+        paths.pipeline_report.is_none(),
+        "a completed run must not write pipeline_report.md"
+    );
+    assert!(
+        !dir.join(PIPELINE_REPORT_ARTIFACT).exists(),
+        "pipeline_report.md must be absent for a completed run"
+    );
+
+    let llm_judge = tokio::fs::read_to_string(&paths.llm_judge)
+        .await
+        .expect("the design report must be readable");
+    assert!(
+        llm_judge.starts_with("# Skill Evaluation Report: document-brief"),
+        "the design report must open with the Python title: {llm_judge}"
+    );
+    for heading in [
+        "## Summary",
+        "## Dimension Scores",
+        "## Critical Issues",
+        "## Detailed Analysis",
+    ] {
+        assert!(
+            llm_judge.contains(heading),
+            "the design report must carry the {heading} section: {llm_judge}"
+        );
+    }
+    assert!(
+        llm_judge.contains("| Dimension | Score | Max |"),
+        "the design report must render the rubric table: {llm_judge}"
+    );
+    assert_markdown_is_tidy(&llm_judge, "design");
+
+    let safety = tokio::fs::read_to_string(&paths.safety)
+        .await
+        .expect("the safety report must be readable");
+    assert!(
+        safety.starts_with("# Safety Evaluation Report: document-brief"),
+        "the safety report must open with the Python title: {safety}"
+    );
+    for heading in [
+        "## Verdict",
+        "## Dimension Scores",
+        "## Findings",
+        "## Cleared Dimensions",
+    ] {
+        assert!(
+            safety.contains(heading),
+            "the safety report must carry the {heading} section: {safety}"
+        );
+    }
+    assert!(
+        safety.contains("- **Gate**: PASS") && safety.contains("- **Auto-fail triggered**: None"),
+        "a passing scan must open the gate and claim no auto-fail: {safety}"
+    );
+    assert_markdown_is_tidy(&safety, "safety");
+
+    let final_report =
+        tokio::fs::read_to_string(paths.final_report.as_ref().expect("final report path"))
+            .await
+            .expect("the final report must be readable");
+    assert!(
+        final_report.starts_with("# Eval Pipeline Report: document-brief"),
+        "the final report must open with the Python title: {final_report}"
+    );
+    for heading in [
+        "## Final Verdict",
+        "## Evaluator Breakdown",
+        "## Key Issues to Fix",
+        "## Full Reports",
+    ] {
+        assert!(
+            final_report.contains(heading),
+            "the final report must carry the {heading} section: {final_report}"
+        );
+    }
+    assert!(
+        final_report.contains("**Status**: COMPLETED"),
+        "the final report must state the completed pipeline status: {final_report}"
+    );
+    assert!(
+        final_report.contains("| E1 Design (skill_llm_judge) |")
+            && final_report.contains("| E2 Functional (skill_tester) |")
+            && final_report.contains("| E3 Safety (skill_safety_judge) | PASS |"),
+        "the evaluator breakdown must list E1, E2, and the passing E3 gate: {final_report}"
+    );
+    assert!(
+        final_report.contains("[final_score.json](final_score.json)"),
+        "the full-report links must point at the JSON artifacts: {final_report}"
+    );
+    assert!(
+        final_report.contains("**Run timestamp**: 2023-11-14T22:13:20Z"),
+        "the timestamp line must render the caller-supplied epoch milliseconds: {final_report}"
+    );
+    assert!(
+        final_report.contains(&format!(
+            "**Run timestamp**: {}",
+            report.functional.timestamp_iso()
+        )),
+        "the timestamp line must agree with FunctionalReport::timestamp_iso"
+    );
+    assert_markdown_is_tidy(&final_report, "final");
+}
+
+#[tokio::test]
+async fn a_blocked_run_writes_a_pipeline_report_instead_of_a_final_report() {
+    use openjiuwen_dev_tools::skill_evaluator::artifacts::{
+        FINAL_REPORT_ARTIFACT, PIPELINE_REPORT_ARTIFACT,
+    };
+
+    let workspace = TempWorkspace::new().expect("temp workspace must be creatable");
+    let skill = author_skill();
+    let report = SkillEvaluator::new(Arc::new(scripted_runner()))
+        .with_config(blocking_config())
+        .evaluate_at(&skill, &evaluation_cases(), 1_700_000_000_000)
+        .await
+        .expect("a matching safety rule blocks the verdict without failing the run");
+    assert_eq!(
+        report.final_score.pipeline_status, "BLOCKED_AT_E3",
+        "the fixture must be blocked at the E3 safety gate"
+    );
+    let dir = workspace.path("evals/skill-tests/document-brief");
+
+    let paths = report
+        .write_markdown_artifacts(&dir)
+        .await
+        .expect("a blocked run must write its markdown reports");
+
+    assert!(
+        paths.final_report.is_none(),
+        "a blocked run must not claim a completed-run report"
+    );
+    assert_eq!(
+        paths.pipeline_report.as_ref(),
+        Some(&dir.join(PIPELINE_REPORT_ARTIFACT)),
+        "a blocked run must write pipeline_report.md"
+    );
+    assert!(
+        !dir.join(FINAL_REPORT_ARTIFACT).exists(),
+        "final_report.md must be absent for a blocked run"
+    );
+
+    let pipeline =
+        tokio::fs::read_to_string(paths.pipeline_report.as_ref().expect("pipeline path"))
+            .await
+            .expect("the pipeline report must be readable");
+    assert!(
+        pipeline.starts_with("# Eval Pipeline Report: document-brief"),
+        "the pipeline report must open with the Python title: {pipeline}"
+    );
+    assert!(
+        pipeline.contains("**Status**: BLOCKED_AT_E3"),
+        "the pipeline report must name the blocking gate: {pipeline}"
+    );
+    assert!(
+        pipeline.contains("**Blocked by**: E3 safety gate"),
+        "the pipeline report must describe the blocking gate: {pipeline}"
+    );
+    assert!(
+        pipeline.contains("## Key Issues to Fix") && pipeline.contains("## Full Reports"),
+        "the pipeline report must keep the Python sections: {pipeline}"
+    );
+    assert!(
+        pipeline.contains(
+            "- Safety: data_leakage (critical): the skill body leaks the internal brief codename"
+        ),
+        "the blocking finding must appear in the issue list: {pipeline}"
+    );
+    assert!(
+        !pipeline.contains("[final_score.json](final_score.json)"),
+        "a blocked run writes no final_score.json to link: {pipeline}"
+    );
+    assert_markdown_is_tidy(&pipeline, "pipeline");
+
+    let safety = tokio::fs::read_to_string(&paths.safety)
+        .await
+        .expect("the safety report must be readable");
+    assert!(
+        safety.contains("- **Gate**: FAIL")
+            && safety.contains("- **Blocked**: Yes")
+            && safety.contains("## Findings\n- data_leakage (critical)"),
+        "the safety report must show the closed gate and the finding: {safety}"
+    );
+    assert_markdown_is_tidy(&safety, "safety");
+}
