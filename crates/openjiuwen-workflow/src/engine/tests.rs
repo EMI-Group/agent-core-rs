@@ -795,10 +795,44 @@ async fn component_routing_short_circuits_the_routers() {
 #[test]
 fn to_mermaid_renders_nodes_and_edges() {
     let workflow = CompiledWorkflow::build(linear(echo(), NodeConfig::default())).unwrap();
-    let rendered = workflow.to_mermaid();
+    let rendered = workflow.to_mermaid().unwrap();
     assert!(rendered.contains("start"), "{rendered}");
     assert!(rendered.contains("mid"), "{rendered}");
     assert!(rendered.contains("end"), "{rendered}");
+}
+
+#[test]
+fn rendering_an_uncompilable_definition_reports_the_compile_error() {
+    // `order` names a component that was never inserted, so validation passes but the graph
+    // cannot be compiled. `CompiledWorkflow` is immutable, which is why the test shapes the
+    // definition before building it.
+    let mut definition = linear(echo(), NodeConfig::default());
+    definition.order.push("ghost".to_owned());
+    let workflow = CompiledWorkflow::build(definition).unwrap();
+
+    let mermaid = workflow.to_mermaid().unwrap_err();
+    assert_eq!(mermaid.kind(), ErrorKind::Workflow);
+    assert!(mermaid.message().contains("ghost"), "{mermaid}");
+    assert!(
+        !mermaid.to_string().contains("could not be compiled"),
+        "no placeholder comment is produced: {mermaid}"
+    );
+    assert!(
+        !mermaid.to_string().contains("%%"),
+        "no Mermaid text leaks into the error: {mermaid}"
+    );
+
+    let svg = workflow.to_svg().unwrap_err();
+    assert_eq!(svg.kind(), ErrorKind::Workflow);
+    assert!(svg.message().contains("ghost"), "{svg}");
+    assert!(
+        !svg.to_string().contains("<?xml"),
+        "no SVG document is fabricated: {svg}"
+    );
+    assert!(
+        !svg.to_string().contains("could not be compiled"),
+        "no error document is fabricated: {svg}"
+    );
 }
 
 #[test]

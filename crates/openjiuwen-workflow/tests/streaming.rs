@@ -21,6 +21,7 @@
 //! frames are produced from in-memory streams, never from sleeps.
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -28,8 +29,10 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use openjiuwen_common::error::{ErrorKind, Result};
 use openjiuwen_session::stream::{StreamItem, StreamMode};
+use openjiuwen_session::{Checkpointer, InteractiveInput, MemoryCheckpointer};
 use serde_json::{json, Value};
 
+use openjiuwen_workflow::engine::StreamDelivery;
 use openjiuwen_workflow::{
     Component, ComponentAbility, ComponentCard, ComponentContext, ComponentOptions, EndComponent,
     StartComponent, Workflow, WorkflowExecutionState, WorkflowRunOptions, END_NODE_STREAM,
@@ -37,7 +40,8 @@ use openjiuwen_workflow::{
 };
 
 use common::{
-    card, end_with_template, session, CollectorComponent, FailingComponent, StreamingProducer,
+    card, end_with_template, session, session_with_checkpointer, CollectorComponent,
+    FailingComponent, StreamingProducer,
 };
 
 /// Upper bound on how long a deterministic in-memory stream may take to yield.
@@ -322,4 +326,138 @@ async fn an_empty_producer_still_yields_the_final_frame() {
     assert_eq!(frames[0].item_type, WORKFLOW_FINAL);
     assert_eq!(frames[0].index, Some(0));
     assert_eq!(frames[0].payload, json!([]));
+}
+
+/// The `Interleaved` rejection message every run entry point must produce.
+fn assert_interleaved_rejection(failure: &openjiuwen_common::error::Error) {
+    assert_eq!(
+        failure.kind(),
+        ErrorKind::Unsupported,
+        "Interleaved must be a typed Unsupported: {failure:?}"
+    );
+    let message = failure.message().to_string();
+    assert!(
+        message.contains("stream_actor"),
+        "the reason names Python's stream_actor:\n{message}"
+    );
+    assert!(
+        message.contains("interleav"),
+        "the reason names live interleaving:\n{message}"
+    );
+    assert!(
+        message.contains("StreamDelivery::Buffered"),
+        "the reason points at the supported mode:\n{message}"
+    );
+}
+
+#[test]
+fn stream_delivery_wire_names_and_default() {
+    assert_eq!(StreamDelivery::default(), StreamDelivery::Buffered);
+    assert_eq!(StreamDelivery::Buffered.as_str(), "buffered");
+    assert_eq!(StreamDelivery::Interleaved.as_str(), "interleaved");
+    assert_eq!(StreamDelivery::Buffered.to_string(), "buffered");
+    assert_eq!(StreamDelivery::all().len(), 2);
+    assert!(StreamDelivery::Buffered.is_supported());
+    assert!(!StreamDelivery::Interleaved.is_supported());
+    assert_eq!(
+        serde_json::to_string(&StreamDelivery::Interleaved).unwrap(),
+        "\"interleaved\""
+    );
+    assert_eq!(
+        serde_json::from_str::<StreamDelivery>("\"buffered\"").unwrap(),
+        StreamDelivery::Buffered
+    );
+}
+
+#[tokio::test]
+async fn interleaved_delivery_is_rejected_by_invoke_without_touching_the_session() {
+    let workflow = custom_workflow();
+    let session = session("interleaved-invoke");
+
+    let failure = workflow
+        .invoke_with(
+            json!({"query": "hi"}),
+            Arc::clone(&session),
+            WorkflowRunOptions::default().with_stream_delivery(StreamDelivery::Interleaved),
+        )
+        .await
+        .expect_err("Interleaved cannot be served by this engine");
+    assert_interleaved_rejection(&failure);
+
+    assert_eq!(
+        session.get_state("query").await.unwrap(),
+        None,
+        "the run inputs must not be committed before the rejection"
+    );
+}
+
+#[tokio::test]
+async fn interleaved_delivery_is_the_streams_single_error_item() {
+    let workflow = custom_workflow();
+    let session = session("interleaved-stream");
+
+    let items: Vec<_> = workflow
+        .stream_with(
+            json!({"query": "hi"}),
+            Arc::clone(&session),
+            WorkflowRunOptions::default().with_stream_delivery(StreamDelivery::Interleaved),
+        )
+        .collect()
+        .await;
+
+    assert_eq!(items.len(), 1, "no frame is yielded before the rejection");
+    let failure = items.into_iter().next().unwrap().unwrap_err();
+    assert_interleaved_rejection(&failure);
+    assert_eq!(
+        session.get_state("query").await.unwrap(),
+        None,
+        "the stream must not commit inputs before the rejection"
+    );
+}
+
+#[tokio::test]
+async fn interleaved_delivery_is_rejected_by_resume_and_by_compiled_entry_points() {
+    let checkpointer = MemoryCheckpointer::new();
+    let session = session_with_checkpointer(
+        "interleaved-resume",
+        Arc::new(checkpointer) as Arc<dyn Checkpointer>,
+    );
+    let compiled = custom_workflow().build().unwrap();
+    let options = WorkflowRunOptions::default()
+        .with_resume(true)
+        .with_stream_delivery(StreamDelivery::Interleaved);
+    let mut interactive = InteractiveInput::new();
+    interactive.answer("ask", json!("yes"));
+
+    let failure = compiled
+        .resume(interactive, Arc::clone(&session), options)
+        .await
+        .expect_err("Interleaved cannot be served by this engine");
+    assert_interleaved_rejection(&failure);
+    assert_eq!(
+        session.get_state("query").await.unwrap(),
+        None,
+        "resume must not commit inputs before the rejection"
+    );
+}
+
+#[tokio::test]
+async fn buffered_delivery_keeps_the_existing_frame_order() {
+    // The default mode and the explicit mode are the one supported delivery, so the frame
+    // sequence is the one the buffered contract pins.
+    let workflow = streaming_workflow(StreamingProducer::new(producer_frames()));
+    let frames: Vec<StreamItem> = workflow
+        .stream_with(
+            json!({}),
+            session("buffered-explicit"),
+            WorkflowRunOptions::default().with_stream_delivery(StreamDelivery::Buffered),
+        )
+        .map(|item| item.expect("the buffered stream yielded an error"))
+        .collect()
+        .await;
+
+    assert_eq!(frames.len(), 3, "two end frames plus the final frame");
+    assert_eq!(frames[0].payload, json!({"response": "a"}));
+    assert_eq!(frames[1].payload, json!({"response": "b"}));
+    assert_eq!(frames[2].item_type, WORKFLOW_FINAL);
 }

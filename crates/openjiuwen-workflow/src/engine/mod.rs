@@ -53,6 +53,7 @@
 //! ```
 
 pub mod definition;
+mod mutation;
 pub mod node;
 mod run;
 pub mod validate;
@@ -67,6 +68,7 @@ use openjiuwen_graph::{
 };
 use openjiuwen_session::stream::StreamMode;
 use openjiuwen_session::InteractiveInput;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -80,10 +82,68 @@ use crate::error;
 
 pub use definition::{ConditionalSource, Edge, EdgeKind, Entry, NodeConfig, WorkflowDefinition};
 
+/// How one run delivers frames from a streaming producer to its consumers.
+///
+/// Python's engine feeds producer frames to consumers live through
+/// `openjiuwen.core.graph.stream_actor`; this rewrite composes them instead. The mode is an
+/// explicit run option so a caller asking for Python's live behaviour learns that it is not
+/// available instead of silently receiving composed frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamDelivery {
+    /// Buffered composition: a `Stream`/`Transform` producer's frames are stored under its
+    /// node id, a `Collect`/`Transform` consumer resolves them afterwards through its
+    /// stream input schema, and the end node replays its template frames in template order.
+    ///
+    /// This is this crate's documented delivery model. The observable text and its order
+    /// match Python for finite streams; only live interleaving of two concurrently
+    /// streaming producers is lost. It is the default.
+    #[default]
+    Buffered,
+    /// Python's live `stream_actor` interleaving, where a producer's frames reach a
+    /// consumer while both are running.
+    ///
+    /// [`openjiuwen-graph`] does not port `stream_actor`, so this engine cannot provide it:
+    /// every run entry point rejects this mode with a typed
+    /// [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) naming the gap
+    /// instead of degrading to [`StreamDelivery::Buffered`].
+    Interleaved,
+}
+
+impl StreamDelivery {
+    /// The lowercase wire name (`"buffered"`, `"interleaved"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Buffered => "buffered",
+            Self::Interleaved => "interleaved",
+        }
+    }
+
+    /// Every delivery mode, in declaration order.
+    #[must_use]
+    pub const fn all() -> [Self; 2] {
+        [Self::Buffered, Self::Interleaved]
+    }
+
+    /// Whether this mode can be served by the engine in this crate.
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        matches!(self, Self::Buffered)
+    }
+}
+
+impl std::fmt::Display for StreamDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Tunables for one workflow run.
 ///
 /// Every field has a permissive default, so [`WorkflowRunOptions::default`] runs to
-/// completion with no cancellation, no explicit timeout, and every stream mode.
+/// completion with no cancellation, no explicit timeout, every stream mode, and
+/// [`StreamDelivery::Buffered`] composition.
 #[derive(Clone, Debug)]
 pub struct WorkflowRunOptions {
     /// Cancels the run when triggered.
@@ -105,6 +165,12 @@ pub struct WorkflowRunOptions {
     /// so on. A [`crate::components::sub_workflow::SubWorkflowComponent`] sets it on the
     /// child run; every other caller leaves it at the default.
     pub depth: usize,
+    /// How streaming producer frames reach their consumers; see [`StreamDelivery`].
+    ///
+    /// [`StreamDelivery::Interleaved`] is rejected by every run entry point with a typed
+    /// `Error::Unsupported`, because Python's live `stream_actor` interleaving is not
+    /// available here.
+    pub stream_delivery: StreamDelivery,
 }
 
 impl Default for WorkflowRunOptions {
@@ -118,6 +184,7 @@ impl Default for WorkflowRunOptions {
             stream_modes: None,
             max_supersteps: None,
             depth: 0,
+            stream_delivery: StreamDelivery::Buffered,
         }
     }
 }
@@ -186,6 +253,17 @@ impl WorkflowRunOptions {
     #[must_use]
     pub fn with_depth(mut self, depth: usize) -> Self {
         self.depth = depth;
+        self
+    }
+
+    /// Request `delivery` for this run's streaming frames.
+    ///
+    /// [`StreamDelivery::Buffered`] is the default and always runs;
+    /// [`StreamDelivery::Interleaved`] is refused by `invoke`, `stream` and `resume` with a
+    /// typed `Error::Unsupported` instead of being silently buffered.
+    #[must_use]
+    pub fn with_stream_delivery(mut self, delivery: StreamDelivery) -> Self {
+        self.stream_delivery = delivery;
         self
     }
 }
@@ -320,60 +398,42 @@ impl CompiledWorkflow {
 
     /// Renders the workflow as a Mermaid flowchart.
     ///
-    /// Compilation for rendering has no run scope and no snapshot store; a definition
-    /// that cannot be compiled yields a Mermaid comment naming the problem instead of
-    /// panicking. Because that compile is render-only, the diagram shows the recorded
-    /// topology: a `wait_for_all = false` fan-in is drawn with an edge from every
-    /// predecessor instead of the dynamic router edges the run path compiles.
-    #[must_use]
-    pub fn to_mermaid(&self) -> String {
-        match self.build_graph(None, None, None) {
-            Ok(graph) => graph.to_mermaid(),
-            Err(failure) => {
-                tracing::warn!(
-                    workflow = self.inner.card.id.as_str(),
-                    error = %failure,
-                    "failed to compile the workflow graph for rendering"
-                );
-                format!(
-                    "%% workflow '{}' could not be compiled: {failure}",
-                    self.inner.card.id
-                )
-            }
-        }
+    /// Compilation for rendering has no run scope and no snapshot store. Because that
+    /// compile is render-only, the diagram shows the recorded topology: a
+    /// `wait_for_all = false` fan-in is drawn with an edge from every predecessor instead
+    /// of the dynamic router edges the run path compiles.
+    ///
+    /// # Errors
+    ///
+    /// Returns the compile error when the recorded definition cannot be compiled. No
+    /// placeholder Mermaid text is produced; a caller that wants an error document must
+    /// render one itself (see [`crate::render::error_svg`]).
+    pub fn to_mermaid(&self) -> Result<String> {
+        let graph = self.build_graph(None, None, None)?;
+        Ok(graph.to_mermaid())
     }
 
     /// Renders the workflow as an inline SVG document.
     ///
-    /// Like [`CompiledWorkflow::to_mermaid`] this never fails: a definition that cannot be
-    /// compiled yields an SVG document naming the problem instead of panicking. The end
-    /// component is passed explicitly so the renderer shapes it as an exit node, and the
-    /// card name becomes the document title when it is not empty.
-    #[must_use]
-    pub fn to_svg(&self) -> String {
-        match self.build_graph(None, None, None) {
-            Ok(_) => crate::render::render_svg(
-                self.spec(),
-                self.card(),
-                &crate::render::SvgOptions {
-                    title: Some(self.inner.card.name.clone())
-                        .filter(|name| !name.trim().is_empty()),
-                    end_nodes: vec![self.inner.end_id.clone()],
-                    ..crate::render::SvgOptions::default()
-                },
-            ),
-            Err(failure) => {
-                tracing::warn!(
-                    workflow = self.inner.card.id.as_str(),
-                    error = %failure,
-                    "failed to compile the workflow graph for SVG rendering"
-                );
-                crate::render::error_svg(&format!(
-                    "workflow '{}' could not be compiled: {failure}",
-                    self.inner.card.id
-                ))
-            }
-        }
+    /// The end component is passed explicitly so the renderer shapes it as an exit node,
+    /// and the card name becomes the document title when it is not empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns the compile error when the recorded definition cannot be compiled. No
+    /// placeholder SVG document is produced; a caller that wants one must build it through
+    /// [`crate::render::error_svg`].
+    pub fn to_svg(&self) -> Result<String> {
+        self.build_graph(None, None, None)?;
+        Ok(crate::render::render_svg(
+            self.spec(),
+            self.card(),
+            &crate::render::SvgOptions {
+                title: Some(self.inner.card.name.clone()).filter(|name| !name.trim().is_empty()),
+                end_nodes: vec![self.inner.end_id.clone()],
+                ..crate::render::SvgOptions::default()
+            },
+        ))
     }
 
     /// The ability recorded for `id`, defaulting to `Invoke`.
