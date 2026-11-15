@@ -8,8 +8,11 @@
 //! assembles candidates, applies the configured policy, and keeps persistence
 //! consistent (a record is never left half-indexed).
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use openjiuwen_common::error::{Error, Result};
+use openjiuwen_retrieval::embedding::Embedding;
 
 use crate::recall::{find_duplicate, merge_records, Candidate};
 use crate::record::{
@@ -34,7 +37,28 @@ impl super::MemoryEngine {
         memory: NewMemory,
         options: &AddOptions,
     ) -> Result<AddOutcome> {
-        self.add_many(scope, vec![memory], options).await
+        self.add_with_embedding(scope, memory, options, None).await
+    }
+
+    /// Stores one memory with `embedding` as the embedder of this call.
+    ///
+    /// `embedding` is the handle a per-scope override resolved to; `None` means "use the
+    /// engine's own model". A supplied handle is never replaced by the engine's, and an
+    /// absent engine handle with no supplied handle stores the record without a vector
+    /// (keyword-only recall), exactly like [`MemoryEngine::add`](super::MemoryEngine::add).
+    ///
+    /// # Errors
+    ///
+    /// See [`MemoryEngine::add`](super::MemoryEngine::add).
+    pub async fn add_with_embedding(
+        &self,
+        scope: &MemoryScope,
+        memory: NewMemory,
+        options: &AddOptions,
+        embedding: Option<&Arc<dyn Embedding>>,
+    ) -> Result<AddOutcome> {
+        self.add_many_with_embedding(scope, vec![memory], options, embedding)
+            .await
     }
 
     /// Stores a batch sequentially under one scope lock, deduping against stored and
@@ -53,6 +77,22 @@ impl super::MemoryEngine {
         memories: Vec<NewMemory>,
         options: &AddOptions,
     ) -> Result<AddOutcome> {
+        self.add_many_with_embedding(scope, memories, options, None)
+            .await
+    }
+
+    /// Stores a batch under one scope lock with `embedding` as the embedder of this call.
+    ///
+    /// # Errors
+    ///
+    /// See [`MemoryEngine::add_many`](super::MemoryEngine::add_many).
+    pub async fn add_many_with_embedding(
+        &self,
+        scope: &MemoryScope,
+        memories: Vec<NewMemory>,
+        options: &AddOptions,
+        embedding: Option<&Arc<dyn Embedding>>,
+    ) -> Result<AddOutcome> {
         scope.validate()?;
         let mut outcome = AddOutcome::default();
         if memories.is_empty() {
@@ -66,7 +106,7 @@ impl super::MemoryEngine {
             memory.validate()?;
             let record = self.build_record(scope, &memory, now);
             record.validate()?;
-            self.write_record(record, options, now, &mut outcome)
+            self.write_record(record, options, now, &mut outcome, embedding)
                 .await?;
         }
         Ok(outcome)
@@ -99,6 +139,23 @@ impl super::MemoryEngine {
         id: &str,
         patch: MemoryUpdate,
         options: &CallOptions,
+    ) -> Result<MemoryRecord> {
+        self.update_with_embedding(scope, id, patch, options, None)
+            .await
+    }
+
+    /// Applies `patch` with `embedding` as the embedder of this call.
+    ///
+    /// # Errors
+    ///
+    /// See [`MemoryEngine::update`](super::MemoryEngine::update).
+    pub async fn update_with_embedding(
+        &self,
+        scope: &MemoryScope,
+        id: &str,
+        patch: MemoryUpdate,
+        options: &CallOptions,
+        embedding: Option<&Arc<dyn Embedding>>,
     ) -> Result<MemoryRecord> {
         scope.validate()?;
         patch.validate()?;
@@ -134,8 +191,11 @@ impl super::MemoryEngine {
         record.validate()?;
 
         let kind_changed = record.kind != previous.kind;
-        let embedding = if (content_changed || kind_changed) && self.has_embedding() {
-            Some(self.embed_text(&record.content, options).await?)
+        let vector = if (content_changed || kind_changed) && self.has_embedding_with(embedding) {
+            Some(
+                self.embed_text_with(embedding, &record.content, options)
+                    .await?,
+            )
         } else {
             None
         };
@@ -145,7 +205,7 @@ impl super::MemoryEngine {
             self.storage().delete_embedding(&previous).await?;
         }
         self.storage().put_record(&record).await?;
-        if let Some(vector) = embedding.as_deref() {
+        if let Some(vector) = vector.as_deref() {
             if let Err(error) = self.storage().index_embedding(&record, vector).await {
                 if !kind_changed {
                     // The old vector was replaced lazily (same collection), so restoring
@@ -261,10 +321,14 @@ impl super::MemoryEngine {
         options: &AddOptions,
         now: DateTime<Utc>,
         outcome: &mut AddOutcome,
+        embedder: Option<&Arc<dyn Embedding>>,
     ) -> Result<()> {
-        let embeds = self.has_embedding() && !options.skip_embedding;
+        let embeds = self.has_embedding_with(embedder) && !options.skip_embedding;
         let embedding = if embeds {
-            Some(self.embed_text(&record.content, &options.call).await?)
+            Some(
+                self.embed_text_with(embedder, &record.content, &options.call)
+                    .await?,
+            )
         } else {
             None
         };
@@ -273,7 +337,7 @@ impl super::MemoryEngine {
         let policy = options.dedupe.unwrap_or(self.config.dedupe.policy);
         let dedupe = self.config.dedupe.enabled && options.dedupe != Some(DedupePolicy::Add);
         let candidates = if dedupe {
-            self.dedupe_candidates(&record, embedding.as_deref(), options)
+            self.dedupe_candidates(&record, embedding.as_deref(), options, embedder)
                 .await?
         } else {
             Vec::new()
@@ -293,7 +357,10 @@ impl super::MemoryEngine {
             DedupePolicy::Merge => {
                 let merged = merge_records(&existing, &record, now);
                 let merged_embedding = if embeds {
-                    Some(self.embed_text(&merged.content, &options.call).await?)
+                    Some(
+                        self.embed_text_with(embedder, &merged.content, &options.call)
+                            .await?,
+                    )
                 } else {
                     None
                 };
@@ -325,6 +392,7 @@ impl super::MemoryEngine {
         incoming: &MemoryRecord,
         vector: Option<&[f32]>,
         options: &AddOptions,
+        embedder: Option<&Arc<dyn Embedding>>,
     ) -> Result<Vec<Candidate>> {
         let search = SearchOptions {
             top_k: self.config.dedupe.candidate_top_k,
@@ -339,7 +407,14 @@ impl super::MemoryEngine {
             call: options.call.clone(),
         };
         match self
-            .recall(&incoming.scope, &incoming.content, vector, &search, false)
+            .recall(
+                &incoming.scope,
+                &incoming.content,
+                vector,
+                &search,
+                false,
+                embedder,
+            )
             .await
         {
             Ok(hits) => Ok(hits

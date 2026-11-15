@@ -34,6 +34,7 @@
 // The constructors mirror the Python `async` call sites even when they never await.
 #![allow(clippy::unused_async_trait_impl)]
 
+mod handles;
 mod integrations;
 mod messages;
 mod overrides;
@@ -41,13 +42,14 @@ mod recall;
 mod records;
 mod variables;
 
-pub use overrides::{ScopeAnalyzerOverrideSpec, ScopeOverrideHandles};
+pub use handles::ScopeOverrideHandles;
+pub use overrides::ScopeAnalyzerOverrideSpec;
 pub use variables::VariableAssignmentReport;
 
 use std::path::Path;
 use std::sync::Arc;
 
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::Model;
 use openjiuwen_retrieval::embedding::Embedding;
 
@@ -101,6 +103,8 @@ pub struct LongTermMemory {
     coding: Option<CodingMemory>,
     /// Fact extraction, classification, and consolidation planner.
     analyzer: Arc<MemoryAnalyzer>,
+    /// The named model/embedding handles a per-scope override can name.
+    handles: ScopeOverrideHandles,
 }
 
 /// Builds a [`LongTermMemory`].
@@ -109,6 +113,12 @@ pub struct LongTermMemory {
 /// [`MemoryStores::in_memory`], and there is no embedding model and no LLM. Attach
 /// them with [`LongTermMemoryBuilder::embedding`] and [`LongTermMemoryBuilder::model`];
 /// the same instances are shared with graph memory.
+///
+/// The attached model and embedding register under their own `model_name()`, so a
+/// scope override document can name them. Register *additional* handles with
+/// [`LongTermMemoryBuilder::model_named`] and
+/// [`LongTermMemoryBuilder::embedding_named`]; those are what make a per-scope model or
+/// embedding swap possible.
 pub struct LongTermMemoryBuilder {
     /// Engine configuration, validated by [`LongTermMemoryBuilder::build`].
     config: MemoryEngineConfig,
@@ -120,6 +130,10 @@ pub struct LongTermMemoryBuilder {
     model: Option<Arc<dyn Model>>,
     /// Optional analyzer override; built from the validated config when absent.
     analyzer: Option<Arc<MemoryAnalyzer>>,
+    /// Extra model handles by registered name (per-scope overrides).
+    named_models: Vec<(String, Arc<dyn Model>)>,
+    /// Extra embedding handles by registered name (per-scope overrides).
+    named_embeddings: Vec<(String, Arc<dyn Embedding>)>,
 }
 
 impl LongTermMemoryBuilder {
@@ -145,6 +159,44 @@ impl LongTermMemoryBuilder {
         self
     }
 
+    /// Registers `model` under `name` so a per-scope override document can name it.
+    ///
+    /// This is what makes a per-scope *model* swap possible: a
+    /// [`ScopeAnalyzerOverrideSpec`] with `model = Some(name)` resolves to this handle
+    /// instead of the engine's. The attached [`LongTermMemoryBuilder::model`] is
+    /// registered under its own `model_name()`, so naming it keeps working; a duplicate
+    /// name replaces the earlier registration (last wins).
+    ///
+    /// [`LongTermMemoryBuilder::build`] rejects a blank `name` with
+    /// [`openjiuwen_common::error::Error::Config`]: a name no document can spell is not a
+    /// resolution target.
+    #[must_use]
+    pub fn model_named(mut self, name: impl Into<String>, model: Arc<dyn Model>) -> Self {
+        self.named_models.push((name.into(), model));
+        self
+    }
+
+    /// Registers `embedding` under `name` so a per-scope override document can name it.
+    ///
+    /// This is what makes a per-scope *embedding* swap possible: a
+    /// [`ScopeAnalyzerOverrideSpec`] with `embedding = Some(name)` resolves to this
+    /// handle, and the write and recall paths of that scope then embed with it (each
+    /// scope owns its own vector collections, so embedders of different dimensions
+    /// coexist). The attached [`LongTermMemoryBuilder::embedding`] is registered under
+    /// its own `model_name()`; a duplicate name replaces the earlier registration.
+    ///
+    /// [`LongTermMemoryBuilder::build`] rejects a blank `name` with
+    /// [`openjiuwen_common::error::Error::Config`].
+    #[must_use]
+    pub fn embedding_named(
+        mut self,
+        name: impl Into<String>,
+        embedding: Arc<dyn Embedding>,
+    ) -> Self {
+        self.named_embeddings.push((name.into(), embedding));
+        self
+    }
+
     /// Replaces the analyzer used by [`LongTermMemory::remember`](crate::facade::LongTermMemory::remember).
     ///
     /// The default is [`MemoryAnalyzer::from_engine`] over the validated configuration
@@ -161,8 +213,9 @@ impl LongTermMemoryBuilder {
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::Error::Config`] when the configuration (or
-    /// one of its nested sections) is invalid, and
-    /// [`openjiuwen_common::error::Error::Unsupported`] when
+    /// one of its nested sections) is invalid, when a name passed to
+    /// [`LongTermMemoryBuilder::model_named`]/[`LongTermMemoryBuilder::embedding_named`]
+    /// is blank, and [`openjiuwen_common::error::Error::Unsupported`] when
     /// [`MemoryAnalyzer::from_engine`] cannot build the analyzer the configuration asks
     /// for (a model-backed extractor without an attached model).
     pub fn build(self) -> Result<Arc<LongTermMemory>> {
@@ -172,7 +225,27 @@ impl LongTermMemoryBuilder {
             embedding,
             model,
             analyzer,
+            named_models,
+            named_embeddings,
         } = self;
+        for (kind, name) in named_models
+            .iter()
+            .map(|(name, _)| ("model", name))
+            .chain(named_embeddings.iter().map(|(name, _)| ("embedding", name)))
+        {
+            if name.trim().is_empty() {
+                return Err(Error::config(format!(
+                    "a scope override `{kind}` handle registered through LongTermMemoryBuilder \
+                     must have a non-blank name"
+                )));
+            }
+        }
+        let handles = scope_handles(
+            model.as_ref(),
+            embedding.as_ref(),
+            named_models,
+            named_embeddings,
+        );
         let stores = stores.unwrap_or_else(MemoryStores::in_memory);
         let mut builder = MemoryEngine::builder(config).stores(stores.clone());
         if let Some(embedding) = &embedding {
@@ -197,8 +270,35 @@ impl LongTermMemoryBuilder {
             graph,
             coding,
             analyzer,
+            handles,
         }))
     }
+}
+
+/// Builds the handle registry: the engine's own handles first, then the named ones.
+///
+/// The attachment order matters for [`ScopeOverrideHandles::model`]: the first handle
+/// registered is the default a scope inherits when it names nothing.
+fn scope_handles(
+    model: Option<&Arc<dyn Model>>,
+    embedding: Option<&Arc<dyn Embedding>>,
+    named_models: Vec<(String, Arc<dyn Model>)>,
+    named_embeddings: Vec<(String, Arc<dyn Embedding>)>,
+) -> ScopeOverrideHandles {
+    let mut handles = ScopeOverrideHandles::new();
+    if let Some(model) = model {
+        handles = handles.with_model(Arc::clone(model));
+    }
+    if let Some(embedding) = embedding {
+        handles = handles.with_embedding(Arc::clone(embedding));
+    }
+    for (name, model) in named_models {
+        handles = handles.with_named_model(name, model);
+    }
+    for (name, embedding) in named_embeddings {
+        handles = handles.with_named_embedding(name, embedding);
+    }
+    handles
 }
 
 impl LongTermMemory {
@@ -211,6 +311,8 @@ impl LongTermMemory {
             embedding: None,
             model: None,
             analyzer: None,
+            named_models: Vec::new(),
+            named_embeddings: Vec::new(),
         }
     }
 
@@ -284,6 +386,17 @@ impl LongTermMemory {
     pub fn coding(&self) -> Option<&CodingMemory> {
         self.coding.as_ref()
     }
+
+    /// The named model/embedding handles a per-scope override can name.
+    ///
+    /// A registry is immutable once built, so this is a snapshot of what the facade was
+    /// constructed with: the engine's own handles under their `model_name()` plus every
+    /// [`LongTermMemoryBuilder::model_named`]/[`LongTermMemoryBuilder::embedding_named`]
+    /// registration.
+    #[must_use]
+    pub fn scope_override_handles(&self) -> ScopeOverrideHandles {
+        self.handles.clone()
+    }
 }
 
 impl std::fmt::Debug for LongTermMemory {
@@ -294,6 +407,7 @@ impl std::fmt::Debug for LongTermMemory {
             .field("embedding", &self.engine.has_embedding())
             .field("model", &self.engine.model().is_some())
             .field("analyzer", &self.analyzer.extractor_name())
+            .field("handles", &self.handles)
             .finish()
     }
 }

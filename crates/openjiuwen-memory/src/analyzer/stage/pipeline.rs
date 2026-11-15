@@ -846,6 +846,78 @@ mod tests {
         assert_eq!(handle.call_count(), 1);
     }
 
+    /// Facts JSON both scripted models answer with (so only the call site differs).
+    const OVERRIDE_FACTS: &str = "{\"facts\":[{\"content\":\"Alice prefers dark mode\",\
+        \"type\":\"user_profile\",\"importance\":0.9}]}";
+
+    /// A plan answer that lets the extract stage run over the first turn.
+    const OVERRIDE_PLAN: &str = "{\"intent\":\"preference\",\"topic\":\"theme\",\
+        \"operations\":[\"extract_facts\"],\"focus_turns\":[0],\
+        \"rationale\":\"a durable theme preference\"}";
+
+    #[tokio::test]
+    async fn a_scope_override_model_replaces_the_base_model_of_every_model_backed_stage() {
+        let base = ScriptedModel::builder()
+            .model_name("model-a")
+            .respond_text(OVERRIDE_FACTS)
+            .build();
+        let scoped = ScriptedModel::builder()
+            .model_name("model-b")
+            .respond_text(OVERRIDE_PLAN)
+            .respond_text(OVERRIDE_FACTS)
+            .build();
+        let base_handle = base.clone();
+        let scoped_handle = scoped.clone();
+        let config = AnalyzerConfig {
+            extractor: ExtractorKind::Llm,
+            ..AnalyzerConfig::default()
+        };
+        // Without an override the base model is the one that runs.
+        let plain = StagedAnalyzer::from_config(config.clone(), Some(Arc::new(base)))
+            .analyze(&conversation(), &CallOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(plain.result.extractor, "llm");
+        assert_eq!(base_handle.call_count(), 1);
+        assert_eq!(scoped_handle.call_count(), 0);
+
+        // With a scope override naming `model-b`, `model-b` runs the plan *and* the extract
+        // stage and `model-a` is never reached again.
+        let overrides = ScopeAnalyzerOverrides::new()
+            .with_model(Arc::new(scoped))
+            .with_stages(StageConfig {
+                plan: StageKind::Llm,
+                ..StageConfig::default()
+            });
+        let staged = StagedAnalyzer::from_config(config, Some(Arc::new(base_handle.clone())))
+            .with_overrides(overrides);
+        assert_eq!(
+            staged
+                .overrides()
+                .model()
+                .map(|model| Model::model_name(model.as_ref())),
+            Some("model-b")
+        );
+        let result = staged
+            .analyze(&conversation(), &CallOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            base_handle.call_count(),
+            1,
+            "the base model was called once by the un-overridden pipeline above and never again"
+        );
+        assert_eq!(
+            scoped_handle.call_count(),
+            2,
+            "the override model ran the plan stage and the extract stage"
+        );
+        assert_eq!(result.plan.focus_turns, vec![0]);
+        assert_eq!(result.result.extractor, "llm");
+        assert_eq!(result.facts().len(), 1);
+        assert_eq!(result.facts()[0].content, "Alice prefers dark mode");
+    }
+
     #[tokio::test]
     async fn llm_stage_kinds_run_through_the_pipeline() {
         let model = ScriptedModel::builder()
