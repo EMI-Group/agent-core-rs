@@ -25,6 +25,13 @@
 //!   [`mutation::request_digest`](crate::orchestration::mutation::request_digest), the
 //!   change-set check, and the durable
 //!   [`mutation::MutationJournal`](crate::orchestration::mutation::MutationJournal).
+//! - [`matcher`](crate::orchestration::matcher) is the request/response protocol between a
+//!   matcher model and the deterministic candidate rules:
+//!   [`matcher::build_match_request`](crate::orchestration::matcher::build_match_request)
+//!   renders the compact document, and
+//!   [`matcher::parse_match_response`](crate::orchestration::matcher::parse_match_response)
+//!   expands and validates the reply. It never calls a model itself; the model-calling side
+//!   is [`llm::OntologyMatcher`](crate::llm::OntologyMatcher).
 //!
 //! Every ordering in this module is explicit: candidates sort by strategy rank,
 //! confidence, source, and target; plans rank on a fixed tuple; graph node ids are
@@ -32,6 +39,7 @@
 
 pub mod candidates;
 pub mod executor;
+pub mod matcher;
 pub mod mutation;
 pub mod plan;
 pub mod planner;
@@ -40,6 +48,11 @@ pub use candidates::{CandidateConfig, CandidateGenerator, MatchStrategy, Relatio
 pub use executor::{
     CapabilityRunner, ExecutorConfig, PlanExecution, PlanExecutor, RunnerContext, StepOutcome,
     UnsupportedRunner,
+};
+pub use matcher::{
+    build_match_request, parse_match_response, parse_match_response_with,
+    parse_match_response_with_evidence, CandidateContext, CandidateEvidence, GraphDiagnostic,
+    MatchOutcome, MatchRequest, MatchThresholds, ValidatedMatch,
 };
 pub use mutation::{
     request_digest, validate_mutation_against_inventory, JournalRecord, MutationJournal,
