@@ -1,9 +1,10 @@
-# common — data model, results, configs, filters
+# common — data model, results, configs, filters, ranking
 
 ## Intent
 
-Shared, serializable value types for the whole crate: the Python `retrieval/common` models (plus the foundation `Document` model), result types, knowledge-base configs, and metadata filtering.
-No I/O and no dependencies on other modules in this crate.
+Shared, serializable value types for the whole crate: the Python `retrieval/common` models (plus the foundation `Document` model), result types, knowledge-base configs, metadata filtering, and the result-ranking configs.
+No I/O.
+Every module is independent of the crate's other modules except `ranking.rs`, whose `RankConfig::apply` dispatches to the fusion formulas in `retriever::fusion` (the formulas must live with the retrievers).
 
 ## API Surface
 
@@ -39,12 +40,24 @@ No I/O and no dependencies on other modules in this crate.
 - `Serialize`/`Deserialize`: objects without `$` keys are AND-ed equality; `{"field": value}`; `{"field": {"$gt": 5}}`; `{"$and": [...]}`, `{"$or": [...]}`, `{"$not": {...}}`; round-trips to a canonical shape (a mixed top-level object becomes one `$and`).
 - Builders `eq`, `ne`, `in_values`, `exists`, `and`, `or`, `not`; `std::ops::Not` is implemented as an alias for `Not(Box<_>)`.
 
+### `ranking.rs`
+- Port of the Python `result_ranking.py` re-export shim over Milvus ranker configs (`foundation/store/graph/result_ranking.py`); the weighted and RRF formulas are executed server-side by Milvus, so they live in `retriever::fusion`.
+- Fixed channel order: `NAME_DENSE = 0` (name embedding, unused by this crate's retrievers), `CONTENT_DENSE = 1`, `CONTENT_SPARSE = 2`; `RANK_CHANNEL_COUNT = 3`.
+- `RankMethod { Weighted, Rrf }` — serde snake_case, `Default = Rrf`, `as_str()` returning `"weighted"`/`"rrf"`.
+- `WeightedRankConfig { name_dense /*0.15*/, content_dense /*0.6*/, content_sparse /*0.25*/ }` with `new(name, dense, sparse) -> Result`, `validate()` (`Error::Validation` naming the field and value when a weight is non-finite or outside `0.0..=1.0`), `weights() -> [f32; 3]`, `channel_weights() -> [f32; 3]` (positional, positive weights renormalised to sum 1, zeros kept at `0.0`), `normalized_weights() -> Vec<f32>` (Python `args`: drop zeros then renormalise, all-zero ⇒ empty), `is_active() -> [bool; 3]` (positive weight), `method_name()`, `higher_is_better() -> false`, `args()`.
+- `RrfRankConfig { k /*40*/, name_dense, content_dense, content_sparse /*all true*/ }` with `new(k)`, `with_k`, `validate()` (a no-op: `usize` cannot be negative), `is_active() -> [bool; 3]`, `method_name()`, `higher_is_better() -> true`, `args() -> vec![k]`.
+- `DEFAULT_RRF_RANK_K = 40` deliberately differs from `retriever::fusion::DEFAULT_RRF_K = 60`; the ranking config mirrors Milvus/Python, the fusion constant mirrors `utils/fusion.py`, and they must not be unified.
+- `RankConfig { Weighted(WeightedRankConfig), Rrf(RrfRankConfig) }` — serde internally tagged by `method` (`{"method":"rrf","k":40,...}`), `Default = Rrf(RrfRankConfig::default())`, `From` conversions from both configs; accessors `method()`, `name()`, `higher_is_better()`, `is_active()`, `ranker_args() -> RankerArgs`, `rrf_k() -> Option<usize>`, `with_rrf_k(k)` (keeps RRF flags; a weighted config becomes default RRF), `validate()`.
+- `RankConfig::apply(channels: Vec<Vec<SearchResult>>) -> Vec<SearchResult>` fuses one list per channel in the fixed order (this crate passes an empty name channel); weighted uses `channel_weights` through `weighted_fusion`, RRF uses `rrf_fusion_channels` and honours `is_active`. Inactive and empty channels contribute nothing.
+- `RankerArgs { Weights(Vec<f32>), Rrf(usize) }` is the backend-argument projection returned by `ranker_args()`.
+- `WeightedRankConfig` and `RrfRankConfig` default every field on deserialization and ignore unknown fields; weights are `f32` so serialized numbers carry binary-float precision.
+
 ## Constraints
 
 - All types `Debug + Clone + PartialEq + Serialize + Deserialize`, snake_case, tolerant of unknown fields, missing collections default to empty.
 - No `unwrap`/`expect` outside tests; parse failures map to `openjiuwen_common::error::Error::Validation`.
 - `MetadataFilter::matches` never panics on mixed JSON types (returns `false`).
-- Keep files ≤400 lines; `document.rs`, `result.rs`, `config.rs`, `filter.rs`, `mod.rs`.
+- Keep one responsibility per file and files under ~1000 lines; `config.rs` (every config and validator), `filter.rs`, and `ranking.rs` (configs plus their unit tests) are the longer ones.
 
 ## Routing Table
 
@@ -52,4 +65,5 @@ No I/O and no dependencies on other modules in this crate.
 - `./result.rs` → `SearchResult`, `RetrievalResult`, `MultiKBRetrievalResult`
 - `./config.rs` → knowledge-base/retrieval/index/vector-store/embedding/reranker configs, their validators, `parse_index_type`, and constants
 - `./filter.rs` → `MetadataFilter` parsing, serialization, evaluation
+- `./ranking.rs` → `RankMethod`, `WeightedRankConfig`, `RrfRankConfig`, `RankConfig`, `RankerArgs`, channel constants
 - `./mod.rs` → module exports (`pub use ...`)

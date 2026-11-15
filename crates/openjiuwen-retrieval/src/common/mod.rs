@@ -7,6 +7,7 @@
 pub mod config;
 pub mod document;
 pub mod filter;
+pub mod ranking;
 pub mod result;
 
 pub use config::{
@@ -17,6 +18,11 @@ pub use config::{
 };
 pub use document::{Document, Metadata, TextChunk};
 pub use filter::MetadataFilter;
+pub use ranking::{
+    RankConfig, RankMethod, RankerArgs, RrfRankConfig, WeightedRankConfig, CONTENT_DENSE,
+    CONTENT_SPARSE, DEFAULT_CONTENT_DENSE_WEIGHT, DEFAULT_CONTENT_SPARSE_WEIGHT,
+    DEFAULT_NAME_DENSE_WEIGHT, DEFAULT_RRF_RANK_K, NAME_DENSE, RANK_CHANNEL_COUNT,
+};
 pub use result::{MultiKBRetrievalResult, RetrievalResult, SearchResult};
 
 #[cfg(test)]

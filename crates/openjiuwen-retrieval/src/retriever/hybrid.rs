@@ -4,7 +4,16 @@
 //! with one documented difference: Python delegates the fusion to
 //! `VectorStore.hybrid_search(alpha=...)`, which this crate does not have, so the
 //! Rust retriever over-fetches both channels and fuses them with
-//! [`rrf_fusion`] (`k = 60`, Python's `utils/fusion.py` default).
+//! [`rrf_fusion`](crate::retriever::fusion::rrf_fusion) (`k = 60`, Python's
+//! `utils/fusion.py` default).
+//!
+//! The fusion method is configurable through [`HybridRetriever::with_rank_config`]:
+//! the default is reciprocal rank fusion with `k = 60`, and a
+//! [`RankConfig::Weighted`] config selects the weighted ranker instead.
+//! The two channels are supplied in the fixed ranking order — the name-embedding
+//! channel (unused here) is empty, the dense channel is
+//! [`CONTENT_DENSE`](crate::common::CONTENT_DENSE), and the sparse channel is
+//! [`CONTENT_SPARSE`](crate::common::CONTENT_SPARSE).
 //!
 //! Mode semantics:
 //! - [`RetrieveMode::Vector`] serves the dense channel and falls back to the
@@ -24,12 +33,11 @@ use async_trait::async_trait;
 
 use openjiuwen_common::error::Result;
 
-use super::fusion::rrf_fusion;
 use super::{
     ensure_query, search_result_to_retrieval, RetrieveMode, Retriever, SparseRetriever,
     VectorRetriever, DEFAULT_RRF_K,
 };
-use crate::common::{MetadataFilter, RetrievalResult, SearchResult};
+use crate::common::{MetadataFilter, RankConfig, RetrievalResult, RrfRankConfig, SearchResult};
 use crate::embedding::Embedding;
 use crate::sparse::Bm25Index;
 use crate::vector_store::VectorStore;
@@ -37,19 +45,22 @@ use crate::vector_store::VectorStore;
 /// Default over-fetch factor for each channel in hybrid mode.
 pub const DEFAULT_CANDIDATE_FACTOR: usize = 2;
 
-/// A [`Retriever`] that fuses a dense and a sparse channel with RRF.
+/// A [`Retriever`] that fuses a dense and a sparse channel.
+///
+/// The default fusion is reciprocal rank fusion with `k = 60`; see
+/// [`Self::with_rank_config`] for the weighted alternative.
 pub struct HybridRetriever {
     dense: Arc<dyn Retriever>,
     sparse: Arc<dyn Retriever>,
     candidate_factor: usize,
-    rrf_k: usize,
+    rank_config: RankConfig,
 }
 
 impl std::fmt::Debug for HybridRetriever {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HybridRetriever")
             .field("candidate_factor", &self.candidate_factor)
-            .field("rrf_k", &self.rrf_k)
+            .field("rank_config", &self.rank_config)
             .finish_non_exhaustive()
     }
 }
@@ -57,14 +68,14 @@ impl std::fmt::Debug for HybridRetriever {
 impl HybridRetriever {
     /// Builds a retriever over an explicit dense and sparse channel.
     ///
-    /// [`Self::candidate_factor`] defaults to [`DEFAULT_CANDIDATE_FACTOR`] and
-    /// [`Self::rrf_k`] to [`DEFAULT_RRF_K`].
+    /// [`Self::candidate_factor`] defaults to [`DEFAULT_CANDIDATE_FACTOR`] and the
+    /// rank config to [`RankConfig::Rrf`] with `k = `[`DEFAULT_RRF_K`].
     pub fn new(dense: Arc<dyn Retriever>, sparse: Arc<dyn Retriever>) -> Self {
         Self {
             dense,
             sparse,
             candidate_factor: DEFAULT_CANDIDATE_FACTOR,
-            rrf_k: DEFAULT_RRF_K,
+            rank_config: RankConfig::Rrf(RrfRankConfig::new(DEFAULT_RRF_K)),
         }
     }
 
@@ -91,10 +102,25 @@ impl HybridRetriever {
         self
     }
 
-    /// Sets the RRF smoothing constant.
+    /// Sets the RRF smoothing constant, selecting the RRF ranker.
+    ///
+    /// Kept for parity with the pre-config API; equivalent to
+    /// `with_rank_config(RankConfig::Rrf(RrfRankConfig::new(rrf_k)))` but keeps
+    /// any existing RRF channel flags.
     #[must_use]
     pub fn with_rrf_k(mut self, rrf_k: usize) -> Self {
-        self.rrf_k = rrf_k;
+        self.rank_config = self.rank_config.with_rrf_k(rrf_k);
+        self
+    }
+
+    /// Selects the rank-fusion configuration used in [`RetrieveMode::Hybrid`].
+    ///
+    /// The default is [`RankConfig::Rrf`] with `k = 60`; pass
+    /// [`RankConfig::Weighted`] to use the weighted ranker. The candidate
+    /// over-fetch and the dense-only `score_threshold` apply to both methods.
+    #[must_use]
+    pub fn with_rank_config(mut self, rank_config: RankConfig) -> Self {
+        self.rank_config = rank_config;
         self
     }
 
@@ -113,12 +139,20 @@ impl HybridRetriever {
         self.candidate_factor.max(1)
     }
 
-    /// The RRF smoothing constant in use.
-    pub fn rrf_k(&self) -> usize {
-        self.rrf_k
+    /// The active fusion configuration.
+    pub fn rank_config(&self) -> &RankConfig {
+        &self.rank_config
     }
 
-    /// Runs both channels and fuses them with RRF.
+    /// The active RRF smoothing constant.
+    ///
+    /// Returns [`DEFAULT_RRF_K`] when the active config is
+    /// [`RankConfig::Weighted`], which has no RRF constant.
+    pub fn rrf_k(&self) -> usize {
+        self.rank_config.rrf_k().unwrap_or(DEFAULT_RRF_K)
+    }
+
+    /// Runs both channels and fuses them with the active rank config.
     async fn hybrid_search(
         &self,
         query: &str,
@@ -138,7 +172,8 @@ impl HybridRetriever {
             .sparse
             .retrieve_search_results(query, candidates, RetrieveMode::Sparse, filters)
             .await?;
-        let mut fused = rrf_fusion(vec![dense, sparse], self.rrf_k);
+        // Fixed channel order: name-embedding (unused), content-dense, content-sparse.
+        let mut fused = self.rank_config.apply(vec![Vec::new(), dense, sparse]);
         fused.truncate(top_k);
         Ok(fused)
     }
