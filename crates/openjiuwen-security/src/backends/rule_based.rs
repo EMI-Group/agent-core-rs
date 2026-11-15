@@ -72,8 +72,11 @@ impl Default for RuleBasedBackendConfig {
 /// Regex-based prompt-injection backend (Python parity).
 ///
 /// Detection is intentionally simple: the first rule (in configuration order)
-/// that matches the context's [`GuardrailContext::text_view`] wins. Blocking is
-/// the pipeline's decision, not the backend's.
+/// that matches the context's checked text projection
+/// ([`GuardrailContext::text_view_checked`]) wins. Blocking is the pipeline's
+/// decision, not the backend's. A payload the projection cannot read is an
+/// [`Error::validation`](openjiuwen_common::error::Error::validation), never a
+/// pass; an empty pattern list, by contrast, is legal configuration.
 #[derive(Debug, Clone)]
 pub struct RuleBasedPromptInjectionBackend {
     rules: Vec<CompiledRule>,
@@ -153,7 +156,9 @@ impl GuardrailBackend for RuleBasedPromptInjectionBackend {
     }
 
     async fn analyze(&self, ctx: &GuardrailContext) -> Result<RiskAssessment> {
-        let text = ctx.text_view();
+        // The checked projection: an unscannable payload is a typed error rather
+        // than a silently clean pattern scan.
+        let text = ctx.text_view_checked()?;
         if text.trim().is_empty() {
             return Ok(safe_assessment());
         }
@@ -302,6 +307,16 @@ mod tests {
             assert_eq!(assessment.details, None);
             assert!((assessment.confidence - 1.0).abs() < f64::EPSILON);
         }
+    }
+
+    #[tokio::test]
+    async fn unscannable_payloads_are_validation_errors() {
+        let backend = RuleBasedPromptInjectionBackend::new();
+        let unscannable = GuardrailContext::raw("custom_event", json!(null));
+
+        let error = backend.analyze(&unscannable).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.to_string().contains("unscannable content"), "{error}");
     }
 
     #[tokio::test]
