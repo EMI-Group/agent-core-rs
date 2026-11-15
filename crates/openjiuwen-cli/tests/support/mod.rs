@@ -223,6 +223,47 @@ impl Sandbox {
         }
     }
 
+    /// Runs the binary with `input` piped on stdin, bounded by [`CHILD_WAIT`].
+    ///
+    /// [`Sandbox::run`] closes stdin, so a `chat` invocation driving the REPL
+    /// would see EOF before its first turn. This variant keeps the same isolated
+    /// cwd/home, scrubbed environment, `kill_on_drop` and piped stdout/stderr,
+    /// but writes `input` to the child and then drops the handle, so the child
+    /// reads exactly those lines and then end of input. The wait is bounded and
+    /// reported exactly like [`Sandbox::run`].
+    pub(crate) async fn run_with_stdin(&self, args: &[impl AsRef<OsStr>], input: &str) -> Output {
+        use tokio::io::AsyncWriteExt;
+
+        let mut command = tokio::process::Command::from(self.command(args));
+        command
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|err| panic!("spawning `openjiuwen {}`: {err}", joined(args)));
+        let mut stdin = child.stdin.take();
+        if let Some(stdin) = stdin.as_mut() {
+            stdin
+                .write_all(input.as_bytes())
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("writing stdin of `openjiuwen {}`: {err}", joined(args))
+                });
+        }
+        // Closing the pipe is the child's end-of-input signal.
+        drop(stdin);
+        match tokio::time::timeout(CHILD_WAIT, child.wait_with_output()).await {
+            Ok(output) => output
+                .unwrap_or_else(|err| panic!("waiting for `openjiuwen {}`: {err}", joined(args))),
+            Err(elapsed) => panic!(
+                "`openjiuwen {}` did not finish within {CHILD_WAIT:?}: {elapsed}",
+                joined(args)
+            ),
+        }
+    }
+
     /// Spawns the binary with piped streams for a suite that drives it live.
     ///
     /// The child inherits the same isolated cwd/home, scrubbed environment and
