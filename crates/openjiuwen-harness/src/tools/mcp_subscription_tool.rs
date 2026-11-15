@@ -374,10 +374,12 @@ fn install_input_params(input_params: &mut Value, language: &str) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::tools::mcp_resources::McpResourceContent;
+    use crate::tools::mcp_resources::{McpClientResourceProvider, McpResourceContent};
     use crate::tools::mcp_subscriptions::{
         FakeMcpResourceSubscriptionProvider, DEFAULT_BUFFER_CAPACITY, DEFAULT_MAX_SUBSCRIPTIONS,
+        LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED,
     };
+    use openjiuwen_foundation::tool::mcp::McpClient;
 
     /// Invokes the tool with a fresh context and unwraps the payload envelope.
     async fn invoke(tool: &McpResourceSubscriptionTool, inputs: Value) -> Value {
@@ -662,6 +664,101 @@ mod tests {
         assert!(
             reason.contains("no MCP resource subscription"),
             "reason: {reason}"
+        );
+    }
+
+    /// A live client with no resource support at all: only the trait's required methods.
+    struct BareClient;
+
+    #[async_trait]
+    impl McpClient for BareClient {
+        fn server_name(&self) -> &'static str {
+            "bare"
+        }
+
+        async fn connect(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn disconnect(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn is_connected(&self) -> bool {
+            false
+        }
+
+        async fn list_tools(&self) -> Result<Vec<openjiuwen_foundation::tool::mcp::McpRemoteTool>> {
+            Ok(Vec::new())
+        }
+
+        async fn call_tool_with(
+            &self,
+            _tool_name: &str,
+            _arguments: Value,
+            _timeout: Option<std::time::Duration>,
+            _include_image_content: bool,
+        ) -> Result<openjiuwen_foundation::tool::mcp::McpToolResult> {
+            Err(Error::unsupported("the bare client calls no tools"))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_live_client_refusal_reaches_the_model_as_a_failure_payload() {
+        let subscriptions = Arc::new(McpResourceSubscriptions::new().with_provider(Arc::new(
+            McpClientResourceProvider::new(Arc::new(BareClient)),
+        )));
+        let tool = McpResourceSubscriptionTool::new(Some(subscriptions), "en");
+
+        let payload = invoke(&tool, json!({"action": "subscribe", "uri": "mem://a"})).await;
+        assert_eq!(payload["success"], json!(false));
+        assert_eq!(payload["error"], json!(LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED));
+        let reason = payload["error"].as_str().unwrap();
+        assert!(reason.contains("resources/subscribe"), "reason: {reason}");
+        assert!(
+            reason.contains("openjiuwen_foundation::tool::mcp::McpClient"),
+            "reason: {reason}"
+        );
+        // The refusal opened nothing, so the listing stays empty and the snapshot has no entry.
+        let listed = invoke(&tool, json!({"action": "list"})).await;
+        assert_eq!(listed["data"]["count"], json!(0));
+        let polled = invoke(&tool, json!({"action": "poll", "uri": "mem://a"})).await;
+        assert_eq!(polled["success"], json!(false));
+        assert_eq!(
+            polled["error"],
+            json!("no MCP resource subscription for `mem://a`")
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_returns_an_update_ingested_from_a_server_notification() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let subscriptions = registry(provider);
+        let tool = McpResourceSubscriptionTool::new(Some(Arc::clone(&subscriptions)), "en");
+        invoke(&tool, json!({"action": "subscribe", "uri": "mem://a"})).await;
+
+        let outcome =
+            subscriptions.ingest_notification(&openjiuwen_foundation::tool::mcp::McpNotification {
+                method: "notifications/resources/updated".to_owned(),
+                params: json!({"uri": "mem://a"}),
+            });
+        assert!(outcome.is_published(), "outcome: {outcome:?}");
+
+        let payload = invoke(&tool, json!({"action": "poll", "uri": "mem://a"})).await;
+        assert_eq!(payload["success"], json!(true));
+        assert_eq!(payload["data"]["count"], json!(1));
+        assert_eq!(payload["data"]["present"], json!(true));
+        assert_eq!(payload["data"]["events"][0]["sequence"], json!(1));
+        assert_eq!(
+            payload["data"]["events"][0]["reason"],
+            json!("notifications/resources/updated")
+        );
+        assert_eq!(payload["data"]["events"][0]["content"], Value::Null);
+        assert_eq!(payload["data"]["events"][0]["uri"], json!("mem://a"));
+        // The buffer is drained: a second poll reports no events.
+        assert_eq!(
+            invoke(&tool, json!({"action": "poll", "uri": "mem://a"})).await["data"]["count"],
+            json!(0)
         );
     }
 }

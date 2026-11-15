@@ -78,8 +78,9 @@ pub use util::{
     IDENTIFIER_MAX_CHARS,
 };
 pub use window::{
-    Capacity, ElidedEntry, ElisionReason, ExtractiveSummarizer, UnsupportedModelSummarizer,
-    WindowAssembler, WindowAssembly, WindowManager, WindowPlan, WindowPolicy, WindowSummarizer,
+    Capacity, CompletionFn, CompletionSummarizer, ElidedEntry, ElisionReason, ExtractiveSummarizer,
+    UnsupportedModelSummarizer, WindowAssembler, WindowAssembly, WindowManager, WindowPlan,
+    WindowPolicy, WindowSummarizer,
 };
 
 #[cfg(test)]

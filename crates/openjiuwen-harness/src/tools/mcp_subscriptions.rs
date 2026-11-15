@@ -22,6 +22,22 @@
 //! only lists and reads resources can still be coerced into the subscription trait — subscribing
 //! then answers with a typed reason naming the missing capability instead of a silent no-op.
 //!
+//! # Notification bridge
+//!
+//! A host that drains the foundation client's server-pushed notifications
+//! (`McpClient::take_notifications`) routes them through
+//! [`McpResourceSubscriptions::ingest_notification`]: `notifications/resources/updated` is
+//! published into the matching subscription, `notifications/resources/list_changed` is reported
+//! without touching any subscription (a changed resource list does not close the subscriptions a
+//! client already holds), and every other case — an unknown method, an update for a URI nobody
+//! subscribed, an update without a usable `uri` — comes back as an explicit
+//! [`NotificationOutcome`] instead of being swallowed. Ingesting never *creates* a subscription.
+//!
+//! Opening one stays the provider's job, and the live foundation-client adapter
+//! ([`super::mcp_resources::McpClientResourceProvider`]) cannot do it: `McpClient` has no
+//! `resources/subscribe` request, so it answers [`LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED`]. Its
+//! `take_notifications` half is wired, which is exactly what the ingest path needs.
+//!
 //! # Delivery model
 //!
 //! Each subscription owns two bounded channels, both sized by the registry capacity
@@ -57,9 +73,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::broadcast;
 
 use openjiuwen_common::error::{Error, Result};
+use openjiuwen_foundation::tool::mcp::McpNotification;
 
 use super::mcp_resources::McpResourceContent;
 
@@ -96,6 +114,97 @@ pub const UNSUBSCRIBE_UNSUPPORTED: &str =
 pub const NO_PROVIDER_REASON: &str =
     "mcp resource subscriptions are not configured: wire a provider implementing \
      McpResourceSubscriptionProvider (McpResourceSubscriptions::with_provider)";
+
+/// The refusal an adapter over a live foundation client reports for `resources/subscribe`.
+///
+/// [`SUBSCRIBE_UNSUPPORTED`] names the missing callback in the abstract; this constant names the
+/// concrete gap, so an operator reading a `success=false` payload knows which trait has to grow
+/// the request: `openjiuwen_foundation::tool::mcp::McpClient` exposes
+/// `list_resources`/`read_resource` plus the server-pushed notification stream
+/// (`take_notifications`) but no `resources/subscribe`.
+pub const LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED: &str =
+    "MCP resource subscriptions are not supported by this client: \
+     openjiuwen_foundation::tool::mcp::McpClient exposes list_resources/read_resource and the \
+     server-pushed notification stream (take_notifications) but no resources/subscribe request, \
+     so no subscription can be opened for this server";
+
+/// The refusal the same adapter reports for `resources/unsubscribe`.
+///
+/// It keeps the diagnosis of [`LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED`] and adds the reason a close
+/// cannot succeed either: no subscription was ever opened through this client.
+pub const LIVE_CLIENT_UNSUBSCRIBE_UNSUPPORTED: &str =
+    "MCP resource unsubscription is not supported by this client: \
+     openjiuwen_foundation::tool::mcp::McpClient exposes no resources/subscribe request, so no \
+     subscription was ever opened through it (resources/unsubscribe has nothing to cancel)";
+
+/// The MCP JSON-RPC method of a resource-update notification.
+pub const RESOURCE_UPDATED_METHOD: &str = "notifications/resources/updated";
+
+/// The bare spelling some transports and fixtures report for [`RESOURCE_UPDATED_METHOD`].
+pub const RESOURCE_UPDATED_METHOD_SHORT: &str = "resources/updated";
+
+/// The MCP JSON-RPC method announcing that the server's resource list changed.
+pub const RESOURCE_LIST_CHANGED_METHOD: &str = "notifications/resources/list_changed";
+
+/// The bare spelling of [`RESOURCE_LIST_CHANGED_METHOD`].
+pub const RESOURCE_LIST_CHANGED_METHOD_SHORT: &str = "resources/list_changed";
+
+/// What [`McpResourceSubscriptions::ingest_notification`] did with one server notification.
+///
+/// Every variant is an explicit outcome, so a host pump can count what it routed and what it
+/// dropped instead of guessing: notifications for a method this registry does not route, for a
+/// URI nobody subscribed and without a usable `uri` are all reported, and none of them registers
+/// a subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum NotificationOutcome {
+    /// The update was published into an open subscription (ring buffer and broadcast channel).
+    Published {
+        /// URI the server updated.
+        uri: String,
+        /// Sequence the subscription assigned to the published event.
+        sequence: u64,
+        /// The notification method, kept verbatim as the event `reason`.
+        reason: String,
+    },
+    /// The server announced that its resource list changed; no subscription was touched.
+    ListChanged {
+        /// The notification method, kept verbatim.
+        method: String,
+    },
+    /// The method is not a resource notification this registry routes.
+    IgnoredMethod {
+        /// The notification method, kept verbatim.
+        method: String,
+    },
+    /// An update for a URI that has no open subscription; nothing was registered for it.
+    NotSubscribed {
+        /// URI the server updated.
+        uri: String,
+    },
+    /// A resource-update notification without a usable `params.uri`.
+    NoUri {
+        /// The notification method, kept verbatim.
+        method: String,
+    },
+}
+
+impl NotificationOutcome {
+    /// Whether the notification was published into an open subscription.
+    #[must_use]
+    pub fn is_published(&self) -> bool {
+        matches!(self, Self::Published { .. })
+    }
+
+    /// The URI this outcome is about, when it names one.
+    #[must_use]
+    pub fn uri(&self) -> Option<&str> {
+        match self {
+            Self::Published { uri, .. } | Self::NotSubscribed { uri } => Some(uri),
+            Self::ListChanged { .. } | Self::IgnoredMethod { .. } | Self::NoUri { .. } => None,
+        }
+    }
+}
 
 /// One update notification of a subscribed MCP resource.
 ///
@@ -182,8 +291,8 @@ impl SubscriptionState {
         }
     }
 
-    /// Assigns the next sequence number, buffers and broadcasts `event`.
-    fn push(&self, mut event: McpResourceEvent) {
+    /// Assigns the next sequence number, buffers and broadcasts `event`, returning the sequence.
+    fn push(&self, mut event: McpResourceEvent) -> u64 {
         let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
         event.sequence = sequence;
         event.uri.clone_from(&self.uri);
@@ -197,8 +306,10 @@ impl SubscriptionState {
             buffered.push_back(event.clone());
         }
         // An error only means "no live receiver", which is not a lost ring-buffer event: the
-        // buffered copy above stays available to `poll`.
+        // buffered copy above stays available to `poll`, so the event is accounted for either
+        // way and nothing is dropped silently here.
         let _ = self.sender.send(event);
+        sequence
     }
 
     /// Drains at most `limit` buffered events (`0` drains everything).
@@ -565,13 +676,109 @@ impl McpResourceSubscriptions {
     /// Returns [`Error::NotFound`] when `uri` is not subscribed.
     pub fn publish(&self, uri: &str, content: McpResourceContent) -> Result<u64> {
         let state = self.state(uri)?;
-        state.push(McpResourceEvent {
+        Ok(state.push(McpResourceEvent {
             uri: state.uri.clone(),
             sequence: 0,
             reason: None,
             content: Some(content),
-        });
-        Ok(state.sequence.load(Ordering::SeqCst))
+        }))
+    }
+
+    /// Routes one server-pushed notification into the matching subscription.
+    ///
+    /// Convenience wrapper over [`Self::ingest`] for the `McpNotification` values
+    /// `McpClient::take_notifications` returns.
+    #[must_use]
+    pub fn ingest_notification(&self, notification: &McpNotification) -> NotificationOutcome {
+        self.ingest(&notification.method, &notification.params)
+    }
+
+    /// Routes every notification of one drain, preserving their order.
+    ///
+    /// The returned outcomes line up one-to-one with `notifications`, so a host can count what it
+    /// routed ([`NotificationOutcome::Published`]) and what it ignored.
+    #[must_use]
+    pub fn ingest_notifications(
+        &self,
+        notifications: &[McpNotification],
+    ) -> Vec<NotificationOutcome> {
+        notifications
+            .iter()
+            .map(|notification| self.ingest_notification(notification))
+            .collect()
+    }
+
+    /// Routes a raw resource notification (`method` plus its JSON-RPC `params`) into the
+    /// subscription of the `uri` it names.
+    ///
+    /// Recognised methods are [`RESOURCE_UPDATED_METHOD`] (and the bare
+    /// [`RESOURCE_UPDATED_METHOD_SHORT`] spelling some transports report), which publishes one
+    /// event, and [`RESOURCE_LIST_CHANGED_METHOD`] (and its bare spelling), which touches nothing
+    /// and answers [`NotificationOutcome::ListChanged`] — the MCP capability list changing does
+    /// not close the subscriptions the client already holds, so reaping them here would drop
+    /// updates a server still sends.
+    ///
+    /// An update is published as an event whose `reason` is the notification method and whose
+    /// `content` is `None`: the server only says *that* the resource changed, so a host that also
+    /// wants the new bytes reads the resource and calls [`Self::publish`]. Publishing goes through
+    /// the same bounded ring buffer and broadcast channel as [`McpResourceSink::updated`], so the
+    /// drop and lag accounting is unchanged.
+    ///
+    /// Ingesting never *creates* a subscription: an update for a URI the registry does not track
+    /// answers [`NotificationOutcome::NotSubscribed`] and nothing is registered, an update without
+    /// a usable `params.uri` answers [`NotificationOutcome::NoUri`], and any other method answers
+    /// [`NotificationOutcome::IgnoredMethod`]. All three are pure no-ops.
+    #[must_use]
+    pub fn ingest(&self, method: &str, params: &Value) -> NotificationOutcome {
+        let method = method.trim();
+        match method {
+            RESOURCE_UPDATED_METHOD | RESOURCE_UPDATED_METHOD_SHORT => {
+                let uri = params
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|uri| !uri.is_empty());
+                let Some(uri) = uri else {
+                    tracing::debug!(
+                        target: "openjiuwen_harness::tools::mcp_subscriptions",
+                        method,
+                        "ignoring an MCP resource update without a usable uri"
+                    );
+                    return NotificationOutcome::NoUri {
+                        method: method.to_owned(),
+                    };
+                };
+                let Ok(state) = self.state(uri) else {
+                    tracing::debug!(
+                        target: "openjiuwen_harness::tools::mcp_subscriptions",
+                        uri,
+                        "ignoring an MCP resource update for a resource that is not subscribed"
+                    );
+                    return NotificationOutcome::NotSubscribed {
+                        uri: uri.to_owned(),
+                    };
+                };
+                let sequence = state.push(McpResourceEvent {
+                    uri: state.uri.clone(),
+                    sequence: 0,
+                    reason: Some(method.to_owned()),
+                    content: None,
+                });
+                NotificationOutcome::Published {
+                    uri: uri.to_owned(),
+                    sequence,
+                    reason: method.to_owned(),
+                }
+            }
+            RESOURCE_LIST_CHANGED_METHOD | RESOURCE_LIST_CHANGED_METHOD_SHORT => {
+                NotificationOutcome::ListChanged {
+                    method: method.to_owned(),
+                }
+            }
+            _ => NotificationOutcome::IgnoredMethod {
+                method: method.to_owned(),
+            },
+        }
     }
 
     /// A publishing handle for `uri`, for a host-owned notification pump.
@@ -630,6 +837,14 @@ impl McpResourceSubscriptions {
     fn register(&self, uri: &str, state: &Arc<SubscriptionState>) -> Result<McpSubscriptionInfo> {
         let mut subscriptions = self.subscriptions.lock();
         if let Some(existing) = subscriptions.get(uri) {
+            // Only reachable when two `subscribe` calls raced past the idempotence check: the
+            // first registration stays authoritative, and the race is logged rather than dropped
+            // so a host sees why the provider may hold a second sink for this URI.
+            tracing::debug!(
+                target: "openjiuwen_harness::tools::mcp_subscriptions",
+                uri,
+                "a concurrent subscribe already registered this MCP resource subscription"
+            );
             return Ok(existing.info());
         }
         let open = subscriptions.len();
@@ -1259,5 +1474,281 @@ mod tests {
             FakeMcpResourceSubscriptionProvider::default().subscribe_calls(),
             Vec::<String>::new()
         );
+    }
+
+    /// One server-pushed `notifications/resources/updated` for `uri`.
+    fn updated(uri: &str) -> McpNotification {
+        McpNotification {
+            method: RESOURCE_UPDATED_METHOD.to_owned(),
+            params: serde_json::json!({ "uri": uri }),
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_publishes_an_update_into_the_matching_subscription() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let subscriptions = registry(provider.clone());
+        subscriptions.subscribe("mem://a").await.unwrap();
+        subscriptions.subscribe("mem://b").await.unwrap();
+        let mut receiver = subscriptions.events("mem://a").unwrap();
+
+        let outcome = subscriptions.ingest_notification(&updated("mem://a"));
+        assert_eq!(
+            outcome,
+            NotificationOutcome::Published {
+                uri: "mem://a".to_owned(),
+                sequence: 1,
+                reason: RESOURCE_UPDATED_METHOD.to_owned(),
+            }
+        );
+        assert!(outcome.is_published());
+        assert_eq!(outcome.uri(), Some("mem://a"));
+
+        // The ring buffer holds the event, with the method as its reason and no content: the
+        // server only said that the resource changed.
+        let events = subscriptions.poll("mem://a", 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[0].uri, "mem://a");
+        assert_eq!(events[0].reason.as_deref(), Some(RESOURCE_UPDATED_METHOD));
+        assert!(events[0].content.is_none());
+
+        // ... and the broadcast channel sees the same event.
+        let broadcast = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("the ingested update must reach the broadcast channel")
+            .unwrap();
+        assert_eq!(broadcast, events[0]);
+
+        // The other subscription is untouched.
+        let other = subscriptions.info("mem://b").unwrap();
+        assert_eq!(other.received, 0);
+        assert_eq!(other.buffered, 0);
+    }
+
+    #[tokio::test]
+    async fn ingest_accepts_the_bare_method_spelling() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let subscriptions = registry(provider);
+        subscriptions.subscribe("mem://a").await.unwrap();
+
+        let outcome = subscriptions.ingest(
+            RESOURCE_UPDATED_METHOD_SHORT,
+            &serde_json::json!({"uri": " mem://a "}),
+        );
+        assert!(outcome.is_published(), "outcome: {outcome:?}");
+        let events = subscriptions.poll("mem://a", 0).unwrap();
+        assert_eq!(
+            events[0].reason.as_deref(),
+            Some(RESOURCE_UPDATED_METHOD_SHORT)
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_reports_unknown_methods_and_list_changes_without_touching_subscriptions() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let subscriptions = registry(provider);
+        subscriptions.subscribe("mem://a").await.unwrap();
+
+        let ignored = subscriptions.ingest_notification(&McpNotification {
+            method: "notifications/tools/list_changed".to_owned(),
+            params: serde_json::json!({"uri": "mem://a"}),
+        });
+        assert_eq!(
+            ignored,
+            NotificationOutcome::IgnoredMethod {
+                method: "notifications/tools/list_changed".to_owned(),
+            }
+        );
+        assert!(!ignored.is_published());
+        assert_eq!(ignored.uri(), None);
+
+        let blank = subscriptions.ingest("   ", &serde_json::Value::Null);
+        assert_eq!(
+            blank,
+            NotificationOutcome::IgnoredMethod {
+                method: String::new(),
+            }
+        );
+
+        // A changed resource list does not close the subscriptions the client already holds.
+        for method in [
+            RESOURCE_LIST_CHANGED_METHOD,
+            RESOURCE_LIST_CHANGED_METHOD_SHORT,
+        ] {
+            let outcome = subscriptions.ingest(method, &serde_json::Value::Null);
+            assert_eq!(
+                outcome,
+                NotificationOutcome::ListChanged {
+                    method: method.to_owned(),
+                }
+            );
+            assert!(subscriptions.is_subscribed("mem://a"));
+        }
+
+        // Nothing was published by any of the above.
+        let info = subscriptions.info("mem://a").unwrap();
+        assert_eq!(info.received, 0);
+        assert_eq!(info.buffered, 0);
+    }
+
+    #[tokio::test]
+    async fn ingest_never_creates_a_subscription() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let subscriptions = registry(provider.clone());
+
+        let outcome = subscriptions.ingest_notification(&updated("mem://a"));
+        assert_eq!(
+            outcome,
+            NotificationOutcome::NotSubscribed {
+                uri: "mem://a".to_owned(),
+            }
+        );
+        assert_eq!(outcome.uri(), Some("mem://a"));
+        assert!(!subscriptions.is_subscribed("mem://a"));
+        assert_eq!(subscriptions.list().len(), 0);
+        assert!(matches!(
+            subscriptions.info("mem://a").unwrap_err(),
+            Error::NotFound(_)
+        ));
+        assert_eq!(provider.subscribe_calls(), Vec::<String>::new());
+
+        // An update that arrives after the subscription was closed stays a no-op too.
+        subscriptions.subscribe("mem://a").await.unwrap();
+        subscriptions.unsubscribe("mem://a").await.unwrap();
+        let outcome = subscriptions.ingest_notification(&updated("mem://a"));
+        assert_eq!(
+            outcome,
+            NotificationOutcome::NotSubscribed {
+                uri: "mem://a".to_owned(),
+            }
+        );
+        assert!(!subscriptions.is_subscribed("mem://a"));
+        assert_eq!(subscriptions.list().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn ingest_reports_updates_without_a_usable_uri() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let subscriptions = registry(provider);
+        subscriptions.subscribe("mem://a").await.unwrap();
+
+        for params in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"uri": "   "}),
+            serde_json::json!({"uri": 7}),
+            serde_json::json!({"name": "mem://a"}),
+        ] {
+            let outcome = subscriptions.ingest(RESOURCE_UPDATED_METHOD, &params);
+            assert_eq!(
+                outcome,
+                NotificationOutcome::NoUri {
+                    method: RESOURCE_UPDATED_METHOD.to_owned(),
+                },
+                "params: {params}"
+            );
+        }
+        assert_eq!(subscriptions.info("mem://a").unwrap().received, 0);
+    }
+
+    #[tokio::test]
+    async fn ingest_notifications_preserves_order() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let subscriptions = registry(provider);
+        subscriptions.subscribe("mem://a").await.unwrap();
+
+        let outcomes = subscriptions.ingest_notifications(&[
+            updated("mem://a"),
+            McpNotification {
+                method: "notifications/tools/list_changed".to_owned(),
+                params: serde_json::Value::Null,
+            },
+            updated("mem://b"),
+        ]);
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes[0].is_published());
+        assert_eq!(
+            outcomes[1],
+            NotificationOutcome::IgnoredMethod {
+                method: "notifications/tools/list_changed".to_owned(),
+            }
+        );
+        assert_eq!(
+            outcomes[2],
+            NotificationOutcome::NotSubscribed {
+                uri: "mem://b".to_owned(),
+            }
+        );
+        assert_eq!(subscriptions.info("mem://a").unwrap().received, 1);
+        assert_eq!(subscriptions.ingest_notifications(&[]).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn ingest_keeps_the_bounded_buffer_accounting() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let subscriptions = registry(provider).with_capacity(1);
+        subscriptions.subscribe("mem://a").await.unwrap();
+
+        for _ in 0..3 {
+            assert!(subscriptions
+                .ingest_notification(&updated("mem://a"))
+                .is_published());
+        }
+
+        let info = subscriptions.info("mem://a").unwrap();
+        assert_eq!(info.capacity, 1);
+        assert_eq!(info.received, 3);
+        assert_eq!(info.dropped, 2);
+        assert_eq!(info.buffered, 1);
+        assert_eq!(info.last_sequence, 3);
+        assert_eq!(subscriptions.poll("mem://a", 0).unwrap()[0].sequence, 3);
+    }
+
+    #[test]
+    fn notification_outcomes_serialize_snake_case() {
+        let published = NotificationOutcome::Published {
+            uri: "mem://a".to_owned(),
+            sequence: 2,
+            reason: RESOURCE_UPDATED_METHOD.to_owned(),
+        };
+        let rendered = serde_json::to_value(&published).unwrap();
+        assert_eq!(rendered["outcome"], "published");
+        assert_eq!(rendered["sequence"], 2);
+        let parsed: NotificationOutcome = serde_json::from_value(rendered).unwrap();
+        assert_eq!(parsed, published);
+
+        assert_eq!(
+            serde_json::to_value(NotificationOutcome::ListChanged {
+                method: RESOURCE_LIST_CHANGED_METHOD.to_owned(),
+            })
+            .unwrap()["outcome"],
+            "list_changed"
+        );
+        assert_eq!(
+            serde_json::to_value(NotificationOutcome::NoUri {
+                method: RESOURCE_UPDATED_METHOD.to_owned(),
+            })
+            .unwrap()["outcome"],
+            "no_uri"
+        );
+    }
+
+    #[test]
+    fn the_live_client_refusals_name_the_missing_foundation_request() {
+        for reason in [
+            LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED,
+            LIVE_CLIENT_UNSUBSCRIBE_UNSUPPORTED,
+        ] {
+            assert!(reason.contains("resources/subscribe"), "reason: {reason}");
+            assert!(
+                reason.contains("openjiuwen_foundation::tool::mcp::McpClient"),
+                "reason: {reason}"
+            );
+        }
+        // The abstract reason stays public and names the capability, so consumers matching on it
+        // keep working.
+        assert_ne!(SUBSCRIBE_UNSUPPORTED, "");
+        assert_ne!(SUBSCRIBE_UNSUPPORTED, LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED);
     }
 }
