@@ -43,8 +43,8 @@ pub mod sha256;
 pub use archive::{detect, ArchiveEntry, ArchiveFormat, ArchiveUnpacker};
 pub use fetch::{FetchedResource, Fetcher, HttpFetcher, ScriptedFetcher};
 pub use filter::{
-    content_hash, dedupe_links, filter_images, filter_images_with, is_probable_icon, slugify,
-    sniff_image, ImageCandidate, ResourceFilter,
+    content_hash, dedupe_links, filter_images, filter_images_with, image_dimensions,
+    is_probable_icon, slugify, sniff_image, ImageCandidate, ResourceFilter,
 };
 pub use html::{resolve_url, Heading, HtmlDocument, Image, Link};
 pub use pipeline::{DownloadedResource, OmniConfig, OmniCreation, OmniOutcome, ScrapedPage};

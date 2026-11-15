@@ -15,12 +15,19 @@
 //!   policy layered on top of that classification.
 //! - [`image_extension`] picks the saved file extension, exactly like Python's
 //!   `stage_04_save.py`.
-//! - [`is_probable_icon`] drops spacers, tracking pixels and 1x1/2x2 sprites.
+//! - [`image_dimensions`] reads a payload's pixel size out of its container
+//!   header (PNG, JPEG, GIF, WebP, PNM), the dependency-free stand-in for
+//!   Pillow's `Image.open(...).size` (see the [`dimensions`] submodule).
+//! - [`is_probable_icon`] drops spacers, tracking pixels and 1x1/2x2 sprites,
+//!   plus — mirroring Python's `MIN_DIMENSION` rule — any image whose known
+//!   width *and* height are below 80 px.
 //! - [`filter_images_with`] applies scheme, icon, format, size and dedupe rules
 //!   in that order, keeping the first occurrence and the input order. The keep
 //!   policy is Python's: only PNG, JPEG, GIF and WebP survive, decided by the
 //!   declared media type when there is one and by magic bytes otherwise.
 //!   Payload duplicates collapse on their SHA-256 hex digest, as in Python.
+//!   A downloaded payload's own header supplies the dimension gate, so a real
+//!   1x1 spacer or a 79x79 bullet icon is dropped without any caller input.
 //! - [`dedupe_links`] collapses equivalent anchors while preserving the first
 //!   original `href` text.
 //! - [`slugify`] produces the skill-name slug used by later stages.
@@ -34,10 +41,15 @@ use crate::skill_creator::omni::html::Link;
 use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+pub mod dimensions;
+pub use dimensions::image_dimensions;
 /// Default lower bound for a downloaded image payload: 1 KiB.
 const DEFAULT_MIN_IMAGE_BYTES: usize = 1024;
 /// Default upper bound for a downloaded image payload: 8 MiB.
 const DEFAULT_MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Python's `common.MIN_DIMENSION`: an image narrower *and* shorter than this
+/// many pixels is decorative.
+const MIN_DIMENSION: u32 = 80;
 /// How many leading bytes are inspected when sniffing for an `svg` document.
 const SVG_SNIFF_BYTES: usize = 512;
 /// Maximum slug length; the value doubles as a conservative skill-name budget.
@@ -83,9 +95,10 @@ const DEFAULT_IMAGE_EXTENSION: &str = "png";
 /// The defaults mirror the Python constants: a 1 KiB floor (anything smaller is
 /// a placeholder or a broken download) and an 8 MiB ceiling (the download
 /// stage's cap per response). Note Python's `MAX_IMAGE_BYTES` is 5 MiB and its
-/// `MIN_DIMENSION` is 80 px; this port uses byte bounds only, because it never
-/// decodes the image, and drops dimension-less icons through
-/// [`is_probable_icon`] instead.
+/// `MIN_DIMENSION` is 80 px; this port keeps the byte bounds here and derives
+/// the pixel size from the payload header instead of decoding it, so
+/// [`is_probable_icon`] applies the same 80 px rule through
+/// [`image_dimensions`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct ResourceFilter {
@@ -250,18 +263,34 @@ pub fn image_extension(url: &str, content_type: Option<&str>) -> &'static str {
 }
 /// Reports whether a URL alone or a known dimension marks a decorative image.
 ///
-/// The rule is: any known axis at or below 2 pixels (so `1x1`, `2x1` and `2x2`
-/// spacers fail, and so does a 1-pixel-high layout graphic), or a lowercased URL
-/// containing one of `spacer`, `pixel`, `blank.gif`, `1x1`, `2x2`,
-/// `transparent.gif`.
+/// Two rules apply, either of which makes the image decorative:
 ///
-/// Python compares `width < 80 and height < 80` on the decoded image; because
-/// this port never decodes pixels, the only dimensions available are the ones a
-/// caller supplies, and the URL hints carry the rest of the decision.
+/// 1. **Spacer rule** — any known axis at or below 2 pixels (so `1x1`, `2x1` and
+///    `2x2` spacers fail, and so does a 1-pixel-high layout graphic).
+/// 2. **Python's `MIN_DIMENSION` rule** — a *complete* known dimension pair with
+///    `width < 80 && height < 80`, mirroring
+///    `if width < MIN_DIMENSION and height < MIN_DIMENSION` in Python's
+///    `stage_02_download.py`. It needs both axes, so a lone known width cannot
+///    trigger it, and it excludes the boundary: a known 79x79 image is
+///    decorative, a known 80x80 image is not, and a known 1200x60 banner is not
+///    (only one axis is short, and neither is at or below 2).
+///
+/// Independently of both, a lowercased URL containing one of `spacer`, `pixel`,
+/// `blank.gif`, `1x1`, `2x2`, `transparent.gif` is decorative.
+///
+/// The dimensions are the caller's — [`image_dimensions`] derives them from a
+/// downloaded payload's header, and [`filter_images_with`] passes them here — so
+/// a payload whose header cannot be parsed simply has no dimension evidence and
+/// falls back to the URL hints.
 #[must_use]
 pub fn is_probable_icon(url: &str, width: Option<u32>, height: Option<u32>) -> bool {
     if width.is_some_and(|value| value <= 2) || height.is_some_and(|value| value <= 2) {
         return true;
+    }
+    if let (Some(width), Some(height)) = (width, height) {
+        if width < MIN_DIMENSION && height < MIN_DIMENSION {
+            return true;
+        }
     }
     let lowered = url.to_ascii_lowercase();
     ICON_HINTS.iter().any(|hint| lowered.contains(hint))
@@ -280,7 +309,13 @@ pub fn filter_images(images: &[ImageCandidate]) -> Vec<ImageCandidate> {
 ///
 /// 1. the URL must be absolute `http`/`https` (relative, `data:` and `ftp:`
 ///    references are dropped);
-/// 2. [`is_probable_icon`] must not fire on the URL;
+/// 2. [`is_probable_icon`] must not fire, checked against the URL *and* the
+///    payload's own header dimensions: [`image_dimensions`] reads the pixel size
+///    out of a downloaded PNG/JPEG/GIF/WebP/PNM header, so Python's decorative
+///    rule (`width < 80 && height < 80`) applies to real bytes and a genuine 1x1
+///    spacer is dropped even when its URL looks innocuous. A payload whose
+///    header cannot be parsed contributes no dimensions, leaving the URL hints
+///    as the only evidence;
 /// 3. the format must be in Python's keep policy, i.e. PNG, JPEG, GIF or WebP:
 ///    a declared `content-type` must be empty or one of [`SUPPORTED_MIMES`]
 ///    (`image/svg+xml`, `image/bmp` and `text/html` are rejected even when the
@@ -305,7 +340,12 @@ pub fn filter_images_with(
         if !is_http_url(&candidate.url) {
             continue;
         }
-        if is_probable_icon(&candidate.url, None, None) {
+        let (width, height) = candidate
+            .bytes
+            .as_deref()
+            .and_then(image_dimensions)
+            .map_or((None, None), |(width, height)| (Some(width), Some(height)));
+        if is_probable_icon(&candidate.url, width, height) {
             continue;
         }
         if !has_supported_format(candidate) {
