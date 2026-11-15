@@ -507,6 +507,10 @@ impl ResumePlan {
 /// `continuation.chain_limit` all stop tracing with a stop note (never an error). The window and
 /// digest come from the recovery execution's snapshot alone.
 ///
+/// A failing window summariser never fails the resume: the plan's `window.summary_error` carries
+/// it alongside the marked count-only fallback summary, so a host that needs the error itself
+/// assembles the same entries with [`WindowAssembler::try_assemble`].
+///
 /// # Errors
 /// `Error::Validation` when the record is missing or invalid, when a waiting scene of another
 /// Request is present, or when the continuation itself is invalid. Errors from the stores are

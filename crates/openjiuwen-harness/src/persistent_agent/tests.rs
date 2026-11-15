@@ -329,8 +329,9 @@ async fn unsupported_paths_are_typed() {
     match error {
         Error::Unsupported(message) => assert_eq!(
             message,
-            "persistent window summarisation requires an injected WindowSummarizer; the \
-             model-backed summariser is not implemented"
+            "persistent window summarisation has no completion seam to call; inject one with \
+             WindowAssembler::with_summarizer — CompletionSummarizer for a model-backed summary, \
+             or ExtractiveSummarizer for the deterministic offline default"
         ),
         other => panic!("expected a typed refusal, got {other:?}"),
     }
