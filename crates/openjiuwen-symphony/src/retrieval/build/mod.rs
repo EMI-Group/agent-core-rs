@@ -25,6 +25,7 @@
 //! [`crate::retrieval::artifacts`], so a build stage only has to decide *what* the nodes
 //! and records are — writing and reading them is already settled.
 
+pub mod catalog;
 /// Grouping of scanned items into tree branches (implemented by the next build stage).
 pub mod grouping;
 /// Deterministic preset taxonomies for a tree build (implemented by the next build stage).
