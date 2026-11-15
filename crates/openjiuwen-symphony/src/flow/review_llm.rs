@@ -355,7 +355,7 @@ fn render_user_payload(pack: &SkillPack, deterministic: &ReviewResult) -> String
             "trigger_conditions": truncate_text(&pack.trigger_conditions, MAX_FIELD_CHARS),
             "permissions": pack.permissions,
             "license": pack.license,
-            "materials_hash": pack.materials_hash(),
+            "materials_hash": deterministic.materials_hash,
             "steps_total": pack.steps.len(),
             "steps_truncated": pack.steps.len() > steps.len(),
             "steps": steps,
