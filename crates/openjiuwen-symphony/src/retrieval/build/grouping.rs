@@ -98,7 +98,7 @@ use openjiuwen_retrieval::Embedding;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{unsupported, validation, Error, Result};
+use crate::error::{validation, Error, Result};
 use crate::llm::{CompletionModel, FallbackMode};
 use crate::model::naming::normalize_name_key;
 use crate::retrieval::build::scanner::SourceItem;
@@ -504,10 +504,10 @@ fn deferral_reason(strategy: GroupingStrategy) -> Option<&'static str> {
     }
 }
 
-/// The [`unsupported`] error the synchronous entry point reports for a runtime strategy.
+/// The [`Error::Unsupported`] the synchronous entry point reports for a runtime strategy.
 fn sync_deferral(strategy: GroupingStrategy) -> Error {
     let reason = deferral_reason(strategy).unwrap_or("this grouping strategy");
-    unsupported(&format!(
+    Error::unsupported(format!(
         "{reason} needs an embedding or completion model, so it is available only from \
          `group_items_with` with a `GroupingRuntime`; the synchronous grouping entry point is \
          part of openjiuwen-symphony's deferred scope"
@@ -523,8 +523,8 @@ fn sync_deferral(strategy: GroupingStrategy) -> Error {
 ///
 /// [`GroupingStrategy::LlmGrouping`] needs a completion model and
 /// [`GroupingStrategy::FaissKmeans`]/[`GroupingStrategy::Kmeans`] an embedding model, which a
-/// synchronous call cannot await, so they return [`unsupported`] (an
-/// [`Error::Unsupported`](crate::error::Error)) naming that strategy instead of grouping;
+/// synchronous call cannot await, so they return an [`Error::Unsupported`] naming that
+/// strategy instead of grouping;
 /// use [`group_items_with`] for them.
 pub fn group_items(items: &[SourceItem], config: &GroupingConfig) -> Result<Vec<GroupAssignment>> {
     if config.strategy.requires_runtime() {
