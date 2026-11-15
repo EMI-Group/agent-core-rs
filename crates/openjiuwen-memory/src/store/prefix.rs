@@ -30,6 +30,7 @@
 //! free of `/`, `\` and NUL, so appending `/{rest}` always keeps the namespace separable.
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -227,10 +228,17 @@ impl KvPrefixRegistry {
     /// The current prefix plus aliases of `family`.
     ///
     /// An incomplete registry (only reachable by decoding JSON without validation) answers
-    /// with an empty entry; [`KvPrefixRegistry::validate`] reports the missing family.
+    /// with the family's documented default entry, exactly like
+    /// [`KvPrefixRegistry::current`]: a missing family must never make
+    /// [`KvPrefixRegistry::prefixes`] yield an empty, namespace-collapsing prefix.
+    /// [`KvPrefixRegistry::validate`] still reports the missing family, and the backup and
+    /// migration entry points call it, so a dropped family is refused rather than guessed.
     #[must_use]
     pub fn family_prefixes(&self, family: KvFamily) -> &FamilyPrefixes {
-        self.families.get(&family).unwrap_or(&EMPTY_FAMILY_PREFIXES)
+        self.families
+            .get(&family)
+            .or_else(|| DEFAULT_FAMILIES.get(&family))
+            .unwrap_or(&EMPTY_FAMILY_PREFIXES)
     }
 
     /// The current prefix of `family`, then its aliases in order.
@@ -354,11 +362,16 @@ impl KvPrefixRegistry {
     }
 }
 
-/// Sentinel answered by [`KvPrefixRegistry::family_prefixes`] for an unvalidated registry.
+/// Sentinel answered by [`KvPrefixRegistry::family_prefixes`] when even the default map
+/// has no entry for a family (unreachable, but no caller may panic on it).
 static EMPTY_FAMILY_PREFIXES: FamilyPrefixes = FamilyPrefixes {
     current: String::new(),
     aliases: Vec::new(),
 };
+
+/// The documented default family map, used as the fallback of an incomplete registry.
+static DEFAULT_FAMILIES: LazyLock<BTreeMap<KvFamily, FamilyPrefixes>> =
+    LazyLock::new(default_families);
 
 /// The documented default prefix of `family`, taken from [`super::keys`].
 fn default_prefix(family: KvFamily) -> &'static str {
@@ -699,5 +712,45 @@ mod tests {
         let error = KvPrefixRegistry::from_json("not json").expect_err("malformed");
         assert!(matches!(error, Error::Validation(_)), "{error:?}");
         assert!(error.to_string().contains("JSON"), "{error}");
+    }
+    #[test]
+    fn an_incomplete_decoded_registry_falls_back_to_the_documented_prefixes() {
+        // Public `Deserialize` skips `validate`, so an incomplete registry is reachable.
+        let text = serde_json::json!({
+            "families": {
+                "records": {"current": "MEMV2", "aliases": ["UMD"]}
+            }
+        });
+        let decoded: KvPrefixRegistry =
+            serde_json::from_value(text).expect("tolerant decode without validation");
+        assert_eq!(decoded.current(KvFamily::Records), "MEMV2");
+        for family in [
+            KvFamily::UserVariables,
+            KvFamily::SessionVariables,
+            KvFamily::ScopeConfig,
+            KvFamily::ScopeUserMapping,
+            KvFamily::Messages,
+        ] {
+            let prefixes = decoded.family_prefixes(family);
+            assert!(
+                !prefixes.current.is_empty(),
+                "{family:?} answers an empty prefix, which would scan the whole keyspace"
+            );
+            assert_eq!(
+                decoded.current(family),
+                prefixes.current,
+                "{family:?}: `current` and `family_prefixes` disagree"
+            );
+            assert_eq!(
+                decoded.prefixes(family).next(),
+                Some(prefixes.current.as_str()),
+                "{family:?}: `prefixes` does not start at the current prefix"
+            );
+        }
+        assert_eq!(decoded.current(KvFamily::UserVariables), "user_var");
+        assert_eq!(decoded.current(KvFamily::Messages), "messages");
+        // The missing families are still reported instead of silently accepted.
+        let error = decoded.validate().expect_err("incomplete registry");
+        assert!(matches!(error, Error::Validation(_)), "{error:?}");
     }
 }

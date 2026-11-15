@@ -231,6 +231,12 @@ impl MemoryStorage {
     /// Reads a text variable, or `None` when it is absent or not stored as text.
     ///
     /// The current key wins; the legacy key layout is consulted only when it is absent.
+    ///
+    /// Exactly one shape answers `None`: the key exists but its value is not UTF-8 text,
+    /// which is the documented "this variable is not a text variable" case. Every store
+    /// error — including a `Validation` error raised by the backend — propagates, so a
+    /// corrupt entry is never reported as an absent variable (unlike a point record read,
+    /// which turns a non-text value into `Error::Validation`; see [`Self::get_record`]).
     pub(crate) async fn get_variable(
         &self,
         scope: &MemoryScope,
@@ -238,11 +244,17 @@ impl MemoryStorage {
         name: &str,
     ) -> Result<Option<String>> {
         let key = variable_key(&self.prefixes, scope, session_id, name);
-        match legacy::read_text_in(self.stores.kv.as_ref(), key, &self.prefixes).await {
-            Ok(found) => Ok(found.map(|(_, text)| text)),
-            // A non-text value is "not a text variable", the documented contract here.
-            Err(Error::Validation(_)) => Ok(None),
-            Err(error) => Err(error),
+        match legacy::lookup_text_in(self.stores.kv.as_ref(), key, &self.prefixes).await? {
+            legacy::TextLookup::Text { text, .. } => Ok(Some(text)),
+            legacy::TextLookup::NonText { key } => {
+                tracing::debug!(
+                    target: "openjiuwen_memory::store",
+                    key = %key,
+                    "a memory variable is not stored as UTF-8 text; reporting it as absent"
+                );
+                Ok(None)
+            }
+            legacy::TextLookup::Missing => Ok(None),
         }
     }
 
@@ -445,6 +457,7 @@ mod tests {
     use super::*;
     use chrono::{DateTime, TimeZone, Utc};
     use openjiuwen_common::error::ErrorKind;
+    use std::sync::Arc;
 
     #[cfg(feature = "sqlite")]
     use crate::store::MessageStore;
@@ -704,6 +717,71 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Validation);
     }
 
+    #[tokio::test]
+    async fn get_variable_distinguishes_a_non_text_value_from_a_broken_backend() {
+        use crate::store::test_support::FaultyKvStore;
+        let scope = scope();
+        // Shape 1: the value exists but is not UTF-8 text — the documented `None`.
+        let stores = MemoryStores::from_parts(
+            Arc::new(FaultyKvStore::new()),
+            Arc::new(openjiuwen_foundation::store::InMemoryVectorStore::new()),
+            Arc::new(openjiuwen_foundation::store::InMemoryDocumentStore::new()),
+        );
+        let storage = MemoryStorage::new(stores.clone());
+        stores
+            .kv
+            .set(
+                &keys::variable_key(&scope, "blob"),
+                KvValue::bytes(vec![0xff, 0x00, 0x80]),
+            )
+            .await
+            .expect("seed a non-text variable");
+        assert_eq!(
+            storage
+                .get_variable(&scope, None, "blob")
+                .await
+                .expect("a non-text value is not an error"),
+            None
+        );
+        // Shape 2: the backend itself reports a validation error — that is corruption and
+        // must propagate instead of reading as "variable absent".
+        let broken = MemoryStores::from_parts(
+            Arc::new(FaultyKvStore::failing_reads()),
+            Arc::new(openjiuwen_foundation::store::InMemoryVectorStore::new()),
+            Arc::new(openjiuwen_foundation::store::InMemoryDocumentStore::new()),
+        );
+        let storage = MemoryStorage::new(broken);
+        let error = storage
+            .get_variable(&scope, None, "theme")
+            .await
+            .expect_err("a broken backend must not read as an absent variable");
+        assert_eq!(error.kind(), ErrorKind::Validation, "{error}");
+        assert!(error.message().contains("injected read failure"), "{error}");
+        // Shape 3: nothing stored at all is `None` too.
+        assert_eq!(
+            MemoryStorage::new(MemoryStores::in_memory())
+                .get_variable(&scope, None, "absent")
+                .await
+                .expect("absent"),
+            None
+        );
+        // A point record read keeps turning a non-text value into a validation error.
+        let storage = MemoryStorage::new(MemoryStores::in_memory());
+        storage
+            .stores
+            .kv
+            .set(
+                &keys::record_key(&scope, "rec-blob"),
+                KvValue::bytes(vec![0x00]),
+            )
+            .await
+            .expect("seed a non-text record");
+        let error = storage
+            .get_record(&scope, "rec-blob")
+            .await
+            .expect_err("a non-text record is corruption");
+        assert_eq!(error.kind(), ErrorKind::Validation, "{error}");
+    }
     #[tokio::test]
     async fn variables_are_text_scoped_and_prefix_listed() {
         let storage = storage();

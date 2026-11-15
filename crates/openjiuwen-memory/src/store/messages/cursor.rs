@@ -2,9 +2,16 @@
 //!
 //! [`MessageCursor`] is an opaque, backend-agnostic position in one scope's history:
 //! the `(timestamp, id)` tuple of the last row a page returned, encoded as
-//! `mc1.{millis}.{checksum}.{id}`. Because the token carries the keyset values
+//! `mc2.{micros}.{checksum}.{id}`. Because the token carries the keyset values
 //! themselves rather than an offset or a row number, it survives a store reopen and a
 //! rebuild of the underlying collection.
+//!
+//! The stamp has the same microsecond precision as the stored rows
+//! ([`rfc3339_micros`](super::rfc3339_micros)), so the inclusive `timestamp >= cursor`
+//! bound selects exactly the rows from the cursor's own instant onwards and the in-memory
+//! tie-break by id never re-reads a row. The older `mc1.{millis}` tokens stay decodable
+//! (their millisecond stamp is a truncation of the same instant, so a page resumed from one
+//! is at worst conservative).
 //!
 //! [`page_filter`] is the single translation from "one page of this scope" to the
 //! foundation document-filter language: the scope clauses ([`scope_filter`]) AND the
@@ -17,7 +24,7 @@
 
 use std::cmp::Ordering;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::map::Entry;
@@ -26,12 +33,15 @@ use serde_json::{Map, Value};
 use crate::record::{MemoryFilter, MemoryScope};
 
 use super::{
-    fnv1a_64, StoredMessage, FIELD_ID, FIELD_SCOPE_ID, FIELD_SESSION_ID, FIELD_TIMESTAMP,
-    FIELD_USER_ID,
+    fnv1a_64, rfc3339_micros, StoredMessage, FIELD_ID, FIELD_SCOPE_ID, FIELD_SESSION_ID,
+    FIELD_TIMESTAMP, FIELD_USER_ID,
 };
 
-/// Version tag of an encoded cursor token.
-pub(crate) const CURSOR_VERSION: &str = "mc1";
+/// Version tag of an encoded cursor token (microsecond stamp).
+pub(crate) const CURSOR_VERSION: &str = "mc2";
+/// Version tag of the earlier millisecond-precision token, still accepted by
+/// [`MessageCursor::decode`] so cursors handed out before the precision change keep working.
+pub(crate) const LEGACY_CURSOR_VERSION: &str = "mc1";
 /// The number of dot-separated fields in an encoded cursor token.
 const CURSOR_FIELDS: usize = 4;
 /// The operator a cursor lower bound uses (inclusive, so same-timestamp rows are read
@@ -56,6 +66,11 @@ pub struct MessageCursor {
 
 impl MessageCursor {
     /// Builds the cursor of the `(timestamp, id)` position.
+    ///
+    /// The position keeps the timestamp it is given; [`Self::encode`] and
+    /// [`Self::is_before`] both truncate it to the microsecond precision the stored rows
+    /// use, so a cursor built from a nanosecond timestamp still names exactly the row it
+    /// was built from.
     #[must_use]
     pub fn new(timestamp: DateTime<Utc>, id: impl Into<String>) -> Self {
         Self {
@@ -70,24 +85,32 @@ impl MessageCursor {
         Self::new(message.timestamp, message.id.clone())
     }
 
+    /// The cursor's instant at the precision the stored rows carry.
+    ///
+    /// Truncating here (never rounding) keeps the tie-break consistent with the stored
+    /// document, which drops sub-microsecond digits the same way.
+    fn position(&self) -> DateTime<Utc> {
+        DateTime::from_timestamp_micros(self.timestamp.timestamp_micros()).unwrap_or(self.timestamp)
+    }
+
     /// Returns `true` when `message` sorts strictly after this position.
     #[must_use]
     pub(super) fn is_before(&self, message: &StoredMessage) -> bool {
-        (message.timestamp, message.id.as_str()) > (self.timestamp, self.id.as_str())
+        (message.timestamp, message.id.as_str()) > (self.position(), self.id.as_str())
     }
 
     /// Encodes the position as an opaque, versioned token.
     ///
-    /// The shape is `mc1.{millis}.{checksum}.{id}`: the millisecond stamp is exact
-    /// (chrono timestamps are millisecond-precision in practice and the id is the
+    /// The shape is `mc2.{micros}.{checksum}.{id}`: the microsecond stamp is exact (the
+    /// stored rows and a cursor therefore agree on the instant, and the id is the
     /// tie-break), and the checksum makes a tampered token detectable instead of
     /// silently repositioning the page.
     #[must_use]
     pub fn encode(&self) -> String {
-        let millis = self.timestamp.timestamp_millis();
+        let micros = self.position().timestamp_micros();
         format!(
-            "{CURSOR_VERSION}.{millis}.{:016x}.{}",
-            cursor_checksum(millis, &self.id),
+            "{CURSOR_VERSION}.{micros}.{:016x}.{}",
+            cursor_checksum(micros, &self.id),
             self.id
         )
     }
@@ -104,14 +127,15 @@ impl MessageCursor {
         };
         let parts: Vec<&str> = token.splitn(CURSOR_FIELDS, '.').collect();
         if parts.len() != CURSOR_FIELDS {
-            return Err(malformed("expected `mc1.{millis}.{checksum}.{id}`"));
+            return Err(malformed("expected `mc2.{micros}.{checksum}.{id}`"));
         }
-        if parts[0] != CURSOR_VERSION {
+        let micros = parts[0] == CURSOR_VERSION;
+        if !micros && parts[0] != LEGACY_CURSOR_VERSION {
             return Err(malformed("unsupported cursor version"));
         }
-        let millis: i64 = parts[1]
+        let stamp: i64 = parts[1]
             .parse()
-            .map_err(|_| malformed("the millisecond stamp is not an integer"))?;
+            .map_err(|_| malformed("the timestamp stamp is not an integer"))?;
         if parts[2].len() != 16 || !parts[2].bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(malformed(
                 "the checksum is not a 16-digit hexadecimal value",
@@ -120,14 +144,16 @@ impl MessageCursor {
         if parts[3].is_empty() {
             return Err(malformed("the message id is empty"));
         }
-        let expected = format!("{:016x}", cursor_checksum(millis, parts[3]));
+        let expected = format!("{:016x}", cursor_checksum(stamp, parts[3]));
         if expected != parts[2].to_ascii_lowercase() {
             return Err(malformed("the checksum does not match the cursor contents"));
         }
-        let timestamp = Utc
-            .timestamp_millis_opt(millis)
-            .single()
-            .ok_or_else(|| malformed("the millisecond stamp is out of range"))?;
+        let timestamp = if micros {
+            DateTime::from_timestamp_micros(stamp)
+        } else {
+            DateTime::from_timestamp_millis(stamp)
+        }
+        .ok_or_else(|| malformed("the timestamp stamp is out of range"))?;
         Ok(Self::new(timestamp, parts[3]))
     }
 }
@@ -150,8 +176,8 @@ pub struct MessagePage {
 }
 
 /// Computes the 64-bit FNV-1a checksum of one cursor's contents.
-fn cursor_checksum(millis: i64, id: &str) -> u64 {
-    fnv1a_64(format!("{millis}.{id}").as_bytes())
+fn cursor_checksum(stamp: i64, id: &str) -> u64 {
+    fnv1a_64(format!("{stamp}.{id}").as_bytes())
 }
 
 /// The document filter selecting every message of `scope`.
@@ -207,10 +233,10 @@ pub(super) fn message_filter(filter: &MemoryFilter) -> Value {
     }
     let mut timestamp = Map::new();
     if let Some(after) = filter.created_after {
-        timestamp.insert("$gt".to_owned(), Value::String(after.to_rfc3339()));
+        timestamp.insert("$gt".to_owned(), Value::String(rfc3339_micros(after)));
     }
     if let Some(before) = filter.created_before {
-        timestamp.insert("$lt".to_owned(), Value::String(before.to_rfc3339()));
+        timestamp.insert("$lt".to_owned(), Value::String(rfc3339_micros(before)));
     }
     if !timestamp.is_empty() {
         clauses.insert(FIELD_TIMESTAMP.to_owned(), Value::Object(timestamp));
@@ -244,7 +270,10 @@ pub(super) fn page_filter(
     }
     if let Some(cursor) = cursor {
         let mut bound = Map::new();
-        bound.insert(GTE.to_owned(), Value::String(cursor.timestamp.to_rfc3339()));
+        bound.insert(
+            GTE.to_owned(),
+            Value::String(rfc3339_micros(cursor.position())),
+        );
         merge_clause(
             &mut clauses,
             FIELD_TIMESTAMP.to_owned(),
@@ -362,6 +391,7 @@ fn match_nothing() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use serde_json::json;
 
     fn scope() -> MemoryScope {
@@ -378,7 +408,7 @@ mod tests {
     fn cursor_round_trips_and_keeps_the_position() {
         let cursor = MessageCursor::new(at(30), "msg_abc_1700000030000");
         let token = cursor.encode();
-        assert!(token.starts_with("mc1.1700000030000."), "{token}");
+        assert!(token.starts_with("mc2.1700000030000000."), "{token}");
         assert_eq!(MessageCursor::decode(&token).expect("decode"), cursor);
         let message = StoredMessage {
             id: "msg_abc_1700000030000".to_owned(),
@@ -399,6 +429,60 @@ mod tests {
     }
 
     #[test]
+    fn a_nanosecond_timestamp_truncates_to_the_stored_microsecond_precision() {
+        let timestamp = Utc
+            .timestamp_opt(1_700_000_030, 123_456_789)
+            .single()
+            .expect("fixed time");
+        let cursor = MessageCursor::new(timestamp, "msg_x_1700000030123");
+        let token = cursor.encode();
+        assert!(token.starts_with("mc2.1700000030123456."), "{token}");
+        let decoded = MessageCursor::decode(&token).expect("decode");
+        assert_eq!(
+            decoded.timestamp,
+            Utc.timestamp_opt(1_700_000_030, 123_456_000)
+                .single()
+                .expect("fixed time")
+        );
+        // The tie-break uses the same truncated instant, so the row the cursor was built
+        // from is not "after" it while a later row still is.
+        let same = StoredMessage {
+            id: "msg_x_1700000030123".to_owned(),
+            timestamp,
+            ..StoredMessage::default()
+        };
+        assert!(
+            cursor.is_before(&same),
+            "a message past the truncated instant still sorts after the cursor"
+        );
+        let stored_later = StoredMessage {
+            timestamp: Utc
+                .timestamp_opt(1_700_000_030, 123_456_500)
+                .single()
+                .expect("fixed time"),
+            ..same.clone()
+        };
+        assert!(cursor.is_before(&stored_later));
+    }
+
+    #[test]
+    fn legacy_millisecond_tokens_still_decode() {
+        let stamp = 1_700_000_030_000_i64;
+        let legacy = format!(
+            "mc1.{stamp}.{:016x}.msg_abc",
+            cursor_checksum(stamp, "msg_abc")
+        );
+        let cursor = MessageCursor::decode(&legacy).expect("legacy decode");
+        assert_eq!(cursor.timestamp, at(30));
+        assert_eq!(cursor.id, "msg_abc");
+        // A legacy token keeps the same position once re-encoded at microsecond precision.
+        assert_eq!(
+            MessageCursor::decode(&cursor.encode()).expect("decode"),
+            cursor
+        );
+    }
+
+    #[test]
     fn garbage_cursors_are_validation_errors() {
         for token in [
             "nonsense",
@@ -406,7 +490,7 @@ mod tests {
             "mc1",
             "mc1.",
             "mc1.1700000030000",
-            "mc2.1700000030000.0000000000000000.id",
+            "mc3.1700000030000000.0000000000000000.id",
             "mc1.notamillis.0000000000000000.id",
             "mc1.1700000030000.zzzzzzzzzzzzzzzz.id",
             "mc1.1700000030000.0123.id",
@@ -450,8 +534,8 @@ mod tests {
                 "session_id": "s1",
                 "id": {"$in": ["a"]},
                 "timestamp": {
-                    "$gt": at(1).to_rfc3339(),
-                    "$gte": at(5).to_rfc3339(),
+                    "$gt": rfc3339_micros(at(1)),
+                    "$gte": rfc3339_micros(at(5)),
                 },
             })
         );
@@ -487,7 +571,7 @@ mod tests {
         );
         assert_eq!(
             value[FIELD_TIMESTAMP],
-            json!({"$gt": at(9).to_rfc3339(), "$gte": at(5).to_rfc3339()}),
+            json!({"$gt": rfc3339_micros(at(9)), "$gte": rfc3339_micros(at(5))}),
             "an inclusive cursor bound must not relax an exclusive caller bound"
         );
         let mut upper = MemoryFilter::for_scope(&scope());
@@ -499,22 +583,22 @@ mod tests {
         );
         assert_eq!(
             value[FIELD_TIMESTAMP],
-            json!({"$lt": at(4).to_rfc3339(), "$gte": at(5).to_rfc3339()})
+            json!({"$lt": rfc3339_micros(at(4)), "$gte": rfc3339_micros(at(5))})
         );
         assert_eq!(
             combine(
-                &json!({"$gte": at(9).to_rfc3339()}),
-                &json!({"$gte": at(5).to_rfc3339()})
+                &json!({"$gte": rfc3339_micros(at(9))}),
+                &json!({"$gte": rfc3339_micros(at(5))})
             ),
-            json!({"$gte": at(9).to_rfc3339()}),
+            json!({"$gte": rfc3339_micros(at(9))}),
             "the same operator keeps the stricter lower bound"
         );
         assert_eq!(
             combine(
-                &json!({"$lt": at(3).to_rfc3339()}),
-                &json!({"$lt": at(8).to_rfc3339()})
+                &json!({"$lt": rfc3339_micros(at(3))}),
+                &json!({"$lt": rfc3339_micros(at(8))})
             ),
-            json!({"$lt": at(3).to_rfc3339()}),
+            json!({"$lt": rfc3339_micros(at(3))}),
             "the same operator keeps the stricter upper bound"
         );
         assert_eq!(

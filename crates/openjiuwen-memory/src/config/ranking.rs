@@ -6,7 +6,7 @@
 //! / (w_sem + w_imp + w_rec)`.
 //! Weights are renormalized per group, so setting a weight to zero disables that term
 //! as long as the group's sum stays positive.
-use super::{ensure_non_negative, ensure_positive, ensure_unit_interval};
+use super::{ensure_non_negative, ensure_positive, ensure_positive_f32, ensure_unit_interval};
 use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +86,7 @@ impl RankingConfig {
             ));
         }
         ensure_unit_interval("keyword_min_score", self.keyword_min_score)?;
+        ensure_positive_f32("candidate_multiplier", self.candidate_multiplier)?;
         ensure_positive("max_candidates", self.max_candidates)?;
         Ok(())
     }
@@ -238,6 +239,28 @@ mod tests {
                 "value {value} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn rejects_a_non_positive_candidate_multiplier() {
+        for value in [0.0, -0.5, -2.0, f32::NAN] {
+            let config = RankingConfig {
+                candidate_multiplier: value,
+                ..Default::default()
+            };
+            let message = error_message(&config);
+            assert!(
+                message.contains("candidate_multiplier"),
+                "value {value}: {message}"
+            );
+            assert!(message.contains("greater than zero"), "{message}");
+        }
+        assert!(RankingConfig {
+            candidate_multiplier: 0.5,
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]

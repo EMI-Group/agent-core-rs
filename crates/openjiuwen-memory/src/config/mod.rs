@@ -48,6 +48,20 @@ pub(crate) fn ensure_unit_interval(field: &str, value: f32) -> Result<()> {
     Ok(())
 }
 
+/// Returns `Error::Config` unless `value` is a finite number greater than zero.
+///
+/// Shared by the float knobs that scale a result (a zero `candidate_multiplier`, for
+/// example, would silently empty the candidate pool): `"<field> must be finite and
+/// greater than zero (got <value>)"`.
+pub(crate) fn ensure_positive_f32(field: &str, value: f32) -> Result<()> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(Error::config(format!(
+            "{field} must be finite and greater than zero (got {value})"
+        )));
+    }
+    Ok(())
+}
+
 /// Returns `Error::Config` unless `value` is a finite, non-negative weight.
 ///
 /// Shared by the ranking section so every weight reports the same message shape:
@@ -84,6 +98,19 @@ mod tests {
                 ensure_unit_interval("default_threshold", value).is_err(),
                 "value {value} must be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn positive_f32_helper_rejects_zero_negative_and_non_finite() {
+        assert!(ensure_positive_f32("candidate_multiplier", 1.0).is_ok());
+        for value in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let message = match ensure_positive_f32("candidate_multiplier", value) {
+                Err(Error::Config(message)) => message,
+                other => panic!("expected a config error for {value}, got {other:?}"),
+            };
+            assert!(message.contains("candidate_multiplier"), "{message}");
+            assert!(message.contains("greater than zero"), "{message}");
         }
     }
 

@@ -39,16 +39,38 @@ impl Default for CodingMemoryConfig {
 }
 
 impl CodingMemoryConfig {
-    /// Validates the index budget and the default fact type.
+    /// Validates the index budget, the accepted fact types, and the default fact type.
     ///
-    /// Called by `MemoryEngineConfig::validate`; each failure is `Error::Config`
-    /// naming the field and the offending value.
+    /// Called by `MemoryEngineConfig::validate` regardless of [`Self::enabled`], so a
+    /// config that would silently reject every fact once enabled fails up front: an empty
+    /// `fact_types` list, a blank entry, and a `default_fact_type` the list does not
+    /// contain are all `Error::Config` naming the field and the offending value.
     pub(crate) fn validate(&self) -> Result<()> {
         ensure_positive("max_index_lines", self.max_index_lines)?;
-        if self.default_fact_type.trim().is_empty() {
+        if self.fact_types.is_empty() {
             return Err(Error::config(
-                "default_fact_type must not be empty (got \"\")",
+                "fact_types must not be empty; at least one fact type must be accepted",
             ));
+        }
+        for fact_type in &self.fact_types {
+            if fact_type.trim().is_empty() {
+                return Err(Error::config(
+                    "fact_types must not contain an empty fact type",
+                ));
+            }
+        }
+        if self.default_fact_type.trim().is_empty() {
+            return Err(Error::config(format!(
+                "default_fact_type must not be empty (got {:?})",
+                self.default_fact_type
+            )));
+        }
+        if !self.fact_types.contains(&self.default_fact_type) {
+            return Err(Error::config(format!(
+                "default_fact_type `{}` is not in fact_types ({})",
+                self.default_fact_type,
+                self.fact_types.join(", ")
+            )));
         }
         Ok(())
     }
@@ -137,5 +159,43 @@ mod tests {
             ..Default::default()
         };
         assert!(error_message(&config).contains("default_fact_type"));
+    }
+
+    #[test]
+    fn rejects_empty_fact_types_and_a_blank_entry() {
+        let config = CodingMemoryConfig {
+            fact_types: Vec::new(),
+            ..Default::default()
+        };
+        let message = error_message(&config);
+        assert!(message.contains("fact_types"), "{message}");
+        let config = CodingMemoryConfig {
+            fact_types: vec!["user".to_owned(), "  ".to_owned()],
+            default_fact_type: "user".to_owned(),
+            ..Default::default()
+        };
+        let message = error_message(&config);
+        assert!(message.contains("fact_types"), "{message}");
+        assert!(message.contains("empty"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_default_fact_type_outside_fact_types() {
+        let config = CodingMemoryConfig {
+            fact_types: vec!["user".to_owned(), "project".to_owned()],
+            default_fact_type: "reference".to_owned(),
+            ..Default::default()
+        };
+        let message = error_message(&config);
+        assert!(message.contains("default_fact_type"), "{message}");
+        assert!(message.contains("reference"), "{message}");
+        assert!(message.contains("fact_types"), "{message}");
+        assert!(CodingMemoryConfig {
+            fact_types: vec!["reference".to_owned()],
+            default_fact_type: "reference".to_owned(),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
     }
 }

@@ -78,6 +78,11 @@ impl MemoryEngineConfig {
         ensure_positive("default_top_k", self.default_top_k)?;
         ensure_unit_interval("default_threshold", self.default_threshold)?;
         ensure_unit_interval("importance_default", self.importance_default)?;
+        if self.token_budget == Some(0) {
+            return Err(Error::config(
+                "token_budget must be greater than zero when set (got 0); use `None` to                  disable the budget",
+            ));
+        }
         self.validate_searchable_kinds()?;
         self.ranking.validate()?;
         self.dedupe.validate()?;
@@ -93,8 +98,11 @@ impl MemoryEngineConfig {
         Ok(())
     }
 
-    /// Validates that the searchable kinds are non-empty, exclude `Variable`, and are
-    /// unique.
+    /// Validates that the searchable kinds are non-empty, exclude `Variable` and
+    /// `Unknown`, and are unique.
+    ///
+    /// `Unknown` is rejected like `Variable`: recall never returns a record stored under
+    /// that kind, so listing it as searchable would silently disable every result.
     fn validate_searchable_kinds(&self) -> Result<()> {
         if self.searchable_kinds.is_empty() {
             return Err(Error::config("searchable_kinds must not be empty"));
@@ -104,6 +112,12 @@ impl MemoryEngineConfig {
                 return Err(Error::config(
                     "searchable_kinds must not contain variable (variables are not searchable \
                      records)",
+                ));
+            }
+            if *kind == MemoryType::Unknown {
+                return Err(Error::config(
+                    "searchable_kinds must not contain unknown (no record is stored under an \
+                     unknown kind, so it can never match)",
                 ));
             }
             if self.searchable_kinds[..index].contains(kind) {
@@ -268,6 +282,35 @@ mod tests {
         assert!(message.contains("searchable_kinds"));
         assert!(message.contains("duplicate"));
         assert!(message.contains("summary"));
+    }
+
+    #[test]
+    fn rejects_a_zero_token_budget_but_accepts_an_absent_one() {
+        let config = MemoryEngineConfig {
+            token_budget: Some(0),
+            ..Default::default()
+        };
+        let message = error_message(&config);
+        assert!(message.contains("token_budget"), "{message}");
+        assert!(message.contains('0'), "{message}");
+        assert!(MemoryEngineConfig {
+            token_budget: Some(1),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
+        assert!(MemoryEngineConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_in_searchable_kinds() {
+        let config = MemoryEngineConfig {
+            searchable_kinds: vec![MemoryType::Summary, MemoryType::Unknown],
+            ..Default::default()
+        };
+        let message = error_message(&config);
+        assert!(message.contains("searchable_kinds"), "{message}");
+        assert!(message.contains("unknown"), "{message}");
     }
 
     #[test]
