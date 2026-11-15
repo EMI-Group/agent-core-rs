@@ -185,7 +185,8 @@ The instruction optimizer is only ever handed `train.cases()`, so a held-out cas
 - `chat_agent/` keeps 44 tests in its three files (config validation, prompt rendering, the `ScriptedChatRunner` recording contract, and `ScriptedModel`-driven `optimize`/`train`) documented in `chat_agent/CONTEXT.md`.
 - `binding/tests.rs` plus the per-file suites cover parameter rendering/validation/apply, the `apply_result` provenance, the `ToolBinding` partitioning and strictness, and `BoundAgent` ordering and completeness, all documented in `binding/CONTEXT.md`.
 - `optimizer/adopt/` keeps its suite in `adopt/tests.rs` plus per-file modules (`support.rs` holds the recording memory and fixed drift judge) covering every decision branch, the memory's adopted/rejected bookkeeping, service persistence, and the deterministic case selection.
-- `prompt_search/run_log.rs` covers the record codec round trip, append versus truncate, the tolerant readers (missing file, blank and corrupt lines, the last-`limit` window), `limit == 0` as unlimited, multiline/unicode prompts, and the non-fatal write failure.
+- `prompt_search/models_tests.rs` covers the domain models: from-text/from-case/to-case round trips, blank-text validation, `characteristics`, visible/hidden splits, candidate-id determinism and index sensitivity, `CaseResult` flags, combined outputs, best-candidate selection, gain/pending, reward-breakdown defaults, Python field names, missing/unknown-field tolerance, and run telemetry (the `measured_*` accessors, `Some(0)` beating a legacy value, absent telemetry on old payloads).
+- `prompt_search/run_log_tests.rs` covers the record codec round trip, append versus truncate, the tolerant readers (missing file, blank and corrupt lines, the last-`limit` window), `limit == 0` as unlimited, multiline/unicode prompts, and the non-fatal write failure.
 - `optimizer/search/run_log_tests.rs` covers the one-record-per-round contract (count, ascending iterations, per-record rewards/components/scores, the `selected` flags, the stopping round's convergence), determinism, the adopt-policy population, a rejecting sink and a poisoned lock, and logged-versus-unlogged `OptimizationResult` equality.
 - `integration_tests/` is the in-node cross-module suite (dataset → sampler/scheduler → tagged split → trainer provenance, held-out isolation, telemetry-fed rewards, the adopt flow over `JsonlPromptMemory`, the run-log round trip and per-round emission, the binding round trip through a real optimizer, and the chat agent offline); it exercises only the public `crate::tune` surface and is split by theme (see its `mod.rs`).
 
@@ -220,6 +221,7 @@ The instruction optimizer is only ever handed `train.cases()`, so a held-out cas
 - `./prompt_search/` → the prompt-search (RLAF-P) domain layer (`prompt_search/CONTEXT.md`)
 - `./prompt_search/CONTEXT.md` → intent, model/reward/convergence/drift/memory/history surface, constraints, test strategy
 - `./prompt_search/models.rs` → task/case/candidate/execution/reward/evaluation/iteration/record models, `RunTelemetry`-carrying `CaseResult`/`Execution` with the `measured_*` accessors, and `candidate_id`
+- `./prompt_search/models_tests.rs` → the domain-model test suite (included as `prompt_search::models::tests`)
 - `./prompt_search/reward.rs` → reward components, normalization, weights, `CompositeReward` guards
 - `./prompt_search/reward_tests.rs` → the reward component/`CompositeReward` test suite
 - `./prompt_search/convergence.rs` → `population_variance`, `ConvergenceState`, `ConvergenceDetector`
@@ -227,6 +229,7 @@ The instruction optimizer is only ever handed `train.cases()`, so a held-out cas
 - `./prompt_search/memory.rs` → `PromptMemory`, `NullPromptMemory`, `JsonlPromptMemory`, shared `token_set`/`jaccard`
 - `./prompt_search/history.rs` → `HistoryEntry`, `OptimizationHistory`, `HistoryCompressor`
 - `./prompt_search/run_log.rs` → `RunLogRecord`, the `RunLog` sink seam with the JSONL/null/in-memory sinks, and the tolerant readers
+- `./prompt_search/run_log_tests.rs` → the run-log test suite (included as `prompt_search::run_log::tests`)
 - `./prompt_search/mod.rs` → module docs and the domain-layer re-export surface
 - `./optimizer.rs` → facade: tuning constants, `OptimizationResult`, `mod` declarations, re-exports, `optimize_prompt`
 - `./optimizer/config.rs` → `OptimizerConfig`, bounds validation, JSON defaults

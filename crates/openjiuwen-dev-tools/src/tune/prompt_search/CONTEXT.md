@@ -70,21 +70,22 @@ Everything is offline and deterministic — no clocks, environment reads, random
 ## Test Strategy
 
 - Unit tests live beside each module and are fully offline: `openjiuwen_test_support::ScriptedModel` for the model drift judge, `TempWorkspace` for the JSONL memory, fixed ids and rewards, no network or wall-clock reads.
-- The reward suite lives in the sibling `reward_tests.rs` (included as `reward::tests` via `#[path]`) because it is the largest; every other module keeps its `#[cfg(test)] mod tests` in-file.
-- `models.rs` covers the from-text/from-case/to-case round trip and blank-text validation, `characteristics`, visible/hidden splits, candidate-id determinism and index sensitivity, `CaseResult` flags, combined outputs, best-candidate selection, gain/pending, reward-breakdown defaults, Python field names, and missing/unknown-field tolerance.
-- `models.rs` also covers run telemetry: the `measured_*` accessors preferring reported telemetry and falling back to the legacy fields, `Some(0)` beating a non-zero legacy value, `CaseResult` telemetry defaults and round-trips, and an old payload without a `telemetry` key parsing with absent telemetry while the legacy keys survive a round trip.
+- Three suites live in sibling files — `reward_tests.rs`, `models_tests.rs` and `run_log_tests.rs` — each included from its module as `mod tests` via `#[cfg(test)] #[path = "…"]`; every other module keeps its `#[cfg(test)] mod tests` in-file so no file exceeds the ~1000-line budget.
+- `models_tests.rs` covers the from-text/from-case/to-case round trip and blank-text validation, `characteristics`, visible/hidden splits, candidate-id determinism and index sensitivity, `CaseResult` flags, combined outputs, best-candidate selection, gain/pending, reward-breakdown defaults, Python field names, and missing/unknown-field tolerance.
+- `models_tests.rs` also covers run telemetry: the `measured_*` accessors preferring reported telemetry and falling back to the legacy fields, `Some(0)` beating a non-zero legacy value, `CaseResult` telemetry defaults and round-trips, and an old payload without a `telemetry` key parsing with absent telemetry while the legacy keys survive a round trip.
 - `reward.rs` covers normalization edges, every component at its boundaries (zero and half-life latency/tokens/cost, errored and empty results, custom validators), the weighted mean, the zero-weight filter, the normalize flag, gate plus overfitting in one case (exact score and both notes), drift clamping, the execution-error override, determinism, and the breakdown JSON round-trip.
 - `reward.rs` also covers the run-cost components against telemetry: a measured half-life scoring exactly `0.5`, a prompt-only token measurement counting the missing completion side as zero, telemetry overriding the legacy fields, absent telemetry keeping the historical constants, and a measured zero scoring `1.0` like an absent measurement.
 - `convergence.rs` covers each rule, its priority, the `window`/`window + 1` boundary, growth that must not converge, invalid configuration, and state serialization.
 - `drift.rs` covers the null and lexical bands, the model judge's fenced/bare/clamped/blank-prompt paths, unusable answers, provider failures, and the recorded request.
 - `memory.rs` covers tokenization/Jaccard, the no-op memory, store/reopen round trips, malformed-line skipping, ranking by overlap then reward, `top_k`, fallbacks, `best_for_objective`, `pending` gain ordering, and `mark_applied` persistence and unknown ids.
 - `history.rs` covers the exact render bytes (em dash, truncation), empty-history defaults, best prompt/reward ties, recent-section limits, single- and multi-entry compression, lesson deduplication, budget truncation, and serialization.
-- `run_log.rs` covers the full record round trip through a JSONL file (every field, including the adoption verdict and the convergence state), `NullRunLog`, `InMemoryRunLog`, parent-directory creation and recreation, blank-path validation on all four entry points, the tolerant codec (arrays, scalars, `null`, wrong field types, blank lines), the `with_convergence` mirroring, `is_improvement`/`adopted`, and a failed append (a path replaced by a directory) staying `Ok`.
+- `run_log_tests.rs` covers the full record round trip through a JSONL file (every field, including the adoption verdict and the convergence state), `NullRunLog`, `InMemoryRunLog`, parent-directory creation and recreation, blank-path validation on all four entry points, the tolerant codec (arrays, scalars, `null`, wrong field types, blank lines), the `with_convergence` mirroring, `is_improvement`/`adopted`, and a failed append (a path replaced by a directory) staying `Ok`.
 - `mod.rs` composes the re-exports into one round (task → executions → reward → iteration → history → memory → convergence) and reaches all three judges.
 
 ## Routing Table
 
 - `./models.rs` → task/case/candidate/execution/reward/evaluation/iteration/record models and `candidate_id`
+- `./models_tests.rs` → the domain-model test suite: round trips, validation, candidate-id determinism, Python field names, and run telemetry (included as `models::tests`)
 - `./reward.rs` → reward components, normalization, weights, `CompositeReward` guards
 - `./reward_tests.rs` → the reward component/`CompositeReward` test suite (included as `reward::tests`)
 - `./convergence.rs` → `population_variance`, `ConvergenceState`, `ConvergenceDetector`
@@ -92,6 +93,7 @@ Everything is offline and deterministic — no clocks, environment reads, random
 - `./memory.rs` → `PromptMemory`, `NullPromptMemory`, `JsonlPromptMemory`, shared `token_set`/`jaccard`
 - `./history.rs` → `HistoryEntry`, `OptimizationHistory`, `HistoryCompressor`
 - `./run_log.rs` → `RunLogRecord` (the typed one-record-per-round payload), the `RunLog` trait, `JsonlRunLog`/`NullRunLog`/`InMemoryRunLog`, and the tolerant `read_run_log`/`read_run_log_limited` readers
+- `./run_log_tests.rs` → the run-log test suite: record codec round trip, append versus truncate, tolerant readers, and the non-fatal write failure (included as `run_log::tests`)
 - `./mod.rs` → module docs and the public re-export surface
 - `../../base.rs` → shared `Case` consumed by `PromptTaskCase` (outside this node — read-only, escalate writes to `src/tune`)
 - `../../tool.rs` → `RunTelemetry` carried by `CaseResult`/`Execution` (outside this node — read-only, escalate writes to `src/tune`)
