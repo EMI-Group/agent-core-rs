@@ -9,6 +9,18 @@
 //! target — and, on unix, the store is restricted to its owner (`0o600`), because
 //! it holds bearer and refresh tokens in plaintext (Python parity: the reference
 //! implementation uses the same temporary-file/`os.replace`/`chmod` sequence).
+//!
+//! On unix every write also runs under the exclusive cross-process lock described
+//! in [`super::lock`], so two processes cannot clobber each other's entries: the
+//! lock file is `<auth_file>.lock`, and [`FileTokenStore::lock`] /
+//! [`FileTokenStore::try_lock`] hand the guard to a caller that needs a wider
+//! critical section. Reads stay lock-free because the rename publishes a complete
+//! document.
+//!
+//! Expiry rule: a token whose expiry resolves from nothing (no `expires_at`, no
+//! `expires_in`, no previous expiry, and no JWT `exp`) is treated as **already
+//! expired**, so the refresh-token flow runs on the next use instead of a stale
+//! credential being handed out forever. See [`OAuthToken::is_expired`].
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -24,6 +36,8 @@ use parking_lot::Mutex;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
+
+use super::lock::TokenFileLock;
 
 /// Provider key this module owns inside the auth store envelope.
 pub const PROVIDER_KEY: &str = "OpenAIAccount";
@@ -65,8 +79,9 @@ const MAX_EPOCH_SECONDS: f64 = 253_402_300_799.0;
 ///   `expires_at` in either epoch seconds or RFC 3339, then `expires_in` (seconds
 ///   from now, clamped at zero), then — when a previous token is supplied — that
 ///   token's `expires_at`, and finally the `exp` claim of a JWT `access_token`
-///   (see `parse_token_payload`); a token whose expiry cannot be resolved never
-///   expires, so it is never refreshed.
+///   (see `parse_token_payload`); a token whose expiry resolves from none of them
+///   is treated as already expired, so it is refreshed on the next use rather than
+///   handed out indefinitely.
 ///
 /// Serialization always writes the canonical field set — `access_token`,
 /// `refresh_token`, `id_token`, `expires_at` (epoch seconds), `token_type`, and
@@ -148,24 +163,38 @@ impl OAuthToken {
     /// The recorded [`expires_at`](Self::expires_at) wins; when it is absent, the
     /// `exp` claim of a JWT access token is used, so a token read from a store
     /// that never recorded an expiry still refreshes on time (Python parity:
-    /// `OpenAIAccountTokens.is_expiring`). A token whose expiry cannot be
-    /// resolved yields `None` and therefore never expires.
+    /// `OpenAIAccountTokens.is_expiring`). A token whose expiry cannot be resolved
+    /// yields `None`, which [`is_expired`](Self::is_expired) reads as "already
+    /// stale".
     #[must_use]
     pub fn effective_expires_at(&self) -> Option<DateTime<Utc>> {
         self.expires_at
             .or_else(|| jwt_exp(self.access_token.expose_secret()))
     }
 
-    /// Returns `true` when the token expires within `skew` (or already has).
+    /// Returns `true` when the token expires within `skew`, has already expired,
+    /// or has no resolvable expiry at all.
     ///
-    /// A token with no resolvable expiry returns `false`: `None` means "unknown",
-    /// and treating an unknown expiry as expired would make every such token
-    /// trigger a refresh round-trip on each call. A `skew` too large for chrono's
-    /// duration range is saturated, so it simply counts as expired.
+    /// The three cases are deliberate and distinct:
+    ///
+    /// - a token already inside `skew` of its expiry (or past it) is stale;
+    /// - a token whose expiry **cannot be resolved** — no `expires_at`, no
+    ///   `expires_in`, no inherited previous expiry, and an access token that is
+    ///   not a JWT with a positive `exp` — is treated as stale as well, so the
+    ///   caller attempts the refresh-token flow instead of using a credential of
+    ///   unknown age forever. With no refresh token stored the attempt surfaces the
+    ///   re-login `Error::Config` of
+    ///   [`OpenAiOAuthClient::refresh`](super::OpenAiOAuthClient::refresh);
+    /// - a token with a resolvable, future expiry beyond `skew` is valid.
+    ///
+    /// A `skew` too large for chrono's duration range is saturated, so it simply
+    /// counts as expired.
     #[must_use]
     pub fn is_expired(&self, skew: Duration) -> bool {
         let Some(expires_at) = self.effective_expires_at() else {
-            return false;
+            // Documented branch: an unresolvable expiry is "expired now", not
+            // "never expires".
+            return true;
         };
         let skew = TimeDelta::from_std(skew).unwrap_or(TimeDelta::MAX);
         Utc::now()
@@ -589,6 +618,80 @@ impl FileTokenStore {
     pub fn default_path() -> Result<PathBuf> {
         resolve_default_path()
     }
+
+    /// Returns the sidecar lock-file path guarding this store (`auth.json.lock`).
+    #[must_use]
+    pub fn lock_path(&self) -> PathBuf {
+        super::lock::lock_path(&self.path)
+    }
+
+    /// Acquires the exclusive cross-process lock, waiting at most
+    /// [`LOCK_TIMEOUT`](super::lock::LOCK_TIMEOUT).
+    ///
+    /// The guard serializes a whole read-modify-write cycle against other
+    /// processes; [`save`](TokenStore::save) and [`clear`](TokenStore::clear)
+    /// already take it for their own cycle, so a caller only needs this method to
+    /// keep a longer critical section (read, decide, write) atomic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Timeout`] when another holder keeps the lock for the whole
+    /// budget, [`Error::External`] for an open or `flock` failure, and
+    /// [`Error::Unsupported`] on a platform without unix advisory locks.
+    pub async fn lock(&self) -> Result<TokenFileLock> {
+        self.lock_with_timeout(super::lock::LOCK_TIMEOUT).await
+    }
+
+    /// [`lock`](Self::lock) with an explicit waiting budget.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`lock`](Self::lock).
+    pub async fn lock_with_timeout(&self, timeout: Duration) -> Result<TokenFileLock> {
+        let path = self.path.clone();
+        let base_url = self.base_url.clone();
+        tokio::task::spawn_blocking(move || {
+            TokenFileLock::acquire_with_timeout(&path, &base_url, timeout)
+        })
+        .await
+        .map_err(Error::external)?
+    }
+
+    /// Acquires the exclusive cross-process lock only when it is free right now.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::External`] wrapping `WouldBlock` when another process holds
+    /// the lock, [`Error::External`] for an open or `flock` failure, and
+    /// [`Error::Unsupported`] on a platform without unix advisory locks.
+    pub async fn try_lock(&self) -> Result<TokenFileLock> {
+        let path = self.path.clone();
+        let base_url = self.base_url.clone();
+        tokio::task::spawn_blocking(move || TokenFileLock::try_acquire(&path, &base_url))
+            .await
+            .map_err(Error::external)?
+    }
+
+    /// Acquires the cross-process lock when the platform provides one.
+    ///
+    /// `Ok(None)` means "no unix advisory locks here": the store's own writes still
+    /// run atomically (temporary file plus rename) but without cross-process
+    /// serialization, so a credential can still be stored instead of the whole
+    /// operation failing on Windows.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`lock`](Self::lock) that are not a platform gap.
+    pub(super) async fn lock_optional(&self) -> Result<Option<TokenFileLock>> {
+        #[cfg(unix)]
+        {
+            self.lock().await.map(Some)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(None)
+        }
+    }
 }
 
 /// Resolves the default auth-store path; see [`FileTokenStore::default_path`].
@@ -634,20 +737,54 @@ impl TokenStore for FileTokenStore {
     }
 
     async fn save(&self, token: &OAuthToken) -> Result<()> {
-        let path = self.path.clone();
-        let base_url = self.base_url.clone();
-        let token = token.clone();
-        tokio::task::spawn_blocking(move || save_token(&path, &base_url, &token))
-            .await
-            .map_err(Error::external)?
+        if let Some(lock) = self.lock_optional().await? {
+            lock.save(token).await
+        } else {
+            let path = self.path.clone();
+            let base_url = self.base_url.clone();
+            let token = token.clone();
+            tokio::task::spawn_blocking(move || save_token(&path, &base_url, &token))
+                .await
+                .map_err(Error::external)?
+        }
     }
 
     async fn clear(&self) -> Result<()> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || clear_token(&path))
-            .await
-            .map_err(Error::external)?
+        if let Some(lock) = self.lock_optional().await? {
+            lock.clear().await.map(drop)
+        } else {
+            let path = self.path.clone();
+            tokio::task::spawn_blocking(move || clear_token(&path))
+                .await
+                .map_err(Error::external)?
+                .map(drop)
+        }
     }
+}
+
+/// Reads the `auth_mode` marker for async callers, off the runtime thread.
+///
+/// [`auth_mode`] reads the file synchronously, so async callers (the credential
+/// status snapshot) go through this wrapper instead of blocking a runtime thread.
+pub(super) async fn auth_mode_async(path: &Path) -> Result<Option<String>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || auth_mode(&path))
+        .await
+        .map_err(Error::external)?
+}
+
+/// Reads the `auth_mode` marker recorded for the [`PROVIDER_KEY`] entry.
+///
+/// Returns `None` when the store or the entry is absent; an unreadable document is
+/// reported as the parse error.
+pub(super) fn auth_mode(path: &Path) -> Result<Option<String>> {
+    let Some(store) = read_store(path)? else {
+        return Ok(None);
+    };
+    Ok(provider_state(&store)
+        .and_then(|entry| entry.get("auth_mode"))
+        .and_then(Value::as_str)
+        .map(str::to_owned))
 }
 
 /// Wraps an I/O failure with the path and action that failed.
@@ -691,7 +828,7 @@ fn provider_state(store: &Value) -> Option<&Value> {
 }
 
 /// Loads the token from the auth store at `path`.
-fn load_token(path: &Path) -> Result<Option<OAuthToken>> {
+pub(super) fn load_token(path: &Path) -> Result<Option<OAuthToken>> {
     let Some(store) = read_store(path)? else {
         return Ok(None);
     };
@@ -715,7 +852,7 @@ fn load_token(path: &Path) -> Result<Option<OAuthToken>> {
 }
 
 /// Merges `token` into the auth store at `path`, preserving every other entry.
-fn save_token(path: &Path, base_url: &str, token: &OAuthToken) -> Result<()> {
+pub(super) fn save_token(path: &Path, base_url: &str, token: &OAuthToken) -> Result<()> {
     let mut store = match read_store(path)? {
         Some(store) => store,
         None => Value::Object(Map::new()),
@@ -757,10 +894,11 @@ fn save_token(path: &Path, base_url: &str, token: &OAuthToken) -> Result<()> {
     write_store(path, &store)
 }
 
-/// Removes only the `providers.OpenAIAccount` entry from the auth store.
-fn clear_token(path: &Path) -> Result<()> {
+/// Removes only the `providers.OpenAIAccount` entry, reporting whether it was
+/// present.
+pub(super) fn clear_token(path: &Path) -> Result<bool> {
     let Some(mut store) = read_store(path)? else {
-        return Ok(());
+        return Ok(false);
     };
     let removed = store
         .get_mut("providers")
@@ -768,9 +906,10 @@ fn clear_token(path: &Path) -> Result<()> {
         .and_then(|providers| providers.remove(PROVIDER_KEY))
         .is_some();
     if !removed {
-        return Ok(());
+        return Ok(false);
     }
-    write_store(path, &store)
+    write_store(path, &store)?;
+    Ok(true)
 }
 
 /// Serializes `store` and replaces the file at `path` with it atomically.

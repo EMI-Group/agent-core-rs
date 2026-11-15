@@ -65,7 +65,7 @@ use openjiuwen_common::http::{HttpClient, HttpRequest};
 use super::query::translate;
 use super::{
     create_index_body, failure, index_names_from, schema_from_index, ElasticsearchClient,
-    ElasticsearchConfig, FILTER_DELETE_PAGE,
+    ElasticsearchConfig, SEARCH_PAGE_SIZE,
 };
 use crate::store::vector::{
     collection_not_found, CollectionSchema, FieldSchema, VectorDataType, VectorQuery,
@@ -176,7 +176,7 @@ impl ElasticsearchVectorStore {
             let body = json!({
                 "query": {"match_all": {}},
                 "_source": true,
-                "size": FILTER_DELETE_PAGE,
+                "size": SEARCH_PAGE_SIZE,
                 "from": offset,
                 "sort": ["_doc"],
             });
@@ -189,7 +189,7 @@ impl ElasticsearchVectorStore {
                         && collected.insert(id.clone())
                 })
                 .count();
-            if page.len() < FILTER_DELETE_PAGE || fresh == 0 {
+            if page.len() < SEARCH_PAGE_SIZE || fresh == 0 {
                 return Ok(collected);
             }
             offset += page.len();

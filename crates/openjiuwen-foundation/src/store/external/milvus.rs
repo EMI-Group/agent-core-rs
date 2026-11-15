@@ -21,15 +21,35 @@
 //!
 //! - `create_collection` rejects `ARRAY` fields: Milvus needs an element type
 //!   that [`VectorDataType`] cannot express.
-//! - `add_docs` cannot tell whether a primary key is already stored (Milvus
-//!   insert is an append), so the batch is validated in full locally — a
-//!   failed call inserts nothing — and a service duplicate maps to validation.
+//! - `add_docs` probes the collection for the batch's primary keys before
+//!   inserting (see *Duplicate primary keys* below); the batch is also
+//!   validated in full locally, so a failed call inserts nothing.
 //! - The filter language is compiled into a Milvus boolean expression. Dotted
 //!   field paths, `$contains`, `$not`, object/array literals and `null`
 //!   operands are rejected with [`Error::Unsupported`](openjiuwen_common::error::Error),
 //!   never dropped.
 //! - Scores are normalized per [`Metric`]: `COSINE`/`IP` use `(s + 1) / 2`,
 //!   `L2` uses `max(0, (4 - d) / 4)`, and every score is clamped to `[0, 1]`.
+//!
+//! # Duplicate primary keys
+//!
+//! Milvus `insert` appends rows: it neither rejects a primary key the
+//! collection already stores nor overwrites it, so a duplicate would silently
+//! become a second row and the insert would look like any other successful
+//! insert. [`VectorStore`] is insert-only (the in-memory and local backends
+//! reject a stored primary key with a validation error), so `add_docs` asks
+//! the service which of the batch's primary keys already exist — one
+//! `entities/query` request with an `in [...]` filter over that batch, whose
+//! `limit` is the batch length — and returns
+//! [`Error::Validation`](openjiuwen_common::error::Error) naming the colliding
+//! keys when any is found, writing nothing.
+//!
+//! The probe costs one extra round trip per `add_docs` call, and a failed
+//! probe fails the insert rather than falling back to the append. Bulk
+//! ingestion whose keys cannot collide can turn it off with
+//! [`MilvusConfig::reject_duplicate_primary_keys`] set to `false`
+//! ([`MilvusConfig::with_reject_duplicate_primary_keys`]), which restores the
+//! service behaviour of appending a duplicate row.
 //!
 //! # Example
 //!
@@ -84,6 +104,9 @@ const ERROR_BODY_EXCERPT: usize = 200;
 /// Maximum number of primary keys read before a filtered delete.
 const FILTER_DELETE_LIMIT: usize = 16_384;
 
+/// Maximum number of colliding primary keys named in one error message.
+const KEY_EXCERPT: usize = 8;
+
 /// Configuration of a [`MilvusVectorStore`].
 ///
 /// The struct is `serde`-deserializable with a default for every field, so a
@@ -118,6 +141,13 @@ pub struct MilvusConfig {
     pub timeout: Duration,
     /// Consistency level of every request (`Bounded` by default).
     pub consistency_level: String,
+    /// Whether `add_docs` refuses primary keys the collection already stores
+    /// (`true` by default).
+    ///
+    /// Milvus `insert` appends, so without this probe a duplicate primary key
+    /// silently becomes a second row. See the module documentation on
+    /// duplicate primary keys.
+    pub reject_duplicate_primary_keys: bool,
 }
 
 impl Default for MilvusConfig {
@@ -129,6 +159,7 @@ impl Default for MilvusConfig {
             metric: Metric::default(),
             timeout: default_timeout(),
             consistency_level: "Bounded".to_string(),
+            reject_duplicate_primary_keys: true,
         }
     }
 }
@@ -175,6 +206,17 @@ impl MilvusConfig {
     #[must_use]
     pub fn with_consistency_level(mut self, consistency_level: impl Into<String>) -> Self {
         self.consistency_level = consistency_level.into();
+        self
+    }
+
+    /// Enables or disables the duplicate primary-key probe of `add_docs`.
+    ///
+    /// Disabling it restores the append-only service behaviour (a duplicate
+    /// primary key becomes a second row) for bulk ingestion where collisions
+    /// are impossible by construction.
+    #[must_use]
+    pub fn with_reject_duplicate_primary_keys(mut self, reject: bool) -> Self {
+        self.reject_duplicate_primary_keys = reject;
         self
     }
 }
@@ -256,6 +298,80 @@ impl MilvusVectorStore {
             .await?
             .ok_or_else(|| collection_not_found(collection))
     }
+
+    /// Fails when `collection` already stores one of `rows`' primary keys.
+    ///
+    /// Milvus `insert` appends rows without consulting the stored ones, so a
+    /// duplicate primary key is invisible to the insert itself. This probe
+    /// queries the keys of the batch (bounded by the batch length) and turns
+    /// the collision into the insert-only contract of [`VectorStore`]: a
+    /// validation error naming the colliding keys, with nothing written.
+    async fn reject_stored_keys(
+        &self,
+        collection: &str,
+        schema: &CollectionSchema,
+        rows: &[Value],
+    ) -> Result<()> {
+        let Some(primary) = schema.primary_key() else {
+            return Ok(());
+        };
+        let mut keys = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(value) = row.get(&primary.name) {
+                keys.push(literal(value)?);
+            }
+        }
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let body = json!({
+            "collectionName": collection,
+            "filter": format!("{} in [{}]", primary.name, keys.join(", ")),
+            "outputFields": [primary.name],
+            "limit": rows.len(),
+        });
+        let context = format!("checking primary keys of collection {collection:?}");
+        let data = self.call(ENTITIES_QUERY, &body, &context).await?;
+        let stored: Vec<Value> = data
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.get(&primary.name).cloned())
+                    .filter(|value| !value.is_null())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if stored.is_empty() {
+            return Ok(());
+        }
+        Err(Error::validation(format!(
+            "adding documents to collection {collection:?} was rejected: primary key(s) {} are \
+             already stored (set `reject_duplicate_primary_keys` to false to append duplicates)",
+            summarize(&stored)
+        )))
+    }
+}
+
+/// Joins up to [`KEY_EXCERPT`] primary keys for an error message.
+fn summarize(keys: &[Value]) -> String {
+    let rendered: Vec<String> = keys
+        .iter()
+        .take(KEY_EXCERPT)
+        .map(|key| match key {
+            Value::String(text) => format!("{text:?}"),
+            other => other.to_string(),
+        })
+        .collect();
+    if keys.len() > KEY_EXCERPT {
+        format!(
+            "{}, and {} more",
+            rendered.join(", "),
+            keys.len() - KEY_EXCERPT
+        )
+    } else {
+        rendered.join(", ")
+    }
 }
 
 #[async_trait]
@@ -319,14 +435,20 @@ impl VectorStore for MilvusVectorStore {
 
     /// Inserts documents, returning how many the service accepted.
     ///
-    /// Milvus insert cannot cheaply detect that a primary key is already
-    /// stored, so insert-only duplicate detection is best-effort: the batch is
-    /// validated in full locally (so a failed validation inserts nothing), and
-    /// a duplicate reported by the service maps to a validation error.
+    /// The batch is validated in full locally (so a failed validation inserts
+    /// nothing), and — unless
+    /// [`MilvusConfig::reject_duplicate_primary_keys`] is off — the primary
+    /// keys already stored in the collection are probed first, so an insert
+    /// that would duplicate one fails with a validation error naming the
+    /// colliding keys instead of appending a second row.
     async fn add_docs(&self, collection: &str, docs: Vec<Map<String, Value>>) -> Result<usize> {
         let schema = self.load_schema(collection).await?;
         let prepared = prepare_docs(&schema, docs)?;
         let count = prepared.len();
+        if self.config.reject_duplicate_primary_keys {
+            self.reject_stored_keys(collection, &schema, &prepared)
+                .await?;
+        }
         let body = json!({"collectionName": collection, "data": prepared});
         let context = format!("inserting documents into collection {collection:?}");
         let data = self.call(ENTITIES_INSERT, &body, &context).await?;

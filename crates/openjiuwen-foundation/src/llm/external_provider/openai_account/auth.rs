@@ -12,17 +12,19 @@
 //! [`crate::llm::oauth`]; this module only decides *when* to call them and keeps
 //! the store in sync. The refresh decision is the reference implementation's:
 //! refresh when the access token expires within the configured skew (120 s by
-//! default), or unconditionally when `force_refresh` is set.
+//! default), when its expiry cannot be resolved at all (such a credential has no
+//! known lifetime and is replaced instead of used indefinitely — see
+//! [`OAuthToken::is_expired`]), or unconditionally when `force_refresh` is set.
 //!
-//! Two deliberate differences, both documented in the parent module's
-//! `CONTEXT.md`:
+//! One deliberate difference is documented in the parent module's `CONTEXT.md`:
+//! the stored `auth_mode` marker stays `openai_account_oauth` (the value
+//! [`crate::llm::oauth`] writes), not Python's `openai_account`; the token payload
+//! itself is byte-compatible.
 //!
-//! - there is no cross-process `FileLock`; [`FileTokenStore`] writes atomically
-//!   (`tmp` + `rename`, `0600`) and the last writer wins, exactly as documented
-//!   for [`crate::llm::oauth`];
-//! - the stored `auth_mode` marker stays `openai_account_oauth` (the value
-//!   [`crate::llm::oauth`] writes), not Python's `openai_account`; the token
-//!   payload itself is byte-compatible.
+//! The whole-flow operations live in [`crate::llm::oauth`] as `login`, `status`,
+//! and `logout` over [`OAuthCredentials`](crate::llm::oauth::OAuthCredentials); the
+//! manager here is the provider-neutral `ExternalAuthProvider` surface over the same
+//! store, which also takes the cross-process lock every write goes through.
 
 use std::fmt;
 use std::path::{Path, PathBuf};

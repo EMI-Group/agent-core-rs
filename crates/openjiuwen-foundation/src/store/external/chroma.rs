@@ -17,11 +17,25 @@
 //! # Schema round-trip
 //!
 //! Chroma has no typed schema, so the store serializes the whole
-//! [`CollectionSchema`] into one reserved metadata key
-//! ([`ChromaConfig::schema_metadata_key`]) at collection creation and reads it
-//! back on every operation. A collection that exists but lacks that key was not
-//! created through this store and yields
-//! [`Error::Unsupported`](openjiuwen_common::error::Error).
+//! [`CollectionSchema`] into the collection's metadata at creation and reads it
+//! back on every operation. The collection document and the Python
+//! `ChromaVectorStore` both keep that JSON under the keys `schema` and `fields`
+//! (the Python `CollectionSchema.to_dict()` layout), so this store writes those
+//! two keys and additionally the legacy
+//! [`ChromaConfig::schema_metadata_key`] (`openjiuwen:schema` by default) in its
+//! own serde layout: a collection written here is readable by both
+//! implementations, and a collection written by the Python store — or by an
+//! older release of this crate — is readable here.
+//!
+//! On read the precedence is `schema`, then `fields`, then the configured
+//! legacy key; every accepted layout is tolerated on all three (Python's `type`
+//! key with upper-case `VectorDataType` names, this crate's `dtype` key with
+//! snake-case names, numbers written as strings, and a bare field array). A
+//! collection that exists but carries none of those keys was not created
+//! through a `ChromaVectorStore` and yields
+//! [`Error::Unsupported`](openjiuwen_common::error::Error) naming all three;
+//! a key whose value is not a readable schema yields
+//! [`Error::Validation`](openjiuwen_common::error::Error).
 //!
 //! # Differences from the reference backend
 //!
@@ -63,7 +77,7 @@ const fn default_timeout() -> Duration {
 
 /// Default metadata key holding the serialized collection schema.
 fn default_schema_metadata_key() -> String {
-    "openjiuwen:schema".to_string()
+    schema_metadata::LEGACY_SCHEMA_KEY.to_string()
 }
 
 /// Number of documents read per page while collecting ids for a filtered delete.
@@ -105,7 +119,12 @@ pub struct ChromaConfig {
     pub metric: Metric,
     /// Timeout of a single HTTP request.
     pub timeout: Duration,
-    /// Metadata key under which the serialized [`CollectionSchema`] is stored.
+    /// Metadata key under which the serialized [`CollectionSchema`] is stored
+    /// in this crate's serde layout, alongside the Python `schema`/`fields`
+    /// keys this store always writes.
+    ///
+    /// The default is the key older releases wrote (`openjiuwen:schema`), and
+    /// reads fall back to it when neither Python key is present.
     pub schema_metadata_key: String,
 }
 
@@ -168,7 +187,7 @@ impl ChromaConfig {
         self
     }
 
-    /// Sets the metadata key that holds the serialized collection schema.
+    /// Sets the extra metadata key that holds the serialized collection schema.
     #[must_use]
     pub fn with_schema_metadata_key(mut self, key: impl Into<String>) -> Self {
         self.schema_metadata_key = key.into();
@@ -255,7 +274,7 @@ impl ChromaVectorStore {
         format!("/api/v1/collections/{}{action}", encode_segment(collection))
     }
 
-    /// Reads the schema of a collection from its reserved metadata key.
+    /// Reads the schema of a collection from its metadata.
     async fn fetch_schema(&self, collection: &str) -> Result<Option<CollectionSchema>> {
         let path = Self::collection_path(collection, "");
         let response = self.send_raw(HttpRequest::get(self.url(&path))).await?;
@@ -265,23 +284,8 @@ impl ChromaVectorStore {
             _ => return Err(failure(&response, "reading collection")),
         }
         let payload: Value = response.json()?;
-        let stored = payload
-            .get("metadata")
-            .and_then(Value::as_object)
-            .and_then(|metadata| metadata.get(&self.config.schema_metadata_key));
-        let Some(Value::String(raw)) = stored else {
-            return Err(Error::unsupported(format!(
-                "collection {collection:?} was not created through ChromaVectorStore: \
-                 its metadata has no {:?} entry",
-                self.config.schema_metadata_key
-            )));
-        };
-        serde_json::from_str(raw).map(Some).map_err(|err| {
-            Error::validation(format!(
-                "collection {collection:?} stores an unreadable schema in metadata {:?}: {err}",
-                self.config.schema_metadata_key
-            ))
-        })
+        let metadata = payload.get("metadata").and_then(Value::as_object);
+        schema_metadata::decode(&self.config.schema_metadata_key, collection, metadata).map(Some)
     }
 
     /// Reads the ids matched by `where_clause`, paging while pages come back full.
@@ -338,10 +342,7 @@ impl VectorStore for ChromaVectorStore {
             "hnsw:space".to_string(),
             json!(hnsw_space(self.config.metric)),
         );
-        metadata.insert(
-            self.config.schema_metadata_key.clone(),
-            json!(serde_json::to_string(&schema).map_err(Error::external)?),
-        );
+        schema_metadata::insert(&mut metadata, &self.config.schema_metadata_key, &schema)?;
         let body = json!({"name": collection, "get_or_create": false, "metadata": metadata});
         let response = self
             .send_raw(HttpRequest::post(self.url("/api/v1/collections")).json(&body)?)
@@ -1115,6 +1116,8 @@ fn parse_hits(
         .map(|(score, _, fields)| VectorSearchResult::new(score, fields))
         .collect())
 }
+
+mod schema_metadata;
 
 #[cfg(test)]
 mod tests;

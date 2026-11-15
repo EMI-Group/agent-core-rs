@@ -11,6 +11,14 @@
 //! server-initiated requests arrive: notifications are buffered and drained
 //! through [`McpClient::take_notifications`], and
 //! [`McpClient::supports_server_stream`] reports the negotiated capability.
+//! The legacy SSE transport reopens its stream with `Last-Event-ID`, so a server
+//! replays the events the client has not seen.
+//!
+//! Resource subscriptions are optional in MCP:
+//! [`McpClient::subscribe_resource`]/[`McpClient::unsubscribe_resource`] are
+//! defaulted to [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported)
+//! and the `rmcp`-backed client gates them on the capability the server
+//! negotiated, which [`McpClient::supports_resource_subscriptions`] reports.
 //!
 //! [`openapi`](crate::tool::mcp::openapi) adds the OpenAPI transport: one MCP
 //! tool per operation of an OpenAPI document, called over plain HTTP instead of
@@ -48,4 +56,4 @@ pub use result::{
 pub use tool::{load_mcp_tools, McpTool, McpToolOptions};
 
 #[cfg(test)]
-pub use client::FakeMcpClient;
+pub use client::{FakeMcpClient, FakeSubscriptionAction, FakeSubscriptionCall};

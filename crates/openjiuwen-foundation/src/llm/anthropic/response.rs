@@ -6,6 +6,19 @@
 //! `input`, and Anthropic's `stop_reason` and cache-aware usage are normalized so
 //! every layer above the foundation sees the same accounting as with the
 //! OpenAI-compatible client.
+//!
+//! Extended-thinking blocks are decoded rather than dropped: the `thinking` text
+//! becomes the assistant message's
+//! [`reasoning_content`](crate::prompt::BaseMessage::reasoning_content), and
+//! every replayable `thinking`/`redacted_thinking` block is preserved verbatim
+//! under [`THINKING_BLOCKS_METADATA_KEY`] in the message metadata. The Messages
+//! API requires the original blocks, signature included, to be echoed back on a
+//! follow-up `tool_use` turn, so [`crate::llm::anthropic::build_messages_body`]
+//! re-emits them ahead of the text and `tool_use` blocks (see
+//! [`preserved_thinking_blocks`]). A block without the provider's `signature`
+//! (`thinking`) or opaque `data` (`redacted_thinking`) is never preserved,
+//! because forwarding it would be a provider error, and this client never
+//! invents one.
 
 use serde_json::{Map, Value};
 
@@ -16,11 +29,27 @@ use openjiuwen_common::error::{Error, Result};
 /// The only tool-call kind the built-in providers emit.
 const FUNCTION_KIND: &str = "function";
 
+/// `BaseMessage::metadata` key holding the raw thinking blocks of an assistant turn.
+///
+/// The value is a JSON array of the provider's `thinking` and
+/// `redacted_thinking` content blocks, in the order the response listed them
+/// (the API requires thinking blocks first). It is what makes a follow-up
+/// `tool_use` turn replayable: the request projection reads this key and emits
+/// the blocks verbatim. Callers may copy it between messages, but should not
+/// edit the blocks — a `thinking` block only replays with the provider's own
+/// `signature`.
+pub const THINKING_BLOCKS_METADATA_KEY: &str = "anthropic_thinking_blocks";
+
 /// Parses one Anthropic Messages response body.
 ///
 /// Missing `id`, `model`, `content`, `usage`, or `stop_reason` are tolerated and
 /// become empty values; a payload that is not a JSON object is an
 /// [`Error::Llm`] because it cannot be a provider response.
+///
+/// `thinking` blocks contribute their text to the message's
+/// `reasoning_content`, and every replayable `thinking`/`redacted_thinking`
+/// block is also stored under [`THINKING_BLOCKS_METADATA_KEY`] so the next
+/// request can echo it back.
 ///
 /// # Errors
 ///
@@ -45,6 +74,8 @@ pub fn parse_messages_response(value: &Value) -> Result<ChatResponse> {
         .to_owned();
 
     let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut thinking_blocks: Vec<Value> = Vec::new();
     let mut tool_calls = Vec::new();
     if let Some(blocks) = object.get("content").and_then(Value::as_array) {
         for block in blocks {
@@ -61,8 +92,13 @@ pub fn parse_messages_response(value: &Value) -> Result<ChatResponse> {
                     let index = u32::try_from(tool_calls.len()).unwrap_or(u32::MAX);
                     tool_calls.push(parse_tool_use(block, index));
                 }
-                // `thinking` and `redacted_thinking` blocks carry no displayable
-                // assistant text and are not replayed by this client.
+                Some("thinking") => {
+                    if let Some(fragment) = block.get("thinking").and_then(Value::as_str) {
+                        reasoning.push_str(fragment);
+                    }
+                    preserve_thinking_block(&mut thinking_blocks, block);
+                }
+                Some("redacted_thinking") => preserve_thinking_block(&mut thinking_blocks, block),
                 _ => {}
             }
         }
@@ -70,6 +106,15 @@ pub fn parse_messages_response(value: &Value) -> Result<ChatResponse> {
 
     let mut message = BaseMessage::assistant(MessageContent::Text(text));
     message.tool_calls = tool_calls;
+    if !reasoning.is_empty() {
+        message.reasoning_content = Some(reasoning);
+    }
+    if !thinking_blocks.is_empty() {
+        message.metadata.insert(
+            THINKING_BLOCKS_METADATA_KEY.to_owned(),
+            Value::Array(thinking_blocks),
+        );
+    }
 
     let finish_reason = object
         .get("stop_reason")
@@ -154,6 +199,70 @@ fn parse_tool_use(block: &Map<String, Value>, index: u32) -> ToolCall {
         arguments: input.to_string(),
         index: Some(index),
     }
+}
+
+/// Preserves one replayable thinking block, or logs why it is not replayed.
+///
+/// A `thinking` block is replayable only with the provider's own `signature`,
+/// and a `redacted_thinking` block only with its opaque `data`; a block missing
+/// either is dropped with a `tracing::warn!` instead of being sent back in a
+/// shape the API rejects. The block is stored verbatim, so an unknown extra
+/// field a future API version adds survives the round trip.
+fn preserve_thinking_block(preserved: &mut Vec<Value>, block: &Map<String, Value>) {
+    let kind = block
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !is_replayable_block(block) {
+        tracing::warn!(
+            target: "openjiuwen_foundation::llm::anthropic",
+            block_type = kind,
+            "dropping a thinking block that cannot be replayed: \
+             `thinking` needs a signature and `redacted_thinking` needs data"
+        );
+        return;
+    }
+    preserved.push(Value::Object(block.clone()));
+}
+
+/// Reports whether `block` is a thinking block the API will accept back.
+///
+/// The required field is the provider's own opaque proof (`signature` for
+/// `thinking`, `data` for `redacted_thinking`) and must be non-empty; this
+/// client never synthesizes one.
+fn is_replayable_block(block: &Map<String, Value>) -> bool {
+    let kind = block
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let proof = match kind {
+        "thinking" => "signature",
+        "redacted_thinking" => "data",
+        _ => return false,
+    };
+    block
+        .get(proof)
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+}
+
+/// The replayable thinking blocks an assistant message carries, in order.
+///
+/// Reads [`THINKING_BLOCKS_METADATA_KEY`] from the message metadata and returns
+/// only the entries that are still replayable (a known block type with its
+/// `signature`/`data`), because the metadata map is caller-writable. An absent
+/// key, a non-array value, and malformed entries all yield no block, so the
+/// request projection can never emit a thinking block the API would reject.
+pub(crate) fn preserved_thinking_blocks(message: &BaseMessage) -> Vec<Value> {
+    let Some(Value::Array(blocks)) = message.metadata.get(THINKING_BLOCKS_METADATA_KEY) else {
+        return Vec::new();
+    };
+
+    blocks
+        .iter()
+        .filter(|block| block.as_object().is_some_and(is_replayable_block))
+        .cloned()
+        .collect()
 }
 
 /// Short JSON kind name used in error messages.

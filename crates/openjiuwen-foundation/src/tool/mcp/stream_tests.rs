@@ -1,17 +1,28 @@
 //! Tests for the server-initiated `GET` event stream of the streamable-HTTP
-//! transport, plus the pure helpers it is built from.
+//! transport, the resource-subscription requests of the `rmcp` client, and the
+//! legacy SSE transport's `Last-Event-ID` replay, plus the pure helpers they are
+//! built from.
 //!
-//! Every server is a loopback `wiremock` instance: the initialize handshake and
-//! the `GET` channel are mocked, no test reaches the network, spawns a process,
-//! or waits without a bound.
+//! Every server is a loopback `wiremock` instance: the initialize handshake, the
+//! `GET` channel, and the JSON-RPC requests are mocked, no test reaches the
+//! network, spawns a process, or waits without a bound.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
+use openjiuwen_common::error::ErrorKind;
+use rmcp::model::{
+    ClientJsonRpcMessage, ClientNotification, Extensions, InitializedNotification,
+    InitializedNotificationMethod,
+};
+use rmcp::transport::Transport;
 use serde_json::{json, Value};
-use wiremock::matchers::{body_partial_json, header, method};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-use super::client::{McpClient, McpNotification, McpServerConfig, RmcpClient};
+use super::client::{McpClient, McpClientType, McpNotification, McpServerConfig, RmcpClient};
+use super::http::sse::{sse_resume_error, sse_stream_headers, SseStop, SseTransport};
 use super::http::{
     server_stream_headers, stream_reconnect_delay, SseParser, DEFAULT_STREAM_RETRY,
     NOTIFICATION_BUFFER_BOUND,
@@ -25,36 +36,74 @@ const POLL: Duration = Duration::from_millis(20);
 const NOTIFICATION_FRAME: &str = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\
                                   \"notifications/tools/list_changed\",\"params\":{\"reason\":\
                                   \"test\"}}\n\n";
+/// The resource the subscription tests subscribe to.
+const RESOURCE_URI: &str = "file:///tmp/report.md";
 
 /// Answers the `initialize` request like an MCP server, echoing the request id.
-struct InitializeResponder;
+///
+/// `capabilities` is what the server advertises in its `initialize` result.
+struct InitializeResponder {
+    capabilities: Value,
+}
+
+impl Default for InitializeResponder {
+    fn default() -> Self {
+        Self {
+            capabilities: json!({}),
+        }
+    }
+}
 
 impl Respond for InitializeResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
-        let id = serde_json::from_slice::<Value>(&request.body)
-            .ok()
-            .and_then(|body| body.get("id").cloned())
-            .unwrap_or(Value::Null);
         ResponseTemplate::new(200)
             .insert_header("Mcp-Session-Id", "sess-1")
             .insert_header("Content-Type", "application/json")
             .set_body_json(json!({
                 "jsonrpc": "2.0",
-                "id": id,
+                "id": request_id(request),
                 "result": {
                     "protocolVersion": "2025-06-18",
-                    "capabilities": {},
+                    "capabilities": self.capabilities,
                     "serverInfo": {"name": "mock", "version": "1.0"}
                 }
             }))
     }
 }
 
+/// Answers a JSON-RPC request with an empty `result`, echoing the request id.
+struct EmptyResultResponder;
+
+impl Respond for EmptyResultResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("Content-Type", "application/json")
+            .set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": request_id(request),
+                "result": {}
+            }))
+    }
+}
+
+/// Returns the `id` of the JSON-RPC `request`.
+fn request_id(request: &Request) -> Value {
+    serde_json::from_slice::<Value>(&request.body)
+        .ok()
+        .and_then(|body| body.get("id").cloned())
+        .unwrap_or(Value::Null)
+}
+
 /// Mounts the handshake mocks every streamable-HTTP test needs.
 async fn mount_handshake(server: &MockServer) {
+    mount_handshake_with(server, json!({})).await;
+}
+
+/// Mounts the handshake mocks with `capabilities` as the advertised capabilities.
+async fn mount_handshake_with(server: &MockServer, capabilities: Value) {
     Mock::given(method("POST"))
         .and(body_partial_json(json!({"method": "initialize"})))
-        .respond_with(InitializeResponder)
+        .respond_with(InitializeResponder { capabilities })
         .mount(server)
         .await;
     Mock::given(method("POST"))
@@ -306,4 +355,283 @@ fn notification_buffer_drops_the_oldest_entry_when_full() {
         state.take_notifications().is_empty(),
         "the buffer was not drained"
     );
+}
+
+// --- resource subscriptions (rmcp client) -----------------------------------
+
+/// Mounts the handshake advertising `resources.subscribe` and the matching
+/// `resources/subscribe` / `resources/unsubscribe` responders.
+async fn mount_subscription_handshake(server: &MockServer) {
+    mount_handshake_with(server, json!({"resources": {"subscribe": true}})).await;
+    for method_name in ["resources/subscribe", "resources/unsubscribe"] {
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": method_name})))
+            .respond_with(EmptyResultResponder)
+            .mount(server)
+            .await;
+    }
+}
+
+/// Returns the recorded POST requests whose JSON-RPC body carries `wanted`.
+fn posts_with_method<'a>(requests: &'a [Request], wanted: &str) -> Vec<&'a Request> {
+    requests
+        .iter()
+        .filter(|request| {
+            request.method.as_str() == "POST"
+                && serde_json::from_slice::<Value>(&request.body)
+                    .ok()
+                    .and_then(|body| {
+                        body.get("method")
+                            .and_then(Value::as_str)
+                            .map(|method_name| method_name == wanted)
+                    })
+                    .unwrap_or(false)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn subscribe_resource_sends_the_negotiated_request_and_records_the_capability() {
+    let server = MockServer::start().await;
+    mount_subscription_handshake(&server).await;
+    let client = client_for(&server);
+
+    client.subscribe_resource(RESOURCE_URI).await.unwrap();
+
+    assert!(client.supports_resource_subscriptions());
+    let requests = server.received_requests().await.unwrap();
+    let subscribe = posts_with_method(&requests, "resources/subscribe");
+    assert_eq!(subscribe.len(), 1, "resources/subscribe was not sent");
+    let body: Value = serde_json::from_slice(&subscribe[0].body).unwrap();
+    // `rmcp` adds its own `_meta.progressToken`, so only the URI is asserted.
+    assert_eq!(body["params"]["uri"], json!(RESOURCE_URI));
+    assert!(
+        posts_with_method(&requests, "resources/unsubscribe").is_empty(),
+        "unsubscribe was sent by subscribe"
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn unsubscribe_resource_sends_the_negotiated_request() {
+    let server = MockServer::start().await;
+    mount_subscription_handshake(&server).await;
+    let client = client_for(&server);
+
+    client.unsubscribe_resource(RESOURCE_URI).await.unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let unsubscribe = posts_with_method(&requests, "resources/unsubscribe");
+    assert_eq!(unsubscribe.len(), 1, "resources/unsubscribe was not sent");
+    let body: Value = serde_json::from_slice(&unsubscribe[0].body).unwrap();
+    assert_eq!(body["params"]["uri"], json!(RESOURCE_URI));
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_subscription_without_the_negotiated_capability_is_a_typed_error() {
+    let server = MockServer::start().await;
+    mount_handshake(&server).await;
+    let client = client_for(&server);
+
+    let error = client
+        .subscribe_resource(RESOURCE_URI)
+        .await
+        .expect_err("the server advertised no resources.subscribe");
+
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(error.message().contains("resources/subscribe"), "{error}");
+    assert!(!client.supports_resource_subscriptions());
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        posts_with_method(&requests, "resources/subscribe").is_empty(),
+        "a request the server never advertised was sent"
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_blank_subscription_uri_fails_before_the_session_is_opened() {
+    let server = MockServer::start().await;
+    mount_subscription_handshake(&server).await;
+    let client = client_for(&server);
+
+    let error = client
+        .subscribe_resource("   ")
+        .await
+        .expect_err("a blank uri must not reach the server");
+
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(!client.is_connected().await, "the client connected anyway");
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.is_empty(), "a blank uri made a request");
+}
+
+// --- legacy SSE replay ------------------------------------------------------
+
+/// Answers the legacy SSE `GET` stream with one `endpoint` frame.
+///
+/// The frame carries `event_id` when one is scripted; the call counter lets a
+/// test tell the reconnects apart.
+struct LegacySseResponder {
+    calls: Arc<AtomicUsize>,
+    event_id: Option<&'static str>,
+}
+
+impl Respond for LegacySseResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let id = match self.event_id {
+            Some(id) => format!("id: {id}\n"),
+            None => String::new(),
+        };
+        ResponseTemplate::new(200)
+            .insert_header("Content-Type", "text/event-stream")
+            .set_body_string(format!("event: endpoint\ndata: /messages\n{id}\n"))
+    }
+}
+
+/// Mounts the legacy SSE `GET` stream and the POST endpoint it announces.
+async fn mount_legacy_sse(server: &MockServer, event_id: Option<&'static str>) -> Arc<AtomicUsize> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .respond_with(LegacySseResponder {
+            calls: calls.clone(),
+            event_id,
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(server)
+        .await;
+    calls
+}
+
+/// Builds the legacy SSE configuration for `server`.
+fn sse_config(server: &MockServer) -> McpServerConfig {
+    McpServerConfig {
+        client_type: McpClientType::Sse,
+        ..McpServerConfig::http("sse", server.uri())
+    }
+}
+
+/// Builds a notification, enough to trigger the legacy transport's first send.
+fn trigger_message() -> ClientJsonRpcMessage {
+    ClientJsonRpcMessage::notification(ClientNotification::InitializedNotification(
+        InitializedNotification {
+            method: InitializedNotificationMethod,
+            extensions: Extensions::default(),
+        },
+    ))
+}
+
+/// Returns the `Last-Event-ID` header of `request`, when the client sent one.
+fn last_event_id(request: &Request) -> Option<String> {
+    request
+        .headers
+        .get("Last-Event-ID")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+/// Returns the recorded `GET` requests, oldest first.
+fn get_requests(requests: &[Request]) -> Vec<&Request> {
+    requests
+        .iter()
+        .filter(|request| request.method.as_str() == "GET")
+        .collect()
+}
+
+#[tokio::test]
+async fn legacy_sse_replays_the_last_event_id_on_reconnect() {
+    let server = MockServer::start().await;
+    mount_legacy_sse(&server, Some("7")).await;
+    let mut transport = SseTransport::new(&sse_config(&server)).unwrap();
+
+    transport.send(trigger_message()).await.unwrap();
+    let requests = wait_for_request(&server, |requests| get_request_count(requests) >= 2).await;
+
+    let gets = get_requests(&requests);
+    assert!(
+        gets.len() >= 2,
+        "the GET stream was not reopened: {} request(s)",
+        gets.len()
+    );
+    assert!(
+        last_event_id(gets[0]).is_none(),
+        "the first GET replayed an event id it never saw"
+    );
+    assert_eq!(last_event_id(gets[1]).as_deref(), Some("7"));
+    transport.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_sse_sends_no_last_event_id_when_it_never_accepted_one() {
+    let server = MockServer::start().await;
+    mount_legacy_sse(&server, None).await;
+    let mut transport = SseTransport::new(&sse_config(&server)).unwrap();
+
+    transport.send(trigger_message()).await.unwrap();
+    let requests = wait_for_request(&server, |requests| get_request_count(requests) >= 2).await;
+
+    let gets = get_requests(&requests);
+    assert!(
+        gets.len() >= 2,
+        "the GET stream was not reopened: {} request(s)",
+        gets.len()
+    );
+    for request in gets {
+        assert!(
+            last_event_id(request).is_none(),
+            "an id the client never saw was replayed"
+        );
+    }
+    transport.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_rejected_legacy_sse_stream_fails_the_send_with_the_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(405))
+        .mount(&server)
+        .await;
+    let mut transport = SseTransport::new(&sse_config(&server)).unwrap();
+
+    let error = transport
+        .send(trigger_message())
+        .await
+        .expect_err("refused");
+
+    assert!(error.to_string().contains("405"), "{error}");
+    transport.close().await.unwrap();
+}
+
+#[test]
+fn sse_stream_headers_advertise_the_event_stream_and_replay_an_id() {
+    assert_eq!(
+        sse_stream_headers(None),
+        vec![("Accept", "text/event-stream".to_owned())]
+    );
+    assert_eq!(
+        sse_stream_headers(Some("7")),
+        vec![
+            ("Accept", "text/event-stream".to_owned()),
+            ("Last-Event-ID", "7".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn sse_resume_error_names_the_last_event_id_and_the_budget() {
+    let exhausted = sse_resume_error(SseStop::Exhausted(3), Some("7")).to_string();
+    let without_id = sse_resume_error(SseStop::Exhausted(2), None).to_string();
+    let rejected = sse_resume_error(SseStop::Rejected(405), None).to_string();
+
+    assert!(exhausted.contains("`7`"), "{exhausted}");
+    assert!(exhausted.contains("3 attempt"), "{exhausted}");
+    assert!(!without_id.contains("event id"), "{without_id}");
+    assert!(rejected.contains("405"), "{rejected}");
 }

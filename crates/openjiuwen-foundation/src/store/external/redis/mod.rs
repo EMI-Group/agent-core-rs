@@ -12,9 +12,24 @@
 //! straight from a JSON object, and exposes builder setters for code.
 //! A `redis://[user:password@]host:port/db` URL is parsed when given; an explicit
 //! `addr`, `username`, `password` or `db` overrides the matching URL component.
-//! `rediss://` (TLS) and the other schemes are rejected with
-//! [`Error::Unsupported`](openjiuwen_common::error::Error) /
+//! `rediss://` selects TLS (see [`RedisConfig::with_tls`]) and keeps the same
+//! parsing rules, including the `6379` default port; every other scheme is an
 //! [`Error::Config`](openjiuwen_common::error::Error), never silently downgraded.
+//!
+//! # TLS (`rediss://`)
+//!
+//! A `rediss://` URL (or [`RedisConfig::with_tls`]) wraps the TCP socket in a
+//! `tokio-rustls` client whose trust anchors are the bundled
+//! [`webpki_roots::TLS_SERVER_ROOTS`] only. The TLS handshake is covered by the
+//! configuration's `timeout`, exactly like the TCP connect.
+//! There is no custom-CA bundle, no certificate pinning, and no
+//! `insecure-skip-verify` switch: a deployment that terminates TLS with a private
+//! CA cannot be reached from this backend yet.
+//! Because a real TLS round trip needs either a trusted certificate chain or a
+//! PEM/certificate-generation crate (neither of which the workspace ships), the
+//! offline tests prove the path is taken (the first bytes on the wire are a TLS
+//! handshake record, never cleartext RESP) and that a failed handshake surfaces
+//! as a typed error; they do not complete a handshake.
 //!
 //! # Semantics
 //!
@@ -56,7 +71,7 @@ pub use store::RedisKvStore;
 /// Address used when neither `url` nor `addr` names a server.
 pub const DEFAULT_ADDR: &str = "127.0.0.1:6379";
 
-/// Port used when a `redis://` URL omits it.
+/// Port used when a `redis://` or `rediss://` URL omits it.
 const DEFAULT_PORT: u16 = 6379;
 
 /// Timeout used when the configuration does not set one.
@@ -90,7 +105,13 @@ pub struct RedisConfig {
     pub password: Option<SecretString>,
     /// Explicit database index for `SELECT`, overriding the URL path when set.
     pub db: Option<u32>,
-    /// Timeout of a connect, a write, and a reply read.
+    /// Whether to speak TLS to the server.
+    ///
+    /// A `rediss://` URL enables this automatically; set it explicitly to reach a
+    /// TLS endpoint through [`RedisConfig::addr`]. It can never be turned off for a
+    /// `rediss://` URL, so a TLS URL is not silently downgraded to cleartext.
+    pub tls: bool,
+    /// Timeout of a connect (including the TLS handshake), a write, and a reply read.
     pub timeout: Duration,
     /// Prefix prepended to every key written and stripped from every key read.
     pub key_prefix: String,
@@ -104,6 +125,7 @@ impl Default for RedisConfig {
             username: None,
             password: None,
             db: None,
+            tls: false,
             timeout: default_timeout(),
             key_prefix: String::new(),
         }
@@ -119,7 +141,7 @@ impl RedisConfig {
         }
     }
 
-    /// Creates a configuration from a `redis://` URL.
+    /// Creates a configuration from a `redis://` or `rediss://` URL.
     pub fn from_url(url: impl Into<String>) -> Self {
         Self {
             url: Some(url.into()),
@@ -152,6 +174,17 @@ impl RedisConfig {
     #[must_use]
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Enables TLS (the `rediss://` transport).
+    ///
+    /// Only `true` is meaningful: a `rediss://` URL already enables TLS and cannot
+    /// be downgraded to cleartext, so this setter is how an explicit
+    /// [`RedisConfig::addr`] reaches a TLS endpoint.
+    #[must_use]
+    pub const fn with_tls(mut self, tls: bool) -> Self {
+        self.tls = tls;
         self
     }
 
@@ -188,13 +221,23 @@ impl RedisConfig {
     /// Connects a [`RedisKvStore`] with this configuration.
     pub async fn connect(&self) -> Result<RedisKvStore> {
         let resolved = self.resolved()?;
-        let connection = RedisConnection::connect_with_timeout(
-            &resolved.addr,
-            resolved.auth(),
-            resolved.db,
-            self.timeout,
-        )
-        .await?;
+        let connection = if resolved.tls {
+            RedisConnection::connect_tls_with_timeout(
+                &resolved.addr,
+                resolved.auth(),
+                resolved.db,
+                self.timeout,
+            )
+            .await?
+        } else {
+            RedisConnection::connect_with_timeout(
+                &resolved.addr,
+                resolved.auth(),
+                resolved.db,
+                self.timeout,
+            )
+            .await?
+        };
         Ok(RedisKvStore::from_connection(connection, self.clone()))
     }
 
@@ -210,6 +253,7 @@ impl RedisConfig {
                 username: None,
                 password: None,
                 db: None,
+                tls: false,
             },
         };
         if let Some(addr) = self.addr.as_deref().filter(|addr| !addr.is_empty()) {
@@ -224,6 +268,8 @@ impl RedisConfig {
         if let Some(db) = self.db {
             resolved.db = Some(db);
         }
+        // A `rediss://` URL can only widen this flag, never clear it.
+        resolved.tls |= self.tls;
         Ok(resolved)
     }
 }
@@ -238,6 +284,8 @@ struct ResolvedRedis {
     password: Option<String>,
     /// Database index for `SELECT`, if any.
     db: Option<u32>,
+    /// Whether the connection speaks TLS (`rediss://`).
+    tls: bool,
 }
 
 impl ResolvedRedis {
@@ -257,21 +305,19 @@ fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-/// Parses a `redis://` URL into connection parameters.
+/// Parses a `redis://` or `rediss://` URL into connection parameters.
 fn parse_redis_url(raw: &str) -> Result<ResolvedRedis> {
     let url = Url::parse(raw)
         .map_err(|error| Error::config(format!("invalid redis url {raw:?}: {error}")))?;
-    match url.scheme() {
-        "redis" => {}
-        "rediss" => return Err(Error::unsupported(
-            "redis: `rediss://` needs a TLS stack that this build does not include; use `redis://`",
-        )),
+    let tls = match url.scheme() {
+        "redis" => false,
+        "rediss" => true,
         other => {
             return Err(Error::config(format!(
-                "unsupported redis url scheme {other:?}; expected `redis://`"
+                "unsupported redis url scheme {other:?}; expected `redis://` or `rediss://`"
             )))
         }
-    }
+    };
     let host = url
         .host_str()
         .filter(|host| !host.is_empty())
@@ -294,6 +340,7 @@ fn parse_redis_url(raw: &str) -> Result<ResolvedRedis> {
         username,
         password,
         db,
+        tls,
     })
 }
 

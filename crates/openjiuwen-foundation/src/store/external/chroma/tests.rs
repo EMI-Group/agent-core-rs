@@ -8,7 +8,7 @@ use super::*;
 
 use openjiuwen_common::error::ErrorKind;
 use serde_json::json;
-use wiremock::matchers::{body_json, header, method, path};
+use wiremock::matchers::{body_json, body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// A schema with a primary key, one embedding and a document + metadata field.
@@ -32,16 +32,79 @@ fn schema_json(schema: &CollectionSchema) -> String {
     serde_json::to_string(schema).expect("serialize schema")
 }
 
-/// Mounts the `GET /collections/{name}` response that returns `schema`.
+/// The metadata [`ChromaVectorStore::create_collection`] writes for `schema`.
+fn metadata_for(schema: &CollectionSchema) -> Value {
+    let mut metadata = Map::new();
+    metadata.insert("hnsw:space".to_string(), json!("cosine"));
+    schema_metadata::insert(&mut metadata, schema_metadata::LEGACY_SCHEMA_KEY, schema)
+        .expect("schema metadata");
+    Value::Object(metadata)
+}
+
+/// Mounts the `GET /collections/{name}` response of a collection holding `schema`.
 async fn mount_collection(server: &MockServer, collection: &str, schema: &CollectionSchema) {
+    mount_metadata(server, collection, &metadata_for(schema)).await;
+}
+
+/// Mounts the `GET /collections/{name}` response of a collection with `metadata`.
+async fn mount_metadata(server: &MockServer, collection: &str, metadata: &Value) {
     Mock::given(method("GET"))
         .and(path(format!("/api/v1/collections/{collection}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "name": collection,
-            "metadata": {"openjiuwen:schema": schema_json(schema)},
+            "metadata": metadata,
         })))
         .mount(server)
         .await;
+}
+
+/// A collection's metadata holding `schema` under the Python `schema` key only,
+/// exactly as the Python `ChromaVectorStore` writes it.
+fn python_metadata(schema: &str) -> Value {
+    json!({"schema": schema, "field_mapping": "{}", "distance_metric": "cosine"})
+}
+
+/// The [`schema`] fixture in the layout Python's `CollectionSchema.to_dict()`
+/// writes: upper-case `VectorDataType` names under the `type` key.
+fn python_written_schema() -> Value {
+    json!({
+        "fields": [
+            {"name": "id", "type": "VARCHAR", "is_primary": true, "max_length": 65535},
+            {"name": "embedding", "type": "FLOAT_VECTOR", "dim": 2, "max_length": 65535},
+            {"name": "content", "type": "VARCHAR", "max_length": 65535},
+            {"name": "score", "type": "INT64", "max_length": 65535},
+        ],
+        "description": "written by python",
+        "enable_dynamic_field": false,
+    })
+}
+
+/// The schema [`python_written_schema`] denotes.
+fn python_read_schema() -> CollectionSchema {
+    CollectionSchema {
+        fields: vec![
+            FieldSchema {
+                is_primary: true,
+                max_length: Some(65535),
+                ..FieldSchema::new("id", VectorDataType::Varchar)
+            },
+            FieldSchema {
+                dim: Some(2),
+                max_length: Some(65535),
+                ..FieldSchema::new("embedding", VectorDataType::FloatVector)
+            },
+            FieldSchema {
+                max_length: Some(65535),
+                ..FieldSchema::new("content", VectorDataType::Varchar)
+            },
+            FieldSchema {
+                max_length: Some(65535),
+                ..FieldSchema::new("score", VectorDataType::Int64)
+            },
+        ],
+        description: Some("written by python".to_string()),
+        enable_dynamic_field: false,
+    }
 }
 
 /// Builds a document for the [`schema`] above.
@@ -71,12 +134,11 @@ async fn create_collection_sends_the_schema_and_the_configured_headers() {
         .and(header("x-chroma-tenant", "tenant-a"))
         .and(header("x-chroma-database", "db-a"))
         .and(header("authorization", "Bearer key-123"))
-        .and(body_json(json!({
+        .and(body_partial_json(json!({
             "name": "docs",
             "get_or_create": false,
             "metadata": {
                 "hnsw:space": "ip",
-                "openjiuwen:schema": schema_json(&schema),
             },
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "c1", "name": "docs"})))
@@ -93,9 +155,34 @@ async fn create_collection_sends_the_schema_and_the_configured_headers() {
     )
     .expect("build store");
     store
-        .create_collection("docs", schema)
+        .create_collection("docs", schema.clone())
         .await
         .expect("create collection");
+    let requests = server.received_requests().await.expect("received requests");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("create body");
+    let metadata = &body["metadata"];
+    assert_eq!(metadata["openjiuwen:schema"], json!(schema_json(&schema)));
+    for key in [
+        schema_metadata::PYTHON_SCHEMA_KEY,
+        schema_metadata::PYTHON_FIELDS_KEY,
+    ] {
+        let stored = metadata[key].as_str().expect("python schema string");
+        let parsed: Value = serde_json::from_str(stored).expect("python schema json");
+        assert_eq!(
+            parsed,
+            json!({
+                "fields": [
+                    {"name": "id", "type": "VARCHAR", "is_primary": true},
+                    {"name": "embedding", "type": "FLOAT_VECTOR", "dim": 2},
+                    {"name": "content", "type": "VARCHAR"},
+                    {"name": "score", "type": "INT64"},
+                ],
+                "description": null,
+                "enable_dynamic_field": false,
+            }),
+            "{key}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -265,7 +352,140 @@ async fn get_schema_round_trips_and_reports_absent_or_foreign_collections() {
         .await
         .expect_err("foreign collection");
     assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert!(error.to_string().contains("not created through"), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("not created through"), "{message}");
+    for key in ["schema", "fields", "openjiuwen:schema"] {
+        assert!(
+            message.contains(&format!("{key:?}")),
+            "{key} must be named: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_schema_reads_a_python_written_collection() {
+    let server = MockServer::start().await;
+    let python = serde_json::to_string(&python_written_schema()).expect("python schema");
+    mount_metadata(&server, "docs", &python_metadata(&python)).await;
+    assert_eq!(
+        store(&server).get_schema("docs").await.expect("schema"),
+        Some(python_read_schema())
+    );
+}
+
+#[tokio::test]
+async fn get_schema_falls_back_to_the_python_fields_key() {
+    let server = MockServer::start().await;
+    let python = serde_json::to_string(&python_written_schema()).expect("python schema");
+    mount_metadata(&server, "docs", &json!({"fields": python})).await;
+    assert_eq!(
+        store(&server).get_schema("docs").await.expect("schema"),
+        Some(python_read_schema())
+    );
+}
+
+#[tokio::test]
+async fn get_schema_prefers_the_python_keys_over_the_legacy_key() {
+    let server = MockServer::start().await;
+    let python = serde_json::to_string(&python_written_schema()).expect("python schema");
+    let mut metadata = metadata_for(&schema());
+    if let Some(entries) = metadata.as_object_mut() {
+        entries.insert("schema".to_string(), json!(python));
+    }
+    mount_metadata(&server, "docs", &metadata).await;
+    assert_eq!(
+        store(&server).get_schema("docs").await.expect("schema"),
+        Some(python_read_schema())
+    );
+}
+
+#[tokio::test]
+async fn get_schema_still_reads_a_legacy_rust_written_collection() {
+    let server = MockServer::start().await;
+    let schema = schema();
+    mount_metadata(
+        &server,
+        "docs",
+        &json!({"hnsw:space": "cosine", "openjiuwen:schema": schema_json(&schema)}),
+    )
+    .await;
+    assert_eq!(
+        store(&server).get_schema("docs").await.expect("schema"),
+        Some(schema)
+    );
+}
+
+#[tokio::test]
+async fn get_schema_rejects_a_malformed_schema_naming_every_key() {
+    let server = MockServer::start().await;
+    mount_metadata(&server, "docs", &json!({"schema": "{not json"})).await;
+    let error = store(&server)
+        .get_schema("docs")
+        .await
+        .expect_err("malformed schema");
+    assert_eq!(error.kind(), ErrorKind::Validation, "{error}");
+    let message = error.to_string();
+    assert!(message.contains("\"schema\""), "{message}");
+    assert!(message.contains("\"fields\""), "{message}");
+    assert!(message.contains("invalid"), "{message}");
+}
+
+/// A Chroma mock that keeps the metadata of a created collection and serves it
+/// back on `GET /api/v1/collections/{name}`, like a real server does.
+#[derive(Clone, Default)]
+struct RoundTripChroma {
+    metadata: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
+}
+
+impl wiremock::Respond for RoundTripChroma {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        if request.method.as_str() == "POST" {
+            let body: Value = serde_json::from_slice(&request.body).expect("create body");
+            *self.metadata.lock().expect("metadata lock") = body.get("metadata").cloned();
+            return ResponseTemplate::new(200).set_body_json(json!({"id": "c1", "name": "docs"}));
+        }
+        let metadata = self.metadata.lock().expect("metadata lock").clone();
+        ResponseTemplate::new(200).set_body_json(json!({"name": "docs", "metadata": metadata}))
+    }
+}
+
+#[tokio::test]
+async fn create_then_get_schema_round_trips_and_writes_both_key_sets() {
+    let server = MockServer::start().await;
+    let fake = RoundTripChroma::default();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/collections"))
+        .respond_with(fake.clone())
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/collections/docs"))
+        .respond_with(fake)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let schema = schema();
+    store
+        .create_collection("docs", schema.clone())
+        .await
+        .expect("create collection");
+    assert_eq!(
+        store.get_schema("docs").await.expect("schema"),
+        Some(schema)
+    );
+    let requests = server.received_requests().await.expect("received requests");
+    let create: Value = serde_json::from_slice(&requests[0].body).expect("create body");
+    let metadata = create["metadata"].as_object().expect("create metadata");
+    for key in [
+        schema_metadata::PYTHON_SCHEMA_KEY,
+        schema_metadata::PYTHON_FIELDS_KEY,
+        schema_metadata::LEGACY_SCHEMA_KEY,
+    ] {
+        let stored = metadata[key].as_str().expect("schema string");
+        if let Err(err) = serde_json::from_str::<Value>(stored) {
+            panic!("{key} is not JSON: {err}: {stored}");
+        }
+    }
 }
 
 #[tokio::test]

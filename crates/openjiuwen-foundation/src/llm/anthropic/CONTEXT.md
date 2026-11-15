@@ -13,6 +13,16 @@ Ports `openjiuwen/core/foundation/llm/model_clients/anthropic_model_client.py`.
 - `build_messages_body_with_endpoint(&[BaseMessage], &ModelRequestConfig, stream, provider, endpoint_profile: Option<&str>, api_base: Option<&str>) -> Result<Value>` — the same projection with the client's `endpoint_profile` as well; the client calls this one, and `_with_provider` delegates with no profile.
 - `normalize_api_base(&str) -> String` — strips a pasted `/v1/messages` or `/v1` suffix.
 - `parse_messages_response`, `parse_anthropic_usage`, `AnthropicStreamState` — response and stream conversion.
+- `THINKING_BLOCKS_METADATA_KEY` (`"anthropic_thinking_blocks"`) — the `BaseMessage::metadata` key holding the raw `thinking`/`redacted_thinking` blocks preserved from a response.
+
+## Extended Thinking (`response.rs`, `convert.rs`)
+
+A non-streaming `thinking` block appends its `thinking` text to the assistant message's `reasoning_content` (adjacent blocks concatenate in order); `reasoning_content` stays `None` when no thinking block carried text.
+Every replayable block — a `thinking` block with a non-empty `signature`, a `redacted_thinking` block with non-empty `data` — is preserved verbatim, in response order, as a JSON array under `BaseMessage::metadata[THINKING_BLOCKS_METADATA_KEY]`.
+A block without that provider proof is dropped with a `tracing::warn!` and never stored: the client never invents a signature.
+The assistant projection reads the same key and emits those blocks first, verbatim and in order, ahead of the text and `tool_use` blocks, because the Messages API requires the original signed blocks on a follow-up `tool_use` turn.
+A turn without survivable blocks keeps the plain string `content` it always had; a turn with them always sends a block array.
+The key is caller-writable, so the projection re-validates every entry (`type` plus `signature`/`data`) and silently drops anything else instead of forwarding a block the API would reject.
 
 ## Request Projection (`request.rs`)
 
@@ -68,7 +78,7 @@ Inline turns carry plain text as their `content`; neighbours are read from the p
 - `./request.rs` → body assembly, reasoning-plan wiring and legacy-control precedence, `max_tokens` caps, `normalize_api_base`
 - `./convert.rs` → message projection, mid-conversation system partition, tools/tool_choice, images
 - `./cache.rs` → cache-control marker, the three anchors, transient-tail detection, `extra` knobs
-- `./response.rs` → non-streaming response parsing (`content` blocks → `BaseMessage`, `stop_reason`, usage)
+- `./response.rs` → non-streaming response parsing (`content` blocks → `BaseMessage`, preserved thinking blocks, `stop_reason`, usage)
 - `./stream.rs` → SSE event state machine (`content_block_*`, `message_*`, tool-input buffering)
 - `./request/tests.rs` → body projection tests
 - `./request/cache_tests.rs` → cache-anchor tests
@@ -85,5 +95,5 @@ No test needs a network or a credential.
 ## Known Gaps
 
 - No `cache_control` breakpoints beyond the three automatic anchors (no per-message caller control, no `clear`/`auto` caching modes).
-- `thinking` blocks are ignored in non-streaming responses; only streaming maps `thinking_delta` onto `reasoning`.
+- The streaming path maps `thinking_delta` onto `reasoning` but does not preserve the streamed signatures, so a thinking block from a streamed turn is not replayed on the next request (only the non-streaming parser preserves blocks).
 - Mid-conversation system turns are text-only, and the supported-family list is a fixed substring match (no capability query).

@@ -4,7 +4,7 @@
 
 Port `openjiuwen/extensions/external_provider/` (v0.1.20): a registry of providers whose credentials live outside the SDK, plus the built-in `OpenAIAccount` implementation.
 Two provider-neutral seams — [`ExternalAuthProvider`] (status / logout / access token) and [`ProviderModelCatalog`] (model discovery) — are registered by provider name and created through a typed configuration.
-The device-authorization grant, token refresh, and auth-store file are **not** reimplemented here: the module composes [`crate::llm::oauth`] (`OpenAiOAuthClient`, `FileTokenStore`, `OAuthToken`, `REFRESH_SKEW`).
+The device-authorization grant, token refresh, the auth-store file, and the cross-process lock around its writes are **not** reimplemented here: the module composes [`crate::llm::oauth`] (`OpenAiOAuthClient`, `FileTokenStore`, `OAuthToken`, `REFRESH_SKEW`, and now `login`/`status`/`logout` over `OAuthCredentials`).
 The model catalog talks HTTP only through `openjiuwen_common::http::HttpClient`.
 
 ## API Surface
@@ -46,8 +46,8 @@ The model catalog talks HTTP only through `openjiuwen_common::http::HttpClient`.
 - **Factories are fallible and take a typed config.** Python constructs classes with `**kwargs`; a Rust path/URL/HTTP-stack resolution can fail, so the factory returns `Result` and the registry propagates it.
 - **The process-global registry is sanctioned.** `ExternalProviderRegistry::global()` (`LazyLock` + `RwLock`) is the second documented mutable global beside `ModelProviderRegistry::global()`; local instances (`new`, `with_builtins`) keep tests and isolated components off it.
 - **`status()` never fails for store trouble.** Missing / unreadable / corrupt stores become `authenticated: false` with a Python error code (mapped by `Error::kind()`: `External` → read-failed, otherwise invalid-store), matching Python's non-raising `status()`. `logout()` and `resolve_access_token()` do propagate store errors.
-- **Refresh decisions are the reference implementation's**: refresh when the token expires within `refresh_skew`, or always with `force`; `OAuthToken::effective_expires_at` already falls back to the JWT `exp` claim.
-- **Device login stays in `llm::oauth`.** Python's `OpenAIAccountAuthManager.start_device_login` / `poll_device_login` / `login_with_device_code` are not duplicated; callers use `OpenAiOAuthClient` (`request_device_code`, `poll_device_token`) and persist through the manager's store.
+- **Refresh decisions are the reference implementation's**: refresh when the token expires within `refresh_skew`, or always with `force`; `OAuthToken::effective_expires_at` already falls back to the JWT `exp` claim, and a token with no resolvable expiry counts as expired (see `llm::oauth`), so it is refreshed on first use instead of being treated as valid forever.
+- **Device login stays in `llm::oauth`.** Python's `OpenAIAccountAuthManager.start_device_login` / `poll_device_login` / `login_with_device_code` are not duplicated; `llm::oauth::login` runs the whole grant (and `status`/`logout` cover the other two commands) over `OAuthCredentials`, while a caller that needs the primitives uses `OpenAiOAuthClient` directly.
 - **Catalog precedence is live → cache → defaults, and never fails.** A discovery or cache-write failure is logged at `debug` and the next fallback answers (Python swallows `OpenAIAccountModelListError` / `OSError`). The individual `fetch_models`/`write_cache` calls still return typed errors for direct callers.
 - **Parsing rules are ported exactly**: entries from `models` then `data` (list or object keyed by ID with a `slug` fallback), `visibility` `hide`/`hidden` (trimmed, case-insensitive) skipped, ID from `slug`/`id`/`name`/`model`, sort by `(priority, id)` with `10_000` for absent/bool/non-numeric priority, dedupe, then append the forward-compat templates (`gpt-5.5`, `gpt-5.4-mini`, `gpt-5.4`, `gpt-5.3-codex-spark`).
 - **The cache document is Python-shaped**: `{provider, base_url, client_version, fetched_at, model_ids, payload}` (keys sorted by serde_json's default map), `model_ids` already forward-compat-extended, written through `{name}.tmp` + rename, `fetched_at` pinned by `with_fixed_time` in tests.
@@ -57,11 +57,10 @@ The model catalog talks HTTP only through `openjiuwen_common::http::HttpClient`.
 
 ## Known Gaps and Deviations
 
-- No cross-process `FileLock` (Python uses `filelock` around every auth-store read/write): writes are atomic (`tmp` + `rename`, `0600` on unix) and last-writer-wins, the limitation `llm::oauth` already documents.
 - The stored `auth_mode` marker is `openai_account_oauth` (what `llm::oauth` writes), not Python's `openai_account`; the `tokens` payload itself round-trips with Python.
 - Python's `now`/`sleep`/`transport` injection points are represented by `with_fixed_time` and `with_http_client`; `max_retries` and `verify`/`proxy` live on `HttpClientConfig`.
 - The catalog supports only the synchronous-equivalent request path: no `asyncio.to_thread` wrapper is needed because the Rust client is async.
-- No `Error::Unsupported` is emitted by this subtree: every deferred Python capability (file locking, callable injection, unknown kwargs) is either replaced by an explicit seam or outside the public surface.
+- No `Error::Unsupported` is emitted by this subtree: every deferred Python capability (callable injection, unknown kwargs) is either replaced by an explicit seam or outside the public surface. The auth-store lock itself lives in `llm::oauth` and is unix-only there.
 
 ## Test Strategy
 

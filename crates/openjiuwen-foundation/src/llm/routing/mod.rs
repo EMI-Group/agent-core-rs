@@ -5,7 +5,7 @@
 //! Nothing here reads a database, a configuration file, or the network while
 //! compiling; resolving a selection id into routes stays in the calling layer.
 //!
-//! Three layers, each independently usable:
+//! Four layers, each independently usable:
 //!
 //! 1. **Schema** — [`ResolvedModel`], [`ResolvedRoute`], [`ResolvedModelGroup`],
 //!    [`ResolvedRoutingConfig`], and [`CompiledModelSelection`] are plain
@@ -19,6 +19,10 @@
 //!    [`Model`](crate::llm::model::Model) over the enabled routes of a group:
 //!    ordered failover, tag pinning, and streaming that only fails over before the
 //!    first chunk reaches the caller.
+//! 4. **Limits** — [`RateLimiter`] enforces the per-route `rpm`/`tpm` budgets over
+//!    a rolling [`RATE_LIMIT_WINDOW`], keyed by provider/model and driven by an
+//!    injected [`Clock`]; [`RoutingModel`] additionally bounds every attempt with
+//!    the route/group `timeout_seconds`.
 //!
 //! ```
 //! use openjiuwen_foundation::llm::routing::{
@@ -43,21 +47,24 @@
 //!
 //! Documented gaps (see the crate `docs/PARITY.md` for the parity matrix):
 //!
-//! - No TPM/RPM throttling: [`ResolvedRoute::tpm`] and [`ResolvedRoute::rpm`] are
-//!   recorded but not enforced, and there is no cross-request circuit breaker or
-//!   cooldown state;
+//! - No cross-request circuit breaker or cooldown state: TPM/RPM budgets are
+//!   enforced per routing-model instance, and a failing route is skipped only by
+//!   the retry policy of the current call;
 //! - No tag-based cost/latency scoring: `tag-filtered` is a filter, not a scorer;
 //! - An unknown strategy name is rejected by [`compile_model_selection`], while
 //!   [`RoutingModel`] treats a [`RoutingStrategy::Custom`] name as
-//!   `ordered-failover`;
-//! - The group `timeout_seconds` is recorded in the compiled plan but not enforced.
+//!   `ordered-failover`.
 pub mod compiler;
+pub mod limit;
 pub mod model;
 pub mod schema;
 
 pub use compiler::{
     compile_model_selection, compile_route, merge_request_defaults, resolve_model_group_routes,
     INTELLI_ROUTER_PROVIDER, ROUTING_PLAN_KEY,
+};
+pub use limit::{
+    Clock, LimitKey, Limits, RateLimiter, Reservation, SystemClock, WindowUsage, RATE_LIMIT_WINDOW,
 };
 pub use model::{is_retryable_failure, RoutingModel};
 pub use schema::{

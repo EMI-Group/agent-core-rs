@@ -1,9 +1,10 @@
 //! Anthropic Messages transport.
 //!
 //! Handles the Anthropic-specific message projection (system hoisting,
-//! `tool_use`/`tool_result` blocks, base64/URL images, content-block cache
-//! breakpoints) and the event-oriented SSE stream. Request, response, and stream
-//! conversion live in the private submodules and are re-exported from here.
+//! `tool_use`/`tool_result` blocks, preserved extended-thinking blocks,
+//! base64/URL images, content-block cache breakpoints) and the event-oriented
+//! SSE stream. Request, response, and stream conversion live in the private
+//! submodules and are re-exported from here.
 
 mod cache;
 mod convert;
@@ -17,7 +18,7 @@ pub use request::{
     build_messages_body, build_messages_body_with_endpoint, build_messages_body_with_provider,
     normalize_api_base,
 };
-pub use response::{parse_anthropic_usage, parse_messages_response};
+pub use response::{parse_anthropic_usage, parse_messages_response, THINKING_BLOCKS_METADATA_KEY};
 pub use stream::AnthropicStreamState;
 
 use std::time::Duration;
