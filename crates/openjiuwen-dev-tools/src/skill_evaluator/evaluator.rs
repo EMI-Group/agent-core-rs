@@ -53,6 +53,12 @@ pub struct EvaluatorConfig {
     /// Weight applied to the functional pass rate.
     pub functional_weight: f64,
     /// Fraction of the safety score required to keep the gate open.
+    ///
+    /// Consumed by both paths: [`evaluate_at`](SkillEvaluator::evaluate_at)
+    /// passes it to the deterministic scan, and
+    /// [`evaluate_with_judge_at`](SkillEvaluator::evaluate_with_judge_at) hands it
+    /// to the judge, so a judged run reports this fraction in
+    /// `SafetyReport::gate_threshold` and gates on it.
     pub safety_gate_threshold: f64,
     /// Regex rules scanned against the rendered skill document.
     pub safety_rules: Vec<SafetyRule>,
@@ -242,11 +248,16 @@ impl SkillEvaluator {
     /// degraded judgement stays visible in the persisted report. A safety rule
     /// hit always closes the gate, whatever the model answers.
     ///
+    /// The safety stage gates on
+    /// [`EvaluatorConfig::safety_gate_threshold`], so the configured fraction is
+    /// the one reported in the safety report's `gate_threshold` and the one the
+    /// judged gate applies — the same fraction the deterministic path uses.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::validation`] when no judge is configured or the skill,
-    /// a case, or a safety rule is invalid, and propagates the runner's and the
-    /// judge's own errors.
+    /// Returns [`Error::validation`] when no judge is configured, the skill, a
+    /// case, a safety rule, or the configured safety gate threshold is invalid,
+    /// and propagates the runner's and the judge's own errors.
     pub async fn evaluate_with_judge_at(
         &self,
         skill: &SkillDefinition,
@@ -262,7 +273,13 @@ impl SkillEvaluator {
 
         let functional = self.functional_report(skill, cases, timestamp_ms).await?;
         let design = judge.design(skill).await?;
-        let safety = judge.safety(skill, &self.config.safety_rules).await?;
+        let safety = judge
+            .safety_with_threshold(
+                skill,
+                &self.config.safety_rules,
+                self.config.safety_gate_threshold,
+            )
+            .await?;
         let final_score = aggregate(
             &design.report,
             &functional,
@@ -805,5 +822,108 @@ mod tests {
         let back: EvaluationReport =
             serde_json::from_str(&report.to_json_string().expect("json")).expect("deserialize");
         assert_eq!(back, report);
+    }
+
+    /// A rule that matches the demo skill body with a non-critical severity.
+    fn warning_rule() -> SafetyRule {
+        SafetyRule::new(
+            "demo",
+            "d3_data_handling",
+            "warning",
+            "mentions the skill name",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_judged_run_honours_the_configured_safety_gate() {
+        let config = EvaluatorConfig {
+            safety_gate_threshold: 0.90,
+            ..EvaluatorConfig::default()
+        };
+        let raised = judged_evaluator([
+            ScriptedTurn::text(fenced_verdict(0.8, true)),
+            ScriptedTurn::text(fenced_verdict(0.875, true)),
+        ])
+        .with_config(config)
+        .evaluate_with_judge_at(&skill(), &[passing_case("case-1", "alpha")], 1)
+        .await
+        .expect("judge");
+
+        assert!((raised.safety.score_pct - 0.875).abs() < 1e-9);
+        assert!(raised.safety.blocked);
+        assert!((raised.safety.gate_threshold - 0.9).abs() < 1e-9);
+        assert_eq!(raised.final_score.pipeline_status, PIPELINE_BLOCKED_AT_E3);
+
+        let defaulted = judged_evaluator([
+            ScriptedTurn::text(fenced_verdict(0.8, true)),
+            ScriptedTurn::text(fenced_verdict(0.875, true)),
+        ])
+        .evaluate_with_judge_at(&skill(), &[passing_case("case-1", "alpha")], 1)
+        .await
+        .expect("judge");
+
+        assert!(!defaulted.safety.blocked);
+        assert!((defaulted.safety.gate_threshold - 0.8).abs() < 1e-9);
+        assert_eq!(defaulted.final_score.pipeline_status, PIPELINE_COMPLETED);
+    }
+
+    #[tokio::test]
+    async fn the_deterministic_and_judged_paths_share_the_configured_gate() {
+        for (threshold, blocked, status) in [
+            (0.70, false, PIPELINE_COMPLETED),
+            (0.90, true, PIPELINE_BLOCKED_AT_E3),
+        ] {
+            let config = EvaluatorConfig {
+                safety_gate_threshold: threshold,
+                safety_rules: vec![warning_rule()],
+                ..EvaluatorConfig::default()
+            };
+
+            let deterministic = evaluator(&[("case-1", "alpha answer")])
+                .with_config(config.clone())
+                .evaluate_at(&skill(), &[passing_case("case-1", "alpha")], 1)
+                .await
+                .expect("evaluate");
+            assert!((deterministic.safety.score_pct - 0.75).abs() < 1e-9);
+            assert_eq!(deterministic.safety.blocked, blocked, "{threshold}");
+            assert!((deterministic.safety.gate_threshold - threshold).abs() < 1e-9);
+            assert_eq!(deterministic.final_score.pipeline_status, status);
+
+            let judged = judged_evaluator([
+                ScriptedTurn::text(fenced_verdict(0.8, true)),
+                ScriptedTurn::text(fenced_verdict(1.0, true)),
+            ])
+            .with_config(config)
+            .evaluate_with_judge_at(&skill(), &[passing_case("case-1", "alpha")], 1)
+            .await
+            .expect("judge");
+            assert!((judged.safety.score_pct - 0.75).abs() < 1e-9);
+            assert_eq!(judged.safety.blocked, blocked, "{threshold}");
+            assert!((judged.safety.gate_threshold - threshold).abs() < 1e-9);
+            assert_eq!(judged.final_score.pipeline_status, status);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_configured_gate_threshold_is_a_validation_error() {
+        let config = EvaluatorConfig {
+            safety_gate_threshold: 1.5,
+            ..EvaluatorConfig::default()
+        };
+        let evaluator = judged_evaluator([
+            ScriptedTurn::text(fenced_verdict(0.8, true)),
+            ScriptedTurn::text(fenced_verdict(1.0, true)),
+        ])
+        .with_config(config);
+
+        let error = evaluator
+            .evaluate_with_judge_at(&skill(), &[passing_case("case-1", "alpha")], 1)
+            .await
+            .expect_err("invalid threshold");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(
+            error.to_string().contains("safety gate threshold"),
+            "{error}"
+        );
     }
 }
