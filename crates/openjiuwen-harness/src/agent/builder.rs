@@ -30,17 +30,18 @@ use crate::prompts::{
     workspace_section, HarnessPromptBuilder, PromptCategory, PromptSection, SectionName,
 };
 use crate::rails::{
-    HarnessRail, HarnessRailRegistry, MemoryRail, MemoryRecall, MemoryWriteBack, SubagentRail,
+    HarnessRail, HarnessRailRegistry, MemoryRail, MemoryRecall, MemoryWriteBack, SubAgentSpawner,
+    SubagentRail,
 };
 use crate::schema::{
     resolve_inner_react_max_iterations, AgentMode, DeepAgentConfig, PlanModeState,
 };
-use crate::subagents::SubAgentFactory;
+use crate::subagents::{RuntimeSubAgentSpawner, SubAgentFactory};
 use crate::task_loop::LoopQueues;
 use crate::tools::{ToolRegistry, UserAsker};
 use crate::workspace::Workspace;
 
-use super::factory::{default_goal_rail, is_goal_tool_name, GOAL_RAIL_NAME};
+use super::factory::{default_goal_rail, is_goal_tool_name, GOAL_RAIL_NAME, SUBAGENT_RAIL_NAME};
 use super::prompt_rail::{PromptRail, PromptState};
 use super::rail_events::{RailEventBus, RailEventDrain};
 use super::{subagent_factory, DeepAgent, Driver};
@@ -271,9 +272,22 @@ impl DeepAgentBuilder {
                     .with_write_back(write_back),
             ));
         }
-        if mounts_subagents {
-            rails.register(Arc::new(SubagentRail::new()));
-        }
+        // The default subagent rail carries the production spawner over the runtime built
+        // above; a caller rail named `subagent` wins and keeps its own seam.
+        let subagent_spawner: Option<Arc<dyn SubAgentSpawner>> = match (
+            &subagent_runtime,
+            caller_names.contains(&SUBAGENT_RAIL_NAME),
+        ) {
+            (Some(runtime), false) => {
+                let spawner: Arc<dyn SubAgentSpawner> =
+                    Arc::new(RuntimeSubAgentSpawner::new(Arc::clone(runtime)));
+                rails.register(Arc::new(
+                    SubagentRail::new().with_spawner(Arc::clone(&spawner)),
+                ));
+                Some(spawner)
+            }
+            _ => None,
+        };
         if cards.iter().any(|card| is_goal_tool_name(&card.name))
             && !caller_names.contains(&GOAL_RAIL_NAME)
         {
@@ -306,6 +320,7 @@ impl DeepAgentBuilder {
             permission_host: permission_host
                 .unwrap_or_else(|| Arc::new(crate::permission::NoopPermissionHost)),
             subagent_runtime: Arc::new(RwLock::new(subagent_runtime)),
+            subagent_spawner,
             model: model_slot,
             initialized: Arc::new(std::sync::atomic::AtomicBool::new(initialized)),
             wired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
