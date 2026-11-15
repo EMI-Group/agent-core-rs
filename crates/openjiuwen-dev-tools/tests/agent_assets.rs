@@ -4,7 +4,8 @@
 //! an [`LlmAgentSpec`] becomes a serialized [`LlmAgentDsl`], that document
 //! survives JSON and is bridged into an `openjiuwen_agent::LlmAgent`; the
 //! session-based [`AgentBuilder`] drives the same document through a model round
-//! trip, falling back to a clarifying response, and keeps sessions isolated.
+//! trip, falling back to a clarifying response, and keeps sessions isolated; a
+//! [`WorkflowSpec`] converts into a validated [`WorkflowDsl`].
 //!
 //! Everything runs offline and deterministically on
 //! [`openjiuwen_test_support::ScriptedModel`]; ids and timestamps are explicit.
