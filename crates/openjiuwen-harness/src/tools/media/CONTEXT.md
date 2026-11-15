@@ -14,7 +14,7 @@ Upper layers only see the two tools and the dispatch functions; the per-format p
 
 - `image::TOOL_NAME = "image_metadata"`; `ImageMetadataArgs { image_path: String }` with aliases `path`, `file_path`, `image_path_or_url` and `#[serde(default)]`; `ImageMetadataTool` — `new(env: ToolEnv, language: impl Into<String>)`, `card_for(language: &str) -> ToolCard` (impl `Tool`); card `required = ["image_path"]`.
 - `audio::TOOL_NAME = "audio_metadata"`; `AudioMetadataArgs { audio_path: String }` with aliases `path`, `file_path`, `audio_path_or_url`; `AudioMetadataTool` — `new(env, language)`, `card_for(language) -> ToolCard`; card `required = ["audio_path"]`.
-- Both resolve the model path through `ToolEnv::resolve_path(TOOL_NAME, "<field>", raw, &args)` like `read_file`, check `ToolContext::check_cancelled`, then read the resolved file with `tokio::fs` (size gate [`MAX_MEDIA_BYTES`]).
+- Both resolve the model path through `ToolEnv::resolve_path(TOOL_NAME, "<field>", raw, &args)` like `read_file`, check `ToolContext::check_cancelled`, then read the resolved file with `tokio::fs` (size gate [`MAX_MEDIA_BYTES`], 256 MiB).
 - Success payload: `data = {kind: "image"|"audio", format, byte_size, ...format fields}`; failure payload: `success=false` with `error` text such as `unsupported image format: XXXX`, `truncated PNG header: IHDR is incomplete`, `empty file: no audio header bytes`.
 - `parse_image_header(&[u8]) -> ParseResult<ImageMetadata>` and `parse_audio_header(&[u8]) -> ParseResult<AudioMetadata>` do the magic-byte dispatch; `ImageMetadata`/`AudioMetadata` expose `format()`, `width()`/`height()` (image), `sample_rate()`/`channels()`/`duration_ms()` (audio), and `to_data(byte_size) -> Value`.
 - `audio::duration_seconds(ms: u64) -> f64` renders the Python `duration_seconds` field (two decimals).
@@ -70,7 +70,7 @@ Upper layers only see the two tools and the dispatch functions; the per-format p
 
 ## Routing Table
 
-- `./mod.rs` → module docs, module declarations, flat re-exports, `MAX_MEDIA_BYTES`, `read_media_bytes`, `require_field`
+- `./mod.rs` → module docs, module declarations, flat re-exports, `MAX_MEDIA_BYTES` (256 MiB), `read_media_bytes`, `require_field`
 - `./parse.rs` → `MediaKind`, `Failure`, `ParseResult`, `Cursor`, endian helpers, `fourcc`
 - `./image.rs` → `image_metadata` tool, `ImageMetadataArgs`, `ImageMetadata` dispatch and payload
 - `./image/png.rs` → PNG `IHDR` + `tRNS`/`acTL` walk

@@ -57,6 +57,7 @@ Eviction scheduler (`runtime/scheduler.rs`, re-exported flat): `EvictionSchedule
   - `subagent_resume`: `subagent_id` -> `{subagent_id, status, restored}` plus `message` when present.
 - `subagent_transcript` (`SubagentTranscriptTool`, Rust-only extension): `subagent_id` (required), `limit` (integer, default 20, clamped `1..=200`), `after_seq` (integer, default 0) -> `{subagent_id, status, activity, entries, count, total, dropped, last_kind, has_more}`.
 - `subagent_tools(runtime)` returns the six parity tools (spawn, wait, list, send_input, close, resume) — a crate-root test asserts that exact list; `subagent_tools_with_transcript(runtime)` returns seven in order spawn, wait, list, transcript, send_input, close, resume.
+- The complete model-facing name set mounted on a `DeepAgent` from this module is exactly eight cards: `task_tool`, `subagent_spawn`, `subagent_wait`, `subagent_list`, `subagent_transcript`, `subagent_send_input`, `subagent_close`, `subagent_resume` (`TaskTool`'s card name is exactly `task_tool`, never `task`); there is no `subagent_create`, `subagent_status` or `subagent_cancel`.
 
 ## Constraints
 
