@@ -63,7 +63,7 @@ External (`external`):
 - Local backends live under a caller-provided root path and never touch paths outside it; collection/bucket/key names are validated as safe single segments where they become paths.
 - `sqlite` code is `#[cfg(feature = "sqlite")]`; default builds and `--no-default-features` must not require `sqlx`.
 - No blocking std I/O on async paths: backends use `tokio::fs`; in-memory state is guarded by `parking_lot::Mutex`, file backends by a `tokio::sync::Mutex` writer lock.
-- External adapters send every HTTP request through `openjiuwen_common::http::HttpClient` and speak RESP2 over a raw `tokio::net::TcpStream` for Redis: no vendor SDK and no new crate dependency.
+- External adapters send every HTTP request through `openjiuwen_common::http::HttpClient` and speak RESP2 over a raw `tokio::net::TcpStream` for Redis (wrapped in `tokio-rustls` for `rediss://`): no vendor SDK and no vendor HTTP client.
 - External adapters are always compiled — their dependencies are plain, non-optional crate dependencies — so only the `sqlite` branches are feature-gated.
 - External tests are offline like the rest: `wiremock` servers for HTTP, a scripted `TcpListener` for Redis, known-answer vectors for the S3 signer.
 - Files stay ≤1000 lines; every public item is documented; no `unsafe`; no `unwrap`/`expect` outside tests.
@@ -98,6 +98,7 @@ External (`external`):
   Elasticsearch `_score` is used as-is and clamped into `[0, 1]`; every adapter clamps.
 - **Redis value encoding**: `KvValue::Text` is stored as raw UTF-8 and `KvValue::Bytes` as the ASCII marker `\0ojb:` plus standard base64, so text can never collide with bytes; a non-UTF-8 payload without the marker decodes as `Bytes` (lossless fallback, never a lossy replacement).
 - **Redis reconnect rule**: at most one transparent reconnect per command — always for a failure before or while writing, and only for the read-only `PING`/`GET`/`MGET`/`EXISTS`/`SCAN` when the reply was lost, because replaying a mutating command could apply it twice.
+- **Redis TLS follows the URL scheme**: `rediss://` (or `with_tls(true)`) wraps the socket in a `tokio-rustls` client that trusts the webpki roots only; an explicit `addr` never clears TLS, so a `rediss://` URL is never silently downgraded, while custom CA bundles, pinning and skip-verify are deliberately absent (`external/redis/CONTEXT.md`).
 - **S3 Signature V4 in-crate**: `s3::sigv4` derives SigV4 from `sha2` with hand-written hex/base64 helpers (no `hmac`/`hex` crate) and takes an explicit `now`, so signatures are reproducible in tests.
   Requests are path-style by default and virtual-host when `path_style = false`; a 404 on `GET`/`HEAD`/`DELETE` is tolerated as "absent" because S3 cannot tell a missing bucket from a missing key.
 - **Registry globals**: the plugin maps behind `register_*_backend` are the one documented mutable global of this subtree; `global_registry()` exposes them and `StoreRegistry::new()` builds an isolated instance over per-instance maps for tests.
@@ -107,10 +108,10 @@ External (`external`):
 
 - PostgreSQL/pgvector and Gauss vector backends are deferred: `pgvector`, `postgres` and `gauss`/`gaussvector` are recognized registry names whose construction returns `Error::Unsupported` with the missing-driver reason.
 - No external graph store exists: the `Graph` family registers only `memory` and `file`/`local`, and a spec naming any other backend fails rather than degrading.
-- Redis has no TLS (`rediss://` → `Unsupported`) and no cluster/pool support: commands are serialized behind one connection mutex.
-- Elasticsearch document `query`/`count`/`delete` with an untranslatable filter fall back to a bounded local scan over at most 10 000 documents, and `limit: None` uses that same 10 000-result window.
-- Milvus insert cannot detect a duplicate primary key locally (insert is an append); only a service-side duplicate maps to `Validation`.
-- Chroma keeps one embedding per record and scalar-only metadata, so multi-vector schemas and JSON/array fields are rejected, and a collection created outside this store (no `schema_metadata_key`) cannot be read.
+- Redis has no cluster/Sentinel or connection-pool support (commands serialize behind one connection mutex), but `rediss://` TLS works through `tokio-rustls` with the webpki roots only — no custom CA, pinning or skip-verify.
+- Elasticsearch document `query`/`count`/`delete` page with `search_after` (`SEARCH_PAGE_SIZE` 500) and fail with `Unsupported` once a read would exceed `MAX_SCAN_DOCUMENTS` (10 000); they never return a truncated list, and an untranslatable filter warns before taking the local scan.
+- Milvus `add_docs` detects duplicate primary keys with a pre-insert `entities/query` probe and returns `Validation` naming them; `MilvusConfig::reject_duplicate_primary_keys = false` restores the service's append semantics.
+- Chroma keeps one embedding per record and scalar-only metadata, so multi-vector schemas and JSON/array fields are rejected, and a schema is read from the Python `schema`/`fields` metadata keys or the legacy `schema_metadata_key` (a collection carrying none of them cannot be read).
 - S3 cannot distinguish a missing bucket from a missing key on `GET`/`HEAD`/`DELETE`, so both read as "absent".
 
 ## Routing Table
