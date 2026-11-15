@@ -370,11 +370,16 @@ impl Runner {
     /// The human-in-the-loop hub every execution path registers on.
     ///
     /// The returned `Arc` is a cheap snapshot of the currently installed seam.
-    /// Use it to list the live runs, pause/resume/cancel a registered run, and
-    /// answer the interaction requests a run published; the facade shortcuts over
-    /// it are [`Runner::interact_agent_team`] and [`Runner::answer_interaction`].
-    /// [`Runner::set_hitl`] replaces the installed hub (a snapshot taken earlier
-    /// keeps addressing the retired one).
+    /// Use it to list the live runs, answer their interactions, and cancel a
+    /// registered run; the facade shortcuts over it are
+    /// [`Runner::interact_agent_team`] and [`Runner::answer_interaction`].
+    /// Pausing and resuming are **not** available: a live invocation owns no
+    /// suspension seam, so [`InteractionHub::pause`] and [`InteractionHub::resume`]
+    /// (and the [`Runner::pause_agent_team`]/[`Runner::resume_agent_team`]
+    /// shortcuts) answer a typed `Error::Unsupported` instead of flipping a state
+    /// Python's deferred `InteractGate` would honour. [`Runner::set_hitl`] replaces
+    /// the installed hub (a snapshot taken earlier keeps addressing the retired
+    /// one).
     #[must_use]
     pub fn hitl(&self) -> Arc<InteractionHub> {
         Arc::clone(&self.hitl.read())
@@ -692,8 +697,8 @@ impl Runner {
     /// [`crate::pool::TeamPool::start`], which keys it by
     /// `(team name, session id)`, bounds how many runs are in flight, owns the
     /// monitor and hub registration for it, and returns before the worker's first
-    /// poll. The handle can be awaited ([`PoolRun::wait`]), subscribed to, paused,
-    /// or cancelled; [`Runner::list_active_teams`] lists the live ones.
+    /// poll. The handle can be awaited ([`PoolRun::wait`]), subscribed to, or
+    /// cancelled; [`Runner::list_active_teams`] lists the live ones.
     ///
     /// The session id is derived by the pool from `inputs["conversation_id"]`,
     /// then [`RunOptions::session_id`], then

@@ -86,8 +86,11 @@ impl Runner {
     /// runs keep being addressable through it; they are not migrated. Runs
     /// already in flight likewise keep the hub they were admitted with. The
     /// facade's HITL shortcuts ([`Runner::interact_agent_team`],
-    /// [`Runner::answer_interaction`], [`Runner::pause_agent_team`], …) address
-    /// the installed hub, so they see the new registrations only.
+    /// [`Runner::answer_interaction`]) address the installed hub, so they see the
+    /// new registrations only. The team controls ([`Runner::pause_agent_team`],
+    /// [`Runner::resume_agent_team`]) are not addressed here at all: they go
+    /// through the installed team pool, and they refuse a live run with a typed
+    /// `Error::Unsupported`.
     pub fn set_hitl(&self, hub: Arc<InteractionHub>) -> Arc<InteractionHub> {
         let previous = std::mem::replace(&mut *self.hitl.write(), hub);
         tracing::debug!(

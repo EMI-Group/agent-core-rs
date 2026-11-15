@@ -386,9 +386,10 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - `./src/spawn/external.rs` → `ExternalCommandSpawner` (command resolution on a search path / `PATH`, executable checks, delegation to the subprocess backend)
 - `./src/spawn/in_process.rs` → `InProcessHandler`, `InProcessFactory`, `InProcessSpawner`, `InProcessAgent` (host-bound agent, no child)
 - `./src/spawn/registry.rs` → `SpawnerRegistry` (multi-backend routing), `DeferredSpawner` (the wording table for undeferrable/undeferred backends)
-- `./src/spawn/monitored.rs` → `MonitoredSpawnedAgent` (lifecycle into `RunMonitor` as `RunKind::Spawn`: admission, health observation, dead-child terminal rule, shutdown/kill/drop) and its unit tests
+- `./src/spawn/monitored.rs` → `MonitoredSpawnedAgent` (lifecycle into `RunMonitor` as `RunKind::Spawn`: admission, health observation, dead-child terminal rule, shutdown/kill/drop) plus the supervision it owns (`SpawnWatch`, `ProbeMode`, `HealthSupervisor`, `SupervisedLoop`, `supervised_health_loop`, `observed_stream`)
 - `./src/spawn/mod_tests.rs` → inline unit tests of `mod.rs` (loaded via `#[path]`): wire names, `SpawnHealth`, `SpawnSpec::backend`, the defaulted accessors
 - `./src/spawn/subprocess_tests.rs` → inline unit tests of `subprocess.rs` (loaded via `#[path]`)
+- `./src/spawn/monitored_tests.rs` → inline unit tests of `monitored.rs` (loaded via `#[path]`): admission/observation/terminal transitions, the fully forwarded seam surface and its bounded deadlines, and the supervised health cadence (re-tune, zero, stop paths)
 - `./src/spawn/remote.rs` → `RemoteAgentConfig`, `RemoteProtocol`, `RemoteClient`, the `RemoteAgent` lifecycle, `create_remote_client`, `RemoteSpawner`, URL building, spawn-time validation
 - `./src/spawn/remote_io.rs` → the HTTP transport of that backend: client construction, request body, invoke/stream/cancel execution, status mapping, NDJSON stream parsing
 - `./src/spawn/remote_tests.rs` → inline unit tests of `remote.rs` (loaded via `#[path]`)
