@@ -10,9 +10,17 @@
 //!   by the vector store (Python has no equivalent no-op reranker).
 //! - [`LlmReranker`] — adapter over the [`LlmScorer`] seam; a `Model`-backed
 //!   scorer lives in an upper crate so this crate never depends upward.
+//!
+//! [`DashScopeReranker`] is the typed seam for Python's hosted `DashScope`
+//! reranker: it validates a [`crate::common::RerankerConfig`] and reports
+//! `Error::Unsupported` from [`Reranker::rerank`] because the vendor transport is
+//! not ported, rather than silently ignoring the configuration.
 
+mod dashscope;
 mod llm;
 mod score;
+
+pub use dashscope::{DashScopeReranker, DASHSCOPE_RERANK_PATH};
 
 pub use llm::{LlmReranker, LlmScorer};
 pub use score::ScoreReranker;

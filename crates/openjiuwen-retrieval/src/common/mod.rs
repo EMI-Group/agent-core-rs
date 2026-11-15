@@ -10,10 +10,10 @@ pub mod filter;
 pub mod result;
 
 pub use config::{
-    EmbeddingConfig, IndexConfig, KnowledgeBaseConfig, RerankerConfig, RetrievalConfig,
-    VectorStoreConfig, DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, DEFAULT_DISTANCE_METRIC,
-    DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_TIMEOUT, DEFAULT_TOP_K, INDEX_TYPE_BM25,
-    INDEX_TYPE_HYBRID, INDEX_TYPE_VECTOR,
+    parse_index_type, EmbeddingConfig, IndexConfig, KnowledgeBaseConfig, RerankerConfig,
+    RetrievalConfig, VectorStoreConfig, DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
+    DEFAULT_DISTANCE_METRIC, DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_TIMEOUT,
+    DEFAULT_TOP_K, INDEX_TYPE_BM25, INDEX_TYPE_HYBRID, INDEX_TYPE_VECTOR,
 };
 pub use document::{Document, Metadata, TextChunk};
 pub use filter::MetadataFilter;

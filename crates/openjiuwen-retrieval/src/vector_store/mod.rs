@@ -199,16 +199,14 @@ impl VectorStoreRegistry {
     /// Creates a registry with the offline in-memory providers registered.
     ///
     /// The names `"memory"` and `"in_memory"` both construct
-    /// [`InMemoryVectorStore`] using `VectorStoreConfig::collection_name`.
+    /// [`InMemoryVectorStore`] through [`InMemoryVectorStore::from_config`], so
+    /// `collection_name` names the store while `database_name` and a
+    /// non-`cosine` `distance_metric` surface as [`Error::Config`] instead of
+    /// being ignored.
     pub fn with_builtin() -> Self {
         let mut registry = Self::new();
         let factory: VectorStoreFactory = Arc::new(|config| {
-            let store = if config.collection_name.trim().is_empty() {
-                InMemoryVectorStore::new()
-            } else {
-                InMemoryVectorStore::with_collection(config.collection_name.clone())
-            };
-            Ok(Arc::new(store) as Arc<dyn VectorStore>)
+            Ok(Arc::new(InMemoryVectorStore::from_config(config)?) as Arc<dyn VectorStore>)
         });
         // The two names are distinct string keys; registering twice cannot fail.
         let _ = registry.register("memory", Arc::clone(&factory));

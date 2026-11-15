@@ -33,8 +33,8 @@ use openjiuwen_common::logging::warn;
 
 use crate::chunking::{CharChunker, Chunker};
 use crate::common::{
-    Document, KnowledgeBaseConfig, MetadataFilter, RetrievalConfig, RetrievalResult, TextChunk,
-    INDEX_TYPE_BM25,
+    parse_index_type, Document, IndexConfig, KnowledgeBaseConfig, MetadataFilter, RetrievalConfig,
+    RetrievalResult, TextChunk, INDEX_TYPE_BM25,
 };
 use crate::embedding::Embedding;
 use crate::graph::{GraphStore, RuleTripleExtractor};
@@ -158,16 +158,43 @@ impl SimpleKnowledgeBase {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] when `config.chunk_size`/`chunk_overlap` do
-    /// not describe a valid window, wrapped with the `"building chunker"` context.
+    /// Returns [`Error::Config`] when `config.index_type` is unknown, and
+    /// [`Error::Validation`] when `config.chunk_size`/`chunk_overlap` do not
+    /// describe a valid window, wrapped with the `"building chunker"` context.
     pub fn from_config(
         config: KnowledgeBaseConfig,
         store: Arc<dyn VectorStore>,
         embedder: Arc<dyn Embedding>,
     ) -> Result<Self> {
+        config
+            .validate()
+            .map_err(|error| error.with_context("validating knowledge base configuration"))?;
         let chunker = CharChunker::new(config.chunk_size, config.chunk_overlap)
             .map_err(|error| error.with_context("building chunker"))?;
         Ok(Self::new(config, store, embedder, Arc::new(chunker)))
+    }
+
+    /// Builds a knowledge base from an [`IndexConfig`], Python's index-level config.
+    ///
+    /// `index_name` becomes the knowledge base id, `index_type` selects the
+    /// retrieval channel, and `use_caption_for_images` carries the image
+    /// embedding policy into the pipeline; chunking keeps the Python defaults.
+    /// Every [`IndexConfig`] field is therefore honored instead of being accepted
+    /// and dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when `index_name` is blank or `index_type` is
+    /// unknown (see [`IndexConfig::validate`]).
+    pub fn from_index_config(
+        index: &IndexConfig,
+        store: Arc<dyn VectorStore>,
+        embedder: Arc<dyn Embedding>,
+    ) -> Result<Self> {
+        index
+            .validate()
+            .map_err(|error| error.with_context("validating index configuration"))?;
+        Self::from_config(index.to_knowledge_base_config(), store, embedder)
     }
 
     /// Attaches a reranker applied to every search result set.
@@ -294,6 +321,12 @@ impl SimpleKnowledgeBase {
     /// embedder's error (context `"embedding chunks"`), the store's error
     /// (context `"upserting chunks"`), or [`Error::Retrieval`] when the embedder
     /// returns a different number of vectors than chunks.
+    ///
+    /// Image documents (`modality = "image"` or a non-empty `image_path`) are
+    /// indexed from their caption text unless the embedder reports multimodal
+    /// support *and* [`KnowledgeBaseConfig::use_caption_for_images`] is `false`,
+    /// the Python `embed_multimodal` branch; that branch is not implemented, so it
+    /// returns [`Error::Unsupported`] instead of silently embedding the caption.
     // The signature takes the documents by value so blank ids can be filled in
     // place before chunking, which keeps the caller's handles untouched.
     #[allow(clippy::needless_pass_by_value)]
@@ -301,6 +334,7 @@ impl SimpleKnowledgeBase {
         if documents.is_empty() {
             return Ok(Vec::new());
         }
+        self.check_image_embedding_policy(&documents)?;
         let documents = assign_missing_ids(documents);
         let document_ids: Vec<String> = documents.iter().map(|doc| doc.id.clone()).collect();
 
@@ -587,6 +621,50 @@ impl SimpleKnowledgeBase {
             tracked.shift_remove(id);
         }
     }
+    /// Enforces [`KnowledgeBaseConfig::use_caption_for_images`].
+    ///
+    /// Python embeds image chunks as image+text when the embedder exposes
+    /// `embed_multimodal` and `use_caption_for_images` is `false`, and as
+    /// caption text otherwise. The caption branch is what this crate implements,
+    /// so a multimodal embedder combined with `use_caption_for_images = false`
+    /// is a requested capability the pipeline cannot honor: report it instead of
+    /// silently embedding the caption.
+    fn check_image_embedding_policy(&self, documents: &[Document]) -> Result<()> {
+        if self.config.use_caption_for_images || !self.embedder.supports_multimodal() {
+            return Ok(());
+        }
+        match documents
+            .iter()
+            .find(|document| is_image_document(document))
+        {
+            Some(document) => Err(Error::unsupported(format!(
+                "embedding model `{}` reports multimodal support and \
+                 use_caption_for_images is false, but image+text embedding is not \
+                 implemented; set use_caption_for_images = true to index image \
+                 document `{}` from its caption",
+                self.embedder.model_name(),
+                document.id
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+/// Whether `document` came from an image loader.
+///
+/// [`crate::multimodal::ImageLoader`] stamps `modality = "image"` and a
+/// non-empty `image_path`; either marker is enough, so a caller-built document
+/// carrying only the path is still recognized.
+fn is_image_document(document: &Document) -> bool {
+    document
+        .metadata
+        .get("modality")
+        .and_then(serde_json::Value::as_str)
+        == Some("image")
+        || document
+            .metadata
+            .get("image_path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|path| !path.trim().is_empty())
 }
 
 /// The document a stored record belongs to, from its field or its metadata.
@@ -600,8 +678,12 @@ fn record_doc_id(record: &VectorRecord) -> Option<&str> {
 }
 
 /// The initial sparse index: enabled exactly for the `bm25` index type.
+///
+/// The name is normalized with [`parse_index_type`], so `"BM25"` and `" bm25 "`
+/// enable the index too; an unknown name leaves it off and later retrieval
+/// reports the configuration error.
 fn initial_sparse_index(index_type: &str) -> Option<Arc<RwLock<Bm25Index>>> {
-    (index_type == INDEX_TYPE_BM25).then(new_sparse_index)
+    (parse_index_type(index_type).ok() == Some(INDEX_TYPE_BM25)).then(new_sparse_index)
 }
 
 /// A fresh, empty BM25 index with the default scoring parameters.

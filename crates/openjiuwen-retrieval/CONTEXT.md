@@ -6,7 +6,8 @@ Documents, chunking, embeddings, vector stores, retrievers, rerankers, query rew
 Maps to the Python package `openjiuwen.core.retrieval` (public surface in `openjiuwen/core/retrieval/__init__.py`), with the document/result/config models from `retrieval/common/` and the foundation store ABCs (`Document`, `Embedding`, `Reranker`, `VectorStore`).
 The crate is offline-first: every capability has a deterministic, dependency-free path, and model-backed behaviour is an injected seam.
 Implementations: text/JSON/Markdown/CSV/HTML/URL/image/DOCX/XLSX/PDF/PPTX/ODT loading from a path or from in-memory bytes, character/recursive/token chunking, an OpenAI-compatible embedding client plus a deterministic hash fake, an in-memory vector store with JSON persistence, BM25 sparse retrieval, dense/sparse/hybrid/graph/agentic retrievers with RRF fusion, heuristic and model-backed query rewriting, rule-based triple extraction with an in-memory graph store, multimodal document/table representation, pure-Rust DEFLATE/ZIP/XML parsing with a stored-entry ZIP writer and public document fixture builders, and a knowledge base that runs load → chunk → embed → index → retrieve → rerank.
-Remaining deferrals are external-service and ML-backed paths: Milvus/Chroma/PGVector/Elasticsearch stores, DashScope embeddings and rerankers, an LLM image captioner and LLM triple extractor (both exist only as traits/seams), multimodal *embedding* models, OCR for scanned PDFs, encrypted PDFs and PDF object streams, and PDF page ordering via the cross-reference table.
+Remaining deferrals are external-service and ML-backed paths: Milvus/Chroma/PGVector/Elasticsearch stores, DashScope embeddings (no client) and rerankers (`reranker::DashScopeReranker` validates the config and returns a typed `Unsupported`), an LLM image captioner and LLM triple extractor (both exist only as traits/seams), multimodal *embedding* models (the `Embedding::supports_multimodal` capability query is wired to `use_caption_for_images`), OCR for scanned PDFs, encrypted PDFs and PDF object streams, and PDF page ordering via the cross-reference table.
+Every configuration struct field is read by the code that owns its behaviour; a value the crate cannot honor is a typed `Error::Config`/`Error::Unsupported`, never a silent default.
 
 ## API Surface
 
@@ -78,6 +79,7 @@ A PDF with no extractable text (scanned/image-only) → `Error::Unsupported("PDF
     async fn embed_query(&self, text: &str) -> Result<Vec<f32>>;
     async fn embed_documents(&self, texts: &[String], batch_size: Option<usize>) -> Result<Vec<Vec<f32>>>;
     async fn dimension(&self) -> Result<usize> { /* hint or probe with "test" */ }
+    fn supports_multimodal(&self) -> bool { false } // all crate embedders are text-only
 }
 ```
 `HashEmbedding::new(dimension)` (`DEFAULT_HASH_DIMENSION = 64`; `0` falls back to it) — deterministic SHA-256 token hashing with mean pooling and L2 normalisation, zero vector for blank text; `with_model_name`, `dimension_size`, `Default`; used by tests.
@@ -103,12 +105,12 @@ pub struct VectorQuery { pub vector: Vec<f32>, pub top_k: usize /*5*/,
     async fn clear(&self) -> Result<()>;
 }
 ```
-`InMemoryVectorStore::new()`, `::with_collection(name)`, `::open(path)` / `::open_with_collection(path, name)` (load JSON if present, auto-persist after mutations), `persist()`; cosine similarity mapped to `(cos + 1) / 2`, descending score with insertion-order tie-break; dimension-mismatched records are skipped; filters resolve `doc_id`/`chunk_id` pseudo-fields; `search` injects them into result metadata.
+`InMemoryVectorStore::new()`, `::with_collection(name)`, `::from_config(&VectorStoreConfig)` (reads every field; rejects a non-blank `database_name` and a non-`cosine` `distance_metric` with `Error::Config`), `::open(path)` / `::open_with_collection(path, name)` (load JSON if present, auto-persist after mutations), `persist()`; cosine similarity mapped to `(cos + 1) / 2`, descending score with insertion-order tie-break; dimension-mismatched records are skipped; filters resolve `doc_id`/`chunk_id` pseudo-fields; `search` injects them into result metadata.
 Persistence JSON: `{"version":1,"name":"…","records":[…]}` written atomically (temp file + rename).
-`VectorStoreRegistry::with_builtin()` registers `"memory"`/`"in_memory"`; `create(&VectorStoreConfig)` returns `Error::Unsupported` for Milvus/Chroma/PGVector/Elasticsearch.
+`VectorStoreRegistry::with_builtin()` registers `"memory"`/`"in_memory"` and builds them through `InMemoryVectorStore::from_config` (invalid fields → `Error::Config`); `create(&VectorStoreConfig)` returns `Error::Unsupported` for Milvus/Chroma/PGVector/Elasticsearch.
 The registry's factory type is `VectorStoreFactory = Arc<dyn Fn(&VectorStoreConfig) -> Result<Arc<dyn VectorStore>> + Send + Sync>`.
 Free functions re-exported at the crate root: `cosine_similarity(a, b) -> f32` (`0.0` on empty/mismatched slices) and `normalize_cosine(cos) -> f32` (`(cos + 1) / 2`); filter pseudo-field constants `DOC_ID_FIELD = "doc_id"` and `CHUNK_ID_FIELD = "chunk_id"`.
-No distance-metric enum exists: only cosine scoring is implemented, and `VectorStoreConfig::distance_metric` is a plain `String` defaulting to `"cosine"`.
+No distance-metric enum exists: only cosine scoring is implemented, and `VectorStoreConfig::distance_metric` is a plain `String` defaulting to `"cosine"` that the in-memory store validates instead of ignoring.
 
 ### Rerankers (`reranker`)
 ```rust
@@ -119,6 +121,7 @@ No distance-metric enum exists: only cosine scoring is implemented, and `VectorS
 ```
 `ScoreReranker::new(top_n: Option<usize>)` — descending existing score, optional truncation.
 `LlmScorer` trait (`async fn score(&self, query: &str, documents: &[String]) -> Result<Vec<f32>>`) and `LlmReranker::new(Arc<dyn LlmScorer>, top_n)` — adapter seam; a `Model`-backed scorer belongs in an upper crate.
+`DashScopeReranker::new(RerankerConfig) -> Result<Self>` — validates every config field (`RerankerConfig::validate` plus `require_api_key`), exposes `config()`/`endpoint()`, and `rerank` returns a typed `Unsupported` naming the endpoint/model/timeout because the DashScope transport is deferred (Python's `DashscopeReranker` calls the hosted rerank API); `DASHSCOPE_RERANK_PATH` is the path appended to `api_base`.
 
 ### Sparse / BM25 (`sparse`)
 ```rust
@@ -225,6 +228,7 @@ pub struct SimpleKnowledgeBase { /* config, store, embedder, chunker, loader, re
 impl SimpleKnowledgeBase {
     pub fn new(config, store, embedder, chunker) -> Self;
     pub fn from_config(config, store, embedder) -> Result<Self>;
+    pub fn from_index_config(&IndexConfig, store, embedder) -> Result<Self>;
     pub fn with_reranker(self, Arc<dyn Reranker>) -> Self;
     pub fn with_loader(self, Arc<dyn DocumentLoader>) -> Self;
     pub fn with_sparse_index(self, enabled: bool) -> Self;
@@ -244,9 +248,11 @@ pub struct KnowledgeBaseStatistics { kb_id, index_type, chunk_count, document_co
 pub async fn retrieve_multi_kb(kbs, query, top_k) -> Vec<RetrievalResult>;
 pub async fn retrieve_multi_kb_with_source(kbs, query, top_k) -> Vec<MultiKBRetrievalResult>;
 ```
-`add_documents` fills empty ids, chunks, embeds, upserts `VectorRecord`s, maintains the BM25 index (when enabled) and extracts triples into the graph store (when configured), returning document ids in input order.
-`retrieve_with_config` channel selection: `vector` → dense; `bm25` → BM25 (index enabled automatically for that index type); `hybrid` + `with_sparse_index(true)` → dense+BM25 RRF; `hybrid` without a sparse index → dense (documented deviation: Python fuses by default).
+`from_config` validates the config (`KnowledgeBaseConfig::validate`, so an unknown `index_type` is `Error::Config`) before building the `CharChunker`; `from_index_config` validates an `IndexConfig` and maps `index_name` → `kb_id`, `index_type` → channel, and `use_caption_for_images` → the image policy.
+`add_documents` enforces the image embedding policy, fills empty ids, chunks, embeds, upserts `VectorRecord`s, maintains the BM25 index (when enabled) and extracts triples into the graph store (when configured), returning document ids in input order.
+`retrieve_with_config` channel selection: `vector` → dense; `bm25` → BM25 (index enabled automatically for that index type); `hybrid` + `with_sparse_index(true)` → dense+BM25 RRF; `hybrid` without a sparse index → dense with a `warn` log (documented deviation: Python fuses by default); an unknown `index_type` → `Error::Config` (never a silent dense fallback).
 `agentic` retrieval wraps the selected channel in `AgenticRetriever` with a corpus-vocabulary `HeuristicQueryRewriter` (offline) or the injected rewriter, bounded by `with_agentic_iterations`.
+`use_caption_for_images`: image documents (`modality = "image"` or a non-empty `image_path`) are indexed from their caption for text-only embedders and when the flag is `true`; `false` plus an embedder whose `Embedding::supports_multimodal()` is `true` returns a typed `Unsupported` (image+text embedding is not implemented) before chunking.
 `use_graph`/`graph_expansion` with a configured graph store routes through `GraphRetriever`; without one they log a `warn` and fall back to the plain channel.
 The reranker (when attached) runs after retrieval and before `top_k` truncation; `delete_documents` removes vector and BM25 entries but leaves extracted triples in the graph store (documented).
 `retrieve_multi_kb*` dedupe by text, keep max score, sort descending, and attach sorted/deduped `kb_ids` plus `raw_score`/`raw_score_scaled` metadata.
@@ -256,7 +262,7 @@ The reranker (when attached) runs after retrieval and before `top_k` truncation;
 - Depends only on `openjiuwen-common` (shared `Error`/`Result`, `http`, `security::SecretString`, `logging`) plus serde/tokio/async-trait/futures/uuid/regex/sha2/parking_lot/url/indexmap/base64; no `openjiuwen-foundation` dependency (embeddings use `openjiuwen_common::http` with a local `EmbeddingConfig`; documented deviation).
 - `#![forbid(unsafe_code)]`; async via `async_trait`/tokio; no blocking I/O inside async methods (`tokio::fs` for persistence and file reading).
 - Every public data type: serde snake_case, defaults for missing collection fields, unknown fields tolerated; `Document`/`TextChunk`/results/triples round-trip with Python field names.
-- Errors: `openjiuwen_common::error::{Error, Result}`; no panics on user input; invalid sizes/overlaps/inputs/modes → `Error::Validation`; missing files → `Error::NotFound`; unsupported formats/filters/providers/PDF variants → `Error::Unsupported`; store/embedding/network/parse failures → `Error::Retrieval`/`Error::Transport`/`Error::Timeout`.
+- Errors: `openjiuwen_common::error::{Error, Result}`; no panics on user input; invalid sizes/overlaps/inputs/modes → `Error::Validation`; configuration values the backend cannot honor (unknown `index_type`, non-`cosine` metric, `database_name` on the in-memory store, out-of-range reranker parameters) → `Error::Config`; missing files → `Error::NotFound`; unsupported formats/filters/providers/PDF variants and deferred capabilities → `Error::Unsupported`; store/embedding/network/parse failures → `Error::Retrieval`/`Error::Transport`/`Error::Timeout`.
 - Logging: `tracing` (`openjiuwen_common::logging` re-exports); libraries never use `println!`/`eprintln!`.
 - Files ≤900-1000 lines; one responsibility per file; shared helpers live in the lowest module that needs them (`parsing/inflate/tests.rs` and `vector_store/memory/tests.rs` keep large test bodies out of the implementation files).
 - No new workspace dependencies beyond what `Cargo.toml` already declares; `base64` is a workspace dependency used only by `multimodal`.
@@ -270,6 +276,8 @@ The reranker (when attached) runs after retrieval and before `top_k` truncation;
 - Python's `SparseRetriever` delegates to a vector database's BM25 function; Rust owns the index (`sparse::Bm25Index`), so sparse retrieval works with no external store, and `SparseVector` provides the term-weight representation the stores never exposed.
 - `VectorStore::upsert` unifies Python's insert-only and upsert semantics; duplicate ids replace the record, which the knowledge base relies on for re-adds.
 - Filters use the store-level JSON shape from Python and now reach every channel (dense, sparse, hybrid, graph, knowledge base) instead of being dropped — a documented behavioural fix.
+- Configuration validation replaces silent degradation: `parse_index_type` rejects unknown `index_type` names (Python's pydantic `Literal` does the same) instead of dispatching to dense, `InMemoryVectorStore::from_config` rejects `database_name`/non-`cosine` metrics, and `RerankerConfig::validate`/`IndexConfig::validate` cover the configs with no other consumer. `IndexConfig` is consumed by `SimpleKnowledgeBase::from_index_config`; `RerankerConfig` by `reranker::DashScopeReranker`.
+- `use_caption_for_images` ports Python's `callable(embed_multimodal) and not use_caption_for_images` condition through the additive `Embedding::supports_multimodal` capability flag: text-only embedders (every crate type) always embed captions, so defaults behave exactly as before; a multimodal embedder with the flag off reports the unimplemented image+text path instead of silently using captions.
 - Query rewriting in Python is LLM-only (`standalone_query` + diagnostics); Rust keeps that exact output schema but adds a deterministic `HeuristicQueryRewriter` so rewriting, agentic retrieval, and knowledge-base expansion work offline, with `ModelQueryRewriter` as the model-backed path.
 - The Python `AgenticRetriever` requires an LLM for both triple reading and query rewriting; the Rust loop has a deterministic triples+keyword-coverage fallback and only uses a model when one is injected.
 - Python's triple extractors are LLM-only; Rust ships a deterministic regex/heuristic `RuleTripleExtractor` (no ML) and keeps the `TripleExtractor` trait as the seam for a future model-backed extractor.
@@ -316,10 +324,12 @@ The reranker (when attached) runs after retrieval and before `top_k` truncation;
 - In-memory loading: `AutoLoader::new().load_bytes("report.docx", bytes, &LoadOptions::new().with_doc_id("doc-1"))`, or `DocumentBytes::new(name, bytes)` + `load_document_bytes(&source, &options)`; per-loader entry points are `DocumentLoader::load_bytes`.
 - `loaders::fixtures` is public and always compiled: `build_zip`, `docx_document`, `xlsx_workbook`, `pptx_slides`, `odt_document`, `pdf_document`, `plain_stream`; it delegates to `parsing::ZipWriter`, so no crate (including `openjiuwen-e2e` and the examples) needs to hand-roll stored-ZIP bytes.
 - `parsing::ZipWriter` writes stored entries only (no compression): `ZipWriter::new().add_stored("word/document.xml", part)?.finish()?`; empty names, name > 65 535 bytes, > 65 535 entries, and payload/offset > `u32::MAX` are `Error::Validation`.
+- Configuration entry points: `parse_index_type(value)` normalizes and rejects unknown index names; `KnowledgeBaseConfig::validate()`/`SimpleKnowledgeBase::from_config` and `IndexConfig::validate()`/`SimpleKnowledgeBase::from_index_config` report `Error::Config`; `InMemoryVectorStore::from_config` (also used by `VectorStoreRegistry::create`) rejects `database_name` and non-`cosine` metrics; `RerankerConfig::validate`/`require_api_key` feed `DashScopeReranker::new`.
+- `Embedding::supports_multimodal()` defaults to `false`; only an upper-crate multimodal model overrides it, which is the sole way `use_caption_for_images = false` reaches the deferred image+text branch.
 
 ## Routing Table
 
-- `./src/common/` → `Document`/`TextChunk`, results, configs, `MetadataFilter` (`common/CONTEXT.md`)
+- `./src/common/` → `Document`/`TextChunk`, results, configs with their validators (`parse_index_type`), `MetadataFilter` (`common/CONTEXT.md`)
 - `./src/chunking/` → `Chunker` trait + char/recursive/token chunkers and registry (`chunking/CONTEXT.md`)
 - `./src/loaders/` → document loader trait with path + in-memory-byte entry points, `LoadOptions`/`DocumentBytes`, text/JSON/Markdown/CSV/HTML/URL/DOCX/XLSX/PDF/PPTX/ODT/auto loaders, the registry, and the public `fixtures` builders (`loaders/CONTEXT.md`)
 - `./src/embedding/` → `Embedding` trait, OpenAI-compatible client, deterministic hash fake (`embedding/CONTEXT.md`)
@@ -331,7 +341,7 @@ The reranker (when attached) runs after retrieval and before `top_k` truncation;
 - `./src/graph/` → `Triple`/`TripleMemory`/`TripleBeam`, rule-based triple extraction, graph store (`graph/CONTEXT.md`)
 - `./src/multimodal/` → modalities, `MultimodalDocument`, offline captioner, image loader, table conversion (`multimodal/CONTEXT.md`)
 - `./src/parsing/` → DEFLATE/zlib, ZIP reader + stored-entry `ZipWriter`, tolerant XML, DOCX/XLSX/PPTX/ODT/PDF readers (`parsing/CONTEXT.md`)
-- `./src/reranker/` → `Reranker` trait, score default, `LlmScorer` seam (`reranker/CONTEXT.md`)
+- `./src/reranker/` → `Reranker` trait, score default, `LlmScorer` seam, deferred `DashScopeReranker` (`reranker/CONTEXT.md`)
 - `./src/knowledge_base/` → `SimpleKnowledgeBase` pipeline and channels, statistics, multi-KB retrieval (`knowledge_base/CONTEXT.md`)
 - `./tests/` → cross-module integration tests (`tests/CONTEXT.md`)
 - `./Cargo.toml` → crate manifest and dependencies

@@ -89,9 +89,9 @@ pub mod vector_store;
 
 // Shared data model, configs, and constants.
 pub use common::{
-    Document, EmbeddingConfig, IndexConfig, KnowledgeBaseConfig, Metadata, MetadataFilter,
-    MultiKBRetrievalResult, RerankerConfig, RetrievalConfig, RetrievalResult, SearchResult,
-    TextChunk, VectorStoreConfig, DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
+    parse_index_type, Document, EmbeddingConfig, IndexConfig, KnowledgeBaseConfig, Metadata,
+    MetadataFilter, MultiKBRetrievalResult, RerankerConfig, RetrievalConfig, RetrievalResult,
+    SearchResult, TextChunk, VectorStoreConfig, DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
     DEFAULT_DISTANCE_METRIC, DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_TIMEOUT,
     DEFAULT_TOP_K, INDEX_TYPE_BM25, INDEX_TYPE_HYBRID, INDEX_TYPE_VECTOR,
 };
@@ -145,8 +145,8 @@ pub use parsing::{
     XlsxParser, XlsxSheet, XlsxWorkbook, XmlDocument, XmlElement, ZipArchive, ZipEntry, ZipWriter,
     DEFAULT_MAX_OUTPUT_BYTES,
 };
-// Rerankers: score ordering plus the LLM-scorer seam.
-pub use reranker::{LlmReranker, LlmScorer, Reranker, ScoreReranker};
+// Rerankers: score ordering, the LLM-scorer seam, and the deferred DashScope client.
+pub use reranker::{DashScopeReranker, LlmReranker, LlmScorer, Reranker, ScoreReranker};
 // The ingestion/retrieval pipeline and multi-KB retrieval.
 pub use knowledge_base::{
     retrieve_multi_kb, retrieve_multi_kb_with_source, KnowledgeBaseStatistics, SimpleKnowledgeBase,

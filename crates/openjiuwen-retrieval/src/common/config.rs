@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::security::SecretString;
 
 use super::filter::MetadataFilter;
@@ -33,6 +34,27 @@ pub const DEFAULT_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 8;
 /// Default vector distance metric.
 pub const DEFAULT_DISTANCE_METRIC: &str = "cosine";
+
+/// Parses an index type name, ignoring surrounding whitespace and case.
+///
+/// The crate has exactly three retrieval channels, so any other name is a
+/// configuration error rather than something to degrade to dense retrieval —
+/// a typo must not silently change what a query searches.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] naming the offending value and the accepted names.
+pub fn parse_index_type(value: &str) -> Result<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        INDEX_TYPE_VECTOR => Ok(INDEX_TYPE_VECTOR),
+        INDEX_TYPE_BM25 => Ok(INDEX_TYPE_BM25),
+        INDEX_TYPE_HYBRID => Ok(INDEX_TYPE_HYBRID),
+        other => Err(Error::config(format!(
+            "unsupported index type `{other}`: expected one of `{INDEX_TYPE_VECTOR}`, \
+             `{INDEX_TYPE_BM25}`, `{INDEX_TYPE_HYBRID}`"
+        ))),
+    }
+}
 
 /// `serde` adapter that stores a [`Duration`] as a number of seconds.
 mod duration_secs {
@@ -84,6 +106,11 @@ pub struct KnowledgeBaseConfig {
     #[serde(default = "default_chunk_overlap")]
     pub chunk_overlap: usize,
     /// Embed image chunks from their text/caption only.
+    ///
+    /// Image+text embedding is not implemented, so `true` (and any text-only
+    /// embedder, which is all this crate ships) indexes an image document from
+    /// its caption; `false` combined with an embedder that reports multimodal
+    /// support is a typed `Error::Unsupported` rather than a silent caption.
     #[serde(default)]
     pub use_caption_for_images: bool,
 }
@@ -99,6 +126,20 @@ impl KnowledgeBaseConfig {
             chunk_overlap: DEFAULT_CHUNK_OVERLAP,
             use_caption_for_images: false,
         }
+    }
+
+    /// Validates the fields that select behaviour.
+    ///
+    /// `index_type` must be one of [`INDEX_TYPE_VECTOR`], [`INDEX_TYPE_BM25`], or
+    /// [`INDEX_TYPE_HYBRID`] (see [`parse_index_type`]); the chunk window is
+    /// validated by the chunker, which owns that contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] for an unknown index type.
+    pub fn validate(&self) -> Result<()> {
+        parse_index_type(&self.index_type)?;
+        Ok(())
     }
 }
 
@@ -171,8 +212,51 @@ pub struct IndexConfig {
     #[serde(default = "default_index_type")]
     pub index_type: String,
     /// Embed image chunks from their text/caption only.
+    ///
+    /// Carried into [`KnowledgeBaseConfig::use_caption_for_images`] by
+    /// [`IndexConfig::to_knowledge_base_config`].
     #[serde(default)]
     pub use_caption_for_images: bool,
+}
+
+impl IndexConfig {
+    /// Validates the index name and type.
+    ///
+    /// Python requires `index_name`, so a blank name is a configuration error,
+    /// as is an unknown `index_type` (see [`parse_index_type`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] for a blank `index_name` or an unknown
+    /// `index_type`.
+    pub fn validate(&self) -> Result<()> {
+        if self.index_name.trim().is_empty() {
+            return Err(Error::config("index_name must not be blank"));
+        }
+        parse_index_type(&self.index_type)?;
+        Ok(())
+    }
+
+    /// Reinterprets this index configuration as a knowledge-base configuration.
+    ///
+    /// `index_name` becomes [`KnowledgeBaseConfig::kb_id`], `index_type` selects
+    /// the retrieval channel, and `use_caption_for_images` carries the image
+    /// embedding policy across; chunking keeps the Python defaults because an
+    /// index does not configure a chunk window.
+    ///
+    /// No validation is performed here: call [`IndexConfig::validate`] first (as
+    /// [`crate::knowledge_base::SimpleKnowledgeBase::from_index_config`] does).
+    #[must_use]
+    pub fn to_knowledge_base_config(&self) -> KnowledgeBaseConfig {
+        KnowledgeBaseConfig {
+            kb_id: self.index_name.clone(),
+            index_type: self.index_type.clone(),
+            use_graph: false,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            chunk_overlap: DEFAULT_CHUNK_OVERLAP,
+            use_caption_for_images: self.use_caption_for_images,
+        }
+    }
 }
 
 /// Vector store configuration.
@@ -181,13 +265,17 @@ pub struct VectorStoreConfig {
     /// Store provider identifier (`memory`, `milvus`, `chroma`, ...).
     #[serde(default)]
     pub store_provider: String,
-    /// Database name (empty for stores without databases).
+    /// Database name; must stay empty for the in-memory store, which has no
+    /// databases (see [`crate::vector_store::InMemoryVectorStore::from_config`]).
     #[serde(default)]
     pub database_name: String,
     /// Collection name inside the store.
     #[serde(default)]
     pub collection_name: String,
     /// Distance metric: `cosine`, `euclidean`, or `dot`.
+    ///
+    /// Only `cosine` is implemented; the in-memory store rejects the others with
+    /// an `Error::Config` instead of silently scoring by cosine.
     #[serde(default = "default_distance_metric")]
     pub distance_metric: String,
 }
@@ -313,6 +401,56 @@ pub struct RerankerConfig {
     pub top_p: f32,
 }
 
+impl RerankerConfig {
+    /// Validates the fields a hosted rerank client needs.
+    ///
+    /// The rules mirror Python's pydantic constraints (`api_base` non-empty,
+    /// `timeout > 0`) and add finite ranges for the sampling parameters:
+    /// `temperature` in `[0, 2]` and `top_p` in `(0, 1]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] naming the first invalid field.
+    pub fn validate(&self) -> Result<()> {
+        if self.api_base.trim().is_empty() {
+            return Err(Error::config("reranker api_base must not be blank"));
+        }
+        if self.model_name.trim().is_empty() {
+            return Err(Error::config("reranker model_name must not be blank"));
+        }
+        if self.timeout.is_zero() {
+            return Err(Error::config("reranker timeout must be greater than zero"));
+        }
+        if !self.temperature.is_finite() || !(0.0..=2.0).contains(&self.temperature) {
+            return Err(Error::config(format!(
+                "reranker temperature must be a finite number between 0 and 2, got {}",
+                self.temperature
+            )));
+        }
+        if !self.top_p.is_finite() || self.top_p <= 0.0 || self.top_p > 1.0 {
+            return Err(Error::config(format!(
+                "reranker top_p must be a finite number in (0, 1], got {}",
+                self.top_p
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns the API key, rejecting a missing or empty credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when `api_key` is `None` or empty.
+    pub fn require_api_key(&self) -> Result<&str> {
+        match self.api_key.as_ref() {
+            Some(key) if !key.is_empty() => Ok(key.expose_secret()),
+            _ => Err(Error::config(
+                "reranker api_key is required and must not be empty",
+            )),
+        }
+    }
+}
+
 fn default_index_type() -> String {
     INDEX_TYPE_HYBRID.to_owned()
 }
@@ -365,6 +503,7 @@ fn default_top_p() -> f32 {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use openjiuwen_common::error::ErrorKind;
     use serde_json::json;
 
     #[test]
@@ -486,5 +625,109 @@ mod tests {
         let index: IndexConfig = serde_json::from_value(json!({"index_name": "idx"})).unwrap();
         assert_eq!(index.index_type, INDEX_TYPE_HYBRID);
         assert!(!index.use_caption_for_images);
+    }
+
+    #[test]
+    fn parse_index_type_normalizes_and_rejects_unknown_names() {
+        assert_eq!(parse_index_type("vector").unwrap(), INDEX_TYPE_VECTOR);
+        assert_eq!(parse_index_type(" BM25 ").unwrap(), INDEX_TYPE_BM25);
+        assert_eq!(parse_index_type("Hybrid").unwrap(), INDEX_TYPE_HYBRID);
+        let error = parse_index_type("faiss").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert!(
+            error.to_string().contains("unsupported index type `faiss`"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[test]
+    fn knowledge_base_validate_checks_the_index_type() {
+        assert!(KnowledgeBaseConfig::new("kb").validate().is_ok());
+        let mut config = KnowledgeBaseConfig::new("kb");
+        config.index_type = "graph".to_owned();
+        let error = config.validate().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+    }
+
+    #[test]
+    fn index_config_validates_and_converts_to_a_knowledge_base_config() {
+        let blank = IndexConfig {
+            index_name: String::new(),
+            index_type: INDEX_TYPE_HYBRID.to_owned(),
+            use_caption_for_images: false,
+        };
+        assert!(blank.validate().is_err());
+        let index = IndexConfig {
+            index_name: "docs".to_owned(),
+            index_type: INDEX_TYPE_BM25.to_owned(),
+            use_caption_for_images: true,
+        };
+        assert!(index.validate().is_ok());
+        let kb = index.to_knowledge_base_config();
+        assert_eq!(kb.kb_id, "docs");
+        assert_eq!(kb.index_type, INDEX_TYPE_BM25);
+        assert!(kb.use_caption_for_images);
+        assert_eq!(kb.chunk_size, DEFAULT_CHUNK_SIZE);
+        assert_eq!(kb.chunk_overlap, DEFAULT_CHUNK_OVERLAP);
+        assert!(!kb.use_graph);
+
+        let unknown = IndexConfig {
+            index_type: "sqlite".to_owned(),
+            ..index
+        };
+        let error = unknown.validate().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+    }
+
+    #[test]
+    fn reranker_validate_and_api_key_requirement() {
+        let mut config = RerankerConfig {
+            api_key: Some("sk-test".into()),
+            api_base: "https://rerank.example".to_owned(),
+            model_name: "bge-m3".to_owned(),
+            timeout: Duration::from_secs(10),
+            temperature: 0.95,
+            top_p: 0.95,
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.require_api_key().unwrap(), "sk-test");
+
+        config.temperature = 2.5;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("temperature"));
+        config.temperature = 0.5;
+        config.top_p = 1.5;
+        assert!(config.validate().unwrap_err().to_string().contains("top_p"));
+        config.top_p = 0.5;
+        config.timeout = Duration::ZERO;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("timeout"));
+        config.timeout = Duration::from_secs(1);
+        config.model_name.clear();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("model_name"));
+        config.model_name = "bge-m3".to_owned();
+        config.api_base = String::new();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("api_base"));
+
+        config.api_base = "https://rerank.example".to_owned();
+        config.api_key = None;
+        let error = config.require_api_key().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        config.api_key = Some(String::new().into());
+        assert!(config.require_api_key().is_err());
     }
 }

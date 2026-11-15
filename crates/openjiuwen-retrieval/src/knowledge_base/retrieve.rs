@@ -28,8 +28,8 @@ use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::logging::warn;
 
 use crate::common::{
-    MetadataFilter, RetrievalConfig, RetrievalResult, SearchResult, INDEX_TYPE_BM25,
-    INDEX_TYPE_HYBRID,
+    parse_index_type, MetadataFilter, RetrievalConfig, RetrievalResult, SearchResult,
+    INDEX_TYPE_BM25, INDEX_TYPE_HYBRID,
 };
 use crate::retriever::{
     ensure_query, search_result_to_retrieval, AgenticConfig, AgenticRetriever, GraphRetriever,
@@ -96,7 +96,7 @@ pub(super) async fn retrieve_with_config(
         return Err(Error::validation("retrieval top_k must be greater than 0"));
     }
 
-    let channel = channel_of(kb);
+    let channel = channel_of(kb)?;
     let graph_requested = config.use_graph.unwrap_or(kb.config.use_graph) || config.graph_expansion;
     let graph_store = if graph_requested {
         kb.graph_store.clone()
@@ -167,15 +167,26 @@ pub(super) async fn retrieve_with_config(
 
 /// Resolves the channel from the index type and sparse-index availability.
 ///
-/// `bm25`/`hybrid` without a sparse index degrade to dense (documented
-/// deviation: RRF fusion is opt-in, so existing dense results are unchanged).
-/// Unknown index types also degrade to dense rather than failing a query.
-fn channel_of(kb: &SimpleKnowledgeBase) -> Channel {
-    match kb.config.index_type.as_str() {
-        INDEX_TYPE_BM25 if kb.has_sparse_index() => Channel::Sparse,
-        INDEX_TYPE_HYBRID if kb.has_sparse_index() => Channel::Hybrid,
+/// An unknown index type is a configuration error (see [`parse_index_type`]), so
+/// a typo cannot silently turn a BM25 query into a dense one. `bm25`/`hybrid`
+/// with the sparse index explicitly disabled do degrade to dense, with a
+/// warning: [`SimpleKnowledgeBase::with_sparse_index`] is the only way to get
+/// there, and the empty index would return nothing at all.
+fn channel_of(kb: &SimpleKnowledgeBase) -> Result<Channel> {
+    let requested = parse_index_type(&kb.config.index_type)?;
+    let channel = match requested {
+        INDEX_TYPE_BM25 => Channel::Sparse,
+        INDEX_TYPE_HYBRID => Channel::Hybrid,
         _ => Channel::Dense,
+    };
+    if channel != Channel::Dense && !kb.has_sparse_index() {
+        warn!(
+            index_type = requested,
+            "the BM25 sparse index is disabled; falling back to dense retrieval"
+        );
+        return Ok(Channel::Dense);
     }
+    Ok(channel)
 }
 
 /// Builds the retriever serving `channel`.
@@ -334,9 +345,10 @@ impl Retriever for SparseIndexRetriever {
 mod tests {
     use super::*;
     use crate::chunking::CharChunker;
-    use crate::common::KnowledgeBaseConfig;
+    use crate::common::{KnowledgeBaseConfig, INDEX_TYPE_VECTOR};
     use crate::embedding::HashEmbedding;
     use crate::vector_store::InMemoryVectorStore;
+    use openjiuwen_common::error::ErrorKind;
 
     fn kb(index_type: &str) -> SimpleKnowledgeBase {
         let mut config = KnowledgeBaseConfig::new("kb");
@@ -351,16 +363,26 @@ mod tests {
 
     #[test]
     fn channel_follows_the_index_type_and_the_sparse_index() {
-        assert_eq!(channel_of(&kb(INDEX_TYPE_BM25)), Channel::Sparse);
-        assert_eq!(channel_of(&kb(INDEX_TYPE_HYBRID)), Channel::Dense);
-        assert_eq!(channel_of(&kb("vector")), Channel::Dense);
-        assert_eq!(channel_of(&kb("made-up")), Channel::Dense);
+        assert_eq!(channel_of(&kb(INDEX_TYPE_BM25)).unwrap(), Channel::Sparse);
+        assert_eq!(channel_of(&kb(INDEX_TYPE_HYBRID)).unwrap(), Channel::Dense);
+        assert_eq!(channel_of(&kb(INDEX_TYPE_VECTOR)).unwrap(), Channel::Dense);
+        // Case and surrounding whitespace are normalized.
+        assert_eq!(channel_of(&kb(" BM25 ")).unwrap(), Channel::Sparse);
+        // An unknown index type is a configuration error, not a dense fallback.
+        let error = channel_of(&kb("made-up")).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported index type `made-up`"),
+            "unexpected message: {error}"
+        );
         assert_eq!(
-            channel_of(&kb(INDEX_TYPE_HYBRID).with_sparse_index(true)),
+            channel_of(&kb(INDEX_TYPE_HYBRID).with_sparse_index(true)).unwrap(),
             Channel::Hybrid
         );
         assert_eq!(
-            channel_of(&kb(INDEX_TYPE_BM25).with_sparse_index(false)),
+            channel_of(&kb(INDEX_TYPE_BM25).with_sparse_index(false)).unwrap(),
             Channel::Dense
         );
     }

@@ -37,10 +37,13 @@ fn metadata(entries: &[(&str, Value)]) -> Metadata {
 }
 
 /// Builds a store configuration with all four fields set explicitly.
+///
+/// `database_name` is blank because the in-memory store has no databases; the
+/// external-provider fixtures below set it themselves.
 fn config(provider: &str, collection: &str) -> VectorStoreConfig {
     VectorStoreConfig {
         store_provider: provider.to_owned(),
-        database_name: "test-db".to_owned(),
+        database_name: String::new(),
         collection_name: collection.to_owned(),
         distance_metric: DEFAULT_DISTANCE_METRIC.to_owned(),
     }
@@ -517,4 +520,67 @@ fn cosine_helpers_match_documented_conventions() {
     // A dimension mismatch degrades to 0.0 instead of panicking.
     assert!(cosine_similarity(&[1.0, 2.0], &[1.0]).abs() < TOLERANCE);
     assert!((normalize_cosine(0.0) - 0.5).abs() < TOLERANCE);
+}
+
+#[test]
+fn from_config_reads_every_field_and_rejects_unhonoured_values() {
+    let valid = InMemoryVectorStore::from_config(&config("memory", "docs")).unwrap();
+    assert_eq!(valid.name(), "docs");
+    // A blank provider and blank collection are accepted (defaults apply).
+    let blank = InMemoryVectorStore::from_config(&config("", "")).unwrap();
+    assert_eq!(blank.name(), "default");
+    // Provider and metric names are case-insensitive.
+    let mixed = VectorStoreConfig {
+        store_provider: "In_Memory".to_owned(),
+        distance_metric: "COSINE".to_owned(),
+        ..config("", "docs")
+    };
+    assert_eq!(
+        InMemoryVectorStore::from_config(&mixed).unwrap().name(),
+        "docs"
+    );
+
+    let mut database = config("memory", "docs");
+    database.database_name = "test-db".to_owned();
+    let error = InMemoryVectorStore::from_config(&database).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Config);
+    assert!(error.to_string().contains("no databases"), "{error}");
+
+    for metric in ["euclidean", "dot", ""] {
+        let mut bad = config("memory", "docs");
+        bad.distance_metric = metric.to_owned();
+        let error = InMemoryVectorStore::from_config(&bad).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config, "metric {metric}");
+        assert!(
+            error.to_string().contains("only supports the `cosine`"),
+            "{error}"
+        );
+    }
+
+    let error = InMemoryVectorStore::from_config(&config("milvus", "docs")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Config);
+    assert!(
+        error.to_string().contains("cannot serve provider `milvus`"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn registry_surfaces_an_invalid_memory_config_as_a_config_error() {
+    let registry = VectorStoreRegistry::with_builtin();
+    let mut bad = config("memory", "docs");
+    bad.distance_metric = "euclidean".to_owned();
+    let error = registry
+        .create(&bad)
+        .err()
+        .expect("a non-cosine metric must be rejected");
+    assert_eq!(error.kind(), ErrorKind::Config);
+    // A database name is likewise reported rather than dropped.
+    let mut database = config("in_memory", "docs");
+    database.database_name = "test-db".to_owned();
+    let error = registry
+        .create(&database)
+        .err()
+        .expect("a database name must be rejected");
+    assert_eq!(error.kind(), ErrorKind::Config);
 }

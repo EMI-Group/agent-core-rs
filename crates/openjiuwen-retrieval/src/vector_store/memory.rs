@@ -20,7 +20,9 @@ use super::{
     cosine_similarity, normalize_cosine, VectorQuery, VectorRecord, VectorStore, CHUNK_ID_FIELD,
     DOC_ID_FIELD,
 };
-use crate::common::{Metadata, MetadataFilter, SearchResult};
+use crate::common::{
+    Metadata, MetadataFilter, SearchResult, VectorStoreConfig, DEFAULT_DISTANCE_METRIC,
+};
 
 /// Snapshot format version; bump when the persisted shape changes.
 const PERSISTENCE_VERSION: u32 = 1;
@@ -73,6 +75,48 @@ impl InMemoryVectorStore {
             records: RwLock::new(IndexMap::new()),
             path: None,
         }
+    }
+
+    /// Builds a store from a [`VectorStoreConfig`].
+    ///
+    /// Every field is read: `collection_name` names the store (a blank name
+    /// falls back to the default), and the fields the in-memory backend cannot
+    /// honour are rejected instead of being ignored — `store_provider` must be
+    /// blank/`memory`/`in_memory`, `database_name` must be blank (there are no
+    /// databases), and `distance_metric` must be `cosine` (the only metric this
+    /// store implements).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] naming the unsupported field value.
+    pub fn from_config(config: &VectorStoreConfig) -> Result<Self> {
+        let provider = config.store_provider.trim();
+        if !provider.is_empty()
+            && !matches!(
+                provider.to_ascii_lowercase().as_str(),
+                "memory" | "in_memory"
+            )
+        {
+            return Err(Error::config(format!(
+                "the in-memory vector store cannot serve provider `{provider}`; \
+                 use `memory` or `in_memory`"
+            )));
+        }
+        if !config.database_name.trim().is_empty() {
+            return Err(Error::config(format!(
+                "the in-memory vector store has no databases, but database_name is `{}`; \
+                 leave it empty or use an external provider",
+                config.database_name
+            )));
+        }
+        let metric = config.distance_metric.trim();
+        if !metric.eq_ignore_ascii_case(DEFAULT_DISTANCE_METRIC) {
+            return Err(Error::config(format!(
+                "the in-memory vector store only supports the `{DEFAULT_DISTANCE_METRIC}` \
+                 distance metric, got `{metric}`"
+            )));
+        }
+        Ok(Self::with_collection(config.collection_name.clone()))
     }
 
     /// Opens a store backed by `path`, loading the JSON snapshot when it exists.

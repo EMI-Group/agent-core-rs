@@ -11,13 +11,14 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::error::{Error, ErrorKind, Result};
 use openjiuwen_retrieval::{
     retrieve_multi_kb, retrieve_multi_kb_with_source, Document, Embedding, HashEmbedding,
-    InMemoryVectorStore, KnowledgeBaseConfig, KnowledgeBaseStatistics, MetadataFilter, Reranker,
-    RetrievalConfig, RetrievalResult, ScoreReranker, SearchResult, SimpleKnowledgeBase,
-    VectorStore,
+    InMemoryVectorStore, IndexConfig, KnowledgeBaseConfig, KnowledgeBaseStatistics, Metadata,
+    MetadataFilter, Reranker, RetrievalConfig, RetrievalResult, ScoreReranker, SearchResult,
+    SimpleKnowledgeBase, VectorStore, INDEX_TYPE_BM25,
 };
+use serde_json::json;
 
 /// Dimension used by every test embedder.
 const EMBEDDING_DIMENSION: usize = 64;
@@ -515,4 +516,144 @@ fn knowledge_base_config_is_exposed() {
     assert_eq!(kb.config().kb_id, "kb-config");
     assert_eq!(kb.config().chunk_size, CHUNK_SIZE);
     assert_eq!(kb.config().chunk_overlap, CHUNK_OVERLAP);
+}
+
+#[tokio::test]
+async fn from_config_rejects_an_unknown_index_type() {
+    let mut config = KnowledgeBaseConfig::new("kb-unknown");
+    config.index_type = "faiss".to_owned();
+    let embedder: Arc<dyn Embedding> = Arc::new(HashEmbedding::new(EMBEDDING_DIMENSION));
+    let error = SimpleKnowledgeBase::from_config(config, store(), embedder)
+        .err()
+        .expect("an unknown index type must be rejected");
+    assert_eq!(error.kind(), ErrorKind::Config);
+    assert!(
+        error
+            .to_string()
+            .contains("validating knowledge base configuration"),
+        "{error}"
+    );
+}
+
+/// An embedder that advertises the image+text capability no crate type has.
+struct MultimodalEmbedding {
+    inner: HashEmbedding,
+}
+
+#[async_trait]
+impl Embedding for MultimodalEmbedding {
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    fn supports_multimodal(&self) -> bool {
+        true
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.inner.embed_query(text).await
+    }
+
+    async fn embed_documents(
+        &self,
+        texts: &[String],
+        batch_size: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.inner.embed_documents(texts, batch_size).await
+    }
+}
+
+/// An image document as [`openjiuwen_retrieval::ImageLoader`] emits it.
+fn image_document() -> Document {
+    Document::with_id("img-1", "[image] cat.png").with_metadata(Metadata::from_iter([(
+        "modality".to_owned(),
+        json!("image"),
+    )]))
+}
+
+#[tokio::test]
+async fn use_caption_for_images_gates_the_image_embedding_path() {
+    // Text-only embedders always take the caption branch, which is Python's
+    // `not callable(embed_multimodal)` case, no matter what the flag says.
+    for flag in [false, true] {
+        let mut config = KnowledgeBaseConfig::new("kb-image");
+        config.use_caption_for_images = flag;
+        let kb = knowledge_base(config, store());
+        kb.add_documents(vec![image_document()]).await.unwrap();
+        assert_eq!(kb.count().await.unwrap(), 1, "flag = {flag}");
+    }
+
+    // A multimodal embedder with the flag off asks for image+text embedding,
+    // which this crate does not implement: a typed error, not a silent caption.
+    let mut config = KnowledgeBaseConfig::new("kb-image");
+    config.use_caption_for_images = false;
+    let embedder: Arc<dyn Embedding> = Arc::new(MultimodalEmbedding {
+        inner: HashEmbedding::new(EMBEDDING_DIMENSION),
+    });
+    let kb = SimpleKnowledgeBase::from_config(config, store(), embedder).unwrap();
+    let error = kb
+        .add_documents(vec![image_document()])
+        .await
+        .expect_err("the multimodal branch is deferred");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(
+        error.to_string().contains("use_caption_for_images = true"),
+        "{error}"
+    );
+    assert!(kb.count().await.unwrap() == 0, "nothing may be indexed");
+
+    // Turning the flag on selects the caption branch for the same embedder.
+    let mut config = KnowledgeBaseConfig::new("kb-image");
+    config.use_caption_for_images = true;
+    let embedder: Arc<dyn Embedding> = Arc::new(MultimodalEmbedding {
+        inner: HashEmbedding::new(EMBEDDING_DIMENSION),
+    });
+    let kb = SimpleKnowledgeBase::from_config(config, store(), embedder).unwrap();
+    kb.add_documents(vec![image_document()]).await.unwrap();
+    assert_eq!(kb.count().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn from_index_config_honours_every_index_field() {
+    let index = IndexConfig {
+        index_name: "idx-docs".to_owned(),
+        index_type: INDEX_TYPE_BM25.to_owned(),
+        use_caption_for_images: true,
+    };
+    let embedder: Arc<dyn Embedding> = Arc::new(HashEmbedding::new(EMBEDDING_DIMENSION));
+    let kb = SimpleKnowledgeBase::from_index_config(&index, store(), embedder).unwrap();
+    assert_eq!(kb.id(), "idx-docs");
+    assert_eq!(kb.config().index_type, INDEX_TYPE_BM25);
+    assert!(kb.config().use_caption_for_images);
+    // A `bm25` index type enables the sparse index, so retrieval is lexical.
+    kb.add_texts(vec!["the quokka lives here".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(kb.sparse_index_len(), 1);
+    let results = kb.retrieve("quokka").await.unwrap();
+    assert_eq!(results.len(), 1);
+}
+
+#[tokio::test]
+async fn from_index_config_rejects_a_blank_name_and_unknown_type() {
+    let embedder: Arc<dyn Embedding> = Arc::new(HashEmbedding::new(EMBEDDING_DIMENSION));
+    let blank = IndexConfig {
+        index_name: "  ".to_owned(),
+        index_type: INDEX_TYPE_BM25.to_owned(),
+        use_caption_for_images: false,
+    };
+    let error = SimpleKnowledgeBase::from_index_config(&blank, store(), Arc::clone(&embedder))
+        .err()
+        .expect("a blank index name must be rejected");
+    assert_eq!(error.kind(), ErrorKind::Config);
+
+    let unknown = IndexConfig {
+        index_name: "idx".to_owned(),
+        index_type: "annoy".to_owned(),
+        use_caption_for_images: false,
+    };
+    let error = SimpleKnowledgeBase::from_index_config(&unknown, store(), embedder)
+        .err()
+        .expect("an unknown index type must be rejected");
+    assert_eq!(error.kind(), ErrorKind::Config);
 }

@@ -32,6 +32,19 @@ pub trait Embedding: Send + Sync {
     fn dimension_hint(&self) -> Option<usize> {
         None
     }
+    /// Whether this model can embed images together with text.
+    ///
+    /// The crate ships text-only embedders, so the default is `false`. An
+    /// upper-crate multimodal model overrides it, which lets
+    /// [`crate::common::KnowledgeBaseConfig::use_caption_for_images`] decide
+    /// between caption text and image+text embedding (Python's
+    /// `callable(embed_multimodal)` condition). The image+text path itself is not
+    /// implemented here, so an image document under
+    /// `use_caption_for_images = false` reports [`Error::Unsupported`] rather
+    /// than silently embedding the caption.
+    fn supports_multimodal(&self) -> bool {
+        false
+    }
 
     /// Encodes a single query string.
     ///
