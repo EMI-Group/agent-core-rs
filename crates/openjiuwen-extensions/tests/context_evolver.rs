@@ -17,17 +17,21 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use openjiuwen_common::error::ErrorKind;
-use openjiuwen_core::foundation::store::{InMemoryVectorStore, VectorStore};
+use openjiuwen_common::error::{ErrorKind, Result};
+use openjiuwen_core::foundation::store::{
+    CollectionSchema, InMemoryVectorStore, Metric, VectorQuery, VectorSearchResult, VectorStore,
+};
+use openjiuwen_extensions::context_evolver::service::ranking;
 use openjiuwen_extensions::context_evolver::{
     create_task_memory_service, generate_memory_id, normalize_algo_name, AddMemoryRequest, Algo,
     AlgoFamily, ChatCompletionConfig, DeterministicTaskMemoryService, HashingEmbedding,
     InMemoryMemoryStore, JsonFileMemoryStore, KernelVectorIndex, MemoryBackend, MemoryDraft,
-    MemoryRecord, MemoryStore, OpenAiChatCompletion, RetrieveRequest, ScriptedCompletion,
-    SummarizeRequest, TaskMemoryConfig, TaskMemoryService, UnsupportedTaskMemoryService,
-    VectorBackend, VectorIndex, VectorNode, DEFAULT_VECTOR_COLLECTION,
+    MemoryEmbedding, MemoryRecord, MemoryStore, OpenAiChatCompletion, RetrieveRequest, ScoredNode,
+    ScriptedCompletion, SummarizeRequest, TaskMemoryConfig, TaskMemoryService,
+    UnsupportedTaskMemoryService, VectorBackend, VectorIndex, VectorNode,
+    DEFAULT_VECTOR_COLLECTION,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1134,4 +1138,372 @@ async fn default_configuration_keeps_the_in_process_index() {
     // sight, exactly as before the seam existed.
     let service = seeded_service(Arc::new(InMemoryMemoryStore::new())).await;
     assert_eq!(scored_entries(&rank(&service, USER).await).len(), 3);
+}
+
+// --- metric-configured store-backed scoring ---------------------------------
+//
+// Python counterpart: `extensions/context_evolver/retrieve/task/*/run.py` scores
+// memories through a `Milvus` collection configured with one similarity metric;
+// these tests pin each metric's conversion offline over the kernel's own engine.
+
+/// A kernel store configured with an explicit similarity metric.
+///
+/// The `VectorStore` contract carries no metric — a vendor backend keeps it in
+/// its own configuration and scores `search` with it — so this adapter gives the
+/// in-memory engine the same shape: every operation delegates to it, and
+/// `search` scores with [`InMemoryVectorStore::search_with_metric`].
+struct MetricStore {
+    /// The engine that owns the documents.
+    inner: InMemoryVectorStore,
+    /// The metric `search` scores with.
+    metric: Metric,
+}
+
+impl MetricStore {
+    /// Builds an empty metric-configured store.
+    fn new(metric: Metric) -> Self {
+        Self {
+            inner: InMemoryVectorStore::new(),
+            metric,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl VectorStore for MetricStore {
+    async fn create_collection(&self, collection: &str, schema: CollectionSchema) -> Result<()> {
+        self.inner.create_collection(collection, schema).await
+    }
+
+    async fn delete_collection(&self, collection: &str) -> Result<()> {
+        self.inner.delete_collection(collection).await
+    }
+
+    async fn collection_exists(&self, collection: &str) -> Result<bool> {
+        self.inner.collection_exists(collection).await
+    }
+
+    async fn get_schema(&self, collection: &str) -> Result<Option<CollectionSchema>> {
+        self.inner.get_schema(collection).await
+    }
+
+    async fn add_docs(&self, collection: &str, docs: Vec<Map<String, Value>>) -> Result<usize> {
+        self.inner.add_docs(collection, docs).await
+    }
+
+    async fn search(
+        &self,
+        collection: &str,
+        query: &VectorQuery,
+    ) -> Result<Vec<VectorSearchResult>> {
+        self.inner
+            .search_with_metric(collection, query, self.metric)
+    }
+
+    async fn delete_docs_by_ids(&self, collection: &str, ids: &[String]) -> Result<usize> {
+        self.inner.delete_docs_by_ids(collection, ids).await
+    }
+
+    async fn delete_docs_by_filters(&self, collection: &str, filters: &Value) -> Result<usize> {
+        self.inner.delete_docs_by_filters(collection, filters).await
+    }
+
+    async fn list_collection_names(&self) -> Result<Vec<String>> {
+        self.inner.list_collection_names().await
+    }
+}
+
+/// The query the metric scenarios score against.
+const METRIC_QUERY: [f32; 2] = [1.0, 0.0];
+
+/// Three vectors whose cosine, dot-product, and euclidean orders all differ.
+fn metric_nodes() -> Vec<VectorNode> {
+    vec![
+        // cosine 1.0, inner product 1, distance 0
+        VectorNode::new("a", vec![1.0, 0.0]),
+        // cosine 1.0, inner product 5, distance 4
+        VectorNode::new("b", vec![5.0, 0.0]),
+        // cosine 0.874, inner product 0.9, distance 0.510
+        VectorNode::new("c", vec![0.9, 0.5]),
+    ]
+}
+
+/// The ids of scored hits, in order.
+fn hit_ids(hits: &[ScoredNode]) -> Vec<String> {
+    hits.iter().map(|hit| hit.node.id.clone()).collect()
+}
+
+/// The inner product of two vectors.
+fn inner_product(left: &[f32], right: &[f32]) -> f32 {
+    left.iter().zip(right).map(|(l, r)| l * r).sum()
+}
+
+/// The cosine similarity of two vectors.
+fn cosine(left: &[f32], right: &[f32]) -> f32 {
+    inner_product(left, right)
+        / (inner_product(left, left).sqrt() * inner_product(right, right).sqrt())
+}
+
+// Port of the Milvus-backed score conversion in
+// `extensions/context_evolver/core/vector_store/milvus_vector_store.py`: every
+// metric keeps the kernel's ranking and reports its own raw similarity scale.
+#[tokio::test]
+async fn store_backed_metric_indexes_rank_and_score_like_the_metric_aware_store() {
+    for (metric, expected) in [
+        (Metric::Cosine, ["a", "b", "c"]),
+        (Metric::Dot, ["b", "a", "c"]),
+        (Metric::Euclidean, ["a", "c", "b"]),
+    ] {
+        let store = Arc::new(MetricStore::new(metric));
+        let index = KernelVectorIndex::with_metric(store.clone(), "memories", metric)
+            .expect("every metric is accepted");
+        assert_eq!(index.metric(), metric);
+        index
+            .upsert(metric_nodes())
+            .await
+            .expect("the nodes upsert");
+
+        // The kernel's own metric-aware search is the reference.
+        let reference = store
+            .inner
+            .search_with_metric(
+                "memories",
+                &VectorQuery::new(METRIC_QUERY.to_vec()).with_top_k(3),
+                metric,
+            )
+            .expect("the in-memory engine searches");
+        let reference_ids: Vec<&str> = reference
+            .iter()
+            .map(|hit| hit.fields["id"].as_str().expect("every hit has an id"))
+            .collect();
+        assert_eq!(reference_ids, expected, "{metric:?}");
+
+        let hits = index
+            .search(&METRIC_QUERY, 10)
+            .await
+            .expect("the metric index searches");
+        assert_eq!(hit_ids(&hits), reference_ids, "{metric:?}");
+
+        for hit in &hits {
+            let embedding = hit.node.embedding.clone();
+            let expected_score = match metric {
+                // The raw cosine in `[-1.0, 1.0]`.
+                Metric::Cosine => cosine(&METRIC_QUERY, &embedding),
+                // The inner product, recovered from `(tanh(dot) + 1) / 2`.
+                Metric::Dot => inner_product(&METRIC_QUERY, &embedding),
+                // `1 / (1 + distance)`, the kernel's own bounded similarity.
+                Metric::Euclidean => metric.score(&METRIC_QUERY, &embedding),
+            };
+            // `Dot` loses precision where `tanh` saturates; the rest is exact.
+            let tolerance = if metric == Metric::Dot { 1e-2 } else { 1e-6 };
+            assert!(
+                (hit.score - expected_score).abs() < tolerance,
+                "{metric:?}/{}: {} vs {expected_score}",
+                hit.node.id,
+                hit.score
+            );
+        }
+        // Every reported score grows with similarity, so ordering and blending
+        // keep their meaning whatever the metric.
+        let mut previous = f32::INFINITY;
+        for hit in &hits {
+            assert!(hit.score <= previous, "{metric:?}: {:?}", hit_ids(&hits));
+            previous = hit.score;
+        }
+    }
+}
+
+#[tokio::test]
+async fn store_backed_metric_indexes_apply_the_metric_to_named_ids_and_metadata_filters() {
+    let store = Arc::new(MetricStore::new(Metric::Dot));
+    let index =
+        KernelVectorIndex::with_metric(store, "memories", Metric::Dot).expect("the dot index");
+    let mut pinned = metric_nodes();
+    pinned[0].metadata.insert("kind".into(), json!("pinned"));
+    index.upsert(pinned).await.expect("the nodes upsert");
+
+    // `search_ids` scores exactly the named nodes on the metric's scale.
+    let hits = index
+        .search_ids(&METRIC_QUERY, &["c".into(), "b".into()])
+        .await
+        .expect("the named nodes score");
+    assert_eq!(hit_ids(&hits), ["b", "c"]);
+    assert!((hits[0].score - 5.0).abs() < 1e-2, "{}", hits[0].score);
+    assert!((hits[1].score - 0.9).abs() < 1e-3, "{}", hits[1].score);
+
+    // Metadata filtering narrows the candidates and keeps the same scale.
+    let mut filter = BTreeMap::new();
+    filter.insert("kind".to_string(), json!("pinned"));
+    let hits = index
+        .search_with_metadata(&METRIC_QUERY, 10, &filter)
+        .await
+        .expect("the filtered search scores");
+    assert_eq!(hit_ids(&hits), ["a"]);
+    assert!((hits[0].score - 1.0).abs() < 1e-3, "{}", hits[0].score);
+}
+
+#[tokio::test]
+async fn deterministic_service_blends_metric_configured_store_indexes() {
+    let embedder = HashingEmbedding::default();
+    for metric in [Metric::Dot, Metric::Euclidean] {
+        let memories: Arc<dyn MemoryStore> = Arc::new(InMemoryMemoryStore::new());
+        let seeded = seeded_service(Arc::clone(&memories)).await;
+        let expected = scored_entries(&rank(&seeded, USER).await);
+        assert_eq!(expected.len(), 3);
+
+        let index = Arc::new(
+            KernelVectorIndex::with_metric(Arc::new(MetricStore::new(metric)), "memories", metric)
+                .expect("every metric is accepted"),
+        );
+        let service = DeterministicTaskMemoryService::new(
+            Algo::Reme,
+            TaskMemoryConfig::new(Algo::Reme),
+            Arc::clone(&memories),
+        )
+        .with_embedding(Arc::new(embedder.clone()))
+        .with_vector_index(Arc::clone(&index) as Arc<dyn VectorIndex>);
+
+        let response = service
+            .retrieve(retrieve_request(USER, RANK_QUERY))
+            .await
+            .expect("a metric-configured index never answers Unsupported");
+        let blended = scored_entries(&response.retrieved_memory);
+        assert_eq!(blended.len(), 3, "{metric:?}");
+
+        // The blend is the documented `0.7 * lexical + 0.3 * similarity`, with
+        // the index similarity coming from the metric's own scale.
+        let records: Vec<MemoryRecord> = memories.load(USER).await.expect("the memories load");
+        let ids: Vec<String> = records.iter().map(|record| record.id.clone()).collect();
+        let scored = index
+            .search_ids(
+                &embedder.embed(RANK_QUERY).await.expect("the query embeds"),
+                &ids,
+            )
+            .await
+            .expect("the metric index scores the memories");
+        let similarities: BTreeMap<String, f32> = scored
+            .into_iter()
+            .map(|scored| (scored.node.id.clone(), scored.score.max(0.0)))
+            .collect();
+        let lexical: BTreeMap<String, f32> = records
+            .iter()
+            .map(|record| {
+                (
+                    record.id.clone(),
+                    ranking::lexical_score(RANK_QUERY, &ranking::scoring_text(record)),
+                )
+            })
+            .collect();
+        let flat = lexical.values().all(|score| score.abs() < f32::EPSILON);
+        for (id, score) in &blended {
+            let similarity = similarities[id];
+            let expected = if flat {
+                similarity
+            } else {
+                0.7 * lexical[id] + 0.3 * similarity
+            };
+            assert!(
+                (f64::from(expected) - score).abs() < 1e-5,
+                "{metric:?}/{id}: {score} vs {expected}"
+            );
+        }
+        // The strongly matching memory still wins: the metric scale only
+        // reweights candidates the lexical signal already separated.
+        let ripgrep = records
+            .iter()
+            .find(|record| record.content == RIPGREP_MEMORY)
+            .expect("the ripgrep memory is stored")
+            .id
+            .clone();
+        assert_eq!(blended[0].0, ripgrep, "{metric:?}");
+    }
+}
+
+// Port of `tests/unit_tests/extensions/context_evolver/` (`test_retrieve_flow.py`
+// and `test_summary_flow.py`) over the in-process scripted double: one
+// model-driven service serves both halves of the contract.
+#[tokio::test]
+async fn llm_backend_retrieves_and_summarizes_through_one_scripted_service() {
+    let experience = "Page with a stable cursor and stop when the next token is empty.";
+    let completion: Arc<ScriptedCompletion> = Arc::new(ScriptedCompletion::new([
+        // retrieve: rank the weaker lexical candidate first
+        json!({"ranked_indices": [1, 0]}).to_string(),
+        // summarize: distill one memory from the trajectory
+        json!([{"when_to_use": "when listing every playlist", "experience": experience}])
+            .to_string(),
+    ]));
+    let store = Arc::new(InMemoryMemoryStore::new());
+    let service = create_task_memory_service(
+        TaskMemoryConfig::new(Algo::Reme),
+        MemoryBackend::Llm(completion.clone()),
+        store.clone(),
+    );
+    service
+        .add_memory(USER, conditional_memory(PAGINATION_CURSOR, "listing rows"))
+        .await
+        .expect("the cursor memory is persisted");
+    service
+        .add_memory(
+            USER,
+            conditional_memory(PAGINATION_TOKEN, "answering a page request"),
+        )
+        .await
+        .expect("the token memory is persisted");
+    assert_eq!(
+        completion.call_count(),
+        0,
+        "add_memory never calls the model"
+    );
+
+    let (cursor_id, token_id) = (
+        stored_id(&store, USER, PAGINATION_CURSOR).await,
+        stored_id(&store, USER, PAGINATION_TOKEN).await,
+    );
+    let retrieved = service
+        .retrieve(retrieve_request(USER, PAGINATION_QUERY))
+        .await
+        .expect("the model-driven retrieve succeeds");
+    assert_eq!(retrieved.status, "success");
+    assert_eq!(completion.call_count(), 1, "one prompt pair per retrieve");
+    assert_eq!(
+        entry_ids(&retrieved.retrieved_memory),
+        [token_id, cursor_id],
+        "the model's ranking order wins over the lexical pre-rank"
+    );
+    assert!(retrieved.memory_string.contains(PAGINATION_TOKEN));
+    // Both memories are injected (the default `top_k` keeps five), rendered in
+    // the model's ranking order.
+    let token_at = retrieved
+        .memory_string
+        .find(PAGINATION_TOKEN)
+        .expect("the token memory is injected");
+    let cursor_at = retrieved
+        .memory_string
+        .find(PAGINATION_CURSOR)
+        .expect("the cursor memory is injected");
+    assert!(token_at < cursor_at, "{}", retrieved.memory_string);
+
+    let summarized = service
+        .summarize(summarize_request(USER, helpful_batch()))
+        .await
+        .expect("the model-driven summarize succeeds");
+    assert_eq!(summarized.status, "success");
+    assert_eq!(completion.call_count(), 2, "one prompt pair per summarize");
+    assert_eq!(
+        entries(&summarized.memories)[0]["content"].as_str(),
+        Some(experience)
+    );
+    let persisted: Vec<MemoryRecord> = store
+        .load(USER)
+        .await
+        .expect("the store loads")
+        .into_iter()
+        .filter(|record| record.content == experience)
+        .collect();
+    assert_eq!(persisted.len(), 1, "the summarize reply was persisted");
+    assert_eq!(
+        persisted[0].when_to_use.as_deref(),
+        Some("when listing every playlist")
+    );
+    assert_eq!(completion.calls().len(), 2);
 }

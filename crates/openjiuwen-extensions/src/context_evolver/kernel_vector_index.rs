@@ -32,18 +32,37 @@
 //!
 //! # Scores
 //!
-//! The kernel normalizes every similarity into `[0, 1]` (`(cosine + 1) / 2` for
-//! the cosine metric), while the evolver's contract is the *raw* cosine in
-//! `[-1.0, 1.0]` — the value
-//! [`HashingEmbedding`](crate::context_evolver::HashingEmbedding) blends with
-//! the lexical score. This index inverts the kernel's normalization, so a
-//! service ranks and blends identically over both backends.
+//! The kernel normalizes every similarity into `[0, 1]`, while this crate's
+//! services blend the index score with a lexical score and need it to grow with
+//! similarity. [`KernelVectorIndex`] therefore inverts that normalization per
+//! metric, and reports each one on its own raw scale:
+//!
+//! | metric | kernel score | index score |
+//! | --- | --- | --- |
+//! | [`Metric::Cosine`] | `(cosine + 1) / 2` | `2 * score - 1`, the raw cosine in `[-1.0, 1.0]` |
+//! | [`Metric::Dot`] | `(tanh(dot) + 1) / 2` | `atanh(2 * score - 1)`, the inner product |
+//! | [`Metric::Euclidean`] | `1 / (1 + distance)` | the score itself, in `(0.0, 1.0]` |
+//!
+//! Cosine (the [`KernelVectorIndex::new`] default) reproduces the in-process
+//! [`HashingEmbedding`](crate::context_evolver::HashingEmbedding) scale, so a
+//! service ranks and blends identically over both backends. `Dot` recovers the
+//! inner product exactly where the kernel's `tanh` compression is invertible and
+//! saturates at `±atanh(1 - 2^-23) ≈ ±8.318` beyond it; `Euclidean` keeps the
+//! kernel's own bounded similarity `1 / (1 + distance)`, which needs no
+//! inversion because it already decreases with distance on a `(0.0, 1.0]`
+//! scale. Both stay monotone in similarity, so ranking and blending keep their
+//! meaning.
 //!
 //! # Limitations (documented, never silent)
 //!
-//! * Only [`Metric::Cosine`] is supported; [`KernelVectorIndex::with_metric`]
-//!   rejects the other metrics with [`Error::Unsupported`], because their
-//!   scores are not cosines and could not be inverted.
+//! * The [`VectorStore`] contract carries no metric, so this index converts
+//!   whatever score the store reports: the store must be configured (and score)
+//!   with the same [`Metric`] passed to [`KernelVectorIndex::with_metric`].
+//!   The kernel's in-process and local-file backends always score cosine
+//!   through the trait — their metric-aware variants are `search_with_metric` —
+//!   so search them with [`Metric::Cosine`]; a vendor backend configured with
+//!   `Dot`/`Euclidean` (Milvus, Chroma, `Elasticsearch`) reports the matching
+//!   normalization.
 //! * Metadata filtering uses the kernel's shared filter language on
 //!   `<metadata>.<dotted path>`, so a backend that cannot express an equality
 //!   (for example `Elasticsearch` on an object value) reports its own typed
@@ -111,15 +130,20 @@ pub struct KernelVectorIndex {
     store: Arc<dyn VectorStore>,
     /// The collection this index owns inside `store`.
     collection: String,
+    /// The similarity metric the store scores with (see the module docs for the
+    /// scale each one is reported on).
+    metric: Metric,
 }
 
 impl fmt::Debug for KernelVectorIndex {
-    /// Reports the collection only: the backing store's configuration (URLs,
-    /// credentials) is its own business and is never printed.
+    /// Reports the collection and metric only: the backing store's
+    /// configuration (URLs, credentials) is its own business and is never
+    /// printed.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("KernelVectorIndex")
             .field("collection", &self.collection)
+            .field("metric", &self.metric)
             .finish_non_exhaustive()
     }
 }
@@ -134,14 +158,16 @@ impl KernelVectorIndex {
         Self::with_metric(store, collection, Metric::Cosine)
     }
 
-    /// Builds an index over `collection` for a store configured with `metric`.
+    /// Builds an index over `collection` for a store scoring with `metric`.
+    ///
+    /// Every [`Metric`] is accepted; the metric decides how a kernel score is
+    /// converted back to the raw similarity this crate's services blend with
+    /// (the formulas are in the module docs). The store itself must score with
+    /// the same metric — see the module's limitations.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] when `collection` is blank and
-    /// [`Error::Unsupported`] for [`Metric::Dot`] and [`Metric::Euclidean`]:
-    /// their kernel scores are not cosines, so they cannot be converted back to
-    /// the raw similarity this crate's services blend with.
+    /// Returns [`Error::Validation`] when `collection` is blank.
     pub fn with_metric(
         store: Arc<dyn VectorStore>,
         collection: impl Into<String>,
@@ -153,20 +179,24 @@ impl KernelVectorIndex {
                 "a store-backed memory index needs a non-empty collection name",
             ));
         }
-        if metric != Metric::Cosine {
-            return Err(Error::unsupported(format!(
-                "the store-backed memory index reports raw cosine similarities, so it supports \
-                 the cosine metric only; {metric:?} cannot be converted — configure the backing \
-                 vector store with Metric::Cosine"
-            )));
-        }
-        Ok(Self { store, collection })
+        Ok(Self {
+            store,
+            collection,
+            metric,
+        })
     }
 
     /// The collection this index reads and writes.
     #[must_use]
     pub fn collection(&self) -> &str {
         &self.collection
+    }
+
+    /// The metric the backing store scores with, and that
+    /// [`VectorIndex::search`] converts from.
+    #[must_use]
+    pub fn metric(&self) -> Metric {
+        self.metric
     }
 
     /// The backing store, for a host that wants to manage the collection.
@@ -243,7 +273,10 @@ impl KernelVectorIndex {
     async fn run_query(&self, query: &VectorQuery) -> Result<Vec<ScoredNode>> {
         self.require_collection().await?;
         let results = self.store.search(&self.collection, query).await?;
-        results.into_iter().map(|hit| scored_node(&hit)).collect()
+        results
+            .into_iter()
+            .map(|hit| scored_node(&hit, self.metric))
+            .collect()
     }
 }
 
@@ -394,7 +427,7 @@ fn metadata_filter(metadata: &BTreeMap<String, Value>) -> Value {
 }
 
 /// Converts one kernel hit into a scored node.
-fn scored_node(result: &VectorSearchResult) -> Result<ScoredNode> {
+fn scored_node(result: &VectorSearchResult, metric: Metric) -> Result<ScoredNode> {
     let id = match result.fields.get(ID_FIELD) {
         Some(Value::String(id)) if !id.is_empty() => id.clone(),
         Some(other) => {
@@ -414,7 +447,7 @@ fn scored_node(result: &VectorSearchResult) -> Result<ScoredNode> {
             embedding: embedding_of(&result.fields)?,
             metadata: metadata_of(&result.fields),
         },
-        score: raw_cosine(result.score),
+        score: raw_similarity(metric, result.score),
     })
 }
 
@@ -458,12 +491,69 @@ fn metadata_of(fields: &Map<String, Value>) -> BTreeMap<String, Value> {
         .unwrap_or_default()
 }
 
+/// The largest `tanh` argument an `f32` kernel score can encode.
+///
+/// `Metric::Dot` normalizes with `(tanh(dot) + 1) / 2`, and `tanh` rounds to
+/// `1.0` in `f32` once the inner product is large, so `2 * score - 1` never
+/// exceeds `1 - 2^-23`; clamping to that bound keeps the inversion finite and
+/// caps the recovered inner product at `atanh(1 - 2^-23) ≈ 8.318`.
+const DOT_ARGUMENT_LIMIT: f32 = 1.0 - f32::EPSILON;
+
+/// Converts one kernel score into the raw similarity the services blend with.
+///
+/// The kernel normalizes every similarity into `[0, 1]`; this inverts that
+/// normalization so a larger value always means "more similar":
+///
+/// * [`Metric::Cosine`] — `2 * score - 1`, the raw cosine in `[-1.0, 1.0]`;
+/// * [`Metric::Dot`] — `atanh(2 * score - 1)`, the inner product, bounded by
+///   `±atanh(1 - 2^-23) ≈ ±8.318` ([`DOT_ARGUMENT_LIMIT`]);
+/// * [`Metric::Euclidean`] — the score itself: the kernel's `1 / (1 + distance)`
+///   already is a bounded similarity that decreases with distance.
+///
+/// A non-finite score maps to `0.0`, and `-0.0` is folded into `0.0` so
+/// ordering stays deterministic.
+fn raw_similarity(metric: Metric, score: f32) -> f32 {
+    match metric {
+        Metric::Cosine => raw_cosine(score),
+        Metric::Dot => raw_dot(score),
+        Metric::Euclidean => bounded_similarity(score),
+    }
+}
+
 /// Inverts the kernel's `(cosine + 1) / 2` normalization back to the raw cosine.
 fn raw_cosine(score: f32) -> f32 {
     let raw = 2.0 * score - 1.0;
     if raw.is_finite() {
         // Normalize `-0.0` to `0.0` so ordering is deterministic.
         raw.clamp(-1.0, 1.0) + 0.0
+    } else {
+        0.0
+    }
+}
+
+/// Inverts the kernel's `(tanh(dot) + 1) / 2` normalization back to the inner
+/// product, bounded by [`DOT_ARGUMENT_LIMIT`].
+fn raw_dot(score: f32) -> f32 {
+    if !score.is_finite() {
+        return 0.0;
+    }
+    let compressed =
+        (2.0 * score.clamp(0.0, 1.0) - 1.0).clamp(-DOT_ARGUMENT_LIMIT, DOT_ARGUMENT_LIMIT);
+    let raw = compressed.atanh();
+    if raw.is_finite() {
+        raw + 0.0
+    } else {
+        0.0
+    }
+}
+
+/// Keeps a kernel score on the bounded `[0, 1]` similarity scale.
+///
+/// The kernel's Euclidean score `1 / (1 + distance)` is already that scale, so
+/// no inversion is needed: the reported value is the score itself.
+fn bounded_similarity(score: f32) -> f32 {
+    if score.is_finite() {
+        score.clamp(0.0, 1.0) + 0.0
     } else {
         0.0
     }
@@ -501,6 +591,15 @@ mod tests {
         assert!(
             (actual - expected).abs() < EPSILON,
             "expected {expected}, got {actual}"
+        );
+    }
+
+    /// Asserts `actual` is within `tolerance` of `expected`, for conversions
+    /// whose precision the kernel's own compression limits.
+    fn assert_near(actual: f32, expected: f32, tolerance: f32) {
+        assert!(
+            (actual - expected).abs() < tolerance,
+            "expected {expected} ± {tolerance}, got {actual}"
         );
     }
 
@@ -763,33 +862,113 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn construction_rejects_blank_collections_and_non_cosine_metrics() {
+    #[test]
+    fn construction_accepts_every_metric_and_rejects_blank_collections() {
         let error = KernelVectorIndex::new(Arc::new(InMemoryVectorStore::new()), "  ").unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Validation);
 
-        for metric in [Metric::Dot, Metric::Euclidean] {
-            let error = KernelVectorIndex::with_metric(
+        for metric in [Metric::Cosine, Metric::Dot, Metric::Euclidean] {
+            let index = KernelVectorIndex::with_metric(
                 Arc::new(InMemoryVectorStore::new()),
                 "memories",
                 metric,
             )
-            .unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::Unsupported);
-            assert!(
-                error.message().contains("cosine metric only"),
-                "{}",
-                error.message()
-            );
+            .unwrap();
+            assert_eq!(index.collection(), "memories");
+            assert_eq!(index.metric(), metric);
+            assert!(format!("{index:?}").contains("memories"));
         }
-        let index = KernelVectorIndex::with_metric(
-            Arc::new(InMemoryVectorStore::new()),
-            "memories",
-            Metric::Cosine,
-        )
-        .unwrap();
-        assert_eq!(index.collection(), "memories");
-        assert!(format!("{index:?}").contains("memories"));
+        // `new` is the cosine default, and a blank collection is rejected
+        // whatever the metric.
+        assert_eq!(index("memories").metric(), Metric::Cosine);
+        assert_eq!(
+            KernelVectorIndex::with_metric(Arc::new(InMemoryVectorStore::new()), " ", Metric::Dot)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Validation
+        );
+    }
+
+    #[test]
+    fn each_metric_converts_the_kernel_score_back_to_its_raw_scale() {
+        // Cosine: `(cos + 1) / 2` inverted is the raw cosine.
+        for (score, expected) in [
+            (Metric::Cosine.score(&[1.0, 0.0], &[1.0, 0.0]), 1.0),
+            (Metric::Cosine.score(&[1.0, 0.0], &[0.0, 1.0]), 0.0),
+            (Metric::Cosine.score(&[1.0, 0.0], &[-1.0, 0.0]), -1.0),
+            (
+                Metric::Cosine.score(&[1.0, 0.0], &[1.0, 1.0]),
+                std::f32::consts::FRAC_1_SQRT_2,
+            ),
+        ] {
+            assert_score(raw_similarity(Metric::Cosine, score), expected);
+        }
+        // Dot: `(tanh(dot) + 1) / 2` inverted is the inner product. The near-`1`
+        // scores lose precision to the `tanh` compression, hence the tolerance.
+        for (left, right, expected) in [
+            (vec![1.0, 0.0], vec![1.0, 0.0], 1.0),
+            (vec![1.0, 0.0], vec![2.0, 3.0], 2.0),
+            (vec![1.0, 0.0], vec![-0.5, 4.0], -0.5),
+        ] {
+            let score = Metric::Dot.score(&left, &right);
+            assert_near(raw_similarity(Metric::Dot, score), expected, 1e-4);
+        }
+        // Euclidean: the kernel's `1 / (1 + d)` is already the bounded scale, so
+        // the reported value is the score itself.
+        for (left, right) in [
+            (vec![1.0, 0.0], vec![1.0, 0.0]),
+            (vec![1.0, 0.0], vec![1.0, 1.0]),
+            (vec![0.0, 0.0], vec![3.0, 4.0]),
+        ] {
+            let score = Metric::Euclidean.score(&left, &right);
+            assert_score(raw_similarity(Metric::Euclidean, score), score);
+        }
+    }
+
+    #[test]
+    fn dot_scores_saturate_and_euclidean_scores_stay_bounded() {
+        // `tanh` rounds to `1.0` in `f32` for a large inner product, so the
+        // inversion caps at `atanh(1 - 2^-23) ≈ 8.3178` instead of `inf`.
+        let saturated = raw_similarity(Metric::Dot, 1.0);
+        assert_near(saturated, 8.3178, 1e-3);
+        assert_eq!(
+            raw_similarity(Metric::Dot, Metric::Dot.score(&[100.0], &[100.0])),
+            saturated
+        );
+        assert_eq!(
+            raw_similarity(Metric::Dot, Metric::Dot.score(&[-100.0], &[100.0])),
+            -saturated
+        );
+
+        // Below the cap the recovered inner product is monotone in the score.
+        let mut previous = f32::NEG_INFINITY;
+        for dot in [-4.0, -1.0, 0.0, 0.5, 1.0, 2.0] {
+            let score = raw_similarity(Metric::Dot, Metric::Dot.score(&[dot], &[1.0]));
+            assert_near(score, dot, 1e-4);
+            assert!(score > previous, "{score} after {previous}");
+            previous = score;
+        }
+
+        // Euclidean: `1 / (1 + d)` decreases with distance and stays in `(0, 1]`,
+        // so a nearer vector always ranks first.
+        let mut previous = f32::INFINITY;
+        for distance in [0.0, 0.5, 1.0, 4.0, 40.0] {
+            let score = raw_similarity(
+                Metric::Euclidean,
+                Metric::Euclidean.score(&[0.0], &[distance]),
+            );
+            assert!(score > 0.0 && score <= 1.0, "{score}");
+            assert!(score < previous, "{distance}");
+            assert_score(score, 1.0 / (1.0 + distance));
+            previous = score;
+        }
+
+        // A non-finite kernel score never reaches a ranking.
+        for metric in [Metric::Cosine, Metric::Dot, Metric::Euclidean] {
+            for score in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                assert_eq!(raw_similarity(metric, score), 0.0, "{metric:?}/{score}");
+            }
+        }
     }
 
     #[tokio::test]
