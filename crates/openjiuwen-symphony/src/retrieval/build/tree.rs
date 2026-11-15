@@ -55,8 +55,9 @@
 //!
 //! [`visualizer`](crate::retrieval::build::tree::visualizer) renders this node list and
 //! its catalog as one `tree_index.html` document for humans. That file is an opt-in extra
-//! artifact outside the three-artifact publish contract: nothing in a build calls it, and
-//! the search runtime never reads it back, so it is purely derived data.
+//! artifact outside the three-artifact publish contract: a build writes it only when
+//! [`BuildOptions::write_html`](crate::retrieval::build::workflows::BuildOptions::write_html)
+//! is set, the search runtime never reads it back, and it is purely derived data.
 
 /// Opt-in model-driven tree shaping, with deterministic fallbacks.
 pub mod shaping;
