@@ -13,9 +13,10 @@ Everything is offline and deterministic by default: no environment reads, no wal
 - `EvaluatedCase` — `case`, `answer`, `score`, `reason`; `new` (score bounds), `validate`, accessors `inputs`/`label`/`tools`/`case_id`, `From<Case>` producing score `0.0` and empty answer/reason.
 - `CaseLoader` — `new`, `size`, `is_empty`, `cases`, `into_cases`, `get`, `iter`, `shuffle` (seeded xorshift64* Fisher-Yates), `split` (floor of `ratio * size`), iteration, JSON round-trip through `{"cases":[...]}`.
 - Evaluator seam (`evaluator/`, details in `evaluator/CONTEXT.md`):
-  - `PromptRunner` — `async fn run(&self, prompt, case) -> Result<BTreeMap<String, Value>>` plus the provided `run_traced` returning a `RunOutcome` (default: `run` with an empty `ToolTrace`).
+  - `PromptRunner` — `async fn run(&self, prompt, case) -> Result<BTreeMap<String, Value>>` plus the provided `run_traced` returning a `RunOutcome` (default: `run` with an empty `ToolTrace` and absent telemetry).
   - `ModelPromptRunner` — system message = candidate prompt, user message = `render_case_inputs(case)`; a fenced or whole-answer JSON object becomes the answer map, plain text becomes `{"output": text}`.
     `with_stubs(ToolStubs)` and `with_max_tool_rounds(usize)` (default `DEFAULT_MAX_TOOL_ROUNDS = 8`) make `run_traced` declare `Case::tools()`, execute the model's tool calls in order against the stubs, record every call, and feed each outcome back as a `Role::Tool` message.
+    `run_traced` also measures the whole run with `std::time::Instant` (`telemetry.latency_ms`) and sums `input_tokens`/`output_tokens` from every `ChatResponse.usage` of the run (`telemetry.prompt_tokens`/`completion_tokens`); cost is never inferred.
   - `ScriptedPromptRunner` — canned answers keyed by case id, optional fallback, recorded `PromptCall`s, `Error::not_found` for an unscripted case without a fallback; runs no tools.
   - `CaseScorer` — `fn score(&self, case, answer) -> (f64, String)` plus the provided `score_with_trace` (default ignores the trace); `LabelScorer` is the deterministic default (see scoring bands below).
   - `ToolUsageScorer` — multiplies an inner `LabelScorer` (or any `Box<dyn CaseScorer>`) by the fraction of the required tools the trace used: `new(required)`, `from_case(&Case)`, `with_inner`, `required()`, `missing(&ToolTrace)`.
