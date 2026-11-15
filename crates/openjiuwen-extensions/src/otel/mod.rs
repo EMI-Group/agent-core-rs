@@ -9,7 +9,14 @@
 //! conventions, redaction, span names — compiles with or without the `otel`
 //! feature, so hosts can build configuration and assert naming rules without
 //! pulling the SDK in. Without the feature, [`init_otel_tracer`] validates the
-//! configuration and returns an inactive handle instead of failing.
+//! configuration and then splits by exporter type:
+//! [`ExporterType::Memory`], [`ExporterType::Console`] and
+//! [`ExporterType::None`] return an inactive handle (the documented no-op seam,
+//! signalled by [`TracerHandle::is_active`] being `false`), while
+//! [`ExporterType::Otlp`] and [`ExporterType::File`] answer
+//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) naming
+//! the missing `otel` cargo feature — a collector endpoint or a traces
+//! directory is never accepted and silently ignored.
 //!
 //! # Seam
 //!
@@ -17,7 +24,9 @@
 //! use openjiuwen_extensions::otel::{init_otel_tracer, ExporterType, OtelTracerConfig};
 //!
 //! // The in-memory exporter needs no collector. Without the `otel` feature the
-//! // handle is an inactive no-op seam, so the call still succeeds.
+//! // handle is an inactive no-op seam, so the call still succeeds; selecting
+//! // `ExporterType::Otlp` or `ExporterType::File` there answers
+//! // `Error::Unsupported` instead.
 //! let config = OtelTracerConfig::default().with_exporter_type(ExporterType::Memory);
 //! let handle = init_otel_tracer(config).expect("the memory exporter always initializes");
 //! assert_eq!(handle.is_active(), cfg!(feature = "otel"));
@@ -176,7 +185,11 @@
 //! [`ExporterType::Otlp`] ships finished spans to a collector over OTLP/HTTP,
 //! encoded either as JSON ([`OtlpProtocol::Http`], the default, payloads
 //! `application/json`) or as protobuf ([`OtlpProtocol::HttpProtobuf`],
-//! `application/x-protobuf`, backed by the crate's hand-written encoder). gRPC
+//! `application/x-protobuf`, backed by the crate's hand-written encoder). A
+//! build without the `otel` feature cannot post anything, so
+//! `ExporterType::Otlp` answers
+//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) there
+//! instead of returning an inactive handle. gRPC
 //! is the only unsupported transport: its framing needs `opentelemetry-otlp`,
 //! `prost`, and `tonic`, which the offline build cannot reach, so
 //! [`OtlpProtocol::Grpc`] — the configuration default — answers
