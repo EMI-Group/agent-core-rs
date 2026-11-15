@@ -15,12 +15,14 @@ JSON field names must stay compatible with the Python `MemoryDoc`/`MemResult` wi
 pub const DEFAULT_ID: &str = "__default__";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case", default)]
+#[serde(rename_all = "snake_case")]
 pub struct MemoryScope {
-    pub user_id: String,                 // default DEFAULT_ID
-    pub scope_id: String,                // default DEFAULT_ID
-    pub session_id: Option<String>,      // skipped when None
-    pub agent_id: Option<String>,        // skipped when None
+    pub user_id: String,                 // required on decode; `Default`/`new` use DEFAULT_ID
+    pub scope_id: String,                // required on decode; `Default`/`new` use DEFAULT_ID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 impl MemoryScope {
     pub fn new(user_id: impl Into<String>, scope_id: impl Into<String>) -> Self;
@@ -31,6 +33,7 @@ impl MemoryScope {
     pub fn matches(&self, other: &Self) -> bool; // user+scope always; session/agent only when set on `self`
 }
 ```
+`user_id` and `scope_id` carry no serde default: a decoded payload that omits either fails with a `serde` "missing field" error instead of silently re-tenanting the record to `__default__`, while `Default`, `new` and `user` keep supplying `DEFAULT_ID` in code.
 `validate`: user_id and scope_id non-empty, no NUL; scope_id additionally has no `/`, no `\\`, length ≤ 128 (Python `_validate_id` parity). Errors are `Error::Validation` naming the field. `session_id`/`agent_id`, when present, must be non-empty and contain no NUL; `/` is rejected for session ids used in KV keys.
 
 ### `kind.rs`
@@ -59,10 +62,10 @@ pub struct MemoryRecord {
     pub kind: MemoryType,
     #[serde(default = "default_importance")]
     pub importance: f32,                 // 0.5
-    #[serde(default = "utc_now")]
-    pub timestamp: DateTime<Utc>,
-    #[serde(default = "utc_now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default = "unix_epoch")]
+    pub timestamp: DateTime<Utc>,        // decoded default: UNIX epoch
+    #[serde(default = "unix_epoch")]
+    pub updated_at: DateTime<Utc>,       // decoded default: UNIX epoch
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_access: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -90,6 +93,7 @@ impl MemoryRecord {
 }
 ```
 `id.rs`: `pub fn new_memory_id(user_id: &str, now: DateTime<Utc>) -> String` producing 24 lowercase hex chars, mirroring Python: 6-byte big-endian millisecond timestamp + 3 random bytes (`Uuid::new_v4`) + 3-byte FNV-1a hash of `user_id`. Also `pub fn normalize_text(text: &str) -> String` (lowercase, collapse whitespace, strip surrounding punctuation) used by dedupe.
+An absent `timestamp`/`updated_at` decodes to the UNIX epoch, never to "now": re-dating an undated row would fabricate a perfect recency score, and `MemoryRecord::new` is the only constructor that stamps the clock.
 
 ### `input.rs`
 ```rust
@@ -107,7 +111,7 @@ pub struct NewMemory {
 impl NewMemory { pub fn new(content, kind) -> Self; pub fn semantic/episodic/user_profile/summary/coding(content) -> Self;
                 pub fn with_importance(self, f32) -> Self; pub fn with_metadata(self, key, Value) -> Self;
                 pub fn with_source(self, impl Into<String>) -> Self; pub fn with_timestamp(self, DateTime<Utc>) -> Self;
-                pub fn validate(&self) -> Result<()>; }   // Non-empty content; kind != Variable
+                pub fn validate(&self) -> Result<()>; }   // Non-empty content; kind neither Variable nor Unknown
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
@@ -120,7 +124,8 @@ pub struct MemoryUpdate {
 }
 impl MemoryUpdate { pub fn content(impl Into<String>) -> Self; pub fn with_importance; pub fn with_metadata(key, Value); pub fn with_source; pub fn with_kind; pub fn is_empty(&self) -> bool; }
 ```
-`MemoryUpdate::content` is a constructor returning `Self`; `with_*` are builders. `validate` rejects empty content, kind `Variable`, importance outside `0..=1`.
+`MemoryUpdate::content` is a constructor returning `Self`; `with_*` are builders. `validate` rejects empty content, kind `Variable` or `Unknown`, importance outside `0..=1`.
+`Variable` is the projection-only namespace and `Unknown` is what a decode produces for an absent or unrecognized kind, so neither is writable through `add`/`update`; both are `Error::Validation` naming the field and value.
 
 ### `filter.rs`
 ```rust
@@ -182,7 +187,8 @@ pub struct RecallHit { #[serde(flatten)] pub record: MemoryRecord, pub score: f3
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct AddOutcome { pub added: Vec<MemoryRecord>, pub merged: Vec<MemoryRecord>,
-                        pub deleted: Vec<String>, pub skipped: Vec<String> }
+                        pub deleted: Vec<String>, pub skipped: Vec<String>,
+                        pub degraded: Option<String> }   // why the dedupe scan did not run
 impl AddOutcome { pub fn len(&self) -> usize; pub fn is_empty(&self) -> bool; }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -194,20 +200,25 @@ pub struct MemoryStats { pub total: usize, pub by_kind: BTreeMap<String, usize>,
 #[serde(rename_all = "snake_case", default)]
 pub struct AddMemResult { pub variables: BTreeMap<String, String>, pub user_profile: Vec<MemoryRecord>,
                           pub semantic_memory: Vec<MemoryRecord>, pub episodic_memory: Vec<MemoryRecord>,
-                          pub summary: Vec<MemoryRecord>, pub coding: Vec<MemoryRecord> }
+                          pub summary: Vec<MemoryRecord>, pub coding: Vec<MemoryRecord>,
+                          pub skipped: usize, pub deleted: usize, pub degraded: Option<String> }
 impl AddMemResult { pub fn records(&self) -> impl Iterator<Item = &MemoryRecord>; pub fn len(&self) -> usize; }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct CombinedRecall { pub memories: Vec<RecallHit>, pub entities: Vec<graph::GraphRecallHit> }
+pub struct CombinedRecall { pub memories: Vec<RecallHit>, pub entities: Vec<graph::GraphRecallHit>,
+                            pub graph_error: Option<String> }
+impl CombinedRecall { pub fn is_partial(&self) -> bool; }
 ```
-`CombinedRecall` may live in the facade or record module; `graph::GraphRecallHit` must already exist, so define `CombinedRecall` in `graph` and re-export from the crate root, or make it generic. Decision: define `CombinedRecall` in `graph::mod` as `{ memories: Vec<RecallHit>, entities: Vec<GraphRecallHit> }` and re-export.
+`AddOutcome::degraded` names why duplicate detection could not run (the candidate scan failed), so a write that stored unchecked duplicates is distinguishable from a clean one; it is a diagnostic and is not counted by `len`/`is_empty`.
+`AddMemResult::skipped`/`deleted`/`degraded` carry the write bookkeeping the records cannot: dedupe-skipped inputs, rows a replace removed, and why model extraction fell back to the heuristics.
+`CombinedRecall` lives in `graph::mod` as `{ memories, entities, graph_error }` and is re-exported; `graph_error` is `Some` when graph recall failed while the memory hits stayed complete, and `is_partial()` reports exactly that.
 
 ## Constraints
 
 - Pure data + pure helpers only: no storage, no embedding, no `Model`, no async except `CallOptions::run` (a generic future selector).
 - `MemoryRecord` JSON must round-trip and must accept Python shapes: `{"id","text","type","timestamp","fields","user_id","scope_id"}` and the `MemResult` aliases `"mem"`/`"mem_type"`.
 - Use `BTreeMap` for metadata/variables so JSON output is deterministic.
-- `MemoryType` `Variable` is never stored through `add`; `NewMemory::validate` rejects it.
+- `MemoryType` `Variable` is the projection-only namespace and `Unknown` is the decode fallback; `NewMemory::validate`/`MemoryUpdate::validate` reject both.
 - No panics: every fallible constructor returns `Result`.
 
 ## Routing Table
@@ -223,5 +234,5 @@ pub struct CombinedRecall { pub memories: Vec<RecallHit>, pub entities: Vec<grap
 
 ## Test Strategy
 
-- Unit tests in each file: scope validation matrix; `MemoryType` serde incl. unknown; record JSON round-trip incl. Python `text`/`mem` and `type`/`mem_type` aliases; flattened scope fields; id shape (24 lowercase hex, deterministic length); update/filter matching; `CallOptions::check` after cancellation; `CallOptions::run` timeout.
+- Unit tests in each file: scope validation matrix; scope decode requiring both tenant ids (a payload without `user_id`/`scope_id` fails, while `new`/`Default` still supply `DEFAULT_ID`); `MemoryType` serde incl. unknown; record JSON round-trip incl. Python `text`/`mem` and `type`/`mem_type` aliases; flattened scope fields; absent `timestamp`/`updated_at` decoding to the UNIX epoch while `MemoryRecord::new` stamps now; write-input validation rejecting `Variable` and `Unknown`; id shape (24 lowercase hex, deterministic length); update/filter matching; `AddOutcome`/`AddMemResult` degraded/skipped serialization; `CallOptions::check` after cancellation; `CallOptions::run` timeout.
 - Integration JSON assertions live in `tests/crud.rs`; do not duplicate them here.

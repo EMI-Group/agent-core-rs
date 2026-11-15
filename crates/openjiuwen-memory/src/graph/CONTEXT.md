@@ -50,7 +50,9 @@ pub struct ExtractedEntity { pub name: String, pub entity_type: String, pub impo
 pub struct ExtractedRelation { pub from: String, pub to: String, pub relation_type: String }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case", default)]
-pub struct Extraction { pub entities: Vec<ExtractedEntity>, pub relations: Vec<ExtractedRelation> }
+pub struct Extraction { pub entities: Vec<ExtractedEntity>, pub relations: Vec<ExtractedRelation>,
+                        pub degraded: Option<String> }   // omitted from JSON when unset
+impl Extraction { pub fn is_degraded(&self) -> bool; pub fn degraded_reason(&self) -> Option<&str>; }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphRecallHit { #[serde(flatten)] pub entity: Entity, pub score: f32, pub depth: usize }
@@ -60,7 +62,9 @@ pub struct GraphRecallHit { #[serde(flatten)] pub entity: Entity, pub score: f32
 pub struct GraphMemoryStats { pub entities: usize, pub relations: usize }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct CombinedRecall { pub memories: Vec<RecallHit>, pub entities: Vec<GraphRecallHit> }  // `LongTermMemory::search_all`
+pub struct CombinedRecall { pub memories: Vec<RecallHit>, pub entities: Vec<GraphRecallHit>,
+                            pub graph_error: Option<String> }  // `LongTermMemory::search_all`
+impl CombinedRecall { pub fn is_partial(&self) -> bool; }          // true when only memory hits are complete
 
 #[derive(Clone, Default)]                 // custom `Debug` reports `EntityExtractor::name`
 pub struct GraphAddOptions { pub extractor: Option<Arc<dyn EntityExtractor>>, pub call: CallOptions }
@@ -106,6 +110,7 @@ impl GraphMemory {
 ```
 
 `GraphMemory` itself never consults `GraphMemoryConfig::enabled`; the `LongTermMemory` facade decides whether to wire graph memory.
+`Extraction::degraded` names why a cheaper path answered (omitted from JSON when unset, so the wire shape of a normal extraction is unchanged), and `CombinedRecall::graph_error` names a failed graph recall while `memories` stays complete — `is_partial()` is the one flag a caller needs to spot that.
 
 ## Persistence Mapping
 
@@ -119,6 +124,7 @@ impl GraphMemory {
 - Relations whose endpoints are not in `extraction.entities` are skipped, as are blank relation types and self loops (no dangling edges or self loops from extraction).
 - Scope filtering uses `GraphQuery { labels: [...], filter: {"user_id": ..., "scope_id": ...} }` from `store::scope_query`; `session_id`/`agent_id` deliberately do not narrow a graph, so every session and agent of one workspace shares its graph.
 - Nodes that do not convert to an `Entity`/`Relation` (relation mirror nodes seen by `query_entities`, foreign nodes in the same scope) are skipped by `filter_map`, never treated as errors.
+- Entity vectors come from the attached `Embedding`: `embed_entities` rejects a provider answer whose vector count does not match the entity count, and an empty or non-finite vector with `Error::Validation` naming the entity and the defect, before anything is written — an unembedded entity is never stored as if it were indexed.
 
 ## Stats and Ordering
 
@@ -137,7 +143,7 @@ impl GraphMemory {
 
 `LlmExtractor`: one `Model::invoke` with a system prompt requesting JSON:
 `{"entities":[{"name":"...","type":"...","importance":0.0}],"relations":[{"from":"...","to":"...","type":"..."}]}`.
-Parse tolerantly (accept a fenced ```json block, an object or an array under `entities`/`relations`); retry up to `model_retries`; on exhausted retries return the heuristic result and log a warning (graceful degradation, Python parity). Cancellation wraps the call.
+Parse tolerantly (accept a fenced ```json block, an object or an array under `entities`/`relations`); retry up to `model_retries`; on exhausted retries return the heuristic result with `Extraction::degraded` set to `LLM entity extraction failed after N attempt(s); fell back to the heuristic extractor` and log a warning (graceful degradation, Python parity — a successful model pass and a plain heuristic pass both leave `degraded` unset). Cancellation wraps the call.
 Default selection in `GraphMemory::add`: `GraphAddOptions::extractor` when set, else `LlmExtractor` when a model is attached, else `HeuristicExtractor`.
 
 ## Recall
@@ -160,7 +166,7 @@ Expansion is gated by `include_relations && max_depth > 0 && max_neighbors > 0`,
 
 ## Constraints
 
-- Errors: invalid scope or blank text/query `Error::Validation`; store/embedding failures keep their kind; LLM extraction failures fall back to heuristics (warn) but cancellation returns `Error::Cancelled`.
+- Errors: invalid scope or blank text/query `Error::Validation`; an empty or non-finite embedding vector is `Error::Validation` naming the entity; store/embedding failures keep their kind; LLM extraction failures fall back to heuristics (warn, plus `Extraction::degraded`) but cancellation returns `Error::Cancelled`.
 - Graph is disabled by default (`GraphMemoryConfig::enabled = false`); `LongTermMemory::search_all` only calls it when enabled and a graph store exists.
 - No `unsafe`; async-trait extractors; graph store calls are async.
 - LLM extraction must tolerate non-JSON output without panicking.
@@ -175,6 +181,6 @@ Expansion is gated by `include_relations && max_depth > 0 && max_neighbors > 0`,
 
 ## Test Strategy
 
-- Unit tests: heuristic extraction (quotes/capitals/patterns, stopwords), LLM JSON parsing (fenced/tolerant/malformed), entity/relation id derivation, merge on repeat add, BFS scoring/ordering, `scope_query` filtering, delete/clear.
+- Unit tests: heuristic extraction (quotes/capitals/patterns, stopwords), LLM JSON parsing (fenced/tolerant/malformed), the degraded fallback reason and attempt count, entity/relation id derivation, merge on repeat add, BFS scoring/ordering, `scope_query` filtering, delete/clear, unusable embedding vectors rejected before a write, `CombinedRecall` JSON with and without `graph_error` (legacy payloads still decode).
 - `tests/graph_memory.rs`: `GraphMemory` directly — extraction wiring, persistence, seed scoring with and without an embedding, neighbor expansion on/off, scope isolation, delete/clear/stats, validation and cancellation.
-- `tests/graph.rs`: through the `LongTermMemory` facade — `ltm.graph()` built only for enabled config plus a graph backend, `search_all` merging memory hits and graph entities, and facade-level persistence/recall.
+- `tests/graph.rs`: through the `LongTermMemory` facade — `ltm.graph()` built only for enabled config plus a graph backend, `search_all` merging memory hits and graph entities, `graph_error` when graph recall fails, and facade-level persistence/recall.
