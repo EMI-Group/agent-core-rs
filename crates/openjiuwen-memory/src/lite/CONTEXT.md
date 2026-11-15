@@ -435,6 +435,8 @@ Independent of the layout, three further surfaces live under the same root:
 - Staleness in the per-fact layout compares `MEMORY.md`/`USER.md` stamps and the `facts/` `DirStamp`; index-document changes trigger an import, fact-file changes trigger a re-render, and when both changed the index wins with a `tracing::warn!`.
 - Mutations are additionally serialized inside the process by an async mutex; the file lock alone would work but is a blocking system call.
 - A read path that observes a changed file without holding the file lock updates the cache and marks the projections dirty; every locked path flushes them, which preserves the file-lock-then-state-guard order.
+- That read-path reload rebuilds only the document and the FTS index (`store::ensure_fresh`); the chunk index is refreshed solely by mutations, `reindex`, `sync_now`, `export_index`/`import_index` and `open`, so a `search` after an external edit scores changed facts against stale vectors.
+- A failed `EmbeddingIndex::reindex` keeps the previously committed chunk list, but the first refresh after open inserts the empty index into its slot before reindexing, so a failure there leaves an empty index that later `search` calls read as `similarity = 0.0` with no error.
 - `start_watching` reloads (and reindexes) on every debounced `.md` change; `reload_count` is the observable reload counter.
 - `write`/`edit`/`delete`/`reindex` refresh the chunk index after the state guard is dropped, so no guard is ever held across an embedding call.
 
@@ -642,6 +644,14 @@ Independent of the layout, three further surfaces live under the same root:
 - Offline and deterministic: `tempfile` directories, `HashEmbedding` plus counting wrappers, explicit `Instant`s, no network, no credentials, bounded awaits (≲5 s in `watch.rs`).
 - Gates (all must be green): `cargo fmt -p openjiuwen-memory`, `cargo test -p openjiuwen-memory --offline` (971 tests), the same with `--all-features` (1048), `cargo clippy -p openjiuwen-memory --all-targets --all-features --offline -- -D warnings`, and `cargo doc -p openjiuwen-memory --no-deps` with and without the feature.
 - Module-level (`//!`) doc links in this directory must be absolute (`crate::lite::<module>::<Item>`): `//!` docs resolve in the parent module's scope.
+
+## Known Issues
+
+- File-level defects of each subtree live in that directory's `## Known Issues` (`markdown`, `embed`, `facts`, `session`, `local`); this list holds only cross-file ones.
+- `watch.rs` logs a `notify`-reported watcher error with `warn!` and keeps running, so a watch that stops delivering after `MemoryWatcher::start` returned `Ok` has no API-level signal.
+- `LocalCodingMemory::write_mode`'s `WritePlan::Skipped(None)` arm reports the incoming fact as stored with `mode = Skip`; `MemUpdateChecker::plan` never returns `Skipped(None)` today, so the arm is latent silent-success code rather than live behaviour.
+- `LocalCodingMemoryBuilder::open` never calls `CodingMemoryConfig::validate`, and `local::store::resolve_fact_type` folds an unparsable `default_fact_type` into `CodingFactType::Project` (debug log only), so a misspelled default degrades silently.
+- `CodingMemory::{list, find_record}` (via `CodingFact::from_record`) drop a `Coding`-kind record whose metadata has no non-blank `name` or lacks `coding_fact = true`, so such a record is invisible to `read`/`list`/`delete` and a later write of the same name creates a second record.
 
 ## Deferred (Python `core.memory.lite` features not ported)
 

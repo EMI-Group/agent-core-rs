@@ -48,6 +48,13 @@ The module-level prose (layout, consistency model, search contract, module split
 - `./watcher.rs` → `start_watching`, `stop_watching`, `is_watching`
 - `./tests.rs` → the 13 store unit tests covering open/layout, read/write/edit/delete, search, the summary index, reloads/`reindex`, locking, the watcher, and the handle's `Send + Sync` bounds
 
+## Known Issues
+
+- The chunk/vector index is only refreshed when it is absent or by a mutation, `refresh_embeddings`, `reindex`, `sync_now`, export/import or `open`; a reader-path reload (`ensure_fresh`/`refresh_facts`) leaves the old vectors in place, so `search` in `Semantic`/`Hybrid` mode ranks on stale text and gives an externally added fact `similarity = 0.0` (usually dropped by the threshold) with no error (`embedding.rs` `semantic_scores`, `search.rs`).
+- A cached chunk vector whose length differs from the query vector silently scores `0.0` (`lite::embed::EmbeddingIndex::search`), so a model whose dimension changed under the same `model_name` turns semantic recall into an empty, error-free result.
+- `refresh_facts` adopts the index documents wholesale when one of them changed, so facts that exist only in `facts/` (e.g. after a reader-path refresh left `projections_dirty`) are dropped from the document and then deleted from `facts/` by the next `export_locked`; only a `tracing::warn!` records it.
+- `start_watching`'s reload task logs a failed `ensure_fresh` as a warning and continues, so `search`/`list` can stay stale with no observable signal, and `is_watching` reports `true` even if that reload task died (`ActiveWatch.task` is never polled).
+
 ## Test Strategy
 
 - 47 unit tests with default features and 48 with `--features sqlite`: `tests.rs` 13, `facts_mode.rs` 7, `session_mode.rs` 6, `write_mode.rs` 6, `search.rs` 5, `embedding.rs` 5 (one sqlite-gated), `sync_mode.rs` 3, `daily_mode.rs` 3.

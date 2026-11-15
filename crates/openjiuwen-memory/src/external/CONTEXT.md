@@ -89,7 +89,16 @@ Per-vendor rail: `mem0_*` (3 tools), `mem2_*` (2), `lkb_*` (6), `viking_*` (5), 
 ## Known Issues
 
 - `clear` on `jiuwen_memory` and `openviking` runs the transport's list-then-delete fallback and therefore ends in the vendor's typed `Unsupported` (nothing is removed); the same is true for a `lakebase`/`openviking` clear where `delete` is supported but `list` is not.
-- A `drop`/`clear` of a `mem0` memory group is a no-op at the vendor; only per-id deletes exist.
+- A `mem0` clear falls back to list-then-delete over one page (`page_size`, 100 by default), so it removes at most that page and reports that count while the rest stays stored.
+- A recall row with no vendor `score` is decoded as `0.0` and then dropped by the default `SearchOptions` threshold (`0.3`), so a vendor whose answer carries no score returns an empty hit list while the HTTP call succeeded — `openviking`'s documented `find` answer has no `score` field and its suites always mock one, so `OpenVikingSpec::search` is empty for every default-threshold caller.
+- `jiuwen_memory` treats a non-JSON `2xx` recall answer as "no hits" (`Ok(Vec::new())`, `debug` log only) and a non-JSON or non-array `2xx` write answer as `skipped` (deduplicated), so a shape drift or proxy error page is reported as a successful empty read or a dedupe.
+- `jiuwen_memory`'s write decoder overwrites the decoded content with its `segments` join, so a unit without `segments` yields an `added` record with empty content (and `mem2_add` answers `"stored"` with `content: ""`).
+- `RestProvider::initialize` ignores the health probe's status and a failing `health_call`, so a `401`/`403`/`5xx` answer still returns `Ok(())` and marks the handle initialized; `health()` is the only place that distinguishes the two.
+- `results_array` maps an unrecognized `2xx` body to `&[]`, so a wrapper or shape drift is indistinguishable from "no rows" for every list/search spec built on it (`mem0`, `lakebase`).
+- `vendor_record` invents a local id and empty content for a row that lacks them, so `list`/`search` can return records whose id cannot be `get`/`update`/`delete`d remotely.
+- `lakebase` reports `added` from any `2xx` ingest even without a `memory_id`, and sends a multi-kind `filter.kinds` listing unfiltered; `mem0`'s `list` ignores the whole filter and fetches one page.
+- `SearchMode::Hybrid` is not validated against `ProviderCapabilities`, so a semantic-only vendor (`mem0`, `openviking`) answers a hybrid request with its semantic result instead of a typed `Unsupported`.
+- `OpenVikingSpec::add_result` and the `viking_add_resource` rail tool report success from a `2xx` without decoding it (a client-generated id, an empty `root_uri`), which is deliberate for session-message writes but loses any vendor rejection carried in a `2xx` body.
 
 ## Deferred (not implemented here)
 
