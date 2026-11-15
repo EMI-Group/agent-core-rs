@@ -77,6 +77,14 @@ pub const REMOTE_URL_NOT_ALLOWED_CODE: &str = "remote_url_not_allowed";
 pub const PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE: &str =
     "provider_official_adapter_not_configured";
 
+/// Compact code: the artefact declares a model type this crate does not decode.
+///
+/// The code is published through [`ARTIFACT_ERROR_CODES`]; the constant itself stays crate-visible because this module's public surface is the re-export list in [`super`], which a downstream crate can extend without changing the manager.
+pub(crate) const TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE: &str = "tokenizer_model_type_unsupported";
+
+/// The vendor named in a `provider_official` message when nothing identifies one.
+const UNNAMED_VENDOR: &str = "provider-official";
+
 /// Every compact code the manager can report.
 pub const ARTIFACT_ERROR_CODES: &[&str] = &[
     LOCAL_ARTIFACT_MISSING_CODE,
@@ -91,6 +99,7 @@ pub const ARTIFACT_ERROR_CODES: &[&str] = &[
     TOKENIZER_SHA256_MISMATCH_CODE,
     REMOTE_URL_NOT_ALLOWED_CODE,
     PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE,
+    TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE,
 ];
 
 /// The hub family a spec resolves through.
@@ -264,7 +273,9 @@ impl TokenizerArtifactManager {
         self.request_timeout
     }
 
-    /// The compact code of the last failed resolution, if the last one failed.
+    /// The reason of the last failed resolution, if the last one failed.
+    ///
+    /// The value starts with one of [`ARTIFACT_ERROR_CODES`]: a typed failure keeps its whole message, so a `provider_official` spec reports the vendor and tokenizer id it needs an adapter for, while a failure the manager decides itself (a disabled download, a missing local artefact) is just the code.
     #[must_use]
     pub fn last_error(&self) -> Option<String> {
         self.slot().clone()
@@ -292,14 +303,10 @@ impl TokenizerArtifactManager {
 
     /// Resolves `spec` to a validated local artefact, downloading when allowed.
     ///
-    /// The order matches Python's manager: an `artifact_path` (file or
-    /// directory), then a `tokenizer_id` that exists on disk, then validation,
-    /// then the hub source. `://` ids are refused before any source is
-    /// considered. Failures return `None` and record a compact code read back
-    /// through [`TokenizerArtifactManager::last_error`]; the call never panics.
-    ///
-    /// Unlike Python this method is `async`, because a download uses the
-    /// workspace HTTP client; it performs no I/O at all when downloads are off.
+    /// The order matches Python's manager: an `artifact_path` (file or directory), then a `tokenizer_id` that exists on disk, then validation, then the hub source; `://` ids are refused before any source is considered.
+    /// Failures return `None` and record the reason read back through [`TokenizerArtifactManager::last_error`], and the call never panics.
+    /// A `provider_official` spec names the vendor and tokenizer id it could not resolve, and a downloaded artefact this crate cannot decode records `tokenizer_model_type_unsupported` with the declared model type, so neither failure looks like a cache miss.
+    /// Unlike Python this method is `async`, because a download uses the workspace HTTP client; it performs no I/O at all when downloads are off.
     pub async fn resolve(&self, spec: &TokenizerSpec) -> Option<PathBuf> {
         self.clear_error();
         if let Some(path) = Self::local_artifact(spec) {
@@ -313,18 +320,15 @@ impl TokenizerArtifactManager {
             HubSource::HuggingFace | HubSource::ModelScope => {
                 self.resolve_hub(spec, source_of(spec)).await
             }
-            HubSource::ProviderOfficial => self.fail(PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE),
+            HubSource::ProviderOfficial => self.fail_error(&provider_official_error(spec)),
             HubSource::Local => self.fail(LOCAL_ARTIFACT_MISSING_CODE),
         }
     }
 
     /// Resolves `spec` against the local cache only, never the network.
     ///
-    /// This is the rung the synchronous tokenizer selector uses: a cached (or
-    /// explicitly configured) artefact is validated and returned, and anything
-    /// else records [`REMOTE_DOWNLOAD_DISABLED_CODE`] when downloads are off,
-    /// or [`TOKENIZER_NOT_IN_LOCAL_CACHE_CODE`] when they are enabled but a
-    /// synchronous caller cannot wait for one.
+    /// This is the rung the synchronous tokenizer selector uses: a cached (or explicitly configured) artefact is validated and returned, and anything else records [`REMOTE_DOWNLOAD_DISABLED_CODE`] when downloads are off, or [`TOKENIZER_NOT_IN_LOCAL_CACHE_CODE`] when they are enabled but a synchronous caller cannot wait for one.
+    /// A `provider_official` spec records the adapter message naming its vendor and tokenizer id.
     #[must_use]
     pub fn resolve_cached(&self, spec: &TokenizerSpec) -> Option<PathBuf> {
         self.clear_error();
@@ -340,9 +344,7 @@ impl TokenizerArtifactManager {
             HubSource::ModelScope => self
                 .modelscope_cached(spec)
                 .or_else(|| self.hub_cached(spec)),
-            HubSource::ProviderOfficial => {
-                return self.fail(PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE)
-            }
+            HubSource::ProviderOfficial => return self.fail_error(&provider_official_error(spec)),
             HubSource::Local => return self.fail(LOCAL_ARTIFACT_MISSING_CODE),
         };
         if let Some(path) = cached {
@@ -357,19 +359,14 @@ impl TokenizerArtifactManager {
     /// Downloads `spec` into the cache, returning the validated artefact path.
     ///
     /// A local artefact or a valid cache entry is returned without a request.
-    /// Concurrent downloads of the same spec serialize on an advisory lock
-    /// file, and the waiter reuses the artefact the winner wrote instead of
-    /// fetching again. The body is written to a temporary file in the target
-    /// directory and renamed into place, so a reader never sees a partial
-    /// artefact and a failed download leaves nothing behind.
+    /// Concurrent downloads of the same spec serialize on an advisory lock file, and the waiter reuses the artefact the winner wrote instead of fetching again.
+    /// The body is written to a temporary file in the target directory and renamed into place, so a reader never sees a partial artefact and a failed download leaves nothing behind.
     ///
     /// # Errors
     ///
-    /// - [`Error::Config`] when downloads are disabled or the manager is
-    ///   offline (message starts with the compact code);
-    /// - [`Error::Unsupported`] for a `provider_official` source;
-    /// - [`Error::Validation`] when the id, the URL, or the body is unusable,
-    ///   including a SHA-256 mismatch;
+    /// - [`Error::Config`] when downloads are disabled or the manager is offline (message starts with the compact code);
+    /// - [`Error::Unsupported`] for a `provider_official` source, naming the vendor and the tokenizer id, and for a well-formed body that declares a model type this crate does not decode (`tokenizer_model_type_unsupported`, published through [`ARTIFACT_ERROR_CODES`]), which is never cached;
+    /// - [`Error::Validation`] when the id, the URL, or the body is unusable, including a SHA-256 mismatch;
     /// - [`Error::Timeout`] / [`Error::Transport`] when the hub is unreachable;
     /// - [`Error::NotFound`] when the repository, revision or file is missing.
     pub async fn download(&self, spec: &TokenizerSpec) -> Result<PathBuf> {
@@ -412,6 +409,9 @@ impl TokenizerArtifactManager {
             return Ok(path);
         }
         let bytes = self.fetch(&url).await?;
+        // Validation runs before anything is written, so a body this crate
+        // cannot decode never enters the cache and is never handed back by
+        // `resolve_cached` for the selector to downgrade silently.
         validate_body(spec, &bytes)?;
         verify_digest(spec, &bytes)?;
         self.write_atomically(&target, &bytes).await?;
@@ -450,7 +450,7 @@ impl TokenizerArtifactManager {
         }
         match self.download(spec).await {
             Ok(path) => self.validate_async(path, spec).await,
-            Err(error) => self.fail(error_code(&error)),
+            Err(error) => self.fail_error(&error),
         }
     }
 
@@ -458,9 +458,7 @@ impl TokenizerArtifactManager {
     fn download_source(spec: &TokenizerSpec) -> Result<HubSource> {
         match source_of(spec) {
             source @ (HubSource::HuggingFace | HubSource::ModelScope) => Ok(source),
-            HubSource::ProviderOfficial => Err(Error::Unsupported(format!(
-                "{PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE}: provider-official tokenizers need a provider adapter"
-            ))),
+            HubSource::ProviderOfficial => Err(provider_official_error(spec)),
             HubSource::Local => Err(Error::Validation(format!(
                 "{LOCAL_ARTIFACT_MISSING_CODE}: a local tokenizer spec has nothing to download"
             ))),
@@ -543,15 +541,26 @@ impl TokenizerArtifactManager {
     }
 
     /// A cache entry that already validates, without touching the file twice.
+    ///
+    /// A file that cannot be read is not a silent "no cache": it is logged with
+    /// its path and the IO error and treated as a miss, so the caller downloads
+    /// the artefact again instead of reusing bytes nobody could digest.
     fn cached_target(target: &Path, spec: &TokenizerSpec) -> Option<PathBuf> {
         if !target.is_file() {
             return None;
         }
-        match expected_digest(spec) {
-            None => Some(target.to_path_buf()),
-            Some(expected) => {
-                let actual = sha256_file(target).ok()?;
-                (actual == expected).then(|| target.to_path_buf())
+        let Some(expected) = expected_digest(spec) else {
+            return Some(target.to_path_buf());
+        };
+        match sha256_file(target) {
+            Ok(actual) => (actual == expected).then(|| target.to_path_buf()),
+            Err(error) => {
+                tracing::warn!(
+                    path = %target.display(),
+                    %error,
+                    "cached tokenizer artefact could not be read; downloading it again"
+                );
+                None
             }
         }
     }
@@ -641,8 +650,10 @@ impl TokenizerArtifactManager {
             }
             Ok(Err(code)) => self.fail(code),
             Err(error) => {
-                tracing::debug!(%error, "tokenizer artefact validation task failed");
-                self.fail(TOKENIZER_DOWNLOAD_FAILED_CODE)
+                tracing::warn!(%error, "tokenizer artefact validation task failed");
+                self.fail_error(&Error::Validation(format!(
+                    "{TOKENIZER_DOWNLOAD_FAILED_CODE}: tokenizer artefact validation task failed: {error}"
+                )))
             }
         }
     }
@@ -664,15 +675,31 @@ impl TokenizerArtifactManager {
         *self.slot() = Some(code.to_owned());
     }
 
+    /// Records the whole message of `error`, code included.
+    ///
+    /// A typed failure keeps its detail — the vendor a `provider_official` spec
+    /// needs, the model type a body declared, the status a hub answered — so
+    /// [`TokenizerArtifactManager::last_error`] explains the downgrade instead of
+    /// only labelling it.
+    fn set_message(&self, error: &Error) {
+        *self.slot() = Some(error.message().into_owned());
+    }
+
     /// Records a compact failure code and returns `None`.
     fn fail<T>(&self, code: &str) -> Option<T> {
         self.set_error(code);
         None
     }
 
-    /// Records the code of `error` and returns the error unchanged.
+    /// Records the whole message of `error` and returns `None`.
+    fn fail_error<T>(&self, error: &Error) -> Option<T> {
+        self.set_message(error);
+        None
+    }
+
+    /// Records the message of `error` and returns the error unchanged.
     fn record(&self, error: Error) -> Error {
-        self.set_error(error_code(&error));
+        self.set_message(&error);
         error
     }
 }
@@ -790,9 +817,9 @@ fn validate_file_with(
 
 /// Refuses a body that cannot be the artefact its name promises.
 ///
-/// A well-formed document of a model type this crate does not decode is kept
-/// (the selector reports the limitation); malformed text is rejected before
-/// anything is written.
+/// A well-formed document of a model type this crate does not decode is a typed [`Error::Unsupported`] carrying [`TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE`] and the declared type, so the caller learns why counting falls back to `tiktoken` or the estimate instead of getting a silent downgrade.
+/// The bytes are not cached: an artefact this loader cannot decode would be handed straight back by [`TokenizerArtifactManager::resolve_cached`] for the selector to downgrade again, so the precedence is reject-before-write and a later loader that decodes the type downloads it afresh.
+/// Malformed text is rejected with [`Error::Validation`] and [`TOKENIZER_DOWNLOAD_FAILED_CODE`], and the SHA-256 check is unchanged.
 fn validate_body(spec: &TokenizerSpec, bytes: &[u8]) -> Result<()> {
     let text = std::str::from_utf8(bytes).map_err(|error| {
         Error::Validation(format!(
@@ -808,12 +835,57 @@ fn validate_body(spec: &TokenizerSpec, bytes: &[u8]) -> Result<()> {
     match decoded {
         Ok(()) => Ok(()),
         Err(Error::Unsupported(message)) => {
-            tracing::debug!(%message, "downloaded tokenizer artefact uses an undecoded model type");
-            Ok(())
+            let id = spec
+                .tokenizer_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default();
+            let artifact = if id.is_empty() {
+                format!("the {} artefact", artifact_name(spec.engine))
+            } else {
+                format!("the tokenizer artefact {id:?}")
+            };
+            Err(Error::Unsupported(format!(
+                "{TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE}: {artifact} declares a model type this loader does not decode: {message}"
+            )))
         }
         Err(error) => Err(Error::Validation(format!(
             "{TOKENIZER_DOWNLOAD_FAILED_CODE}: artefact body is not a usable tokenizer: {error}"
         ))),
+    }
+}
+
+/// The typed refusal of a `provider_official` spec, naming vendor and id.
+///
+/// No provider-hosted tokenizer client ships in this workspace, so the source stays unimplemented; the message still identifies what was asked for, because "provider official" alone names neither the vendor nor the artefact.
+/// The vendor comes from the spec's `provider` field, then the `vendor/name` prefix of the tokenizer id, then `provider-official`; an unrecognised provider is reported verbatim instead of being mapped onto a vendor this crate happens to know.
+fn provider_official_error(spec: &TokenizerSpec) -> Error {
+    let vendor = provider_official_vendor(spec);
+    let id = spec
+        .tokenizer_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    let id = if id.is_empty() { "<unnamed>" } else { id };
+    Error::Unsupported(format!(
+        "{PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE}: {vendor}:{id} needs a {vendor} tokenizer adapter (no provider-hosted tokenizer client is shipped)"
+    ))
+}
+
+/// The vendor a `provider_official` spec belongs to.
+fn provider_official_vendor(spec: &TokenizerSpec) -> String {
+    let provider = spec.provider.trim();
+    if !provider.is_empty() {
+        return provider.to_owned();
+    }
+    let vendor = spec
+        .tokenizer_id
+        .as_deref()
+        .map(str::trim)
+        .and_then(|id| id.split_once('/'));
+    match vendor {
+        Some((vendor, _)) if !vendor.trim().is_empty() => vendor.trim().to_owned(),
+        _ => UNNAMED_VENDOR.to_owned(),
     }
 }
 
@@ -844,6 +916,9 @@ fn transport_error(error: Error, url: &str) -> Error {
 }
 
 /// The compact code an error carries, else the download-failed default.
+///
+/// [`TokenizerArtifactManager::last_error`] now keeps the whole message, so this classification is only exercised by the tests that pin the message↔code contract.
+#[cfg(test)]
 fn error_code(error: &Error) -> &'static str {
     let message = error.message();
     let head = message.split(':').next().unwrap_or_default().trim();
@@ -956,9 +1031,10 @@ mod tests {
             )),
             None
         );
-        assert_eq!(
-            manager.last_error().as_deref(),
-            Some(PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE)
+        let recorded = manager.last_error().expect("adapter message");
+        assert!(
+            recorded.starts_with(PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE),
+            "the message keeps its compact code: {recorded}"
         );
         assert_eq!(
             manager.resolve_cached(&spec("local", "tok", TokenizerEngine::Native)),
@@ -968,5 +1044,51 @@ mod tests {
             manager.last_error().as_deref(),
             Some(LOCAL_ARTIFACT_MISSING_CODE)
         );
+    }
+
+    #[test]
+    fn a_provider_official_message_names_the_vendor_and_the_id() {
+        let mut named = spec(
+            PROVIDER_OFFICIAL_SOURCE,
+            "vendor-mini",
+            TokenizerEngine::Native,
+        );
+        named.provider = "acme".to_owned();
+        let message = provider_official_error(&named).message().into_owned();
+        assert!(
+            message.starts_with(PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE),
+            "{message}"
+        );
+        assert!(message.contains("acme:vendor-mini"), "{message}");
+        assert!(
+            message.contains("needs a acme tokenizer adapter"),
+            "{message}"
+        );
+
+        // An unrecognised provider is reported verbatim instead of guessed.
+        named.provider = "not-a-known-vendor".to_owned();
+        let message = provider_official_error(&named).message().into_owned();
+        assert!(
+            message.contains("not-a-known-vendor:vendor-mini"),
+            "{message}"
+        );
+
+        // With no provider the id's `vendor/name` prefix names the vendor, and a bare id falls back to the neutral name.
+        let from_id = provider_official_error(&spec(
+            PROVIDER_OFFICIAL_SOURCE,
+            "vendor/name",
+            TokenizerEngine::Native,
+        ))
+        .message()
+        .into_owned();
+        assert!(from_id.contains("vendor:vendor/name"), "{from_id}");
+        let unnamed = provider_official_error(&spec(
+            PROVIDER_OFFICIAL_SOURCE,
+            "unnamed",
+            TokenizerEngine::Native,
+        ))
+        .message()
+        .into_owned();
+        assert!(unnamed.contains("provider-official:unnamed"), "{unnamed}");
     }
 }

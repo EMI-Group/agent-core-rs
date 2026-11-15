@@ -124,16 +124,35 @@ pub fn find_artifact(root: &Path, engine: TokenizerEngine) -> Option<PathBuf> {
 }
 
 /// Collects artefacts named `name` below `dir`, depth first in sorted order.
+///
+/// A directory the process cannot read, and an entry it cannot stat, are logged and skipped instead of ending the search silently: the walk is best-effort by design, so one unreadable subdirectory must not hide the artefacts beside it.
 fn collect_artifacts(dir: &Path, name: &str, depth: usize, found: &mut Vec<PathBuf>) {
     if depth == 0 || found.len() >= MAX_ARTIFACT_CANDIDATES {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::debug!(
+                path = %dir.display(),
+                %error,
+                "tokenizer artefact search could not read a directory"
+            );
+            return;
+        }
     };
     let mut paths: Vec<PathBuf> = entries
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry.path()),
+            Err(error) => {
+                tracing::debug!(
+                    path = %dir.display(),
+                    %error,
+                    "tokenizer artefact search skipped an unreadable entry"
+                );
+                None
+            }
+        })
         .collect();
     paths.sort();
     for path in paths {

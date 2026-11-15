@@ -70,7 +70,13 @@ impl ArtifactLock {
                             lock = %path.display(),
                             "removing a stale tokenizer download lock"
                         );
-                        let _ = tokio::fs::remove_file(&path).await;
+                        if let Err(error) = tokio::fs::remove_file(&path).await {
+                            tracing::warn!(
+                                lock = %path.display(),
+                                %error,
+                                "the stale tokenizer download lock could not be removed"
+                            );
+                        }
                         continue;
                     }
                     if Instant::now() >= deadline {
@@ -101,17 +107,39 @@ impl Drop for ArtifactLock {
     /// early return and every cancellation releases the lock; a failure to
     /// remove only leaves a marker that later waiters expire as stale.
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Err(error) = std::fs::remove_file(&self.path) {
+            tracing::debug!(
+                lock = %self.path.display(),
+                %error,
+                "the tokenizer download lock marker could not be removed; waiters expire it as stale"
+            );
+        }
     }
 }
 
 /// Whether the marker at `path` has not been touched for [`STALE_LOCK_AFTER`].
 async fn is_stale(path: &std::path::Path) -> bool {
-    let Ok(metadata) = tokio::fs::metadata(path).await else {
-        return false;
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::debug!(
+                lock = %path.display(),
+                %error,
+                "the tokenizer download lock could not be inspected; it is treated as held"
+            );
+            return false;
+        }
     };
-    let Ok(modified) = metadata.modified() else {
-        return false;
+    let modified = match metadata.modified() {
+        Ok(modified) => modified,
+        Err(error) => {
+            tracing::debug!(
+                lock = %path.display(),
+                %error,
+                "the tokenizer download lock has no mtime; it is treated as held"
+            );
+            return false;
+        }
     };
     modified
         .elapsed()

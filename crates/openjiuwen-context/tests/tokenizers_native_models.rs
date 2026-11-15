@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Model-level decoding for native artifacts: BPE and Unigram round-trips and single-sequence post-processing.
 //!
-//! Every fixture is built with `serde_json::json!` and declares no decoder node, so the assertions cover the model's own `decode` fallback as well as the framing a declared post-processor adds on encode.
+//! Every fixture is built with `serde_json::json!`; the fixtures that declare no decoder node are decoded with the explicit `NativeTokenizer::decode_model_level` opt-in, which is what reassembles byte-level spellings, while `decode` itself keeps `HuggingFace`'s single-space join. The assertions also cover the framing a declared post-processor adds on encode.
 
 use openjiuwen_context::tokenizers::{NativeTokenizer, NativeTokenizerKind};
 use openjiuwen_foundation::prompt::TokenCounter;
@@ -35,7 +35,12 @@ fn bpe_continuation_prefix_round_trips_without_a_decoder() {
     assert_eq!(tokenizer.warnings().len(), 0, "{:?}", tokenizer.warnings());
     assert_eq!(tokenizer.encode("abc"), vec![0, 3, 4]);
     // The continuation prefix is stripped again, so the count round-trips through text.
-    assert_eq!(tokenizer.decode(&tokenizer.encode("abc")), "abc");
+    assert_eq!(
+        tokenizer.decode_model_level(&tokenizer.encode("abc")),
+        "abc"
+    );
+    // Without the opt-in the spellings are joined the way `HuggingFace` joins them.
+    assert_eq!(tokenizer.decode(&tokenizer.encode("abc")), "a ##b ##c");
     assert_eq!(tokenizer.count_text("abc"), 3);
 }
 
@@ -50,8 +55,10 @@ fn bpe_end_of_word_suffix_round_trips_without_a_decoder() {
         },
         "pre_tokenizer": {"type": "Whitespace"}
     }));
-    assert_eq!(tokenizer.decode(&[0, 1]), "hello");
-    assert_eq!(tokenizer.decode(&[2]), "world");
+    assert_eq!(tokenizer.decode_model_level(&[0, 1]), "hello");
+    assert_eq!(tokenizer.decode_model_level(&[2]), "world");
+    // `decode` keeps the space join, so the suffix stays visible.
+    assert_eq!(tokenizer.decode(&[0, 1]), "hel lo</w>");
 }
 
 #[test]
@@ -75,7 +82,11 @@ fn bpe_byte_fallback_round_trips_multibyte_text() {
     // A space can only survive with a decoder node that puts it back, so the round trips stay single-piece.
     for text in ["é", "héllo", "中文", "😀"] {
         let ids = tokenizer.encode(text);
-        assert_eq!(tokenizer.decode(&ids), text, "round trip of {text:?}");
+        assert_eq!(
+            tokenizer.decode_model_level(&ids),
+            text,
+            "round trip of {text:?}"
+        );
     }
     assert_eq!(tokenizer.count_text("中文"), 6);
 }
@@ -94,9 +105,9 @@ fn bpe_byte_fallback_round_trips_a_character_split_across_tokens() {
     }));
     let ids = tokenizer.encode("中");
     assert_eq!(ids.len(), 3);
-    assert_eq!(tokenizer.decode(&ids), "中");
+    assert_eq!(tokenizer.decode_model_level(&ids), "中");
     // A truncated run degrades to the replacement character instead of failing.
-    assert_eq!(tokenizer.decode(&ids[..2]), "\u{FFFD}");
+    assert_eq!(tokenizer.decode_model_level(&ids[..2]), "\u{FFFD}");
 }
 
 #[test]
@@ -121,10 +132,15 @@ fn unigram_encode_and_decode_agree_through_the_model() {
     }));
     assert_eq!(tokenizer.kind(), NativeTokenizerKind::Unigram);
     assert_eq!(tokenizer.encode("abcd"), vec![5, 6]);
-    assert_eq!(tokenizer.decode(&tokenizer.encode("abcd")), "abcd");
+    assert_eq!(
+        tokenizer.decode_model_level(&tokenizer.encode("abcd")),
+        "abcd"
+    );
     // An uncovered character becomes the unknown id, and the model decode keeps its spelling.
     assert_eq!(tokenizer.encode("az"), vec![1, 0]);
-    assert_eq!(tokenizer.decode(&[1, 0]), "a<unk>");
+    assert_eq!(tokenizer.decode_model_level(&[1, 0]), "a<unk>");
+    // The declared-decoder path has none, so it space-joins the same ids.
+    assert_eq!(tokenizer.decode(&[1, 0]), "a <unk>");
 }
 
 #[test]
@@ -142,7 +158,11 @@ fn unigram_byte_fallback_round_trips_multibyte_text() {
     }));
     for text in ["é", "中文"] {
         let ids = tokenizer.encode(text);
-        assert_eq!(tokenizer.decode(&ids), text, "round trip of {text:?}");
+        assert_eq!(
+            tokenizer.decode_model_level(&ids),
+            text,
+            "round trip of {text:?}"
+        );
     }
     // `中` needs three fallback tokens, `é` two.
     assert_eq!(tokenizer.count_text("中"), 3);
@@ -221,5 +241,6 @@ fn no_post_processor_means_no_framing() {
     }));
     assert_eq!(tokenizer.encode("a b"), vec![0, 1]);
     assert_eq!(tokenizer.count_text("a b"), 2);
-    assert_eq!(tokenizer.decode(&[0, 1]), "ab");
+    assert_eq!(tokenizer.decode(&[0, 1]), "a b");
+    assert_eq!(tokenizer.decode_model_level(&[0, 1]), "ab");
 }

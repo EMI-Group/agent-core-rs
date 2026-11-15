@@ -5,8 +5,9 @@
 //! A `.model` vocabulary is decoded with `base64` by [`tiktoken_model::TiktokenModel`] (see [`NativeTokenizer::from_tiktoken_model`]) and shares the same [`NativeTokenizer`] surface.
 //! Loading happens once per context/model binding; every later [`NativeTokenizer::encode`] is pure computation over the in-memory tables.
 //! A declared post-processor adds its framing tokens on encode — `BERT`'s `[CLS] … [SEP]`, for instance — so a count includes the tokens the model really receives; with no post-processor declared, nothing is added.
-//! Decoding prefers the declared decoder node and falls back to the model's own concatenation for a `BPE`, `Unigram` or `WordLevel` model that declares none (or only `Plain`), so an artifact with no decoder node still round-trips.
-//! Shapes this crate cannot reproduce exactly (regex splits, the Unicode-normalization families, unsupported pipeline nodes) are recorded in [`NativeTokenizer::warnings`] and degrade to a coarser but working behaviour instead of failing the load.
+//! Decoding runs the declared decoder node; an artifact that declares none (or only `Plain`) joins the token spellings with a single space, matching `HuggingFace`'s `tokenizers` and the Python reference.
+//! [`NativeTokenizer::decode_model_level`] is the documented opt-in for the byte-aware model-level decoding that a byte-level artifact without a decoder node needs.
+//! Shapes this crate cannot reproduce exactly (a node type it does not know, the `Nmt`/`Precompiled` normalization families, a template piece without declared ids) are recorded in [`NativeTokenizer::warnings`] and degrade to a coarser but working behaviour instead of failing the load.
 //! A model type this crate does not know is refused with [`Error::Unsupported`], because guessing a vocabulary layout would silently bias every budget decision.
 
 mod added_tokens;
@@ -294,31 +295,50 @@ impl NativeTokenizer {
     /// Decodes token ids back into text.
     ///
     /// Ids the artifact does not declare are skipped; special tokens are included, unlike `HuggingFace`'s `skip_special_tokens = true` default.
-    /// The declared decoder node always wins; when the artifact declares none (or only `Plain`), a `BPE`, `Unigram` or `WordLevel` model decodes with its own rules, so continuation prefixes, byte fallback and whole-piece concatenation survive a round trip.
-    /// A `WordPiece` model keeps the plain space join in that case, because its continuation prefix only becomes unambiguous through the declared decoder node.
+    /// The declared decoder node always wins, and an artifact that declares none (or only `Plain`) joins the token spellings with a single space, which is what `HuggingFace`'s `tokenizers` — and therefore the Python reference — does.
+    /// [`NativeTokenizer::decode_model_level`] is the explicit opt-in for the model's own byte-aware reassembly, which a byte-level artifact without a decoder node needs to round-trip.
+    /// A `tiktoken` vocabulary decodes with its own rules.
     #[must_use]
     pub fn decode(&self, ids: &[u32]) -> String {
         if let Some(tiktoken) = &self.tiktoken {
             return tiktoken.decode(ids);
         }
-        let Some(model) = self.model.as_ref() else {
+        if self.model.is_none() {
             return String::new();
+        }
+        self.decoder.decode(&self.token_spellings(ids))
+    }
+
+    /// Decodes token ids with the model's own rules, ignoring the declared decoder.
+    ///
+    /// This is an intentional deviation from `HuggingFace`'s `tokenizers`, whose `decode` only ever goes through the declared decoder node: a byte-level `BPE` or `Unigram` vocabulary that declares no decoder (or only `Plain`) encodes one id per byte, so only the model can strip continuation prefixes, reassemble `<0xXX>` byte runs and concatenate whole pieces back into the original text.
+    /// A `WordPiece` model has no model-level rule — its continuation prefix is only unambiguous through the decoder node — so the declared decoder still answers, and with no decoder that is the same space join [`NativeTokenizer::decode`] returns.
+    /// A `tiktoken` `.model` artifact carries no pipeline at all and decodes exactly like [`NativeTokenizer::decode`].
+    #[must_use]
+    pub fn decode_model_level(&self, ids: &[u32]) -> String {
+        if let Some(tiktoken) = &self.tiktoken {
+            return tiktoken.decode(ids);
+        }
+        let tokens = self.token_spellings(ids);
+        self.model
+            .as_ref()
+            .and_then(|model| model.decode(&tokens))
+            .unwrap_or_else(|| self.decoder.decode(&tokens))
+    }
+
+    /// The token spellings an id list resolves to, skipping ids the artifact does not declare.
+    fn token_spellings(&self, ids: &[u32]) -> Vec<String> {
+        let Some(model) = self.model.as_ref() else {
+            return Vec::new();
         };
-        let tokens: Vec<String> = ids
-            .iter()
+        ids.iter()
             .filter_map(|id| {
                 self.added
                     .token(*id)
                     .or_else(|| model.id_to_token(*id))
                     .map(str::to_owned)
             })
-            .collect();
-        if matches!(self.decoder, decoder::Decoder::Plain) {
-            if let Some(text) = model.decode(&tokens) {
-                return text;
-            }
-        }
-        self.decoder.decode(&tokens)
+            .collect()
     }
 
     /// The number of tokens the artifact declares: model vocabulary plus added tokens.
@@ -343,7 +363,7 @@ impl NativeTokenizer {
 
     /// Everything the load could not reproduce exactly, in the order it was found.
     ///
-    /// A warning always means a coarser behaviour, never a failed load: a regex split became a whitespace split, or an unsupported normalizer was skipped.
+    /// A warning always means a coarser behaviour, never a failed load: a node type this loader does not know is skipped, an `Nmt`/`Precompiled` normalizer leaves the text unnormalized, a `Split`/`Replace` regex that does not compile falls back to whitespace, or a template piece whose special token declares no ids is left out.
     #[must_use]
     pub fn warnings(&self) -> &[String] {
         &self.warnings
@@ -439,18 +459,21 @@ mod post_processing {
                 "TemplateProcessing" => Self::template(value, warnings),
                 "BertProcessing" | "RobertaProcessing" => Self::pair(value, kind, warnings),
                 "ByteLevel" => Self::None,
-                "Sequence" => Self::Sequence(
-                    value
-                        .get("processors")
-                        .and_then(Value::as_array)
-                        .map(|entries| {
-                            entries
-                                .iter()
-                                .map(|entry| Self::from_json(Some(entry), warnings))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                ),
+                "Sequence" => {
+                    let Some(entries) = value.get("processors").and_then(Value::as_array) else {
+                        warnings.push(
+                            "post-processor Sequence declares no `processors`; no framing tokens are added"
+                                .to_owned(),
+                        );
+                        return Self::None;
+                    };
+                    Self::Sequence(
+                        entries
+                            .iter()
+                            .map(|entry| Self::from_json(Some(entry), warnings))
+                            .collect(),
+                    )
+                }
                 other => {
                     warnings.push(format!(
                         "post-processor `{other}` is not implemented; no framing tokens are added"
@@ -604,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn a_model_decodes_when_the_artifact_declares_no_decoder() {
+    fn a_nameless_decoder_joins_spellings_and_the_model_level_opt_in_concatenates() {
         let tokenizer = parse(serde_json::json!({
             "model": {
                 "type": "BPE",
@@ -614,9 +637,12 @@ mod tests {
             },
             "pre_tokenizer": {"type": "Whitespace"}
         }));
-        // Without the fallback this would be the plain space join `a ##b`.
-        assert_eq!(tokenizer.decode(&[0, 2]), "ab");
-        assert_eq!(tokenizer.decode(&tokenizer.encode("a b")), "ab");
+        // `HuggingFace`'s `tokenizers` joins the spellings with one space when no decoder is declared.
+        assert_eq!(tokenizer.decode(&[0, 2]), "a ##b");
+        assert_eq!(tokenizer.decode(&tokenizer.encode("a b")), "a b");
+        // The byte-aware model-level decoding stays available as the explicit opt-in.
+        assert_eq!(tokenizer.decode_model_level(&[0, 2]), "ab");
+        assert_eq!(tokenizer.decode_model_level(&tokenizer.encode("a b")), "ab");
     }
 
     #[test]
@@ -629,12 +655,13 @@ mod tests {
     }
 
     #[test]
-    fn word_level_decodes_by_concatenation_without_a_decoder() {
+    fn word_level_joins_with_spaces_and_concatenates_at_model_level() {
         let tokenizer = parse(serde_json::json!({
             "model": {"type": "WordLevel", "vocab": {"hello": 0, "world": 1}, "unk_token": "hello"},
             "pre_tokenizer": {"type": "Whitespace"}
         }));
-        assert_eq!(tokenizer.decode(&[0, 1]), "helloworld");
+        assert_eq!(tokenizer.decode(&[0, 1]), "hello world");
+        assert_eq!(tokenizer.decode_model_level(&[0, 1]), "helloworld");
     }
 
     #[test]
@@ -643,8 +670,9 @@ mod tests {
             "model": {"type": "WordPiece", "vocab": {"h": 0, "##i": 1}, "unk_token": "h"},
             "pre_tokenizer": {"type": "Whitespace"}
         }));
-        // The continuation prefix is only unambiguous through the decoder node, so the model contributes nothing.
+        // The continuation prefix is only unambiguous through the decoder node, so the model contributes nothing either way.
         assert_eq!(tokenizer.decode(&[0, 1]), "h ##i");
+        assert_eq!(tokenizer.decode_model_level(&[0, 1]), "h ##i");
     }
 
     #[test]
@@ -762,6 +790,23 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("DialogFraming")),
             "the warning should name the node: {:?}",
+            tokenizer.warnings()
+        );
+    }
+
+    #[test]
+    fn a_sequence_post_processor_without_stages_warns_instead_of_framing() {
+        let tokenizer = parse(serde_json::json!({
+            "model": {"type": "WordLevel", "vocab": {"a": 0}, "unk_token": "a"},
+            "post_processor": {"type": "Sequence"}
+        }));
+        assert_eq!(tokenizer.encode("a"), vec![0]);
+        assert!(
+            tokenizer
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("Sequence") && warning.contains("processors")),
+            "the warning should name the missing stage list: {:?}",
             tokenizer.warnings()
         );
     }

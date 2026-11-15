@@ -11,13 +11,13 @@ use std::time::Duration;
 
 use openjiuwen_common::error::ErrorKind;
 use openjiuwen_context::tokenizers::artifacts::{
-    artifact_name, default_cache_dir, sha256_hex, TokenizerArtifactManager, CACHE_DIR_ENV,
-    DEFAULT_HUGGINGFACE_ENDPOINT, DEFAULT_MODELSCOPE_ENDPOINT, LOCAL_ARTIFACT_MISSING_CODE,
-    PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE, REMOTE_DOWNLOAD_DISABLED_CODE,
-    REMOTE_URL_NOT_ALLOWED_CODE, TIKTOKEN_MODEL_MISSING_CODE, TOKENIZER_DOWNLOAD_FAILED_CODE,
-    TOKENIZER_JSON_MISSING_CODE, TOKENIZER_NETWORK_UNAVAILABLE_CODE,
-    TOKENIZER_NOT_IN_LOCAL_CACHE_CODE, TOKENIZER_REVISION_UNAVAILABLE_CODE,
-    TOKENIZER_SHA256_MISMATCH_CODE,
+    artifact_name, default_cache_dir, sha256_hex, TokenizerArtifactManager, ARTIFACT_ERROR_CODES,
+    CACHE_DIR_ENV, DEFAULT_HUGGINGFACE_ENDPOINT, DEFAULT_MODELSCOPE_ENDPOINT,
+    LOCAL_ARTIFACT_MISSING_CODE, PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE,
+    REMOTE_DOWNLOAD_DISABLED_CODE, REMOTE_URL_NOT_ALLOWED_CODE, TIKTOKEN_MODEL_MISSING_CODE,
+    TOKENIZER_DOWNLOAD_FAILED_CODE, TOKENIZER_JSON_MISSING_CODE,
+    TOKENIZER_NETWORK_UNAVAILABLE_CODE, TOKENIZER_NOT_IN_LOCAL_CACHE_CODE,
+    TOKENIZER_REVISION_UNAVAILABLE_CODE, TOKENIZER_SHA256_MISMATCH_CODE,
 };
 use openjiuwen_context::tokenizers::CompatibleTokenizerSpec;
 use openjiuwen_context::{
@@ -453,10 +453,12 @@ async fn a_404_records_the_revision_code() {
     spec.revision = Some("missing".to_owned());
 
     assert_eq!(manager.resolve(&spec).await, None);
-    assert_eq!(
-        manager.last_error().as_deref(),
-        Some(TOKENIZER_REVISION_UNAVAILABLE_CODE)
+    let recorded = manager.last_error().expect("a 404 is recorded");
+    assert!(
+        recorded.starts_with(TOKENIZER_REVISION_UNAVAILABLE_CODE),
+        "the message keeps the code and the detail: {recorded}"
     );
+    assert!(recorded.contains("404"), "{recorded}");
     let error = manager.download(&spec).await.expect_err("404 is an error");
     assert_eq!(error.kind(), ErrorKind::NotFound);
     assert!(error
@@ -492,9 +494,12 @@ async fn an_unreachable_endpoint_records_the_network_code() {
         .with_request_timeout(Duration::from_millis(500));
     let spec = hub_spec("huggingface", "acme/tok", TokenizerEngine::Native);
     assert_eq!(manager.resolve(&spec).await, None);
-    assert_eq!(
-        manager.last_error().as_deref(),
-        Some(TOKENIZER_NETWORK_UNAVAILABLE_CODE)
+    let recorded = manager
+        .last_error()
+        .expect("an unreachable hub is recorded");
+    assert!(
+        recorded.starts_with(TOKENIZER_NETWORK_UNAVAILABLE_CODE),
+        "{recorded}"
     );
 }
 
@@ -521,10 +526,60 @@ async fn a_malformed_body_is_a_typed_error_and_leaves_no_file() {
         "no partial artefact may be left behind"
     );
     assert_eq!(manager.resolve(&spec).await, None);
-    assert_eq!(
-        manager.last_error().as_deref(),
-        Some(TOKENIZER_DOWNLOAD_FAILED_CODE)
+    let recorded = manager.last_error().expect("a malformed body is recorded");
+    assert!(
+        recorded.starts_with(TOKENIZER_DOWNLOAD_FAILED_CODE),
+        "{recorded}"
     );
+}
+
+/// A well-formed document whose model type this crate does not decode.
+const UNDECODED_TOKENIZER_JSON: &str = r#"{"model": {"type": "UnigramV2", "vocab": [["a", 0.0]]}}"#;
+
+/// The compact code such a body reports, published through [`ARTIFACT_ERROR_CODES`].
+const MODEL_TYPE_UNSUPPORTED_CODE: &str = "tokenizer_model_type_unsupported";
+
+#[tokio::test]
+async fn a_downloaded_body_of_an_undecoded_model_type_is_a_typed_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(UNDECODED_TOKENIZER_JSON, "application/json"),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let cache = TempDir::new().expect("temp dir");
+    let manager = downloading_manager(cache.path(), &server);
+    let spec = hub_spec("huggingface", "acme/tok", TokenizerEngine::Native);
+
+    let error = manager
+        .download(&spec)
+        .await
+        .expect_err("an undecoded model type is refused");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(ARTIFACT_ERROR_CODES.contains(&MODEL_TYPE_UNSUPPORTED_CODE));
+    assert!(
+        error.message().starts_with(MODEL_TYPE_UNSUPPORTED_CODE),
+        "{error}"
+    );
+    assert!(error.message().contains("UnigramV2"), "{error}");
+    assert!(error.message().contains("acme/tok"), "{error}");
+    let message = error.message().into_owned();
+    assert_eq!(manager.last_error().as_deref(), Some(message.as_str()));
+    assert!(
+        find_files(cache.path(), "tokenizer.json").is_empty(),
+        "an artefact this loader cannot decode is not cached"
+    );
+
+    // The resolving call reports the same typed reason instead of a silent miss.
+    assert_eq!(manager.resolve(&spec).await, None);
+    let recorded = manager.last_error().expect("the model type is recorded");
+    assert!(
+        recorded.starts_with(MODEL_TYPE_UNSUPPORTED_CODE),
+        "{recorded}"
+    );
+    assert!(recorded.contains("UnigramV2"), "{recorded}");
 }
 
 #[tokio::test]
@@ -729,18 +784,36 @@ fn a_family_registry_match_uses_the_family_artefact() {
 }
 
 #[tokio::test]
-async fn a_provider_official_spec_records_the_adapter_code() {
+async fn a_provider_official_spec_names_the_vendor_and_the_tokenizer() {
     let dir = TempDir::new().expect("temp dir");
     let manager = offline_manager(dir.path());
     let spec = hub_spec("provider_official", "acme/tok", TokenizerEngine::Native);
     assert_eq!(manager.resolve(&spec).await, None);
-    assert_eq!(
-        manager.last_error().as_deref(),
-        Some(PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE)
+    let recorded = manager
+        .last_error()
+        .expect("the adapter message is recorded");
+    assert!(
+        recorded.starts_with(PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE),
+        "the message keeps its compact code: {recorded}"
     );
+    assert!(recorded.contains("acme"), "the vendor is named: {recorded}");
+    assert!(
+        recorded.contains("acme/tok"),
+        "the tokenizer id is named: {recorded}"
+    );
+    assert!(
+        recorded.contains("tokenizer adapter"),
+        "the missing adapter is named: {recorded}"
+    );
+
+    // The synchronous rung reports the same reason.
+    assert_eq!(manager.resolve_cached(&spec), None);
+    assert_eq!(manager.last_error().as_deref(), Some(recorded.as_str()));
+
     let enabled = manager.with_enable_download(true);
     let error = enabled.download(&spec).await.expect_err("no adapter");
     assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(error.to_string().contains("acme:acme/tok"), "{error}");
 }
 
 #[test]
