@@ -1831,6 +1831,7 @@ dependencies = [
  "openjiuwen-foundation",
  "openjiuwen-session",
  "openjiuwen-test-support",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
@@ -1839,6 +1840,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "unicode-normalization",
  "uuid",
  "wiremock",
 ]
