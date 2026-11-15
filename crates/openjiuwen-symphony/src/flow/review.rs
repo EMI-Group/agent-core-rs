@@ -8,7 +8,18 @@
 //!
 //! The verdict is `approved` when every check passes, `needs_human_review` when
 //! the only failure is `meta_naming` (the name is cosmetic and fixable), and
-//! `rejected` otherwise. No check invokes a model or touches the network.
+//! `rejected` otherwise. No check invokes a model or touches the network, so this
+//! gate is always available offline.
+//!
+//! # The optional model stage
+//!
+//! [`LlmPackageReviewer`] is a second,
+//! opt-in stage that asks a [`CompletionModel`](openjiuwen_retrieval::CompletionModel)
+//! for extra findings over an otherwise approved package. Its merge is fail-closed:
+//! it can only add failures, never remove one. A review produced by the model stage
+//! carries [`REVIEW_MODE_LLM`] in [`ReviewResult::review_mode`], and a review whose
+//! model stage was skipped or degraded carries [`REVIEW_MODE_DETERMINISTIC`] plus a
+//! note explaining why — neither path is silent.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -22,6 +33,7 @@ use crate::flow::model::{canonical_json, is_valid_meta_name, sha256_short};
 use crate::flow::pack::{
     chain_order_from_steps, DependenciesDoc, SkillPack, SKILL_MD_FILENAME, TARGET_KIND_SKILL,
 };
+use crate::flow::review_llm::LlmPackageReviewer;
 use crate::redaction::redact_private_json;
 
 /// The review schema version.
@@ -36,6 +48,10 @@ pub const VERDICT_NEEDS_HUMAN_REVIEW: &str = "needs_human_review";
 pub const CHECK_PASS: &str = "pass";
 /// A failing check result.
 pub const CHECK_FAIL: &str = "fail";
+/// [`ReviewResult::review_mode`] for a review produced by the deterministic gate.
+pub const REVIEW_MODE_DETERMINISTIC: &str = "deterministic";
+/// [`ReviewResult::review_mode`] for a review whose model stage answered usablely.
+pub const REVIEW_MODE_LLM: &str = "llm";
 
 /// Permissions a generated package may never request.
 const FORBIDDEN_PERMISSIONS: [&str; 4] =
@@ -80,6 +96,18 @@ pub struct ReviewResult {
     pub reviewed_at: String,
     /// The review schema version.
     pub schema_version: String,
+    /// How the verdict was produced: [`REVIEW_MODE_DETERMINISTIC`] or
+    /// [`REVIEW_MODE_LLM`].
+    ///
+    /// The deterministic gate always sets `deterministic`; only
+    /// [`LlmPackageReviewer`] sets
+    /// `llm`, and only after it accepted a usable model reply.
+    pub review_mode: String,
+    /// Model-authored notes, plus the `deterministic_fallback:` /
+    /// `model review skipped:` markers that explain a stage which did not run.
+    ///
+    /// Empty for a review the deterministic gate produced on its own.
+    pub notes: Vec<String>,
 }
 
 impl Default for ReviewResult {
@@ -93,6 +121,8 @@ impl Default for ReviewResult {
             materials_hash: String::new(),
             reviewed_at: String::new(),
             schema_version: REVIEW_SCHEMA_VERSION.to_string(),
+            review_mode: REVIEW_MODE_DETERMINISTIC.to_string(),
+            notes: Vec::new(),
         }
     }
 }
@@ -155,14 +185,13 @@ impl Reviewer {
             check_license(pack),
         ];
         let verdict = resolve_verdict(&checks);
-        let identity = serde_json::json!({
-            "package_id": pack.package_id,
-            "target_kind": pack.target_kind,
-            "verdict": verdict,
-            "checks": &checks,
-            "materials_hash": materials_hash,
-        });
-        let review_id = format!("review_{}", sha256_short(&canonical_json(&identity), 12));
+        let review_id = compute_review_id(
+            &pack.package_id,
+            &pack.target_kind,
+            &verdict,
+            &checks,
+            &materials_hash,
+        );
         ReviewResult {
             review_id,
             package_id: pack.package_id.clone(),
@@ -172,12 +201,48 @@ impl Reviewer {
             materials_hash,
             reviewed_at: now_rfc3339(),
             schema_version: REVIEW_SCHEMA_VERSION.to_string(),
+            review_mode: REVIEW_MODE_DETERMINISTIC.to_string(),
+            notes: Vec::new(),
         }
     }
 }
 
+/// Hashes the verdict identity into a `review_<12 hex>` id.
+///
+/// `reviewed_at`, `review_mode` and `notes` are metadata and deliberately stay out
+/// of the digest, so the same verdict over the same materials keeps the same id
+/// whichever stage produced it.
+fn compute_review_id(
+    package_id: &str,
+    target_kind: &str,
+    verdict: &str,
+    checks: &[ReviewCheck],
+    materials_hash: &str,
+) -> String {
+    let identity = serde_json::json!({
+        "package_id": package_id,
+        "target_kind": target_kind,
+        "verdict": verdict,
+        "checks": checks,
+        "materials_hash": materials_hash,
+    });
+    format!("review_{}", sha256_short(&canonical_json(&identity), 12))
+}
+
+/// Re-derives [`ReviewResult::review_id`] and [`ReviewResult::verdict`] after a
+/// stage merged extra findings.
+pub(crate) fn refresh_review_id(result: &mut ReviewResult) {
+    result.review_id = compute_review_id(
+        &result.package_id,
+        &result.target_kind,
+        &result.verdict,
+        &result.checks,
+        &result.materials_hash,
+    );
+}
+
 /// Resolves the three-state verdict from the checks.
-fn resolve_verdict(checks: &[ReviewCheck]) -> String {
+pub(crate) fn resolve_verdict(checks: &[ReviewCheck]) -> String {
     let failures: Vec<&ReviewCheck> = checks
         .iter()
         .filter(|check| check.result == CHECK_FAIL)
@@ -480,8 +545,37 @@ impl FlowEngine {
         target_kind: &str,
         dest_dir: impl AsRef<Path>,
     ) -> Result<InstallPreparation> {
-        self.prepare_target(recipe_id, None, target_kind, dest_dir.as_ref())
+        self.prepare_target(recipe_id, None, target_kind, dest_dir.as_ref(), None)
             .await
+    }
+
+    /// Reviews the current version of `recipe_id` with an optional model stage and
+    /// renders it into `dest_dir` when the merged review still approves it.
+    ///
+    /// The model stage can only add failures, so this is never more permissive
+    /// than [`FlowEngine::review_and_prepare_install`]; a pack the deterministic
+    /// gate rejects is returned unchanged without a model call.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`FlowEngine::review_and_prepare_install`], plus the model-stage
+    /// error a [`FallbackMode::Error`](crate::llm::FallbackMode::Error) reviewer
+    /// returns for an unusable reply.
+    pub async fn review_and_prepare_install_with_reviewer(
+        &self,
+        recipe_id: &str,
+        target_kind: &str,
+        dest_dir: impl AsRef<Path>,
+        reviewer: &LlmPackageReviewer,
+    ) -> Result<InstallPreparation> {
+        self.prepare_target(
+            recipe_id,
+            None,
+            target_kind,
+            dest_dir.as_ref(),
+            Some(reviewer),
+        )
+        .await
     }
 
     /// Reviews one explicitly requested recipe version and renders it when
@@ -502,17 +596,19 @@ impl FlowEngine {
             Some(recipe_version),
             target_kind,
             dest_dir.as_ref(),
+            None,
         )
         .await
     }
 
-    /// Shared implementation of the two installation-preparation entry points.
+    /// Shared implementation of the installation-preparation entry points.
     async fn prepare_target(
         &self,
         recipe_id: &str,
         requested_version: Option<u64>,
         target_kind: &str,
         dest_dir: &Path,
+        reviewer: Option<&LlmPackageReviewer>,
     ) -> Result<InstallPreparation> {
         if target_kind != TARGET_KIND_SKILL {
             return Ok(rejected(
@@ -551,6 +647,10 @@ impl FlowEngine {
             }
         };
         let review = Reviewer::new().review(&pack);
+        let review = match reviewer {
+            Some(reviewer) => reviewer.review(&pack, review).await?,
+            None => review,
+        };
         if review.verdict != VERDICT_APPROVED {
             return Ok(InstallPreparation {
                 recipe_id: recipe_id.to_string(),

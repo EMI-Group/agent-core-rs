@@ -28,6 +28,8 @@
 //!   package as an SDD-0010 `SKILL.md` document, and the unsupported-target boundary.
 //! - [`review`](crate::flow::review) — `Reviewer`, the ten deterministic checks,
 //!   `ReviewResult`, and `FlowEngine::review_and_prepare_install`.
+//! - [`review_llm`](crate::flow::review_llm) — `LlmPackageReviewer`, the optional
+//!   model-driven semantic review stage and its fail-closed merge.
 //!
 //! # Determinism
 //!
@@ -41,6 +43,7 @@ pub mod model;
 pub mod pack;
 pub mod render;
 pub mod review;
+pub mod review_llm;
 pub mod store;
 
 pub use codegen::{
@@ -59,5 +62,10 @@ pub use pack::{SkillPack, SkillPackStep};
 pub use render::{render_package, RenderedArtifact, SkillAdapter, SkillPackAdapter};
 pub use review::{
     InstallPreparation, ReviewCheck, ReviewResult, Reviewer, CHECK_FAIL, CHECK_PASS,
-    REVIEW_SCHEMA_VERSION, VERDICT_APPROVED, VERDICT_NEEDS_HUMAN_REVIEW, VERDICT_REJECTED,
+    REVIEW_MODE_DETERMINISTIC, REVIEW_MODE_LLM, REVIEW_SCHEMA_VERSION, VERDICT_APPROVED,
+    VERDICT_NEEDS_HUMAN_REVIEW, VERDICT_REJECTED,
+};
+pub use review_llm::{
+    LlmPackageReviewer, LlmReviewFinding, MIN_FINDING_CONFIDENCE, REVIEW_CHECK_NAMES,
+    REVIEW_SYSTEM_PROMPT,
 };
