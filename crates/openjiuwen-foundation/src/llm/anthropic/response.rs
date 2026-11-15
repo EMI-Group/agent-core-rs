@@ -96,9 +96,9 @@ pub fn parse_messages_response(value: &Value) -> Result<ChatResponse> {
                     if let Some(fragment) = block.get("thinking").and_then(Value::as_str) {
                         reasoning.push_str(fragment);
                     }
-                    preserve_thinking_block(&mut thinking_blocks, block);
+                    thinking_blocks.extend(replayable_block(block));
                 }
-                Some("redacted_thinking") => preserve_thinking_block(&mut thinking_blocks, block),
+                Some("redacted_thinking") => thinking_blocks.extend(replayable_block(block)),
                 _ => {}
             }
         }
@@ -109,12 +109,7 @@ pub fn parse_messages_response(value: &Value) -> Result<ChatResponse> {
     if !reasoning.is_empty() {
         message.reasoning_content = Some(reasoning);
     }
-    if !thinking_blocks.is_empty() {
-        message.metadata.insert(
-            THINKING_BLOCKS_METADATA_KEY.to_owned(),
-            Value::Array(thinking_blocks),
-        );
-    }
+    attach_thinking_blocks(&mut message, thinking_blocks);
 
     let finish_reason = object
         .get("stop_reason")
@@ -201,28 +196,47 @@ fn parse_tool_use(block: &Map<String, Value>, index: u32) -> ToolCall {
     }
 }
 
-/// Preserves one replayable thinking block, or logs why it is not replayed.
+/// Returns `block` verbatim when the API will accept it back on a later turn.
 ///
 /// A `thinking` block is replayable only with the provider's own `signature`,
 /// and a `redacted_thinking` block only with its opaque `data`; a block missing
 /// either is dropped with a `tracing::warn!` instead of being sent back in a
-/// shape the API rejects. The block is stored verbatim, so an unknown extra
+/// shape the API rejects. The block is returned verbatim, so an unknown extra
 /// field a future API version adds survives the round trip.
-fn preserve_thinking_block(preserved: &mut Vec<Value>, block: &Map<String, Value>) {
+///
+/// Both the non-streaming parser and the stream accumulator call this function,
+/// so a block is judged by exactly one rule and this client never invents the
+/// provider's proof.
+pub(crate) fn replayable_block(block: &Map<String, Value>) -> Option<Value> {
+    if is_replayable_block(block) {
+        return Some(Value::Object(block.clone()));
+    }
     let kind = block
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if !is_replayable_block(block) {
-        tracing::warn!(
-            target: "openjiuwen_foundation::llm::anthropic",
-            block_type = kind,
-            "dropping a thinking block that cannot be replayed: \
-             `thinking` needs a signature and `redacted_thinking` needs data"
-        );
+    tracing::warn!(
+        target: "openjiuwen_foundation::llm::anthropic",
+        block_type = kind,
+        "dropping a thinking block that cannot be replayed: \
+         `thinking` needs a signature and `redacted_thinking` needs data"
+    );
+    None
+}
+
+/// Stores `blocks` under [`THINKING_BLOCKS_METADATA_KEY`] when there are any.
+///
+/// Shared by the response parser and the stream accumulator so a streamed turn
+/// and an invoked turn carry identical metadata; a turn with nothing replayable
+/// is left untouched (no empty array).
+pub(crate) fn attach_thinking_blocks(message: &mut BaseMessage, blocks: Vec<Value>) {
+    if blocks.is_empty() {
         return;
     }
-    preserved.push(Value::Object(block.clone()));
+    message.metadata.insert(
+        THINKING_BLOCKS_METADATA_KEY.to_owned(),
+        Value::Array(blocks),
+    );
 }
 
 /// Reports whether `block` is a thinking block the API will accept back.

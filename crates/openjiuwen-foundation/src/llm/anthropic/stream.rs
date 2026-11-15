@@ -10,6 +10,11 @@
 //! - text and thinking deltas become `content` and `reasoning` fragments;
 //! - tool-input fragments are buffered per content-block index and emitted as one
 //!   complete [`ToolCallDelta`] on `content_block_stop`;
+//! - `thinking`/`redacted_thinking` blocks are buffered per content-block index
+//!   (text, `signature_delta` proof, redacted `data`) and kept on the state once
+//!   the stream stops them, so [`AnthropicStreamState::apply_thinking_blocks`]
+//!   can make the accumulated message replayable exactly like the non-streaming
+//!   parser's message;
 //! - `message_delta` yields the terminal reason and the merged usage (Anthropic
 //!   reports the output count there while the prompt count arrives in
 //!   `message_start`, so the state keeps the prompt side to produce one complete
@@ -23,6 +28,8 @@
 //!
 //! [`finish`]: AnthropicStreamState::finish
 
+mod thinking;
+
 use std::collections::BTreeMap;
 
 use openjiuwen_common::error::{Error, Result};
@@ -31,9 +38,11 @@ use serde_json::Value;
 
 use crate::llm::model::{FinishReason, StreamChunk};
 use crate::llm::sse::SseEvent;
-use crate::prompt::{Role, ToolCallDelta, Usage};
+use crate::prompt::{BaseMessage, Role, ToolCallDelta, Usage};
 
 use super::response::{finish_reason_from_stop_reason, parse_anthropic_usage};
+
+use thinking::ThinkingBlocks;
 
 /// Accumulator for one Anthropic Messages event stream.
 ///
@@ -49,6 +58,8 @@ pub struct AnthropicStreamState {
     model: Option<String>,
     /// Tool-use blocks being assembled, keyed by content-block index.
     blocks: BTreeMap<u32, ToolBlock>,
+    /// Thinking blocks being assembled, and those already sealed for replay.
+    thinking: ThinkingBlocks,
     /// Usage reported so far; `message_delta` merges its output count into it.
     usage: Option<Usage>,
     /// Whether a `Done` chunk has been emitted.
@@ -88,6 +99,29 @@ impl AnthropicStreamState {
         self.model.as_deref()
     }
 
+    /// The replayable thinking blocks this stream preserved, in block order.
+    ///
+    /// A block is sealed by its `content_block_stop`, or by
+    /// [`finish`](Self::finish) when the stream ends without one, so read this
+    /// after the stream has finished. Only blocks the provider vouched for are
+    /// returned (a `signature` for `thinking`, opaque `data` for
+    /// `redacted_thinking`); an unfinished block is dropped with a warning.
+    #[must_use]
+    pub fn thinking_blocks(&self) -> Vec<Value> {
+        self.thinking.preserved()
+    }
+
+    /// Attaches the preserved thinking blocks to an accumulated assistant message.
+    ///
+    /// Pass the message a [`StreamAccumulator`](crate::llm::model::StreamAccumulator)
+    /// built from this stream's chunks, after the stream ended: the thinking text
+    /// already arrived there as `reasoning_content`, and this call adds the
+    /// provider blocks a follow-up request has to echo back. A turn with no
+    /// replayable block is left untouched.
+    pub fn apply_thinking_blocks(&self, message: &mut BaseMessage) {
+        self.thinking.apply(message);
+    }
+
     /// Converts one Server-Sent-Events event into zero or more chunks.
     ///
     /// # Errors
@@ -118,7 +152,10 @@ impl AnthropicStreamState {
     /// Emits the terminal [`StreamChunk::Done`] unless `message_stop` did.
     ///
     /// Calling it more than once is safe: only the first call can emit a chunk.
+    /// It also seals any thinking block the server never stopped, so a block the
+    /// provider fully signed is still replayable and an unsigned one is dropped.
     pub fn finish(&mut self) -> Vec<StreamChunk> {
+        self.thinking.seal_pending();
         if self.done_emitted {
             return Vec::new();
         }
@@ -153,7 +190,8 @@ impl AnthropicStreamState {
         }
     }
 
-    /// Handles `content_block_start`: remembers a tool call's id and name.
+    /// Handles `content_block_start`: remembers a tool call's id and name, or
+    /// opens a thinking block with what its start event already carries.
     fn content_block_start(&mut self, data: &Value) {
         let Some(index) = block_index(data) else {
             tracing::warn!("ignoring an Anthropic content_block_start without an index");
@@ -163,19 +201,29 @@ impl AnthropicStreamState {
             tracing::warn!("ignoring an Anthropic content_block_start without a block");
             return;
         };
-        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
-            return;
-        }
 
-        self.blocks.insert(
-            index,
-            ToolBlock {
-                id: non_empty_string(block.get("id")),
-                name: non_empty_string(block.get("name")),
-                arguments: String::new(),
-                is_tool_use: true,
-            },
-        );
+        match block.get("type").and_then(Value::as_str) {
+            Some("tool_use") => {
+                self.blocks.insert(
+                    index,
+                    ToolBlock {
+                        id: non_empty_string(block.get("id")),
+                        name: non_empty_string(block.get("name")),
+                        arguments: String::new(),
+                        is_tool_use: true,
+                    },
+                );
+            }
+            Some("thinking") => self.thinking.open_thinking(
+                index,
+                non_empty_str(block.get("thinking")),
+                non_empty_str(block.get("signature")),
+            ),
+            Some("redacted_thinking") => self
+                .thinking
+                .open_redacted(index, non_empty_str(block.get("data"))),
+            _ => {}
+        }
     }
 
     /// Handles `content_block_delta`: text, thinking, or a tool-input fragment.
@@ -193,7 +241,24 @@ impl AnthropicStreamState {
             }
             Some("thinking_delta") => {
                 if let Some(thinking) = non_empty_str(delta.get("thinking")) {
+                    if let Some(index) = block_index(data) {
+                        self.thinking.append_text(index, thinking);
+                    }
                     chunks.push(delta_chunk(None, Some(thinking), None));
+                }
+            }
+            Some("signature_delta") => {
+                if let (Some(index), Some(signature)) =
+                    (block_index(data), non_empty_str(delta.get("signature")))
+                {
+                    self.thinking.append_signature(index, signature);
+                }
+            }
+            Some("data") => {
+                if let (Some(index), Some(fragment)) =
+                    (block_index(data), non_empty_str(delta.get("data")))
+                {
+                    self.thinking.append_data(index, fragment);
                 }
             }
             Some("input_json_delta") => {
@@ -209,18 +274,20 @@ impl AnthropicStreamState {
                 block.is_tool_use = true;
                 block.arguments.push_str(partial);
             }
-            // `signature_delta` carries only a thinking-block signature, and any
-            // unknown delta type cannot contribute to the assistant message.
+            // An unknown delta type cannot contribute to the assistant message.
             _ => {}
         }
     }
 
-    /// Handles `content_block_stop`: emits one complete tool call for its block.
+    /// Handles `content_block_stop`: seals a thinking block, emits one complete
+    /// tool call for a tool block.
     fn content_block_stop(&mut self, data: &Value, chunks: &mut Vec<StreamChunk>) {
         let Some(index) = block_index(data) else {
             tracing::warn!("ignoring an Anthropic content_block_stop without an index");
             return;
         };
+        self.thinking.seal(index);
+
         let Some(block) = self.blocks.get(&index) else {
             return;
         };
@@ -265,6 +332,7 @@ impl AnthropicStreamState {
 
     /// Handles `message_stop`: emits the single terminal `Done`.
     fn message_stop(&mut self, chunks: &mut Vec<StreamChunk>) {
+        self.thinking.seal_pending();
         if !self.done_emitted {
             self.done_emitted = true;
             chunks.push(StreamChunk::Done);
