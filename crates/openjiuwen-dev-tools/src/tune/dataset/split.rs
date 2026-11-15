@@ -15,6 +15,8 @@ use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::tune::base::Case;
+use crate::tune::dataset::batch::{BatchScheduler, Epoch};
+use crate::tune::dataset::sampler::CaseSampler;
 
 /// The partition a case set (or a score measured over one) came from.
 ///
@@ -159,6 +161,33 @@ impl SplitDataset {
             Self::new(self.split, right.iter().cloned()),
         ))
     }
+
+    /// Samples the dataset's cases through `sampler`.
+    ///
+    /// A thin convenience over [`CaseSampler::sample`], so a tagged partition can
+    /// be subsampled without reaching for [`SplitDataset::cases`] first. The
+    /// sampler's clamping, zero-count, determinism, and identity contract all
+    /// apply unchanged; the tag is not carried into the returned cases.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the sampler reports; the samplers in this module never fail.
+    pub fn sample(&self, sampler: &dyn CaseSampler) -> Result<Vec<Case>> {
+        sampler.sample(self.cases())
+    }
+
+    /// Plans the dataset's case list into epochs and batches with `scheduler`.
+    ///
+    /// A thin convenience over [`BatchScheduler::plan`], so a tagged partition can
+    /// be turned straight into a trainer's schedule. The plan is a pure function
+    /// of the cases and the scheduler's configuration.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::validation`] when the scheduler's `batch_size` or `epochs` is `0`.
+    pub fn batches(&self, scheduler: &BatchScheduler) -> Result<Vec<Epoch>> {
+        scheduler.plan(self.cases())
+    }
 }
 
 impl IntoIterator for SplitDataset {
@@ -188,6 +217,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::tune::dataset::{RandomSampler, SequentialSampler};
 
     /// A minimal valid case with the given identifier.
     fn case(id: &str) -> Case {
@@ -325,6 +355,40 @@ mod tests {
         assert!(right.is_empty());
         assert_eq!(left.split, CaseSplit::Unspecified);
         assert_eq!(right.split, CaseSplit::Unspecified);
+    }
+
+    #[test]
+    fn sample_and_batches_delegate_to_the_seams() {
+        let dataset = dataset(CaseSplit::Train, 5);
+
+        // `sample` hands the dataset's cases to the sampler unchanged.
+        let sampled = dataset.sample(&SequentialSampler::new(2)).unwrap();
+        assert_eq!(sampled, dataset.cases()[..2].to_vec());
+        let all = dataset.sample(&RandomSampler::new(7)).unwrap();
+        assert_eq!(all.len(), dataset.len());
+
+        // `batches` plans exactly what the scheduler plans over the same cases.
+        let scheduler = BatchScheduler::new(2).unwrap();
+        assert_eq!(
+            dataset.batches(&scheduler).unwrap(),
+            scheduler.plan(dataset.cases()).unwrap()
+        );
+        let plan = dataset.batches(&scheduler).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].batches.len(), 3);
+        assert_eq!(plan[0].batches[2].indices, [4]);
+        let last = &plan[0].batches[2];
+        assert_eq!(
+            last.cases
+                .iter()
+                .map(|case| case.case_id.as_str())
+                .collect::<Vec<_>>(),
+            ["4"]
+        );
+
+        // A scheduler that cannot plan reports its validation error unchanged.
+        let broken = BatchScheduler::new(2).unwrap().with_epochs(0);
+        assert!(dataset.batches(&broken).is_err());
     }
 
     #[test]
