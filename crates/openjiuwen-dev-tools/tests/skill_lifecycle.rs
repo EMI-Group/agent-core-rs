@@ -11,16 +11,18 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use openjiuwen_common::error::ErrorKind;
 use openjiuwen_dev_tools::skill_creator::{
     SkillBundle, SkillCreator, SkillDefinition, SkillResource, SkillSpec,
 };
 use openjiuwen_dev_tools::skill_evaluator::{
-    CaseStatus, EvalCase, EvaluationReport, EvaluatorConfig, ModelCaseRunner, SafetyRule,
-    ScriptedCaseRunner, SkillEvaluator,
+    CaseStatus, EvalCase, EvaluationReport, EvaluatorConfig, ModelCaseRunner, ReactCaseRunner,
+    SafetyRule, ScriptedCaseRunner, SkillEvaluator, DEFAULT_MAX_REACT_ROUNDS,
 };
+use openjiuwen_dev_tools::tune::{ToolStub, ToolStubs};
 use openjiuwen_foundation::llm::Model;
 use openjiuwen_foundation::prompt::Role;
-use openjiuwen_test_support::{ScriptedModel, TempWorkspace};
+use openjiuwen_test_support::{MockCompletion, ScriptedModel, ScriptedTurn, TempWorkspace};
 use serde_json::json;
 
 /// The instruction template: every design-rubric dimension is satisfiable from it
@@ -738,4 +740,144 @@ async fn a_blocked_run_writes_a_pipeline_report_instead_of_a_final_report() {
         "the safety report must show the closed gate and the finding: {safety}"
     );
     assert_markdown_is_tidy(&safety, "safety");
+}
+
+/// The `lookup` tool stub the `ReAct` runs share: it answers the audience.
+fn react_stubs() -> ToolStubs {
+    ToolStubs::new().with_stub(
+        ToolStub::constant("lookup", json!({"audience": "release engineers"}))
+            .expect("a non-blank stub name"),
+    )
+}
+
+/// A model that looks the audience up once and then answers with `answer`.
+fn tool_calling_model(answer: &str) -> ScriptedModel {
+    ScriptedModel::builder()
+        .completion(MockCompletion::tool_call(
+            "lookup",
+            json!({"topic": "audience"}),
+        ))
+        .respond_text(answer)
+        .build()
+}
+
+#[tokio::test]
+async fn a_tool_using_case_runs_through_the_react_runner() {
+    let skill = author_skill();
+    let case = EvalCase::new("case-brief", "Brief structure", "Draft a brief.")
+        .with_expectation("contains:release engineers");
+    let answer = "This brief is written for release engineers.";
+
+    // The traced entry point reports the tool round behind the answer.
+    let model = tool_calling_model(answer);
+    let runner = ReactCaseRunner::new(Arc::new(model.clone())).with_stubs(react_stubs());
+    assert_eq!(
+        runner.max_rounds(),
+        DEFAULT_MAX_REACT_ROUNDS,
+        "a fresh runner carries the documented tool-round budget"
+    );
+
+    let outcome = runner
+        .run_traced(&case, &skill)
+        .await
+        .expect("the model answers after one tool round");
+    assert_eq!(outcome.answer, answer);
+    assert_eq!(outcome.rounds, 1, "one assistant turn requested tools");
+    assert!(!outcome.truncated, "the budget did not cut the run short");
+    assert!(outcome.used_tools(), "the model asked for a tool");
+    assert!(outcome.used("lookup"));
+    let record = &outcome.trace.calls()[0];
+    assert_eq!(record.name, "lookup");
+    assert_eq!(record.arguments, json!({"topic": "audience"}));
+    assert_eq!(record.result, json!({"audience": "release engineers"}));
+    assert!(!record.is_error(), "{record:?}");
+
+    let calls = model.calls();
+    assert_eq!(calls.len(), 2, "the tool result is fed back to the model");
+    assert_eq!(
+        calls[0]
+            .request
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.as_array())
+            .map(Vec::len),
+        Some(1),
+        "the registered stub is declared to the model"
+    );
+    let tool_message = calls[1]
+        .messages
+        .iter()
+        .find(|message| message.role == Role::Tool)
+        .expect("the second turn carries the tool result");
+    assert_eq!(tool_message.text(), "{\"audience\":\"release engineers\"}");
+
+    // The same runner satisfies the evaluator's `CaseRunner` seam, so the
+    // functional report scores the tool-backed answer.
+    let evaluator_model = tool_calling_model(answer);
+    let report = SkillEvaluator::new(Arc::new(
+        ReactCaseRunner::new(Arc::new(evaluator_model.clone())).with_stubs(react_stubs()),
+    ))
+    .evaluate_at(&skill, &[case], 1_700_000_000_000)
+    .await
+    .expect("a tool-backed case evaluates");
+    assert_eq!(
+        report.functional.results[0].status,
+        CaseStatus::Passed,
+        "the tool-backed answer satisfies `contains:release engineers`"
+    );
+    assert_eq!(report.functional.summary.passed, 1);
+    assert!(
+        (report.functional.summary.pass_rate - 1.0).abs() < 1e-9,
+        "the assertion-based pass rate must stay 1.0, got {}",
+        report.functional.summary.pass_rate
+    );
+    assert_eq!(
+        evaluator_model.call_count(),
+        2,
+        "the evaluator seam drives the same tool round and answer"
+    );
+}
+
+#[tokio::test]
+async fn with_max_rounds_bounds_an_always_tool_calling_script() {
+    let skill = author_skill();
+    let case =
+        EvalCase::new("case-loop", "Loop", "Draft a brief.").with_expectation("contains:brief");
+    // Every turn asks for the tool, so only the budget can end the loop.
+    let unbounded_turn = ScriptedTurn::Response(
+        MockCompletion::tool_call("lookup", json!({"topic": "audience"})).to_chat_response(""),
+    );
+    let model = ScriptedModel::builder().fallback(unbounded_turn).build();
+    let runner = ReactCaseRunner::new(Arc::new(model.clone()))
+        .with_stubs(react_stubs())
+        .with_max_rounds(2);
+
+    let outcome = runner
+        .run_traced(&case, &skill)
+        .await
+        .expect("the budget ends the loop instead of failing the run");
+    assert!(
+        outcome.truncated,
+        "a caller must be able to tell a cut-short answer from a real one"
+    );
+    assert_eq!(outcome.rounds, 2, "at most `max_rounds` tool rounds run");
+    assert_eq!(outcome.trace.count("lookup"), 2);
+    assert!(outcome.used_tools());
+    assert_eq!(
+        model.call_count(),
+        3,
+        "a bounded loop costs at most `max_rounds + 1` model invocations"
+    );
+
+    let error = ReactCaseRunner::new(Arc::new(ScriptedModel::text("never reached")))
+        .with_stubs(react_stubs())
+        .with_max_rounds(0)
+        .run_traced(&case, &skill)
+        .await
+        .expect_err("a zero budget is rejected before any model call");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(
+        error.to_string().contains("max_rounds"),
+        "the error must name the budget: {error}"
+    );
 }
