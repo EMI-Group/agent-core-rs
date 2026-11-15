@@ -14,6 +14,7 @@
 //! - `render` — `RenderState`, the chunk-to-terminal renderer
 //! - `run` — one-shot execution and its output formats
 //! - `repl` — the interactive REPL and its slash commands
+//! - `resume` — resuming a persisted session as a normal one-shot turn
 //! - `permissions` — approval prompts and the permission host
 //! - `session_store` — append-only session records under the home directory
 //! - `allow_rules` — permanent allow-rule persistence to `permissions.yaml`
@@ -38,6 +39,7 @@ mod io;
 mod permissions;
 mod render;
 mod repl;
+mod resume;
 mod run;
 mod session_store;
 
@@ -68,6 +70,7 @@ pub use io::{CliIo, LineReader, StdioReader, StdoutWriter, Writer};
 pub use permissions::{render_prompt, render_prompt_styled, CliPermissionHost, PermissionAnswer};
 pub use render::RenderState;
 pub use repl::{InterruptAction, InterruptCounter, Repl, ReplCommand, TurnOutcome};
+pub use resume::{run_once_resumed, run_with_model_resumed, ResumedTurn};
 pub use run::{
     build_agent, build_agent_with, new_session, result_json_line, run_once, run_with_model,
     session_id, stream_json_line, FoundationMcpToolProvider, McpToolProvider, RunOutcome,

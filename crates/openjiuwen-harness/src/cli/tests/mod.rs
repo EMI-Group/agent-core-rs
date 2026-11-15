@@ -21,6 +21,7 @@
 
 mod commands;
 mod features;
+mod resume;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};

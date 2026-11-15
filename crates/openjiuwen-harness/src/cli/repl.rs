@@ -38,6 +38,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use openjiuwen_agent::Agent;
 use openjiuwen_common::error::Result;
+use openjiuwen_foundation::BaseMessage;
 use openjiuwen_session::Session;
 use serde_json::json;
 
@@ -340,7 +341,7 @@ impl Repl {
         if self.watch_signals {
             self.spawn_signal_watcher();
         }
-        self.seed_history().await;
+        self.replay_input_history().await;
         loop {
             if self.exited.load(Ordering::SeqCst) {
                 break;
@@ -499,6 +500,47 @@ impl Repl {
         Ok(outcome)
     }
 
+    /// Seeds the conversation of the current session from a persisted history.
+    ///
+    /// This is the REPL side of resuming: the messages are pushed into the
+    /// kernel `"main"` context of the REPL's session, so every following
+    /// [`Repl::run_turn`] continues that same kernel session and the model sees
+    /// the restored transcript ahead of the new query. The user and assistant
+    /// texts are also mirrored into the [`ConversationHistory`] behind
+    /// `/compact` and `/cost`, so those commands reason over the same transcript
+    /// the model sees; system and tool messages reach the kernel only.
+    ///
+    /// Call it **after** the REPL is built ([`Repl::new`], [`Repl::with_io`] or
+    /// [`Repl::with_io_and_signals`], and after any
+    /// [`DeepAgent::configure`](crate::agent::DeepAgent::configure) — that
+    /// re-applies the kernel configuration and drops pooled contexts) and
+    /// **before** the first [`Repl::run_turn`]/[`Repl::run`]. Seeding the same
+    /// history twice yields one copy, so a repeated identical seed is harmless.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the kernel context seed reports.
+    pub async fn seed_history(&mut self, history: Vec<BaseMessage>) -> Result<()> {
+        self.agent
+            .seed_history(&self.session, history.clone())
+            .await?;
+        for message in &history {
+            let role = if message.role.is_user() {
+                ROLE_USER
+            } else if message.role.is_assistant() {
+                ROLE_ASSISTANT
+            } else {
+                continue;
+            };
+            let text = message.text();
+            if text.trim().is_empty() {
+                continue;
+            }
+            self.conversation.push(role, text.as_ref());
+        }
+        Ok(())
+    }
+
     /// Loads the persistent input history, logging and continuing on failure.
     fn load_history(&mut self) {
         if let Err(error) = self.history.load() {
@@ -511,7 +553,7 @@ impl Repl {
     /// This is the offline analogue of pre-filling a line editor's history
     /// buffer: the stored entries are queued ahead of the real input, so the
     /// session begins by re-running what the user typed in earlier sessions.
-    async fn seed_history(&self) {
+    async fn replay_input_history(&self) {
         if !self.replay_history || self.history.is_empty() {
             return;
         }

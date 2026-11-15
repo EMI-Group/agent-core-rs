@@ -39,12 +39,17 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 
 `./run.rs`:
 - `RunOutcome` (`to_json`, `stream_json_line`, `result_json_line`), `session_id()`, `new_session()`, `run_once`, `run_with_model` (plain/text shapes unchanged).
+- `stream_run(options, args, io, agent, session, session_id, prompt)` is the shared tail: streaming, per-format rendering/output, `RunOutcome` and the warn-only transcript append; only a caller starting a fresh run may create the record (`SessionStore::new_session` truncates).
+- `resolve_prompt(args, io)` is `pub(crate)` so the resumed runner resolves prompts by the same rules.
 - `build_agent(model, options, io)` and `build_agent_with(model, options, io, &dyn McpToolProvider)`: load `InstructionFiles` into the system prompt, mount the thirteen extended built-in tools on top of the builder's default twenty, mount MCP tools, merge persisted allow rules, install `CliPermissionHost`.
 - `CLI_EXTENDED_TOOLS` / `cli_extended_tools(workspace, permissions)`: the mounted extra set — `fetch_webpage`, `web_search`, `image_metadata`, `audio_metadata`, `cron`, `list_mcp_resources`, `read_mcp_resource`, `tool_search`, `get_current_goal`, `submit_goal_report`, `worktree`, `enter_worktree`, `exit_worktree` — built from a `ToolRegistry` restricted to it and wired with the agent's permission engine.
 - `CLI_EXTENDED_TOOLS` is `BuiltinTool::EXTENDED` minus the default twenty minus exactly two documented exclusions: `lsp` (no per-workspace server configuration is resolved) and `mcp_resource_subscription` (no subscription registry is wired).
 - `trait McpToolProvider` + `FoundationMcpToolProvider` (real `mcp` connect/list, a failing server is warned and skipped).
 
-`./repl.rs`: `Repl` (`new`, `with_io_and_signals`, `with_io`, plus builders `with_history`, `with_history_replay`, `with_shell`, `with_skills`), `run`, `run_turn`, `handle_input`, `on_interrupt`, `session_id`; `ReplCommand::{Prompt, Exit, New, Clear, Help, Status, Cost, Compact, Sessions, Mode, Shell, Skill, Usage, Unknown, Empty}`; `TurnOutcome`, `InterruptCounter`, `InterruptAction`.
+`./repl.rs`: `Repl` (`new`, `with_io_and_signals`, `with_io`, plus builders `with_history`, `with_history_replay`, `with_shell`, `with_skills`), `run`, `run_turn`, `seed_history(history: Vec<BaseMessage>)`, `handle_input`, `on_interrupt`, `session_id`; `ReplCommand::{Prompt, Exit, New, Clear, Help, Status, Cost, Compact, Sessions, Mode, Shell, Skill, Usage, Unknown, Empty}`; `TurnOutcome`, `InterruptCounter`, `InterruptAction`.
+- `Repl::seed_history` seeds the current kernel session (user/assistant/system/tool messages) and mirrors the user/assistant text into the `/compact` transcript; the private input-history replay helper is `replay_input_history`.
+
+`./resume.rs`: `ResumedTurn` (`new`, `with_history`, `with_state`; fields `session_id`, `history: Vec<BaseMessage>`, `state: Option<Value>`), `run_with_model_resumed(options, args, io, model, resumed)`, `run_once_resumed(options, args, io, resumed)` — plain-data resume surface: seeds the kernel session id, restores the `deepagent` state lane, continues the CLI record and finishes through `run::stream_run`.
 
 `./permissions.rs`: `PermissionAnswer` (`parse`, `to_response`), `render_prompt`, `render_prompt_styled`, `CliPermissionHost` (`new`, `with_allow_rules`, `with_style`, `permission_yaml_path`, `PermissionHost` impl).
 
@@ -68,7 +73,7 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 
 `./onboarding.rs`: `OnboardingWizard` (`new`, `needed`, `needed_with`, `run`), `OnboardingOutcome::{Skipped, Declined, Configured}`, `maybe_run(io, home, env)` — first-run setup that writes `settings.json`.
 
-`./tests/` → `mod.rs` (original parity suite + shared doubles), `commands.rs` (slash-command/history/shell/skill behaviour), `features.rs` (cross-feature public-API coverage) (`tests/CONTEXT.md` not present; this section documents them).
+`./tests/` → `mod.rs` (original parity suite + shared doubles), `commands.rs` (slash-command/history/shell/skill behaviour), `features.rs` (cross-feature public-API coverage), `resume.rs` (one-shot continuation, `Repl::seed_history`, output parity) (`tests/CONTEXT.md` not present; this section documents them).
 
 ## Constraints
 
@@ -78,7 +83,7 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - Async-first: IO traits are async; blocking stdin only inside `StdioReader`; no std/parking_lot lock held across `.await` (IO state is behind `tokio::sync::Mutex`).
 - `CliOptions` fields are frozen: `crates/openjiuwen-e2e/tests/cli_binary.rs` and `tests/cli.rs` construct it with a struct literal, so new knobs go into `paths`/`Cli`/`CliIo`, never into `CliOptions`.
 - Colour is opt-in per handle (`CliIo::with_color`); plain output must stay byte-identical so piped `text`, `json` and `stream-json` runs contain no escape bytes.
-- Files ≤ ~1000 lines; `repl.rs` (744) is the largest logic file and stays single-responsibility; the test tree is split per concern.
+- Files ≤ ~1000 lines; `repl.rs` (786) is the largest logic file and stays single-responsibility; the test tree is split per concern.
 - No dependency on `crate::protocol`, `crate::subagents` or upper-layer crates; only `crate::agent`, `crate::permission`, `crate::schema`, `crate::skills`, `crate::workspace` and kernel crates.
 - Precedence everywhere is explicit and documented: flags → `OPENJIUWEN_*` → generic SDK env → settings file → default for options; workspace identity over home identity, home memory before workspace memory for instructions; home `mcp.json` before workspace `.openjiuwen/mcp.json` (workspace wins by server name).
 
@@ -90,9 +95,10 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - **`/compact` is bounded truncation, not summarisation**: the kernel `ContextEngine` is not reachable from `DeepAgent`, so `ConversationHistory` keeps the newest 8 messages within a 12 000-character budget and the trimmed transcript is written back through `SessionStore::replace_messages`.
 - **`/cost` counts what the kernel actually emits**: tokens from every `llm_usage` frame (`usage_metadata`), tool calls from the `answer` frame's `observations` (the `tool_call`/`tool_result` frame kinds never appear on `DeepAgent::stream`).
 - **Fail closed on permissions**: a non-interactive handle never prompts; EOF rejects the call; only an interactive terminal answers, and `Always` persists the whole merged section to `permissions.yaml`.
-- **No resume/seeding seam**: `run_once`/`run_with_model` and `Repl` accept no prior conversation, message history, persisted session transcript or resume state — every run/REPL starts from `new_session(id)` (a fresh `AgentSession`) and sends `json!({"query": …})`.
-- `SessionStore` transcripts are write-only from the agent's point of view: they are read back only by `/sessions` (summaries) and rewritten by `/compact` from the CLI-side `ConversationHistory`; `SessionStore::load` is never fed to `build_agent`/`DeepAgent`.
-- The crate's `persistent_agent` module (`PersistentSessionRecord`, `ResumePlan`, `WindowAssembly`, `resume`) exists but `src/cli/` never references it.
+- **Resuming is a seeded turn on an existing session id**: `ResumedTurn` carries the id, the prior message window and the optional `deepagent` state; `run_with_model_resumed`/`run_once_resumed` build the agent, seed it (`DeepAgent::seed_history`, then `agent::seed_state`), continue the record and finish through `run::stream_run`. Seed errors propagate; `run_once`/`run_with_model` and a bare `Repl` still start from `new_session(id)` and send `json!({"query": …})`.
+- **A resumed run continues the CLI record, never truncates it**: the record is created only when `SessionStore::load` reports `None`; an existing `<home>/sessions/<id>.json` keeps its earlier messages and only gains the new user/assistant pair.
+- `SessionStore` transcripts stay write-only from the agent's point of view: they are read back by `/sessions` (summaries), rewritten by `/compact` from the CLI-side `ConversationHistory`, and existence-checked by the resumed runner; `SessionStore::load` is never fed to `build_agent`/`DeepAgent`.
+- The `resume` module is the host seam for the crate's `persistent_agent` module (`PersistentSessionRecord`, `ResumePlan`, `WindowAssembly`, `resume`): `src/cli/` imports nothing from it — a host extracts a `ResumePlan` (or any other store's data) into `ResumedTurn` itself, because `cli` must never depend on `persistent_agent`.
 - **Persistent allow rules are a Rust addition**: Python keeps "always" in memory for the session only; here `CliPermissionHost::with_allow_rules` writes YAML and the next run reloads it via `AllowRules::load_merged(&options.permissions())`.
 - **Instruction files**: `IDENTITY.md` (workspace wins over home) is a Rust addition injected through `DeepAgentConfig::with_system_prompt` (which replaces the built-in identity preamble); `OPENJIUWEN.md` layers keep the Python `### User-level memory` / `### Project-level memory` headers and the 40 000-character cap.
 - **MCP config is typed and loud**: malformed `mcp.json` returns `Error::config` naming the path (Python silently drops every server); a server that fails to connect is warned and skipped at build time so one bad entry never blocks the CLI.
@@ -110,7 +116,8 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 
 - Multi-turn REPL sessions go silent: the task loop's `NoProgressAnswer` guard (`max_consecutive_empty_answers = 3`, `min_answer_chars = 20`, enabled by default) keeps its streak in the reused session state, so after three consecutive short answers the next `agent.stream` returns one empty `answer` frame without calling the model. Fix belongs to the task-loop/agent area, not this module.
 - `ReplCommand`'s `Unknown skill:` branch is unreachable from `handle_input` (unknown names are rejected by `parse_skill_command` first and surface as `Unknown command: /name`).
-- `crates/openjiuwen-harness/tests/cli.rs` covers the pre-extension surface only; the new features are covered by `src/cli/tests/{commands,features}.rs` instead (that file is outside this node).
+- `crates/openjiuwen-harness/tests/cli.rs` covers the pre-extension surface only; the new features are covered by `src/cli/tests/{commands,features,resume}.rs` instead (that file is outside this node).
+- A resumed REPL turn is not interruptible in a new way: `Repl::seed_history` seeds a built REPL only, so a host that resumes into `chat` must call it before the first turn and after any `agent.configure`.
 
 ## Deferred Python areas
 
@@ -120,7 +127,8 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - Dollar-price `/cost` reporting (Python has none either: token/call counts only).
 - LLM-summarising `/compact` (bounded truncation instead).
 - The `lsp` built-in tool is not mounted by the CLI: a language server needs a per-workspace configuration the CLI does not resolve yet.
-- Plugin hot-loading (templates are loaded by `crate::spec`, not by the CLI), a `--config` command, and file-based session-history restore.
+- Plugin hot-loading (templates are loaded by `crate::spec`, not by the CLI) and a `--config` command.
+- No automatic resume in the binary: there is no `--resume`/`--session` flag and `run_cli` never restores a past transcript by itself; the `resume` module is the library seam a host drives.
 - Multi-skill roots beyond `<workspace>/skills` and `<home>/skills` (`~/.claude/skills`, `~/.codex/skills` are not scanned).
 
 ## Routing Table
@@ -132,7 +140,8 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - `./style.rs` → ANSI `Style` helpers
 - `./render.rs` → `RenderState`: chunk-to-terminal rendering shared by `run` and the REPL
 - `./run.rs` → one-shot execution, agent construction (instructions, extended built-in tools, MCP, permissions), output formats, `RunOutcome`
-- `./repl.rs` → `Repl`, slash commands, history integration, skill/shell dispatch, Ctrl-C handling, per-turn streaming
+- `./repl.rs` → `Repl`, slash commands, history integration, skill/shell dispatch, Ctrl-C handling, per-turn streaming, `seed_history`
+- `./resume.rs` → `ResumedTurn` plus the resumed one-shot entry points (`run_with_model_resumed`, `run_once_resumed`): seed history/state on an existing session id and continue through `run::stream_run`
 - `./permissions.rs` → approval prompt text/styling, answer mapping, `CliPermissionHost` with persistent rules
 - `./allow_rules.rs` → `permissions.yaml` persistence and merge
 - `./session_store.rs` → `~/.openjiuwen/sessions/<id>.json` records (append, list, replace)
@@ -147,6 +156,7 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - `./tests/mod.rs` → original parsing/precedence/permission/runner/REPL parity suite and shared doubles
 - `./tests/commands.rs` → slash-command, history, shell and skill behaviour
 - `./tests/features.rs` → cross-feature public-API coverage (colour, history, onboarding, instructions, MCP, allow rules, `/cost`, `/compact`, skills)
+- `./tests/resume.rs` → `ResumedTurn` builders, record continuation, seeded-window ordering, `Repl::seed_history` over a turn, resumed-vs-fresh output parity
 
 ## Test Strategy
 
@@ -154,6 +164,7 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - `tests/mod.rs` keeps the parity guards: clap parsing/dispatch, option precedence, settings aliases, permission answer mapping, session store round-trip, renderer per-kind output, `run_with_model` text/json/stream-json shapes, scripted REPL transcript.
 - `tests/commands.rs` drives each slash command end to end: `handle_input` table, `/help` (with and without skills), `/cost`/`/status` usage, `/clear`, `/compact` (no-op and truncating), `/sessions` (empty and populated), `!cmd` (stdout/stderr/exit line, model untouched, failure keeps the loop alive), skill turn prompt wrapping, history recording and replay seeding.
 - `tests/features.rs` proves the wiring from the public API: `--no-color` parsing + `color_enabled`, styled-vs-plain prompt bytes, history round-trip/cap, onboarding interactive vs non-interactive, instruction precedence, `mcp.json` loading and malformed-file error, allow-rule persistence through the host, and escape-free `text`/single-object `json` output.
+- `tests/resume.rs` proves the resume surface: a pre-created record keeps its earlier message (three messages in order, roles `user`/`user`/`assistant`), the seeded window reaches `ScriptedModel::last_call()` ahead of the new query, `Repl::seed_history` survives `run_turn` (model window plus rendered answer), the builders expose their fields, and a resumed `text` run writes byte-identical output to `run_with_model`.
 - `run.rs`/`permissions.rs` carry inline tests for `build_agent_with` (no MCP config → offline turn, recording provider, instruction prompt, persisted rules) and the styled/fail-closed permission host.
 - `run.rs` also pins the CLI tool set: the `CLI_EXTENDED_TOOLS` shape (extended minus the default twenty minus the two documented exclusions, disjoint from the default twenty), the mounted card names in the rendered prompt, the absence of both excluded cards, the automatic `goal` rail, the typed `success=false` payloads of the backend-less `web_search`/`list_mcp_resources`/`fetch_webpage` tools and of `enter_worktree`/`exit_worktree` outside a repository, and a scripted `web_search` run whose tool result carries "web search backend is not configured".
 - Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --no-default-features`, `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` all clean.

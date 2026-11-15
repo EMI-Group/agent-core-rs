@@ -549,7 +549,10 @@ pub(crate) async fn stream_run(
 ///
 /// A `None` prompt or the literal `-` reads stdin to end of input and joins the
 /// lines with `\n`; the result is trimmed in both cases.
-async fn resolve_prompt(args: &RunArgs, io: &CliIo) -> Result<String> {
+///
+/// Shared with the resumed runner of [`super::resume`], so a resumed prompt is
+/// resolved by exactly the same rules as a fresh one.
+pub(crate) async fn resolve_prompt(args: &RunArgs, io: &CliIo) -> Result<String> {
     let prompt = match &args.prompt {
         Some(prompt) if prompt != "-" => prompt.trim().to_owned(),
         _ => {
