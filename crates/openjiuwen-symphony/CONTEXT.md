@@ -432,6 +432,9 @@ impl SymphonyRuntime {
     pub async fn update_capabilities(&self, descriptors: Vec<CapabilityDescriptor>, request_id: &str) -> Result<GraphMutationResult>;
     pub async fn remove_capabilities(&self, keys: &[CapabilityKey], request_id: &str) -> Result<GraphMutationResult>;
     pub async fn submit_evolution(&self, execution: &PlanExecution) -> Result<EvolutionResult>;
+    pub async fn submit_observation(&self, &GraphEvolutionInput) -> Result<ObservationReceipt>;
+    pub async fn observation_snapshot(&self, &str, Option<&str>) -> Result<GraphSnapshot>;
+    pub async fn flush_observations(&self) -> Result<()>;
     pub fn capture_graph_snapshot(&self) -> BTreeMap<String, Value>;
 }
 pub struct InvokeRequest;   pub struct InvokeResponse { pub plan, pub execution: Option<PlanExecution>, pub graph_status }
@@ -446,6 +449,7 @@ Lifecycle: `Created` → `start` → `Running` → `stop`/`close` → `Stopped`;
 `start` publishes a graph when none exists; `build` re-derives it from the registry plus candidate edges.
 The mutation order is replay lookup → digest conflict → `Running` gate → change-set/CAS → apply → publish → record; a replay with a different digest or a stale `source_revision` is `Error::Validation` naming that field, and the ledger is in-memory unless a journal is configured.
 `submit_evolution` applies successful transitions as an EMA on edge weights (`w' = (w + 1.0) / 2`); `semantic_search` re-embeds only when `CapabilityRegistry::revision()` changed, and without a semantic index it is `Error::Unsupported`.
+The graph-observation service is built only when `graph_artifact_root` is configured (its append-only log lives at `<root>/evolution/`); otherwise `submit_observation`, `observation_snapshot` and `flush_observations` are `Error::Unsupported`, and `close` flushes it only when present.
 See [`runtime`](src/runtime/CONTEXT.md) for the full surface and rules.
 
 ### `observation` (`src/observation/`)
@@ -454,49 +458,25 @@ Caller-supplied execution evidence distilled into derived, immutable observation
 
 ```rust
 pub const GRAPH_EVOLUTION_INPUT_SCHEMA: &str = "symphony.graph_evolution_input.v2";
-// refusal reasons: TRUNCATED_TRACE, TRACE_QUALITY_FLAGS, OUTCOME_NOT_STRONG,
-// CAPABILITY_IDENTITY_MISMATCH, UNKNOWN_STATIC_REVISION, UNKNOWN_MERGED_REVISION,
-// MERGED_STATIC_REVISION_MISMATCH, MERGED_OBSERVATION_REVISION_MISMATCH,
-// NO_QUALIFIED_EDGE_OUTCOME, SAFE_FALLBACK
-
 pub struct GraphEvolutionInput { schema_version, evidence_id, graph_scope_id, observed_at,
-                                 graph_snapshot: GraphSnapshotRef, trace: TraceEvidence,
-                                 task: TaskEvidence, planned_graph: Option<EvolutionGraph>,
-                                 execution_graph: EvolutionGraph }
+                                 graph_snapshot, trace, task, planned_graph, execution_graph }
 impl GraphEvolutionInput { pub fn validate(&self) -> Result<()>; pub fn normalized(self) -> Result<Self>; }
 impl TraceEvidence { pub fn from_trace_record(&TraceRecord) -> Self; }
 impl TaskOutcome { pub fn from_trace_record(&TraceRecord) -> Self; }
-impl TaskEvidence { pub fn from_trace_record(&TraceRecord) -> Self; }
-
 pub enum TaskOutcomeLabel;  pub enum EvidenceStrength;  pub enum FailureDomain;
 pub enum ObservationStatus { Accepted, AuditOnly, Duplicate }
 pub struct ObservationReceipt { evidence_id, graph_scope_id, sequence, status, reason }
-pub struct GraphSnapshotRef;  pub struct GraphSnapshot { graph_scope_id, static_revision,
-    observation_revision, merged_revision, high_water_sequence, overlay }
-
-pub fn stable_hash(value: &Value) -> String;
-pub const POINT_EDGE_IDENTITY_SCHEMA: &str = "symphony.point-edge.v1";
-pub struct EdgeIdentity;  pub struct StaticGraphIndex;   // from_graph / from_graph_with_descriptors
-pub fn edge_identity_from_observation(&EvolutionGraphEdge, &StaticGraphIndex) -> Option<EdgeIdentity>;
-
-pub struct EvidenceStore;  pub struct RevisionStore;    // append-only log + immutable revisions
-pub struct GraphObservationService;
-impl GraphObservationService {
-    pub fn new(artifacts: Arc<dyn GraphArtifactStore>, root: impl AsRef<Path>) -> Self;
-    pub async fn submit(&self, &GraphEvolutionInput) -> Result<ObservationReceipt>;
-    pub async fn get_snapshot(&self, &str, Option<&str>) -> Result<GraphSnapshot>;
-    pub async fn flush(&self) -> Result<()>;      pub async fn reproject(&self, &str) -> Result<GraphSnapshot>;
-    pub async fn reproject_all(&self) -> Result<Vec<GraphSnapshot>>;
-    pub async fn publish_safe_fallback(&self, &str, &str) -> Result<GraphSnapshot>;
-    pub async fn close(&self) -> Result<()>;
-}
+pub struct GraphSnapshot { graph_scope_id, static_revision, observation_revision,
+                           merged_revision, high_water_sequence, overlay }
+pub struct StaticGraphIndex;  pub struct EdgeIdentity;  pub fn stable_hash(&Value) -> String;
+pub struct EvidenceStore;  pub struct RevisionStore;  pub struct GraphObservationService;
 ```
 
-Evidence is qualified before it may move a weight: a truncated trace, quality flags, weak evidence, unknown capability ids, a stale pinned snapshot, or an edge without a countable outcome becomes `audit_only` with its reason and never re-qualifies.
-Only `verified_success` edges and `orchestration`-attributed `verified_failure` edges count; `runtime_weight = 1.0 + clamp(0.05 * (success - failure), -1.0, 1.0)`.
-Rebinding yields `legacy_ignored | orphaned | invalidated | active_static | quarantined | active_runtime_only | insufficient_evidence`, and an edge absent from the static graph becomes plannable only after `MIN_RUNTIME_ONLY_SUCCESS_SESSIONS = 2` failure-free success sessions in the current static revision.
-`get_snapshot` reprojects rather than failing and publishes a neutral `safe_fallback` snapshot when projection fails.
-See [`observation`](src/observation/CONTEXT.md) for the full contract, qualification order, overlay record and on-disk layout.
+Evidence is qualified first: a truncated trace, quality flags, weak evidence, unknown capability ids, a stale pinned snapshot or an edge without a countable outcome is `audit_only` with its reason (`TRUNCATED_TRACE`, `TRACE_QUALITY_FLAGS`, `OUTCOME_NOT_STRONG`, `CAPABILITY_IDENTITY_MISMATCH`, `UNKNOWN_STATIC_REVISION`, `UNKNOWN_MERGED_REVISION`, `MERGED_STATIC_REVISION_MISMATCH`, `MERGED_OBSERVATION_REVISION_MISMATCH`, `NO_QUALIFIED_EDGE_OUTCOME`) and never re-qualifies.
+Only `verified_success` edges and `orchestration`-attributed `verified_failure` edges count, so `runtime_weight = 1.0 + clamp(0.05 * (success - failure), -1.0, 1.0)`.
+Rebinding yields `legacy_ignored | orphaned | invalidated | active_static | quarantined | active_runtime_only | insufficient_evidence`; an edge absent from the static graph needs `MIN_RUNTIME_ONLY_SUCCESS_SESSIONS = 2` failure-free success sessions in the current static revision to become plannable.
+`GraphObservationService::{new, submit, get_snapshot, flush, reproject, reproject_all, publish_safe_fallback, close}` reads static revisions from a `GraphArtifactStore`; snapshot reads reproject rather than fail and publish a neutral `safe_fallback` snapshot when projection fails.
+See [`observation`](src/observation/CONTEXT.md) for the full contract, the overlay record and the on-disk layout.
 
 ### `discovery` (`src/discovery/`)
 
@@ -701,6 +681,7 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
 - `tests/matcher_cache.rs` — identity digests, endpoint normalization, `sanitize_metadata`, cache round-trip and byte-stable layout, replay with zero model calls, `force` bypass, signature invalidation, malformed cache, degradation.
 - `tests/observation.rs` — contract validation (graph types, node labels/metadata, ports, edge endpoints, timezone, failure domain), `observed_at` UTC normalisation, the trace-record bridges, stable hashing and static-graph indexes, and the evidence/revision layout with dedupe, cursor, content-derived ids, immutability and atomic writes.
 - `tests/observation_service.rs` — one scenario per qualification reason, duplicate idempotency, the runtime-only threshold, symmetric bounded session-deduped weights, the high-water cursor, `safe_fallback` replay, quarantine/rebind across static republications, merged-revision pinning, persisted sanitisation and UTC persistence.
+- `tests/observation_runtime.rs` — end-to-end submission through `SymphonyRuntime` (derived static edge, `active_static` weight, runtime snapshot), the `Unsupported` answer without a filesystem root, and rehydration after `close`.
 - `tests/object_artifact.rs` — numbered revisions, `current` pointer/status, reopen persistence, object keys, pinned-version skipping, blank bucket, malformed `current.json`.
 - `tests/artifact_gcs.rs` / `tests/artifact_azure.rs` — full publish → read → status → versions round-trips against a stateful wiremock cloud emulator, plus auth-header assertions (bearer / `SharedKey` / SAS / anonymous), pagination, prefix sorting, 404 semantics and endpoint failure mapping.
 - `tests/deferred.rs` — the remaining `vLLM` stub and the `ivf*` algorithm deferral return `Error::Unsupported`, and `error::is_unsupported` recognizes them.
