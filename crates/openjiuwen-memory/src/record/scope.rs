@@ -2,7 +2,8 @@
 //!
 //! Ports the scope handling of the Python `openjiuwen.core.memory` package: the
 //! `scope_id` rules follow `LongTermMemory._validate_id` (non-empty, no `/`, at most
-//! 128 characters) and a missing id falls back to [`DEFAULT_ID`] (`"__default__"`).
+//! 128 characters) and the constructors fall back to [`DEFAULT_ID`] (`"__default__"`)
+//! when a caller does not pass one, while a *decoded* payload must name both tenant ids.
 use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 /// Placeholder id used when a caller does not supply a `user_id` or `scope_id`.
@@ -15,20 +16,24 @@ const MAX_SCOPE_ID_CHARS: usize = 128;
 /// every storage key; `session_id` and `agent_id` narrow the scope further and are
 /// only present when the caller binds memory to a session or an agent.
 ///
-/// JSON is flat and `snake_case`; `session_id`/`agent_id` are omitted when absent and
-/// a missing `user_id`/`scope_id` defaults to [`DEFAULT_ID`].
+/// JSON is flat and `snake_case`; `session_id`/`agent_id` are omitted when absent. A
+/// **decode** requires `user_id` and `scope_id`: defaulting a missing tenant id to
+/// [`DEFAULT_ID`] would silently re-tenant a record, so a lossy payload fails with a
+/// `serde` "missing field" error. [Constructor](Self::new) defaults still apply when a
+/// caller builds a scope in code ([`MemoryScope::user`] is the explicit
+/// [`DEFAULT_ID`] scope).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", default)]
+#[serde(rename_all = "snake_case")]
 pub struct MemoryScope {
-    /// Owning user id; defaults to [`DEFAULT_ID`].
+    /// Owning user id; required by the decoder, so a payload cannot re-tenant a record.
     pub user_id: String,
-    /// Owning scope id (workspace, tenant, or project); defaults to [`DEFAULT_ID`].
+    /// Owning scope id (workspace, tenant, or project); required by the decoder.
     pub scope_id: String,
     /// Session the memory belongs to, when the scope is session-bound.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     /// Agent the memory belongs to, when the scope is agent-bound.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
 }
 impl Default for MemoryScope {
@@ -260,18 +265,13 @@ mod tests {
         assert!(!base.matches(&MemoryScope::new("bob", "ws")));
     }
     #[test]
-    fn serde_omits_absent_optionals_and_defaults_missing_ids() {
+    fn serde_omits_absent_optionals_and_requires_the_tenant_ids() {
         let scope = MemoryScope::new("alice", "ws");
         assert_eq!(
             serde_json::to_value(&scope).unwrap(),
             serde_json::json!({"user_id": "alice", "scope_id": "ws"})
         );
-        let restored: MemoryScope = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert_eq!(restored, MemoryScope::default());
-        let restored: MemoryScope =
-            serde_json::from_value(serde_json::json!({"user_id": "alice"})).unwrap();
-        assert_eq!(restored.user_id, "alice");
-        assert_eq!(restored.scope_id, DEFAULT_ID);
+        // The optional ids stay optional …
         let restored: MemoryScope = serde_json::from_value(serde_json::json!({
             "user_id": "alice", "scope_id": "ws", "session_id": "s1", "agent_id": "a1"
         }))
@@ -280,5 +280,26 @@ mod tests {
             restored,
             MemoryScope::new("alice", "ws").session("s1").agent("a1")
         );
+        let bare: MemoryScope =
+            serde_json::from_value(serde_json::json!({"user_id": "alice", "scope_id": "ws"}))
+                .unwrap();
+        assert_eq!(bare, scope);
+        // … but a missing tenant id is a decode error, never a silent `__default__`.
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"user_id": "alice"}),
+            serde_json::json!({"scope_id": "ws"}),
+        ] {
+            let error = serde_json::from_value::<MemoryScope>(payload.clone())
+                .expect_err("a missing tenant id must not default");
+            let message = error.to_string();
+            assert!(
+                message.contains("user_id") || message.contains("scope_id"),
+                "{payload}: {message}"
+            );
+        }
+        // The constructors keep the `DEFAULT_ID` behaviour.
+        assert_eq!(MemoryScope::default().user_id, DEFAULT_ID);
+        assert_eq!(MemoryScope::user("alice").scope_id, DEFAULT_ID);
     }
 }

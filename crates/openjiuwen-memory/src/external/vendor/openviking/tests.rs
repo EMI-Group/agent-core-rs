@@ -12,6 +12,15 @@ use crate::record::{
     AddOptions, CallOptions, MemoryFilter, MemoryScope, MemoryUpdate, NewMemory, SearchOptions,
 };
 
+/// A buffered `2xx` answer carrying `body`, for the spec-level decode tests.
+fn spec_response(body: &str) -> openjiuwen_common::http::HttpResponse {
+    openjiuwen_common::http::HttpResponse {
+        status: 200,
+        headers: wiremock::http::HeaderMap::new(),
+        url: "http://viking.test/api/v1/search/find".to_owned(),
+        body: body.as_bytes().to_vec().into(),
+    }
+}
 /// The session every configured test handle carries.
 const SESSION: &str = "sess-1";
 /// The credential every configured test handle carries.
@@ -863,6 +872,57 @@ async fn a_failed_tool_call_becomes_an_error_payload() {
 }
 
 #[test]
+fn an_unscored_find_item_survives_the_default_threshold() {
+    let config = config("https://viking.invalid").with_option("session_id", json!("sess-1"));
+    let scope = scope();
+    let cx = crate::external::rest::SpecContext::new(&config, &scope);
+    let response = spec_response(
+        r#"{"result":{"memories":[{"uri":"viking://m/1","abstract":"a fact"}],"resources":[],"skills":[],"total":1}}"#,
+    );
+    let hits = SPEC
+        .search_result(&cx, &response, &SearchOptions::default())
+        .expect("a decode");
+    assert_eq!(hits.len(), 1, "an unscored item is kept");
+    assert_eq!(hits[0].record.id, "viking://m/1");
+    assert!(hits[0].score.abs() < f32::EPSILON, "no score is invented");
+    let skipped = spec_response(
+        r#"{"result":{"memories":[{"abstract":"no uri"}],"resources":[],"skills":[]}}"#,
+    );
+    let hits = SPEC
+        .search_result(&cx, &skipped, &SearchOptions::default())
+        .expect("a decode");
+    assert!(
+        hits.is_empty(),
+        "an unaddressable item is skipped: {hits:?}"
+    );
+}
+
+#[test]
+fn a_directory_entry_never_becomes_a_record() {
+    let scope = scope();
+    for entry in [
+        json!({ "uri": "viking://notes", "rel_path": "notes", "isDir": true }),
+        json!({ "uri": "viking://notes", "rel_path": "notes", "isDir": "true" }),
+    ] {
+        assert!(
+            spec::entry_record(&entry, &scope).is_none(),
+            "a directory is not a record: {entry}"
+        );
+    }
+    let file = spec::entry_record(
+        &json!({ "uri": "viking://notes/a.md", "name": "a.md", "isDir": false }),
+        &scope,
+    )
+    .expect("a file entry is a record");
+    assert_eq!(file.id, "viking://notes/a.md");
+    assert_eq!(file.content, "a.md");
+    assert!(
+        spec::entry_record(&json!({ "uri": "viking://notes/empty.md" }), &scope).is_none(),
+        "an entry with no content of any kind is skipped"
+    );
+}
+
+#[test]
 fn truncate_chars_keeps_char_boundaries() {
     assert_eq!(spec::truncate_chars("abcdef", 3), "abc");
     assert_eq!(spec::truncate_chars("abc", 3), "abc");
@@ -888,10 +948,15 @@ fn render_context_ignores_abstractless_and_excess_items() {
 }
 
 #[test]
-fn directory_detection_accepts_both_spellings() {
+fn directory_detection_accepts_both_spellings_and_the_scalar_forms() {
     assert!(spec::is_directory(&json!({ "isDir": true })));
     assert!(spec::is_directory(&json!({ "is_dir": true })));
     assert!(!spec::is_directory(&json!({ "isDir": false })));
     assert!(!spec::is_directory(&json!({ "uri": "viking://a" })));
-    assert!(!spec::is_directory(&json!({ "isDir": "true" })));
+    // A JSON encoder may spell a flag as a string or a number; both mean "directory".
+    assert!(spec::is_directory(&json!({ "isDir": "true" })));
+    assert!(spec::is_directory(&json!({ "isDir": " TRUE " })));
+    assert!(spec::is_directory(&json!({ "is_dir": 1 })));
+    assert!(!spec::is_directory(&json!({ "isDir": "false" })));
+    assert!(!spec::is_directory(&json!({ "isDir": 0 })));
 }

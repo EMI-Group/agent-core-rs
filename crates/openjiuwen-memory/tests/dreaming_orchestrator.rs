@@ -34,7 +34,7 @@ use openjiuwen_memory::dreaming::{
     DreamLeaseOptions, DreamMetrics, DreamOrchestrator, DreamOrchestratorConfig, DreamOutcome,
     DreamPlanner, DreamRepository, DreamRetention, DreamState, DreamTrigger,
     InMemoryDreamRepository, LeaseLostReason, LlmConsolidator, LlmConsolidatorConfig,
-    SalienceBackend, SalienceConfig, SalienceWeights, StaticCandidateSource,
+    SalienceBackend, SalienceConfig, SalienceWeights, StaticCandidateSource, RECORD_ONLY_NOTE,
 };
 use openjiuwen_memory::record::{CallOptions, MemoryRecord, MemoryScope, MemoryType};
 use openjiuwen_test_support::{ScriptedModel, ScriptedTurn};
@@ -817,10 +817,14 @@ async fn a_valid_model_answer_is_llm_origin_and_completes_unde_graded() {
         .expect("an outcome");
     assert_eq!(outcome.state, DreamState::Succeeded);
     assert_eq!(outcome.job_id, "llm-valid");
+    // The default sink is record-only: it observes the candidates but applies nothing, so
+    // the planned merge ride on the plan, never on the metrics stored with the job.
+    assert_eq!(plan.metrics.records_merged, 1);
     assert_eq!(outcome.metrics.records_scanned, 3);
-    assert_eq!(outcome.metrics.records_merged, 1);
+    assert_eq!(outcome.metrics.records_merged, 0);
     assert_eq!(outcome.metrics.records_created, 0);
     assert_eq!(outcome.metrics.records_deleted, 0);
+    assert_eq!(outcome.metrics.tokens_saved, 0);
     assert!(
         outcome
             .notes
@@ -828,6 +832,11 @@ async fn a_valid_model_answer_is_llm_origin_and_completes_unde_graded() {
             .any(|note| note.contains("merge 1 record(s) into `a`")),
         "{:?}",
         outcome.notes
+    );
+    assert_eq!(
+        outcome.notes.last().map(String::as_str),
+        Some(RECORD_ONLY_NOTE),
+        "a sink that applies nothing says so"
     );
     assert!(
         !outcome
@@ -872,12 +881,23 @@ async fn a_malformed_model_answer_degrades_to_the_deterministic_plan() {
     assert!(degraded.contains("fell back to rules"), "{degraded}");
     assert_eq!(outcome.metrics.records_scanned, 3);
     assert_eq!(
-        outcome.metrics.records_merged, 1,
-        "the fallback merges the near-duplicate pair"
+        outcome.metrics.records_merged, 0,
+        "the fallback decides the merge but the record-only sink applies none of it"
     );
 
     let expected = deterministic_plan("llm-degraded", &candidates(), config.fallback_similarity);
-    assert_eq!(&outcome.notes[1..], expected.notes().as_slice());
+    assert_eq!(
+        expected.metrics.records_merged, 1,
+        "the plan decides a merge"
+    );
+    assert_eq!(
+        &outcome.notes[1..=expected.notes().len()],
+        expected.notes().as_slice()
+    );
+    assert_eq!(
+        outcome.notes.last().map(String::as_str),
+        Some(RECORD_ONLY_NOTE)
+    );
 }
 
 #[tokio::test]
@@ -897,8 +917,15 @@ async fn a_consolidator_without_a_model_degrades_deterministically() {
     );
 
     let expected = deterministic_plan("llm-no-model", &candidates(), config.fallback_similarity);
-    assert_eq!(&outcome.notes[1..], expected.notes().as_slice());
-    assert_eq!(outcome.metrics.records_merged, 1);
+    assert_eq!(
+        &outcome.notes[1..=expected.notes().len()],
+        expected.notes().as_slice()
+    );
+    assert_eq!(
+        outcome.notes.last().map(String::as_str),
+        Some(RECORD_ONLY_NOTE)
+    );
+    assert_eq!(outcome.metrics.records_merged, 0);
 }
 
 // --- the caller-driven loop ---------------------------------------------------------

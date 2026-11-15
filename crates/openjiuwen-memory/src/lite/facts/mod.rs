@@ -195,28 +195,53 @@ impl FactFiles {
     /// front matter, a blank `name` — is skipped with a warning naming the path, so one
     /// stray file never makes the store unreadable. An absent directory holds no facts.
     ///
+    /// The skipped files are reported by [`FactFiles::read_all_report`], which a caller
+    /// that deletes or rewrites fact files must use: the returned list is the facts that
+    /// decoded, not necessarily every fact file on disk.
+    ///
     /// # Errors
     ///
     /// Returns the filesystem error with the failing path as context when the directory
     /// cannot be listed or one of its fact files cannot be read.
     pub async fn read_all(&self) -> Result<Vec<CodingFact>> {
+        Ok(self.read_all_report().await?.0)
+    }
+
+    /// Reads every fact of the directory and reports the files that did not decode.
+    ///
+    /// The first element is exactly [`FactFiles::read_all`]: the facts that decoded,
+    /// sorted by name ascending. The second element names every Markdown file that was
+    /// skipped, with the parse error that skipped it, so a caller can surface how much of
+    /// the directory it could not read. A skipped file is *not* evidence that its fact was
+    /// deleted: a caller that removes stale fact files must leave these paths alone,
+    /// because a file it cannot decode is a file it cannot judge.
+    ///
+    /// # Errors
+    ///
+    /// Returns the filesystem error with the failing path as context when the directory
+    /// cannot be listed or a file cannot be read as UTF-8 text.
+    pub async fn read_all_report(&self) -> Result<(Vec<CodingFact>, Vec<(PathBuf, Error)>)> {
         let mut facts = Vec::new();
+        let mut skipped: Vec<(PathBuf, Error)> = Vec::new();
         for path in self.markdown_files().await? {
             let text = tokio::fs::read_to_string(&path)
                 .await
                 .map_err(|error| io_error(error, "reading the fact file", &path))?;
             match FactDocument::parse(&text).and_then(|document| document.to_fact(&self.scope)) {
                 Ok(fact) => facts.push(fact),
-                Err(error) => tracing::warn!(
-                    target: TARGET,
-                    path = %path.display(),
-                    error = %error,
-                    "skipping a Markdown file that is not a coding fact"
-                ),
+                Err(error) => {
+                    tracing::warn!(
+                        target: TARGET,
+                        path = %path.display(),
+                        error = %error,
+                        "skipping a Markdown file that is not a coding fact"
+                    );
+                    skipped.push((path, error));
+                }
             }
         }
         facts.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(facts)
+        Ok((facts, skipped))
     }
     /// Deletes the file of the fact called `name`, returning whether it existed.
     ///
@@ -663,6 +688,30 @@ mod tests {
         expected.sort_by(|left, right| left.name.cmp(&right.name));
         assert_eq!(files.read_all().await.expect("read_all"), expected);
     }
+    #[tokio::test]
+    async fn read_all_report_names_the_files_it_could_not_decode() {
+        let directory = tempdir().expect("temp dir");
+        let files = FactFiles::new(directory.path(), scope());
+        files
+            .write(&fact("build", CodingFactType::Project, 1))
+            .await
+            .expect("write");
+        let prose = files.dir().join("hand-written.md");
+        std::fs::write(&prose, "just prose, not a coding fact\n").expect("write the prose");
+
+        let (facts, skipped) = files.read_all_report().await.expect("read_all_report");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].name, "build");
+        assert_eq!(skipped.len(), 1, "the undecodable file is reported");
+        assert_eq!(skipped[0].0, prose);
+        assert!(
+            !skipped[0].1.to_string().is_empty(),
+            "the skip reason is reported"
+        );
+        // `read_all` keeps its documented meaning: only the decodable facts.
+        assert_eq!(files.read_all().await.expect("read_all"), facts);
+    }
+
     #[tokio::test]
     async fn the_level_round_trip_holds_through_files() {
         let directory = tempdir().expect("temp dir");

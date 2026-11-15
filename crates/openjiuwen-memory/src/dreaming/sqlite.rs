@@ -1,10 +1,16 @@
 //! [`SqliteDreamRepository`]: the durable, feature-gated dream-job backend.
 //!
-//! One `dream_jobs` table holds every job, with the free-form payload/metadata and the
-//! metrics stored as JSON text. Timestamps are RFC 3339 UTC text with fixed microsecond
-//! precision ([`SecondsFormat::Micros`], `Z` suffix), so lexicographic TEXT ordering is
-//! chronological ordering: the retry predicate and the retention cutoff are plain string
-//! comparisons, and the claim index can use them without a functional index.
+//! One `dream_jobs` table holds every job, with the free-form payload/metadata, the
+//! metrics and the completion notes stored as JSON text. Timestamps are RFC 3339 UTC text
+//! with fixed microsecond precision ([`SecondsFormat::Micros`], `Z` suffix), so
+//! lexicographic TEXT ordering is chronological ordering: the retry predicate and the
+//! retention cutoff are plain string comparisons, and the claim index can use them without
+//! a functional index.
+//!
+//! Decoding is strict where a guess would be harmful: an unparseable timestamp, JSON
+//! column or `state` value is a typed error naming the column, so `get`/`list` cannot
+//! advertise a row that the claim SQL can never select and `count_by_state` cannot
+//! disagree with them about it.
 //!
 //! Every query is parameter-bound — the only interpolated text is the module-level
 //! column list const, never user data. Claiming is a single atomic
@@ -52,6 +58,7 @@ CREATE TABLE IF NOT EXISTS dream_jobs (
     started_at TEXT,
     finished_at TEXT,
     last_error TEXT,
+    notes_json TEXT NOT NULL DEFAULT '[]',
     metrics_json TEXT NOT NULL DEFAULT '{}',
     payload_json TEXT NOT NULL DEFAULT '{}',
     metadata_json TEXT NOT NULL DEFAULT '{}'
@@ -71,7 +78,7 @@ const SCOPE_INDEX: &str =
 /// the same [`row_to_job`] helper and can never drift apart.
 const COLUMNS: &str = "id, user_id, scope_id, session_id, agent_id, kind, state, trigger, \
      priority, attempts, max_attempts, created_at, updated_at, started_at, finished_at, \
-     last_error, metrics_json, payload_json, metadata_json";
+     last_error, notes_json, metrics_json, payload_json, metadata_json";
 
 /// The terminal states a retention sweep may delete; mirrors
 /// [`DreamState::is_terminal`].
@@ -81,10 +88,10 @@ const TERMINAL_STATES: &str = "'succeeded', 'failed', 'skipped', 'cancelled'";
 const INSERT_JOB: &str = "
 INSERT INTO dream_jobs (
     id, user_id, scope_id, session_id, agent_id, kind, state, trigger, priority, attempts,
-    max_attempts, created_at, updated_at, started_at, finished_at, last_error,
+    max_attempts, created_at, updated_at, started_at, finished_at, last_error, notes_json,
     metrics_json, payload_json, metadata_json
 ) VALUES (
-    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
 ) ON CONFLICT(id) DO NOTHING";
 
 /// The single-statement claim: pick the head, move it to `running`, and return it.
@@ -160,6 +167,7 @@ impl SqliteDreamRepository {
                 .await
                 .map_err(Error::external)?;
         }
+        ensure_notes_column(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -174,6 +182,7 @@ impl DreamRepository for SqliteDreamRepository {
     async fn enqueue(&self, job: DreamJob) -> Result<DreamJob> {
         job.validate()?;
         let metrics_json = encode_json("metrics_json", &job.metrics)?;
+        let notes_json = encode_json("notes_json", &job.notes)?;
         let payload_json = encode_json("payload_json", &job.payload)?;
         let metadata_json = encode_json("metadata_json", &job.metadata)?;
         let result = sqlx::query(INSERT_JOB)
@@ -193,6 +202,7 @@ impl DreamRepository for SqliteDreamRepository {
             .bind(job.started_at.map(format_time))
             .bind(job.finished_at.map(format_time))
             .bind(job.last_error.as_deref())
+            .bind(notes_json)
             .bind(metrics_json)
             .bind(payload_json)
             .bind(metadata_json)
@@ -241,18 +251,20 @@ impl DreamRepository for SqliteDreamRepository {
             )));
         }
         let metrics_json = encode_json("metrics_json", &outcome.metrics)?;
+        let notes_json = encode_json("notes_json", &outcome.notes)?;
         let now = format_time(Utc::now());
         let mut transaction = self.pool.begin().await.map_err(Error::external)?;
         let result = sqlx::query(
             "UPDATE dream_jobs
                 SET state = ?2, metrics_json = ?3, finished_at = ?4, updated_at = ?4,
-                    last_error = NULL
+                    last_error = NULL, notes_json = ?5
               WHERE id = ?1 AND state = 'running'",
         )
         .bind(job_id)
         .bind(outcome.state.as_str())
         .bind(metrics_json)
         .bind(&now)
+        .bind(notes_json)
         .execute(&mut *transaction)
         .await
         .map_err(Error::external)?;
@@ -285,6 +297,7 @@ impl DreamRepository for SqliteDreamRepository {
             "UPDATE dream_jobs
                 SET state = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
                     last_error = ?2,
+                    notes_json = '[]',
                     finished_at = CASE WHEN attempts >= max_attempts THEN ?3 ELSE NULL END,
                     updated_at = ?3
               WHERE id = ?1 AND state = 'running'",
@@ -375,15 +388,10 @@ impl DreamRepository for SqliteDreamRepository {
         for row in &rows {
             let raw: String = column(row, "state")?;
             let total: i64 = column(row, "n")?;
-            if let Some(state) = DreamState::parse(&raw) {
-                counts.insert(state, usize::try_from(total).unwrap_or(0));
-            } else {
-                tracing::warn!(
-                    target: "openjiuwen_memory::dreaming::sqlite",
-                    state = %raw,
-                    "ignoring a dream job row with an unknown state"
-                );
-            }
+            // An unknown state is an error here too: dropping the row would make the
+            // counts disagree with `get`/`list`, which refuse to decode it at all.
+            let state = decode_state(&raw)?;
+            counts.insert(state, usize::try_from(total).unwrap_or(0));
         }
         Ok(counts)
     }
@@ -462,6 +470,34 @@ impl SqliteDreamRepository {
     }
 }
 
+/// Adds the `notes_json` column to a `dream_jobs` table created before it existed.
+///
+/// `CREATE TABLE IF NOT EXISTS` cannot extend an existing table and SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, so the column list is inspected first; an upgraded database
+/// therefore keeps its jobs instead of needing a fresh file.
+async fn ensure_notes_column(pool: &SqlitePool) -> Result<()> {
+    let rows = sqlx::query("PRAGMA table_info(dream_jobs)")
+        .fetch_all(pool)
+        .await
+        .map_err(Error::external)?;
+    let names = rows
+        .iter()
+        .map(|row| column::<String>(row, "name"))
+        .collect::<Result<Vec<_>>>()?;
+    if names.iter().any(|name| name == "notes_json") {
+        return Ok(());
+    }
+    sqlx::query("ALTER TABLE dream_jobs ADD COLUMN notes_json TEXT NOT NULL DEFAULT '[]'")
+        .execute(pool)
+        .await
+        .map_err(Error::external)?;
+    tracing::debug!(
+        target: "openjiuwen_memory::dreaming::sqlite",
+        "added the `notes_json` column to an existing dream_jobs table"
+    );
+    Ok(())
+}
+
 /// Formats `value` in the single canonical storage format: RFC 3339, microseconds, `Z`.
 ///
 /// The fixed width and precision are what make TEXT ordering equal chronological
@@ -534,15 +570,18 @@ fn encode_json<T: serde::Serialize>(column_name: &'static str, value: &T) -> Res
     serde_json::to_string(value).map_err(|error| decode_error(column_name, error))
 }
 
-/// Decodes the `state` discriminator, tolerating an unknown value as `Pending`.
-fn decode_state(raw: &str) -> DreamState {
-    DreamState::parse(raw).unwrap_or_else(|| {
-        tracing::warn!(
-            target: "openjiuwen_memory::dreaming::sqlite",
-            state = %raw,
-            "unknown dream job state in storage; treating the job as pending"
-        );
-        DreamState::Pending
+/// Decodes the `state` discriminator, naming the column when the value is unknown.
+///
+/// An unknown state is a typed error, never a guessed `Pending`: the claim SQL only
+/// selects `state = 'pending'`, so guessing would advertise a job every sweep skips while
+/// `count_by_state` reported the row differently. Both reads and counts therefore refuse
+/// the same rows, with the column named like every other decoding failure.
+fn decode_state(raw: &str) -> Result<DreamState> {
+    DreamState::parse(raw).ok_or_else(|| {
+        decode_error(
+            "state",
+            std::io::Error::other(format!("unknown dream job state `{raw}`")),
+        )
     })
 }
 
@@ -567,6 +606,7 @@ fn row_to_job(row: &SqliteRow) -> Result<DreamJob> {
     let updated_at: String = column(row, "updated_at")?;
     let started_at: Option<String> = column(row, "started_at")?;
     let finished_at: Option<String> = column(row, "finished_at")?;
+    let notes_json: String = column(row, "notes_json")?;
     let metrics_json: String = column(row, "metrics_json")?;
     let payload_json: String = column(row, "payload_json")?;
     let metadata_json: String = column(row, "metadata_json")?;
@@ -583,7 +623,7 @@ fn row_to_job(row: &SqliteRow) -> Result<DreamJob> {
             agent_id: column(row, "agent_id")?,
         },
         kind: DreamKind::parse(&kind_raw),
-        state: decode_state(&state_raw),
+        state: decode_state(&state_raw)?,
         trigger: decode_trigger(&trigger_raw),
         priority: i32::try_from(priority).unwrap_or(0),
         created_at: decode_time("created_at", &created_at)?,
@@ -600,6 +640,7 @@ fn row_to_job(row: &SqliteRow) -> Result<DreamJob> {
         max_attempts: u32::try_from(max_attempts).unwrap_or(0),
         last_error: column(row, "last_error")?,
         metrics: decode_json::<DreamMetrics>("metrics_json", &metrics_json)?,
+        notes: decode_json("notes_json", &notes_json)?,
         payload: decode_json("payload_json", &payload_json)?,
         metadata: decode_json("metadata_json", &metadata_json)?,
     })
@@ -978,5 +1019,150 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["dedupe", "bob"]
         );
+    }
+
+    #[tokio::test]
+    async fn completion_notes_survive_a_reopen_and_a_failure_clears_them() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let repo = open(&dir).await;
+            repo.enqueue(job("noted", 0, 0)).await.unwrap();
+            repo.enqueue(job("stale-notes", 0, 1).with_notes(vec!["from an import".to_owned()]))
+                .await
+                .unwrap();
+            claimed(&repo, ts(10)).await;
+            repo.complete(
+                "noted",
+                DreamOutcome::succeeded(
+                    "noted",
+                    DreamMetrics {
+                        records_scanned: 2,
+                        ..DreamMetrics::default()
+                    },
+                )
+                .with_note("degraded: llm consolidation fell back to rules: timeout"),
+            )
+            .await
+            .unwrap();
+            let second = claimed(&repo, ts(11)).await;
+            assert_eq!(second.id, "stale-notes");
+            assert_eq!(second.notes, vec!["from an import".to_owned()]);
+            let requeued = repo.fail("stale-notes", "boom").await.unwrap();
+            assert_eq!(requeued.notes, Vec::<String>::new());
+        }
+
+        let reopened = open(&dir).await;
+        let noted = reopened.get("noted").await.unwrap().expect("noted");
+        assert_eq!(noted.state, DreamState::Succeeded);
+        assert_eq!(
+            noted.notes,
+            vec!["degraded: llm consolidation fell back to rules: timeout".to_owned()],
+            "the degraded note is durable, not just part of the sweep summary"
+        );
+        let requeued = reopened
+            .get("stale-notes")
+            .await
+            .unwrap()
+            .expect("stale-notes");
+        assert_eq!(requeued.state, DreamState::Pending);
+        assert!(requeued.notes.is_empty(), "{:?}", requeued.notes);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_persisted_state_is_a_typed_error_on_every_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = open(&dir).await;
+        repo.enqueue(job("corrupt", 0, 0)).await.unwrap();
+        sqlx::query("UPDATE dream_jobs SET state = 'dormant' WHERE id = ?1")
+            .bind("corrupt")
+            .execute(repo.pool())
+            .await
+            .unwrap();
+
+        // The claim SQL only matches `state = 'pending'`, so the row is not runnable.
+        assert!(repo.claim_next(ts(10)).await.unwrap().is_none());
+
+        let read = repo.get("corrupt").await.unwrap_err();
+        assert!(matches!(read, Error::External(_)), "{read:?}");
+        let message = read.to_string();
+        assert!(message.contains("state"), "{message}");
+        assert!(message.contains("dormant"), "{message}");
+
+        let listed = repo.list(&DreamFilter::new()).await.unwrap_err();
+        assert!(matches!(listed, Error::External(_)), "{listed:?}");
+        assert!(listed.to_string().contains("state"), "{listed}");
+
+        let counts = repo.count_by_state().await.unwrap_err();
+        assert!(matches!(counts, Error::External(_)), "{counts:?}");
+        assert!(counts.to_string().contains("state"), "{counts}");
+    }
+
+    #[tokio::test]
+    async fn a_legacy_table_without_notes_gains_the_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/legacy.db", dir.path().display());
+        {
+            // The pre-notes schema, exactly as an older worker left it.
+            let options = SqliteConnectOptions::from_str(&url)
+                .unwrap()
+                .create_if_missing(true);
+            let pool = SqlitePool::connect_with(options).await.unwrap();
+            sqlx::query(
+                "CREATE TABLE dream_jobs (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    user_id TEXT NOT NULL,
+                    scope_id TEXT NOT NULL,
+                    session_id TEXT,
+                    agent_id TEXT,
+                    kind TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    trigger TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    last_error TEXT,
+                    metrics_json TEXT NOT NULL DEFAULT '{}',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO dream_jobs (id, user_id, scope_id, kind, state, trigger,
+                    created_at, updated_at)
+                 VALUES ('legacy', 'alice', 'ws', 'consolidation', 'pending', 'manual',
+                    '2023-11-14T22:13:20.000000Z', '2023-11-14T22:13:20.000000Z')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+
+        let repo = SqliteDreamRepository::connect(&url).await.unwrap();
+        let upgraded = repo.get("legacy").await.unwrap().expect("legacy row");
+        assert_eq!(upgraded.state, DreamState::Pending);
+        assert!(
+            upgraded.notes.is_empty(),
+            "the added column defaults to no notes"
+        );
+        // The upgraded table is writable through the new column.
+        let claimed = claimed(&repo, ts(10)).await;
+        assert_eq!(claimed.id, "legacy");
+        let completed = repo
+            .complete(
+                "legacy",
+                DreamOutcome::succeeded("legacy", DreamMetrics::default())
+                    .with_note("after upgrade"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.notes, vec!["after upgrade".to_owned()]);
     }
 }

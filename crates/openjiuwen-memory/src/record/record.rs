@@ -20,9 +20,19 @@ const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// The lowercase hex digits used to render memory ids.
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-/// Returns the current UTC time; the serde default for record timestamps.
+/// Returns the current UTC time; the timestamp [`MemoryRecord::new`] stamps.
 fn utc_now() -> DateTime<Utc> {
     Utc::now()
+}
+/// Returns the UNIX epoch; the serde default of [`MemoryRecord::timestamp`] and
+/// [`MemoryRecord::updated_at`].
+///
+/// A decoded record that carries no timestamp must not be re-dated to "now": the recency
+/// term of the recall blend would then score every undated row as brand new. The epoch is
+/// the one value that is both obviously wrong and deterministic, so an undated record keeps
+/// the least preferred recency instead of fabricating a perfect one.
+fn unix_epoch() -> DateTime<Utc> {
+    DateTime::<Utc>::UNIX_EPOCH
 }
 /// Returns [`DEFAULT_IMPORTANCE`]; the serde default for [`MemoryRecord::importance`].
 fn default_importance() -> f32 {
@@ -33,6 +43,10 @@ fn default_importance() -> f32 {
 /// Every record carries its scope, so a record can be persisted, moved, and rendered
 /// without consulting the engine. Timestamps are RFC 3339; `importance` lives in
 /// `0.0..=1.0` and defaults to `0.5`.
+///
+/// Decoding is tolerant of absent members, but a timestamp is never invented: an absent
+/// `timestamp`/`updated_at` decodes to the UNIX epoch (see `unix_epoch`), while
+/// [`MemoryRecord::new`] is the only constructor that stamps "now".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRecord {
     /// Unique record id (24 lowercase hex characters, see [`new_memory_id`]).
@@ -46,11 +60,12 @@ pub struct MemoryRecord {
     /// Relative importance in `0.0..=1.0`; defaults to `0.5`.
     #[serde(default = "default_importance")]
     pub importance: f32,
-    /// Creation time; defaults to "now" when absent from the input.
-    #[serde(default = "utc_now")]
+    /// Creation time; a decoded record without it keeps the UNIX epoch (only
+    /// [`MemoryRecord::new`] stamps "now").
+    #[serde(default = "unix_epoch")]
     pub timestamp: DateTime<Utc>,
-    /// Last modification time; defaults to "now" when absent from the input.
-    #[serde(default = "utc_now")]
+    /// Last modification time; a decoded record without it keeps the UNIX epoch.
+    #[serde(default = "unix_epoch")]
     pub updated_at: DateTime<Utc>,
     /// Time of the most recent recall that returned this record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,14 +323,58 @@ mod tests {
         assert_eq!(record.kind, MemoryType::Summary);
     }
     #[test]
-    fn missing_scope_fields_default_to_default_id() {
+    fn absent_timestamps_decode_to_the_epoch_never_to_now() {
         let json = serde_json::json!({
-            "id": "000000000000000000000005",
-            "text": "orphan",
-            "type": "semantic_memory"
+            "id": "000000000000000000000006",
+            "text": "undated",
+            "type": "semantic_memory",
+            "user_id": "alice",
+            "scope_id": "ws"
         });
         let record: MemoryRecord = serde_json::from_value(json).unwrap();
-        assert_eq!(record.scope, MemoryScope::default());
+        assert_eq!(record.timestamp, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(record.updated_at, DateTime::<Utc>::UNIX_EPOCH);
+        // Only the constructor stamps "now".
+        let fresh = MemoryRecord::new(
+            MemoryScope::new("alice", "ws"),
+            "dated",
+            MemoryType::SemanticMemory,
+        );
+        assert!(fresh.timestamp > DateTime::<Utc>::UNIX_EPOCH);
+    }
+    #[test]
+    fn decoding_a_record_without_the_required_scope_ids_is_a_typed_error() {
+        for payload in [
+            serde_json::json!({
+                "id": "000000000000000000000007",
+                "text": "orphan",
+                "type": "semantic_memory"
+            }),
+            serde_json::json!({
+                "id": "000000000000000000000008",
+                "text": "orphan",
+                "type": "semantic_memory",
+                "user_id": "alice"
+            }),
+            serde_json::json!({
+                "id": "000000000000000000000009",
+                "text": "orphan",
+                "type": "semantic_memory",
+                "scope_id": "ws"
+            }),
+        ] {
+            let error = serde_json::from_value::<MemoryRecord>(payload.clone())
+                .expect_err("a record cannot be re-tenanted by a default");
+            assert!(
+                error.to_string().contains("user_id") || error.to_string().contains("scope_id"),
+                "{payload}: {error}"
+            );
+        }
+        // A full payload still round-trips.
+        let record = sample_record();
+        let restored: MemoryRecord =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        assert_eq!(restored, record);
     }
     #[test]
     fn validate_rejects_bad_records() {

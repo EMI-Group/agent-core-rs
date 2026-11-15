@@ -263,8 +263,8 @@ impl KvLockGuard {
 
     /// Whether the lock is still held (`false` only after [`Self::release`]).
     ///
-    /// On a platform without `flock` the file backend's inner guard is inactive, yet the seam
-    /// still counts the guard as held until it is dropped: the handle is what a caller owns.
+    /// Every guard a backend returns is a real one: [`FileKvLock`] refuses an environment
+    /// without a working advisory lock, so a held guard always rests on an active lock.
     #[must_use]
     pub fn is_held(&self) -> bool {
         self.inner.is_some()
@@ -424,9 +424,10 @@ impl DistributedKvLock for InProcessKvLock {
 /// its [`FileKvLock`] over the same directory. The lock file is created on first use and is
 /// never read or written.
 ///
-/// Where the platform has no `flock`, [`Self::is_enabled`] is `false` and acquisitions return
-/// an inactive handle immediately (the in-process layer stays the only exclusion), matching
-/// `openjiuwen-sysop`.
+/// Where the platform has no `flock` (or the sysop configuration disables cross-process
+/// locks), [`Self::is_enabled`] is `false` and every acquisition is a typed
+/// [`Error::Unsupported`]: an inactive handle would let two processes both "hold" the same
+/// lock, which is worse than refusing. Use [`InProcessKvLock`] on such a platform.
 #[derive(Debug, Clone)]
 pub struct FileKvLock {
     /// The sysop manager that creates the sidecar files and polls the deadline.
@@ -515,6 +516,15 @@ impl DistributedKvLock for FileKvLock {
     async fn acquire(&self, name: &str, options: &LockOptions) -> Result<KvLockGuard> {
         validate_lock_name(name)?;
         options.validate()?;
+        if !self.manager.is_enabled() {
+            // Without `flock` the sysop manager hands back an inactive handle; returning it
+            // would report "held" for a lock nobody holds, so the exclusion is refused.
+            return Err(Error::unsupported(format!(
+                "the file kv lock backend cannot exclude processes for {name:?}: advisory \
+                 cross-process locks are disabled on this platform/configuration; use the \
+                 in-process backend instead"
+            )));
+        }
         let target = self.lock_path(name);
         let timeout = options.timeout.or_else(|| self.manager.timeout());
         let manager = self.manager.clone().with_timeout(timeout);
@@ -828,6 +838,36 @@ mod tests {
         assert!(third.is_held(), "a different root does not contend");
     }
 
+    #[tokio::test]
+    async fn a_disabled_file_backend_refuses_instead_of_reporting_a_held_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("locks");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = LocalWorkConfig {
+            cross_process_locks: false,
+            ..LocalWorkConfig::default()
+        };
+        let locks = FileKvLock {
+            manager: FileLockManager::with_root(&config, root.clone()),
+            root,
+        };
+        assert!(
+            !locks.is_enabled(),
+            "cross-process locks are disabled by configuration"
+        );
+        let error = locks
+            .acquire("migrate", &LockOptions::new("alice"))
+            .await
+            .expect_err("a disabled backend must not hand out a guard");
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+        assert!(error.message().contains("migrate"), "{error}");
+        assert!(error.message().contains("in-process"), "{error}");
+        // Two acquisitions therefore cannot both "hold" the same lock name.
+        assert!(locks
+            .acquire("migrate", &LockOptions::new("bob"))
+            .await
+            .is_err());
+    }
     #[tokio::test]
     async fn remote_brokers_are_typed_unsupported() {
         let lock = UnsupportedKvLock::redis();

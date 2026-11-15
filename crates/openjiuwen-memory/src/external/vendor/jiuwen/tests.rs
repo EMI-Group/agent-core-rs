@@ -231,26 +231,24 @@ async fn an_empty_add_answer_is_a_skip_not_a_failure() {
 }
 
 #[test]
-fn a_non_array_add_answer_is_tolerated_as_a_skip() {
+fn an_unparseable_add_answer_reports_the_accepted_write_as_added() {
     let config = ProviderConfig::new(ProviderKind::Jiuwen).with_endpoint("https://jiuwen.invalid");
     let scope = scope();
     let cx = SpecContext::new(&config, &scope);
     let memory = NewMemory::semantic("fact");
-    let outcome = SPEC
-        .add_result(
-            &cx,
-            &response(r#"{"ok":true}"#),
-            std::slice::from_ref(&memory),
-        )
-        .expect("a non-array body is a skip");
-    assert!(outcome.added.is_empty());
-    assert_eq!(outcome.skipped.len(), 1);
-
-    let outcome = SPEC
-        .add_result(&cx, &response("<html>nope</html>"), &[memory])
-        .expect("a non-JSON body is a skip");
-    assert!(outcome.added.is_empty());
-    assert_eq!(outcome.skipped.len(), 1);
+    for body in [r#"{"ok":true}"#, "<html>nope</html>", "not json at all"] {
+        let outcome = SPEC
+            .add_result(&cx, &response(body), std::slice::from_ref(&memory))
+            .expect("an accepted write is never a failure");
+        assert_eq!(
+            outcome.added.len(),
+            1,
+            "an unparseable answer is not a dedupe: {body}"
+        );
+        assert!(outcome.skipped.is_empty(), "{body}");
+        assert_eq!(outcome.added[0].content, "fact", "{body}");
+        assert_eq!(outcome.added[0].id.len(), 24, "a generated id is reported");
+    }
 }
 
 #[test]
@@ -275,6 +273,45 @@ fn search_decodes_tolerantly() {
         .expect("a decode");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].record.id, "u1");
+}
+
+#[test]
+fn a_non_json_recall_answer_is_a_typed_error_not_an_empty_result() {
+    let config = ProviderConfig::new(ProviderKind::Jiuwen).with_endpoint("https://jiuwen.invalid");
+    let scope = scope();
+    let cx = SpecContext::new(&config, &scope);
+    let error = SPEC
+        .search_result(
+            &cx,
+            &response("<html>proxy error</html>"),
+            &SearchOptions::default(),
+        )
+        .expect_err("a proxy page must not read as `no memories`");
+    assert!(matches!(error, Error::Transport(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("non-JSON"), "{message}");
+    assert!(message.contains("http://jiuwen.test/v1/add"), "{message}");
+}
+
+#[test]
+fn an_unscored_item_survives_the_default_threshold() {
+    let config = ProviderConfig::new(ProviderKind::Jiuwen).with_endpoint("https://jiuwen.invalid");
+    let scope = scope();
+    let cx = SpecContext::new(&config, &scope);
+    let hits = SPEC
+        .search_result(
+            &cx,
+            &response(r#"{"items":[{"unit_id":"u1","content":"a fact"},{"unit_id":"u2"}]}"#),
+            &SearchOptions::default(),
+        )
+        .expect("a decode");
+    assert_eq!(
+        hits.len(),
+        1,
+        "an unscored hit is kept, a contentless one is not"
+    );
+    assert_eq!(hits[0].record.id, "u1");
+    assert!(hits[0].score.abs() < f32::EPSILON, "no score is invented");
 }
 
 #[tokio::test]

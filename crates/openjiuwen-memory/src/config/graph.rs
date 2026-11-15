@@ -53,6 +53,7 @@ impl GraphMemoryConfig {
         }
         ensure_positive("max_neighbors", self.max_neighbors)?;
         ensure_unit_interval("min_score", self.min_score)?;
+        ensure_positive("max_entities", self.max_entities)?;
         Ok(())
     }
 }
@@ -140,6 +141,17 @@ mod tests {
             ..Default::default()
         };
         assert!(error_message(&config).contains("max_neighbors"));
+    }
+
+    #[test]
+    fn rejects_zero_max_entities() {
+        let config = GraphMemoryConfig {
+            max_entities: 0,
+            ..Default::default()
+        };
+        let message = error_message(&config);
+        assert!(message.contains("max_entities"), "{message}");
+        assert!(message.contains('0'), "{message}");
     }
 
     #[test]

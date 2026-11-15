@@ -12,8 +12,8 @@ use super::{DISPLAY, ID, MISSING};
 use crate::external::provider::ProviderCapabilities;
 use crate::external::registry::ProviderConfig;
 use crate::external::rest::{
-    body_value, field_f32, field_str, results_array, vendor_hit, vendor_record, AuthScheme,
-    RestCall, SpecContext, WireSpec,
+    body_value, field_f32, field_str, listing_record, rank_hits, results_array,
+    results_array_checked, vendor_record, AuthScheme, RestCall, SpecContext, WireSpec,
 };
 use crate::record::{
     new_memory_id, AddOptions, AddOutcome, MemoryFilter, MemoryRecord, MemoryScope, MemoryType,
@@ -176,7 +176,11 @@ impl WireSpec for Mem0Spec {
     /// Decodes scored hits, dropping the ones below the caller's threshold.
     ///
     /// Hits are sorted by the vendor score descending and truncated to `top_k`; the score
-    /// is mem0's similarity and is kept as the hit's blended score.
+    /// is mem0's similarity and is kept as the hit's blended score. A row mem0 answered
+    /// without a `score` — and a row that carries no memory content at all — is handled by
+    /// [`rank_hits`]/[`listing_record`]: an unscored row is a genuine match the vendor did
+    /// not rank, so the threshold never drops it, and a content-less row is skipped with a
+    /// warning instead of becoming an empty record.
     ///
     /// # Errors
     ///
@@ -188,17 +192,14 @@ impl WireSpec for Mem0Spec {
         options: &SearchOptions,
     ) -> Result<Vec<RecallHit>> {
         let value = body_value(response)?;
-        let mut hits: Vec<RecallHit> = results_array(&value)
+        let candidates = results_array(&value)
             .iter()
-            .map(|row| {
-                let record = vendor_record(row, cx.scope, MemoryType::SemanticMemory);
-                vendor_hit(record, field_f32(row, &["score"]).unwrap_or(0.0))
+            .filter_map(|row| {
+                let record = listing_record(row, cx.scope, MemoryType::SemanticMemory, "search")?;
+                Some((record, field_f32(row, &["score"])))
             })
-            .filter(|hit| options.threshold <= 0.0 || hit.score >= options.threshold)
             .collect();
-        hits.sort_by(|left, right| right.score.total_cmp(&left.score));
-        hits.truncate(options.top_k);
-        Ok(hits)
+        Ok(rank_hits(candidates, options.threshold, options.top_k))
     }
 
     /// Reads one memory by id; the id is encoded as a single path segment.
@@ -322,32 +323,39 @@ impl WireSpec for Mem0Spec {
         Ok(true)
     }
 
-    /// Lists the user's memories one page at a time.
+    /// Builds the first listing page for the user (and agent, when bound).
+    ///
+    /// `GET /v1/memories/` pages by number, so the transport follows the pages through
+    /// [`Mem0Spec::next_list_call`]; this method asks for page 1 and never claims to have
+    /// seen the whole collection.
+    ///
+    /// The vendor filter is exactly `user_id`/`agent_id`. A filter field mem0 cannot
+    /// express is reported as a typed [`Error::Unsupported`] naming the fields — a
+    /// silently unfiltered (or silently truncated) listing would answer a question the
+    /// caller did not ask.
     ///
     /// # Errors
     ///
-    /// This implementation never fails while building the call.
-    fn list_call(&self, cx: &SpecContext<'_>, _filter: &MemoryFilter) -> Result<RestCall> {
-        let page_size = cx
-            .option("page_size")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE);
-        let mut call = RestCall::get(MEMORIES_PATH)
-            .query("user_id", cx.user_id())
-            .query("page", "1")
-            .query("page_size", page_size.to_string());
-        if let Some(agent_id) = agent_param(cx.scope) {
-            call = call.query("agent_id", agent_id);
+    /// Returns [`Error::Unsupported`] when `filter` restricts a field mem0's listing has no
+    /// parameter for.
+    fn list_call(&self, cx: &SpecContext<'_>, filter: &MemoryFilter) -> Result<RestCall> {
+        let rejected = unsupported_filter_fields(filter);
+        if !rejected.is_empty() {
+            return Err(Error::unsupported(format!(
+                "the mem0 memory provider cannot filter a listing by {}: GET /v1/memories/ \
+                 accepts only `user_id` and `agent_id`",
+                rejected.join(", ")
+            )));
         }
-        Ok(call)
+        Ok(page_call(cx, 1))
     }
 
-    /// Decodes a listing; an empty body is an empty list.
+    /// Decodes one listing page, skipping a row that carries no memory content.
     ///
     /// # Errors
     ///
-    /// Returns a typed error when the body is not JSON.
+    /// Returns a typed error when the body is not JSON, or when a non-empty body carries no
+    /// recognised row array (a renamed wrapper must not read as an empty collection).
     fn list_result(
         &self,
         cx: &SpecContext<'_>,
@@ -355,10 +363,41 @@ impl WireSpec for Mem0Spec {
         _filter: &MemoryFilter,
     ) -> Result<Vec<MemoryRecord>> {
         let value = body_value(response)?;
-        Ok(results_array(&value)
+        Ok(results_array_checked(response, &value)?
             .iter()
-            .map(|row| vendor_record(row, cx.scope, MemoryType::SemanticMemory))
+            .filter_map(|row| listing_record(row, cx.scope, MemoryType::SemanticMemory, "list"))
             .collect())
+    }
+
+    /// Asks for the next page while the answer fills a whole page.
+    ///
+    /// mem0 answers `page`/`page_size` windows with no cursor and no `total`, so the only
+    /// reliable signal that more rows exist is a page of exactly `page_size` rows. A short
+    /// page — including the last one — ends the walk.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the body is not JSON.
+    fn next_list_call(
+        &self,
+        cx: &SpecContext<'_>,
+        _filter: &MemoryFilter,
+        response: &HttpResponse,
+        page: usize,
+    ) -> Result<Option<RestCall>> {
+        let value = body_value(response)?;
+        let rows = results_array(&value).len();
+        let page_size = usize::try_from(
+            cx.option("page_size")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_PAGE_SIZE)
+                .clamp(1, MAX_PAGE_SIZE),
+        )
+        .unwrap_or(usize::MAX);
+        if rows < page_size {
+            return Ok(None);
+        }
+        Ok(Some(page_call(cx, page.saturating_add(1))))
     }
 
     /// Probes mem0's documented `GET /v1/ping/` health endpoint.
@@ -369,6 +408,61 @@ impl WireSpec for Mem0Spec {
     fn health_call(&self, _cx: &SpecContext<'_>) -> Result<RestCall> {
         Ok(RestCall::get(PING_PATH))
     }
+}
+
+/// The listing request for one page of the user's memories.
+fn page_call(cx: &SpecContext<'_>, page: usize) -> RestCall {
+    let page_size = cx
+        .option("page_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let mut call = RestCall::get(MEMORIES_PATH)
+        .query("user_id", cx.user_id())
+        .query("page", page.to_string())
+        .query("page_size", page_size.to_string());
+    if let Some(agent_id) = agent_param(cx.scope) {
+        call = call.query("agent_id", agent_id);
+    }
+    call
+}
+
+/// The filter fields mem0's listing cannot express, in a stable order.
+///
+/// `user_id` and `agent_id` ride the request as query parameters; `scope_id` is satisfied by
+/// construction, because every decoded row is stamped with the caller's scope. Everything
+/// else — a session axis, explicit ids, a content substring, an importance floor, a time
+/// window, or a kind restriction beyond the single kind mem0 decodes — has no vendor
+/// parameter, so the caller gets a typed error rather than an unfiltered listing.
+fn unsupported_filter_fields(filter: &MemoryFilter) -> Vec<&'static str> {
+    let mut rejected: Vec<&'static str> = Vec::new();
+    if filter.session_id.is_some() {
+        rejected.push("session_id");
+    }
+    if !filter.ids.is_empty() {
+        rejected.push("ids");
+    }
+    if filter.text_contains.is_some() {
+        rejected.push("text_contains");
+    }
+    if filter.min_importance.is_some() {
+        rejected.push("min_importance");
+    }
+    if filter.created_after.is_some() {
+        rejected.push("created_after");
+    }
+    if filter.created_before.is_some() {
+        rejected.push("created_before");
+    }
+    if !filter.kinds.is_empty()
+        && !filter
+            .kinds
+            .iter()
+            .all(|kind| *kind == MemoryType::SemanticMemory)
+    {
+        rejected.push("kinds");
+    }
+    rejected
 }
 
 /// The agent id sent to mem0: present, non-blank, and not the placeholder default.

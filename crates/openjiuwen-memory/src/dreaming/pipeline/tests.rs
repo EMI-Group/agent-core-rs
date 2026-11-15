@@ -325,7 +325,14 @@ async fn an_empty_plan_is_a_skipped_outcome() {
         .unwrap();
 
     assert_eq!(outcome.state, DreamState::Skipped);
-    assert_eq!(outcome.notes, vec!["no consolidation actions".to_owned()]);
+    assert_eq!(
+        outcome.notes,
+        vec![
+            "no consolidation actions".to_owned(),
+            RECORD_ONLY_NOTE.to_owned(),
+        ],
+        "the record-only sink also says it applied nothing"
+    );
     assert_eq!(outcome.job_id, "job-1");
 }
 
@@ -347,13 +354,17 @@ async fn consolidate_applies_the_plan_through_the_sink() {
         .unwrap();
 
     assert_eq!(outcome.state, DreamState::Succeeded);
-    assert_eq!(outcome.metrics.records_merged, 1);
+    assert_eq!(
+        outcome.metrics.records_merged, 0,
+        "the record-only sink applies no merge, so none is reported as work"
+    );
     assert_eq!(outcome.metrics.records_scanned, 3);
     assert_eq!(
         outcome.notes,
         vec![
             "merge 1 record(s) into `a`".to_owned(),
             "keep `c`".to_owned(),
+            RECORD_ONLY_NOTE.to_owned(),
         ],
     );
 }
@@ -845,13 +856,25 @@ fn normalizing_keeps_only_known_and_distinct_ids() {
 }
 
 #[tokio::test]
-async fn the_default_sink_records_the_plan_metrics_and_writes_nothing() {
-    let plan = deterministic_plan("job-1", &candidates(), 0.75);
+async fn the_default_sink_reports_only_the_observation_and_writes_nothing() {
+    let plan = deterministic_plan("job-1", &candidates(), 0.5);
+    assert_eq!(plan.metrics.records_merged, 1, "the plan decides a merge");
 
     let metrics = RecordOnlySink
         .apply(&job(), &plan, &CallOptions::new())
         .await
         .unwrap();
 
-    assert_eq!(metrics, plan.metrics);
+    assert!(!RecordOnlySink.applies_plans());
+    assert_eq!(
+        metrics,
+        DreamMetrics {
+            records_scanned: 3,
+            ..DreamMetrics::default()
+        },
+        "planned merges, deletions and token savings are not applied work"
+    );
+    assert_eq!(metrics.records_merged, 0);
+    assert_eq!(metrics.records_deleted, 0);
+    assert_eq!(metrics.tokens_saved, 0);
 }

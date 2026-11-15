@@ -20,14 +20,15 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_memory::dreaming::{
-    DreamConfig, DreamConsolidator, DreamFilter, DreamJob, DreamKind, DreamMetrics, DreamOutcome,
-    DreamPlanner, DreamState, DreamTrigger, NoopConsolidator,
+    DreamConfig, DreamConsolidator, DreamFilter, DreamJob, DreamKind, DreamLease,
+    DreamLeaseOptions, DreamMetrics, DreamOutcome, DreamPlanner, DreamRepository, DreamState,
+    DreamTrigger, InMemoryDreamRepository, LeaseRequest, LeaseStatus, LeasedJob, NoopConsolidator,
 };
 use openjiuwen_memory::record::{CallOptions, MemoryScope};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "sqlite")]
-use openjiuwen_memory::dreaming::{DreamRepository, SqliteDreamRepository};
+use openjiuwen_memory::dreaming::SqliteDreamRepository;
 
 /// A fixed instant `offset` seconds after the shared test epoch.
 fn ts(offset: i64) -> DateTime<Utc> {
@@ -572,4 +573,379 @@ async fn sqlite_repository_keeps_jobs_across_reopens() {
         verified.count_by_state().await.expect("state counts")[&DreamState::Succeeded],
         1
     );
+}
+
+/// An [`InMemoryDreamRepository`] whose `complete` write fails a scripted number of times.
+///
+/// A completion write that fails *after* the claim committed is precisely the storage
+/// failure that used to leave a job `running` for good, and it cannot be produced through
+/// the public repository surface.
+#[derive(Debug)]
+struct FlakyCompletionRepository {
+    /// The queue the wrapper delegates to.
+    inner: InMemoryDreamRepository,
+    /// How many upcoming `complete` calls must fail.
+    remaining_failures: parking_lot::Mutex<usize>,
+}
+
+impl FlakyCompletionRepository {
+    /// Builds a wrapper around an empty queue that fails no writes.
+    fn new() -> Self {
+        Self {
+            inner: InMemoryDreamRepository::new(),
+            remaining_failures: parking_lot::Mutex::new(0),
+        }
+    }
+
+    /// Makes the next `count` completion writes fail.
+    fn fail_next_completions(&self, count: usize) {
+        *self.remaining_failures.lock() = count;
+    }
+
+    /// Consumes one scripted failure, returning `true` when this call must fail.
+    fn take_failure(&self) -> bool {
+        let mut remaining = self.remaining_failures.lock();
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        true
+    }
+}
+
+#[async_trait]
+impl DreamRepository for FlakyCompletionRepository {
+    async fn enqueue(&self, job: DreamJob) -> Result<DreamJob> {
+        self.inner.enqueue(job).await
+    }
+
+    async fn claim_next(&self, now: DateTime<Utc>) -> Result<Option<DreamJob>> {
+        self.inner.claim_next(now).await
+    }
+
+    async fn claim_next_leased(
+        &self,
+        now: DateTime<Utc>,
+        request: &LeaseRequest,
+    ) -> Result<Option<LeasedJob>> {
+        self.inner.claim_next_leased(now, request).await
+    }
+
+    async fn renew_lease(
+        &self,
+        job_id: &str,
+        owner: &str,
+        now: DateTime<Utc>,
+        ttl: chrono::Duration,
+    ) -> Result<LeaseStatus> {
+        self.inner.renew_lease(job_id, owner, now, ttl).await
+    }
+
+    async fn release_lease(&self, job_id: &str, owner: &str) -> Result<bool> {
+        self.inner.release_lease(job_id, owner).await
+    }
+
+    async fn lease(&self, job_id: &str) -> Result<Option<DreamLease>> {
+        self.inner.lease(job_id).await
+    }
+
+    async fn complete(&self, job_id: &str, outcome: DreamOutcome) -> Result<DreamJob> {
+        if self.take_failure() {
+            return Err(Error::memory("the completion write failed"));
+        }
+        self.inner.complete(job_id, outcome).await
+    }
+
+    async fn fail(&self, job_id: &str, error: &str) -> Result<DreamJob> {
+        self.inner.fail(job_id, error).await
+    }
+
+    async fn get(&self, job_id: &str) -> Result<Option<DreamJob>> {
+        self.inner.get(job_id).await
+    }
+
+    async fn list(&self, filter: &DreamFilter) -> Result<Vec<DreamJob>> {
+        self.inner.list(filter).await
+    }
+
+    async fn count_by_state(&self) -> Result<std::collections::BTreeMap<DreamState, usize>> {
+        self.inner.count_by_state().await
+    }
+
+    async fn delete_finished(&self, older_than: DateTime<Utc>) -> Result<usize> {
+        self.inner.delete_finished(older_than).await
+    }
+}
+
+/// The leased options every lease-aware test in this suite sweeps with.
+fn lease_options(owner: &str) -> DreamLeaseOptions {
+    DreamLeaseOptions::new(
+        owner,
+        chrono::Duration::seconds(30),
+        Duration::from_secs(10),
+    )
+}
+
+#[tokio::test]
+async fn a_failed_completion_write_requeues_the_job_instead_of_stranding_it() {
+    let repository = Arc::new(FlakyCompletionRepository::new());
+    repository.fail_next_completions(1);
+    let consolidator = Arc::new(SucceedingConsolidator::new(success_metrics()));
+    let planner = DreamPlanner::new(
+        repository.clone(),
+        consolidator.clone(),
+        DreamConfig::default(),
+    )
+    .expect("a valid planner");
+    repository
+        .enqueue(job("stranded-1", ts(0)).with_max_attempts(3))
+        .await
+        .expect("enqueue");
+
+    let error = planner
+        .run_once(ts(10), 10)
+        .await
+        .expect_err("the completion write failed");
+    assert!(matches!(error, Error::Memory(_)), "{error:?}");
+
+    // The claim committed and the completion did not: the job must be claimable again
+    // rather than parked in `running`, which no sweep can select.
+    let rescued = repository
+        .get("stranded-1")
+        .await
+        .expect("get")
+        .expect("the enqueued job");
+    assert_eq!(
+        rescued.state,
+        DreamState::Pending,
+        "a failed transition write requeues the job"
+    );
+    assert_eq!(rescued.attempts, 1);
+    assert!(rescued.finished_at.is_none());
+    assert!(
+        rescued
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("could not record the transition")),
+        "the rescue records why the transition was lost: {:?}",
+        rescued.last_error
+    );
+
+    // A later sweep, past the retry marker, claims and completes it.
+    let summary = planner.run_once(ts(11), 10).await.expect("recovery sweep");
+    assert_eq!((summary.scanned, summary.succeeded), (1, 1));
+    let completed = repository
+        .get("stranded-1")
+        .await
+        .expect("get")
+        .expect("the enqueued job");
+    assert_eq!(completed.state, DreamState::Succeeded);
+    assert_eq!(completed.attempts, 2);
+}
+
+#[tokio::test]
+async fn a_failed_completion_write_with_a_spent_budget_fails_the_job_explicitly() {
+    let repository = Arc::new(FlakyCompletionRepository::new());
+    repository.fail_next_completions(1);
+    let consolidator = Arc::new(SucceedingConsolidator::new(success_metrics()));
+    let planner = DreamPlanner::new(repository.clone(), consolidator, DreamConfig::default())
+        .expect("a valid planner");
+    repository
+        .enqueue(job("spent-1", ts(0)).with_max_attempts(1))
+        .await
+        .expect("enqueue");
+
+    let _ = planner
+        .run_once(ts(10), 10)
+        .await
+        .expect_err("the completion write failed");
+
+    let rescued = repository
+        .get("spent-1")
+        .await
+        .expect("get")
+        .expect("the enqueued job");
+    assert_eq!(
+        rescued.state,
+        DreamState::Failed,
+        "the rescue spends the exhausted budget instead of leaving the job running"
+    );
+    assert!(rescued.finished_at.is_some());
+    assert!(planner
+        .run_once(ts(11), 10)
+        .await
+        .expect("later sweep")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_leased_sweep_requeues_the_job_and_releases_the_lease_after_a_failed_transition() {
+    let repository = Arc::new(FlakyCompletionRepository::new());
+    repository.fail_next_completions(1);
+    let consolidator = Arc::new(SucceedingConsolidator::new(success_metrics()));
+    let planner = DreamPlanner::new(
+        repository.clone(),
+        consolidator.clone(),
+        DreamConfig::default(),
+    )
+    .expect("a valid planner");
+    repository
+        .enqueue(job("leased-1", ts(0)).with_max_attempts(3))
+        .await
+        .expect("enqueue");
+
+    let error = planner
+        .run_leased(ts(10), 10, &CallOptions::new(), &lease_options("worker-a"))
+        .await
+        .expect_err("the completion write failed");
+    assert!(matches!(error, Error::Memory(_)), "{error:?}");
+
+    let rescued = repository
+        .get("leased-1")
+        .await
+        .expect("get")
+        .expect("the enqueued job");
+    assert_eq!(rescued.state, DreamState::Pending);
+    assert!(
+        repository
+            .lease("leased-1")
+            .await
+            .expect("read the lease")
+            .is_none(),
+        "the lease is released even though the transition failed"
+    );
+
+    // The requeued job is claimable again: a pending claim never needs the stale lease.
+    let summary = planner
+        .run_leased(ts(11), 10, &CallOptions::new(), &lease_options("worker-b"))
+        .await
+        .expect("recovery sweep");
+    assert_eq!((summary.scanned, summary.succeeded), (1, 1));
+    assert_eq!(
+        repository
+            .get("leased-1")
+            .await
+            .expect("get")
+            .expect("the enqueued job")
+            .state,
+        DreamState::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn a_completion_persists_its_notes_and_a_failed_attempt_clears_them() {
+    let consolidator = Arc::new(SucceedingConsolidator::new(success_metrics()));
+    let shared: Arc<dyn DreamConsolidator> = consolidator;
+    let planner =
+        DreamPlanner::with_in_memory(shared, DreamConfig::default()).expect("a valid planner");
+    planner
+        .repository()
+        .enqueue(job("noted-1", ts(0)))
+        .await
+        .expect("enqueue");
+
+    planner.run_once(ts(10), 10).await.expect("sweep");
+    let stored = planner
+        .repository()
+        .get("noted-1")
+        .await
+        .expect("get")
+        .expect("the enqueued job");
+    assert_eq!(stored.state, DreamState::Succeeded);
+    assert_eq!(
+        stored.notes,
+        vec!["consolidated by the test consolidator".to_owned()],
+        "the outcome's notes are durable, not just part of the sweep summary"
+    );
+
+    // A job imported with notes keeps them until a completion replaces them; a failed
+    // attempt clears them, because they describe work that attempt did not do.
+    let failing = Arc::new(FailingConsolidator::new("boom"));
+    let shared: Arc<dyn DreamConsolidator> = failing;
+    let retrying =
+        DreamPlanner::with_in_memory(shared, DreamConfig::default()).expect("a valid planner");
+    retrying
+        .repository()
+        .enqueue(
+            job("noted-2", ts(0))
+                .with_max_attempts(2)
+                .with_notes(vec!["imported".to_owned()]),
+        )
+        .await
+        .expect("enqueue");
+    retrying.run_once(ts(10), 10).await.expect("sweep");
+    let requeued = retrying
+        .repository()
+        .get("noted-2")
+        .await
+        .expect("get")
+        .expect("the enqueued job");
+    assert_eq!(requeued.state, DreamState::Pending);
+    assert!(requeued.notes.is_empty(), "{:?}", requeued.notes);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_notes_are_durable_and_an_unknown_state_is_a_typed_error() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let url = format!("sqlite:{}", dir.path().join("dreams.db").display());
+    let repository: Arc<dyn DreamRepository> = Arc::new(
+        SqliteDreamRepository::connect(&url)
+            .await
+            .expect("open the database"),
+    );
+    let consolidator = Arc::new(SucceedingConsolidator::new(success_metrics()));
+    let shared: Arc<dyn DreamConsolidator> = consolidator;
+    let planner =
+        DreamPlanner::new(repository.clone(), shared, DreamConfig::default()).expect("a planner");
+    repository
+        .enqueue(job("sqlite-notes", ts(0)))
+        .await
+        .expect("enqueue");
+    planner.run_once(ts(10), 10).await.expect("sweep");
+    repository
+        .enqueue(
+            DreamJob::new(scope(), DreamKind::Dedupe, DreamTrigger::Manual, ts(1))
+                .with_id("sqlite-corrupt"),
+        )
+        .await
+        .expect("enqueue");
+
+    // Corrupt one row's state straight in the table: no repository write produces it.
+    let sqlite = SqliteDreamRepository::connect(&url)
+        .await
+        .expect("reopen the database");
+    sqlx::query("UPDATE dream_jobs SET state = 'dormant' WHERE id = ?1")
+        .bind("sqlite-corrupt")
+        .execute(sqlite.pool())
+        .await
+        .expect("corrupt the row");
+
+    let verified = SqliteDreamRepository::connect(&url)
+        .await
+        .expect("final reopen");
+    let stored = verified
+        .get("sqlite-notes")
+        .await
+        .expect("get")
+        .expect("the completed job");
+    assert_eq!(
+        stored.notes,
+        vec!["consolidated by the test consolidator".to_owned()]
+    );
+
+    // An unknown state is never reported as a runnable `pending` job: the reads and the
+    // counts fail with the same typed, column-naming error.
+    let read = verified
+        .get("sqlite-corrupt")
+        .await
+        .expect_err("an unknown state cannot be decoded");
+    assert!(matches!(read, Error::External(_)), "{read:?}");
+    assert!(read.to_string().contains("`state`"), "{read}");
+    assert!(read.to_string().contains("dormant"), "{read}");
+    let counted = verified
+        .count_by_state()
+        .await
+        .expect_err("the counts refuse the same row");
+    assert!(counted.to_string().contains("`state`"), "{counted}");
 }

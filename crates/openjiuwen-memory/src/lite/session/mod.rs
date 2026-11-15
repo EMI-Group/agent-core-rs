@@ -12,9 +12,14 @@
 //!
 //! The day comes from the caller (the day the turns belong to) and the session id is
 //! sanitized, so the file name is self-describing and sortable and a hostile id cannot leave
-//! [`SESSIONS_DIR`](crate::lite::session::SESSIONS_DIR). The file holds one JSON object per
-//! line — the text, a role or event kind, and a timestamp — so appending a turn never
-//! rewrites earlier ones and the file stays readable with ordinary line-oriented tools.
+//! [`SESSIONS_DIR`](crate::lite::session::SESSIONS_DIR). A portable id (one the sanitizer
+//! leaves unchanged) names its log verbatim; an id that has to be folded carries an
+//! eight-hex-digit discriminator, so `café` and `caf-` never share one file. The file holds
+//! one JSON object per line — the text, a role or event kind, and a timestamp — so appending
+//! a turn never rewrites earlier ones and the file stays readable with ordinary
+//! line-oriented tools; a log whose last byte is not a newline (a truncated write) gains one
+//! before the next append, so the tail is preserved and the new record starts on its own
+//! line.
 //! [`SessionStore`](crate::lite::session::SessionStore) discovers `sessions/**/*.jsonl`
 //! recursively, as Python does, and exposes every record with its path relative to the store
 //! root (`sessions/2026-11-14/abc.jsonl`) and its 1-based line number, so a hit can be cited
@@ -52,7 +57,7 @@ use std::path::{Component, Path, PathBuf};
 
 use chrono::NaiveDate;
 use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use openjiuwen_common::error::{Error, Result};
 
@@ -137,6 +142,10 @@ impl SessionStore {
     /// pass a whole turn list without filtering. Appending is additive: a second call adds
     /// its lines after the earlier ones and leaves them untouched.
     ///
+    /// A log whose last byte is not a newline (a truncated write, or a file edited by hand)
+    /// is repaired by writing one newline first, so the new records start on their own line
+    /// instead of being glued to the truncated tail; the repair is reported.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`] when `records` holds no non-empty record or the session
@@ -171,6 +180,17 @@ impl SessionStore {
                     parent.display()
                 ))
             })?;
+        }
+        if ends_mid_line(&path).await.map_err(|error| {
+            Error::external(error)
+                .with_context(format!("inspecting the session log {}", path.display()))
+        })? {
+            tracing::warn!(
+                target: TARGET,
+                path = %path.display(),
+                "the session log ends mid-line; appending a newline before the new records"
+            );
+            buffer.insert(0, '\n');
         }
         let mut file = OpenOptions::new()
             .create(true)
@@ -339,6 +359,15 @@ impl SessionStore {
 /// append `.jsonl` when building the file name, so the result can never be a `.` or `..`
 /// path component.
 ///
+/// # Identity
+///
+/// Folding is not injective: `café`, `caf-`, and `caf_` would all name the same log, which
+/// would mix their turns and make every [`SessionHit`] cite the wrong session. A *portable*
+/// id — one the fold leaves unchanged — is therefore used verbatim (so an existing log keeps
+/// its file name), and any other id carries a `-<8 hex digit>` suffix of a hash over the
+/// exact id. Distinct ids name distinct logs, and the suffix is stable across processes and
+/// runs.
+///
 /// # Errors
 ///
 /// Returns [`Error::Validation`] when nothing is left (empty or whitespace-only id).
@@ -357,7 +386,43 @@ pub fn sanitize_session_id(session_id: &str) -> Result<String> {
             "session id `{session_id}` is empty after sanitizing"
         )));
     }
+    if sanitized != trimmed {
+        // The folded text cannot be told apart from another id folding to the same text, so
+        // the exact id contributes a discriminator.
+        sanitized.push('-');
+        sanitized.push_str(&discriminator(trimmed));
+    }
     Ok(sanitized)
+}
+
+/// Eight hex digits of an FNV-1a hash over `id`, used to keep folded ids distinct.
+fn discriminator(id: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:08x}", (hash ^ (hash >> 32)) as u32)
+}
+
+/// Returns `true` when `path` exists, holds at least one byte, and its last byte is not a
+/// newline.
+///
+/// A missing (or empty) file does not end mid-line: the first append starts a fresh line.
+async fn ends_mid_line(path: &Path) -> std::io::Result<bool> {
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let length = file.metadata().await?.len();
+    if length == 0 {
+        return Ok(false);
+    }
+    file.seek(std::io::SeekFrom::Start(length - 1)).await?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last).await?;
+    Ok(last[0] != b'\n')
 }
 
 /// Returns `true` when `path` carries the session-log extension (`jsonl`).
@@ -398,19 +463,47 @@ mod tests {
     }
 
     #[test]
-    fn sanitizes_slashes_dots_and_unicode() {
+    fn portable_ids_are_kept_and_folded_ids_carry_a_discriminator() {
         assert_eq!(sanitize_session_id("abc-1_2.3").unwrap(), "abc-1_2.3");
         assert_eq!(sanitize_session_id("  abc  ").unwrap(), "abc");
-        assert_eq!(sanitize_session_id("a/b").unwrap(), "a-b");
-        assert_eq!(
-            sanitize_session_id("../../etc/passwd").unwrap(),
-            "..-..-etc-passwd"
-        );
-        assert_eq!(sanitize_session_id("a\\b").unwrap(), "a-b");
-        assert_eq!(sanitize_session_id("sess 1").unwrap(), "sess-1");
-        assert_eq!(sanitize_session_id("café").unwrap(), "caf-");
-        assert_eq!(sanitize_session_id("日本").unwrap(), "--");
         assert_eq!(sanitize_session_id("..").unwrap(), "..");
+        for id in ["a/b", "../../etc/passwd", "a\\b", "sess 1", "café", "日本"] {
+            let sanitized = sanitize_session_id(id).unwrap();
+            let (stem, suffix) = sanitized.rsplit_once('-').expect("a discriminator");
+            assert!(
+                stem.chars()
+                    .all(|character| character.is_ascii_alphanumeric()
+                        || matches!(character, '-' | '_' | '.')),
+                "{id:?} folded to {sanitized:?}"
+            );
+            assert_eq!(suffix.len(), 8, "{id:?} folded to {sanitized:?}");
+            assert!(
+                suffix
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit()),
+                "{id:?} folded to {sanitized:?}"
+            );
+            assert_ne!(sanitized, id, "a folded id must not be used verbatim");
+        }
+        assert_eq!(sanitize_session_id("a/b").unwrap().len(), "a-b-".len() + 8);
+        // The same id always folds to the same name, so a log stays addressable.
+        assert_eq!(
+            sanitize_session_id("café").unwrap(),
+            sanitize_session_id("café").unwrap()
+        );
+    }
+
+    #[test]
+    fn ids_that_fold_alike_still_name_different_logs() {
+        let mut seen = std::collections::BTreeSet::new();
+        for id in ["café", "caf-", "caf_", "caf ", "cafe", "日本", "--"] {
+            let sanitized = sanitize_session_id(id).unwrap();
+            assert!(
+                seen.insert(sanitized.clone()),
+                "{id:?} collided: {sanitized}"
+            );
+        }
+        assert_eq!(sanitize_session_id("caf-").unwrap(), "caf-");
     }
 
     #[test]
@@ -449,9 +542,14 @@ mod tests {
         let path = store.path_for("abc", day()).unwrap();
         assert_eq!(path, store.root().join("sessions/2026-11-14/abc.jsonl"));
         let sanitized = store.path_for("a/b", day()).unwrap();
+        let id = sanitize_session_id("a/b").unwrap();
         assert_eq!(
             sanitized,
-            store.root().join("sessions/2026-11-14/a-b.jsonl")
+            store.root().join(format!("sessions/2026-11-14/{id}.jsonl"))
+        );
+        assert_eq!(
+            sanitized.parent(),
+            store.path_for("abc", day()).unwrap().parent()
         );
     }
 
@@ -541,6 +639,79 @@ mod tests {
         let text = tokio::fs::read_to_string(&path).await.unwrap();
         assert_eq!(text.lines().count(), 1, "escaped newline stays one line");
         assert_eq!(store.load(&path).await.unwrap(), vec![record]);
+    }
+
+    #[tokio::test]
+    async fn ids_that_fold_alike_keep_themselves_apart_on_disk() {
+        let (_temp, store) = store();
+        let first = store
+            .append("café", day(), &[SessionRecord::new("from cafe")])
+            .await
+            .unwrap();
+        let second = store
+            .append("caf-", day(), &[SessionRecord::new("from caf ")])
+            .await
+            .unwrap();
+        assert_ne!(first, second, "two ids must not share one log");
+        assert_eq!(store.load(&first).await.unwrap()[0].content, "from cafe");
+        assert_eq!(store.load(&second).await.unwrap()[0].content, "from caf ");
+
+        let chunks = store.chunks().await.unwrap();
+        assert_eq!(chunks.len(), 2);
+        let cafe = chunks
+            .iter()
+            .find(|chunk| chunk.record.content == "from cafe")
+            .expect("the café turn is indexed");
+        assert_eq!(
+            cafe.path,
+            format!(
+                "sessions/2026-11-14/{}.jsonl",
+                sanitize_session_id("café").unwrap()
+            ),
+            "the hit cites the log it came from"
+        );
+        let plain = chunks
+            .iter()
+            .find(|chunk| chunk.record.content == "from caf ")
+            .expect("the portable turn is indexed");
+        assert_eq!(plain.path, "sessions/2026-11-14/caf-.jsonl");
+    }
+
+    #[tokio::test]
+    async fn append_repairs_a_log_that_ends_mid_line() {
+        let (_temp, store) = store();
+        let path = store.path_for("abc", day()).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        // A truncated write leaves a partial JSON line with no trailing newline.
+        tokio::fs::write(&path, "{\"content\":\"trunc")
+            .await
+            .unwrap();
+
+        store
+            .append("abc", day(), &[SessionRecord::new("after the truncation")])
+            .await
+            .unwrap();
+        let text = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            text.starts_with("{\"content\":\"trunc\n"),
+            "the truncated tail is preserved and terminated: {text}"
+        );
+        assert_eq!(text.lines().count(), 2, "{text}");
+        let records = store.load(&path).await.unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].content, "{\"content\":\"trunc");
+        assert_eq!(records[1].content, "after the truncation");
+
+        // A log that already ends with a newline gains no blank line.
+        store
+            .append("abc", day(), &[SessionRecord::new("and one more")])
+            .await
+            .unwrap();
+        let text = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(text.lines().count(), 3, "{text}");
+        assert!(!text.contains("\n\n"), "{text}");
     }
 
     #[tokio::test]

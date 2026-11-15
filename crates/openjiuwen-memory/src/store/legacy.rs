@@ -24,13 +24,38 @@ use super::json;
 use super::keys;
 use super::prefix::KvPrefixRegistry;
 
+/// The outcome of a text lookup over one key plus its alias keys.
+///
+/// The variant carries what the value *is*, so the caller decides what a non-text value
+/// means: a record read treats it as corruption (`Error::Validation`), a variable read as
+/// "not a text variable" (`None`). Collapsing both into one error is what used to turn a
+/// broken entry into a silently absent one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TextLookup {
+    /// No candidate key exists at all.
+    Missing,
+    /// The first candidate found holds UTF-8 text.
+    Text {
+        /// The candidate key the text was read from.
+        key: String,
+        /// The stored text.
+        text: String,
+    },
+    /// The first candidate found holds a value that is not UTF-8 text.
+    NonText {
+        /// The candidate key holding the non-text value.
+        key: String,
+    },
+}
+
 /// Reads the UTF-8 text stored under `key`, falling back to the alias key layout.
 ///
 /// Returns the key that was actually found plus its text. The current key always
 /// wins: an alias candidate is tried only when `key` is absent. A candidate holding
 /// a non-text value is `Error::Validation` naming that key, because a point read
 /// must not hide corruption behind a "missing" answer. `None` means no candidate
-/// key exists at all.
+/// key exists at all. Callers that legitimately accept a non-text value use
+/// [`lookup_text_in`] instead.
 #[cfg_attr(not(test), allow(dead_code))] // default-registry form; `storage` passes its own registry
 pub(crate) async fn read_text(kv: &dyn KvStore, key: String) -> Result<Option<(String, String)>> {
     read_text_in(kv, key, &KvPrefixRegistry::default()).await
@@ -42,6 +67,26 @@ pub(crate) async fn read_text_in(
     key: String,
     prefixes: &KvPrefixRegistry,
 ) -> Result<Option<(String, String)>> {
+    match lookup_text_in(kv, key, prefixes).await? {
+        TextLookup::Text { key, text } => Ok(Some((key, text))),
+        TextLookup::Missing => Ok(None),
+        TextLookup::NonText { key } => Err(Error::validation(format!(
+            "stored memory value `{key}` is not UTF-8 text"
+        ))),
+    }
+}
+
+/// [`read_text_in`] reporting *why* no text was returned instead of failing on a
+/// non-text value.
+///
+/// The current key always wins and only store errors propagate, so the caller can tell a
+/// genuinely absent entry (no candidate key) from one that exists with a value this read
+/// cannot interpret.
+pub(crate) async fn lookup_text_in(
+    kv: &dyn KvStore,
+    key: String,
+    prefixes: &KvPrefixRegistry,
+) -> Result<TextLookup> {
     let mut candidates = vec![key.clone()];
     candidates.extend(keys::legacy_alternatives_in(prefixes, &key));
     for (position, candidate) in candidates.into_iter().enumerate() {
@@ -49,16 +94,17 @@ pub(crate) async fn read_text_in(
             continue;
         };
         let Some(text) = value.as_str() else {
-            return Err(Error::validation(format!(
-                "stored memory value `{candidate}` is not UTF-8 text"
-            )));
+            return Ok(TextLookup::NonText { key: candidate });
         };
         if position > 0 {
             log_read(&key, &candidate);
         }
-        return Ok(Some((candidate, text.to_owned())));
+        return Ok(TextLookup::Text {
+            key: candidate,
+            text: text.to_owned(),
+        });
     }
-    Ok(None)
+    Ok(TextLookup::Missing)
 }
 
 /// Lists the records under `prefix` plus the records of every alias prefix.

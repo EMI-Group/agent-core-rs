@@ -39,10 +39,20 @@
 //! - Leading and trailing blank lines of a fact body are dropped, and blank lines
 //!   between the `### name` heading, the attribute block, and the body are canonical.
 //! - A body line that would otherwise look like a heading is escaped with a backslash
-//!   (`\## note`) and unescaped on parse, so fact bodies can contain Markdown headings.
+//!   (`\## note`) and unescaped on parse, so fact bodies can contain Markdown headings; a
+//!   line that already starts with a backslash is escaped too, so the pair is a true
+//!   inverse.
 //! - A missing or unparsable `updated_at` attribute decodes to
 //!   [`chrono::DateTime::default`] (the Unix epoch) rather than "now", which keeps a
-//!   parse deterministic.
+//!   parse deterministic; an unparsable value is kept verbatim and rendered back
+//!   unchanged instead of being replaced by the epoch.
+//! - A fact name that appears more than once keeps its last occurrence: a copy-paste
+//!   duplicate is dropped (and reported), so a read returns the latest text and a delete
+//!   removes the entry instead of resurrecting a leftover copy.
+//! - An attribute-block line that is a bullet but not `key: value` is kept verbatim
+//!   instead of ending the block, so the attributes after it still parse; `tags` accept a
+//!   JSON array, a comma-separated list, and a bracketed list without quotes
+//!   (`[one, two]`).
 //! - `description` and `path` attributes are single-line by construction: embedded
 //!   newlines are folded to spaces when rendering.
 //! - `tags` are written as a JSON array (a comma-separated value is also accepted when

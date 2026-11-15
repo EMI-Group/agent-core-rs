@@ -23,13 +23,20 @@
 //!
 //! # Restore semantics
 //!
-//! [`restore_with`] maps each entry key through the *target* registry: a family that the
-//! target renamed keeps the target's current prefix, an entry whose family the target
-//! does not know (and which the backup's own recorded prefixes do not explain) is written
-//! verbatim. Restoring is additive: entries whose target already holds an equal value are
-//! counted `skipped`, every other entry is written, and target keys the backup does not
-//! contain are never deleted. A dry run performs every read and no write, so it reports
-//! exactly what a real restore would do.
+//! [`restore_with_options`] maps each entry key through the *target* registry: a family
+//! that the target renamed keeps the target's current prefix, an entry whose family the
+//! target does not know (and which the backup's own recorded prefixes do not explain) is
+//! written verbatim. Restoring is additive: entries whose target already holds an equal
+//! value are counted `skipped`, every other entry is written, and target keys the backup
+//! does not contain are never deleted. A dry run performs every read and no write, so it
+//! reports exactly what a real restore would do.
+//!
+//! An entries-less backup is refused with `Error::Validation` unless
+//! [`RestoreOptions::allow_empty`] opts in, and both the dump and the restore validate the
+//! prefix registry first, so a decoded-but-incomplete registry cannot scan or write an
+//! empty prefix. [`restore_into`] takes the [`RestoreReport`] by reference and refreshes it
+//! entry by entry, so a failure halfway through keeps the counts of what was already
+//! handled.
 //!
 //! # Out of scope
 //!
@@ -286,7 +293,7 @@ impl MemoryBackup {
 }
 
 /// What a restore did (or, for a dry run, what it would do).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreReport {
     /// Whether the run only reported; a dry run writes nothing.
     pub dry_run: bool,
@@ -312,6 +319,41 @@ impl RestoreReport {
     }
 }
 
+/// Options of one [`restore_with_options`] run.
+///
+/// The defaults are a real (writing) restore that refuses an entries-less backup; a caller
+/// opts in explicitly to a dry run or to restoring nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct RestoreOptions {
+    /// Report what a real restore would write without writing anything.
+    pub dry_run: bool,
+    /// Restore an entries-less backup instead of refusing it with `Error::Validation`.
+    pub allow_empty: bool,
+}
+
+impl RestoreOptions {
+    /// The default options: a writing restore that refuses an empty backup.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets [`Self::dry_run`].
+    #[must_use]
+    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    /// Sets [`Self::allow_empty`], opting in to a restore of nothing.
+    #[must_use]
+    pub fn with_allow_empty(mut self, allow_empty: bool) -> Self {
+        self.allow_empty = allow_empty;
+        self
+    }
+}
+
 /// Dumps the four key-value memory families of `stores` using the default prefix registry.
 ///
 /// # Errors
@@ -329,8 +371,12 @@ pub async fn dump(stores: &MemoryStores) -> Result<MemoryBackup> {
 ///
 /// # Errors
 ///
-/// Propagates any key-value store read error, annotated with the scanned prefix.
+/// Every [`KvPrefixRegistry::validate`] error, plus any key-value store read error,
+/// annotated with the scanned prefix.
 pub async fn dump_with(stores: &MemoryStores, prefixes: &KvPrefixRegistry) -> Result<MemoryBackup> {
+    // A decoded-but-incomplete registry would otherwise fall back to a short (or empty)
+    // scan prefix and silently dump nothing.
+    prefixes.validate()?;
     let mut entries: BTreeMap<String, KvValue> = BTreeMap::new();
     for family in DUMPED_FAMILIES {
         collect_family(stores, prefixes, family, &mut entries).await?;
@@ -350,12 +396,13 @@ pub async fn dump_with(stores: &MemoryStores, prefixes: &KvPrefixRegistry) -> Re
 
 /// Restores `backup` into `stores`, writing every entry.
 ///
-/// Uses the default prefix registry; see [`restore_with`] for an explicit registry and a
-/// dry run.
+/// Uses the default prefix registry and [`RestoreOptions::default`]; see
+/// [`restore_with_options`] for an explicit registry, a dry run, or an empty backup.
 ///
 /// # Errors
 ///
-/// Every [`MemoryBackup::verify`] error, plus any key-value store read or write error,
+/// Every [`MemoryBackup::verify`] error, an empty backup (see
+/// [`RestoreOptions::allow_empty`]), plus any key-value store read or write error,
 /// annotated with the affected key.
 pub async fn restore(stores: &MemoryStores, backup: &MemoryBackup) -> Result<RestoreReport> {
     restore_with(stores, backup, &KvPrefixRegistry::default(), false).await
@@ -363,25 +410,83 @@ pub async fn restore(stores: &MemoryStores, backup: &MemoryBackup) -> Result<Res
 
 /// Restores `backup` into `stores` under `prefixes`, optionally as a dry run.
 ///
-/// Each entry key is mapped onto the target layout (an entry of a family `prefixes`
-/// renamed keeps the new current prefix; an entry the backup's recorded prefixes cannot
-/// explain is written verbatim), then read: an existing equal value counts `skipped`,
-/// anything else is written (or, for `dry_run`, only counted as `written`). Target keys
-/// absent from the backup are left untouched.
+/// Equivalent to [`restore_with_options`] with the dry-run flag set and every other option
+/// at its default, so an entries-less backup is still refused.
 ///
 /// # Errors
 ///
-/// Every [`MemoryBackup::verify`] error, plus any key-value store read or write error,
-/// annotated with the affected key.
+/// Every [`MemoryBackup::verify`] error, an empty backup, plus any key-value store read or
+/// write error, annotated with the affected key.
 pub async fn restore_with(
     stores: &MemoryStores,
     backup: &MemoryBackup,
     prefixes: &KvPrefixRegistry,
     dry_run: bool,
 ) -> Result<RestoreReport> {
+    restore_with_options(
+        stores,
+        backup,
+        prefixes,
+        &RestoreOptions::default().with_dry_run(dry_run),
+    )
+    .await
+}
+
+/// Restores `backup` into `stores` under `prefixes` with explicit [`RestoreOptions`].
+///
+/// Each entry key is mapped onto the target layout (an entry of a family `prefixes`
+/// renamed keeps the new current prefix; an entry the backup's recorded prefixes cannot
+/// explain is written verbatim), then read: an existing equal value counts `skipped`,
+/// anything else is written (or, for a dry run, only counted as `written`). Target keys
+/// absent from the backup are left untouched.
+///
+/// An entries-less backup is `Error::Validation` unless [`RestoreOptions::allow_empty`] is
+/// set: a document that lost its `entries` member must not report a successful restore of
+/// nothing.
+///
+/// # Errors
+///
+/// Every [`KvPrefixRegistry::validate`] and [`MemoryBackup::verify`] error, the empty
+/// backup refusal, plus any key-value store read or write error, annotated with the
+/// affected key. Use [`restore_into`] to keep the partial report of a failed run.
+pub async fn restore_with_options(
+    stores: &MemoryStores,
+    backup: &MemoryBackup,
+    prefixes: &KvPrefixRegistry,
+    options: &RestoreOptions,
+) -> Result<RestoreReport> {
+    let mut report = RestoreReport::default();
+    restore_into(stores, backup, prefixes, options, &mut report).await?;
+    Ok(report)
+}
+
+/// [`restore_with_options`] writing its progress into the caller's `report`.
+///
+/// `report` is refreshed from the backup once the run is accepted and updated after every
+/// entry, so a caller that sees an error still holds the counts of the entries handled
+/// before the failure instead of losing them. Nothing is written to `report` when the
+/// registry or the backup is rejected.
+///
+/// # Errors
+///
+/// As [`restore_with_options`].
+pub async fn restore_into(
+    stores: &MemoryStores,
+    backup: &MemoryBackup,
+    prefixes: &KvPrefixRegistry,
+    options: &RestoreOptions,
+    report: &mut RestoreReport,
+) -> Result<()> {
+    prefixes.validate()?;
     backup.verify()?;
-    let mut report = RestoreReport {
-        dry_run,
+    if backup.is_empty() && !options.allow_empty {
+        return Err(Error::validation(
+            "memory backup holds no entry; refusing to restore nothing (set \
+             `RestoreOptions::allow_empty` to restore an empty backup)",
+        ));
+    }
+    *report = RestoreReport {
+        dry_run: options.dry_run,
         written: 0,
         skipped: 0,
         total: backup.len(),
@@ -396,7 +501,7 @@ pub async fn restore_with(
             report.skipped += 1;
             continue;
         }
-        if !dry_run {
+        if !options.dry_run {
             stores
                 .kv
                 .set(&target, value.clone())
@@ -416,7 +521,7 @@ pub async fn restore_with(
         total = report.total,
         "restored the memory key-value keyspace"
     );
-    Ok(report)
+    Ok(())
 }
 
 /// Reads every entry under the current prefix of `family` and then under each alias.
@@ -921,6 +1026,115 @@ mod tests {
         assert!(error.to_string().contains("JSON"), "{error}");
     }
 
+    #[tokio::test]
+    async fn an_empty_backup_is_refused_unless_the_caller_opts_in() {
+        let stores = MemoryStores::in_memory();
+        let empty = dump(&stores).await.expect("dump an empty store");
+        assert!(empty.is_empty());
+        // A valid-JSON but entries-less document must not "restore" successfully.
+        let target = MemoryStores::in_memory();
+        let text = empty.to_json().expect("serialize");
+        let decoded = MemoryBackup::from_json(&text).expect("decode");
+        let error = restore(&target, &decoded)
+            .await
+            .expect_err("an empty backup is refused");
+        assert!(matches!(error, Error::Validation(_)), "{error:?}");
+        assert!(error.to_string().contains("no entry"), "{error}");
+        assert!(error.to_string().contains("allow_empty"), "{error}");
+        let error = restore_with(&target, &decoded, &KvPrefixRegistry::default(), true)
+            .await
+            .expect_err("a dry run refuses it too");
+        assert!(matches!(error, Error::Validation(_)), "{error:?}");
+        // The documented opt-in accepts it and reports an empty run.
+        let report = restore_with_options(
+            &target,
+            &decoded,
+            &KvPrefixRegistry::default(),
+            &RestoreOptions::default().with_allow_empty(true),
+        )
+        .await
+        .expect("an opted-in empty restore");
+        assert_eq!(report.total, 0);
+        assert_eq!(report.written, 0);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.counts, BackupCounts::default());
+    }
+    #[tokio::test]
+    async fn a_mid_loop_write_failure_keeps_the_partial_report() {
+        use crate::store::test_support::FaultyKvStore;
+        let scope = scope();
+        let source = MemoryStores::in_memory();
+        for id in ["rec-1", "rec-2", "rec-3"] {
+            source
+                .kv
+                .set(
+                    &keys::record_key(&scope, id),
+                    KvValue::text(format!("{{\"id\":\"{id}\"}}")),
+                )
+                .await
+                .expect("seed record");
+        }
+        let backup = dump(&source).await.expect("dump");
+        assert_eq!(backup.len(), 3);
+        // The third write fails, so two entries reach the target.
+        let faulty = std::sync::Arc::new(FaultyKvStore::failing_writes_from(3));
+        let target = MemoryStores::from_parts(
+            faulty.clone(),
+            std::sync::Arc::new(openjiuwen_foundation::store::InMemoryVectorStore::new()),
+            std::sync::Arc::new(openjiuwen_foundation::store::InMemoryDocumentStore::new()),
+        );
+        let mut report = RestoreReport::default();
+        let error = restore_into(
+            &target,
+            &backup,
+            &KvPrefixRegistry::default(),
+            &RestoreOptions::default(),
+            &mut report,
+        )
+        .await
+        .expect_err("the injected write failure propagates");
+        assert!(matches!(error, Error::Validation(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("injected write failure"),
+            "{error}"
+        );
+        assert!(!report.dry_run);
+        assert_eq!(report.total, 3, "the report knows the planned total");
+        assert_eq!(report.written, 2, "the two completed writes are kept");
+        assert_eq!(report.counts.records, 2);
+        assert_eq!(faulty.write_count(), 3);
+        // The failed entry is the one never written, and the wrapper reports no report.
+        let error = restore_with_options(
+            &target,
+            &backup,
+            &KvPrefixRegistry::default(),
+            &RestoreOptions::default(),
+        )
+        .await
+        .expect_err("the wrapper propagates the failure");
+        assert!(matches!(error, Error::Validation(_)), "{error:?}");
+    }
+    #[tokio::test]
+    async fn an_incomplete_registry_is_refused_by_dump_and_restore() {
+        let incomplete: KvPrefixRegistry = serde_json::from_value(serde_json::json!({
+            "families": {"records": {"current": "UMD", "aliases": ["user_mem"]}}
+        }))
+        .expect("tolerant decode");
+        // The fallback keeps the missing families readable instead of collapsing to "".
+        assert_eq!(incomplete.current(KvFamily::UserVariables), "user_var");
+        let stores = MemoryStores::in_memory();
+        let error = dump_with(&stores, &incomplete)
+            .await
+            .expect_err("an incomplete registry cannot be dumped");
+        assert!(matches!(error, Error::Validation(_)), "{error:?}");
+        assert!(error.to_string().contains("family"), "{error}");
+        let (_source, backup) = seeded_backup().await;
+        let error = restore_with_options(&stores, &backup, &incomplete, &RestoreOptions::default())
+            .await
+            .expect_err("an incomplete registry cannot be restored with");
+        assert!(matches!(error, Error::Validation(_)), "{error:?}");
+        assert!(error.to_string().contains("family"), "{error}");
+    }
     #[test]
     fn from_entries_classifies_the_four_dumped_families_only() {
         let registry = KvPrefixRegistry::new();

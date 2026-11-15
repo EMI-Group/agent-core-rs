@@ -37,6 +37,14 @@
 //! [`DreamOutcome`] note) never mistakes a fallback for model output. Cancellation is the
 //! one exception: it is returned as [`Error::Cancelled`] instead of degrading, because a
 //! cancelled job must stop, not consume the remaining retries.
+//!
+//! # Dry runs
+//!
+//! The default sink is [`RecordOnlySink`], which writes nothing: it reports the plan's
+//! `records_scanned` and zeros every applied counter, and the outcome carries
+//! [`RECORD_ONLY_NOTE`], so a stored job never claims merges or deletions that nothing
+//! performed. A caller that wants the plan applied injects its own [`ConsolidationSink`]
+//! through [`LlmConsolidator::with_sink`].
 use std::fmt;
 use std::sync::Arc;
 
@@ -254,25 +262,42 @@ impl DreamCandidateSource for PayloadCandidateSource {
     }
 }
 
+/// The note the pipeline records after a sink that only reads the plan.
+///
+/// [`ConsolidationSink::applies_plans`] is `false` for [`RecordOnlySink`], and the
+/// completion outcome then carries this note so a stored job never looks like a pass that
+/// rewrote memory.
+pub const RECORD_ONLY_NOTE: &str = "record-only sink: the plan was not applied to memory";
+
 /// Applies one consolidation plan to the memory store.
 ///
-/// The default [`RecordOnlySink`] mutates nothing and returns the plan's own counters —
-/// that is the pure "decide, don't write" mode useful for dry runs and tests. A real
+/// The default [`RecordOnlySink`] mutates nothing and reports only what it observed — that
+/// is the pure "decide, don't write" mode useful for dry runs and tests. A real
 /// application injects a sink backed by its memory facade; a sink error fails the
 /// attempt (the planner retries it), and a sink must never turn a cancellation into a
 /// success.
 #[async_trait]
 pub trait ConsolidationSink: Send + Sync {
-    /// Applies `plan` and returns the counters to record on the completed job.
+    /// Applies `plan` and returns the counters of the work it actually did.
     async fn apply(
         &self,
         job: &DreamJob,
         plan: &DreamConsolidationPlan,
         ctx: &CallOptions,
     ) -> Result<DreamMetrics>;
+
+    /// Whether [`ConsolidationSink::apply`] really mutates memory; default `true`.
+    ///
+    /// [`RecordOnlySink`] answers `false`, because its counters describe a decision set
+    /// rather than applied work. The pipeline records [`RECORD_ONLY_NOTE`] on the
+    /// completion outcome in that case, so a persisted job is never mistaken for one whose
+    /// consolidation ran.
+    fn applies_plans(&self) -> bool {
+        true
+    }
 }
 
-/// The sink used when none is injected: it records the plan's counters and mutates
+/// The sink used when none is injected: it records what the plan *observed* and mutates
 /// nothing.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RecordOnlySink;
@@ -286,7 +311,16 @@ impl ConsolidationSink for RecordOnlySink {
         ctx: &CallOptions,
     ) -> Result<DreamMetrics> {
         ctx.check()?;
-        Ok(plan.metrics)
+        // Nothing was merged, deleted, created or reclaimed here, so only the observation
+        // survives: the plan's own counters are what it *decided*, not what happened.
+        Ok(DreamMetrics {
+            records_scanned: plan.metrics.records_scanned,
+            ..DreamMetrics::default()
+        })
+    }
+
+    fn applies_plans(&self) -> bool {
+        false
     }
 }
 
@@ -600,6 +634,9 @@ impl DreamConsolidator for LlmConsolidator {
             DreamOutcome::succeeded(job.id.clone(), metrics)
         };
         outcome.notes.extend(plan.notes());
+        if !self.sink.applies_plans() {
+            outcome.notes.push(RECORD_ONLY_NOTE.to_owned());
+        }
         Ok(outcome)
     }
 }
