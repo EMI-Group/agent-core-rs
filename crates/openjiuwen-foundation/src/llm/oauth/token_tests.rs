@@ -112,11 +112,14 @@ fn token_round_trips_through_json() {
 }
 
 #[test]
-fn token_without_an_expiry_is_never_expired() {
+fn token_without_a_resolvable_expiry_is_treated_as_expired() {
     let token = OAuthToken::new("access-1");
     assert!(token.expires_at.is_none());
-    assert!(!token.is_expired(Duration::ZERO));
-    assert!(!token.is_expired(Duration::from_secs(86_400)));
+    assert!(
+        token.is_expired(Duration::ZERO),
+        "an unresolvable expiry is stale, so the refresh flow runs on use"
+    );
+    assert!(token.is_expired(Duration::from_secs(86_400)));
 
     let expired = OAuthToken::new("access-1").with_expires_at(expiry_in(-10));
     assert!(expired.is_expired(Duration::ZERO));
@@ -124,6 +127,9 @@ fn token_without_an_expiry_is_never_expired() {
     let within_skew = OAuthToken::new("access-1").with_expires_at(expiry_in(60));
     assert!(within_skew.is_expired(REFRESH_SKEW));
     assert!(!within_skew.is_expired(Duration::from_secs(10)));
+
+    let valid = OAuthToken::new("access-1").with_expires_at(expiry_in(3600));
+    assert!(!valid.is_expired(REFRESH_SKEW), "a future expiry is valid");
 }
 
 #[test]
@@ -184,8 +190,11 @@ fn token_expiry_falls_back_to_the_jwt_claim() {
 fn token_expiry_is_unknown_when_nothing_resolves() {
     let opaque = OAuthToken::new("opaque-access-token");
     assert_eq!(opaque.effective_expires_at(), None);
-    assert!(!opaque.is_expired(REFRESH_SKEW));
-    assert!(!opaque.is_expired(Duration::from_secs(86_400)));
+    assert!(
+        opaque.is_expired(REFRESH_SKEW),
+        "an unknown expiry counts as expired"
+    );
+    assert!(opaque.is_expired(Duration::from_secs(86_400)));
 
     for access_token in [
         jwt(json!({ "sub": "user" })),
@@ -202,8 +211,8 @@ fn token_expiry_is_unknown_when_nothing_resolves() {
             token.access_token.expose_secret()
         );
         assert!(
-            !token.is_expired(REFRESH_SKEW),
-            "an unknown expiry must never refresh"
+            token.is_expired(REFRESH_SKEW),
+            "an unknown expiry must trigger the refresh flow"
         );
     }
 }

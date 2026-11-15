@@ -36,6 +36,13 @@ pub const DEFAULT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Path of the device-login callback the token exchange reports as `redirect_uri`.
 pub const DEVICE_CALLBACK_PATH: &str = "/deviceauth/callback";
 
+/// Path of the page a user opens to enter a device user code.
+///
+/// The device-code response carries only the code, so the verification URL is
+/// derived from the configured issuer (Python parity:
+/// `OPENAI_ACCOUNT_DEVICE_AUTH_URL = f"{issuer}/codex/device"`).
+pub const DEVICE_VERIFICATION_PATH: &str = "/codex/device";
+
 /// Path that hands out a device user code.
 const USER_CODE_PATH: &str = "/api/accounts/deviceauth/usercode";
 
@@ -300,9 +307,11 @@ impl OpenAiOAuthClient {
 
     /// Returns a usable access token, refreshing and persisting it when needed.
     ///
-    /// The token is refreshed when `force_refresh` is set or when it expires
-    /// within [`REFRESH_SKEW`]; the (possibly rotated) result is saved through
-    /// `store` before it is returned.
+    /// The token is refreshed when `force_refresh` is set or when
+    /// [`OAuthToken::is_expired`] reports it stale within [`REFRESH_SKEW`] — which
+    /// includes a token whose expiry cannot be resolved, because such a credential
+    /// has no known lifetime and must be replaced instead of used indefinitely. The
+    /// (possibly rotated) result is saved through `store` before it is returned.
     ///
     /// # Errors
     ///
