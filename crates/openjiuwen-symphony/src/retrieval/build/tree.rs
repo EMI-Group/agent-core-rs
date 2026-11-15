@@ -35,6 +35,13 @@
 //! `(depth, cid)` — parents before their descendants, siblings in `cid` order — after
 //! every mutating helper. No clock, no hash-map iteration order.
 //!
+//! # LLM tree shaping
+//!
+//! The four opt-in model stages — `one_shot`, `expansion`, `repair` and `equivalence` —
+//! live in [`shaping`](crate::retrieval::build::tree::shaping), each with a documented
+//! deterministic fallback, so the default build never needs a model and the assembly here
+//! stays model-free.
+//!
 //! # Branch descriptions
 //!
 //! Python asks the model to write one description per branch
@@ -43,6 +50,9 @@
 //! [`branch_description`](crate::retrieval::build::tree::branch_description) derives a
 //! stable sentence from the `cid` path, so a build never needs a model and never embeds
 //! prose that could drift between runs.
+
+/// Opt-in model-driven tree shaping, with deterministic fallbacks.
+pub mod shaping;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
