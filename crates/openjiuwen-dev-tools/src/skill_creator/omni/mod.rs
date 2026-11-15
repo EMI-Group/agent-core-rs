@@ -9,19 +9,25 @@
 //!   `openjiuwen_common::http`, and [`fetch::ScriptedFetcher`] for tests.
 //! - [`html`] — rule-based HTML extraction into headings, links, images, code
 //!   blocks, title, description, and text ([`html::HtmlDocument`]).
-//! - [`archive`] — archive sniffing plus in-process unpacking of `tar`, `zip`,
-//!   and `gzip` (including gzip-wrapped `tar`/`zip`), bounded by
-//!   [`archive::MAX_ENTRY_UNCOMPRESSED_BYTES`] per entry and
-//!   [`archive::MAX_ARCHIVE_UNCOMPRESSED_BYTES`] per archive; ZIP64, encrypted
-//!   entries, and compression methods other than stored/DEFLATE stay a typed
+//! - [`archive`] — archive sniffing ([`archive::detect`], plus the
+//!   [`archive::detect_named`] suffix fallback) and in-process unpacking of
+//!   `tar`, `zip` (classic and ZIP64, `ZipCrypto` with a
+//!   [`archive::UnpackOptions`] password) and `gzip` (including gzip-wrapped
+//!   `tar`/`zip`), bounded by [`archive::MAX_ENTRY_UNCOMPRESSED_BYTES`] per
+//!   entry and [`archive::MAX_ARCHIVE_UNCOMPRESSED_BYTES`] per archive.
+//!   `bzip2`/`xz`/`zstd`, `WinZip` AES, PKWARE strong encryption, and
+//!   compression methods other than stored/DEFLATE stay a typed
 //!   [`Error::unsupported`](openjiuwen_common::error::Error::unsupported).
 //! - [`sha256`] — the in-crate SHA-256 (FIPS 180-4) whose hex digest keys the
 //!   payload deduplication of [`filter`], matching Python's
 //!   `hashlib.sha256(data).hexdigest()` identity.
-//! - [`filter`] — image sniffing, icon heuristics, content/url deduplication,
-//!   link deduplication, and [`filter::slugify`].
+//! - [`filter`] — image sniffing, header-only image dimensions
+//!   ([`filter::image_dimensions`]), the decorative-image gate, content/url
+//!   deduplication, link deduplication, and [`filter::slugify`].
 //! - [`pipeline`] — [`pipeline::OmniCreation`]: scrape → download → generate →
-//!   save, plus model-assisted generation. The generation stages report a
+//!   save, plus model-assisted generation. `scrape` reads HTML, archives, the
+//!   office/PDF document formats the kernel's retrieval loaders decode, and
+//!   plain text. The generation stages report a
 //!   [`pipeline::GenerationProvenance`] (deterministic template or drafting
 //!   model) through [`pipeline::GeneratedSkill`] and
 //!   [`pipeline::OmniOutcome::provenance`], so a caller can tell a model-drafted
@@ -45,7 +51,10 @@ pub mod pipeline;
 pub mod render;
 pub mod sha256;
 
-pub use archive::{detect, ArchiveEntry, ArchiveFormat, ArchiveUnpacker};
+pub use archive::{
+    detect, detect_named, ArchiveEntry, ArchiveEntryKind, ArchiveFormat, ArchiveUnpacker,
+    UnpackOptions,
+};
 pub use fetch::{FetchedResource, Fetcher, HttpFetcher, ScriptedFetcher};
 pub use filter::{
     content_hash, dedupe_links, filter_images, filter_images_with, image_dimensions,
