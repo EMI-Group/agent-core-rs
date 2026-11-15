@@ -3,7 +3,7 @@
 //! Basic, bearer, and API-key authentication are resolved while the request is built.
 //! Digest authentication is challenge-driven — [`apply_authentication`] only validates the
 //! credentials and the component replays the request once a `401` arrives (see
-//! [`super::digest`]). AWS SigV4 is signed in [`sign_aws`], called after the body bytes are
+//! [`super::digest`]). AWS `SigV4` is signed in [`sign_aws`], called after the body bytes are
 //! known, because the payload hash is part of the signature.
 //!
 //! # AWS credentials
@@ -107,7 +107,7 @@ pub(crate) fn apply_authentication(
     Ok(())
 }
 
-/// Whether `authentication` selects AWS SigV4.
+/// Whether `authentication` selects AWS `SigV4`.
 pub(crate) fn is_aws(authentication: Option<&HttpAuthConfig>) -> bool {
     authentication.is_some_and(|auth| auth.auth_type == HttpAuthType::Aws)
 }
@@ -126,7 +126,7 @@ pub(crate) fn digest_credentials(auth: &HttpAuthConfig) -> Result<(&str, &str)> 
     }
 }
 
-/// Signs `headers` with AWS SigV4 and records the `x-amz-*` headers the signature covers.
+/// Signs `headers` with AWS `SigV4` and records the `x-amz-*` headers the signature covers.
 pub(crate) fn sign_aws(
     authentication: Option<&HttpAuthConfig>,
     method: &str,
@@ -281,7 +281,11 @@ mod tests {
         };
         let mut query = Vec::new();
         apply_authentication(Some(&auth), &mut BTreeMap::new(), &mut query).unwrap();
-        assert!(query.is_empty());
+        assert_eq!(
+            query.len(),
+            0,
+            "a body-located api key adds no query parameter"
+        );
     }
 
     #[test]

@@ -346,6 +346,6 @@ mod tests {
         // The scanner the generator relies on is exact.
         let parts = vec![b"xx".to_vec()];
         let boundary = generate_boundary(&parts);
-        assert!(!boundary.is_empty());
+        assert_ne!(boundary, "", "a boundary is always generated");
     }
 }

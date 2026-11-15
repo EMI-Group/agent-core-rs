@@ -45,7 +45,7 @@
 //!   identical request once with an `Authorization: Digest …` header (MD5, MD5-sess,
 //!   SHA-256, SHA-256-sess; `qop=auth` when offered, otherwise the legacy form). A missing
 //!   `username`/`password` pair is a typed input-parameter error.
-//! - **AWS SigV4 authentication** signs in pre-flight, after the body bytes are known:
+//! - **AWS `SigV4` authentication** signs in pre-flight, after the body bytes are known:
 //!   credentials come from `authentication.username`/`password` or
 //!   `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, the region from `AWS_REGION`/
 //!   `AWS_DEFAULT_REGION` (default `us-east-1`), and the service from `AWS_SERVICE`
