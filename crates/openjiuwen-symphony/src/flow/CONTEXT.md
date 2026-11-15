@@ -7,7 +7,8 @@ Observed execution traces are ingested, grouped by their successful-edge structu
 A packed recipe also carries the generated SwarmFlow orchestrator script (`swarmflow/run.py`), and a reviewed pack renders as one SDD-0010 SkillPack `SKILL.md` document.
 Distillation is structural, not narrative: evidence groups on its cycle-broken successful-edge signature, versions are content-addressed and immutable, and a model can only write prose.
 The flow store writes eagerly and atomically, so there is no flush on close and a reopened engine reproduces its evidence, recipe versions, and packages.
-Everything here is offline and deterministic; an optional `CompletionModel` supplies only names, applicability, and narrative text, with a template fallback.
+Everything here is offline and deterministic; an optional `CompletionModel` supplies names, applicability, and narrative text (with a template fallback) and, in the opt-in review stage, additional package findings (with a fail-closed merge).
+The deterministic ten-check gate is always model-free; the model stage runs after it, only over packages it approved.
 
 ## API Surface
 
@@ -213,11 +214,13 @@ pub const VERDICT_REJECTED: &str = "rejected";
 pub const VERDICT_NEEDS_HUMAN_REVIEW: &str = "needs_human_review";
 pub const CHECK_PASS: &str = "pass";
 pub const CHECK_FAIL: &str = "fail";
+pub const REVIEW_MODE_DETERMINISTIC: &str = "deterministic";
+pub const REVIEW_MODE_LLM: &str = "llm";
 
 pub struct Reviewer;
 impl Reviewer { pub fn new() -> Self; pub fn review(&self, pack: &SkillPack) -> ReviewResult; }
 pub struct ReviewCheck { pub check: String, pub result: String /*pass|fail*/, pub reasons: Vec<String> }
-pub struct ReviewResult { pub review_id: String, pub package_id: String, pub target_kind: String, pub verdict: String, pub checks: Vec<ReviewCheck>, pub materials_hash: String, pub reviewed_at: String, pub schema_version: String }
+pub struct ReviewResult { pub review_id: String, pub package_id: String, pub target_kind: String, pub verdict: String, pub checks: Vec<ReviewCheck>, pub materials_hash: String, pub reviewed_at: String, pub schema_version: String, pub review_mode: String /*deterministic|llm*/, pub notes: Vec<String> }
 impl ReviewResult { pub fn failed_checks(&self) -> Vec<&ReviewCheck>; pub fn failure_reasons(&self) -> Vec<String>; }
 pub struct InstallPreparation { pub recipe_id: String, pub target_kind: String, pub verdict: String, pub package: Option<SkillPack>, pub artifact_dir: Option<PathBuf>, pub review: Option<ReviewResult>, pub reasons: Vec<String> }
 ```
@@ -226,10 +229,58 @@ The `Reviewer` runs ten checks in order — `structure`, `dependencies`, `code_s
 
 `code_safety` scans every rendered artifact (including `swarmflow/run.py`) for the forbidden tokens, and runs `validate_generated_script` over a pack's generated script.
 
-A pack may not request `credential_access`, `filesystem_write`, `process`, or `shell`, and may only declare `Apache-2.0`, `BSD-3-Clause`, `MIT`, or `Proprietary`; `review_id` is `review_<12 hex>` over the identity fields, and `reviewed_at` is metadata only.
+A pack may not request `credential_access`, `filesystem_write`, `process`, or `shell`, and may only declare `Apache-2.0`, `BSD-3-Clause`, `MIT`, or `Proprietary`; `review_id` is `review_<12 hex>` over `package_id`, `target_kind`, `verdict`, `checks` and `materials_hash`, and `reviewed_at`, `review_mode` and `notes` are metadata only.
 
 `review_and_prepare_install`/`prepare_install` return structural rejections (unsupported target kind, unknown recipe, stale requested version, failed review) as `InstallPreparation::verdict` with reasons, not errors, and only I/O failures are `Err`.
-Python's `LLMPackageReviewAgent` is not ported: `Reviewer` is the only review path and no check calls a model or the network.
+
+### Model-driven review
+
+```rust
+pub const REVIEW_CHECK_NAMES: [&str; 10];                     // the ten check names, in review order
+pub const MIN_FINDING_CONFIDENCE: f64 = 0.5;
+pub const MAX_REASON_CHARS: usize = 500;
+pub const MAX_NOTE_CHARS: usize = 500;
+pub const MAX_NOTES: usize = 8;
+pub const MAX_REASONS_PER_CHECK: usize = 3;
+pub const MODEL_REASON_PREFIX: &str = "model review: ";
+pub const FALLBACK_NOTE_PREFIX: &str = "deterministic_fallback: ";
+pub const SKIPPED_NOTE_PREFIX: &str = "model review skipped: ";
+pub const MAX_ARTIFACT_CHARS: usize = 2_000;
+pub const MAX_ARTIFACTS: usize = 8;
+pub const MAX_STEP_DESCRIPTION_CHARS: usize = 400;
+pub const MAX_PROMPT_STEPS: usize = 32;
+pub const MAX_FIELD_CHARS: usize = 1_000;
+pub const REVIEW_SYSTEM_PROMPT: &str;                          // the pinned system instruction
+
+pub struct LlmPackageReviewer;
+impl LlmPackageReviewer {
+    pub fn new(model: Arc<dyn CompletionModel>) -> Self;
+    pub fn without_model() -> Self;
+    pub fn with_fallback(self, fallback: FallbackMode) -> Self;
+    pub fn fallback(&self) -> FallbackMode;
+    pub fn has_model(&self) -> bool;
+    pub async fn review(&self, pack: &SkillPack, deterministic: ReviewResult) -> Result<ReviewResult>;
+    pub async fn review_pack(&self, pack: &SkillPack) -> Result<ReviewResult>;
+    pub fn render_prompt(pack: &SkillPack, deterministic: &ReviewResult) -> String;
+}
+pub struct LlmReviewFinding { pub check: String, pub result: String /*pass|fail*/, pub reason: String, pub confidence: f64 /*defaults to 1.0*/ }
+```
+
+Python's `flow.review.LLMPackageReviewAgent` returns one verdict; this port returns findings bound to the ten deterministic check names, so the model can add detail but never rewrite machine-checked ground truth.
+
+The merge is fail-closed: a model `fail` at or above `MIN_FINDING_CONFIDENCE` appends `model review: <reason>` to that check (capped at `MAX_REASONS_PER_CHECK`) and marks it failed; a model `pass` is ignored entirely and can never clear a deterministic failure, so the deterministic `secrets` and `code_safety` verdicts stay authoritative.
+The verdict is then re-derived with the three-state rule and `review_id` is refreshed over the merged checks.
+
+When the deterministic verdict is not `approved` the stage is not run at all (Python's gate does the same), so a rejected or human-review package is never sent to a model and the result gains a `model review skipped:` note; `LlmPackageReviewer::without_model` answers the deterministic result unchanged.
+
+The reply must be an object with a `checks` array; unknown check names, non-object items, unknown `result` values and non-string notes are dropped with a `tracing::warn!` naming the reply item, an absent `confidence` means `1.0` and a non-numeric one warns, and only a missing or non-array `checks` (or no JSON object) is an unusable reply.
+Reasons are redacted with `redact_sensitive_text` and clamped on character boundaries before they enter a `ReviewResult`.
+
+Provenance is explicit: a merged review carries `review_mode = "llm"`, a review the stage did not touch carries `"deterministic"`, an unusable reply is `Error::Llm` naming `llm package review` under `FallbackMode::Error`, and under `FallbackMode::Deterministic` it keeps the deterministic verdict with a `deterministic_fallback: <reason>` note plus a `tracing::warn!`.
+A `deterministic` review handed to `review` for another package id, or one that is already an `llm` review, is `Error::Validation`.
+
+The prompt is one byte-stable rendering: the pinned `REVIEW_SYSTEM_PROMPT` plus a canonical JSON payload of the package (redacted with `redact_private_json`, descriptions and trigger conditions capped at `MAX_FIELD_CHARS`, artifact text at `MAX_ARTIFACT_CHARS` for at most `MAX_ARTIFACTS`, steps at `MAX_PROMPT_STEPS` with `steps_total`/`artifacts_truncated` flags) and the deterministic checks.
+`FlowEngine::review_and_prepare_install_with_reviewer` runs the deterministic gate, then the model stage, then the same approve-or-report path; `review_and_prepare_install` and `prepare_install` stay deterministic-only.
 
 ## Constraints
 
@@ -239,7 +290,8 @@ Python's `LLMPackageReviewAgent` is not ported: `Reviewer` is the only review pa
 - Only an `active`, `verified` linear chain can be packed; every other shape is a typed validation error.
 - Every public item is documented; no `unsafe`, no `println!`, no panics on user input.
 - Reuse `CapabilityIo` and `openjiuwen-retrieval`'s `CompletionModel`; do not duplicate shared types.
-- Files stay around or under 1000 lines: `pack.rs` and `engine.rs` are the largest and are split by responsibility.
+- The ten deterministic checks never call a model; only `review_llm.rs` does, and it can only add failures — never remove one and never upgrade a rejected package.
+- Files stay around or under 1000 lines: `pack.rs`, `review.rs` and `review_llm.rs` are the largest and are split by responsibility.
 
 ## Routing Table
 
@@ -252,9 +304,11 @@ Python's `LLMPackageReviewAgent` is not ported: `Reviewer` is the only review pa
 - `./codegen.rs` → `generate_swarmflow_script`, `swarmflow_identifier`, `validate_generated_script`, `python_string_literal`, `SwarmflowScript`
 - `./pack.rs` → `SkillPack`, content-addressed identity, `SKILL.md`/`dependencies.yaml`/`swarmflow/run.py` render, save/load
 - `./render.rs` → `SkillPackAdapter`, `SkillAdapter`, `RenderedArtifact`, `render_package`
-- `./review.rs` → `Reviewer`, the ten checks, verdicts, `InstallPreparation`
+- `./review.rs` → `Reviewer`, the ten checks, verdicts, `ReviewResult`, `InstallPreparation`, the install preparation path
+- `./review_llm.rs` → `LlmPackageReviewer`, the pinned system prompt, reply parsing, the fail-closed merge, prompt rendering
 
 ## Tests
 
 - `tests/flow.rs` — normalization, ingestion, grouping, versioning, persistence, packing/rendering/loading (including `swarmflow/run.py`), the ten review checks, installation preparation, and the model-narrative fallback.
+- `tests/flow.rs` (model review) — findings added to an approved pack, a deterministic `secrets` failure the model cannot overturn (and never sees), malformed replies under both fallback modes, dropped unknown checks and low-confidence findings, redacted/clamped reasons, byte-identical reruns of one scripted reply, the model-free reviewer, and installation preparation both blocked and approved by the stage.
 - `tests/flow_codegen.rs` — pinned two-step script, empty-combination script, identifier stability/content sensitivity, quote/newline/CJK escaping, the validator's accept/reject cases and first-bad-line reporting, member validation failures, the unsupported render target, script participation in the package id, and a full pack → review → install path containing `run.py`.

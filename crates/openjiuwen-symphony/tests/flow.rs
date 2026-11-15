@@ -3,8 +3,8 @@
 //! Everything is offline and deterministic: temporary roots, scripted completion
 //! models, and no clock-dependent assertions (timestamps are never compared).
 //! The tests cover trace normalization, evidence ingestion, grouping, versioning,
-//! persistence, packing/rendering/loading, the ten review checks, installation
-//! preparation, and the model-narrative fallback.
+//! persistence, packing/rendering/loading, the ten review checks, the optional
+//! model review stage, installation preparation, and the model-narrative fallback.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(
     clippy::float_cmp,
@@ -18,9 +18,11 @@ use std::sync::Arc;
 use openjiuwen_retrieval::StaticCompletionModel;
 use openjiuwen_symphony::error::ErrorKind;
 use openjiuwen_symphony::flow::{
-    FlowEngine, FlowTrace, ReviewResult, Reviewer, SkillPack, TraceOutcome, CHECK_FAIL,
-    VERDICT_APPROVED, VERDICT_NEEDS_HUMAN_REVIEW, VERDICT_REJECTED,
+    FlowEngine, FlowTrace, LlmPackageReviewer, ReviewResult, Reviewer, SkillPack, TraceOutcome,
+    CHECK_FAIL, REVIEW_MODE_DETERMINISTIC, REVIEW_MODE_LLM, VERDICT_APPROVED,
+    VERDICT_NEEDS_HUMAN_REVIEW, VERDICT_REJECTED,
 };
+use openjiuwen_symphony::llm::FallbackMode;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -810,4 +812,299 @@ fn review_constants_are_stable() {
     assert_eq!(VERDICT_APPROVED, "approved");
     assert_eq!(VERDICT_REJECTED, "rejected");
     assert_eq!(VERDICT_NEEDS_HUMAN_REVIEW, "needs_human_review");
+}
+
+/// Returns the named check of a review result.
+fn check<'a>(result: &'a ReviewResult, name: &str) -> &'a openjiuwen_symphony::flow::ReviewCheck {
+    result
+        .checks
+        .iter()
+        .find(|check| check.check == name)
+        .expect("check present")
+}
+
+#[tokio::test]
+async fn llm_review_can_add_findings_to_an_approved_pack() {
+    let dir = TempDir::new().unwrap();
+    let (engine, recipe_id) = distilled_engine(dir.path()).await;
+    let pack = engine.pack(&recipe_id).await.unwrap();
+    let deterministic = Reviewer::new().review(&pack);
+    assert_eq!(deterministic.verdict, VERDICT_APPROVED);
+
+    let model = Arc::new(StaticCompletionModel::new(vec![
+        r#"{"checks": [{"check": "materials", "result": "fail", "reason": "the steps contradict the description", "confidence": 0.9}], "notes": ["reviewed by hand"]}"#.to_string(),
+        r#"{"checks": [{"check": "materials", "result": "fail", "reason": "the steps contradict the description", "confidence": 0.9}], "notes": ["reviewed by hand"]}"#.to_string(),
+    ]));
+    let reviewer = LlmPackageReviewer::new(model.clone());
+    assert!(reviewer.has_model());
+
+    let merged = reviewer
+        .review(&pack, deterministic.clone())
+        .await
+        .expect("review");
+    assert_eq!(model.call_count(), 1);
+    assert_eq!(merged.review_mode, REVIEW_MODE_LLM);
+    assert_eq!(merged.verdict, VERDICT_REJECTED);
+    assert_eq!(failed_names(&merged), vec!["materials"]);
+    assert_eq!(
+        check(&merged, "materials").reasons,
+        vec!["model review: the steps contradict the description".to_string()]
+    );
+    assert_eq!(merged.notes, vec!["reviewed by hand".to_string()]);
+    assert_ne!(merged.review_id, deterministic.review_id);
+    assert_eq!(merged.package_id, pack.package_id);
+    // The deterministic checks are otherwise untouched.
+    for name in [
+        "structure",
+        "dependencies",
+        "code_safety",
+        "secrets",
+        "artifact_paths",
+        "integrity",
+        "meta_naming",
+        "permissions",
+        "license",
+    ] {
+        assert_eq!(check(&merged, name).result, "pass", "{name} should pass");
+        assert!(check(&merged, name).reasons.is_empty(), "{name}");
+    }
+
+    // The same scripted reply reproduces a byte-identical verdict.
+    let repeat = reviewer
+        .review(&pack, deterministic)
+        .await
+        .expect("review again");
+    assert_eq!(repeat, merged);
+    assert_eq!(model.call_count(), 2);
+}
+
+#[tokio::test]
+async fn llm_review_cannot_overturn_a_deterministic_failure() {
+    let dir = TempDir::new().unwrap();
+    let (engine, recipe_id) = distilled_engine(dir.path()).await;
+    let pack = engine.pack(&recipe_id).await.unwrap();
+
+    // A pack whose `secrets` check fails without the model's help.
+    let mut leaky = pack.clone();
+    leaky.steps[1].description = "call it with api_key: sk-live-0123456789abcdef".to_string();
+    leaky.recompute_identity();
+    let deterministic = Reviewer::new().review(&leaky);
+    assert_eq!(failed_names(&deterministic), vec!["secrets"]);
+
+    // The model claims every check passes; the deterministic failure stands and
+    // no model is called at all.
+    let model = Arc::new(StaticCompletionModel::single(
+        r#"{"checks": [{"check": "secrets", "result": "pass", "reason": "no secret here"}]}"#,
+    ));
+    let merged = LlmPackageReviewer::new(model.clone())
+        .review(&leaky, deterministic.clone())
+        .await
+        .expect("review");
+    assert_eq!(model.call_count(), 0);
+    assert_eq!(merged.verdict, VERDICT_REJECTED);
+    assert_eq!(failed_names(&merged), vec!["secrets"]);
+    assert_eq!(merged.review_mode, REVIEW_MODE_DETERMINISTIC);
+    assert!(merged.notes[0].starts_with("model review skipped:"));
+    assert_eq!(check(&merged, "secrets").result, CHECK_FAIL);
+    assert!(check(&merged, "secrets").reasons[0].contains("unredacted credential material"));
+
+    // A `pass` over a deterministic failure never clears it, even when the stage
+    // does run (an approved package the model then reports as broken).
+    let clean = Reviewer::new().review(&pack);
+    let failing_only_reason = Arc::new(StaticCompletionModel::single(
+        r#"{"checks": [{"check": "code_safety", "result": "pass", "reason": "fine"}]}"#,
+    ));
+    let merged = LlmPackageReviewer::new(failing_only_reason)
+        .review(&pack, clean.clone())
+        .await
+        .expect("review");
+    assert_eq!(merged.verdict, VERDICT_APPROVED);
+    assert_eq!(merged.review_mode, REVIEW_MODE_LLM);
+    assert_eq!(merged.checks, clean.checks);
+    assert_eq!(merged.review_id, clean.review_id);
+}
+
+#[tokio::test]
+async fn llm_review_malformed_replies_fall_back_or_error() {
+    let dir = TempDir::new().unwrap();
+    let (engine, recipe_id) = distilled_engine(dir.path()).await;
+    let pack = engine.pack(&recipe_id).await.unwrap();
+    let deterministic = Reviewer::new().review(&pack);
+    assert_eq!(deterministic.verdict, VERDICT_APPROVED);
+
+    for reply in [
+        "not json at all",
+        r#"{"notes": ["no checks array"]}"#,
+        r#"{"checks": "not an array"}"#,
+    ] {
+        // The default mode keeps the deterministic verdict, with a marker.
+        let merged = LlmPackageReviewer::new(Arc::new(StaticCompletionModel::single(reply)))
+            .review(&pack, deterministic.clone())
+            .await
+            .expect("fallback");
+        assert_eq!(merged.verdict, VERDICT_APPROVED);
+        assert_eq!(merged.review_mode, REVIEW_MODE_DETERMINISTIC);
+        assert_eq!(merged.checks, deterministic.checks);
+        assert_eq!(merged.review_id, deterministic.review_id);
+        assert_eq!(merged.notes.len(), 1);
+        assert!(
+            merged.notes[0].starts_with("deterministic_fallback: "),
+            "{}",
+            merged.notes[0]
+        );
+        assert!(merged.notes[0].contains("llm package review"));
+
+        // The strict mode surfaces the same failure as a typed error.
+        let strict = LlmPackageReviewer::new(Arc::new(StaticCompletionModel::single(reply)))
+            .with_fallback(FallbackMode::Error)
+            .review(&pack, deterministic.clone())
+            .await;
+        let error = strict.expect_err("typed error");
+        assert_eq!(error.kind(), ErrorKind::Llm);
+        assert!(error.message().contains("llm package review"));
+    }
+
+    // A model invocation failure (an exhausted script) is the same two paths.
+    let failing = LlmPackageReviewer::new(Arc::new(StaticCompletionModel::new(Vec::new())));
+    let merged = failing
+        .review(&pack, deterministic.clone())
+        .await
+        .expect("fallback");
+    assert_eq!(merged.review_mode, REVIEW_MODE_DETERMINISTIC);
+    let error = failing
+        .with_fallback(FallbackMode::Error)
+        .review(&pack, deterministic)
+        .await
+        .expect_err("typed error");
+    assert_eq!(error.kind(), ErrorKind::Llm);
+}
+
+#[tokio::test]
+async fn llm_review_drops_unknown_checks_and_redacts_reasons() {
+    let dir = TempDir::new().unwrap();
+    let (engine, recipe_id) = distilled_engine(dir.path()).await;
+    let pack = engine.pack(&recipe_id).await.unwrap();
+    let deterministic = Reviewer::new().review(&pack);
+
+    let long_reason = format!("leaked Bearer abcdefgh12345678 {}", "x".repeat(2_000));
+    let reply = json!({
+        "checks": [
+            {"check": "quality", "result": "fail", "reason": "unknown check"},
+            {"check": "permissions", "result": "fail", "reason": "unsure", "confidence": 0.1},
+            {"check": "license", "result": "fail", "reason": long_reason},
+            {"check": "license", "result": "fail", "reason": "second finding"},
+            "nonsense",
+        ],
+        "notes": ["note one", "note one", 7],
+    });
+    let merged =
+        LlmPackageReviewer::new(Arc::new(StaticCompletionModel::single(reply.to_string())))
+            .review(&pack, deterministic)
+            .await
+            .expect("review");
+
+    // The unknown check and the low-confidence finding are dropped.
+    assert!(!merged.checks.iter().any(|check| check.check == "quality"));
+    assert_eq!(check(&merged, "permissions").result, "pass");
+    assert!(check(&merged, "permissions").reasons.is_empty());
+    // The surviving findings are redacted, clamped and prefixed.
+    assert_eq!(failed_names(&merged), vec!["license"]);
+    assert_eq!(check(&merged, "license").reasons.len(), 2);
+    let reason = &check(&merged, "license").reasons[0];
+    assert!(reason.starts_with("model review: "));
+    assert!(!reason.contains("abcdefgh12345678"));
+    assert!(reason.contains("<redacted"));
+    assert!(reason.chars().count() <= 500 + "model review: ".chars().count());
+    // Non-string and duplicate notes are dropped; the note list stays sorted by
+    // reply order.
+    assert_eq!(merged.notes, vec!["note one".to_string()]);
+    assert_eq!(merged.verdict, VERDICT_REJECTED);
+}
+
+#[tokio::test]
+async fn llm_review_without_a_model_is_the_deterministic_review() {
+    let dir = TempDir::new().unwrap();
+    let (engine, recipe_id) = distilled_engine(dir.path()).await;
+    let pack = engine.pack(&recipe_id).await.unwrap();
+    let deterministic = Reviewer::new().review(&pack);
+
+    let reviewer = LlmPackageReviewer::without_model();
+    assert!(!reviewer.has_model());
+    let result = reviewer.review_pack(&pack).await.expect("review");
+    assert_eq!(result.review_mode, REVIEW_MODE_DETERMINISTIC);
+    assert!(result.notes.is_empty());
+    assert_eq!(result.checks, deterministic.checks);
+    assert_eq!(result.verdict, VERDICT_APPROVED);
+    assert_eq!(result.review_id, deterministic.review_id);
+
+    // A review for another package is a caller error, not a silent merge.
+    let mut stranger = deterministic.clone();
+    stranger.package_id = "cap-000000000000".to_string();
+    let error = reviewer
+        .review(&pack, stranger)
+        .await
+        .expect_err("package mismatch");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+}
+
+#[tokio::test]
+async fn installation_preparation_runs_the_model_review_stage() {
+    let dir = TempDir::new().unwrap();
+    let (engine, recipe_id) = distilled_engine(dir.path()).await;
+    let destination = TempDir::new().unwrap();
+
+    // A model that adds a failure blocks the installation.
+    let blocking = LlmPackageReviewer::new(Arc::new(StaticCompletionModel::single(
+        r#"{"checks": [{"check": "materials", "result": "fail", "reason": "the package is not reviewable"}]}"#,
+    )));
+    let blocked = engine
+        .review_and_prepare_install_with_reviewer(
+            &recipe_id,
+            "skill",
+            destination.path(),
+            &blocking,
+        )
+        .await
+        .expect("preparation");
+    assert_eq!(blocked.verdict, VERDICT_REJECTED);
+    assert_eq!(
+        blocked.reasons,
+        vec!["materials: model review: the package is not reviewable".to_string()]
+    );
+    assert!(blocked.artifact_dir.is_none());
+    assert!(!destination.path().join("SKILL.md").exists());
+    let review = blocked.review.expect("review");
+    assert_eq!(review.review_mode, REVIEW_MODE_LLM);
+
+    // A model with no findings still approves and renders.
+    let permissive = LlmPackageReviewer::new(Arc::new(StaticCompletionModel::single(
+        r#"{"checks": [{"check": "materials", "result": "pass"}], "notes": ["looks good"]}"#,
+    )));
+    let prepared = engine
+        .review_and_prepare_install_with_reviewer(
+            &recipe_id,
+            "skill",
+            destination.path(),
+            &permissive,
+        )
+        .await
+        .expect("preparation");
+    assert_eq!(prepared.verdict, VERDICT_APPROVED);
+    assert!(prepared.reasons.is_empty());
+    assert!(destination.path().join("SKILL.md").is_file());
+    let review = prepared.review.expect("review");
+    assert_eq!(review.review_mode, REVIEW_MODE_LLM);
+    assert_eq!(review.notes, vec!["looks good".to_string()]);
+
+    // The deterministic entry point still works and stays deterministic.
+    let plain_destination = TempDir::new().unwrap();
+    let plain = engine
+        .review_and_prepare_install(&recipe_id, "skill", plain_destination.path())
+        .await
+        .expect("preparation");
+    assert_eq!(plain.verdict, VERDICT_APPROVED);
+    assert_eq!(
+        plain.review.expect("review").review_mode,
+        REVIEW_MODE_DETERMINISTIC
+    );
 }
