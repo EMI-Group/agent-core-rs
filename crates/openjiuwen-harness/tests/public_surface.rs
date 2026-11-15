@@ -17,7 +17,11 @@
 //! - [`WorktreeLock`] / [`SparseConfig`] acquire a repository lock and refuse a hostile path;
 //! - [`ActivityThrottle`] clamps its tunables;
 //! - [`drain_rail_events`] takes the goal channel out of a [`HarnessRailContext`];
-//! - [`DiagnosticRegistry`] buffers and clears push diagnostics.
+//! - [`DiagnosticRegistry`] buffers and clears push diagnostics;
+//! - [`ExecutionCatalog`] / [`FileSessionStore`] enumerate a journalled execution and its session
+//!   record through the [`PersistentAgentLayout`] constants, [`seed_state`] replaces the
+//!   `deepagent` lane, and the resume entry points ([`ResumedTurn`], `run_with_model_resumed`,
+//!   `Repl::seed_history`, `DeepAgent::seed_history`) are pinned to their exact signatures.
 //!
 //! Everything runs offline against `tempfile` directories, scripted models and injected clocks.
 
@@ -32,15 +36,22 @@ use openjiuwen_common::error::ErrorKind;
 use openjiuwen_foundation::{BaseMessage, Model};
 // `prompt_sections` is the read side of the prompt-section channel and is only reachable through
 // its module; every type below is spelled through the flat crate root.
+use openjiuwen_harness::cli::{CliIo, CliOptions, RunArgs, RunOutcome};
 use openjiuwen_harness::rails::prompt_sections;
 use openjiuwen_harness::{
-    drain_rail_events, ActivityThrottle, Capacity, Diagnostic, DiagnosticRegistry,
-    DiagnosticsConfig, DiagnosticsEvent, EntryPayload, ExecutionIdentity, ExecutionLog, GoalRail,
-    GoalRailConfig, GoalStore, HarnessRail, HarnessRailContext, HeartbeatRail, HeartbeatRailConfig,
+    drain_rail_events, percent_decode_identifier, percent_encode_identifier, run_once_resumed,
+    run_with_model_resumed, seed_state, ActivityThrottle, Capacity, DeepAgent, Diagnostic,
+    DiagnosticRegistry, DiagnosticsConfig, DiagnosticsEvent, EntryPayload, ExecutionCatalog,
+    ExecutionIdentity, ExecutionLog, ExecutionSummary, FileSessionStore, GoalRail, GoalRailConfig,
+    GoalStore, HarnessRail, HarnessRailContext, HeartbeatRail, HeartbeatRailConfig,
     HeartbeatReason, InteractionEvent, LogCapacity, ManualClock, MoaConfig, MoaRail, ModelUsage,
-    PersonalContextStore, Range, SparseConfig, WatchTargetKind, WindowAssembler, WorkspaceWatcher,
-    WorktreeLock, WorktreeLockConfig, GOAL_EVENT_EXTRA_KEY,
+    PersistentAgentLayout, PersistentSessionRecord, PersonalContextStore, Range, Repl, ResumedTurn,
+    SessionBinding, SessionStateStore, SessionSummary, SparseConfig, WatchTargetKind,
+    WindowAssembler, Workspace, WorkspaceWatcher, WorktreeLock, WorktreeLockConfig,
+    GOAL_EVENT_EXTRA_KEY, LINKS_DIR, LOGS_DIR, PERSISTENT_AGENT_NODE, SESSIONS_DIR,
+    SESSION_STATE_KEY,
 };
+use openjiuwen_session::{AgentSession, Session};
 use openjiuwen_test_support::ScriptedModel;
 use serde_json::json;
 use tempfile::TempDir;
@@ -506,6 +517,147 @@ async fn workspace_watcher_starts_with_notify() -> Result<()> {
             .await
             .is_none(),
         "a shut-down watcher must not publish another update"
+    );
+    Ok(())
+}
+
+// --- host resume ----------------------------------------------------------
+
+/// Compile-time pin of `run_once_resumed`'s signature.
+///
+/// An `async fn` item cannot coerce to a `fn` pointer (its return type is an unnameable future),
+/// so every async pin here is a one-line wrapper with the exact argument and return types: a
+/// changed argument type, arity or error type fails to compile. The wrappers are referenced but
+/// never called — this one would build a provider model and needs credentials.
+async fn pinned_run_once_resumed(
+    options: &CliOptions,
+    args: &RunArgs,
+    io: &CliIo,
+    resumed: ResumedTurn,
+) -> openjiuwen_common::error::Result<RunOutcome> {
+    run_once_resumed(options, args, io, resumed).await
+}
+
+/// Compile-time pin of `run_with_model_resumed`'s signature (never called here).
+async fn pinned_run_with_model_resumed(
+    options: &CliOptions,
+    args: &RunArgs,
+    io: &CliIo,
+    model: Arc<dyn Model>,
+    resumed: ResumedTurn,
+) -> openjiuwen_common::error::Result<RunOutcome> {
+    run_with_model_resumed(options, args, io, model, resumed).await
+}
+
+/// Compile-time pin of `Repl::seed_history`'s signature (never called here).
+async fn pinned_repl_seed_history(
+    repl: &mut Repl,
+    history: Vec<BaseMessage>,
+) -> openjiuwen_common::error::Result<()> {
+    repl.seed_history(history).await
+}
+
+/// Compile-time pin of `DeepAgent::seed_history`'s signature (never called here).
+async fn pinned_deep_agent_seed_history(
+    agent: &DeepAgent,
+    session: &Arc<dyn Session>,
+    history: Vec<BaseMessage>,
+) -> openjiuwen_common::error::Result<()> {
+    agent.seed_history(session, history).await
+}
+
+/// The host-resume surface resolves from the crate root and does real work.
+#[tokio::test]
+async fn resume_surface_comes_from_the_crate_root() -> Result<()> {
+    let temp = TempDir::new()?;
+    let workspace = Workspace::for_language(temp.path().join("workspace"), "en");
+    let layout = PersistentAgentLayout::for_workspace(&workspace);
+    ensure!(
+        layout.base() == workspace.root_path.join(PERSISTENT_AGENT_NODE).as_path(),
+        "the layout must fall back to the workspace node, got {}",
+        layout.base().display()
+    );
+    ensure!(
+        layout.logs_root() == layout.base().join(LOGS_DIR)
+            && layout.sessions_root() == layout.base().join(SESSIONS_DIR)
+            && layout.links_root() == layout.base().join(LINKS_DIR),
+        "the layout roots must be the exported directory constants"
+    );
+
+    // `percent_decode_identifier` inverts the encoding the layout and the stores share.
+    let encoded = percent_encode_identifier("agent/1");
+    ensure!(
+        encoded == "agent%2F1" && percent_decode_identifier(&encoded).as_deref() == Some("agent/1"),
+        "unexpected identifier encoding: {encoded}"
+    );
+
+    // One journalled execution, discovered by the catalogue.
+    let identity = ExecutionIdentity::new("ns", "agent", "session", "req", "exec", "src")?;
+    let log = ExecutionLog::open_with_clock(
+        layout.logs_root().join(identity.directory_name()),
+        identity,
+        LogCapacity::default(),
+        Arc::new(ManualClock::new(NOW_MS)),
+    )
+    .await?;
+    log.append(EntryPayload::execution_started("resume me"))
+        .await?;
+    let catalog = ExecutionCatalog::new(layout.logs_root(), LogCapacity::default())
+        .with_clock(Arc::new(ManualClock::new(NOW_MS)));
+    let summary: ExecutionSummary = catalog
+        .list()
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("the journalled execution must be catalogued"))?;
+    ensure!(
+        summary.execution_id == "exec" && summary.entries == 1 && summary.usable,
+        "unexpected execution summary: {summary:?}"
+    );
+
+    // One persisted session record, discovered by the store.
+    let binding = SessionBinding::new("agent", "session")?;
+    let store = FileSessionStore::new(layout.sessions_root());
+    let mut record = PersistentSessionRecord::new(&binding)?;
+    record.messages = vec![BaseMessage::user("resume me")];
+    store.save(&record).await?;
+    let session: SessionSummary = store
+        .list()
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("the persisted session record must be catalogued"))?;
+    ensure!(
+        session.binding == binding && session.state_path == store.path_for(&binding),
+        "unexpected session summary: {session:?}"
+    );
+
+    // The resumed-turn value keeps what its builders set.
+    let turn = ResumedTurn::new("session")
+        .with_history(vec![BaseMessage::user("earlier question")])
+        .with_state(json!({"iteration": 1}));
+    ensure!(
+        turn.session_id == "session"
+            && turn.history.len() == 1
+            && turn.state == Some(json!({"iteration": 1})),
+        "the builders must keep their fields: {turn:?}"
+    );
+
+    // `seed_state` really replaces the persisted `deepagent` lane of a session.
+    let seeded: Arc<dyn Session> = Arc::new(AgentSession::new("session"));
+    seed_state(seeded.as_ref(), json!({"iteration": 3})).await?;
+    ensure!(
+        seeded.get_state(SESSION_STATE_KEY).await? == Some(json!({"iteration": 3})),
+        "the seeded payload must be the session state"
+    );
+
+    // Signature pins of the async surface: referencing the wrappers keeps them (and therefore
+    // their signatures) compiled; nothing is executed.
+    let _ = (
+        pinned_run_once_resumed,
+        pinned_run_with_model_resumed,
+        pinned_repl_seed_history,
+        pinned_deep_agent_seed_history,
     );
     Ok(())
 }
