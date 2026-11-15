@@ -4,7 +4,7 @@
 
 Port of `openjiuwen/extensions/tracer_otel/` (v0.1.20): turn session trace frames into OpenTelemetry spans with the Python span names, attributes, statuses, redaction, and parent/child links.
 Python registers async handler callbacks on the session tracer registry; Rust sessions emit synchronous [`TraceSink`] frames instead, so the primary seam is a sink (`OtelTraceSink`) plus typed handlers (`OtelAgentHandler`, `OtelWorkflowHandler`) for callers that already hold a `TraceSpan`.
-Finished spans leave the process through one of four exporters: in-memory capture (`Memory`), one `tracing` line per span (`Console`), nothing (`None`), or OTLP/HTTP with JSON or protobuf payloads (`Otlp`, in `otlp/`).
+Finished spans leave the process through one of five exporters: in-memory capture (`Memory`), one `tracing` line per span (`Console`), nothing (`None`), one JSONL trace file per day (`File`, see `../observability/file_exporter.rs`), or OTLP/HTTP with JSON or protobuf payloads (`Otlp`, in `otlp/`).
 Two presets wrap the OTLP exporter for hosted backends and for a local collector: the Grafana Cloud gateway and the self-hosted Grafana Agent/Alloy preset (`grafana/`), and Langfuse (`langfuse/`).
 Everything that decides *what a span looks like* — configuration, environment resolution, semantic conventions, redaction, span names — plus both presets compile without the `otel` feature; only the SDK-backed exporter, sink, and handlers need it.
 Without the feature, `init_otel_tracer` validates the configuration and returns an inactive handle for every exporter type instead of failing.
