@@ -28,7 +28,7 @@ fn shell(&self) -> Option<Arc<dyn ShellOperation>>
 fn code(&self) -> Option<Arc<dyn CodeOperation>>
 fn isolation_key_template(&self) -> Option<&str>   // None in local mode
 fn sandbox_endpoint(&self) -> Option<&SandboxEndpoint>          // Some only for a lifecycle-bound service
-async fn release_sandbox(&self) -> Result<()>                   // applies launcher_config.on_stop
+async fn release_sandbox(&self) -> Result<()>                   // applies launcher_config.on_stop; a launcher that cannot delete/pause refuses with `Unsupported`
 async fn evict_idle_sandboxes(&self) -> Vec<String>              // deletes containers past idle_ttl_seconds
 async fn evict_idle_sandboxes_at(&self, now_epoch_secs: u64) -> Vec<String>
 fn tool_specs(&self) -> Vec<OperationToolSpec>     // 13 specs: 10 fs, 2 shell, 1 code
@@ -78,7 +78,10 @@ Streaming methods take `self: Arc<Self>` and return `OpStream<T>` = `BoxStream<'
 idiomatic `Result`; `into_optional_result()` keeps the payload optional.
 `SysOpStatus` carries the Python codes: 0 success, -1 error, 199001 manager, 199002 card
 param, 199003 fs, 199004 shell, 199005 code, 199006 registry, 199007 sandbox gateway,
-199008 launcher, 199009 provider, 199010 isolation key, 199011 file version conflict.
+199008 launcher, 199009 provider, 199010 isolation key, 199011 file version conflict, plus the
+Rust-only 199012 (`SysOpStatus::Unsupported`: "the sandbox backend does not implement this
+capability"; `OpResult::into_result`/`into_optional_result` turn it back into
+`ErrorKind::Unsupported`).
 Message builders (`fs_execution_message`, `shell_execution_message`, `code_execution_message`,
 `registry_message`, `sandbox_gateway_message`, `sandbox_launcher_message`,
 `sandbox_provider_message`, `isolation_key_message`, …) reproduce the Python templates
@@ -110,8 +113,11 @@ quality scoring → Latin-1), `decode_text`, `encode_text`, `is_binary`, `bom_en
 `fs::lock` — `FileLockManager`, `FileLockGuard`, `LockMode`, `LockError`, `lock_path_for`,
 `default_lock_root` (cross-process advisory `flock`).
 `shell::pty` (crate-internal, Unix) — `openpty`-backed streaming spawn with a documented pipe fallback.
-`sandbox::launcher` — `SandboxLauncher`, `LaunchedSandbox`, `SandboxStatus`,
-`LauncherRegistry`, `PreDeploymentLauncher`, `global()`, error builders.
+`sandbox::launcher` — `SandboxLauncher` trait, `LaunchedSandbox`, `SandboxStatus`
+(`Running`/`Paused`/`Stopped`/`Unknown`), `LauncherRegistry`, `PreDeploymentLauncher`,
+`global()`, error builders; only `launch` is required — the inherited `pause`/`resume`/`delete`
+refuse with `ErrorKind::Unsupported` naming the launcher, and the inherited `check_status`
+reports `SandboxStatus::Unknown` instead of claiming the container is running.
 `sandbox::lifecycle` — `SandboxRecord`, `Clock`/`SystemClock`/`FixedClock`,
 `SandboxLifecycle` (`ensure_endpoint`, `release`, `evict_idle`, `record(s)`), `global()`.
 
