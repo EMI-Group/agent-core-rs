@@ -20,6 +20,7 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool`, th
 - The three worktree tools share one `WorktreeManager` — the wired one, else one rooted at `with_worktree_root` or the workspace root — and forward the registry's `PermissionEngine`; nothing is checked at construction time, so a non-repository workspace reports the manager's typed git failure as a `success=false` payload.
 - `enter_worktree` and `exit_worktree` also share one `WorktreeSessionStore` per registry, `with_worktree_session_store` when the host keeps the session elsewhere and a `MemoryWorktreeSessionStore` by default; they never change the process cwd and report `worktree_path`/`original_cwd` in the payload instead.
 - Deferred tools are held by `with_deferred_tools` but NOT mounted by `build()` and NOT listed by `cards()`: the model finds them through the `tool_search` tool (or `discover`) and the host unions `reveal(names)` into the next model call's tool list. The mounted set always wins, so a deferred tool can never shadow an active one.
+- With nothing deferred (`deferred` empty, the default) `discovery_set()` is `BuiltinTool::EXTENDED`, so `discover`/`reveal`/`deferred_cards` cover all thirty-five extended tools even though only twenty are mounted; a configured deferred list narrows discovery to that list.
 - `build()` yields one `Arc<dyn Tool>` per selected variant in `self.tools` order; the four todo tools share one `Arc<TodoStore>` created lazily once per call (`todo_dir` when set, else `TodoStore::for_workspace`), and the filesystem tools share the registry's `ReadStateRegistry`.
 - `cards(language)` maps `self.tools` through `card(tool, language)`, which returns the owning module's real `card_for`, never a placeholder.
 - Card schemas are Python-shaped: `schemars` output with `$schema`/`title`/`$defs` stripped, every `$ref` inlined (`todo` and `ask_user` post-process theirs), and `required` narrowed to Python's list; no card contains a dangling reference.
@@ -190,7 +191,7 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool`, th
 - `bash`: `OPENJIUWEN_BASH_STRICT` injection detection, destructive-command warnings, rm-target history, sudo rewriting, `PowerShellTool`, and persisted oversized output.
 - `grep`: ripgrep binary invocation, `--type` filters, multiline search, Windows `Select-String`, and `.gitignore` awareness.
 - `todo`: `TodoLockManager` per-session process registry (replaced by `TodoStore` locks) and the Python code-numbered `build_error` envelope.
-- `memory`: SQLite/embedding hybrid retrieval lives in `openjiuwen_memory` behind `MemoryToolBackend`; `coding_memory` front-matter validation is the backend's job.
+- `memory`: SQLite/embedding hybrid retrieval lives in `openjiuwen_memory` behind `MemoryToolBackend`, but no production `MemoryToolBackend` implementation ships in this crate (only the `FakeBackend` in `memory/tests.rs`; `rails::memory::LongTermMemoryAdapter` implements `MemoryRecall`/`MemoryWriteBack` instead) — the host supplies one via `ToolRegistry::with_memory`; `coding_memory` front-matter validation is the backend's job.
 - `ask_user`: the `AskUserRail` interrupt wiring lives in `crate::rails`.
 
 ## Routing Table
