@@ -20,21 +20,107 @@
 //!    [`rrf_fusion`] and truncate to `top_k`.
 //!
 //! Python degrades to the plain chunk results whenever expansion is impossible or
-//! fails; Rust does the same and logs the reason through `tracing` at debug level,
-//! so a broken graph never fails a retrieval call or loses the chunk hits.
+//! fails; Rust does the same, but no longer hides *why* it degraded. Every failed
+//! graph step is recorded in a [`GraphExpansionReport`] and logged at `warn`
+//! level, while genuine no-ops (no entity candidates, no triples around the
+//! entities, no new chunks, expansion disabled) stay `debug`-only and are not
+//! counted as degradations. A failed expansion still never fails a retrieval call
+//! or loses the chunk hits: when the report holds degradations, every returned hit
+//! carries `metadata["graph_degraded"] = true` so a caller can tell a clean run
+//! from a broken graph store. The report is available through
+//! [`GraphRetriever::retrieve_with_report`] and
+//! [`GraphRetriever::retrieve_search_results_with_report`]; the [`Retriever`] trait
+//! methods delegate to them and drop the report.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use openjiuwen_common::error::Result;
-use openjiuwen_common::logging::debug;
+use openjiuwen_common::logging::{debug, warn};
 
 use super::fusion::{rrf_fusion, DEFAULT_RRF_K};
 use super::{ensure_query, search_result_to_retrieval, RetrieveMode, Retriever};
 use crate::common::{MetadataFilter, RetrievalResult, SearchResult};
 use crate::graph::{GraphStore, RuleTripleExtractor, Triple};
+
+/// Metadata key set to `true` on every hit of a call whose graph expansion
+/// degraded.
+///
+/// The key is absent on a clean run, so a downstream consumer can distinguish
+/// "the graph held nothing for this query" from "the graph call failed".
+pub const GRAPH_DEGRADED_FIELD: &str = "graph_degraded";
+
+/// The graph step a [`GraphDegradation`] was recorded for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphStage {
+    /// Entity-candidate resolution from the query and the top chunk texts.
+    ///
+    /// The rule-based extractor is deterministic and infallible, so no current
+    /// code path produces this stage; it exists so a future extractor seam (for
+    /// example a model-backed one) can report a failed candidate lookup with the
+    /// same mechanism.
+    EntityLookup,
+    /// A `neighbors(entity, max_hops)` lookup against the [`GraphStore`] failed.
+    NeighborExpansion,
+    /// A chunk query issued for a triple's text failed.
+    ChunkQuery,
+}
+
+/// One failed step of a graph expansion.
+///
+/// Records which [`GraphStage`] failed, the entity (`NeighborExpansion`) or
+/// triple subject (`ChunkQuery`) it was about — `None` when the stage is not tied
+/// to a single subject — and the error message the store or channel produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphDegradation {
+    /// The step that failed.
+    pub stage: GraphStage,
+    /// The entity or triple subject the failing step was about, when known.
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// The error message produced by the failing step.
+    pub error: String,
+}
+
+/// What a graph expansion did, and what failed while doing it.
+///
+/// Returned alongside the hits by
+/// [`GraphRetriever::retrieve_search_results_with_report`] and
+/// [`GraphRetriever::retrieve_with_report`]. A report with no
+/// [`degradations`](Self::degradations) describes a clean run — including the
+/// non-degrading no-ops (an empty graph, no entity candidates, no expansion).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphExpansionReport {
+    /// Entity candidates the retriever looked up, in candidate order.
+    #[serde(default)]
+    pub entities: Vec<String>,
+    /// Distinct triples collected from the store, before the `expansion_limit`
+    /// truncation.
+    #[serde(default)]
+    pub triple_count: usize,
+    /// Triple-text chunk queries issued (attempted, including the failed ones),
+    /// bounded by `expansion_limit`.
+    #[serde(default)]
+    pub expanded_queries: usize,
+    /// The failed graph steps, in the order they failed.
+    #[serde(default)]
+    pub degradations: Vec<GraphDegradation>,
+}
+
+impl GraphExpansionReport {
+    /// Whether at least one graph step failed.
+    ///
+    /// When this is `true`, the hits returned by the same call carry
+    /// `metadata["graph_degraded"] = true` (see [`GRAPH_DEGRADED_FIELD`]).
+    pub fn is_degraded(&self) -> bool {
+        !self.degradations.is_empty()
+    }
+}
 
 /// Default number of expansion hops taken from each entity.
 pub const DEFAULT_MAX_HOPS: usize = 2;
@@ -131,6 +217,53 @@ impl GraphRetriever {
         self.triple_mode
     }
 
+    /// Retrieves raw hits and reports what the graph expansion did.
+    ///
+    /// Behaves exactly like [`Retriever::retrieve_search_results`], but returns a
+    /// [`GraphExpansionReport`] alongside the hits instead of only logging why
+    /// the expansion fell back. A blank query is `Error::Validation`, and
+    /// `top_k == 0` returns no hits with a default (clean) report.
+    pub async fn retrieve_search_results_with_report(
+        &self,
+        query: &str,
+        top_k: usize,
+        mode: RetrieveMode,
+        filters: Option<&MetadataFilter>,
+    ) -> Result<(Vec<SearchResult>, GraphExpansionReport)> {
+        ensure_query(query)?;
+        if top_k == 0 {
+            return Ok((Vec::new(), GraphExpansionReport::default()));
+        }
+        self.expand(query, top_k, None, mode, filters).await
+    }
+
+    /// Retrieves [`RetrievalResult`]s and reports what the graph expansion did.
+    ///
+    /// Behaves exactly like [`Retriever::retrieve`], but returns a
+    /// [`GraphExpansionReport`] alongside the results. When the report
+    /// [is degraded](GraphExpansionReport::is_degraded), every result carries
+    /// `metadata["graph_degraded"] = true`.
+    pub async fn retrieve_with_report(
+        &self,
+        query: &str,
+        top_k: usize,
+        score_threshold: Option<f32>,
+        mode: RetrieveMode,
+        filters: Option<&MetadataFilter>,
+    ) -> Result<(Vec<RetrievalResult>, GraphExpansionReport)> {
+        ensure_query(query)?;
+        if top_k == 0 {
+            return Ok((Vec::new(), GraphExpansionReport::default()));
+        }
+        let (hits, report) = self
+            .expand(query, top_k, score_threshold, mode, filters)
+            .await?;
+        Ok((
+            hits.into_iter().map(search_result_to_retrieval).collect(),
+            report,
+        ))
+    }
+
     /// Collects entity candidates from the query, then from the top chunk texts.
     fn entity_candidates(query: &str, chunks: &[SearchResult]) -> Vec<String> {
         let extractor = RuleTripleExtractor::new();
@@ -153,8 +286,19 @@ impl GraphRetriever {
     }
 
     /// Walks the triples around every entity, deduplicated and bounded.
-    async fn collect_triples(&self, query: &str, chunks: &[SearchResult]) -> Vec<Triple> {
+    ///
+    /// Entity candidates are recorded in `report.entities`; a failed
+    /// `neighbors` lookup is recorded as a
+    /// [`GraphStage::NeighborExpansion`](GraphStage::NeighborExpansion)
+    /// degradation and the walk continues with the other entities.
+    async fn collect_triples(
+        &self,
+        query: &str,
+        chunks: &[SearchResult],
+        report: &mut GraphExpansionReport,
+    ) -> Vec<Triple> {
         let entities = Self::entity_candidates(query, chunks);
+        report.entities.clone_from(&entities);
         if entities.is_empty() {
             debug!("graph expansion skipped: no entity candidates in the query or chunks");
             return Vec::new();
@@ -165,7 +309,16 @@ impl GraphRetriever {
             let found = match self.graph_store.neighbors(entity, self.max_hops).await {
                 Ok(found) => found,
                 Err(error) => {
-                    debug!(entity = %entity, error = %error, "skipping a graph entity");
+                    warn!(
+                        entity = %entity,
+                        error = %error,
+                        "graph entity lookup failed; continuing without its triples"
+                    );
+                    report.degradations.push(GraphDegradation {
+                        stage: GraphStage::NeighborExpansion,
+                        subject: Some(entity.clone()),
+                        error: error.to_string(),
+                    });
                     continue;
                 }
             };
@@ -181,7 +334,8 @@ impl GraphRetriever {
         triples
     }
 
-    /// Runs the chunk retrieval plus the graph expansion, returning raw hits.
+    /// Runs the chunk retrieval plus the graph expansion, returning raw hits and
+    /// the expansion report.
     async fn expand(
         &self,
         query: &str,
@@ -189,7 +343,8 @@ impl GraphRetriever {
         score_threshold: Option<f32>,
         mode: RetrieveMode,
         filters: Option<&MetadataFilter>,
-    ) -> Result<Vec<SearchResult>> {
+    ) -> Result<(Vec<SearchResult>, GraphExpansionReport)> {
+        let mut report = GraphExpansionReport::default();
         let mut chunks = self
             .chunk_retriever
             .retrieve_search_results(query, top_k, mode, filters)
@@ -199,16 +354,18 @@ impl GraphRetriever {
         }
         chunks.truncate(top_k);
         if chunks.is_empty() || self.expansion_limit == 0 {
-            return Ok(chunks);
+            return Ok((chunks, report));
         }
-        let triples = self.collect_triples(query, &chunks).await;
+        let triples = self.collect_triples(query, &chunks, &mut report).await;
+        report.triple_count = triples.len();
         if triples.is_empty() {
             debug!("graph expansion skipped: no triples around the query entities");
-            return Ok(chunks);
+            return Ok(Self::finish(chunks, report));
         }
         let mut expanded: Vec<SearchResult> = Vec::new();
         for triple in triples.iter().take(self.expansion_limit) {
             let text = triple.text();
+            report.expanded_queries += 1;
             match self
                 .chunk_retriever
                 .retrieve_search_results(&text, 1, self.triple_mode, None)
@@ -220,17 +377,50 @@ impl GraphRetriever {
                     }
                 }
                 Err(error) => {
-                    debug!(triple = %text, error = %error, "skipping a graph expansion query");
+                    warn!(
+                        triple = %text,
+                        error = %error,
+                        "graph expansion query failed"
+                    );
+                    report.degradations.push(GraphDegradation {
+                        stage: GraphStage::ChunkQuery,
+                        subject: Some(triple.subject.clone()),
+                        error: error.to_string(),
+                    });
                 }
             }
         }
         if expanded.is_empty() {
             debug!("graph expansion produced no new chunks");
-            return Ok(chunks);
+            return Ok(Self::finish(chunks, report));
         }
         let mut fused = rrf_fusion(vec![expanded, chunks], DEFAULT_RRF_K);
         fused.truncate(top_k);
-        Ok(fused)
+        Ok(Self::finish(fused, report))
+    }
+
+    /// Marks the final hits when the expansion degraded.
+    ///
+    /// The flag is applied after truncation, on the exact vector handed back to
+    /// the caller, and only when a degradation was recorded, so a clean run never
+    /// grows a `graph_degraded` key.
+    fn finish(
+        results: Vec<SearchResult>,
+        report: GraphExpansionReport,
+    ) -> (Vec<SearchResult>, GraphExpansionReport) {
+        if !report.is_degraded() {
+            return (results, report);
+        }
+        let marked = results
+            .into_iter()
+            .map(|mut result| {
+                result
+                    .metadata
+                    .insert(GRAPH_DEGRADED_FIELD.to_owned(), Value::Bool(true));
+                result
+            })
+            .collect();
+        (marked, report)
     }
 }
 
@@ -244,16 +434,10 @@ impl Retriever for GraphRetriever {
         mode: RetrieveMode,
         filters: Option<&MetadataFilter>,
     ) -> Result<Vec<RetrievalResult>> {
-        ensure_query(query)?;
-        if top_k == 0 {
-            return Ok(Vec::new());
-        }
         Ok(self
-            .expand(query, top_k, score_threshold, mode, filters)
+            .retrieve_with_report(query, top_k, score_threshold, mode, filters)
             .await?
-            .into_iter()
-            .map(search_result_to_retrieval)
-            .collect())
+            .0)
     }
 
     async fn retrieve_search_results(
@@ -263,11 +447,10 @@ impl Retriever for GraphRetriever {
         mode: RetrieveMode,
         filters: Option<&MetadataFilter>,
     ) -> Result<Vec<SearchResult>> {
-        ensure_query(query)?;
-        if top_k == 0 {
-            return Ok(Vec::new());
-        }
-        self.expand(query, top_k, None, mode, filters).await
+        Ok(self
+            .retrieve_search_results_with_report(query, top_k, mode, filters)
+            .await?
+            .0)
     }
 }
 
@@ -391,6 +574,42 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].text, "Rust ownership model");
         assert_eq!(results[0].chunk_id.as_deref(), Some("chunk-a"));
+    }
+
+    #[tokio::test]
+    async fn a_clean_expansion_reports_no_degradation() {
+        let retriever = GraphRetriever::new(channel(), store());
+        let (results, report) = retriever
+            .retrieve_search_results_with_report("Rust ownership", 2, RetrieveMode::Sparse, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|result| !result.metadata.contains_key(GRAPH_DEGRADED_FIELD)));
+        assert_eq!(report.entities, vec!["Rust".to_owned()]);
+        assert_eq!(report.triple_count, 2);
+        assert_eq!(report.expanded_queries, 2);
+        assert!(report.degradations.is_empty());
+        assert!(!report.is_degraded());
+    }
+
+    #[tokio::test]
+    async fn zero_top_k_returns_a_default_report() {
+        let retriever = GraphRetriever::new(channel(), store());
+        let (results, report) = retriever
+            .retrieve_with_report("Rust ownership", 0, None, RetrieveMode::Sparse, None)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+        assert_eq!(report, GraphExpansionReport::default());
+        assert!(!report.is_degraded());
+
+        let error = retriever
+            .retrieve_search_results_with_report("   ", 2, RetrieveMode::Sparse, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
     }
 
     #[tokio::test]
