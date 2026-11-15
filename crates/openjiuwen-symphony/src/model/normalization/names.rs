@@ -48,7 +48,7 @@ pub const METHOD_VOCAB_UNSEEN: &str = "unseen";
 /// Converts an I/O label to a deterministic `snake_case` semantic name.
 ///
 /// The value is first passed through
-/// [`redact_sensitive_text`](crate::redaction::redact_sensitive_text) so a credential
+/// [`redact_sensitive_text`] so a credential
 /// smuggled into a name never reaches the output. It is then compatibility-folded,
 /// trimmed, lowercased, and reduced to alphanumeric runs joined by single underscores;
 /// leading and trailing separators are dropped and the result is bounded by
@@ -99,7 +99,7 @@ fn fold_compatibility(text: &str) -> String {
         match character {
             // Unicode space separators, all of which NFKC maps to a plain space.
             '\u{00A0}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => {
-                folded.push(' ')
+                folded.push(' ');
             }
             // The full-width ASCII block, which NFKC decomposes to ASCII.
             '\u{FF01}'..='\u{FF5E}' => {

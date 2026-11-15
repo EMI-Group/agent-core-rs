@@ -241,7 +241,7 @@ impl IONameVocabulary {
 
     /// Learns canonical terms and conservative aliases from raw extracted I/O.
     ///
-    /// `inputs` and `outputs` accept everything [`coerce_io_entries`] accepts (a list of
+    /// `inputs` and `outputs` accept everything `coerce_io_entries` accepts (a list of
     /// strings or mappings, or one mapping). A token already known to this vocabulary — as
     /// a term or as an alias — keeps its target; otherwise an unambiguous variant of a
     /// known term is folded into it; otherwise the token becomes a new term. Matching
@@ -264,8 +264,8 @@ impl IONameVocabulary {
                     continue;
                 }
                 let raw_type = first_present(&payload, &TYPE_KEYS);
-                let data_type = vocabulary
-                    .normalize(&raw_type.map_or_else(|| token.clone(), |value| type_text(value)));
+                let data_type =
+                    vocabulary.normalize(&raw_type.map_or_else(|| token.clone(), type_text));
                 let evidence = observed.entry(token).or_default();
                 evidence.count += 1;
                 evidence.directions.insert(direction.as_str().to_string());
@@ -343,7 +343,7 @@ impl IONameVocabulary {
         let normalized = exact.or_else(|| {
             self.terms
                 .iter()
-                .find(|term| term.aliases.iter().any(|alias| *alias == token))
+                .find(|term| term.aliases.contains(&token))
                 .map(|term| term.name.clone())
         });
         IONameResolution::new(raw, token, normalized)
@@ -801,7 +801,7 @@ mod tests {
         assert_eq!(prompt.count, 2);
         assert_eq!(prompt.directions, vec!["input"]);
         assert_eq!(prompt.data_types, vec!["string", "text"]);
-        assert!(prompt.aliases.is_empty());
+        assert_eq!(prompt.aliases.len(), 0);
         assert_eq!(vocabulary.terms[1].directions, vec!["output"]);
     }
 
@@ -829,7 +829,7 @@ mod tests {
     #[test]
     fn merged_evidence_uses_max_counts() {
         let vocabulary = IONameVocabulary::build(&[descriptor("a", &[("prompt", "text")], &[])]);
-        let merged = vocabulary.merge(&[vocabulary.clone()]);
+        let merged = vocabulary.merge(std::slice::from_ref(&vocabulary));
         assert_eq!(merged.terms.len(), 1);
         assert_eq!(merged.terms[0].count, 1);
         assert_eq!(merged.content_hash, vocabulary.content_hash);

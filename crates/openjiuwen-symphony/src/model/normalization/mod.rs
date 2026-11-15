@@ -2,7 +2,7 @@
 //!
 //! Ports `openjiuwen.symphony.shared.fingerprint.normalization` (Python, ~990 lines), the
 //! layer that turns whatever an extractor wrote about a capability's inputs and outputs
-//! into typed [`CapabilityIo`](crate::model::CapabilityIo) values that the graph, the
+//! into typed [`CapabilityIo`] values that the graph, the
 //! planner, and the evaluator can compare — and that records *why* every value looks the
 //! way it does.
 //!
@@ -59,17 +59,17 @@
 //! - **No Unicode NFKC.** This crate does not depend on a normalization table crate, so
 //!   full-width ASCII and the Unicode space separators are folded by hand and other
 //!   compatibility forms (ligatures, subscripts, circled numbers) are not decomposed; see
-//!   [`names::normalize_io_name`] for the exact list.
+//!   [`normalize_io_name`] for the exact list.
 //! - **Every non-alphanumeric run collapses, including `_`.** Python keeps existing
 //!   underscores, so `read__file` survives there; here it becomes `read_file`, matching
-//!   [`normalize_name_key`](crate::model::normalize_name_key).
+//!   [`normalize_name_key`].
 //! - **Names are bounded** at [`MAX_IO_NAME_LEN`] characters; Python has no cap.
 //! - **Sensitive names are redacted.** Python keeps an `api_key` parameter name and drops
 //!   only its default; this port redacts the name as well and audits it.
 //! - **Metadata is redacted on the way in.** Python redacts it only in the sanitized
 //!   replay state.
 //! - **Unknown data types keep their spelling** instead of collapsing to the Python
-//!   `unknown` sentinel, because [`DataTypeVocabulary`](crate::model::DataTypeVocabulary)
+//!   `unknown` sentinel, because [`DataTypeVocabulary`]
 //!   has none; blank types become `any`.
 //! - **[`builtin_io_name_vocabulary`] exists.** Python's vocabulary is always
 //!   corpus-derived; the crate ships a small documented default corpus so normalization

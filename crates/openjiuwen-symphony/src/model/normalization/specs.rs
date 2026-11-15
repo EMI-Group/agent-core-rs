@@ -1,4 +1,5 @@
-//! I/O-spec normalization: raw declarations to typed [`CapabilityIo`] values plus audit.
+//! I/O-spec normalization: raw declarations to typed [`CapabilityIo`](crate::model::CapabilityIo)
+//! values plus audit.
 //!
 //! Ports `_normalize_io_specs`, `_normalize_io_entry`, `_coerce_io_entries`,
 //! `_normalize_required`, `_to_bool`, `_first_present`, `_normalize_metadata`,
@@ -9,8 +10,10 @@
 //! A raw spec is whatever an extractor produced for one side of a capability: a list of
 //! mappings, one mapping, a mapping of name → spec, or a list of plain strings. Every
 //! accepted alias key is honoured, names are resolved through the corpus vocabulary,
-//! types through [`DataTypeVocabulary`], `required`/`optional` are coerced, and the result
-//! is a vector of [`CapabilityIo`] values whose every cleanup is recorded — a dropped,
+//! types through [`DataTypeVocabulary`](crate::model::DataTypeVocabulary), `required`/`optional`
+//! are coerced, and the result
+//! is a vector of [`CapabilityIo`](crate::model::CapabilityIo) values whose every cleanup is
+//! recorded — a dropped,
 //! renamed, coerced, defaulted, redacted, or unrecognized field always leaves either a
 //! [`NormalizationIssue`] or a [`NormalizationDecision`] behind.
 //!
@@ -22,16 +25,19 @@
 //!   does not say otherwise).
 //! - **Sensitive names are redacted.** Python keeps an I/O name such as `api_key` and
 //!   redacts only its default; this port additionally replaces the emitted name with
-//!   [`REDACTED`] and records a decision plus a `sensitive_io_name_redacted` issue, so a
+//!   [`REDACTED`](crate::redaction::REDACTED) and records a decision plus a
+//!   `sensitive_io_name_redacted` issue, so a
 //!   credential-shaped label never reaches a fingerprint verbatim.
 //! - **Metadata is redacted during normalization.** Python redacts metadata only in the
-//!   sanitized replay state; here [`redact_sensitive_json`] runs on the way in, and every
+//!   sanitized replay state; here [`redact_sensitive_json`](crate::redaction::redact_sensitive_json)
+//!   runs on the way in, and every
 //!   top-level key it recognized is audited.
 //! - **Unknown types keep their spelling.** Python collapses an unrecognized type to the
-//!   shared `unknown` sentinel from `data_types.yaml`; [`DataTypeVocabulary`] has no such
+//!   shared `unknown` sentinel from `data_types.yaml`;
+//!   [`DataTypeVocabulary`](crate::model::DataTypeVocabulary) has no such
 //!   sentinel, so the normalized token of the raw spelling is kept (`image/png` →
 //!   `image_png`) and the decision's `source` is [`DataTypeSource::Unknown`]. Blank types
-//!   become [`DEFAULT_IO_TYPE`] (`any`).
+//!   become [`DEFAULT_IO_TYPE`](crate::model::DEFAULT_IO_TYPE) (`any`).
 //! - **`invalid_required` and the two sensitive-redaction codes are Rust-only issues.**
 //!   Python silently falls back to the direction default for an unparseable `required`.
 
@@ -48,6 +54,10 @@ use crate::model::normalization::vocabulary::{
     IONameVocabulary, IoDirection, IO_NAME_VOCAB_VERSION,
 };
 use crate::redaction::{is_sensitive_name, redact_sensitive_json, redact_sensitive_text, REDACTED};
+
+mod entry;
+
+pub(crate) use entry::{entry_payload, first_present, type_text, value_text, vocabulary_version};
 
 /// The issue code for a raw value that is not a list, mapping, or string.
 pub const ISSUE_CODE_INVALID_IO_COLLECTION: &str = "invalid_io_collection";
@@ -490,9 +500,16 @@ pub fn normalize_io_specs_for_direction(
     let mut items: Vec<CapabilityIo> = Vec::with_capacity(entries.len());
     let mut decisions: Vec<NormalizationDecision> = Vec::new();
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let version = vocabulary_version(vocabulary);
     for (index, entry) in entries.iter().enumerate() {
-        let (item, entry_decisions, entry_issues) =
-            normalize_entry(entry, index, vocabulary, direction, default_required);
+        let (item, entry_decisions, entry_issues) = entry::normalize_entry(
+            entry,
+            index,
+            direction,
+            &version,
+            vocabulary,
+            default_required,
+        );
         decisions.extend(entry_decisions);
         issues.extend(entry_issues);
         let Some(mut item) = item else {
@@ -515,7 +532,7 @@ pub fn normalize_io_specs_for_direction(
                     .with_raw_value(&item.name)
                     .with_token(&item.name)
                     .with_normalized_value(&unique)
-                    .with_vocabulary(VOCABULARY_IO_NAME, &vocabulary_version(vocabulary)),
+                    .with_vocabulary(VOCABULARY_IO_NAME, &version),
             );
             item.name = unique;
         }
@@ -631,73 +648,9 @@ pub(crate) fn coerce_io_entries(raw: &Value) -> (Vec<Value>, Vec<NormalizationIs
     }
 }
 
-/// Returns the payload mapping of one entry, or `None` when the entry is not spec-shaped.
-///
-/// A plain string becomes `{"name": <string>, "type": <string>}`, mirroring Python.
-pub(crate) fn entry_payload(entry: &Value) -> Option<Map<String, Value>> {
-    match entry {
-        Value::String(text) => {
-            let mut map = Map::new();
-            map.insert("name".to_string(), Value::String(text.clone()));
-            map.insert("type".to_string(), Value::String(text.clone()));
-            Some(map)
-        }
-        Value::Object(map) => Some(map.clone()),
-        _ => None,
-    }
-}
-
-/// Returns the first non-blank value among `keys`.
-pub(crate) fn first_present<'a>(
-    payload: &'a Map<String, Value>,
-    keys: &[&str],
-) -> Option<&'a Value> {
-    for key in keys {
-        if let Some(value) = payload.get(*key) {
-            if !value_text(value).trim().is_empty() {
-                return Some(value);
-            }
-        }
-    }
-    None
-}
-
-/// Renders a JSON leaf as the text Python's `str(...)` would produce for it.
-///
-/// `null` becomes the empty string, scalars their usual rendering, and containers their
-/// canonical JSON (Python would show a `dict`/`list` repr, including object addresses for
-/// opaque values; JSON keeps this deterministic).
-pub(crate) fn value_text(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::String(text) => text.clone(),
-        Value::Bool(flag) => flag.to_string(),
-        Value::Number(number) => number.to_string(),
-        other => serde_json::to_string(other).unwrap_or_default(),
-    }
-}
-
-/// Renders a raw data type declaration, following Python's `_raw_data_type`.
-///
-/// A mapping is read through its `format`, `contentMediaType` and `type` members (in that
-/// order); anything else is rendered as text. The result is redacted and trimmed.
-pub(crate) fn type_text(value: &Value) -> String {
-    let text = match value {
-        Value::Object(map) => {
-            first_present(map, &TYPE_OBJECT_KEYS).map_or_else(String::new, value_text)
-        }
-        other => value_text(other),
-    };
-    redact_sensitive_text(text.trim())
-}
-
 /// Reports whether `raw` is a canonical data-type spelling in `vocabulary`.
 fn is_canonical(raw: &str, vocabulary: &DataTypeVocabulary) -> bool {
-    raw == "bytes"
-        || vocabulary
-            .canonical_types()
-            .iter()
-            .any(|candidate| *candidate == raw)
+    raw == "bytes" || vocabulary.canonical_types().contains(&raw)
 }
 
 /// Folds a type declaration to an ASCII token, following Python's `_normalize_type_token`.
@@ -771,391 +724,6 @@ fn to_bool(value: &Value, default: Option<bool>) -> Option<bool> {
     }
 }
 
-/// The vocabulary version to record in a decision.
-fn vocabulary_version(vocabulary: &IONameVocabulary) -> String {
-    if vocabulary.version.is_empty() {
-        IO_NAME_VOCAB_VERSION.to_string()
-    } else {
-        vocabulary.version.clone()
-    }
-}
-
-/// Normalizes one payload into a [`CapabilityIo`] plus its audit trail.
-fn normalize_entry(
-    entry: &Value,
-    index: usize,
-    vocabulary: &IONameVocabulary,
-    direction: IoDirection,
-    default_required: Option<bool>,
-) -> (
-    Option<CapabilityIo>,
-    Vec<NormalizationDecision>,
-    Vec<NormalizationIssue>,
-) {
-    let mut decisions: Vec<NormalizationDecision> = Vec::new();
-    let mut issues: Vec<NormalizationIssue> = Vec::new();
-    let Some(payload) = entry_payload(entry) else {
-        issues.push(
-            NormalizationIssue::new(
-                ISSUE_CODE_INVALID_IO_ENTRY,
-                "I/O entry must be a string or mapping",
-            )
-            .with_direction(direction)
-            .with_index(index),
-        );
-        return (None, decisions, issues);
-    };
-    let version = vocabulary_version(vocabulary);
-
-    let raw_name_text = redact_sensitive_text(
-        &payload
-            .get("name")
-            .or_else(|| payload.get("id"))
-            .map_or_else(String::new, value_text)
-            .trim(),
-    );
-    let name_token = normalize_io_name(&raw_name_text, "");
-    let resolution = vocabulary.resolve(&raw_name_text);
-    let corpus = !vocabulary.terms.is_empty();
-    let resolved_name = match resolution.normalized.clone() {
-        Some(found) => found,
-        None => {
-            let fallback = if name_token.is_empty() {
-                direction.default_name().to_string()
-            } else {
-                name_token.clone()
-            };
-            if name_token.is_empty() {
-                issues.push(
-                    NormalizationIssue::new(
-                        ISSUE_CODE_MISSING_IO_NAME,
-                        format!("missing I/O name normalized to '{fallback}'"),
-                    )
-                    .with_direction(direction)
-                    .with_index(index),
-                );
-            } else if corpus {
-                issues.push(
-                    NormalizationIssue::new(
-                        ISSUE_CODE_IO_NAME_NOT_IN_VOCABULARY,
-                        format!(
-                            "I/O name '{name_token}' was not observed in the corpus vocabulary"
-                        ),
-                    )
-                    .with_direction(direction)
-                    .with_index(index),
-                );
-            }
-            fallback
-        }
-    };
-    let name_method = if resolution.known {
-        resolution.method.clone()
-    } else if corpus {
-        METHOD_VOCAB_FALLBACK.to_string()
-    } else {
-        METHOD_SYNTAX.to_string()
-    };
-    let sensitive_name = is_sensitive_name(&resolved_name);
-    let name = if sensitive_name {
-        REDACTED.to_string()
-    } else {
-        resolved_name.clone()
-    };
-    let token_is_sensitive = !name_token.is_empty() && is_sensitive_name(&name_token);
-    let mut name_decision = NormalizationDecision::new(direction, index, FIELD_NAME, &name_method)
-        .with_raw_value(&raw_name_text)
-        .with_token(if sensitive_name || token_is_sensitive {
-            REDACTED
-        } else {
-            name_token.as_str()
-        })
-        .with_normalized_value(&name)
-        .with_vocabulary(VOCABULARY_IO_NAME, &version);
-    if corpus {
-        name_decision = name_decision
-            .with_detail("vocabulary_hash", vocabulary.content_hash.clone())
-            .with_detail("observed", resolution.known);
-    }
-    decisions.push(name_decision);
-    if sensitive_name {
-        decisions.push(
-            NormalizationDecision::new(direction, index, FIELD_NAME, METHOD_REDACTED)
-                .with_token(REDACTED)
-                .with_normalized_value(REDACTED)
-                .with_vocabulary(VOCABULARY_IO_NAME, &version)
-                .with_detail("sensitive", true),
-        );
-        issues.push(
-            NormalizationIssue::new(
-                ISSUE_CODE_SENSITIVE_IO_NAME_REDACTED,
-                "sensitive I/O name was redacted",
-            )
-            .with_direction(direction)
-            .with_index(index),
-        );
-    }
-
-    let mut metadata = normalize_metadata(payload.get("metadata"));
-    if let Some(Value::Object(raw_metadata)) = payload.get("metadata") {
-        let mut keys: Vec<&String> = raw_metadata.keys().collect();
-        keys.sort();
-        for key in keys {
-            if !is_sensitive_name(key) {
-                continue;
-            }
-            decisions.push(
-                NormalizationDecision::new(direction, index, FIELD_METADATA, METHOD_REDACTED)
-                    .with_token(REDACTED)
-                    .with_normalized_value(REDACTED)
-                    .with_vocabulary(VOCABULARY_REDACTION, &version)
-                    .with_detail("key", key.clone()),
-            );
-            issues.push(
-                NormalizationIssue::new(
-                    ISSUE_CODE_SENSITIVE_METADATA_REDACTED,
-                    format!("sensitive metadata key '{key}' was redacted"),
-                )
-                .with_direction(direction)
-                .with_index(index)
-                .with_detail("key", key.clone()),
-            );
-        }
-    }
-
-    let mut resolution = match first_present(&payload, &TYPE_KEYS) {
-        Some(value) => resolve_data_type(&type_text(value)),
-        None => resolve_data_type(&resolved_name),
-    };
-    if !resolution.known() && !resolution.raw.is_empty() {
-        if let Some(preserved) = metadata
-            .get("raw_type")
-            .filter(|value| !value_text(value).trim().is_empty())
-        {
-            let preserved = value_text(preserved);
-            resolution = resolve_data_type(&preserved);
-        }
-    }
-    decisions.push(
-        NormalizationDecision::new(direction, index, FIELD_TYPE, resolution.source.as_str())
-            .with_raw_value(&resolution.raw)
-            .with_token(&type_token(&resolution.raw))
-            .with_normalized_value(&resolution.normalized)
-            .with_vocabulary(VOCABULARY_DATA_TYPE, DATA_TYPE_VOCABULARY_VERSION)
-            .with_detail("known", resolution.known()),
-    );
-
-    let description = payload
-        .get("description")
-        .or_else(|| payload.get("help"))
-        .map_or_else(String::new, value_text)
-        .trim()
-        .to_string();
-
-    let required = normalize_required(
-        &payload,
-        default_required,
-        direction,
-        index,
-        &mut decisions,
-        &mut issues,
-    );
-
-    let default_was_redacted = metadata
-        .get("default_redacted")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let mut default: Option<Value> = None;
-    match payload.get("default").filter(|value| !value.is_null()) {
-        Some(_raw_default) if sensitive_name => {
-            metadata.insert("default_redacted".to_string(), Value::Bool(true));
-            issues.push(
-                NormalizationIssue::new(
-                    ISSUE_CODE_SENSITIVE_DEFAULT_REDACTED,
-                    "sensitive I/O default was not retained",
-                )
-                .with_direction(direction)
-                .with_index(index)
-                .with_detail("reason", "sensitive_io_name"),
-            );
-            decisions.push(
-                NormalizationDecision::new(direction, index, FIELD_DEFAULT, METHOD_REDACTED)
-                    .with_vocabulary(VOCABULARY_REDACTION, &version)
-                    .with_detail("reason", "sensitive_io_name"),
-            );
-        }
-        Some(raw_default) => {
-            let plain = json_safe(raw_default, 0);
-            let sanitized = redact_sensitive_json(&plain);
-            if sanitized != plain {
-                decisions.push(
-                    NormalizationDecision::new(direction, index, FIELD_DEFAULT, METHOD_REDACTED)
-                        .with_vocabulary(VOCABULARY_REDACTION, &version)
-                        .with_detail("reason", "credential_value"),
-                );
-            }
-            default = Some(sanitized);
-            if default_was_redacted {
-                issues.push(
-                    NormalizationIssue::new(
-                        ISSUE_CODE_SENSITIVE_DEFAULT_REDACTED,
-                        "sensitive I/O default was not retained",
-                    )
-                    .with_direction(direction)
-                    .with_index(index)
-                    .with_detail("reason", "previous_pass"),
-                );
-            }
-        }
-        None => {
-            if default_was_redacted {
-                issues.push(
-                    NormalizationIssue::new(
-                        ISSUE_CODE_SENSITIVE_DEFAULT_REDACTED,
-                        "sensitive I/O default was not retained",
-                    )
-                    .with_direction(direction)
-                    .with_index(index)
-                    .with_detail("reason", "previous_pass"),
-                );
-            }
-        }
-    }
-
-    if !resolution.known() && !resolution.raw.is_empty() {
-        metadata.insert(
-            "raw_type".to_string(),
-            Value::String(resolution.raw.clone()),
-        );
-        issues.push(
-            NormalizationIssue::new(
-                ISSUE_CODE_UNKNOWN_DATA_TYPE,
-                format!(
-                    "unsupported data type '{}' normalized to '{}'",
-                    resolution.raw, resolution.normalized
-                ),
-            )
-            .with_direction(direction)
-            .with_index(index),
-        );
-    }
-
-    let item = CapabilityIo {
-        name,
-        io_type: resolution.normalized,
-        description,
-        required,
-        default,
-        metadata,
-    };
-    (Some(item), decisions, issues)
-}
-
-/// Normalizes the `required`/`optional`/`default` trio into one optional flag.
-fn normalize_required(
-    payload: &Map<String, Value>,
-    default: Option<bool>,
-    direction: IoDirection,
-    index: usize,
-    decisions: &mut Vec<NormalizationDecision>,
-    issues: &mut Vec<NormalizationIssue>,
-) -> Option<bool> {
-    if let Some(raw) = payload.get("required") {
-        if raw.is_null() {
-            return None;
-        }
-        let coerced = to_bool(raw, default);
-        if coerced.is_none() {
-            issues.push(
-                NormalizationIssue::new(
-                    ISSUE_CODE_INVALID_REQUIRED,
-                    "unparseable `required` value, fell back to the direction default",
-                )
-                .with_direction(direction)
-                .with_index(index)
-                .with_detail("raw_value", value_text(raw)),
-            );
-            decisions.push(
-                NormalizationDecision::new(direction, index, FIELD_REQUIRED, METHOD_DEFAULTED)
-                    .with_raw_value(&value_text(raw))
-                    .with_normalized_value(flag_text(default))
-                    .with_detail("reason", "invalid_value"),
-            );
-            return default;
-        }
-        if !raw.is_boolean() {
-            decisions.push(
-                NormalizationDecision::new(direction, index, FIELD_REQUIRED, METHOD_COERCED)
-                    .with_raw_value(&value_text(raw))
-                    .with_normalized_value(flag_text(coerced)),
-            );
-        }
-        return coerced;
-    }
-    if let Some(raw) = payload.get("optional") {
-        if raw.is_null() {
-            return None;
-        }
-        let optional = to_bool(raw, None);
-        if optional.is_none() {
-            issues.push(
-                NormalizationIssue::new(
-                    ISSUE_CODE_INVALID_REQUIRED,
-                    "unparseable `optional` value, left unspecified",
-                )
-                .with_direction(direction)
-                .with_index(index)
-                .with_detail("raw_value", value_text(raw)),
-            );
-            return None;
-        }
-        let required = optional.map(|optional| !optional);
-        if !raw.is_boolean() {
-            decisions.push(
-                NormalizationDecision::new(direction, index, FIELD_REQUIRED, METHOD_COERCED)
-                    .with_raw_value(&value_text(raw))
-                    .with_normalized_value(flag_text(required))
-                    .with_detail("source", "optional"),
-            );
-        }
-        return required;
-    }
-    if payload.contains_key("default") {
-        decisions.push(
-            NormalizationDecision::new(direction, index, FIELD_REQUIRED, METHOD_DEFAULTED)
-                .with_normalized_value("false")
-                .with_detail("reason", "default_present"),
-        );
-        return Some(false);
-    }
-    decisions.push(
-        NormalizationDecision::new(direction, index, FIELD_REQUIRED, METHOD_DEFAULTED)
-            .with_normalized_value(flag_text(default))
-            .with_detail("reason", "direction_default"),
-    );
-    default
-}
-
-/// Renders an optional flag for the audit trail.
-fn flag_text(flag: Option<bool>) -> String {
-    match flag {
-        Some(true) => "true".to_string(),
-        Some(false) => "false".to_string(),
-        None => String::new(),
-    }
-}
-
-/// Normalizes a raw metadata member into a JSON-safe, redacted, sorted map.
-fn normalize_metadata(raw: Option<&Value>) -> BTreeMap<String, Value> {
-    let Some(Value::Object(map)) = raw else {
-        return BTreeMap::new();
-    };
-    match redact_sensitive_json(&json_safe(&Value::Object(map.clone()), 0)) {
-        Value::Object(redacted) => redacted.into_iter().collect(),
-        _ => BTreeMap::new(),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1170,7 +738,7 @@ mod tests {
         assert_eq!(resolve_data_type("str").source, DataTypeSource::Alias);
         assert_eq!(resolve_data_type("integer").source, DataTypeSource::Exact);
         assert_eq!(resolve_data_type("").normalized, "any");
-        assert!(resolve_data_type("").raw.is_empty());
+        assert_eq!(resolve_data_type("").raw, "");
         let unknown = resolve_data_type("image/png");
         assert_eq!(unknown.normalized, "image_png");
         assert_eq!(unknown.source, DataTypeSource::Unknown);
@@ -1212,7 +780,7 @@ mod tests {
     fn coercion_accepts_maps_and_name_keyed_objects() {
         let (entries, issues) = coerce_io_entries(&json!({"name": "q", "type": "text"}));
         assert_eq!(entries.len(), 1);
-        assert!(issues.is_empty());
+        assert_eq!(issues.len(), 0);
         let (entries, _) = coerce_io_entries(&json!({"alpha": "text", "beta": {"type": "int"}}));
         assert_eq!(
             entries,
@@ -1222,7 +790,7 @@ mod tests {
             ]
         );
         let (entries, issues) = coerce_io_entries(&json!(true));
-        assert!(entries.is_empty());
+        assert_eq!(entries.len(), 0);
         assert_eq!(issues[0].code, ISSUE_CODE_INVALID_IO_COLLECTION);
     }
 
