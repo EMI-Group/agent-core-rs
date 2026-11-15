@@ -7,6 +7,11 @@
 //! [`GuardrailResult`](crate::GuardrailResult); blocking is the pipeline's
 //! decision, not the guardrail's.
 //!
+//! A payload the checked text projection cannot read makes `check` return a
+//! typed `Error::validation` instead of a pass: the pipeline's
+//! [`FailurePolicy`](crate::FailurePolicy) decides whether that failure blocks
+//! (the default) or is only recorded.
+//!
 //! Modules:
 //!
 //! - [`prompt_injection`] — Python's `PromptInjectionGuardrail`: rule-based,

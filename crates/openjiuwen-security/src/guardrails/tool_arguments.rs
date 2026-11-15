@@ -402,6 +402,11 @@ impl Guardrail for ToolArgumentGuardrail {
     }
 
     async fn check(&self, ctx: &GuardrailContext) -> Result<GuardrailResult> {
+        // The arguments are walked structurally below, but the checked
+        // projection still gates the scan: an unscannable payload (for example
+        // `null` arguments) is a typed failure rather than a silent pass, and
+        // the pipeline's failure policy decides whether it blocks.
+        ctx.text_view_checked()?;
         let tool_name = ctx.get_tool_name();
         if let Some(name) = tool_name {
             if let Some(verdict) = self.tool_name_verdict(name) {
@@ -790,12 +795,7 @@ mod tests {
     #[tokio::test]
     async fn empty_arguments_pass() {
         let detector = guardrail();
-        for arguments in [
-            json!({}),
-            json!({"q": ""}),
-            json!({"q": "   "}),
-            json!(null),
-        ] {
+        for arguments in [json!({}), json!({"q": ""}), json!({"q": "   "})] {
             let result = detector
                 .check(&tool_ctx("search", arguments))
                 .await
@@ -813,6 +813,38 @@ mod tests {
             .await
             .unwrap();
         assert!(benign.is_safe());
+    }
+
+    #[tokio::test]
+    async fn unscannable_payload_is_a_validation_error() {
+        let detector = guardrail();
+        // `null` arguments cannot be projected, so the detector reports a typed
+        // failure instead of passing the call unexamined.
+        let error = detector
+            .check(&GuardrailContext::raw(
+                "user_input",
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.to_string().contains("unscannable content"), "{error}");
+        let null_arguments = detector
+            .check(&tool_ctx("search", json!(null)))
+            .await
+            .unwrap_err();
+        assert_eq!(null_arguments.kind(), ErrorKind::Validation);
+        assert!(
+            null_arguments.to_string().contains("unscannable content"),
+            "{null_arguments}"
+        );
+
+        // Scannable empty arguments still pass.
+        assert!(detector
+            .check(&tool_ctx("search", json!({})))
+            .await
+            .unwrap()
+            .is_safe());
     }
 
     #[tokio::test]
