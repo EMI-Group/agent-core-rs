@@ -12,8 +12,9 @@
 //! `transport` owns the [`LspTransport`] seam, `config` holds [`LspServerConfig`], `client`
 //! correlates requests, `diagnostics` buffers push diagnostics, `discovery` maps files to
 //! servers, `instance` supervises one server's lifecycle, `render` formats results, `tool`
-//! adapts all of it to the [`Tool`](openjiuwen_foundation::tool::Tool) trait, and its
-//! `tool_ops` submodule executes the actions.
+//! adapts all of it to the [`Tool`](openjiuwen_foundation::tool::Tool) trait, its `tool_ops`
+//! submodule executes the actions, and `parse` implements the `FromStr`/`Display` spellings of
+//! [`LspToolConfig`], [`LspAction`] and [`LspArgs`] so a host can drive the tool from text.
 //!
 //! # Offline testing
 //!
@@ -34,6 +35,7 @@ mod config;
 mod diagnostics;
 mod discovery;
 mod instance;
+mod parse;
 pub mod protocol;
 pub mod render;
 mod tool;
