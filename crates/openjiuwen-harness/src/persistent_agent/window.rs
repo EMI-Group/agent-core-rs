@@ -882,6 +882,13 @@ impl WindowAssembler {
     }
 
     /// Replaces the summariser.
+    ///
+    /// This is the one injection point for summary text: [`CompletionSummarizer`] wraps a
+    /// caller-supplied synchronous completion function (a model client, a cache, a pre-computed
+    /// answer), [`ExtractiveSummarizer`] is the deterministic offline default, and
+    /// [`UnsupportedModelSummarizer`] refuses. A failing summariser never fails
+    /// [`WindowAssembler::assemble`]; the failure is reported in
+    /// [`WindowAssembly::summary_error`].
     #[must_use]
     pub fn with_summarizer(mut self, summarizer: Arc<dyn WindowSummarizer>) -> Self {
         self.summarizer = summarizer;
