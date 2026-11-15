@@ -20,12 +20,13 @@ No I/O and no dependencies on other modules in this crate.
 - Result types implement `Default` where meaningful (`metadata`/`kb_ids` empty, `score` 0.0).
 
 ### `config.rs`
-- `KnowledgeBaseConfig` with `kb_id`, `index_type` (default `"hybrid"`), `use_graph`, `chunk_size` 512, `chunk_overlap` 50, `use_caption_for_images`; `KnowledgeBaseConfig::new(kb_id)`.
+- `KnowledgeBaseConfig` with `kb_id`, `index_type` (default `"hybrid"`), `use_graph`, `chunk_size` 512, `chunk_overlap` 50, `use_caption_for_images`; `KnowledgeBaseConfig::new(kb_id)`, `validate()` (`Error::Config` for an unknown `index_type`); `use_caption_for_images` is honored by the knowledge base's image embedding policy.
+- `parse_index_type(value) -> Result<&'static str>`: normalizes case/whitespace and maps `vector`/`bm25`/`hybrid`; anything else is `Error::Config` (never a silent dense fallback).
 - `RetrievalConfig` with `top_k` 5, `score_threshold`, `use_graph`, `agentic`, `graph_expansion`, `filters: Option<MetadataFilter>`; `RetrievalConfig::with_top_k/with_score_threshold/with_filter`.
-- `IndexConfig { index_name, index_type, use_caption_for_images }`.
-- `VectorStoreConfig { store_provider, database_name, collection_name, distance_metric }` (default `"cosine"`).
-- `EmbeddingConfig { model_name, base_url, api_key, timeout, max_retries, max_batch_size, headers, dimension, verify_ssl }` with `new(model_name, base_url)` and builders; `api_key` is `openjiuwen_common::security::SecretString`.
-- `RerankerConfig { api_key, api_base, model_name (alias model), timeout, temperature, top_p }`; `model_name` accepts Python's `model` alias on input and serializes as `model_name`.
+- `IndexConfig { index_name, index_type, use_caption_for_images }` with `validate()` (blank `index_name` or unknown `index_type` → `Error::Config`) and `to_knowledge_base_config()` (`index_name` → `kb_id`, plus `index_type`/`use_caption_for_images`; default chunk window).
+- `VectorStoreConfig { store_provider, database_name, collection_name, distance_metric }` (default `"cosine"`); consumed by `InMemoryVectorStore::from_config`, which rejects a non-blank `database_name` and a non-`cosine` metric with `Error::Config`.
+- `EmbeddingConfig { model_name, base_url, api_key, timeout, max_retries, max_batch_size, headers, dimension, verify_ssl }` with `new(model_name, base_url)` and builders; `api_key` is `openjiuwen_common::security::SecretString`; every field is read by `OpenAiEmbedding`.
+- `RerankerConfig { api_key, api_base, model_name (alias model), timeout, temperature, top_p }` with `validate()` (non-blank `api_base`/`model_name`, `timeout > 0`, `temperature` in `[0, 2]`, `top_p` in `(0, 1]`) and `require_api_key()`; consumed by `reranker::DashScopeReranker`; `model_name` accepts Python's `model` alias on input and serializes as `model_name`.
 - All configs default every field on deserialization and ignore unknown fields; `RetrievalConfig` implements `Default` with `top_k = 5`.
 - `Duration` fields (`EmbeddingConfig::timeout`, `RerankerConfig::timeout`) serialize as seconds (integer when whole, float otherwise) and deserialization rejects negative or non-numeric values.
 - Constants: `DEFAULT_TOP_K`, `DEFAULT_CHUNK_SIZE`, `DEFAULT_CHUNK_OVERLAP`, `INDEX_TYPE_VECTOR/BM25/HYBRID`, `DEFAULT_EMBEDDING_TIMEOUT`, `DEFAULT_EMBEDDING_BATCH_SIZE`.
@@ -49,6 +50,6 @@ No I/O and no dependencies on other modules in this crate.
 
 - `./document.rs` → `Metadata`, `Document`, `TextChunk`
 - `./result.rs` → `SearchResult`, `RetrievalResult`, `MultiKBRetrievalResult`
-- `./config.rs` → knowledge-base/retrieval/index/vector-store/embedding/reranker configs and constants
+- `./config.rs` → knowledge-base/retrieval/index/vector-store/embedding/reranker configs, their validators, `parse_index_type`, and constants
 - `./filter.rs` → `MetadataFilter` parsing, serialization, evaluation
 - `./mod.rs` → module exports (`pub use ...`)
