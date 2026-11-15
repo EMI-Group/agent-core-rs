@@ -6,8 +6,8 @@ Every `rust` excerpt below is a condensation of a current signature — changing
 
 ## 1. Crate layering
 
-30 crates sit in layers 0–7, plus three development crates that no library crate depends on.
-Dependencies point downward only, with the three opt-in exceptions listed after the table.
+27 crates sit in layers 0–7, plus three development crates that no library crate depends on, for 30 in total.
+Dependencies point downward only, apart from the exceptions listed after the table.
 
 | Layer | Crates | Notes |
 |---|---|---|
@@ -18,7 +18,7 @@ Dependencies point downward only, with the three opt-in exceptions listed after 
 | 4 | `openjiuwen-runner`, `openjiuwen-core` | Runner orchestrates the layer 0–3 crates (workflow, agent, multiagent, security, sysop, memory); core re-exports layers 0–4 and defines nothing itself. |
 | 5 | `openjiuwen-harness`, `openjiuwen-extensions`, `openjiuwen-dev-tools`, `openjiuwen-symphony` | All four depend on `openjiuwen-core`; harness also drives the kernel crates directly, dev-tools adds agent, symphony adds graph/retrieval/session. |
 | 6 | `openjiuwen-harness-providers`, `openjiuwen-rsi`, `openjiuwen-agent-evolving`, `openjiuwen-auto-harness`, `openjiuwen-agent-teams` | Providers/teams sit on harness; rsi and agent-evolving sit on harness + core; auto-harness depends only on rsi and re-exports it. |
-| 7 | `openjiuwen`, `openjiuwen-cli` | Umbrella over every library crate plus a curated `prelude`; the binary composes harness, harness-protocol, harness-providers and core. |
+| 7 | `openjiuwen`, `openjiuwen-cli` | Umbrella over every library crate plus a curated `prelude`; the binary depends on the umbrella, `openjiuwen-harness` (feature `notify`), `openjiuwen-harness-protocol`, `openjiuwen-core`, `openjiuwen-common` and `openjiuwen-rsi`, and reaches `harness-providers` only transitively through the umbrella. |
 | dev | `openjiuwen-test-support`, `openjiuwen-e2e`, `openjiuwen-examples` | `publish = false`, never dependencies of library crates. |
 
 `openjiuwen-core` is 17 modules of pure aliases (`common`, `foundation`, `session`, `graph`, `workflow`, `context_engine`, `memory`, `retrieval`, `sys_operation`, `security`, `single_agent`, `application`, `controller`, `kv_cache`, `operator`, `multi_agent`, `runner`) and defines nothing.
@@ -29,7 +29,8 @@ Rules:
 - `openjiuwen-macros` stays unaliased because it is compile-time only; no runtime path exists for it.
 - If two crates need the same type it belongs in the lowest common ancestor (`openjiuwen-common` or `openjiuwen-foundation`).
 - Python's function-local `core → harness/extensions/agent_teams` imports become traits implemented in the upper crate and registered at startup; cycles are never introduced to mirror them.
-- Three edges break strict downward layering, all optional and all off by default: `openjiuwen-harness-providers/native-v2` → `openjiuwen-agent-teams` (the only same-layer edge), `openjiuwen-agent-teams/otlp` → `openjiuwen-extensions`, and `openjiuwen-agent-evolving/redis` → `openjiuwen-extensions`.
+- Four edges break strict downward layering: the same-layer `openjiuwen-harness-providers/native-v2` → `openjiuwen-agent-teams` (layer 6) and `openjiuwen-cli` → `openjiuwen` (layer 7), plus the upward `openjiuwen-agent-teams/otlp` → `openjiuwen-extensions` and `openjiuwen-agent-evolving/redis` → `openjiuwen-extensions`.
+- The three feature-gated edges are opt-in and off by default; the `openjiuwen-cli` → `openjiuwen` edge is unconditional.
 
 ## 2. Shared contracts
 
@@ -143,7 +144,7 @@ pub trait Session: Send + Sync {
 }
 
 #[async_trait]
-pub trait Checkpointer: Send + Sync {
+pub trait Checkpointer: Send + Sync + std::fmt::Debug {
     async fn save(&self, checkpoint: Checkpoint) -> Result<String>;
     async fn load(&self, session_id: &str, checkpoint_id: &str) -> Result<Option<Checkpoint>>;
     async fn latest(&self, session_id: &str) -> Result<Option<Checkpoint>>;   // defaulted
@@ -222,11 +223,12 @@ pub trait Agent: Send + Sync {
 }
 ```
 
-There is no `BaseAgent`: `Agent` plus `AgentCard` is the whole seam, and `ReActAgent`, `LlmAgent`, `WorkflowAgent` and `ControllerAgent` implement it.
+There is no `BaseAgent`: `Agent` plus `AgentCard` is the whole seam, and `ReActAgent`, `LlmAgent`, `WorkflowAgent` and `ReActAgentEvolve` implement it.
+`ControllerAgent` is not an `Agent`: it implements `TaskExecutor` over an `Arc<dyn Agent>`.
 `ReActAgent::configure(ReActAgentConfig)`, `WorkflowAgent::add_workflows` and `LlmAgent::new(LlmAgentConfig)` are the configuration entry points.
 Rail hooks are one trait, `AgentRail`, with nine callbacks: `before_invoke`, `after_invoke`, `before_model_call`, `after_model_call`, `on_model_exception`, `before_tool_call`, `after_tool_call`, `on_tool_exception`, `after_react_iteration`, plus `name` and `priority`.
 Interrupts are typed by `InterruptKind` (`Undeclared`, `Permission`, `Confirm`, `AskUser`, `SkillAuthorization`, `SkillEvolutionApproval`, `TeamToolApproval`, `ClientTool`, `Custom`) and each maps to a stable wire string.
-The controller stack (`controller::{BaseController, Controller, GroupRouter, TaskManager, TaskQueue, TaskSchedulerLoop}`) owns task bookkeeping; `TaskManager` is clone-shared and indexes tasks by id, session, parent and status.
+The controller stack (`controller::{BaseController, Controller, GroupRouter, TaskManager, TaskQueue, TaskSchedulerLoop}`) owns task bookkeeping; `TaskManager` is clone-shared and indexes tasks by id, by priority and by parent/child links including the root ids, while session lookup and status filtering are linear scans.
 `KvCacheActionRuntime` (`prepare`/`suspend`/`release`) is the KV-cache affinity runtime, installed through `KVCacheModelCallHook::with_action_runtime`.
 Operators implement `Operator` (`get_tunables`, `get_state`, `set_parameter`, `load_state`, `apply_update`); staged changes go through `PendingChangeStore` (`stage` → `approve`/`reject`/`retry`), which appends records to a `SkillExperienceStore` and reports a partial commit when the sink fails mid-way.
 
@@ -282,11 +284,11 @@ Subagents stream `SubagentActivityFrame`s through `ActivityThrottle` with `DEFAU
 
 ### 2.9 Context engine (`openjiuwen-context`)
 
-`ContextEngine` is a struct with inherent methods (no trait): `new`, `with_store(s)`, `with_recorder`, `with_usage_analyzer`, `create_context`, `create_context_with`, `get_context`, `remove_context`, `prepare`, `observe`, `observe_tool_result`, `compress`, `recover_from_model_exception`, `is_context_overflow_error`, `resolved_window`, `detect_window_change`, `usage_report`, `usage_snapshot`, `record_provider_usage`, `kv_cache_usage`, `save_contexts`, `load_contexts`.
+`ContextEngine` is a struct with inherent methods (no trait): `new`, `with_store(s)`, `with_recorder`, `with_usage_analyzer`, `config`, `set_recorder`, `set_usage_analyzer`, `create_context`, `create_context_with`, `get_context`, `remove_context`, `prepare`, `observe`, `observe_tool_result`, `compress`, `recover_from_model_exception`, `is_context_overflow_error`, `resolved_window`, `detect_window_change`, `usage_report`, `usage_snapshot`, `record_provider_usage`, `kv_cache_usage`, `save_contexts`, `load_contexts`.
 `prepare` runs the pipeline over a working copy and never mutates stored history; `observe` appends one message and applies the rolling `max_context_messages` limit; `compress` persists the change and reports `noop`, `compressed` or `busy`.
 There is no `get_context_window`: `prepare` returning `PreparedContext` is the window/messages getter, `ModelContext::messages()` is the raw reader, and `usage_report`/`usage_snapshot` explain the last prepared window.
 Tokenizer selection is `TokenizerRegistry` + `TokenizerSelector`, resolved as explicit spec → native artefact → compatible fallback → registry (`exact`, then unique `family`) → model encoding → estimate, and `TokenizerArtifactManager` owns the on-disk vocabulary cache.
-Offload handles are opaque ids scoped by `OffloadScope { session_id, context_id }`, markers keep Python's `[[OFFLOAD: handle=..., type=in_memory|filesystem]]` shape, and full compaction reinjects host-rendered state sections through the `SnapshotRegistry` seam (`ProcessorPipeline::reinjection`).
+Offload handles are opaque ids scoped by `OffloadScope { session_id, context_id }`, markers keep Python's `[[OFFLOAD: handle=..., type=in_memory|filesystem]]` shape, and full compaction reinjects host-rendered state sections through the `SnapshotRegistry` seam (`PipelineDeps::reinjection`, wired with `with_reinjection`).
 Every LLM-backed processor step has a deterministic offline fallback, so compression works with no network and no credentials.
 
 ### 2.10 Memory providers (`openjiuwen-memory`)
@@ -302,13 +304,15 @@ pub trait MemoryProvider: Send + Sync {
     async fn get(&self, scope: &MemoryScope, id: &str) -> Result<Option<MemoryRecord>>;
     async fn update(&self, scope: &MemoryScope, id: &str, update: MemoryUpdate, options: &CallOptions) -> Result<MemoryRecord>;
     async fn delete(&self, scope: &MemoryScope, id: &str) -> Result<bool>;
+    async fn list(&self, filter: &MemoryFilter) -> Result<Vec<MemoryRecord>>;
+    async fn clear(&self, filter: &MemoryFilter) -> Result<usize>;
     async fn health(&self) -> Result<ProviderHealth>;
     // defaulted rail: prefetch, sync_turn, on_session_end, system_prompt_block,
     // get_tool_schemas, handle_tool_call, is_available, is_initialized, default_scope
 }
 ```
 
-`sync_turn(user_msg, assistant_msg)` and `on_session_end(&[ConversationTurn])` are the turn-lifecycle hooks a host drives; the default bodies do nothing, so a provider without a background pipeline stays inert.
+`sync_turn(user_msg, assistant_msg)` and `on_session_end(&[ConversationTurn])` are the turn-lifecycle hooks a host drives; `sync_turn`'s default writes one episodic memory via `add(&self.default_scope(), …)`, `prefetch`'s default recalls and renders snippets, and only `on_session_end` and `system_prompt_block` are inert.
 `EngineProvider` adapts the in-crate long-term engine to that SPI, `ProviderRegistry`/`ProviderKind` plus the vendor handles and `RestProvider` expose vendor memories as record-only implementations, and `TeamMemory` + `MemberMemoryToolkit` (`team_memory_remember|search|forget|stats`) cover team scope over `TeamMemoryObserver`.
 Dreaming is a repository + orchestrator contract: `DreamRepository::claim_next_leased` takes a `LeaseRequest` and returns a `LeasedJob`, `DreamLeaseGuard` renews or releases it, and `DreamOrchestrator::tick` runs one bounded sweep.
 
@@ -321,8 +325,8 @@ The real exporter is separate: `otel::OtelTraceSink` implements the kernel `Trac
 
 ### 2.12 Resume and journal (`openjiuwen-harness`)
 
-`persistent_agent::ExecutionCatalog` is the on-disk index: `new(root, capacity)`, `path_for(session_id)`, `list() -> Vec<ExecutionSummary>`, `open(session_id) -> ExecutionLog`.
-Every execution appends to its log, and `resume(session_id)` builds a `ResumePlan` — serde-serializable both ways — carrying `record`, `cursor`, `window`, `chain`, `background` and `digest`, with `seed_messages()`/`seed_history()` for replay.
+`persistent_agent::ExecutionCatalog` is the on-disk index keyed by execution id: `new(root, capacity)`, `path_for(&self, execution_id: &str) -> PathBuf`, `async fn list(&self) -> Result<Vec<ExecutionSummary>>` and `async fn open(&self, execution_id: &str) -> Result<ExecutionLog>`.
+`persistent_agent::resume(store, logs, links, binding: &SessionBinding, request_id, continuation, assembler: &WindowAssembler)` builds a `ResumePlan` — serde-serializable both ways — carrying `record`, `cursor`, `window`, `chain`, `background` and `digest`, with `seed_messages()`/`seed_history()` for replay; the module never appends log entries itself, the rails do.
 `ResumePlan` is a value, so a host can persist or forward it; the CLI resumes through `cli::run_with_model_resumed`, the counterpart of `cli::run_with_model`.
 The runner has no resume entry point of its own: `Runner` exposes only `run_agent(_streaming)`, `run_workflow(_streaming)` and `run_agent_team(_streaming)`.
 
@@ -347,9 +351,9 @@ The runner has no resume entry point of its own: `Runner` exposes only `run_agen
 | Home and workspace | `OPENJIUWEN_HOME`, `OPENJIUWEN_WORKSPACE` | Root of runtime state (`OpenJiuwenHome::resolve()`, `ensure()` creates it) and the working directory tools operate on. |
 | Credentials and model defaults | `OPENJIUWEN_API_KEY`, `OPENJIUWEN_API_BASE`, `OPENJIUWEN_MODEL`, `OPENJIUWEN_MODEL_NAME`, `OPENJIUWEN_MODEL_PROVIDER`, `OPENJIUWEN_PROVIDER`, `OPENJIUWEN_MAX_TOKENS`, `OPENJIUWEN_MAX_ITERATIONS`, `OPENJIUWEN_LLM_TIMEOUT_SECS` | Model selection and per-call defaults. |
 | Provider aliases | `API_KEY`, `API_BASE`, `MODEL_PROVIDER`, `MODEL_NAME`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, `NO_COLOR` | Shared / OpenAI spellings honoured alongside the `OPENJIUWEN_*` forms; `NO_COLOR` disables CLI colour. |
-| CLI, service and logging | `OPENJIUWEN_SERVER_URL`, `OPENJIUWEN_HUB_URL`, `OPENJIUWEN_HUB_API_KEY`, `OPENJIUWEN_CLI_PROVIDER`, `OPENJIUWEN_CLI_MODEL`, `OPENJIUWEN_CLI_AGENT`, `OPENJIUWEN_AUTH_FILE`, `OPENJIUWEN_NO_ONBOARDING`, `OPENJIUWEN_LIVE`, `OPENJIUWEN_LOG_LEVEL`, `OPENJIUWEN_LOG_FORMAT`, `OPENJIUWEN_OTEL_SERVICE_NAME`, `OPENJIUWEN_OTEL_EXPORTER_OTLP_ENDPOINT`, `OPENJIUWEN_OTEL_EXPORTER_OTLP_HEADERS`, `OPENJIUWEN_OTEL_EXPORTER_OTLP_PROTOCOL`, `OPENJIUWEN_OTEL_GLOBAL_INSTRUMENT_ENABLE` | CLI target, auth-file location, onboarding suppression, the offline/live switch for examples, `tracing` subscriber setup and the OTLP/HTTP export settings. |
+| CLI, service and logging | `OPENJIUWEN_SERVER_URL`, `OPENJIUWEN_HUB_URL`, `OPENJIUWEN_HUB_API_KEY`, `OPENJIUWEN_AUTH_FILE`, `OPENJIUWEN_NO_ONBOARDING`, `OPENJIUWEN_LIVE`, `OPENJIUWEN_LOG_LEVEL`, `OPENJIUWEN_LOG_FORMAT`, `OPENJIUWEN_OTEL_SERVICE_NAME`, `OPENJIUWEN_OTEL_EXPORTER_OTLP_ENDPOINT`, `OPENJIUWEN_OTEL_EXPORTER_OTLP_HEADERS`, `OPENJIUWEN_OTEL_EXPORTER_OTLP_PROTOCOL`, `OPENJIUWEN_OTEL_GLOBAL_INSTRUMENT_ENABLE` | CLI target, auth-file location, onboarding suppression, the offline/live switch for examples, `tracing` subscriber setup and the OTLP/HTTP export settings. |
 | Sessions and teams | `OPENJIUWEN_SESSION_ID`, `OPENJIUWEN_TEAM_NAME`, `OPENJIUWEN_TEAM_JOIN`, `OPENJIUWEN_TEAM_SOCKET`, `OPENJIUWEN_MEMBER_NAME`, `OPENJIUWEN_MEMBER_WORKSPACE`, `OPENJIUWEN_MEMBER_CHECKPOINTS`, `OPENJIUWEN_MEMBER_CHECKPOINT`, `OPENJIUWEN_MEMBER_CHECKPOINT_DIR` | Team identity, join target, the Unix-socket attach path, member workspace, and where member checkpoints are read from. |
-| Storage and caches | `OPENJIUWEN_REDIS_URL`, `OPENJIUWEN_REDIS_USERNAME`, `OPENJIUWEN_REDIS_PASSWORD`, `OPENJIUWEN_TOKENIZER_CACHE_DIR`, `OPENJIUWEN_OPENAI_ACCOUNT_MODELS_CACHE_FILE`, `OPENJIUWEN_OPENAI_ACCOUNT_BASE_URL`, `OPENJIUWEN_COMPRESSION_DUMP_DIR`, `OPENJIUWEN_RULE_COMPRESSION_DUMP_DIR` | Redis connection, tokenizer artefact cache, OpenAI-account catalogue cache, compression dumps. |
+| Storage and caches | `OPENJIUWEN_REDIS_URL`, `OPENJIUWEN_REDIS_USERNAME`, `OPENJIUWEN_REDIS_PASSWORD`, `OPENJIUWEN_TOKENIZER_CACHE_DIR`, `OPENJIUWEN_OPENAI_ACCOUNT_MODELS_CACHE_FILE`, `OPENJIUWEN_OPENAI_ACCOUNT_BASE_URL`, `OPENJIUWEN_RULE_COMPRESSION_DUMP_DIR` | Redis connection, tokenizer artefact cache, OpenAI-account catalogue cache and the rule-compression dumps; Python's full-compaction dumps are not ported (see `PARITY.md` §Deferred Features). |
 | Object stores | `OPENJIUWEN_S3_{ENDPOINT,BUCKET,REGION,ACCESS_KEY_ID,SECRET_ACCESS_KEY}`, `OPENJIUWEN_GCS_{ENDPOINT,PROJECT,ACCESS_TOKEN}`, `OPENJIUWEN_AZURE_STORAGE_{ACCOUNT,KEY,SAS,ENDPOINT}` | Symphony object-artifact transports. |
 | Tools and harness | `OPENJIUWEN_BASH_STRICT`, `OPENJIUWEN_MCP_{CONFIG,SERVER_CMD,RECONNECT_ATTEMPTS}`, `OPENJIUWEN_WEB_SEARCH_ENDPOINT`, `OPENJIUWEN_SUBAGENT_TASK_TIMEOUT_S`, `OPENJIUWEN_HISTORY`, `OPENJIUWEN_HISTORY_REPLAY`, `OPENJIUWEN_EXTENSIONS_TEARDOWN_HELPER` | Shell strictness, MCP client wiring, the generic HTTP web-search backend, subagent deadlines, history replay, and the test teardown helper. |
 | Vendor adapters | `OPENJIUWEN_CODEX_API_KEY`, `OPENJIUWEN_DASHSCOPE_API_KEY`, `OPENJIUWEN_DASHSCOPE_API_BASE`, `OPENJIUWEN_DASHSCOPE_API_KEY_ENV`, `OPENJIUWEN_DASHSCOPE_API_BASE_ENV` | Vendor CLI credentials and the DashScope names to read keys from. |
