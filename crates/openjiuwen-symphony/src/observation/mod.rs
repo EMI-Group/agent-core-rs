@@ -8,4 +8,5 @@
 //! The static `can_feed` capability graph stays authoritative; nothing here rewrites it.
 
 pub mod contracts;
+pub mod identity;
 pub(crate) mod timestamp;
