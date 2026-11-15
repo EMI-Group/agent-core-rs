@@ -133,13 +133,25 @@ impl LocalShellOperation {
                 .await
                 .map_err(|error| Rejection::new(error.message().to_string()))?,
         };
-        let display = format_path(&path);
-        if !tokio::fs::metadata(&path)
-            .await
-            .is_ok_and(|meta| meta.is_dir())
-        {
-            let reason = format!("working directory does not exist: {display}");
-            return Err(Rejection::with_cwd(reason, display));
+        let cwd_display = format_path(&path);
+        match tokio::fs::metadata(&path).await {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                let reason = format!("working directory does not exist: {cwd_display}");
+                return Err(Rejection::with_cwd(reason, cwd_display));
+            }
+            Err(error) => {
+                // Python's `Path.is_dir()` is also `False` here, so the message stays the
+                // same; the underlying reason is logged so a permission problem on the
+                // workspace root is diagnosable.
+                tracing::debug!(
+                    path = %cwd_display,
+                    %error,
+                    "the working directory could not be inspected; reporting it as missing"
+                );
+                let reason = format!("working directory does not exist: {cwd_display}");
+                return Err(Rejection::with_cwd(reason, cwd_display));
+            }
         }
         Ok(path)
     }
@@ -408,7 +420,11 @@ impl ShellOperation for LocalShellOperation {
                 if let Some(group) = pid {
                     process::kill_group(group);
                 }
-                let _ = child.start_kill();
+                // Best-effort teardown of a background run that could not be started
+                // properly: the failure of the teardown itself is reported, not dropped.
+                if let Err(kill) = child.start_kill() {
+                    tracing::warn!(pid, %kill, "failed to kill the background child");
+                }
                 let reason = format!("background command failed: {error}");
                 return background_failure(&command, &cwd, pid, Some(&reason), &reason);
             }
@@ -423,12 +439,22 @@ impl ShellOperation for LocalShellOperation {
             // Keep draining stderr and reap the child so no zombie is left behind.
             None => {
                 tokio::spawn(async move {
-                    let _ = child.wait().await;
+                    if let Err(error) = child.wait().await {
+                        // The child stays unreaped, so the OS keeps its zombie until the
+                        // process exits: that must not be silent.
+                        tracing::warn!(pid, %error, "failed to reap the backgrounded child");
+                    }
                     // Deregistering only after the reap keeps the group addressable for
                     // as long as the child could still be killed.
                     drop(registration);
                     if let Some(task) = stderr_task {
-                        let _ = task.await;
+                        if let Err(error) = task.await {
+                            tracing::debug!(
+                                pid,
+                                %error,
+                                "the background stderr reader task failed"
+                            );
+                        }
                     }
                 });
             }

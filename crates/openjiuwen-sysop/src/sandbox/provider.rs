@@ -60,8 +60,18 @@ pub struct SandboxProviderRegistry {
 
 impl std::fmt::Debug for SandboxProviderRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A poisoned provider lock is rendered explicitly: an empty list would claim that
+        // no provider is registered, which is a different state.
+        fn types<T>(map: &RwLock<BTreeMap<String, T>>) -> Vec<String> {
+            match map.read() {
+                Ok(map) => map.keys().cloned().collect(),
+                Err(_) => vec!["<poisoned>".to_string()],
+            }
+        }
         f.debug_struct("SandboxProviderRegistry")
-            .field("fs", &self.sandbox_types())
+            .field("fs", &types(&self.fs))
+            .field("shell", &types(&self.shell))
+            .field("code", &types(&self.code))
             .finish()
     }
 }
@@ -141,48 +151,98 @@ impl SandboxProviderRegistry {
     }
 
     /// Removes every factory registered for `sandbox_type`.
+    ///
+    /// A poisoned lock on any of the three maps is reported at `warn!` instead of being
+    /// ignored: that kind's factory then stays registered and still builds backends.
     pub fn unregister(&self, sandbox_type: &str) {
-        if let Ok(mut map) = self.fs.write() {
-            map.remove(sandbox_type);
-        }
-        if let Ok(mut map) = self.shell.write() {
-            map.remove(sandbox_type);
-        }
-        if let Ok(mut map) = self.code.write() {
-            map.remove(sandbox_type);
+        let fs_removed = self
+            .fs
+            .write()
+            .map(|mut map| map.remove(sandbox_type))
+            .is_ok();
+        let shell_removed = self
+            .shell
+            .write()
+            .map(|mut map| map.remove(sandbox_type))
+            .is_ok();
+        let code_removed = self
+            .code
+            .write()
+            .map(|mut map| map.remove(sandbox_type))
+            .is_ok();
+        for (kind, removed) in [
+            ("fs", fs_removed),
+            ("shell", shell_removed),
+            ("code", code_removed),
+        ] {
+            if !removed {
+                tracing::warn!(
+                    sandbox_type,
+                    kind,
+                    "the provider registry lock is poisoned; that provider was not removed"
+                );
+            }
         }
     }
 
     /// Whether a filesystem provider is registered for `sandbox_type`.
     #[must_use]
     pub fn has_fs(&self, sandbox_type: &str) -> bool {
-        self.fs
-            .read()
-            .is_ok_and(|map| map.contains_key(sandbox_type))
+        if let Ok(map) = self.fs.read() {
+            map.contains_key(sandbox_type)
+        } else {
+            tracing::warn!(
+                sandbox_type,
+                kind = "fs",
+                "the provider registry lock is poisoned; reporting no such provider"
+            );
+            false
+        }
     }
 
     /// Whether a shell provider is registered for `sandbox_type`.
     #[must_use]
     pub fn has_shell(&self, sandbox_type: &str) -> bool {
-        self.shell
-            .read()
-            .is_ok_and(|map| map.contains_key(sandbox_type))
+        if let Ok(map) = self.shell.read() {
+            map.contains_key(sandbox_type)
+        } else {
+            tracing::warn!(
+                sandbox_type,
+                kind = "shell",
+                "the provider registry lock is poisoned; reporting no such provider"
+            );
+            false
+        }
     }
 
     /// Whether a code provider is registered for `sandbox_type`.
     #[must_use]
     pub fn has_code(&self, sandbox_type: &str) -> bool {
-        self.code
-            .read()
-            .is_ok_and(|map| map.contains_key(sandbox_type))
+        if let Ok(map) = self.code.read() {
+            map.contains_key(sandbox_type)
+        } else {
+            tracing::warn!(
+                sandbox_type,
+                kind = "code",
+                "the provider registry lock is poisoned; reporting no such provider"
+            );
+            false
+        }
     }
 
     /// The registered sandbox types, sorted.
+    ///
+    /// A poisoned registry lock yields only the types of the readable maps (an infallible
+    /// accessor cannot report the failure), and that gap is logged at `warn!`.
     #[must_use]
     pub fn sandbox_types(&self) -> Vec<String> {
         let mut types = Vec::new();
         if let Ok(map) = self.fs.read() {
             types.extend(map.keys().cloned());
+        } else {
+            tracing::warn!(
+                "the provider registry lock is poisoned; the reported sandbox types are incomplete"
+            );
         }
         types.sort();
         types.dedup();

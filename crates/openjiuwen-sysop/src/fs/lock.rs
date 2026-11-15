@@ -88,7 +88,19 @@ pub fn default_lock_root() -> PathBuf {
 /// the same argument always maps to the same file within one process.
 #[must_use]
 pub fn lock_path_for(root: &Path, target: &Path) -> PathBuf {
-    let normalized = std::path::absolute(target).unwrap_or_else(|_| target.to_path_buf());
+    let normalized = match std::path::absolute(target) {
+        Ok(normalized) => normalized,
+        Err(error) => {
+            // The target stays relative, so two processes started from different working
+            // directories would hash it differently and take different lock files.
+            tracing::warn!(
+                target = %crate::util::format_path(target),
+                %error,
+                "cannot make the lock target absolute; its sidecar file may not be shared"
+            );
+            target.to_path_buf()
+        }
+    };
     let digest = sha256_hex(normalized.as_os_str().as_encoded_bytes());
     root.join(format!("{digest}.lock"))
 }

@@ -46,7 +46,20 @@ pub(crate) async fn write_file(
         Ok(path) => path,
         Err(error) => return fs_failure(WRITE_FILE, &error.message()),
     };
-    let metadata = tokio::fs::metadata(&path).await.ok();
+    let metadata = match metadata_if_exists(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            // A target that cannot be stat'ed is not the same as a missing one: reporting
+            // "File does not exist" here would hide a permission or symlink-loop failure,
+            // and treating it as missing would let `create_if_absent` replace it.
+            tracing::debug!(
+                path = %format_path(&path),
+                %error,
+                "cannot read the write target's metadata"
+            );
+            return fs_failure(WRITE_FILE, &error.to_string());
+        }
+    };
     if metadata.as_ref().is_some_and(std::fs::Metadata::is_dir) {
         return fs_failure(
             WRITE_FILE,
@@ -81,6 +94,19 @@ fn version_conflict<T>() -> OpResult<T> {
     )
 }
 
+/// Stats `path`, distinguishing a missing target from an I/O failure.
+///
+/// `Ok(None)` means the target does not exist. Every other error (a permission failure, a
+/// symlink loop, an I/O error) is returned unchanged so the caller reports the OS message
+/// instead of turning it into "the file does not exist".
+async fn metadata_if_exists(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Rejects the write flag combinations Python refuses before touching the filesystem.
 ///
 /// # Errors
@@ -102,7 +128,17 @@ fn validate_write(params: &WriteFileParams) -> Result<(), String> {
 /// The conditional checks run *before* the file is opened for writing, so a rejected
 /// compare-and-swap leaves the target byte-identical.
 async fn write_locked(path: &Path, params: &WriteFileParams) -> OpResult<WriteFileData> {
-    let exists = tokio::fs::metadata(path).await.is_ok();
+    let exists = match metadata_if_exists(path).await {
+        Ok(metadata) => metadata.is_some(),
+        Err(error) => {
+            tracing::debug!(
+                path = %format_path(path),
+                %error,
+                "cannot re-read the write target's metadata under the lock"
+            );
+            return fs_failure(WRITE_FILE, &error.to_string());
+        }
+    };
     if params.create_if_absent && exists {
         return version_conflict();
     }
@@ -406,5 +442,47 @@ mod tests {
         assert_eq!(failure.code, 199_003);
         assert!(failure.message.contains("U+1F600"), "{}", failure.message);
         assert!(!dir.path().join("new.txt").exists());
+    }
+    /// A target that cannot be stat'ed is a real failure, not "the file does not exist".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stat_failure_is_reported_instead_of_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A self-referencing link makes `metadata` fail with `ELOOP`, which is neither
+        // "missing" nor a directory.
+        std::os::unix::fs::symlink("loop.txt", dir.path().join("loop.txt")).unwrap();
+        let op = backend(&dir);
+        let mut params = WriteFileParams::raw("loop.txt", "x");
+        params.create_if_not_exist = false;
+        let failure = op.write_file(params).await;
+        assert_eq!(failure.code, 199_003);
+        assert!(
+            !failure.message.contains("File does not exist"),
+            "an I/O error must not be reported as a missing file: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.to_lowercase().contains("symbolic link"),
+            "{}",
+            failure.message
+        );
+    }
+
+    /// The same failure under the lock must not silently treat the target as absent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_if_absent_refuses_an_unstatable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("loop.txt", dir.path().join("loop.txt")).unwrap();
+        let op = backend(&dir);
+        let mut params = WriteFileParams::raw("loop.txt", "x");
+        params.create_if_absent = true;
+        let failure = op.write_file(params).await;
+        assert_eq!(failure.code, 199_003);
+        assert!(
+            failure.message.to_lowercase().contains("symbolic link"),
+            "{}",
+            failure.message
+        );
     }
 }

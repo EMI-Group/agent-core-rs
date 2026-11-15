@@ -68,10 +68,21 @@ impl OperationToolSpec {
 }
 
 /// Renders the JSON Schema of `P` as a JSON value.
+///
+/// A schema that cannot be serialized degrades to the empty object schema (the tool stays
+/// callable, unvalidated) instead of panicking; the degradation is logged with the type name
+/// so an unusable tool schema is not silent.
 #[must_use]
 pub fn schema_value<P: schemars::JsonSchema>() -> Value {
     let schema = schema_for!(P);
-    serde_json::to_value(schema).unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
+    serde_json::to_value(schema).unwrap_or_else(|error| {
+        tracing::warn!(
+            schema_type = std::any::type_name::<P>(),
+            %error,
+            "the tool parameter schema could not be serialized; using an empty object schema"
+        );
+        Value::Object(serde_json::Map::new())
+    })
 }
 
 /// Tool specs for the ten filesystem operations.

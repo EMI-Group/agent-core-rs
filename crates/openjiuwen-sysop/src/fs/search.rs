@@ -78,9 +78,16 @@ pub async fn search_files(
         Ok(root) => root,
         Err(error) => return fs_failure("search_files", &error.message()),
     };
-    let is_directory = tokio::fs::metadata(&root)
-        .await
-        .is_ok_and(|metadata| metadata.is_dir());
+    let is_directory = match tokio::fs::metadata(&root).await {
+        Ok(metadata) => metadata.is_dir(),
+        // A missing root keeps Python's "not a directory" wording; a root that cannot be
+        // stat'ed at all (a permission failure, an I/O error) is not the same thing.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            tracing::debug!(path = %crate::util::format_path(&root), %error, "cannot stat the search root");
+            return fs_failure("search_files", &error.to_string());
+        }
+    };
     if !is_directory {
         let root_path = crate::util::format_path(&root);
         return fs_failure(
@@ -104,7 +111,8 @@ pub async fn search_files(
     })
     .await
     {
-        Ok(files) => files,
+        Ok(Ok(files)) => files,
+        Ok(Err(error)) => return fs_failure("search_files", &error.to_string()),
         Err(error) => return fs_failure("search_files", &error.to_string()),
     };
 
@@ -142,17 +150,35 @@ fn compile_excludes(patterns: Option<&[String]>) -> Result<Vec<glob::Pattern>, S
 }
 
 /// Walks `root` and returns the matching regular files in filesystem order.
+///
+/// A failure to read the *root* is returned, because an empty match list would otherwise
+/// look like "no file matches". An unreadable subdirectory keeps Python's `os.walk`
+/// behavior (the walk continues past it) and is logged with its path.
 fn collect_matches(
     root: &Path,
     matcher: &Matcher,
     excludes: &[glob::Pattern],
-) -> Vec<FileSystemItem> {
+) -> std::io::Result<Vec<FileSystemItem>> {
     let mut items = Vec::new();
     for entry in walkdir::WalkDir::new(root).min_depth(1).follow_links(false) {
         let entry = match entry {
             Ok(entry) => entry,
+            Err(error)
+                if error
+                    .path()
+                    .is_some_and(|path| path == root && error.depth() == 0) =>
+            {
+                return Err(root_error(&error));
+            }
             Err(error) => {
-                tracing::debug!(error = %error, "skipping unreadable directory entry");
+                let path = error
+                    .path()
+                    .map_or_else(|| crate::util::format_path(root), crate::util::format_path);
+                tracing::warn!(
+                    path,
+                    error = %error,
+                    "skipping an unreadable directory; its files are missing from this search"
+                );
                 continue;
             }
         };
@@ -178,7 +204,15 @@ fn collect_matches(
         }
         items.push(file_system_item(path, &metadata));
     }
-    items
+    Ok(items)
+}
+
+/// Converts a walk error on the root into the I/O error the search must report.
+fn root_error(error: &walkdir::Error) -> std::io::Error {
+    match error.io_error() {
+        Some(io) => std::io::Error::new(io.kind(), io.to_string()),
+        None => std::io::Error::other(error.to_string()),
+    }
 }
 
 /// Returns `true` when `relative` matches the glob `pattern` with `rglob` semantics.
@@ -499,6 +533,36 @@ mod tests {
         assert_eq!(result.code, 199_003);
         assert!(
             result.message.contains("path must not be empty"),
+            "{}",
+            result.message
+        );
+    }
+    /// A root that cannot be read is a real failure, not "no file matches".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_root_is_an_error_not_an_empty_result() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("a.txt"), b"a").unwrap();
+        let policy = policy(&dir);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = search_files(
+            &policy,
+            &SearchFilesParams::new("locked", "*.txt"),
+            SearchPatternMode::Glob,
+        )
+        .await;
+        let enforced = std::fs::read_dir(&locked).is_err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !enforced {
+            eprintln!("skipping: permission bits are not enforced for this user");
+            return;
+        }
+        assert_eq!(result.code, 199_003, "{}", result.message);
+        assert!(
+            result.message.contains("ermission denied") || result.message.contains("os error 13"),
             "{}",
             result.message
         );

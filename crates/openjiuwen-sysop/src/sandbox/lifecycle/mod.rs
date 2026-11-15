@@ -185,21 +185,20 @@ pub struct SandboxLifecycle {
 impl fmt::Debug for SandboxLifecycle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Records carry endpoints, which may embed credentials: only keys and states show.
+        // A map that cannot be read at all is rendered as an explicit marker, because an
+        // empty list would claim that no container is tracked.
+        let records = match self.records.try_lock() {
+            Ok(records) => records
+                .iter()
+                .map(|(key, record)| (key.clone(), record.status))
+                .collect::<Vec<_>>(),
+            // `tokio::sync::Mutex::try_lock` has a single failure mode (the lock is held),
+            // so the marker says the view is unavailable rather than "no containers".
+            Err(_) => vec![("<locked>".to_string(), SandboxStatus::Unknown)],
+        };
         f.debug_struct("SandboxLifecycle")
             .field("launchers", &self.launchers.launcher_types())
-            .field(
-                "records",
-                &self
-                    .records
-                    .try_lock()
-                    .map(|records| {
-                        records
-                            .iter()
-                            .map(|(key, record)| (key.clone(), record.status))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default(),
-            )
+            .field("records", &records)
             .finish_non_exhaustive()
     }
 }
@@ -526,7 +525,16 @@ impl SandboxLifecycle {
                 return Err(error);
             }
         };
-        let sandbox_id = record.sandbox_id.clone().unwrap_or_default();
+        let sandbox_id = record.sandbox_id.clone().unwrap_or_else(|| {
+            // The launcher has no container identity to act on; the call still goes out
+            // (Python does the same) but the caller can see why it may not resolve.
+            tracing::warn!(
+                isolation_key,
+                launcher_type = %record.launcher_type,
+                "the released record carries no sandbox id; the launcher receives an empty id"
+            );
+            String::new()
+        });
         let outcome = if on_stop == OnStop::Pause {
             launcher.pause(&sandbox_id).await
         } else {
@@ -596,7 +604,14 @@ impl SandboxLifecycle {
 
         let mut evicted = Vec::with_capacity(expired.len());
         for record in expired {
-            let sandbox_id = record.sandbox_id.clone().unwrap_or_default();
+            let sandbox_id = record.sandbox_id.clone().unwrap_or_else(|| {
+                tracing::warn!(
+                    isolation_key = %record.isolation_key,
+                    launcher_type = %record.launcher_type,
+                    "the evicted record carries no sandbox id; the launcher receives an empty id"
+                );
+                String::new()
+            });
             match self.launchers.create(&record.launcher_type) {
                 Ok(launcher) => {
                     if let Err(error) = launcher.delete(&sandbox_id).await {

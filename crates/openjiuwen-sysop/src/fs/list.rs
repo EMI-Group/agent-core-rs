@@ -143,9 +143,7 @@ pub fn file_system_item(path: &Path, metadata: &std::fs::Metadata) -> FileSystem
         name,
         path: crate::util::format_path(path),
         size: if is_directory { 0 } else { metadata.len() },
-        modified_time: crate::util::format_modified_time(
-            metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-        ),
+        modified_time: crate::util::modified_time_of(metadata, path),
         is_directory,
         file_type,
     }
@@ -160,9 +158,16 @@ async fn collect_listing(
         Ok(root) => root,
         Err(error) => return fs_failure(spec.execution, &error.message()),
     };
-    let is_directory = tokio::fs::metadata(&root)
-        .await
-        .is_ok_and(|metadata| metadata.is_dir());
+    let is_directory = match tokio::fs::metadata(&root).await {
+        Ok(metadata) => metadata.is_dir(),
+        // A missing root keeps Python's "not a directory" wording; a root that cannot be
+        // stat'ed at all (a permission failure, an I/O error) is not the same thing.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            tracing::debug!(path = %crate::util::format_path(&root), %error, "cannot stat the listing root");
+            return fs_failure(spec.execution, &error.to_string());
+        }
+    };
     if !is_directory {
         let root_path = crate::util::format_path(&root);
         return fs_failure(
@@ -188,14 +193,29 @@ async fn collect_listing(
 }
 
 /// Walks the tree, filters entries, and sorts the result.
+///
+/// A failure to read the *root* is returned: it would otherwise turn into an empty listing
+/// that looks like "the directory has no entries". An unreadable subdirectory keeps
+/// Python's `os.walk` behavior (the walk continues past it) and is logged with its path.
 fn collect(request: &ListRequest) -> std::io::Result<Vec<FileSystemItem>> {
     let mut items = Vec::new();
     if request.recursive {
         for entry in walk(&request.root, request.max_depth) {
             match entry {
                 Ok(entry) => push_entry(&mut items, entry.path(), request),
+                Err(error) if is_root_error(&error, &request.root) => {
+                    return Err(root_error(&error))
+                }
                 Err(error) => {
-                    tracing::debug!(error = %error, "skipping unreadable directory entry");
+                    let path = error.path().map_or_else(
+                        || crate::util::format_path(&request.root),
+                        crate::util::format_path,
+                    );
+                    tracing::warn!(
+                        path,
+                        error = %error,
+                        "skipping an unreadable directory; its entries are missing from this listing"
+                    );
                 }
             }
         }
@@ -211,6 +231,21 @@ fn collect(request: &ListRequest) -> std::io::Result<Vec<FileSystemItem>> {
     }
     sort_items(&mut items, request.sort_by, request.sort_descending);
     Ok(items)
+}
+
+/// Whether `error` is the walk failing on its own root rather than on a nested directory.
+fn is_root_error(error: &walkdir::Error, root: &Path) -> bool {
+    error
+        .path()
+        .is_some_and(|path| path == root && error.depth() == 0)
+}
+
+/// Converts a walk error on the root into the I/O error the listing must report.
+fn root_error(error: &walkdir::Error) -> std::io::Error {
+    match error.io_error() {
+        Some(io) => std::io::Error::new(io.kind(), io.to_string()),
+        None => std::io::Error::other(error.to_string()),
+    }
 }
 
 /// Builds the recursive walker for `root`.
@@ -671,5 +706,56 @@ mod tests {
             "{}",
             result.message
         );
+    }
+    /// A root that cannot be read is a real failure, not an empty listing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_root_is_an_error_not_an_empty_listing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("a.txt"), b"a").unwrap();
+        let policy = policy(&dir);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = list_files(&policy, &ListFilesParams::new("locked").recursive(None)).await;
+        let enforced = std::fs::read_dir(&locked).is_err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !enforced {
+            eprintln!("skipping: permission bits are not enforced for this user");
+            return;
+        }
+        assert_eq!(result.code, 199_003, "{}", result.message);
+        assert!(
+            result.message.contains("ermission denied") || result.message.contains("os error 13"),
+            "{}",
+            result.message
+        );
+        assert!(
+            result.data.is_none(),
+            "a failed listing must not carry an (empty) item list"
+        );
+    }
+
+    /// An unreadable *subdirectory* keeps Python's `os.walk` behavior: the walk continues.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_subdirectory_does_not_hide_the_readable_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("locked")).unwrap();
+        std::fs::write(dir.path().join("visible.txt"), b"v").unwrap();
+        let policy = policy(&dir);
+        let locked = dir.path().join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = list_files(&policy, &ListFilesParams::new(".").recursive(None)).await;
+        let enforced = std::fs::read_dir(&locked).is_err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let data = result.into_result().unwrap();
+        assert_eq!(data.total_count, 1, "the readable file is still listed");
+        assert_eq!(data.list_items[0].name, "visible.txt");
+        if !enforced {
+            eprintln!("note: permission bits are not enforced for this user");
+        }
     }
 }

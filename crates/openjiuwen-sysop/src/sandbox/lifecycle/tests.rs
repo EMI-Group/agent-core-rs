@@ -972,3 +972,25 @@ async fn evict_idle_for_is_a_no_op_without_a_configured_ttl() {
     assert_eq!(lifecycle.len().await, 1, "no TTL means no sweep");
     assert_eq!(launcher.calls(), vec!["launch:42".to_string()]);
 }
+
+/// The `Debug` rendering never claims "no containers" when it cannot read the map.
+#[tokio::test]
+async fn debug_marks_a_busy_record_map_instead_of_listing_nothing() {
+    let lifecycle = SandboxLifecycle::new(LauncherRegistry::new());
+    assert!(
+        format!("{lifecycle:?}").contains("records: []"),
+        "an idle lifecycle renders an empty list: {lifecycle:?}"
+    );
+    // Holding the map lock makes `try_lock` fail while the call is running.
+    let guard = lifecycle.records.lock().await;
+    let rendered = format!("{lifecycle:?}");
+    assert!(
+        rendered.contains("<locked>"),
+        "a busy record map must be marked, not shown as empty: {rendered}"
+    );
+    drop(guard);
+    assert!(
+        format!("{lifecycle:?}").contains("records: []"),
+        "the marker disappears once the map is readable again"
+    );
+}

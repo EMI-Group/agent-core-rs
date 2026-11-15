@@ -275,11 +275,25 @@ fn transfer_stream(
 }
 
 /// Captures the source metadata before a copy so its permissions can be applied afterwards.
+///
+/// Preserving permissions is best-effort (the copy itself has already been validated), so a
+/// metadata failure does not fail the transfer — but it must not be silent either, because
+/// the destination then keeps the default mode instead of the source's.
 async fn source_metadata(source: &Path, preserve: bool) -> Option<std::fs::Metadata> {
-    if preserve {
-        return tokio::fs::metadata(source).await.ok();
+    if !preserve {
+        return None;
     }
-    None
+    match tokio::fs::metadata(source).await {
+        Ok(metadata) => Some(metadata),
+        Err(error) => {
+            tracing::warn!(
+                path = %format_path(source),
+                %error,
+                "cannot read the source metadata; the copied file keeps the default permissions"
+            );
+            None
+        }
+    }
 }
 
 /// Applies copied permissions to `destination`, best-effort, on Unix only.
@@ -336,15 +350,25 @@ fn transfer_chunk_size(requested: u64) -> u64 {
 ///
 /// # Errors
 ///
-/// Returns `Source not found: <path>` when the source is missing or not a regular file.
+/// Returns `Source not found: <path>` when the source is missing or not a regular file, and
+/// the OS message when its metadata cannot be read at all (a permission failure is not the
+/// same as a missing source).
 async fn ensure_source_file(source: &Path) -> Result<(), String> {
-    let is_file = tokio::fs::metadata(source)
-        .await
-        .is_ok_and(|metadata| metadata.is_file());
-    if is_file {
-        return Ok(());
+    match tokio::fs::metadata(source).await {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(format!("Source not found: {}", format_path(source))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("Source not found: {}", format_path(source)))
+        }
+        Err(error) => {
+            tracing::debug!(
+                path = %format_path(source),
+                %error,
+                "cannot read the transfer source's metadata"
+            );
+            Err(error.to_string())
+        }
     }
-    Err(format!("Source not found: {}", format_path(source)))
 }
 
 /// Rejects an existing destination unless the caller allows overwriting it.
@@ -787,5 +811,33 @@ mod tests {
             "{}",
             items[0].message
         );
+    }
+    /// A source whose metadata cannot be read is an I/O failure, not a missing source.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_reports_an_unstatable_source_as_an_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let loop_path = host.path().join("loop.txt");
+        std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+        let result = backend(&dir)
+            .upload_file(UploadFileParams {
+                local_path: format_path(&loop_path),
+                target_path: "out.txt".to_string(),
+                ..UploadFileParams::default()
+            })
+            .await;
+        assert_eq!(result.code, 199_003);
+        assert!(
+            !result.message.contains("Source not found"),
+            "an I/O error must not be reported as a missing source: {}",
+            result.message
+        );
+        assert!(
+            result.message.to_lowercase().contains("symbolic link"),
+            "{}",
+            result.message
+        );
+        assert!(!dir.path().join("out.txt").exists());
     }
 }

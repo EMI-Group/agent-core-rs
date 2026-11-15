@@ -306,8 +306,14 @@ pub struct LauncherRegistry {
 
 impl fmt::Debug for LauncherRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A poisoned registry is rendered explicitly: an empty list would claim that no
+        // launcher is registered, which is a different state.
+        let launchers = match self.launchers.read() {
+            Ok(map) => map.keys().cloned().collect::<Vec<_>>(),
+            Err(_) => vec!["<poisoned>".to_string()],
+        };
         f.debug_struct("LauncherRegistry")
-            .field("launchers", &self.launcher_types())
+            .field("launchers", &launchers)
             .finish()
     }
 }
@@ -346,20 +352,37 @@ impl LauncherRegistry {
     }
 
     /// Whether a launcher is registered under `launcher_type`.
+    ///
+    /// A poisoned registry lock reports `false` (the accessor is infallible) and is logged,
+    /// because "no launcher registered" is a different answer from "cannot tell".
     #[must_use]
     pub fn has(&self, launcher_type: &str) -> bool {
-        self.launchers
-            .read()
-            .is_ok_and(|map| map.contains_key(launcher_type))
+        if let Ok(map) = self.launchers.read() {
+            map.contains_key(launcher_type)
+        } else {
+            tracing::warn!(
+                launcher_type,
+                "the launcher registry lock is poisoned; reporting no such launcher"
+            );
+            false
+        }
     }
 
     /// The launcher registered under `launcher_type`, if any.
+    ///
+    /// A poisoned registry lock reports `None` and is logged; [`Self::create`] is the
+    /// fallible accessor and reports the poisoning as an error.
     #[must_use]
     pub fn get(&self, launcher_type: &str) -> Option<Arc<dyn SandboxLauncher>> {
-        self.launchers
-            .read()
-            .ok()
-            .and_then(|map| map.get(launcher_type).cloned())
+        if let Ok(map) = self.launchers.read() {
+            map.get(launcher_type).cloned()
+        } else {
+            tracing::warn!(
+                launcher_type,
+                "the launcher registry lock is poisoned; reporting no such launcher"
+            );
+            None
+        }
     }
 
     /// The launcher registered under `launcher_type`.
@@ -379,19 +402,32 @@ impl LauncherRegistry {
     }
 
     /// Removes the launcher registered under `launcher_type`, if any.
+    ///
+    /// A poisoned registry lock is reported at `warn!` rather than ignored: the launcher
+    /// then stays registered and the next `create` would still find it.
     pub fn unregister(&self, launcher_type: &str) {
         if let Ok(mut map) = self.launchers.write() {
             map.remove(launcher_type);
+        } else {
+            tracing::warn!(
+                launcher_type,
+                "the launcher registry lock is poisoned; the launcher was not removed"
+            );
         }
     }
 
     /// The registered launcher types, sorted.
+    ///
+    /// A poisoned registry lock yields the empty list (the accessor is infallible), which is
+    /// indistinguishable from "nothing registered": that case is logged at `warn!`.
     #[must_use]
     pub fn launcher_types(&self) -> Vec<String> {
-        self.launchers
-            .read()
-            .map(|map| map.keys().cloned().collect())
-            .unwrap_or_default()
+        if let Ok(map) = self.launchers.read() {
+            map.keys().cloned().collect()
+        } else {
+            tracing::warn!("the launcher registry lock is poisoned; reporting no launcher types");
+            Vec::new()
+        }
     }
 }
 
