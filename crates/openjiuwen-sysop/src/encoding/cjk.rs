@@ -6,8 +6,9 @@
 //! `scripts/gen_cjk_tables.py` fuzzes the model against Python's `gb18030`, `big5` and
 //! `shift_jis` codecs in replace mode).
 //!
-//! Decoding is decode-only: [`encode_text`](super::encode_text) keeps rejecting legacy
-//! names, because writes stay UTF-8.
+//! Decoding is table driven; writing uses the reverse geometry at the bottom of this module
+//! (the crate-internal `two_byte_bytes`, `four_byte_index` and `four_byte_bytes`) through the
+//! private `encode` module, which verifies every candidate code by decoding it back first.
 //!
 //! ```
 //! use openjiuwen_sysop::encoding::cjk::{CjkDecoder, CjkEncoding};
@@ -386,6 +387,131 @@ fn mapped(value: u16) -> Option<char> {
 fn halfwidth_katakana(byte: u8) -> char {
     char::from_u32(HALFWIDTH_KATAKANA_UNICODE + u32::from(byte - HALFWIDTH_KATAKANA_START))
         .unwrap_or(REPLACEMENT)
+}
+
+// ---------------------------------------------------------------------------------------
+// Reverse geometry for the encoders.
+//
+// The tables above are the decode direction: a position in the dense two-byte array plus the
+// lead/trail geometry yields a character. [`super::encode`] builds its reverse lookup from
+// exactly these functions, so a position it emits is always a position the decoder above
+// accepts, and it verifies every entry by decoding it back before trusting it.
+// ---------------------------------------------------------------------------------------
+
+/// Row and column count of an encoding's dense two-byte table.
+///
+/// The counts match the generated tables (`126 × 190` for GB18030, `89 × 157` for Big5,
+/// `60 × 188` for Shift-JIS).
+#[must_use]
+pub(crate) const fn two_byte_shape(encoding: CjkEncoding) -> (usize, usize) {
+    match encoding {
+        CjkEncoding::Gb18030 => (126, tables::gb18030::TWO_BYTE_COLUMNS),
+        CjkEncoding::Big5 => (89, tables::big5::TWO_BYTE_COLUMNS),
+        CjkEncoding::ShiftJis => (60, tables::shift_jis::TWO_BYTE_COLUMNS),
+    }
+}
+
+/// Returns the two bytes of a two-byte table position, or `None` for a position outside it.
+///
+/// This is the inverse of [`two_byte_char`]'s row/column geometry.
+pub(crate) fn two_byte_bytes(encoding: CjkEncoding, row: usize, column: usize) -> Option<[u8; 2]> {
+    let (rows, columns) = two_byte_shape(encoding);
+    if row >= rows || column >= columns {
+        return None;
+    }
+    let row = u32::try_from(row).ok()?;
+    let column = u32::try_from(column).ok()?;
+    let lead = match encoding {
+        CjkEncoding::Gb18030 => 0x81_u8.checked_add(to_u8(row)?)?,
+        CjkEncoding::Big5 => 0xA1_u8.checked_add(to_u8(row)?)?,
+        CjkEncoding::ShiftJis if row <= 30 => 0x81_u8.checked_add(to_u8(row)?)?,
+        CjkEncoding::ShiftJis => 0xE0_u8.checked_add(to_u8(row.checked_sub(31)?)?)?,
+    };
+    // Trails start at `0x40` and skip the `0x7F` hole; Big5 resumes at `0xA1`, the other
+    // two codecs at `0x80`.
+    let trail = if column <= 62 {
+        0x40_u8.checked_add(to_u8(column)?)?
+    } else {
+        let offset = to_u8(column.checked_sub(63)?)?;
+        match encoding {
+            CjkEncoding::Big5 => 0xA1_u8.checked_add(offset)?,
+            CjkEncoding::Gb18030 | CjkEncoding::ShiftJis => 0x80_u8.checked_add(offset)?,
+        }
+    };
+    Some([lead, trail])
+}
+
+/// Decodes one two-byte pair, verifying a candidate code before it is used for writing.
+pub(crate) fn decode_two_byte(encoding: CjkEncoding, lead: u8, trail: u8) -> Option<char> {
+    two_byte_char(encoding, lead, trail)
+}
+
+/// Decodes one GB18030 four-byte sequence, verifying a candidate code before it is written.
+pub(crate) fn decode_four_byte(bytes: [u8; 4]) -> Option<char> {
+    gb18030_four_byte(bytes[0], bytes[1], bytes[2], bytes[3])
+}
+
+/// Returns the GB18030 four-byte linear index that maps to `character`.
+///
+/// `FOUR_BYTE_RUNS` is sorted by both index and code point, so this is one binary search
+/// over the 207 runs and allocates nothing. Every code point in a run maps back to itself
+/// through [`four_byte_bytes`] → [`decode_four_byte`].
+pub(crate) fn four_byte_index(character: char) -> Option<u32> {
+    let code = u32::from(character);
+    let runs = &tables::gb18030::FOUR_BYTE_RUNS;
+    let position = runs.partition_point(|run| run.1 <= code);
+    let (start, first, length) = runs.get(position.checked_sub(1)?).copied()?;
+    if code >= first + length {
+        return None;
+    }
+    Some(start + (code - first))
+}
+
+/// Returns the four bytes of a GB18030 four-byte linear index.
+///
+/// This inverts `index = ((b1 - 0x81) * 10 + (b2 - 0x30)) * 1260 + (b3 - 0x81) * 10 +
+/// (b4 - 0x30)`.
+pub(crate) fn four_byte_bytes(index: u32) -> Option<[u8; 4]> {
+    if index > tables::gb18030::FOUR_BYTE_MAX_INDEX {
+        return None;
+    }
+    let units = index % 1260;
+    let high = index / 1260;
+    let lead = 0x81_u8.checked_add(to_u8(high / 10)?)?;
+    let second = 0x30_u8.checked_add(to_u8(high % 10)?)?;
+    let third = 0x81_u8.checked_add(to_u8(units / 10)?)?;
+    let fourth = 0x30_u8.checked_add(to_u8(units % 10)?)?;
+    Some([lead, second, third, fourth])
+}
+
+/// Returns the Shift-JIS halfwidth katakana byte for `character`, if it has one.
+///
+/// The block is positional (`U+FF61..=U+FF9F` ↔ `0xA1..=0xDF`), so no table is needed.
+pub(crate) fn halfwidth_katakana_byte(character: char) -> Option<u8> {
+    let code = u32::from(character);
+    let last = HALFWIDTH_KATAKANA_UNICODE + u32::from(HALFWIDTH_KATAKANA_END)
+        - u32::from(HALFWIDTH_KATAKANA_START);
+    if (HALFWIDTH_KATAKANA_UNICODE..=last).contains(&code) {
+        to_u8(code - HALFWIDTH_KATAKANA_UNICODE).map(|offset| HALFWIDTH_KATAKANA_START + offset)
+    } else {
+        None
+    }
+}
+
+/// The byte range of the Shift-JIS halfwidth katakana block (`0xA1..=0xDF`).
+pub(crate) const HALFWIDTH_KATAKANA_BYTES: std::ops::RangeInclusive<u8> =
+    HALFWIDTH_KATAKANA_START..=HALFWIDTH_KATAKANA_END;
+
+/// Decodes one Shift-JIS halfwidth katakana byte, or `None` outside the block.
+pub(crate) fn decode_halfwidth_katakana(byte: u8) -> Option<char> {
+    HALFWIDTH_KATAKANA_BYTES
+        .contains(&byte)
+        .then(|| halfwidth_katakana(byte))
+}
+
+/// Narrows a table position or offset to a byte.
+fn to_u8(value: u32) -> Option<u8> {
+    u8::try_from(value).ok()
 }
 
 #[cfg(test)]

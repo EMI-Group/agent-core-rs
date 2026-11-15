@@ -192,7 +192,7 @@ fn apply_permissions(path: &Path, permissions: Option<&str>) {
 mod tests {
     use super::*;
     use crate::fs::local::test_util::{backend, read_back};
-    use crate::fs::types::ReadMode;
+    use crate::fs::types::{FileContent, ReadFileParams, ReadMode};
     use crate::operation::FsOperation;
 
     // ----- write_file ---------------------------------------------------------------
@@ -319,5 +319,92 @@ mod tests {
         created.create_if_absent = true;
         op.write_file(created).await.into_result().unwrap();
         assert_eq!(read_back(&dir, "fresh.txt"), b"x".to_vec());
+    }
+
+    // ----- declared write encodings -------------------------------------------------
+    #[tokio::test]
+    async fn write_and_read_round_trip_the_declared_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = backend(&dir);
+        let mut gbk = vec![0xD6_u8, 0xD0, 0xCE, 0xC4];
+        gbk.extend_from_slice(b"\nascii");
+        for (name, text, expected, encoding) in [
+            ("gb.txt", "中文", vec![0xD6_u8, 0xD0, 0xCE, 0xC4], "gb18030"),
+            ("gbk.txt", "中文\nascii", gbk, "gbk"),
+            ("big5.txt", "中文", vec![0xA4_u8, 0xA4, 0xA4, 0xE5], "big5"),
+            (
+                "sjis.txt",
+                "日本語",
+                vec![0x93_u8, 0xFA, 0x96, 0x7B, 0x8C, 0xEA],
+                "shift-jis",
+            ),
+            ("latin1.txt", "café", b"caf\xE9".to_vec(), "latin-1"),
+            (
+                "utf16.txt",
+                "hi",
+                vec![0x68_u8, 0x00, 0x69, 0x00],
+                "utf-16le",
+            ),
+        ] {
+            op.write_file(WriteFileParams::raw(name, text).with_encoding(encoding))
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(read_back(&dir, name), expected, "{encoding} bytes");
+            let read = op
+                .read_file(ReadFileParams::text(name).with_encoding(encoding))
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                read.content,
+                FileContent::Text(text.to_string()),
+                "{encoding} round trip"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_rejects_unknown_encodings_without_creating_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = backend(&dir);
+        let failure = op
+            .write_file(WriteFileParams::raw("a.txt", "x").with_encoding("koi8-r"))
+            .await;
+        assert_eq!(failure.code, 199_003);
+        assert!(failure.message.contains("koi8-r"), "{}", failure.message);
+        assert!(!dir.path().join("a.txt").exists());
+        // `auto` is a read policy, so it is refused for writing too.
+        let auto = op
+            .write_file(WriteFileParams::raw("b.txt", "x").with_encoding("auto"))
+            .await;
+        assert_eq!(auto.code, 199_003);
+        assert!(
+            auto.message.contains("cannot be used for writing"),
+            "{}",
+            auto.message
+        );
+        assert!(!dir.path().join("b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn write_rejects_unrepresentable_content_and_keeps_the_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        let op = backend(&dir);
+        let failure = op
+            .write_file(WriteFileParams::raw("a.txt", "中文").with_encoding("latin-1"))
+            .await;
+        assert_eq!(failure.code, 199_003);
+        assert!(failure.message.contains("latin-1"), "{}", failure.message);
+        assert!(failure.message.contains("U+4E2D"), "{}", failure.message);
+        // The encode happens before the file is opened, so the target is untouched.
+        assert_eq!(read_back(&dir, "a.txt"), b"old".to_vec());
+        let failure = op
+            .write_file(WriteFileParams::raw("new.txt", "\u{1F600}").with_encoding("big5"))
+            .await;
+        assert_eq!(failure.code, 199_003);
+        assert!(failure.message.contains("U+1F600"), "{}", failure.message);
+        assert!(!dir.path().join("new.txt").exists());
     }
 }

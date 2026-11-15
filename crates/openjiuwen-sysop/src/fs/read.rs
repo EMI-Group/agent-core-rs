@@ -104,7 +104,15 @@ pub(crate) fn read_file_stream(
                 }
                 let last = lines.len() - 1;
                 for (index, line) in lines.into_iter().enumerate() {
-                    let chunk_size = slice::encoded_len(&line, &encoding);
+                    // The chunk size is the encoded length; a line the declared encoding
+                    // cannot re-encode is reported instead of a fabricated size.
+                    let chunk_size = match slice::try_encoded_len(&line, &encoding) {
+                        Ok(size) => size,
+                        Err(reason) => {
+                            yield fs_failure(READ_FILE_STREAM, &reason);
+                            return;
+                        }
+                    };
                     yield OpResult::success(ReadChunkData {
                         path: path.clone(),
                         chunk: FileContent::Text(line),
