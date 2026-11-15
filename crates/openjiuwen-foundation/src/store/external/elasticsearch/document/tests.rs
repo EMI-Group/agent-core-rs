@@ -12,6 +12,10 @@ use serde_json::json;
 use wiremock::matchers::{body_json, body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+use crate::store::document::SortOrder;
+
+use super::super::{MAX_SCAN_DOCUMENTS, SEARCH_PAGE_SIZE};
+
 /// Builds a store pointing at `server` with the default index prefix.
 fn store(server: &MockServer) -> ElasticsearchDocumentStore {
     ElasticsearchDocumentStore::new(ElasticsearchConfig::new(server.uri())).expect("build store")
