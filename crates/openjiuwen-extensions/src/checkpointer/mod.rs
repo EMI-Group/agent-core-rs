@@ -6,9 +6,8 @@
 //! surface and dispatches [`build_checkpointer`] to the kernel factory.
 //!
 //! The Redis backend lives in the `redis` submodule behind the `redis` feature.
-//! It is a live single-node implementation over this crate's in-tree `RESP`
-//! client; TLS (`rediss://`) and cluster slot routing remain deferred and report
-//! [`openjiuwen_common::error::ErrorKind::Unsupported`] with a reason. The kernel
+//! It is a live implementation over this crate's in-tree `RESP` client, which
+//! handles `rediss://` (TLS) and cluster redirection. The kernel
 //! `CheckpointerKind` has no Redis variant, so [`build_checkpointer`] cannot
 //! select it: construct one with `checkpointer::redis::RedisCheckpointer::new`
 //! (lazy connect) or `connect`/`create` (eager connect).

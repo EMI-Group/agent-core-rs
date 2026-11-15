@@ -59,12 +59,13 @@
 //! write (an interrupted batch) can leave the key-value view temporarily
 //! inconsistent, because multi-key transactions are not used.
 //!
-//! # Deferred
+//! # Transport
 //!
-//! `rediss://` (TLS) and real cluster slot routing stay deferred and are
-//! reported by [`crate::redis`] as [`Error::Unsupported`]. `RediSearch` module
-//! commands (`FT.*`) are not available offline, so vector ranking is brute force
-//! on the client (the same O(n) scan the in-memory reference performs).
+//! `rediss://` (TLS, verified against the web PKI) and `redis[s]+cluster://`
+//! (verified seed plus `MOVED`/`ASK` redirection) are handled by
+//! [`crate::redis`]. `RediSearch` module commands (`FT.*`) are not available
+//! offline, so vector ranking is brute force on the client (the same O(n) scan
+//! the in-memory reference performs).
 #![allow(clippy::module_name_repetitions)] // `Redis*` names are fixed by the contract.
 use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};

@@ -6,7 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
-use crate::redis::testsupport::{FakeOptions, FakeRedis};
+use crate::redis::testsupport::FakeRedis;
 use openjiuwen_common::error::ErrorKind;
 use serde_json::json;
 
@@ -185,7 +185,7 @@ fn unknown_unlink_is_detected_from_the_server_message() {
     );
     assert!(is_unknown_command(&error, "UNLINK"));
     assert!(!is_unknown_command(&error, "DEL"));
-    let moved = Error::unsupported("redis cluster slot redirection (MOVED/ASK) is not implemented");
+    let moved = Error::transport("redis server error: MOVED 3999 127.0.0.1:7000");
     assert!(!is_unknown_command(&moved, "UNLINK"));
 }
 
@@ -402,23 +402,23 @@ async fn connect_fails_fast_for_a_closed_port() {
 }
 
 #[tokio::test]
-async fn connect_rejects_tls() {
-    let error = RedisStore::connect(url_config("rediss://localhost:6379"))
+async fn connect_uses_tls_and_reports_a_failed_handshake() {
+    // `rediss://` now performs a real TLS handshake; against a plain RESP listener it
+    // fails as a transport error naming TLS rather than as an unsupported feature.
+    let fake = FakeRedis::start().await;
+    let error = RedisStore::connect(url_config(&format!("rediss://{}/0", fake.addr())))
         .await
         .err()
-        .expect("TLS is not supported");
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
+        .expect("a plain listener cannot complete a TLS handshake");
+    assert_eq!(error.kind(), ErrorKind::Transport);
     let message = error.message().to_string();
     assert!(message.contains("TLS"), "{message}");
+    fake.shutdown().await;
 }
 
 #[tokio::test]
-async fn cluster_mode_against_a_redirecting_server_is_unsupported() {
-    let fake = FakeRedis::start_with(FakeOptions {
-        moved_everything: true,
-        ..FakeOptions::default()
-    })
-    .await;
+async fn cluster_mode_against_a_standalone_server_is_rejected() {
+    let fake = FakeRedis::start().await;
     let error = RedisStore::connect(RedisStoreConfig {
         url: Some(fake.url()),
         cluster_mode: Some(true),
@@ -426,12 +426,9 @@ async fn cluster_mode_against_a_redirecting_server_is_unsupported() {
     })
     .await
     .err()
-    .expect("a redirecting server must surface the cluster limitation");
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-    let message = error.message().to_ascii_lowercase();
-    assert!(
-        message.contains("cluster") && message.contains("moved"),
-        "{message}"
-    );
+    .expect("a standalone node must not be accepted in cluster mode");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let message = error.message().to_string();
+    assert!(message.contains("cluster_enabled:1"), "{message}");
     fake.shutdown().await;
 }

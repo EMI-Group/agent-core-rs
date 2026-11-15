@@ -1,38 +1,47 @@
-//! Minimal single-node `Redis` client over [`tokio::net::TcpStream`].
+//! Minimal `Redis` client over TCP or TLS, with cluster redirection handling.
 //!
 //! The workspace has no `Redis` driver crate and builds offline, so this module
-//! speaks `RESP2` directly with [`crate::redis::codec`]. A client owns exactly one
-//! mutex-guarded connection (commands are serialized), supports pipelining, and
-//! re-opens the connection lazily after a transport failure or timeout.
+//! speaks `RESP2`/`RESP3` directly with [`crate::redis::codec`].
+//! Commands are serialized per connection, pipelining is supported, and a
+//! connection re-opens lazily after a transport failure or timeout.
 //!
-//! Supported URL schemes are `redis://` and `redis+cluster://`; the latter only
-//! records [`ConnectionOptions::cluster_mode`] and then connects as a single node
-//! because slot routing is not implemented. `rediss://` and `rediss+cluster://`
-//! return [`openjiuwen_common::error::ErrorKind::Unsupported`] naming TLS as the
-//! missing piece.
+//! Supported URL schemes are `redis://`, `rediss://`, `redis+cluster://`, and
+//! `rediss+cluster://`: `rediss` selects TLS ([`ConnectionOptions::tls`], verified
+//! against the web PKI through `rustls` and `webpki-roots`) and `+cluster` selects
+//! [`ConnectionOptions::cluster_mode`], which is verified at connect time instead of
+//! being assumed.
 //!
-//! Server error replies are mapped here: `MOVED`/`ASK` redirections become
-//! `Unsupported`, `WRONGTYPE` becomes `Validation`, and every other error reply
-//! becomes `Transport`, keeping the server message. Credentials never appear in
-//! an error or log message: [`ConnectionOptions`] has a redacting `Debug`, and
-//! timeout messages carry only the command name.
-use super::codec::{encode_command, parse_reply, Reply};
+//! Cluster redirections are followed: a `-MOVED <slot> host:port` reply re-issues the
+//! command once on the reported node and caches the slot, an `-ASK <slot> host:port`
+//! reply sends `ASKING` and then the command once, and a second consecutive
+//! redirection for the same command is a typed transport error rather than a loop.
+//!
+//! Server error replies are mapped here: `WRONGTYPE` becomes
+//! [`openjiuwen_common::error::ErrorKind::Validation`] and every other error reply
+//! (including an unparseable redirection) becomes `Transport`, keeping the server
+//! message. Credentials never appear in an error or log message:
+//! [`ConnectionOptions`] has a redacting `Debug`, and timeout messages carry only the
+//! command name.
+//!
+//! Reply framing is unchanged: an out-of-band `RESP3` push frame is returned to the
+//! caller as [`Reply::Push`] like any other value, because these adapters subscribe to
+//! no keyspace channel and therefore expect none.
+mod cluster;
+mod connection;
+mod tls;
+use crate::redis::codec::{encode_command, Reply};
+use cluster::{Node, Nodes, RedirectKind};
 use openjiuwen_common::error::{Error, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use url::Url;
 /// Default per-round-trip timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default `Redis` port used when a URL does not specify one.
 const DEFAULT_PORT: u16 = 6379;
-/// Maximum bytes buffered for one in-flight reply before the connection is dropped.
-const MAX_REPLY_BYTES: usize = 512 * 1024 * 1024;
-/// How to reach a single `Redis` node, including authentication and database.
+/// How to reach a `Redis` node, including authentication, database, TLS, and mode.
 ///
 /// Build one with [`ConnectionOptions::default`] or parse a URL with
 /// [`ConnectionOptions::from_url`]; `connection_args` maps onto the same fields
@@ -49,10 +58,14 @@ pub struct ConnectionOptions {
     pub password: Option<String>,
     /// Database index selected with `SELECT` after connecting.
     pub db: Option<i64>,
-    /// Per-round-trip timeout (connect, each command, and each pipeline batch).
+    /// Per-round-trip timeout (connect, TLS handshake, each command, each batch).
     pub timeout: Duration,
-    /// Whether the URL asked for cluster mode; the client still connects to one node.
+    /// Whether the URL asked for cluster mode; the seed node is verified as a cluster
+    /// node at connect time and redirections are followed.
     pub cluster_mode: bool,
+    /// Whether to wrap the transport in TLS (`rediss://`), verified against the web
+    /// PKI. Redirect targets inherit this flag.
+    pub tls: bool,
 }
 impl Default for ConnectionOptions {
     fn default() -> Self {
@@ -64,6 +77,7 @@ impl Default for ConnectionOptions {
             db: None,
             timeout: DEFAULT_TIMEOUT,
             cluster_mode: false,
+            tls: false,
         }
     }
 }
@@ -78,37 +92,32 @@ impl fmt::Debug for ConnectionOptions {
             .field("db", &self.db)
             .field("timeout", &self.timeout)
             .field("cluster_mode", &self.cluster_mode)
+            .field("tls", &self.tls)
             .finish()
     }
 }
 impl ConnectionOptions {
-    /// Parses `redis://[user[:password]@]host[:port][/db]`.
+    /// Parses `redis[s][+cluster]://[user[:password]@]host[:port][/db]`.
     ///
-    /// `redis+cluster://` is accepted but connects as a single node. Percent-encoded
-    /// user info (`%40`) is decoded.
+    /// `rediss` selects TLS and `+cluster` selects cluster mode, so
+    /// `rediss+cluster://` sets both. Percent-encoded user info (`%40`) is decoded.
     ///
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for a malformed
-    /// URL, a missing host, or a non-numeric database path, and
-    /// [`openjiuwen_common::error::ErrorKind::Unsupported`] for the TLS schemes
-    /// `rediss://` and `rediss+cluster://`.
+    /// URL, an unsupported scheme, a missing host, or a non-numeric database path.
     pub fn from_url(url: &str) -> Result<Self> {
         let parsed = Url::parse(url)
             .map_err(|error| Error::validation(format!("invalid redis URL: {error}")))?;
-        let cluster_mode = match parsed.scheme() {
-            "redis" => false,
-            "redis+cluster" => true,
-            "rediss" | "rediss+cluster" => {
-                return Err(Error::unsupported(
-                    "redis TLS (rediss://) is not supported: the workspace does not vendor a \
-                     TLS stack; use redis:// to a trusted network or a TLS terminator",
-                ));
-            }
+        let (cluster_mode, tls) = match parsed.scheme() {
+            "redis" => (false, false),
+            "rediss" => (false, true),
+            "redis+cluster" => (true, false),
+            "rediss+cluster" => (true, true),
             scheme => {
                 return Err(Error::validation(format!(
-                    "unsupported redis URL scheme '{scheme}'; accepted schemes are redis:// and \
-                     redis+cluster://"
+                    "unsupported redis URL scheme '{scheme}'; accepted schemes are redis://, \
+                     rediss://, redis+cluster://, and rediss+cluster://"
                 )));
             }
         };
@@ -134,12 +143,14 @@ impl ConnectionOptions {
             db: database_from_path(parsed.path())?,
             timeout: DEFAULT_TIMEOUT,
             cluster_mode,
+            tls,
         })
     }
     /// Applies `username`/`password`/`db`/`timeout` from Python-style connection
     /// arguments; unknown keys are ignored and `null` clears a value.
     ///
     /// `timeout` is in seconds and may be an integer, a float, or a numeric string.
+    /// The TLS and cluster flags are owned by the URL scheme and are left unchanged.
     ///
     /// # Errors
     ///
@@ -176,20 +187,38 @@ impl ConnectionOptions {
         }
         Ok(self)
     }
-    /// Records the requested cluster mode (the connection stays single-node).
+    /// Records the requested cluster mode; the seed node is verified at connect time.
     #[must_use]
     pub fn with_cluster_mode(mut self, cluster_mode: bool) -> Self {
         self.cluster_mode = cluster_mode;
         self
     }
+    /// Records whether the transport uses TLS (`rediss://`).
+    ///
+    /// Callers normally get this from the URL scheme; it is exposed so a
+    /// configuration that builds options field by field can still ask for TLS.
+    #[must_use]
+    pub fn with_tls(mut self, tls: bool) -> Self {
+        self.tls = tls;
+        self
+    }
 }
-/// A serialized connection to a single `Redis` node.
+/// How a reply at the top of a command is handled.
+enum Outcome {
+    /// A value for the caller.
+    Value(Reply),
+    /// A `MOVED`/`ASK` redirection to follow once.
+    Redirect(cluster::Redirect),
+    /// A typed error (including `WRONGTYPE`).
+    Failure(Error),
+}
+/// A `Redis` client over one seed node plus any cluster redirection targets.
 ///
-/// The client is `Send + Sync`: one [`tokio::sync::Mutex`]-guarded connection is
-/// shared by all callers, so commands and pipelines never interleave on the wire.
+/// The client is `Send + Sync`: every node connection is guarded by its own
+/// [`tokio::sync::Mutex`], so commands and pipelines never interleave on one wire.
 pub struct Client {
     options: ConnectionOptions,
-    connection: Mutex<Connection>,
+    nodes: Nodes,
 }
 impl fmt::Debug for Client {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -200,14 +229,20 @@ impl fmt::Debug for Client {
     }
 }
 impl Client {
-    /// Opens a connection and performs `AUTH` (when a password is configured) and
-    /// `SELECT` (when a database is configured).
+    /// Opens a connection to the seed node and performs `AUTH` (when a password is
+    /// configured) and `SELECT` (when a database is configured).
+    ///
+    /// When [`ConnectionOptions::cluster_mode`] is set, the seed is verified as a
+    /// cluster node (`CLUSTER INFO` must report `cluster_enabled:1`, or
+    /// `CLUSTER SLOTS` must return slot ranges) and the slot map is pre-seeded from
+    /// `CLUSTER SLOTS` on a best-effort basis.
     ///
     /// # Errors
     ///
-    /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for an empty host
-    /// or port `0`, `Transport` for a connection or handshake failure, and `Timeout`
-    /// when the connect or handshake exceeds [`ConnectionOptions::timeout`].
+    /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for an empty host,
+    /// port `0`, or cluster mode against a non-cluster node, `Transport` for a
+    /// connection, TLS, or handshake failure, and `Timeout` when the connect or
+    /// handshake exceeds [`ConnectionOptions::timeout`].
     pub async fn connect(options: ConnectionOptions) -> Result<Self> {
         if options.host.trim().is_empty() {
             return Err(Error::validation("redis host must not be empty"));
@@ -215,27 +250,24 @@ impl Client {
         if options.port == 0 {
             return Err(Error::validation("redis port must not be 0"));
         }
-        if options.cluster_mode {
-            tracing::warn!(
-                host = %options.host,
-                port = options.port,
-                "redis cluster mode requested; connecting to one node because slot routing is not implemented"
-            );
-        }
         tracing::debug!(
             host = %options.host,
             port = options.port,
             db = ?options.db,
+            tls = options.tls,
+            cluster_mode = options.cluster_mode,
             "connecting to redis"
         );
-        let mut connection = Connection::default();
-        connection.ensure_open(&options).await?;
-        Ok(Self {
-            options,
-            connection: Mutex::new(connection),
-        })
+        let nodes = Nodes::new(options.clone());
+        let seed = nodes.seed();
+        seed.ensure_open().await?;
+        if options.cluster_mode {
+            cluster::verify_cluster(&seed).await?;
+            cluster::preseed_slots(&nodes, &seed).await;
+        }
+        Ok(Self { options, nodes })
     }
-    /// Opens a client from a `redis://[user[:password]@]host[:port][/db]` URL.
+    /// Opens a client from a `redis[s][+cluster]://[user[:password]@]host[/db]` URL.
     ///
     /// # Errors
     ///
@@ -250,11 +282,14 @@ impl Client {
     }
     /// Sends one command and returns its reply.
     ///
+    /// A `MOVED`/`ASK` redirection is followed once (on the reported node, with
+    /// `ASKING` for `ASK`); a second consecutive redirection is a `Transport` error.
+    ///
     /// # Errors
     ///
-    /// `Validation` for an empty command or a `WRONGTYPE` reply, `Unsupported` for a
-    /// `MOVED`/`ASK` redirection, `Timeout` when the round trip exceeds the
-    /// configured timeout, and `Transport` for any other server error or I/O failure.
+    /// `Validation` for an empty command or a `WRONGTYPE` reply, `Timeout` when the
+    /// round trip exceeds the configured timeout, and `Transport` for any other server
+    /// error, a doubled redirection, or an I/O or TLS failure.
     pub async fn command(&self, args: &[&[u8]]) -> Result<Reply> {
         if args.is_empty() {
             return Err(Error::validation(
@@ -263,13 +298,9 @@ impl Client {
         }
         let name = command_name(args);
         let payload = encode_command(args);
-        let reply = self
-            .send(&payload, 1, &name)
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::transport("redis connection closed before a reply was read"))?;
-        map_reply(reply)
+        let node = self.route(args);
+        let reply = node.reply(&payload, &name).await?;
+        self.settle(reply, &payload, &name).await
     }
     /// Convenience wrapper over [`Client::command`] for text arguments.
     ///
@@ -282,19 +313,24 @@ impl Client {
     }
     /// Sends every command in one write and returns the replies in order.
     ///
-    /// An error reply among the responses fails the whole call, exactly like
+    /// The batch goes to the seed node. A `MOVED`/`ASK` reply inside the batch makes
+    /// the client re-issue **that** command once on the reported node and keep the
+    /// positional result, so the returned vector always has one reply per command; a
+    /// second consecutive redirection for one command fails the batch with a typed
+    /// error. Any other error reply fails the whole call, exactly like
     /// [`Client::command`].
     ///
     /// # Errors
     ///
     /// `Validation` for an empty command inside the batch or a `WRONGTYPE` reply,
-    /// `Unsupported` for a `MOVED`/`ASK` redirection, `Timeout` for the batch
-    /// exceeding the configured timeout, and `Transport` for other failures.
+    /// `Timeout` for the batch exceeding the configured timeout, and `Transport` for
+    /// other failures.
     pub async fn pipeline(&self, commands: &[Vec<Vec<u8>>]) -> Result<Vec<Reply>> {
         if commands.is_empty() {
             return Ok(Vec::new());
         }
         let mut payload = Vec::new();
+        let mut prepared: Vec<(Vec<u8>, String)> = Vec::with_capacity(commands.len());
         for command in commands {
             if command.is_empty() {
                 return Err(Error::validation(
@@ -302,10 +338,21 @@ impl Client {
                 ));
             }
             let args: Vec<&[u8]> = command.iter().map(Vec::as_slice).collect();
-            payload.extend_from_slice(&encode_command(&args));
+            let name = command_name(&args);
+            let encoded = encode_command(&args);
+            payload.extend_from_slice(&encoded);
+            prepared.push((encoded, name));
         }
-        let replies = self.send(&payload, commands.len(), "pipeline").await?;
-        replies.into_iter().map(map_reply).collect()
+        let replies = self
+            .nodes
+            .seed()
+            .exchange(&payload, commands.len(), "pipeline")
+            .await?;
+        let mut results = Vec::with_capacity(replies.len());
+        for (reply, (command_payload, name)) in replies.into_iter().zip(prepared) {
+            results.push(self.settle(reply, &command_payload, &name).await?);
+        }
+        Ok(results)
     }
     /// Sends `PING` and requires the `PONG` reply.
     ///
@@ -324,211 +371,60 @@ impl Client {
             ))),
         }
     }
-    /// Acquires the connection lock and exchanges a payload under a single timeout.
-    async fn send(&self, payload: &[u8], expected: usize, name: &str) -> Result<Vec<Reply>> {
-        let timeout = self.options.timeout;
-        let mut connection = tokio::time::timeout(timeout, self.connection.lock())
-            .await
-            .map_err(|_| {
-                Error::timeout(format!(
-                    "timed out waiting for the redis connection to run '{name}'"
-                ))
-            })?;
-        connection.ensure_open(&self.options).await?;
-        connection.exchange(payload, expected, timeout, name).await
+    /// The node a command starts on: the cached slot owner, or else the seed.
+    fn route(&self, args: &[&[u8]]) -> std::sync::Arc<Node> {
+        cluster::command_slot(args)
+            .and_then(|slot| self.nodes.slot_node(slot))
+            .unwrap_or_else(|| self.nodes.seed())
     }
-}
-/// The single connection shared by a [`Client`].
-#[derive(Default)]
-struct Connection {
-    stream: Option<TcpStream>,
-    buffer: Vec<u8>,
-}
-impl Connection {
-    /// Connects and runs the handshake when the connection is not open.
-    async fn ensure_open(&mut self, options: &ConnectionOptions) -> Result<()> {
-        if self.stream.is_some() {
-            return Ok(());
-        }
-        let stream = connect_stream(options).await?;
-        let _ = stream.set_nodelay(true);
-        self.stream = Some(stream);
-        self.buffer.clear();
-        if let Some(password) = options.password.clone() {
-            let result = if let Some(username) = options.username.clone() {
-                let args: [&[u8]; 3] = [b"AUTH", username.as_bytes(), password.as_bytes()];
-                self.perform(&encode_command(&args), options.timeout, "AUTH")
-                    .await
-            } else {
-                let args: [&[u8]; 2] = [b"AUTH", password.as_bytes()];
-                self.perform(&encode_command(&args), options.timeout, "AUTH")
-                    .await
-            };
-            match result {
-                Ok(reply) => {
-                    if let Err(error) = expect_ok(reply, "AUTH") {
-                        self.close();
-                        return Err(error);
+    /// Maps one reply, following a single `MOVED`/`ASK` redirection.
+    async fn settle(&self, reply: Reply, payload: &[u8], name: &str) -> Result<Reply> {
+        match classify(reply) {
+            Outcome::Value(reply) => Ok(reply),
+            Outcome::Failure(error) => Err(error),
+            Outcome::Redirect(redirect) => {
+                let node = self.nodes.node(&redirect.addr);
+                let reply = match redirect.kind {
+                    RedirectKind::Moved => node.reply(payload, name).await?,
+                    RedirectKind::Ask => node.asking_reply(payload, name).await?,
+                };
+                match classify(reply) {
+                    Outcome::Value(reply) => {
+                        if redirect.kind == RedirectKind::Moved {
+                            self.nodes.remember_slot(redirect.slot, redirect.addr);
+                        }
+                        Ok(reply)
                     }
+                    Outcome::Failure(error) => Err(error),
+                    Outcome::Redirect(second) => Err(Error::transport(format!(
+                        "redis cluster replied '{}' for '{name}' after following the redirection to \
+                         {}; a second consecutive redirection is not followed",
+                        second.raw, redirect.addr
+                    ))),
                 }
-                Err(error) => return Err(error),
             }
         }
-        if let Some(db) = options.db {
-            let db = db.to_string();
-            let args: [&[u8]; 2] = [b"SELECT", db.as_bytes()];
-            match self
-                .perform(&encode_command(&args), options.timeout, "SELECT")
-                .await
-            {
-                Ok(reply) => {
-                    if let Err(error) = expect_ok(reply, "SELECT") {
-                        self.close();
-                        return Err(error);
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
-    }
-    /// Reads exactly one reply, closing the connection on failure.
-    async fn perform(&mut self, payload: &[u8], timeout: Duration, name: &str) -> Result<Reply> {
-        let mut replies = self.exchange(payload, 1, timeout, name).await?;
-        replies
-            .pop()
-            .ok_or_else(|| Error::transport("redis connection closed before a reply was read"))
-    }
-    /// Writes `payload` once, then reads `expected` replies in order.
-    ///
-    /// Any transport failure or timeout closes the connection so the next command
-    /// reconnects instead of reading a stale reply.
-    async fn exchange(
-        &mut self,
-        payload: &[u8],
-        expected: usize,
-        timeout: Duration,
-        name: &str,
-    ) -> Result<Vec<Reply>> {
-        if expected == 0 {
-            return Ok(Vec::new());
-        }
-        if self.stream.is_none() {
-            return Err(Error::transport("redis connection is closed"));
-        }
-        let result = tokio::time::timeout(timeout, async {
-            let Some(stream) = self.stream.as_mut() else {
-                return Err(Error::transport("redis connection is closed"));
-            };
-            stream
-                .write_all(payload)
-                .await
-                .map_err(|error| Error::transport(format!("redis write failed: {error}")))?;
-            stream
-                .flush()
-                .await
-                .map_err(|error| Error::transport(format!("redis write failed: {error}")))?;
-            let mut replies = Vec::with_capacity(expected);
-            for _ in 0..expected {
-                replies.push(read_protocol_reply(stream, &mut self.buffer).await?);
-            }
-            Ok::<Vec<Reply>, Error>(replies)
-        })
-        .await;
-        match result {
-            Ok(Ok(replies)) => Ok(replies),
-            Ok(Err(error)) => {
-                self.close();
-                Err(error)
-            }
-            Err(_) => {
-                self.close();
-                Err(Error::timeout(format!(
-                    "redis command '{name}' timed out after {timeout:?}"
-                )))
-            }
-        }
-    }
-    /// Drops the socket so the next command reconnects.
-    fn close(&mut self) {
-        self.stream.take();
-        self.buffer.clear();
     }
 }
-/// Opens a TCP connection to the configured host and port.
-async fn connect_stream(options: &ConnectionOptions) -> Result<TcpStream> {
-    tokio::time::timeout(
-        options.timeout,
-        TcpStream::connect((options.host.as_str(), options.port)),
-    )
-    .await
-    .map_err(|_| {
-        Error::timeout(format!(
-            "redis connection to {}:{} timed out after {:?}",
-            options.host, options.port, options.timeout
-        ))
-    })?
-    .map_err(|error| {
-        Error::transport(format!(
-            "failed to connect to redis at {}:{}: {error}",
-            options.host, options.port
-        ))
-    })
-}
-/// Reads one reply from `stream`, buffering until [`parse_reply`] reports completion.
-async fn read_protocol_reply(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<Reply> {
-    let mut chunk = [0u8; 8192];
-    loop {
-        if let Some((reply, consumed)) = parse_reply(buffer)? {
-            buffer.drain(..consumed);
-            return Ok(reply);
-        }
-        if buffer.len() > MAX_REPLY_BYTES {
-            return Err(Error::transport(format!(
-                "redis reply exceeds the {MAX_REPLY_BYTES}-byte limit"
-            )));
-        }
-        let read = stream
-            .read(&mut chunk)
-            .await
-            .map_err(|error| Error::transport(format!("redis read failed: {error}")))?;
-        if read == 0 {
-            return Err(Error::transport(
-                "redis connection closed by the server before a reply was received",
-            ));
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-    }
-}
-/// Maps a server error reply to the client's typed error.
-fn map_reply(reply: Reply) -> Result<Reply> {
+/// Classifies a raw reply into a value, a redirection, or a typed error.
+fn classify(reply: Reply) -> Outcome {
     match reply {
-        Reply::Error(message) => Err(map_server_error(&message)),
-        other => Ok(other),
+        Reply::Error(message) => match cluster::parse_redirect(&message) {
+            Some(redirect) => Outcome::Redirect(redirect),
+            None => Outcome::Failure(map_server_error(&message)),
+        },
+        other => Outcome::Value(other),
     }
 }
-/// Maps a `-` error reply to a typed error, preserving the server message.
+/// Maps a non-redirection `-` error reply to a typed error, keeping the message.
+///
+/// `MOVED`/`ASK` never reach this function: [`classify`] turns them into
+/// [`Outcome::Redirect`] and the client follows them itself.
 fn map_server_error(message: &str) -> Error {
-    if message.starts_with("MOVED ") || message.starts_with("ASK ") {
-        Error::unsupported(
-            "redis cluster slot redirection (MOVED/ASK) is not implemented; connect to a cluster \
-             entry point or use standalone Redis",
-        )
-    } else if message.starts_with("WRONGTYPE") {
+    if message.starts_with("WRONGTYPE") {
         Error::validation(format!("redis server error: {message}"))
     } else {
         Error::transport(format!("redis server error: {message}"))
-    }
-}
-/// Validates a handshake reply (`AUTH`/`SELECT` must answer `+OK`).
-fn expect_ok(reply: Reply, step: &str) -> Result<()> {
-    match reply {
-        Reply::Simple(text) if text == "OK" => Ok(()),
-        Reply::Error(message) => Err(Error::transport(format!("redis {step} failed: {message}"))),
-        other => Err(Error::transport(format!(
-            "redis {step} returned an unexpected {} reply",
-            other.kind_name()
-        ))),
     }
 }
 /// The command name used in timeout messages; argument values never leak.
