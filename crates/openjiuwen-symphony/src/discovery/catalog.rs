@@ -305,6 +305,23 @@ impl SkillFs {
         &self.diagnostics
     }
 
+    /// The capability descriptors the scan derived, in the same order as [`Self::records`].
+    ///
+    /// The directory view reads each skill's front-matter `category` from
+    /// [`CapabilityDescriptor::classification`](crate::model::CapabilityDescriptor::classification).
+    #[must_use]
+    pub fn descriptors(&self) -> &[CapabilityDescriptor] {
+        &self.descriptors
+    }
+
+    /// The capability descriptor of the skill with `worker_id`, when it is known.
+    #[must_use]
+    pub fn descriptor(&self, worker_id: &str) -> Option<&CapabilityDescriptor> {
+        self.descriptors
+            .iter()
+            .find(|descriptor| descriptor.capability_id == worker_id)
+    }
+
     /// The markdown body of the skill with `worker_id`, when it is known.
     #[must_use]
     pub fn read_body(&self, worker_id: &str) -> Option<&str> {
