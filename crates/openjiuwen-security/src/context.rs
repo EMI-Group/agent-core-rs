@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::security::REDACTED;
 use openjiuwen_foundation::prompt::BaseMessage;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -233,6 +234,11 @@ impl GuardrailContext {
     /// message's text (string content, or the `"text"` parts of multimodal
     /// content) plus every tool call's argument string, joined with `\n`.
     /// Tool-call, raw, and non-string contexts fall back to compact JSON.
+    ///
+    /// The projection is total, so a payload that cannot be scanned projects to
+    /// something a detector silently passes over. Use
+    /// [`Self::text_view_checked`] whenever a projection failure must be
+    /// visible — the built-in detectors and the pipeline do.
     #[must_use]
     pub fn text_view(&self) -> Cow<'_, str> {
         if self.content_type == crate::GuardrailContentType::Messages {
@@ -242,6 +248,77 @@ impl GuardrailContext {
             Some(text) => Cow::Borrowed(text),
             None => Cow::Owned(compact_json(&self.content)),
         }
+    }
+
+    /// The text projection, or a typed error when the payload cannot be
+    /// scanned.
+    ///
+    /// This is the projection the built-in detectors and
+    /// [`GuardrailPipeline::run`](crate::GuardrailPipeline::run) use: an
+    /// unscannable payload is a *failure*, reported as
+    /// [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+    /// so the configured [`FailurePolicy`](crate::FailurePolicy) decides the
+    /// call's fate instead of a detector silently passing it.
+    ///
+    /// A payload is unscannable when
+    ///
+    /// - its content type is [`GuardrailContentType::Text`](crate::GuardrailContentType::Text)
+    ///   but the content is not a JSON string,
+    /// - its content type is [`GuardrailContentType::Messages`](crate::GuardrailContentType::Messages)
+    ///   but the content is not an array, or it holds messages that carry no
+    ///   text and no tool-call arguments at all (a multimodal-only or empty
+    ///   payload gives a detector nothing to read),
+    /// - its content is `null` (the payload could not be represented), or
+    /// - the content cannot be serialized as compact JSON.
+    ///
+    /// An empty string and an empty message array are scannable: they carry no
+    /// content, which is a legitimate, non-suspicious payload.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+    /// naming the content type, the expected shape, and the shape found. The
+    /// message never echoes the payload.
+    pub fn text_view_checked(&self) -> Result<Cow<'_, str>> {
+        match self.content_type {
+            crate::GuardrailContentType::Text => self.content.as_str().map_or_else(
+                || Err(self.unscannable("a JSON string")),
+                |text| Ok(Cow::Borrowed(text)),
+            ),
+            crate::GuardrailContentType::Messages => {
+                if !self.content.is_array() {
+                    return Err(self.unscannable("a message array"));
+                }
+                let text = self.messages_text();
+                let empty_array = self.content.as_array().is_some_and(Vec::is_empty);
+                if empty_array || !text.trim().is_empty() {
+                    return Ok(Cow::Owned(text));
+                }
+                Err(Error::validation(
+                    "unscannable content: the message array carries no text and no tool-call \
+                     arguments (multimodal-only or empty message content)",
+                ))
+            }
+            crate::GuardrailContentType::ToolCall | crate::GuardrailContentType::Raw => {
+                if self.content.is_null() {
+                    return Err(self.unscannable("a non-null JSON value"));
+                }
+                match serde_json::to_string(&self.content) {
+                    Ok(text) => Ok(Cow::Owned(text)),
+                    Err(_) => Err(self.unscannable("a serializable JSON value")),
+                }
+            }
+        }
+    }
+
+    /// The error a failed [`Self::text_view_checked`] reports, naming the
+    /// content type, the expected shape, and the shape found.
+    fn unscannable(&self, expected: &str) -> Error {
+        Error::validation(format!(
+            "unscannable content: content_type {} expects {expected}, got {}",
+            content_type_name(self.content_type),
+            json_kind(&self.content),
+        ))
     }
 
     /// Flattens a serialized message array into one newline-joined string.
@@ -295,6 +372,28 @@ impl fmt::Debug for GuardrailContext {
 /// Compact JSON of a value; an empty string when it cannot be serialized.
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
+}
+
+/// The JSON shape of `value`, for unscannable-payload errors.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// The `snake_case` name of a content type, for unscannable-payload errors.
+fn content_type_name(content_type: crate::GuardrailContentType) -> &'static str {
+    match content_type {
+        crate::GuardrailContentType::Text => "text",
+        crate::GuardrailContentType::Messages => "messages",
+        crate::GuardrailContentType::ToolCall => "tool_call",
+        crate::GuardrailContentType::Raw => "raw",
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +481,111 @@ mod tests {
 
         let object = GuardrailContext::raw("custom_event", json!({"a": 1}));
         assert_eq!(object.text_view(), "{\"a\":1}");
+    }
+
+    #[test]
+    fn checked_view_matches_the_unchecked_view_for_scannable_payloads() {
+        let text = GuardrailContext::text("hello", ScanStage::UserInput);
+        assert_eq!(text.text_view_checked().unwrap(), text.text_view());
+        assert_eq!(text.text_view_checked().unwrap(), "hello");
+
+        let messages = vec![BaseMessage::user("hi"), BaseMessage::assistant("there")];
+        let context = GuardrailContext::messages(&messages, ScanStage::LlmInvokeInput);
+        assert_eq!(context.text_view_checked().unwrap(), "hi\nthere");
+
+        let tool = GuardrailContext::tool_call(
+            "shell",
+            &json!({"cmd": "rm -rf /"}),
+            ScanStage::ToolInvokeInput,
+        );
+        assert_eq!(tool.text_view_checked().unwrap(), "{\"cmd\":\"rm -rf /\"}");
+
+        let raw = GuardrailContext::raw("custom_event", json!({"a": 1}));
+        assert_eq!(raw.text_view_checked().unwrap(), "{\"a\":1}");
+    }
+
+    #[test]
+    fn empty_payloads_are_scannable_but_suspicious_only_by_policy() {
+        // An empty string and an empty message array carry nothing to find;
+        // they are not projection failures.
+        assert_eq!(
+            GuardrailContext::text("", ScanStage::UserInput)
+                .text_view_checked()
+                .unwrap(),
+            ""
+        );
+        let empty: Vec<BaseMessage> = Vec::new();
+        assert_eq!(
+            GuardrailContext::messages(&empty, ScanStage::LlmInvokeInput)
+                .text_view_checked()
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn checked_view_reports_unscannable_payloads() {
+        let null_text = {
+            let mut context = GuardrailContext::text("x", ScanStage::UserInput);
+            context.content = Value::Null;
+            context
+        };
+        let error = null_text.text_view_checked().unwrap_err();
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Validation
+        );
+        assert_eq!(
+            error.to_string(),
+            "validation: unscannable content: content_type text expects a JSON string, got null"
+        );
+
+        let number_text = {
+            let mut context = GuardrailContext::text("x", ScanStage::UserInput);
+            context.content = json!(7);
+            context
+        };
+        assert!(number_text
+            .text_view_checked()
+            .unwrap_err()
+            .to_string()
+            .contains("content_type text expects a JSON string, got a number"));
+
+        // `GuardrailContext::messages` stores `Null` when serialization fails.
+        let null_messages = {
+            let mut context = GuardrailContext::text("x", ScanStage::LlmInvokeInput);
+            context.content_type = crate::GuardrailContentType::Messages;
+            context.content = Value::Null;
+            context
+        };
+        assert!(null_messages
+            .text_view_checked()
+            .unwrap_err()
+            .to_string()
+            .contains("content_type messages expects a message array, got null"));
+
+        // A multimodal-only payload carries no text for a detector to read.
+        let multimodal_only = GuardrailContext {
+            content_type: crate::GuardrailContentType::Messages,
+            content: json!([{
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}]
+            }]),
+            event: EVENT_LLM_INVOKE_INPUT.to_owned(),
+            metadata: BTreeMap::new(),
+        };
+        assert!(multimodal_only
+            .text_view_checked()
+            .unwrap_err()
+            .to_string()
+            .contains("carries no text and no tool-call arguments"));
+
+        let null_raw = GuardrailContext::raw("custom_event", Value::Null);
+        assert!(null_raw
+            .text_view_checked()
+            .unwrap_err()
+            .to_string()
+            .contains("content_type raw expects a non-null JSON value, got null"));
     }
 
     #[test]

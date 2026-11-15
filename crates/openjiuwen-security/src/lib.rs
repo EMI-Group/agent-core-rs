@@ -13,8 +13,12 @@
 //! [`GuardrailResult`], and only findings at or above
 //! [`SecurityPolicy::block_level`] (default [`RiskLevel::Critical`]) block the
 //! caller. Lower severities are recorded as findings and execution continues.
-//! Guardrail *failures* are fail-open by default ([`FailurePolicy::FailOpen`]):
-//! the error is recorded and logged, never silently dropped.
+//! Guardrail *failures* are fail-closed by default
+//! ([`FailurePolicy::FailClosed`]): a detector error, an unrecognized backend
+//! reply, or a payload no detector can read becomes a blocking finding whose
+//! message names the reason. [`FailurePolicy::FailOpen`] — Python's behavior, in
+//! which the callback framework swallows guardrail errors — is an explicit
+//! opt-in for callers that prefer availability over detection.
 //!
 //! A run produces one [`GuardrailOutcome`]: the evaluations, the findings, the
 //! decision, and the merged sanitized content. [`GuardrailOutcome::enforce`]
