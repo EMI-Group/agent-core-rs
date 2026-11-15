@@ -76,6 +76,7 @@ pub mod prompts;
 pub mod recall;
 pub mod reload;
 pub mod session_memory;
+pub mod session_memory_agent;
 pub mod stats;
 pub mod telemetry;
 pub mod tokens;

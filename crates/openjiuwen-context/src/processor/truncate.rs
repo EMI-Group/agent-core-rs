@@ -201,6 +201,7 @@ mod tests {
                 cancellation: &self.cancellation,
                 recall: None,
                 session_memory: None,
+                session_memory_agent: None,
             }
         }
     }

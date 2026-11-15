@@ -435,6 +435,7 @@ async fn probe_stores(context: &Arc<ConversationContext>) -> (bool, bool) {
         cancellation: &cancellation,
         recall: context.recall_store().map(|store| &**store),
         session_memory: context.session_memory_store().map(|store| &**store),
+        session_memory_agent: None,
     };
     let mut messages = vec![BaseMessage::user("hi")];
     pipeline.run(&mut messages, &cx).await.unwrap();
