@@ -8,6 +8,13 @@
 //! configuration — the base [`AnalyzerConfig`] with the per-scope
 //! [`ScopeAnalyzerOverrides`] applied — so a scope override really changes the extractor,
 //! the thresholds, and the stage kinds.
+//!
+//! Construction and every run refuse to degrade silently: a configuration that asks for
+//! the model-backed extractor or classifier without a model is
+//! [`openjiuwen_common::error::Error::Unsupported`], and a model-backed *stage kind*
+//! requested without a model runs the rule stage while reporting the fallback on
+//! [`StagedResult::result`](crate::analyzer::StagedResult::result)'s
+//! [`ExtractionResult::degraded`](crate::analyzer::ExtractionResult::degraded) field.
 use crate::analyzer::config::AnalyzerConfig;
 use crate::analyzer::conflict::{ConflictClassifier, ConflictVerdict};
 use crate::analyzer::fact::{ExtractedFact, ExtractionInput, ExtractionResult};
@@ -222,11 +229,14 @@ impl ExtractionStage for ConflictStage {
         let mut degraded: Vec<String> = Vec::new();
         for (fact_index, fact) in input.facts.iter().enumerate() {
             if fact.content.trim().is_empty() {
-                tracing::warn!(
-                    target: "openjiuwen_memory::analyzer",
-                    fact_index,
-                    "skipping conflict classification for an empty fact"
+                // The extract stage filters blank content, so this only happens with a
+                // caller-supplied stage sequence; the skip is reported rather than only
+                // logged so the caller can tell "no conflict" from "never classified".
+                let reason = format!(
+                    "fact #{fact_index} skipped in conflict classification: its content is empty"
                 );
+                tracing::warn!(target: "openjiuwen_memory::analyzer", fact_index, "%reason");
+                degraded.push(reason);
                 continue;
             }
             let incoming = fact.to_new_memory();
@@ -344,23 +354,20 @@ pub struct StagedAnalyzer {
 
 impl StagedAnalyzer {
     /// Builds the deterministic pipeline over `config`.
+    ///
+    /// The pipeline always runs the rule extractor and the rule conflict classifier; use
+    /// [`StagedAnalyzer::from_config`] when the configuration may ask for the model-backed
+    /// extractor. A `config` that keeps [`ExtractorKind::Llm`](crate::analyzer::ExtractorKind::Llm)
+    /// (or [`ClassifierKind::Llm`](crate::analyzer::ClassifierKind::Llm)) is not silently
+    /// downgraded here: [`StagedAnalyzer::analyze`]/[`StagedAnalyzer::analyze_against`] and
+    /// [`StagedAnalyzer::consolidate`] resolve the effective configuration again and return
+    /// [`openjiuwen_common::error::Error::Unsupported`] when the model it asks for is
+    /// missing.
     #[must_use]
     pub fn new(config: AnalyzerConfig) -> Self {
-        Self::from_config(config, None)
-    }
-
-    /// Builds the pipeline `config` asks for.
-    ///
-    /// The extract stage follows [`MemoryAnalyzer::from_config`] (`ExtractorKind::Llm`
-    /// with a model, rules otherwise); the plan/reasoning/proactive stages follow
-    /// [`StageConfig`] and fall back to their rule implementations when `Llm` is
-    /// requested without a model, with a `tracing::warn!` recording the degradation.
-    #[must_use]
-    pub fn from_config(config: AnalyzerConfig, model: Option<Arc<dyn Model>>) -> Self {
-        let analyzer = MemoryAnalyzer::from_config(config, model.clone());
         Self {
-            analyzer,
-            model,
+            analyzer: MemoryAnalyzer::rule(config),
+            model: None,
             stages: StageConfig::default(),
             overrides: ScopeAnalyzerOverrides::default(),
             dedupe: DedupeConfig::default(),
@@ -368,9 +375,38 @@ impl StagedAnalyzer {
         }
     }
 
+    /// Builds the pipeline `config` asks for.
+    ///
+    /// The extract stage follows [`MemoryAnalyzer::from_config`] (`ExtractorKind::Llm`
+    /// with a model, rules when the configuration asks for rules); the
+    /// plan/reasoning/proactive stages follow [`StageConfig`] and fall back to their rule
+    /// implementations when `Llm` is requested without a model, recording that fallback in
+    /// [`StagedResult::result`]'s [`ExtractionResult::degraded`](crate::analyzer::ExtractionResult::degraded)
+    /// field *and* in a `tracing::warn!`.
+    ///
+    /// # Errors
+    ///
+    /// [`openjiuwen_common::error::Error::Unsupported`] when `config` asks for the
+    /// model-backed extractor and `model` is `None` (see [`MemoryAnalyzer::from_config`]).
+    pub fn from_config(config: AnalyzerConfig, model: Option<Arc<dyn Model>>) -> Result<Self> {
+        let analyzer = MemoryAnalyzer::from_config(config, model.clone())?;
+        Ok(Self {
+            analyzer,
+            model,
+            stages: StageConfig::default(),
+            overrides: ScopeAnalyzerOverrides::default(),
+            dedupe: DedupeConfig::default(),
+            custom: None,
+        })
+    }
+
     /// Builds the pipeline an engine configuration implies.
-    #[must_use]
-    pub fn from_engine(config: &MemoryEngineConfig, model: Option<Arc<dyn Model>>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// The same [`openjiuwen_common::error::Error::Unsupported`] as
+    /// [`StagedAnalyzer::from_config`].
+    pub fn from_engine(config: &MemoryEngineConfig, model: Option<Arc<dyn Model>>) -> Result<Self> {
         Self::from_config(AnalyzerConfig::from_engine(config), model)
     }
 
@@ -438,7 +474,9 @@ impl StagedAnalyzer {
     ///
     /// [`openjiuwen_common::error::Error::Validation`] for an invalid configuration or
     /// input, [`openjiuwen_common::error::Error::Cancelled`] when `options` is cancelled,
-    /// and the stage's own error otherwise.
+    /// [`openjiuwen_common::error::Error::Unsupported`] when the effective configuration
+    /// asks for the model-backed extractor or classifier and no model is available, and
+    /// the stage's own error otherwise.
     pub async fn analyze(
         &self,
         input: &ExtractionInput,
@@ -469,11 +507,11 @@ impl StagedAnalyzer {
             .model()
             .cloned()
             .or_else(|| self.model.clone());
-        let stages = self.build_stages(&config, model.clone());
+        let built = self.build_stages(&config, model)?;
+        let mut degradations = built.degradations;
         let mut state = StageInput::new(input.clone(), config).with_candidates(existing.to_vec());
-        let mut ran: Vec<String> = Vec::with_capacity(stages.len());
-        let mut degradations: Vec<String> = Vec::new();
-        for stage in stages {
+        let mut ran: Vec<String> = Vec::with_capacity(built.stages.len());
+        for stage in built.stages {
             options.check()?;
             let output = stage.run(&state, options).await?;
             ran.push(output.stage.clone());
@@ -511,8 +549,10 @@ impl StagedAnalyzer {
 
     /// Plans the writes for `incoming` against `existing` under `dedupe`.
     ///
-    /// Delegates to [`MemoryAnalyzer::consolidate`] using the effective configuration, so
-    /// the staged pipeline and the plain analyzer agree on the plan.
+    /// Delegates to [`MemoryAnalyzer::consolidate`], so the staged pipeline and the plain
+    /// analyzer agree on the plan. The plan is a function of the facts, the stored records,
+    /// and `dedupe` alone — consolidation never consults the extractor or the classifier —
+    /// so the effective (override-resolved) configuration cannot change it.
     #[must_use]
     pub fn consolidate(
         &self,
@@ -520,39 +560,41 @@ impl StagedAnalyzer {
         existing: &[MemoryRecord],
         dedupe: &DedupeConfig,
     ) -> crate::analyzer::ConsolidationPlan {
-        let model = self
-            .overrides
-            .model()
-            .cloned()
-            .or_else(|| self.model.clone());
-        MemoryAnalyzer::from_config(self.effective_config(), model)
-            .consolidate(incoming, existing, dedupe)
+        self.analyzer.consolidate(incoming, existing, dedupe)
     }
 
     /// Builds the stage sequence for one run.
+    ///
+    /// Returns the stages plus the degradations that hold for the whole run, in the order
+    /// the stages run: a [`StageKind::Llm`] stage configured without a model is reported
+    /// here (and logged) so the fallback reaches
+    /// [`StagedResult::result`]'s `degraded` field instead of staying in the log.
     fn build_stages(
         &self,
         config: &AnalyzerConfig,
         model: Option<Arc<dyn Model>>,
-    ) -> Vec<Arc<dyn ExtractionStage>> {
+    ) -> Result<BuiltStages> {
         if let Some(custom) = &self.custom {
-            return custom.clone();
+            return Ok(BuiltStages {
+                stages: custom.clone(),
+                degradations: Vec::new(),
+            });
         }
         let selection = self.stage_config().clone();
+        let mut degradations: Vec<String> = Vec::new();
         let planner: Arc<dyn ExtractionStage> = match (selection.plan, &model) {
             (StageKind::Llm, Some(model)) => {
                 Arc::new(LlmPlanStage::new(model.clone(), config.clone()))
             }
             (StageKind::Llm, None) => {
-                tracing::warn!(
-                    target: "openjiuwen_memory::analyzer",
-                    "LLM plan stage requested without a model; using the rule plan stage"
-                );
+                let reason = "llm plan stage requested without a model; using the rule plan stage";
+                tracing::warn!(target: "openjiuwen_memory::analyzer", "{reason}");
+                degradations.push(reason.to_owned());
                 Arc::new(RulePlanStage::new(config.clone()))
             }
             (StageKind::Rule, _) => Arc::new(RulePlanStage::new(config.clone())),
         };
-        let analyzer = Arc::new(MemoryAnalyzer::from_config(config.clone(), model.clone()));
+        let analyzer = Arc::new(MemoryAnalyzer::from_config(config.clone(), model.clone())?);
         let reasoning: Arc<dyn ExtractionStage> = match (selection.reasoning, &model) {
             (StageKind::Llm, Some(model)) => Arc::new(
                 LlmReasoningStage::new(model.clone(), config.clone()).with_fallback(
@@ -561,10 +603,10 @@ impl StagedAnalyzer {
                 ),
             ),
             (StageKind::Llm, None) => {
-                tracing::warn!(
-                    target: "openjiuwen_memory::analyzer",
-                    "LLM reasoning stage requested without a model; using the rule reasoning stage"
-                );
+                let reason = "llm reasoning stage requested without a model; \
+                              using the rule reasoning stage";
+                tracing::warn!(target: "openjiuwen_memory::analyzer", "{reason}");
+                degradations.push(reason.to_owned());
                 Arc::new(
                     RuleReasoningStage::new(config.clone())
                         .with_metadata_key(selection.reasoning_key.clone()),
@@ -582,10 +624,10 @@ impl StagedAnalyzer {
                 selection.proactive_config.clone(),
             )),
             (StageKind::Llm, None) => {
-                tracing::warn!(
-                    target: "openjiuwen_memory::analyzer",
-                    "LLM proactive stage requested without a model; using the rule proactive stage"
-                );
+                let reason = "llm proactive stage requested without a model; \
+                              using the rule proactive stage";
+                tracing::warn!(target: "openjiuwen_memory::analyzer", "{reason}");
+                degradations.push(reason.to_owned());
                 Arc::new(RuleProactiveStage::new(
                     config.clone(),
                     selection.proactive_config.clone(),
@@ -597,26 +639,37 @@ impl StagedAnalyzer {
             )),
         };
         let conflict = ConflictStage::new(
-            analyzer.classifier(model.clone()),
+            analyzer.classifier(model.clone())?,
             self.dedupe.clone(),
             config.max_candidates,
         );
-        vec![
-            planner,
-            Arc::new(ExtractStage::new(analyzer)),
-            reasoning,
-            proactive,
-            Arc::new(conflict),
-        ]
+        Ok(BuiltStages {
+            stages: vec![
+                planner,
+                Arc::new(ExtractStage::new(analyzer)),
+                reasoning,
+                proactive,
+                Arc::new(conflict),
+            ],
+            degradations,
+        })
     }
+}
+
+/// The stage sequence one run executes, plus its run-wide degradations.
+struct BuiltStages {
+    /// The stages to run, in order.
+    stages: Vec<Arc<dyn ExtractionStage>>,
+    /// Why a configured model-backed stage ran its rule implementation instead.
+    degradations: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::{
-        AnalyzerConfig, ConflictKind, ConsolidationAction, ExtractionStage, ExtractorKind,
-        MemoryAnalyzer, PlanIntent, ScopeAnalyzerOverrides, StageInput, StageOutput,
+        AnalyzerConfig, ClassifierKind, ConflictKind, ConsolidationAction, ExtractionStage,
+        ExtractorKind, MemoryAnalyzer, PlanIntent, ScopeAnalyzerOverrides, StageInput, StageOutput,
     };
     use crate::record::{CallOptions, MemoryScope, MemoryType};
     use async_trait::async_trait;
@@ -720,6 +773,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_conflict_stage_reports_facts_it_cannot_classify() {
+        let conflict = ConflictStage::new(
+            MemoryAnalyzer::rule(AnalyzerConfig::default())
+                .classifier(None)
+                .expect("the default config asks for the rule classifier"),
+            DedupeConfig::default(),
+            8,
+        );
+        let mut state = StageInput::new(
+            ExtractionInput::from_text("anything"),
+            AnalyzerConfig::default(),
+        )
+        .with_candidates(vec![record("id-1", "I prefer dark mode")]);
+        state.facts = vec![ExtractedFact::semantic("   ")];
+        let output = conflict.run(&state, &CallOptions::new()).await.unwrap();
+        assert_eq!(output.verdicts.len(), 0);
+        let degraded = output
+            .degraded
+            .as_deref()
+            .expect("the skipped fact is reported, not just logged");
+        assert!(degraded.contains("fact #0"), "{degraded}");
+        assert!(degraded.contains("empty"), "{degraded}");
+    }
+
+    #[tokio::test]
     async fn override_threshold_drops_low_importance_facts() {
         let overrides = ScopeAnalyzerOverrides::new()
             .with_min_importance(0.8)
@@ -794,6 +872,7 @@ mod tests {
         };
         let pipeline =
             StagedAnalyzer::from_config(AnalyzerConfig::default(), Some(Arc::new(model)))
+                .expect("a model satisfies the model-backed stages")
                 .with_stage_config(stages);
         assert_eq!(pipeline.stage_config().plan, StageKind::Llm);
         let result = pipeline
@@ -840,7 +919,90 @@ mod tests {
         assert_eq!(left.facts().len(), right.facts().len());
         assert_eq!(left.plan.intent, right.plan.intent);
         assert_eq!(left.reasoning, right.reasoning);
-        assert!(!left.is_degraded());
+        // The rule stages produce the same output, but the fallback is no longer silent:
+        // the result names every stage kind that degraded.
+        assert!(left.is_degraded());
+        let degraded = left
+            .result
+            .degraded
+            .as_deref()
+            .expect("the no-model fallback is reported");
+        for reason in [
+            "llm plan stage requested without a model",
+            "llm reasoning stage requested without a model",
+            "llm proactive stage requested without a model",
+        ] {
+            assert!(degraded.contains(reason), "missing {reason}: {degraded}");
+        }
+        assert!(!right.is_degraded());
+    }
+
+    #[tokio::test]
+    async fn a_model_backed_extractor_without_a_model_is_rejected() {
+        let config = AnalyzerConfig {
+            extractor: ExtractorKind::Llm,
+            ..AnalyzerConfig::default()
+        };
+        // Construction refuses the request instead of silently running rules.
+        let error = StagedAnalyzer::from_config(config.clone(), None)
+            .err()
+            .expect("the llm extractor needs a model");
+        let Error::Unsupported(message) = error else {
+            panic!("expected Unsupported, got {error:?}");
+        };
+        assert!(message.contains("extractor"), "{message}");
+        assert!(message.contains("no model was supplied"), "{message}");
+        // `new` builds the deterministic pipeline, but a run still refuses to downgrade the
+        // configuration the caller asked for.
+        let error = StagedAnalyzer::new(config)
+            .analyze(&conversation(), &CallOptions::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_model_backed_classifier_without_a_model_is_rejected() {
+        let config = AnalyzerConfig {
+            classifier: ClassifierKind::Llm,
+            ..AnalyzerConfig::default()
+        };
+        // The extractor stays rule-based, so construction succeeds.
+        let staged = StagedAnalyzer::new(config);
+        let error = staged
+            .analyze(&conversation(), &CallOptions::new())
+            .await
+            .unwrap_err();
+        let Error::Unsupported(message) = error else {
+            panic!("expected Unsupported, got {error:?}");
+        };
+        assert!(message.contains("classifier"), "{message}");
+        assert!(message.contains("no model was supplied"), "{message}");
+        // With a model the same configuration runs end to end.
+        let model = ScriptedModel::builder()
+            .respond_text(r#"[{"info_id": "id-1", "result": "none"}]"#)
+            .build();
+        let staged = StagedAnalyzer::from_config(
+            AnalyzerConfig {
+                classifier: ClassifierKind::Llm,
+                ..AnalyzerConfig::default()
+            },
+            Some(Arc::new(model)),
+        )
+        .expect("the model satisfies the classifier");
+        let existing = vec![record("id-1", "the service uses postgres")];
+        let result = staged
+            .analyze_against(
+                &ExtractionInput::from_text("the service uses mysql"),
+                &existing,
+                &CallOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.facts().len(), 1);
+        assert_eq!(result.verdicts.len(), 1);
+        assert_eq!(result.verdicts[0].verdict.kind, ConflictKind::Unrelated);
+        assert!(!result.is_degraded());
     }
 
     #[tokio::test]
@@ -891,6 +1053,7 @@ mod tests {
         };
         let pipeline =
             StagedAnalyzer::from_config(AnalyzerConfig::default(), Some(Arc::new(model)))
+                .expect("a model satisfies the model-backed stages")
                 .with_stage_config(stages);
         let token = CancellationToken::new();
         token.cancel();
@@ -924,6 +1087,7 @@ mod tests {
     #[tokio::test]
     async fn staged_result_round_trips_through_json() {
         let staged = StagedAnalyzer::from_engine(&MemoryEngineConfig::default(), None)
+            .expect("the engine default asks for rules")
             .analyze(&conversation(), &CallOptions::new())
             .await
             .unwrap();

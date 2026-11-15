@@ -31,6 +31,16 @@
 //! the stage output carries a `degraded` reason ("… fell back to rules: …"). A cancelled
 //! [`CallOptions`] is checked before the first model call, so an already-cancelled call
 //! performs zero model invocations.
+//!
+//! A *missing* model is reported too, never just logged: a [`StageKind::Llm`] stage whose
+//! model is absent runs its rule implementation and the pipeline records "llm <stage>
+//! stage requested without a model" in
+//! [`StagedResult::result`](crate::analyzer::StagedResult::result)'s
+//! [`ExtractionResult::degraded`](crate::analyzer::ExtractionResult::degraded) field, while
+//! a configuration whose *extractor* or *classifier* asks for the model returns
+//! [`openjiuwen_common::error::Error::Unsupported`] from
+//! [`StagedAnalyzer::from_config`](crate::analyzer::StagedAnalyzer::from_config) or from
+//! the run itself.
 mod overrides;
 mod pipeline;
 mod plan;

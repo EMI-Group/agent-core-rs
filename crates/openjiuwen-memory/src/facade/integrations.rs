@@ -168,7 +168,7 @@ impl LongTermMemory {
             };
             return Ok((extraction.facts, report));
         }
-        let staged = StagedAnalyzer::from_engine(self.config(), self.engine.model().cloned())
+        let staged = StagedAnalyzer::from_engine(self.config(), self.engine.model().cloned())?
             .with_overrides(overrides.clone())
             .with_dedupe(self.config().dedupe.clone());
         let result = staged.analyze(input, &options.call).await?;
@@ -232,8 +232,9 @@ impl LongTermMemory {
     ///
     /// `Error::Validation` for an invalid scope or a blank/unsupported content (and for a
     /// malformed stored override document), `Error::Unsupported` when a stored override
-    /// names a handle this facade does not hold, `Error::Cancelled` when `options` fires,
-    /// and the engine's recall error otherwise.
+    /// names a handle this facade does not hold or when an extracted override asks for the
+    /// model-backed extractor/classifier while the facade holds no model,
+    /// `Error::Cancelled` when `options` fires, and the engine's recall error otherwise.
     pub async fn consolidate(
         &self,
         scope: &MemoryScope,
@@ -261,7 +262,7 @@ impl LongTermMemory {
             .await?;
         let records: Vec<_> = hits.into_iter().map(|hit| hit.record).collect();
         let fact = ExtractedFact::from(incoming);
-        let staged = StagedAnalyzer::from_engine(self.config(), self.engine.model().cloned())
+        let staged = StagedAnalyzer::from_engine(self.config(), self.engine.model().cloned())?
             .with_overrides(overrides)
             .with_dedupe(dedupe.clone());
         Ok(staged.consolidate(&[fact], &records, &dedupe))

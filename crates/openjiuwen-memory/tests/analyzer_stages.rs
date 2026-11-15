@@ -107,6 +107,7 @@ async fn staged_analysis_matches_the_plain_analyzer() {
         .await
         .unwrap();
     let from_engine = StagedAnalyzer::from_engine(&MemoryEngineConfig::default(), None)
+        .expect("the engine default asks for rules")
         .analyze(&conversation, &options())
         .await
         .unwrap();
@@ -340,6 +341,7 @@ async fn a_plan_without_extract_facts_yields_no_facts() {
         .build();
     let handle = model.clone();
     let pipeline = StagedAnalyzer::from_config(AnalyzerConfig::default(), Some(Arc::new(model)))
+        .expect("a model satisfies the model-backed stages")
         .with_stage_config(StageConfig {
             plan: StageKind::Llm,
             ..StageConfig::default()
@@ -397,6 +399,7 @@ async fn a_focused_plan_narrows_the_turns_the_extract_stage_sees() {
         )
         .build();
     let pipeline = StagedAnalyzer::from_config(AnalyzerConfig::default(), Some(Arc::new(model)))
+        .expect("a model satisfies the model-backed stages")
         .with_stage_config(StageConfig {
             plan: StageKind::Llm,
             ..StageConfig::default()
@@ -554,6 +557,7 @@ async fn llm_stages_fall_back_to_rules_and_report_the_degradation() {
     let model = ScriptedModel::builder().build();
     let handle = model.clone();
     let pipeline = StagedAnalyzer::from_config(config.clone(), Some(Arc::new(model)))
+        .expect("a model satisfies the model-backed stages")
         .with_stage_config(llm_stages());
     let fell_back = pipeline.analyze(&conversation(), &options()).await.unwrap();
 
@@ -628,6 +632,7 @@ async fn llm_stages_use_valid_answers_without_degradation() {
         .build();
     let handle = model.clone();
     let pipeline = StagedAnalyzer::from_config(AnalyzerConfig::default(), Some(Arc::new(model)))
+        .expect("a model satisfies the model-backed stages")
         .with_stage_config(llm_stages());
     let result = pipeline.analyze(&conversation(), &options()).await.unwrap();
 
@@ -668,7 +673,18 @@ async fn llm_stage_kinds_without_a_model_still_analyze_with_the_rule_stages() {
         .unwrap();
     assert_eq!(result.stages, built_in_stages());
     assert_eq!(result.facts().len(), 3);
-    assert!(!result.is_degraded());
+    // The rule stages ran (same output as the deterministic pipeline), but the fallback is
+    // reported on the result rather than only logged.
+    assert!(result.is_degraded());
+    let degraded = result
+        .result
+        .degraded
+        .as_deref()
+        .expect("the no-model fallback is reported");
+    for stage in ["plan", "reasoning", "proactive"] {
+        let reason = format!("llm {stage} stage requested without a model");
+        assert!(degraded.contains(&reason), "missing {reason}: {degraded}");
+    }
     assert_eq!(result.decision.as_ref().unwrap().degraded, None);
 
     let rule_only = StagedAnalyzer::new(AnalyzerConfig::default())
@@ -800,6 +816,7 @@ async fn a_cancelled_analysis_returns_cancelled_with_zero_model_calls() {
     let model = ScriptedModel::builder().build();
     let handle = model.clone();
     let pipeline = StagedAnalyzer::from_config(AnalyzerConfig::default(), Some(Arc::new(model)))
+        .expect("a model satisfies the model-backed stages")
         .with_stage_config(llm_stages());
     let token = CancellationToken::new();
     token.cancel();

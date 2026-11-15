@@ -6,6 +6,13 @@
 //! batch of facts into a [`ConsolidationPlan`] against already-stored records, using the
 //! engine's [`DedupeConfig`] so the plan agrees with the write path's policy.
 //!
+//! Construction is fallible on purpose: a configuration that requests a model-backed
+//! extractor or classifier while no [`Model`] is supplied is an
+//! [`openjiuwen_common::error::Error::Unsupported`] naming the field and the fix, never a
+//! silent switch to the deterministic implementation. Callers that want rules build them
+//! explicitly with [`MemoryAnalyzer::rule`] or leave the configuration at
+//! [`ExtractorKind::Rule`]/[`ClassifierKind::Rule`].
+//!
 //! The analyzer never writes storage itself: it produces facts and a plan, and the
 //! caller (engine, harness, or workflow) applies them.
 use crate::analyzer::config::{AnalyzerConfig, ClassifierKind, ExtractorKind};
@@ -18,7 +25,7 @@ use crate::config::{DedupeConfig, MemoryEngineConfig};
 use crate::recall::{find_duplicate, merge_records, Candidate};
 use crate::record::{CallOptions, DedupePolicy, MemoryRecord, MemoryScope};
 use chrono::Utc;
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::Model;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -96,16 +103,30 @@ impl MemoryAnalyzer {
     /// Builds the analyzer `config` asks for.
     ///
     /// [`ExtractorKind::Llm`] with a model yields an [`LlmExtractor`] (whose own fallback
-    /// is the rule extractor); every other combination yields rules, so a config that
-    /// requests the model without supplying one degrades deterministically instead of
-    /// failing.
-    #[must_use]
-    pub fn from_config(config: AnalyzerConfig, model: Option<Arc<dyn Model>>) -> Self {
+    /// is the rule extractor once the model's retry budget is spent); [`ExtractorKind::Rule`]
+    /// yields rules regardless of `model`.
+    ///
+    /// # Errors
+    ///
+    /// [`openjiuwen_common::error::Error::Unsupported`] when
+    /// [`AnalyzerConfig::extractor`](crate::analyzer::AnalyzerConfig::extractor) is
+    /// [`ExtractorKind::Llm`] and no `model` is supplied: the request cannot be honoured,
+    /// and silently running the rule extractor would misreport what produced the facts.
+    /// Attach a model, or set the field to [`ExtractorKind::Rule`] (or call
+    /// [`MemoryAnalyzer::rule`]) to ask for rules on purpose.
+    pub fn from_config(config: AnalyzerConfig, model: Option<Arc<dyn Model>>) -> Result<Self> {
         let extractor: Arc<dyn FactExtractor> = match (config.extractor, model) {
             (ExtractorKind::Llm, Some(model)) => Arc::new(LlmExtractor::new(model, config.clone())),
-            _ => Arc::new(RuleExtractor::new(config.clone())),
+            (ExtractorKind::Llm, None) => {
+                return Err(Error::unsupported(
+                    "analyzer `extractor` is `ExtractorKind::Llm` but no model was supplied; \
+                     attach a model with `MemoryAnalyzer::from_config(config, Some(model))` or \
+                     set `AnalyzerConfig::extractor` to `ExtractorKind::Rule`",
+                ));
+            }
+            (ExtractorKind::Rule, _) => Arc::new(RuleExtractor::new(config.clone())),
         };
-        Self { config, extractor }
+        Ok(Self { config, extractor })
     }
 
     /// Builds the analyzer an engine configuration implies.
@@ -114,8 +135,13 @@ impl MemoryAnalyzer {
     /// depth, the model retry budget, and the default importance) come from
     /// [`AnalyzerConfig::from_engine`], so the analyzer and the engine cannot drift.
     /// `model` only takes effect when the configuration asks for the LLM extractor.
-    #[must_use]
-    pub fn from_engine(config: &MemoryEngineConfig, model: Option<Arc<dyn Model>>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// The same [`openjiuwen_common::error::Error::Unsupported`] as
+    /// [`MemoryAnalyzer::from_config`] when the derived configuration asks for the
+    /// model-backed extractor and `model` is `None`.
+    pub fn from_engine(config: &MemoryEngineConfig, model: Option<Arc<dyn Model>>) -> Result<Self> {
         Self::from_config(AnalyzerConfig::from_engine(config), model)
     }
 
@@ -159,15 +185,27 @@ impl MemoryAnalyzer {
 
     /// Builds the conflict classifier `config` asks for.
     ///
-    /// [`ClassifierKind::Llm`] with a model yields an [`LlmClassifier`]; every other
-    /// combination yields [`RuleClassifier`].
-    #[must_use]
-    pub fn classifier(&self, model: Option<Arc<dyn Model>>) -> Arc<dyn ConflictClassifier> {
+    /// [`ClassifierKind::Llm`] with a model yields an [`LlmClassifier`];
+    /// [`ClassifierKind::Rule`] yields a [`RuleClassifier`] regardless of `model`.
+    ///
+    /// # Errors
+    ///
+    /// [`openjiuwen_common::error::Error::Unsupported`] when
+    /// [`AnalyzerConfig::classifier`](crate::analyzer::AnalyzerConfig::classifier) is
+    /// [`ClassifierKind::Llm`] and no `model` is supplied: the request cannot be honoured,
+    /// and silently classifying with rules would misreport how the verdicts were reached.
+    /// Attach a model, or set the field to [`ClassifierKind::Rule`].
+    pub fn classifier(&self, model: Option<Arc<dyn Model>>) -> Result<Arc<dyn ConflictClassifier>> {
         match (self.config.classifier, model) {
             (ClassifierKind::Llm, Some(model)) => {
-                Arc::new(LlmClassifier::new(model, self.config.clone()))
+                Ok(Arc::new(LlmClassifier::new(model, self.config.clone())))
             }
-            _ => Arc::new(RuleClassifier::new(self.config.clone())),
+            (ClassifierKind::Llm, None) => Err(Error::unsupported(
+                "analyzer `classifier` is `ClassifierKind::Llm` but no model was supplied; \
+                 attach a model with `MemoryAnalyzer::classifier(Some(model))` or set \
+                 `AnalyzerConfig::classifier` to `ClassifierKind::Rule`",
+            )),
+            (ClassifierKind::Rule, _) => Ok(Arc::new(RuleClassifier::new(self.config.clone()))),
         }
     }
 
@@ -277,19 +315,37 @@ mod tests {
 
     #[test]
     fn from_config_picks_the_requested_extractor() {
-        let analyzer = MemoryAnalyzer::from_config(AnalyzerConfig::default(), None);
+        let analyzer = MemoryAnalyzer::from_config(AnalyzerConfig::default(), None)
+            .expect("the default config asks for rules");
         assert_eq!(analyzer.extractor_name(), "rule");
 
         let config = AnalyzerConfig {
             extractor: ExtractorKind::Llm,
             ..Default::default()
         };
-        let analyzer = MemoryAnalyzer::from_config(config.clone(), None);
-        assert_eq!(analyzer.extractor_name(), "rule");
-
         let model = ScriptedModel::builder().build();
-        let analyzer = MemoryAnalyzer::from_config(config, Some(Arc::new(model)));
+        let analyzer = MemoryAnalyzer::from_config(config, Some(Arc::new(model)))
+            .expect("the model satisfies the request");
         assert_eq!(analyzer.extractor_name(), "llm");
+    }
+
+    #[test]
+    fn from_config_rejects_the_llm_extractor_without_a_model() {
+        let config = AnalyzerConfig {
+            extractor: ExtractorKind::Llm,
+            ..Default::default()
+        };
+        let error = MemoryAnalyzer::from_config(config, None)
+            .err()
+            .expect("a model-backed extractor without a model must not silently run rules");
+        let Error::Unsupported(message) = error else {
+            panic!("expected Unsupported, got {error:?}");
+        };
+        assert!(message.contains("extractor"), "{message}");
+        assert!(message.contains("ExtractorKind::Llm"), "{message}");
+        assert!(message.contains("no model was supplied"), "{message}");
+        assert!(message.contains("attach a model"), "{message}");
+        assert!(message.contains("ExtractorKind::Rule"), "{message}");
     }
 
     #[test]
@@ -299,7 +355,8 @@ mod tests {
             importance_default: 0.7,
             ..Default::default()
         };
-        let analyzer = MemoryAnalyzer::from_engine(&engine, None);
+        let analyzer =
+            MemoryAnalyzer::from_engine(&engine, None).expect("the engine config asks for rules");
         assert_eq!(analyzer.extractor_name(), "rule");
         assert_eq!(analyzer.config(), &AnalyzerConfig::from_engine(&engine));
         assert_eq!(analyzer.config().max_input_chars, 2048);
@@ -309,7 +366,8 @@ mod tests {
     fn from_engine_keeps_rules_when_the_engine_config_does_not_request_the_llm() {
         let engine = MemoryEngineConfig::default();
         let model: Arc<dyn Model> = Arc::new(ScriptedModel::builder().build());
-        let analyzer = MemoryAnalyzer::from_engine(&engine, Some(model));
+        let analyzer =
+            MemoryAnalyzer::from_engine(&engine, Some(model)).expect("rules need no model");
         assert_eq!(analyzer.extractor_name(), "rule");
         assert_eq!(
             analyzer.config().extractor,
@@ -319,15 +377,33 @@ mod tests {
     #[test]
     fn classifier_follows_the_classifier_kind() {
         let analyzer = MemoryAnalyzer::rule(AnalyzerConfig::default());
-        assert_eq!(analyzer.classifier(None).name(), "rule");
+        assert_eq!(
+            analyzer.classifier(None).expect("rule classifier").name(),
+            "rule"
+        );
         let config = AnalyzerConfig {
             classifier: ClassifierKind::Llm,
             ..Default::default()
         };
-        let analyzer = MemoryAnalyzer::rule(config.clone());
-        assert_eq!(analyzer.classifier(None).name(), "rule");
+        let analyzer = MemoryAnalyzer::rule(config);
+        let error = analyzer
+            .classifier(None)
+            .err()
+            .expect("a model-backed classifier without a model must not silently run rules");
+        let Error::Unsupported(message) = error else {
+            panic!("expected Unsupported, got {error:?}");
+        };
+        assert!(message.contains("classifier"), "{message}");
+        assert!(message.contains("no model was supplied"), "{message}");
+        assert!(message.contains("ClassifierKind::Rule"), "{message}");
         let model = ScriptedModel::builder().build();
-        assert_eq!(analyzer.classifier(Some(Arc::new(model))).name(), "llm");
+        assert_eq!(
+            analyzer
+                .classifier(Some(Arc::new(model)))
+                .expect("the model satisfies the request")
+                .name(),
+            "llm"
+        );
     }
 
     #[tokio::test]

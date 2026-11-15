@@ -161,7 +161,10 @@ impl LongTermMemoryBuilder {
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::Error::Config`] when the configuration (or
-    /// one of its nested sections) is invalid.
+    /// one of its nested sections) is invalid, and
+    /// [`openjiuwen_common::error::Error::Unsupported`] when
+    /// [`MemoryAnalyzer::from_engine`] cannot build the analyzer the configuration asks
+    /// for (a model-backed extractor without an attached model).
     pub fn build(self) -> Result<Arc<LongTermMemory>> {
         let Self {
             config,
@@ -179,9 +182,10 @@ impl LongTermMemoryBuilder {
             builder = builder.model(Arc::clone(model));
         }
         let engine = builder.build()?;
-        let analyzer = analyzer.unwrap_or_else(|| {
-            Arc::new(MemoryAnalyzer::from_engine(engine.config(), model.clone()))
-        });
+        let analyzer = match analyzer {
+            Some(analyzer) => analyzer,
+            None => Arc::new(MemoryAnalyzer::from_engine(engine.config(), model.clone())?),
+        };
         let graph = build_graph(&engine, &stores, embedding.as_ref(), model.as_ref());
         let coding = engine
             .config()
