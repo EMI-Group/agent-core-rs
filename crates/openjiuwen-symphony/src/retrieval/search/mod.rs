@@ -68,6 +68,7 @@ pub mod expand;
 pub mod flow;
 pub mod lexical;
 pub mod reduce;
+pub mod render;
 pub mod selector;
 pub mod subtree;
 pub mod truncation;
@@ -94,6 +95,12 @@ pub use lexical::{
     BM25_K1, FIELD_WEIGHTS, IDENTITY_BONUS, PHRASE_FIELD_WEIGHTS,
 };
 pub use reduce::DefaultBranchReducer;
+pub use render::{
+    build_disclosure_messages, build_disclosure_prompt_parts, build_exposed_fragment,
+    disclosure_request_marker, disclosure_system_prompt, disclosure_user_prefix,
+    exposure_item_count, fragmentation_fingerprint, parse_selected_codes, DefaultSubtreeRenderer,
+    DisclosurePromptParts, SubtreeRenderer, DISCLOSURE_PROMPT_VERSION,
+};
 pub use selector::{
     is_abstain_output, query_text, DefaultTopKSelector, LexicalTopKSelector, ABSTAIN_HINTS,
     FRAGMENT_SELECTED_EVENT, MODE_GENERATE, MODE_LEXICAL,
