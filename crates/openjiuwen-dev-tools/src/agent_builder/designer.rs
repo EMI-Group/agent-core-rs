@@ -4,8 +4,14 @@
 //! Python runs a three-stage model pipeline (basic design, branch design,
 //! reflection evaluation) and answers with free-form Markdown; this port answers
 //! with a typed [`WorkflowDesign`] that converts into the platform
-//! [`WorkflowDsl`], and keeps a deterministic offline designer behind the same
-//! entry point as the single model round trip.
+//! [`WorkflowDsl`].
+//!
+//! [`WorkflowDesigner::design`] is the single-round-trip entry point: one model
+//! answer when a model is wired, else the deterministic synthesis.
+//! [`WorkflowDesigner::design_three_pass`] runs Python's pipeline as three
+//! recorded passes ([`DesignPass`]), [`WorkflowDesigner::stream_design`] streams
+//! the same pipeline as [`DesignEvent`]s, and every entry point records
+//! [`GenerationProvenance`], so a degraded design is never silent.
 //!
 //! A design is validated before it is used: at least one node, unique ids,
 //! resolvable edges, exactly one start node, and at least one end node.
@@ -16,15 +22,22 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use futures::stream::BoxStream;
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_foundation::llm::{Model, ModelRequestConfig};
-use openjiuwen_foundation::BaseMessage;
+use openjiuwen_foundation::llm::Model;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
+use super::outcome::GenerationProvenance;
+use super::progress::ProgressStage;
 use super::workflow_dsl::{DslEdge, DslNode, WorkflowDsl};
-use crate::util::extract_json_fence;
+
+mod passes;
+mod stream;
+
+pub use self::passes::{DesignPass, DesignPassKind, ThreePassDesign};
+pub use self::stream::DesignEvent;
 
 /// The instruction sent to the model by [`WorkflowDesigner::design`].
 ///
@@ -46,6 +59,9 @@ using these keys:
 Every design needs exactly one "start" node, at least one "end" node, unique
 node ids, and edges whose endpoints are node ids.
 Do not add other keys and do not wrap the document in prose."#;
+
+/// The provenance detail recorded for a deterministic design.
+const DETERMINISTIC_DESIGN_DETAIL: &str = "no model configured; deterministic design synthesis";
 
 /// The maximum number of task steps the offline designer turns into LLM nodes.
 const MAX_STEPS: usize = 4;
@@ -351,25 +367,36 @@ fn config_object(config: &Value, key: &str) -> BTreeMap<String, Value> {
         .unwrap_or_default()
 }
 
+/// A workflow design together with the provenance of the stage that produced it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct DesignOutcome {
+    /// The design the designer produced.
+    pub design: WorkflowDesign,
+    /// The stage records behind that design, oldest first.
+    pub provenance: GenerationProvenance,
+}
+
 /// Designs workflows from a natural-language request.
 ///
 /// Without a model the designer is deterministic and offline: it splits the
 /// request into steps and synthesizes a start/LLM/end workflow. With a model it
 /// performs one round trip and falls back to the offline design whenever the
 /// answer cannot be parsed into a valid [`WorkflowDesign`].
+#[derive(Clone)]
 pub struct WorkflowDesigner {
-    /// The optional model the model path talks to.
+    /// The optional model the model paths talk to.
     model: Option<Arc<dyn Model>>,
 }
 
 impl WorkflowDesigner {
-    /// Creates an offline designer; [`Self::design`] never calls a model.
+    /// Creates an offline designer; every entry point runs its deterministic path.
     #[must_use]
     pub fn new() -> Self {
         Self { model: None }
     }
 
-    /// Creates a designer whose [`Self::design`] asks `model` first.
+    /// Creates a designer whose model paths ask `model` first.
     #[must_use]
     pub fn with_model(model: Arc<dyn Model>) -> Self {
         Self { model: Some(model) }
@@ -377,6 +404,7 @@ impl WorkflowDesigner {
 
     /// Designs a workflow, using the model when one is configured.
     ///
+    /// This is [`Self::design_with_provenance`] without the provenance record.
     /// One system message describing the JSON contract is followed by one user
     /// message carrying `query`. A model error, a choice-less answer, a missing
     /// JSON fence, an unparseable document, or a document failing
@@ -388,23 +416,58 @@ impl WorkflowDesigner {
     /// Returns [`Error::Validation`] for a blank query — the only error this
     /// entry point produces.
     pub async fn design(&self, query: &str) -> Result<WorkflowDesign> {
+        Ok(self.design_with_provenance(query).await?.design)
+    }
+
+    /// Designs a workflow and records where the output came from.
+    ///
+    /// With no model the result is [`Self::design_offline`]'s, recorded as
+    /// `deterministic` with `no model configured; deterministic design synthesis`
+    /// as its detail. An
+    /// accepted model answer is recorded as `model`; a rejected one is logged,
+    /// replaced by the offline design, and recorded as `fallback` with the
+    /// rejection reason. The record is warned about once per non-model stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for a blank query.
+    pub async fn design_with_provenance(&self, query: &str) -> Result<DesignOutcome> {
         if query.trim().is_empty() {
             return Err(Error::validation("query must not be blank"));
         }
-        let Some(model) = self.model.as_deref() else {
-            return self.design_offline(query);
+
+        let mut provenance = GenerationProvenance::new();
+        let design = match self.model.as_deref() {
+            None => {
+                let design = passes::offline_design(query)?;
+                provenance.record_deterministic(
+                    ProgressStage::GeneratingWorkflowDesign,
+                    DETERMINISTIC_DESIGN_DETAIL,
+                );
+                design
+            }
+            Some(model) => match passes::design_with_model(model, query).await {
+                Ok(design) => {
+                    provenance.record_model(ProgressStage::GeneratingWorkflowDesign);
+                    design
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        "workflow design failed; falling back to the offline designer"
+                    );
+                    let design = passes::offline_design(query)?;
+                    provenance.record_fallback(
+                        ProgressStage::GeneratingWorkflowDesign,
+                        passes::rejection_reason(&error),
+                    );
+                    design
+                }
+            },
         };
 
-        match design_with_model(model, query).await {
-            Ok(design) => Ok(design),
-            Err(error) => {
-                tracing::debug!(
-                    %error,
-                    "workflow design failed; falling back to the offline designer"
-                );
-                self.design_offline(query)
-            }
-        }
+        provenance.warn_if_degraded();
+        Ok(DesignOutcome { design, provenance })
     }
 
     /// Designs a workflow deterministically, without any model call.
@@ -417,88 +480,156 @@ impl WorkflowDesigner {
     /// `是否`, `分支`, ...). The result always passes
     /// [`WorkflowDesign::validate`].
     ///
+    /// The stage is recorded as `deterministic` and warned about like any other
+    /// non-model stage, because this entry point never consults a model.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`] for a blank query.
     pub fn design_offline(&self, query: &str) -> Result<WorkflowDesign> {
-        let trimmed = query.trim();
-        if trimmed.is_empty() {
+        let design = passes::offline_design(query)?;
+        let mut provenance = GenerationProvenance::new();
+        provenance.record_deterministic(
+            ProgressStage::GeneratingWorkflowDesign,
+            DETERMINISTIC_DESIGN_DETAIL,
+        );
+        provenance.warn_if_degraded();
+        Ok(design)
+    }
+
+    /// Runs the basic design pass deterministically: `start` -> `llm_1..N` -> `end`.
+    ///
+    /// The request is split into at most `MAX_STEPS` task clauses (sentence
+    /// terminators, sequencing phrases, numbered list markers, leading list
+    /// markers stripped, empties and duplicates dropped, single-step fallback),
+    /// and every clause becomes one LLM node carrying its instruction. The pass
+    /// never inserts a branch node, never calls a model, and the result always
+    /// passes [`WorkflowDesign::validate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for a blank `query`.
+    pub fn design_basic_offline(&self, query: &str) -> Result<WorkflowDesign> {
+        passes::basic_design(query)
+    }
+
+    /// Runs the branch design pass deterministically over `basic`.
+    ///
+    /// When the lowercased `query` holds a decision marker (`if`, `when`,
+    /// `whether`, `condition`, `decision`, `branch`, `else`, `otherwise`,
+    /// `如果`, `否则`, `当`, `是否`, `条件`, `分支`) and `basic` has no branch
+    /// node, one branch node is inserted before the end node with
+    /// `config.conditions = ["condition", "default"]`, and every edge into the
+    /// end node is rewired through it. Without a marker, or when the design
+    /// already has a branch node or an id `branch`, `basic` is returned
+    /// unchanged, so the pass is idempotent and never duplicates the id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] when the produced design fails
+    /// [`WorkflowDesign::validate`], which needs a malformed `basic` input.
+    pub fn design_branch_offline(
+        &self,
+        query: &str,
+        basic: &WorkflowDesign,
+    ) -> Result<WorkflowDesign> {
+        let (design, _) = passes::branch_design(query, basic);
+        design.validate()?;
+        Ok(design)
+    }
+
+    /// Runs the reflection pass deterministically over `with_branches`.
+    ///
+    /// The repairs run in this order and every one appends one note: duplicate
+    /// node ids are renamed `<id>_2`, `<id>_3`, ...; edges naming an unknown
+    /// node are dropped; a missing `start` node is inserted at the front and
+    /// connected to the first node; a missing `end` node is appended and
+    /// connected from every sink; an unreachable node is connected from the
+    /// nearest earlier reachable node (the `start` node when none is earlier);
+    /// and a cycle is broken by dropping the back edge `find_cycle` reports.
+    /// An already-valid design yields no notes and is returned unchanged.
+    ///
+    /// `query` is the originating request: the deterministic repairs do not read
+    /// it, and only the model-backed reflection pass uses it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] when the repaired design still fails
+    /// [`WorkflowDesign::validate`] — an input no listed repair can fix.
+    pub fn design_reflection_offline(
+        &self,
+        query: &str,
+        with_branches: &WorkflowDesign,
+    ) -> Result<(WorkflowDesign, Vec<String>)> {
+        let _ = query;
+        passes::reflection_design(with_branches)
+    }
+
+    /// Runs the three designer passes and reports each one.
+    ///
+    /// The passes run in Python's order — basic, branch, reflection — and each
+    /// uses the model when one is wired, accepting an answer only when it
+    /// parses, validates, and (for the branch pass, when the request holds a
+    /// decision marker) actually contains a branch node. A rejected answer is
+    /// never an error: that pass falls back to its deterministic result and
+    /// records `fallback` with the reason. The result holds exactly three
+    /// [`DesignPass`] records, one provenance record per pass, and one note per
+    /// repair the reflection pass applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for a blank query, before any model call.
+    pub async fn design_three_pass(&self, query: &str) -> Result<ThreePassDesign> {
+        if query.trim().is_empty() {
             return Err(Error::validation("query must not be blank"));
         }
 
-        let mut steps = task_clauses(trimmed);
-        if steps.is_empty() {
-            steps.push(trimmed.to_string());
-        }
+        let mut provenance = GenerationProvenance::new();
+        let mut records = Vec::with_capacity(3);
 
-        let mut nodes = vec![DesignNode {
-            id: "start".to_string(),
-            kind: DesignNodeKind::Start,
-            title: "Start".to_string(),
-            description: "Workflow entry".to_string(),
-            config: json!({"inputs": {"query": {"type": "string", "description": "user input"}}}),
-        }];
-        let mut edges = Vec::new();
-        let mut previous = "start".to_string();
+        let basic = passes::run_basic(self, query).await?;
+        provenance.record(
+            ProgressStage::GeneratingWorkflowDesign,
+            basic.pass.source,
+            basic.pass.detail.clone(),
+        );
+        records.push(basic.pass);
 
-        for (position, clause) in steps.iter().enumerate() {
-            let id = format!("llm_{}", position + 1);
-            nodes.push(DesignNode {
-                id: id.clone(),
-                kind: DesignNodeKind::Llm,
-                title: step_title(clause, position + 1),
-                description: clause.clone(),
-                config: json!({
-                    "instruction": clause,
-                    "inputs": {"query": {"type": "string"}},
-                    "outputs": {"result": {"type": "string"}},
-                }),
-            });
-            edges.push(DesignEdge {
-                source: previous,
-                target: id.clone(),
-                condition: None,
-            });
-            previous = id;
-        }
+        let branch = passes::run_branch(self, query, &basic.design).await?;
+        provenance.record(
+            ProgressStage::GeneratingWorkflowDesign,
+            branch.pass.source,
+            branch.pass.detail.clone(),
+        );
+        records.push(branch.pass);
 
-        if needs_branch(trimmed) {
-            nodes.push(DesignNode {
-                id: "branch".to_string(),
-                kind: DesignNodeKind::Branch,
-                title: "Decide".to_string(),
-                description: "Choose the next step".to_string(),
-                config: json!({"conditions": ["default"]}),
-            });
-            edges.push(DesignEdge {
-                source: previous,
-                target: "branch".to_string(),
-                condition: None,
-            });
-            previous = "branch".to_string();
-        }
+        let reflection = passes::run_reflection(self, query, &branch.design).await?;
+        provenance.record(
+            ProgressStage::ValidatingDl,
+            reflection.pass.source,
+            reflection.pass.detail.clone(),
+        );
+        records.push(reflection.pass);
 
-        nodes.push(DesignNode {
-            id: "end".to_string(),
-            kind: DesignNodeKind::End,
-            title: "End".to_string(),
-            description: "Workflow exit".to_string(),
-            config: Value::Null,
-        });
-        edges.push(DesignEdge {
-            source: previous,
-            target: "end".to_string(),
-            condition: None,
-        });
+        provenance.warn_if_degraded();
+        Ok(ThreePassDesign {
+            design: reflection.design,
+            passes: records,
+            provenance,
+            notes: reflection.notes,
+        })
+    }
 
-        let design = WorkflowDesign {
-            name: slugify(&steps[0]),
-            description: truncate_chars(trimmed, DESCRIPTION_LIMIT),
-            nodes,
-            edges,
-        };
-        design.validate()?;
-        Ok(design)
+    /// Streams the three designer passes as [`DesignEvent`]s.
+    ///
+    /// The stream owns a clone of the designer and of `query`, so it is
+    /// `Send + 'static` and outlives both. It yields `pass_started` and
+    /// `pass_completed` around each pass in Python's order, then one `completed`
+    /// event holding the same [`ThreePassDesign`] [`Self::design_three_pass`]
+    /// returns. A blank query yields one [`Error::Validation`] and ends the
+    /// stream.
+    pub fn stream_design(&self, query: &str) -> BoxStream<'static, Result<DesignEvent>> {
+        stream::design_stream(self.clone(), query.to_string())
     }
 }
 
@@ -515,295 +646,6 @@ impl fmt::Debug for WorkflowDesigner {
             .field("has_model", &self.model.is_some())
             .finish()
     }
-}
-
-/// Asks the model for one fenced design document and validates it.
-async fn design_with_model(model: &dyn Model, query: &str) -> Result<WorkflowDesign> {
-    let messages = vec![
-        BaseMessage::system(DESIGN_SYSTEM_PROMPT),
-        BaseMessage::user(query),
-    ];
-    let request = ModelRequestConfig::new(model.model_name());
-    let response = model.invoke(&messages, &request).await?;
-    let Some(choice) = response.choices.into_iter().next() else {
-        return Err(Error::llm("model returned no choices"));
-    };
-
-    let text = choice.message.text().into_owned();
-    let value = extract_json_fence(&text)
-        .ok_or_else(|| Error::validation("model answer contained no JSON code fence"))?;
-    let design: WorkflowDesign = serde_json::from_value(value).map_err(|error| {
-        Error::validation(format!("failed to parse workflow design JSON: {error}"))
-    })?;
-    design.validate()?;
-    Ok(design)
-}
-
-/// Splits `query` into at most `MAX_STEPS` task clauses.
-fn task_clauses(query: &str) -> Vec<String> {
-    let mut clauses: Vec<String> = Vec::new();
-    for numbered in split_numbered(query) {
-        for sentence in split_terminators(&numbered) {
-            for sequenced in split_sequences(sentence) {
-                let clause = strip_list_marker(&sequenced).trim();
-                if clause.chars().all(|character| !character.is_alphabetic()) {
-                    continue;
-                }
-                if clauses.iter().any(|seen| seen == clause) {
-                    continue;
-                }
-                clauses.push(clause.to_string());
-                if clauses.len() == MAX_STEPS {
-                    return clauses;
-                }
-            }
-        }
-    }
-    clauses
-}
-
-/// Splits numbered list items (`1.`, `2)`, `3、`) out of `text`.
-fn split_numbered(text: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut index = 0usize;
-
-    while index < text.len() {
-        let bytes = text.as_bytes();
-        let at_boundary = index == 0 || bytes[index - 1].is_ascii_whitespace();
-        if at_boundary && bytes[index].is_ascii_digit() {
-            let mut digits_end = index;
-            while digits_end < text.len() && bytes[digits_end].is_ascii_digit() {
-                digits_end += 1;
-            }
-            let rest = &text[digits_end..];
-            let marker_len = if rest.starts_with('、') {
-                '、'.len_utf8()
-            } else if rest.starts_with('.') || rest.starts_with(')') {
-                let after = &rest[1..];
-                usize::from(after.is_empty() || after.starts_with(char::is_whitespace))
-            } else {
-                0
-            };
-            if marker_len > 0 {
-                if index > start {
-                    parts.push(text[start..index].to_string());
-                    start = index;
-                }
-                index = digits_end + marker_len;
-                continue;
-            }
-        }
-        index += 1;
-    }
-
-    parts.push(text[start..].to_string());
-    parts
-}
-
-/// Splits `text` at every sentence terminator, dropping the terminator.
-fn split_terminators(text: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    for (index, character) in text.char_indices() {
-        if TERMINATORS.contains(&character) {
-            parts.push(&text[start..index]);
-            start = index + character.len_utf8();
-        }
-    }
-    parts.push(&text[start..]);
-    parts
-}
-
-/// Splits `text` at every sequencing phrase, dropping the phrase itself.
-fn split_sequences(text: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut rest = text;
-    while let Some((start, length)) = find_sequence_marker(rest) {
-        parts.push(rest[..start].to_string());
-        rest = &rest[start + length..];
-    }
-    parts.push(rest.to_string());
-    parts
-}
-
-/// The earliest sequencing phrase in `text`, as `(offset, length)`.
-///
-/// Among phrases starting at the same offset the longest one wins, so
-/// `", then "` is preferred over `" then "`.
-fn find_sequence_marker(text: &str) -> Option<(usize, usize)> {
-    let mut best: Option<(usize, usize)> = None;
-    for (index, _) in text.char_indices() {
-        if best.is_some_and(|(position, _)| position < index) {
-            break;
-        }
-        for marker in SEQUENCE_MARKERS {
-            let Some(length) = match_prefix_ci(&text[index..], marker) else {
-                continue;
-            };
-            best = match best {
-                Some((position, current)) if position == index && current >= length => {
-                    Some((position, current))
-                }
-                _ => Some((index, length)),
-            };
-        }
-    }
-    best
-}
-
-/// The byte length of `prefix` when `text` starts with it, ignoring ASCII case.
-fn match_prefix_ci(text: &str, prefix: &str) -> Option<usize> {
-    let mut characters = text.chars();
-    for wanted in prefix.chars() {
-        if !characters.next()?.eq_ignore_ascii_case(&wanted) {
-            return None;
-        }
-    }
-    Some(prefix.len())
-}
-
-/// Strips one leading list marker (`-`, `*`, `1.`, `1)`, `1、`) from `text`.
-fn strip_list_marker(text: &str) -> &str {
-    let trimmed = text.trim_start();
-    for marker in ['-', '*'] {
-        if let Some(rest) = trimmed.strip_prefix(marker) {
-            return rest.trim_start();
-        }
-    }
-
-    let mut digits_end = 0usize;
-    for (index, character) in trimmed.char_indices() {
-        if !character.is_ascii_digit() {
-            break;
-        }
-        digits_end = index + character.len_utf8();
-    }
-    if digits_end > 0 {
-        let rest = &trimmed[digits_end..];
-        for marker in ['.', ')', '、'] {
-            if let Some(rest) = rest.strip_prefix(marker) {
-                return rest.trim_start();
-            }
-        }
-    }
-    trimmed
-}
-
-/// Whether the request asks for a decision, and so needs a branch node.
-fn needs_branch(query: &str) -> bool {
-    let lowered = query.to_lowercase();
-    BRANCH_MARKERS.iter().any(|marker| {
-        if marker.is_ascii() {
-            contains_word(&lowered, marker)
-        } else {
-            lowered.contains(marker)
-        }
-    })
-}
-
-/// Whether `needle` occurs in `haystack` delimited by non-alphanumeric chars.
-fn contains_word(haystack: &str, needle: &str) -> bool {
-    let mut from = 0usize;
-    while let Some(offset) = haystack[from..].find(needle) {
-        let start = from + offset;
-        let end = start + needle.len();
-        let before = haystack[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|character| !character.is_alphanumeric());
-        let after = haystack[end..]
-            .chars()
-            .next()
-            .is_none_or(|character| !character.is_alphanumeric());
-        if before && after {
-            return true;
-        }
-        from = end;
-    }
-    false
-}
-
-/// A deterministic title for an LLM step.
-///
-/// CJK clauses keep their first `CJK_TITLE_CHARS` characters, other clauses
-/// their first `TITLE_WORDS` words; trailing punctuation is dropped. A clause
-/// with no usable title falls back to `Step <position>`.
-fn step_title(clause: &str, position: usize) -> String {
-    let title = if clause.chars().any(is_cjk) {
-        clause.chars().take(CJK_TITLE_CHARS).collect::<String>()
-    } else {
-        clause
-            .split_whitespace()
-            .take(TITLE_WORDS)
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let title = title
-        .trim()
-        .trim_end_matches(is_trailing_punctuation)
-        .trim();
-    if title.is_empty() {
-        format!("Step {position}")
-    } else {
-        title.to_string()
-    }
-}
-
-/// Whether `character` ends a clause fragment and should not end a title.
-fn is_trailing_punctuation(character: char) -> bool {
-    matches!(
-        character,
-        '.' | ',' | ';' | ':' | '!' | '?' | '。' | '，' | '；' | '：' | '！' | '？' | '、'
-    )
-}
-
-/// Whether `character` is a CJK ideograph or kana.
-fn is_cjk(character: char) -> bool {
-    matches!(
-        character,
-        '\u{3040}'..='\u{30FF}'   // hiragana and katakana
-        | '\u{3400}'..='\u{4DBF}' // CJK unified ideographs extension A
-        | '\u{4E00}'..='\u{9FFF}' // CJK unified ideographs
-        | '\u{F900}'..='\u{FAFF}' // CJK compatibility ideographs
-    )
-}
-
-/// Slugifies `text` into a workflow name.
-///
-/// Alphanumerics (including CJK) are kept, every other run becomes one `-`, the
-/// result is trimmed of `-` and capped at `NAME_LIMIT` characters. Text with
-/// nothing to keep yields `"workflow"`.
-fn slugify(text: &str) -> String {
-    let mut slug = String::new();
-    let mut separator = false;
-    for character in text.chars() {
-        if character.is_alphanumeric() {
-            if separator && !slug.is_empty() {
-                slug.push('-');
-            }
-            separator = false;
-            slug.extend(character.to_lowercase());
-        } else {
-            separator = true;
-        }
-    }
-
-    let capped: String = slug.chars().take(NAME_LIMIT).collect();
-    let trimmed = capped.trim_matches('-');
-    if trimmed.is_empty() {
-        "workflow".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// Truncates `text` to at most `limit` characters.
-fn truncate_chars(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_string();
-    }
-    text.chars().take(limit).collect()
 }
 
 #[cfg(test)]
