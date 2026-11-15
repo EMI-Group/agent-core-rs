@@ -112,7 +112,7 @@ pub fn mask_secrets(value: &str) -> String {
 }
 
 /// Masks a standalone bearer credential: `bearer` plus at least
-/// [`BEARER_TOKEN_MIN_LENGTH`] token characters becomes [`BEARER_MASK`].
+/// `BEARER_TOKEN_MIN_LENGTH` token characters becomes [`BEARER_MASK`].
 ///
 /// The word boundary, the case-insensitive `bearer` keyword and the token alphabet
 /// (`A-Z`, `a-z`, `0-9`, `.`, `_`, `~`, `+`, `/`, `=`, `-`) match Python's
@@ -432,7 +432,7 @@ mod tests {
             r#"{"client-secret": "s3cr3t"}"#
         );
         assert_eq!(
-            mask_secrets(r#"client_secret='s3cr3t'"#),
+            mask_secrets(r"client_secret='s3cr3t'"),
             "client_secret=***"
         );
     }

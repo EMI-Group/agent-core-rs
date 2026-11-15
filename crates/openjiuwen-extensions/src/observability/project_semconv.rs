@@ -3,23 +3,19 @@
 //! Port of `openjiuwen/extensions/observability/semconv.py` and its generated companion
 //! `openjiuwen/extensions/observability/gen_ai_semconv.py` (v0.1.20). Python keeps every
 //! project-owned key in one importable module so the handlers cannot drift apart on a typo; this
-//! module is that single place for the Rust handlers, and stays dependency-free so it compiles
-//! into the default build.
+//! module is that single place for the Rust handlers, and stays dependency-free so it compiles into
+//! the default build.
 //!
 //! # Naming rule
 //!
 //! The constant name carries the namespace, and the wire name is the namespace plus the rest of the
-//! name lowercased with `_` → `.`:
-//!
-//! - `OJ_*` → `openjiuwen.*` — additive project extensions (trajectory, correlation, streams, tools),
-//! - `AT_*` → `agentteam.*` — team-collaboration attributes,
-//! - `DA_*` → `deepagent.*` — DeepAgent task-loop attributes,
-//! - `GEN_AI_*` → `gen_ai.*` — pinned upstream standard names.
-//!
-//! The mechanical part of the rule is the namespace and the dotted path; final compound nouns stay
-//! one snake_case segment because the wire name is defined once, here, and never derived from the
-//! constant name (`message_count`, `tool_call`, `recorded_at_unix_nano`, `request.number`,
-//! `follow_up`, `loop_event`). Treat the literal as authoritative and the name as a hint.
+//! name lowercased with `_` → `.`: `OJ_*` → `openjiuwen.*` (additive project extensions),
+//! `AT_*` → `agentteam.*` (team collaboration), `DA_*` → `deepagent.*` (`DeepAgent` task loop),
+//! `GEN_AI_*` → `gen_ai.*` (pinned upstream standards). The mechanical part of the rule is the
+//! namespace and the dotted path; final compound nouns stay one `snake_case` segment because the wire
+//! name is defined once, here, and never derived from the constant name (`message_count`,
+//! `tool_call`, `recorded_at_unix_nano`, `follow_up`, `loop_event`). Treat the literal as
+//! authoritative and the name as a hint.
 //!
 //! # No duplicated keys
 //!
@@ -27,31 +23,28 @@
 //! re-exports a name that `openjiuwen/extensions/tracer_otel/semconv.py` already owns — the standard
 //! `gen_ai.*` keys, `error.type`, and the four `openjiuwen.gen_ai.*` extension keys that module
 //! declares — this module re-exports [`crate::otel::semconv`]'s constant instead of repeating the
-//! literal, so a consumer importing `project_semconv` still finds the full set while no second
-//! source of truth exists. [`REEXPORTED_KEYS`] enumerates those names; [`GEN_AI_KEYS`],
-//! [`OJ_KEYS`], [`AT_KEYS`] and [`DA_KEYS`] enumerate the ones defined here.
+//! literal, so a consumer importing this module still finds the full set while no second source of
+//! truth exists. [`REEXPORTED_KEYS`] enumerates those names; [`GEN_AI_KEYS`], [`OJ_KEYS`],
+//! [`AT_KEYS`] and [`DA_KEYS`] enumerate the ones defined here.
 //!
 //! # Source and revision
 //!
 //! The standard names come from `open-telemetry/semantic-conventions-genai` revision
-//! [`GEN_AI_SEMCONV_REVISION`]: [`GEN_AI_SEMCONV_ATTRIBUTE_COUNT`] attributes, GenAI schema
-//! [`GEN_AI_SEMCONV_SCHEMA_URL`] layered over core schema
-//! [`GEN_AI_CORE_SEMCONV_SCHEMA_URL`]. That pinned revision defines attribute names only — it
-//! carries no `gen_ai.client.*` metric instruments (its token-usage and operation-duration metrics
-//! are named nowhere in the registry, only alluded to in prose), so this module defines no metric
-//! constants rather than inventing names the pinned upstream does not carry. Upgrading the registry
-//! replaces this block as one unit.
+//! [`GEN_AI_SEMCONV_REVISION`]: [`GEN_AI_SEMCONV_ATTRIBUTE_COUNT`] attributes, `GenAI` schema
+//! [`GEN_AI_SEMCONV_SCHEMA_URL`] over core schema [`GEN_AI_CORE_SEMCONV_SCHEMA_URL`]. That revision
+//! defines attribute names only — no `gen_ai.client.*` token-usage or operation-duration metric
+//! instrument is named in the registry, only alluded to in prose — so this module defines no metric
+//! constants rather than inventing names the pinned upstream does not carry.
 //!
 //! # Design rules kept from Python
 //!
 //! A project key exists only when the standard has no attribute for the same fact: session identity
-//! is `gen_ai.conversation.id`, agent identity is `gen_ai.agent.name` / `gen_ai.agent.id`, tool-call
-//! identity is `gen_ai.tool.call.id` / `gen_ai.tool.name`, and no `openjiuwen.*` mirror of any of
-//! them is written, so no reader ever needs a fallback chain. `openjiuwen.gen_ai.*` is the additive
-//! namespace for facts the standard does not model at all (cost, TPOT, logprobs, provider
-//! payloads). Durations here are milliseconds and keep a load-bearing `_ms` suffix, because the
-//! standard states durations in seconds (`gen_ai.response.time_to_first_chunk` is the one duration
-//! attribute in the pinned registry, and the handler writes it in seconds).
+//! is `gen_ai.conversation.id`, agent identity `gen_ai.agent.name` / `gen_ai.agent.id`, tool-call
+//! identity `gen_ai.tool.call.id` / `gen_ai.tool.name`, and no `openjiuwen.*` mirror of any of them is
+//! written, so no reader ever needs a fallback chain. `openjiuwen.gen_ai.*` is the additive namespace
+//! for facts the standard does not model at all (cost, TPOT, logprobs, provider payloads). Durations
+//! here are milliseconds with a load-bearing `_ms` suffix, because the standard states durations in
+//! seconds (`gen_ai.response.time_to_first_chunk` is its one duration attribute).
 
 // ---------------------------------------------------------------------------
 // gen_ai.* — standard keys re-exported from the OTel semconv tree
@@ -87,11 +80,11 @@ pub use crate::otel::semconv::{
 /// Upstream registry revision the standard names are pinned to.
 pub const GEN_AI_SEMCONV_REVISION: &str = "fee465db333bdd6a7d2faa320edab5cf3101a4f4";
 
-/// GenAI semantic-convention schema URL of the pinned revision.
+/// `GenAI` semantic-convention schema URL of the pinned revision.
 pub const GEN_AI_SEMCONV_SCHEMA_URL: &str =
     "https://opentelemetry.io/schemas/gen-ai-dev/1.42.0-dev";
 
-/// Core semantic-convention schema URL the GenAI schema layers over.
+/// Core semantic-convention schema URL the `GenAI` schema layers over.
 pub const GEN_AI_CORE_SEMCONV_SCHEMA_URL: &str = "https://opentelemetry.io/schemas/1.44.0";
 
 /// Number of attributes the pinned registry defines.
@@ -240,10 +233,9 @@ pub const OJ_SPAN_FORCED_CLOSE: &str = "openjiuwen.span.forced_close";
 /// Wire name `openjiuwen.span.forced_close.reason` — why the span was force-closed.
 pub const OJ_SPAN_FORCED_CLOSE_REASON: &str = "openjiuwen.span.forced_close.reason";
 
-/// Wire name `openjiuwen.span.input` — backend-neutral JSON span input.
-///
-/// Used by records with no dedicated standard carrier (team/task/event/agent-tier spans); the
-/// payload follows the same redaction and truncation policy as prompts.
+/// Wire name `openjiuwen.span.input` — backend-neutral JSON span input for records with no
+/// dedicated standard carrier (team/task/event/agent-tier spans). The payload follows the same
+/// redaction and truncation policy as prompts.
 pub const OJ_SPAN_INPUT: &str = "openjiuwen.span.input";
 
 /// Wire name `openjiuwen.span.output` — backend-neutral JSON span output.
@@ -273,10 +265,9 @@ pub const OJ_STEP_NUMBER: &str = "openjiuwen.step.number";
 /// Wire name `openjiuwen.inference.id` — one model inference.
 pub const OJ_INFERENCE_ID: &str = "openjiuwen.inference.id";
 
-/// Wire name `openjiuwen.inference.input_observed` — whether the request was observed.
-///
-/// False when the inference was reported from the reply alone (a harness whose request logs never
-/// arrived), so its input is unknown and its output may be partial; absent means observed.
+/// Wire name `openjiuwen.inference.input_observed` — false when the inference was reported from the
+/// reply alone (a harness whose request logs never arrived), so its input is unknown and its output
+/// may be partial; absent means the request was observed.
 pub const OJ_INFERENCE_INPUT_OBSERVED: &str = "openjiuwen.inference.input_observed";
 
 /// Wire name `openjiuwen.request.number` — ordinal of the request for its subject.
@@ -285,10 +276,9 @@ pub const OJ_REQUEST_NUMBER: &str = "openjiuwen.request.number";
 /// Wire name `openjiuwen.request.purpose` — why the request was issued.
 pub const OJ_REQUEST_PURPOSE: &str = "openjiuwen.request.purpose";
 
-/// Wire name `openjiuwen.request.retry_count` — provider-SDK retries inside one request.
-///
-/// Retry time is part of every request-relative duration, so a reader needs the count to tell a slow
-/// provider from a retried one.
+/// Wire name `openjiuwen.request.retry_count` — provider-SDK retries inside one request; retry time
+/// is part of every request-relative duration, so the count separates a slow provider from a
+/// retried one.
 pub const OJ_REQUEST_RETRY_COUNT: &str = "openjiuwen.request.retry_count";
 
 /// Wire name `openjiuwen.model_group.id` — logical model group of the request.
@@ -300,10 +290,9 @@ pub const OJ_MODEL_GROUP_ROUTE_ID: &str = "openjiuwen.model_group.route_id";
 /// Wire name `openjiuwen.context.operation.id` — one context operation.
 pub const OJ_CONTEXT_OPERATION_ID: &str = "openjiuwen.context.operation.id";
 
-/// Wire name `openjiuwen.compaction.number` — ordinal of this compaction for its subject.
-///
-/// Counts operations, not model calls: a throttled compaction is retried and every attempt states
-/// the same number, so a reader counts what happened to the context.
+/// Wire name `openjiuwen.compaction.number` — ordinal of this compaction for its subject, counting
+/// operations rather than model calls: a throttled compaction is retried and every attempt states the
+/// same number, so a reader counts what happened to the context.
 pub const OJ_COMPACTION_NUMBER: &str = "openjiuwen.compaction.number";
 
 /// Wire name `openjiuwen.trajectory.record.kind` — see [`TRAJECTORY_RECORD_KINDS`].
@@ -405,9 +394,8 @@ pub const OJ_GEN_AI_RESPONSE_TIME_TO_FIRST_TOKEN_MS: &str =
 
 // Request-relative durations share one origin: the moment the LLM span opens, before the client
 // builds the request. They are client-side end-to-end measurements including request preparation,
-// network and gateway time. The nearest standard relative is `total_latency_ms`: the standard's
-// `gen_ai.client.operation.duration` metric measures the same fact in seconds, under another name
-// and as a metric rather than a span attribute, so neither is a duplicate.
+// network and gateway time. The standard's `gen_ai.client.operation.duration` metric measures the
+// nearest relative fact in seconds, as a metric rather than a span attribute, so neither duplicates.
 
 /// Wire name `openjiuwen.event.sequence` — ordinal of an event frame.
 pub const OJ_EVENT_SEQUENCE: &str = "openjiuwen.event.sequence";
@@ -424,8 +412,7 @@ pub const OJ_STREAM_TOOL_CALL_ARGUMENTS_DELTA: &str = "openjiuwen.stream.tool_ca
 /// Span event name `openjiuwen.stream.chunk` — one model-stream frame.
 ///
 /// Frames ride the stream-frame channel rather than span events: an answer produces hundreds of
-/// them and the SDK's per-span event limit evicts the oldest, which would drop the beginning of every
-/// long answer.
+/// them and the SDK's per-span event limit evicts the oldest, dropping the start of long answers.
 pub const OJ_STREAM_FRAME_EVENT: &str = "openjiuwen.stream.chunk";
 
 /// Span event name `openjiuwen.stream.open` — the stream started.
@@ -552,17 +539,14 @@ pub const DA_TASK_LOOP_EVENT: &str = "deepagent.task.loop_event";
 // Attribute values — everything above this section is an attribute key
 // ---------------------------------------------------------------------------
 
-/// The one span-level trajectory contract version, the value of
-/// [`OJ_TRAJECTORY_SCHEMA_VERSION`].
+/// The one span-level trajectory contract version, the value of [`OJ_TRAJECTORY_SCHEMA_VERSION`].
 ///
 /// Every canonical span states it; v2 events are identified by [`OJ_TRAJECTORY_EVENT_KIND`], not by
 /// this value.
 pub const TRAJECTORY_SPAN_SCHEMA_VERSION: &str = "2";
 
-/// Closed set of [`OJ_TRAJECTORY_RECORD_KIND`] values.
-///
-/// Readers generated from this module (the web trajectory viewer) reject anything outside it, so a
-/// new record kind is added here first.
+/// Closed set of [`OJ_TRAJECTORY_RECORD_KIND`] values: readers generated from this module (the web
+/// trajectory viewer) reject anything outside it, so a new record kind is added here first.
 pub const TRAJECTORY_RECORD_KINDS: [&str; 7] = [
     "turn",
     "step",
@@ -607,10 +591,8 @@ pub const STREAM_FRAME_KIND_TOOL_CALL_DELTA: &str = "tool-call-delta";
 /// [`OJ_STREAM_KIND`] value for a usage report frame.
 pub const STREAM_FRAME_KIND_USAGE: &str = "usage";
 
-/// Closed set of [`OJ_STREAM_KIND`] values.
-///
-/// Python writes these as bare literals in `callback_handler.py`; the Rust side names them so a
-/// frame producer cannot misspell one.
+/// Closed set of [`OJ_STREAM_KIND`] values: Python writes these as bare literals in
+/// `callback_handler.py`, while the Rust side names them so a frame producer cannot misspell one.
 pub const STREAM_FRAME_KINDS: [&str; 4] = [
     STREAM_FRAME_KIND_TEXT_DELTA,
     STREAM_FRAME_KIND_REASONING_DELTA,
