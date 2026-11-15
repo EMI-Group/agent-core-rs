@@ -9,7 +9,7 @@
 //!
 //! A facade built with [`TeamMemory::with_embedding`] derives a vector for every record
 //! it writes: `upsert`-bound writes embed `title + " " + content + " " + tags` (the same
-//! [`document_text`](super::document_text) the keyword signal reads) and store it on
+//! `document_text` the keyword signal reads) and store it on
 //! [`TeamMemoryRecord::embedding`], and `search` embeds the query and ranks with
 //! [`TeamMemory::ranking`]. Without an embedder nothing changes: records keep
 //! `embedding: None` and search uses the keyword-only formula documented on [`super`].

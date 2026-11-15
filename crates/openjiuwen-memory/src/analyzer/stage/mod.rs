@@ -33,8 +33,8 @@
 //! performs zero model invocations.
 //!
 //! A *missing* model is reported too, never just logged: a [`StageKind::Llm`] stage whose
-//! model is absent runs its rule implementation and the pipeline records "llm <stage>
-//! stage requested without a model" in
+//! model is absent runs its rule implementation and the pipeline records `llm <stage>
+//! stage requested without a model` in
 //! [`StagedResult::result`](crate::analyzer::StagedResult::result)'s
 //! [`ExtractionResult::degraded`](crate::analyzer::ExtractionResult::degraded) field, while
 //! a configuration whose *extractor* or *classifier* asks for the model returns

@@ -68,7 +68,7 @@ impl MessageCursor {
     /// Builds the cursor of the `(timestamp, id)` position.
     ///
     /// The position keeps the timestamp it is given; [`Self::encode`] and
-    /// [`Self::is_before`] both truncate it to the microsecond precision the stored rows
+    /// `Self::is_before` both truncate it to the microsecond precision the stored rows
     /// use, so a cursor built from a nanosecond timestamp still names exactly the row it
     /// was built from.
     #[must_use]

@@ -99,7 +99,7 @@ pub struct TeamSearchOptions {
     /// The query vector of the semantic group.
     ///
     /// `None` (the default) keeps the keyword-only formula. A
-    /// [`TeamMemory`](super::TeamMemory) facade with an embedder fills this in on
+    /// [`TeamMemory`] facade with an embedder fills this in on
     /// `search`; a caller embedding its own queries may set it directly.
     pub query_embedding: Option<Vec<f32>>,
     /// The weights of [`blend`]: the similarity/keyword group and the final

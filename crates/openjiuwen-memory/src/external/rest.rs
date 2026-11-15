@@ -66,7 +66,7 @@
 //!
 //! [`list`](super::provider::MemoryProvider::list) follows a vendor's own paging when the
 //! spec implements `next_list_call`: it collects every page (bounded by
-//! [`MAX_LIST_PAGES`]) before decoding, so `list` and the list-then-delete fallback of
+//! `MAX_LIST_PAGES`) before decoding, so `list` and the list-then-delete fallback of
 //! [`clear`](super::provider::MemoryProvider::clear) see the whole collection instead of
 //! only its first page. A spec that pages in one request leaves the hook unimplemented.
 //!

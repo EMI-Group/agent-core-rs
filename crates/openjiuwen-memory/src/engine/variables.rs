@@ -106,7 +106,7 @@ impl super::MemoryEngine {
     ///
     /// # Errors
     ///
-    /// See [`MemoryEngine::write_variable`].
+    /// See `MemoryEngine::write_variable`.
     pub async fn write_variable_with_embedding(
         &self,
         scope: &MemoryScope,
