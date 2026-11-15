@@ -3,9 +3,9 @@
 //! Ports the pure-logic core of Python
 //! `openjiuwen.symphony.retrieval.search.runtime.codebooks` (v0.1.20) together with the
 //! validation Python keeps in `render/disclosure.py::_normalize_codebook`: a
-//! [`CompactCodebook`](crate::retrieval::search::codebooks::CompactCodebook) rejects blank,
+//! [`CompactCodebook`] rejects blank,
 //! whitespace-bearing, duplicated and reserved-`"0"` entries, and a
-//! [`CodeTrie`](crate::retrieval::search::codebooks::CodeTrie) answers the prefix questions
+//! [`CodeTrie`] answers the prefix questions
 //! a constrained decoder asks (is this still a prefix of some code? is this a whole code?).
 //!
 //! # Deviation: the code book is generated, not tokenizer-tuned
@@ -52,7 +52,7 @@ impl CompactCodebook {
     ///
     /// [`Error::Validation`](crate::error::Error) naming `compact_codebook` when an entry is
     /// blank, contains whitespace, repeats an earlier entry (after trimming), or is the
-    /// reserved abstain token [`ABSTAIN_TOKEN`](crate::retrieval::search::flow::ABSTAIN_TOKEN).
+    /// reserved abstain token [`ABSTAIN_TOKEN`].
     pub fn new(codes: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut normalized: Vec<String> = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -290,10 +290,18 @@ mod tests {
         assert!(error.message().contains("non-empty"), "{}", error.message());
 
         let error = CompactCodebook::new(codes(&["A A"])).unwrap_err();
-        assert!(error.message().contains("whitespace"), "{}", error.message());
+        assert!(
+            error.message().contains("whitespace"),
+            "{}",
+            error.message()
+        );
 
         let error = CompactCodebook::new(codes(&["AA", "AA"])).unwrap_err();
-        assert!(error.message().contains("duplicated"), "{}", error.message());
+        assert!(
+            error.message().contains("duplicated"),
+            "{}",
+            error.message()
+        );
 
         let error = CompactCodebook::new(codes(&["0"])).unwrap_err();
         assert!(error.message().contains("abstain"), "{}", error.message());
@@ -307,7 +315,11 @@ mod tests {
         let book = CompactCodebook::new(codes(&["AA"])).unwrap();
         assert_eq!(book.prefix(1).unwrap(), codes(&["AA"]));
         let error = book.prefix(2).unwrap_err();
-        assert!(error.message().contains("provides 1 codes"), "{}", error.message());
+        assert!(
+            error.message().contains("provides 1 codes"),
+            "{}",
+            error.message()
+        );
     }
 
     #[test]

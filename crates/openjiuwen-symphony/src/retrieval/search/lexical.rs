@@ -3,7 +3,7 @@
 //! Ports Python `openjiuwen.symphony.retrieval.search.runtime.lexical` (v0.1.20) — the
 //! scorer `symphony/discovery` uses for live-inventory search — and serves the same role in
 //! this crate: the offline candidate ranking behind
-//! [`LexicalIndex`](crate::retrieval::search::lexical::LexicalIndex), and the ranking a
+//! [`LexicalIndex`], and the ranking a
 //! model-free ([`SelectionMode::Lexical`](crate::retrieval::search::config::SelectionMode))
 //! traversal can consume.
 //!
@@ -388,7 +388,10 @@ impl LexicalIndex {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        let visible: String = description.chars().take(visible_description_chars).collect();
+        let visible: String = description
+            .chars()
+            .take(visible_description_chars)
+            .collect();
         let visible_tokens: BTreeSet<String> = tokenize(&visible).into_iter().collect();
         let hidden_description: BTreeSet<String> = matched
             .intersection(&field_tokens[3])
@@ -414,10 +417,7 @@ impl LexicalIndex {
             return String::new();
         }
         let body = without_front_matter(&document.body);
-        format!(
-            "body: {}",
-            matched_excerpt(&body, &body_matches, max_chars)
-        )
+        format!("body: {}", matched_excerpt(&body, &body_matches, max_chars))
     }
 
     /// The document stored for `key`.
@@ -458,7 +458,8 @@ impl LexicalIndex {
                 std::array::from_fn(|index| tokens.get(index).cloned().unwrap_or_default());
             let sets: [BTreeSet<String>; 6] =
                 std::array::from_fn(|index| tokens[index].iter().cloned().collect());
-            self.search_text.insert(key.clone(), search_text(document, &fields));
+            self.search_text
+                .insert(key.clone(), search_text(document, &fields));
             self.fields.insert(key.clone(), fields);
             self.field_tokens.insert(key.clone(), sets);
             let frequencies = weighted_frequencies(&tokens);
@@ -510,8 +511,7 @@ impl LexicalIndex {
         let inverse_frequency =
             (1.0 + (population - document_frequency + 0.5) / (document_frequency + 0.5)).ln();
         let length_ratio = length as f64 / self.average_length.max(1e-9);
-        let denominator =
-            frequency as f64 + BM25_K1 * (1.0 - BM25_B + BM25_B * length_ratio);
+        let denominator = frequency as f64 + BM25_K1 * (1.0 - BM25_B + BM25_B * length_ratio);
         let information = inverse_frequency * inverse_frequency;
         let numerator = information * (frequency as f64 * (BM25_K1 + 1.0));
         (numerator / denominator, information)
@@ -543,8 +543,7 @@ impl LexicalIndex {
             .filter(|term| identity_terms.contains(**term))
             .count();
         if identity_overlap > 0 {
-            score += IDENTITY_BONUS * identity_overlap as f64
-                / identity_terms.len().max(1) as f64;
+            score += IDENTITY_BONUS * identity_overlap as f64 / identity_terms.len().max(1) as f64;
         }
         score
     }
@@ -603,7 +602,11 @@ impl LexicalIndex {
         }
         let key_value = key.to_lowercase();
         let name = document.name.to_lowercase();
-        let aliases: Vec<String> = document.aliases.iter().map(|alias| alias.to_lowercase()).collect();
+        let aliases: Vec<String> = document
+            .aliases
+            .iter()
+            .map(|alias| alias.to_lowercase())
+            .collect();
         if terms.iter().any(|term| term == &key_value) {
             return 0;
         }
@@ -668,10 +671,7 @@ impl LexicalIndex {
             .cloned()
             .collect();
         if candidates.is_empty() {
-            if let Some(rarest) = ordered
-                .iter()
-                .min_by_key(|term| posting(term))
-            {
+            if let Some(rarest) = ordered.iter().min_by_key(|term| posting(term)) {
                 candidates.push(rarest.clone());
             }
         }
@@ -783,8 +783,7 @@ fn ranking_query(query: &str) -> String {
 /// `[\w .+/#-]+` filter, `\w` being the alphanumeric-plus-underscore class).
 fn identity_alternative_allowed(part: &str) -> bool {
     part.chars().all(|character| {
-        character.is_alphanumeric()
-            || matches!(character, '_' | ' ' | '.' | '+' | '/' | '#' | '-')
+        character.is_alphanumeric() || matches!(character, '_' | ' ' | '.' | '+' | '/' | '#' | '-')
     })
 }
 
@@ -989,9 +988,7 @@ fn push_surface(raw: &[char], terms: &mut Vec<String>) {
 
 /// Whether `value` is a whole symbol token (`[a-z0-9]+(?:\+\+|#)`).
 fn is_symbol_token(value: &str) -> bool {
-    let core = value
-        .strip_suffix("++")
-        .or_else(|| value.strip_suffix('#'));
+    let core = value.strip_suffix("++").or_else(|| value.strip_suffix('#'));
     let Some(core) = core else {
         return false;
     };
@@ -1071,10 +1068,7 @@ fn verb_forms(token: &str) -> Vec<String> {
     let stem_characters: Vec<char> = stem.chars().collect();
     let mut stems = vec![stem.clone()];
     let last = stem_characters.len();
-    if last > 2
-        && stem_characters[last - 1] == stem_characters[last - 2]
-        && !stem.ends_with("ss")
-    {
+    if last > 2 && stem_characters[last - 1] == stem_characters[last - 2] && !stem.ends_with("ss") {
         stems.push(take_chars(&stem, last - 1));
     }
     let mut forms: Vec<String> = stems.clone();
@@ -1147,7 +1141,9 @@ fn pattern_matches(haystack: &str, pattern: &[PatternSegment]) -> bool {
             PatternSegment::AnyRun => {}
             PatternSegment::Literal(literal) => {
                 has_literal = true;
-                let Some(found) = haystack.get(position..).and_then(|rest| rest.find(literal.as_str()))
+                let Some(found) = haystack
+                    .get(position..)
+                    .and_then(|rest| rest.find(literal.as_str()))
                 else {
                     return false;
                 };
@@ -1292,7 +1288,11 @@ mod tests {
     #[test]
     fn tokenize_handles_ascii_symbols_punctuation_and_cjk() {
         assert_eq!(tokenize("Data-Flow"), vec!["data", "flow"]);
-        assert_eq!(tokenize("a b"), Vec::<String>::new(), "single letters are dropped");
+        assert_eq!(
+            tokenize("a b"),
+            Vec::<String>::new(),
+            "single letters are dropped"
+        );
         assert_eq!(tokenize("c++ c#"), vec!["c++", "c#"]);
         assert_eq!(
             tokenize("skills.io_v2"),
@@ -1331,7 +1331,10 @@ mod tests {
     #[test]
     fn front_matter_is_stripped_only_when_complete() {
         assert_eq!(without_front_matter("---\nkey: v\n---\nbody\n"), "body\n");
-        assert_eq!(without_front_matter("---\nkey: v\nbody\n"), "---\nkey: v\nbody\n");
+        assert_eq!(
+            without_front_matter("---\nkey: v\nbody\n"),
+            "---\nkey: v\nbody\n"
+        );
         assert_eq!(without_front_matter("plain"), "plain");
         assert_eq!(without_front_matter(""), "");
         assert_eq!(without_front_matter("---\n---\n"), "");
@@ -1359,9 +1362,8 @@ mod tests {
         // score 3x the single term.
         let single = LexicalIndex::build(vec![LexicalDocument::new("x", "common")]);
         let one = single.search("common").unwrap()[0].score;
-        let repeated = LexicalIndex::build(vec![
-            LexicalDocument::new("x", "common").with_body("common")
-        ]);
+        let repeated =
+            LexicalIndex::build(vec![LexicalDocument::new("x", "common").with_body("common")]);
         let two = repeated.search("common").unwrap()[0].score;
         assert!(two > one, "{two} should exceed {one}");
         assert!(two < one * 2.0, "{two} should saturate below 2x {one}");
@@ -1446,11 +1448,11 @@ mod tests {
         assert!(!matcher.is_literal());
         assert!(matcher.matches("abc"), "the dot is a one-run wildcard");
         assert!(matcher.matches("a-long-run-c"));
-        assert!(matcher.matches("a.c"), "a literal dot still matches the wildcard");
         assert!(
-            matcher.matches("ac"),
-            "the wildcard may span an empty run"
+            matcher.matches("a.c"),
+            "a literal dot still matches the wildcard"
         );
+        assert!(matcher.matches("ac"), "the wildcard may span an empty run");
 
         // Classes, quantifiers, anchors and groups are literal characters.
         for query in ["[abc]+", "^start$", "(group)", "a{2,3}", "back\\1", "a+?"] {
@@ -1462,7 +1464,10 @@ mod tests {
         }
         let star = compile_matcher("*", true, false).unwrap();
         assert!(star.matches("anything"));
-        assert!(!star.matches(""), "a wildcard-only pattern needs a character");
+        assert!(
+            !star.matches(""),
+            "a wildcard-only pattern needs a character"
+        );
 
         assert!(compile_matcher("   ", true, false).is_err());
         let long = "a".repeat(MAX_QUERY_CHARS + 1);
@@ -1549,7 +1554,9 @@ mod tests {
     #[test]
     fn search_in_scopes_the_corpus_and_rejects_a_blank_query() {
         let index = LexicalIndex::build(documents());
-        let scoped = index.search_in("alpha", &["skills.beta", "unknown"]).unwrap();
+        let scoped = index
+            .search_in("alpha", &["skills.beta", "unknown"])
+            .unwrap();
         assert_eq!(keys(&scoped), vec!["skills.beta"]);
         assert_eq!(index.search_in("alpha", &["unknown"]).unwrap(), vec![]);
         assert_eq!(

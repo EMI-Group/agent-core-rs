@@ -8,39 +8,39 @@
 //!
 //! # What is here
 //!
-//! - [`flow`](crate::retrieval::search::flow) — the Python flow value objects:
-//!   [`ChatMessage`](crate::retrieval::search::flow::ChatMessage),
-//!   the Python-shaped [`SearchCursor`](crate::retrieval::search::flow::SearchCursor) (a
+//! - [`flow`] — the Python flow value objects:
+//!   [`ChatMessage`],
+//!   the Python-shaped [`SearchCursor`] (a
 //!   node id, a depth, a branch path and the requested `top_k`),
-//!   [`ExposedNode`](crate::retrieval::search::flow::ExposedNode),
-//!   [`SelectableResolution`](crate::retrieval::search::flow::SelectableResolution),
-//!   [`ExposedFragment`](crate::retrieval::search::flow::ExposedFragment),
-//!   [`SelectableTarget`](crate::retrieval::search::flow::SelectableTarget),
-//!   [`CurrentSubtree`](crate::retrieval::search::flow::CurrentSubtree),
-//!   [`SelectionProtocol`](crate::retrieval::search::flow::SelectionProtocol),
-//!   [`PromptBundle`](crate::retrieval::search::flow::PromptBundle),
-//!   [`SelectionResult`](crate::retrieval::search::flow::SelectionResult),
-//!   [`ChildSearchCursor`](crate::retrieval::search::flow::ChildSearchCursor),
-//!   [`ExpansionPlan`](crate::retrieval::search::flow::ExpansionPlan) and
-//!   [`NodeSearchResult`](crate::retrieval::search::flow::NodeSearchResult).
-//! - [`config`](crate::retrieval::search::config) — the serializable engine config:
-//!   [`ProgressiveSearchConfig`](crate::retrieval::search::config::ProgressiveSearchConfig),
+//!   [`ExposedNode`],
+//!   [`SelectableResolution`],
+//!   [`ExposedFragment`],
+//!   [`SelectableTarget`],
+//!   [`CurrentSubtree`],
+//!   [`SelectionProtocol`],
+//!   [`PromptBundle`],
+//!   [`SelectionResult`],
+//!   [`ChildSearchCursor`],
+//!   [`ExpansionPlan`] and
+//!   [`NodeSearchResult`].
+//! - [`config`] — the serializable engine config:
+//!   [`ProgressiveSearchConfig`],
 //!   its disclosure, embedding and truncation sub-configs, and
-//!   [`SelectionMode`](crate::retrieval::search::config::SelectionMode).
-//! - [`lexical`](crate::retrieval::search::lexical) — the deterministic field-weighted BM25
-//!   scorer ([`LexicalIndex`](crate::retrieval::search::lexical::LexicalIndex),
-//!   [`LexicalDocument`](crate::retrieval::search::lexical::LexicalDocument),
-//!   [`tokenize`](crate::retrieval::search::lexical::tokenize),
-//!   [`compile_matcher`](crate::retrieval::search::lexical::compile_matcher)).
-//! - [`embedding`](crate::retrieval::search::embedding) — Rust-only embedding-backed
-//!   scoring ([`EmbeddingScorer`](crate::retrieval::search::embedding::EmbeddingScorer),
-//!   [`blend_scores`](crate::retrieval::search::embedding::blend_scores)).
-//! - [`codebooks`](crate::retrieval::search::codebooks) — the compact boundary code book
-//!   ([`CompactCodebook`](crate::retrieval::search::codebooks::CompactCodebook)) and the
+//!   [`SelectionMode`].
+//! - [`lexical`] — the deterministic field-weighted BM25
+//!   scorer ([`LexicalIndex`],
+//!   [`LexicalDocument`],
+//!   [`tokenize`],
+//!   [`compile_matcher`]).
+//! - [`embedding`] — Rust-only embedding-backed
+//!   scoring ([`EmbeddingScorer`],
+//!   [`blend_scores`]).
+//! - [`codebooks`] — the compact boundary code book
+//!   ([`CompactCodebook`]) and the
 //!   prefix trie a constrained decoder needs
-//!   ([`CodeTrie`](crate::retrieval::search::codebooks::CodeTrie)).
-//! - [`truncation`](crate::retrieval::search::truncation) — the score-truncation decision
-//!   ([`truncate_sorted_by_score`](crate::retrieval::search::truncation::truncate_sorted_by_score))
+//!   ([`CodeTrie`]).
+//! - [`truncation`] — the score-truncation decision
+//!   ([`truncate_sorted_by_score`])
 //!   plus the bounded char/item helpers the renderers use.
 //!
 //! # Two search cursors
@@ -48,7 +48,7 @@
 //! [`SearchCursor`](crate::retrieval::types::SearchCursor) in
 //! [`types`](crate::retrieval::types) is the *build-side* resumable pre-order traversal plan.
 //! The search runtime uses its own Python-shaped cursor,
-//! [`flow::SearchCursor`](crate::retrieval::search::flow::SearchCursor), which names one node
+//! [`flow::SearchCursor`], which names one node
 //! and the path that reached it. The two are unrelated types; do not convert one into the
 //! other.
 //!
@@ -67,8 +67,12 @@ pub mod flow;
 pub mod lexical;
 pub mod truncation;
 
-pub use codebooks::{default_compact_boundary_codebook, CodeTrie, CompactCodebook, DEFAULT_COMPACT_CODEBOOK_SIZE};
-pub use config::{DisclosureConfig, EmbeddingScoringConfig, ProgressiveSearchConfig, SelectionMode, DEFAULT_TOP_K};
+pub use codebooks::{
+    default_compact_boundary_codebook, CodeTrie, CompactCodebook, DEFAULT_COMPACT_CODEBOOK_SIZE,
+};
+pub use config::{
+    DisclosureConfig, EmbeddingScoringConfig, ProgressiveSearchConfig, SelectionMode, DEFAULT_TOP_K,
+};
 pub use embedding::{blend_scores, cosine_similarity, EmbeddingScorer};
 pub use flow::{
     ChatMessage, ChildSearchCursor, CurrentSubtree, ExpansionPlan, ExposedFragment, ExposedNode,
@@ -86,8 +90,8 @@ pub use truncation::{
 
 /// The default `top_k` of the progressive runtime (Python `ProgressiveRetrieverConfig.top_k`).
 ///
-/// [`DisclosureConfig`](crate::retrieval::search::config::DisclosureConfig) users reach it
-/// through [`ProgressiveSearchConfig`](crate::retrieval::search::config::ProgressiveSearchConfig);
+/// [`DisclosureConfig`] users reach it
+/// through [`ProgressiveSearchConfig`];
 /// the public facade in a later wave defaults to the larger
-/// [`DEFAULT_TOP_K`](crate::retrieval::search::config::DEFAULT_TOP_K) instead.
+/// [`DEFAULT_TOP_K`] instead.
 pub const RUNTIME_TOP_K: usize = 5;

@@ -2,22 +2,22 @@
 //!
 //! Ports Python `openjiuwen.symphony.retrieval.search.runtime.types` (v0.1.20) plus the two
 //! exposure value objects it imports from `render/disclosure.py`
-//! ([`ExposedNode`](crate::retrieval::search::flow::ExposedNode) and
-//! [`SelectableResolution`](crate::retrieval::search::flow::SelectableResolution)).
+//! ([`ExposedNode`] and
+//! [`SelectableResolution`]).
 //!
 //! Everything here is plain data: no model, no I/O, no traversal. The later waves
 //! (rendering, traversal protocols, engine) build these values and hand them on.
 //!
 //! # Rust-only adjustments
 //!
-//! - [`SearchCursor`](crate::retrieval::search::flow::SearchCursor) names its node by id
+//! - [`SearchCursor`] names its node by id
 //!   (`node_id`) instead of holding the [`RetrieverNode`] itself, so a cursor is
 //!   serializable and cheap to copy; [`SearchCursor::resolve`] turns it back into a node
 //!   reference against the tree the caller owns.
-//! - [`SelectableResolution`](crate::retrieval::search::flow::SelectableResolution) keeps
+//! - [`SelectableResolution`] keeps
 //!   `node_id` (Python keeps the whole `RetrieverNode`) and the [`RetrieverItem`] it
 //!   resolves to.
-//! - [`ExposedFragment`](crate::retrieval::search::flow::ExposedFragment) adds
+//! - [`ExposedFragment`] adds
 //!   `rendered_chars` / `truncated` — the bookkeeping of the Rust-only rendered-fragment
 //!   char budget — and drops Python's `selectable_nodes` / `score_key` / `token_id`
 //!   fields, which no ported stage reads. A code's score key is the code itself.
@@ -394,7 +394,9 @@ mod tests {
             "Skills.alpha",
             "Alpha",
         )
-        .with_items(vec![RetrieverItem::new("alpha", "Skills.alpha.item").with_label("Alpha")])])
+        .with_items(vec![
+            RetrieverItem::new("alpha", "Skills.alpha.item").with_label("Alpha")
+        ])])
     }
 
     #[test]
@@ -412,10 +414,21 @@ mod tests {
         assert_eq!(cursor.depth, 0);
         assert_eq!(cursor.branch_path, vec![ROOT_NODE_ID.to_string()]);
         assert_eq!(cursor.top_k, 5);
-        assert_eq!(cursor.resolve(&tree).map(|node| node.label.as_str()), Some("Root"));
+        assert_eq!(
+            cursor.resolve(&tree).map(|node| node.label.as_str()),
+            Some("Root")
+        );
 
-        let child = SearchCursor::at("Skills.alpha", 1, vec![ROOT_NODE_ID.into(), "Skills.alpha".into()], 3);
-        assert_eq!(child.resolve(&tree).map(|node| node.label.as_str()), Some("Alpha"));
+        let child = SearchCursor::at(
+            "Skills.alpha",
+            1,
+            vec![ROOT_NODE_ID.into(), "Skills.alpha".into()],
+            3,
+        );
+        assert_eq!(
+            child.resolve(&tree).map(|node| node.label.as_str()),
+            Some("Alpha")
+        );
         assert_eq!(child.depth, child.branch_path.len() - 1);
         let missing = SearchCursor::at("nope", 1, vec!["nope".into()], 1);
         assert!(missing.resolve(&tree).is_none());
@@ -457,7 +470,9 @@ mod tests {
         assert_eq!(fragment.selectable_count(), 3);
         assert!(!fragment.is_empty());
         assert_eq!(
-            fragment.resolution("1").map(|entry| entry.canonical_id.as_str()),
+            fragment
+                .resolution("1")
+                .map(|entry| entry.canonical_id.as_str()),
             Some("node::alpha")
         );
         assert!(fragment.resolution("9").is_none());
@@ -507,7 +522,8 @@ mod tests {
         assert_eq!(parsed, bundle);
 
         let cursor = SearchCursor::at("n", 2, vec!["root".into(), "a".into(), "n".into()], 4);
-        let parsed: SearchCursor = serde_json::from_str(&serde_json::to_string(&cursor).unwrap()).unwrap();
+        let parsed: SearchCursor =
+            serde_json::from_str(&serde_json::to_string(&cursor).unwrap()).unwrap();
         assert_eq!(parsed, cursor);
         let defaulted: SearchCursor = serde_json::from_str("{}").unwrap();
         assert_eq!(defaulted, SearchCursor::default());

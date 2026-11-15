@@ -466,7 +466,9 @@ mod tests {
             0.0
         );
         assert_eq!(
-            EmbeddingScoringConfig::default().with_weight(f64::NAN).weight,
+            EmbeddingScoringConfig::default()
+                .with_weight(f64::NAN)
+                .weight,
             0.0
         );
         assert_eq!(

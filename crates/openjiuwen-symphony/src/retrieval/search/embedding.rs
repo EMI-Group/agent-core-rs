@@ -3,15 +3,15 @@
 //! Python's Symphony search runtime has no vector path: a live inventory is ranked by the
 //! deterministic field-weighted BM25 in
 //! [`lexical`](crate::retrieval::search::lexical). This module adds an *additive*, optional
-//! path over `openjiuwen-retrieval`'s [`Embedding`](openjiuwen_retrieval::Embedding) trait,
+//! path over `openjiuwen-retrieval`'s [`Embedding`] trait,
 //! so a caller that already runs an embedding model can blend cosine similarity into the
-//! same [`LexicalHit`](crate::retrieval::search::lexical::LexicalHit) ranking — or ignore
+//! same [`LexicalHit`] ranking — or ignore
 //! the trait entirely, because a weight of `0.0` reproduces the lexical order exactly (see
-//! [`blend_scores`](crate::retrieval::search::embedding::blend_scores)).
+//! [`blend_scores`]).
 //!
 //! # Determinism
 //!
-//! Only the embedder decides whether the numbers are reproducible: [`HashEmbedding`]
+//! Only the embedder decides whether the numbers are reproducible: `HashEmbedding`
 //! (openjiuwen-retrieval) derives vectors purely from the text, so tests are offline and
 //! stable. Everything this module adds is deterministic — keys are [`BTreeMap`]-sorted,
 //! ties break on the key, and no output depends on hash-map iteration order or the clock.
@@ -58,7 +58,7 @@ pub fn embedding_text(document: &LexicalDocument) -> String {
 /// An embedding index over [`LexicalDocument`]s.
 ///
 /// One vector per document key, kept in memory and computed from
-/// [`embedding_text`](crate::retrieval::search::embedding::embedding_text). The scorer owns
+/// [`embedding_text`]. The scorer owns
 /// its vectors, so two scorers over one embedder never interfere.
 pub struct EmbeddingScorer {
     /// The embedder used for documents and queries.
@@ -121,7 +121,10 @@ impl EmbeddingScorer {
         if ordered.is_empty() {
             return Ok(0);
         }
-        let texts: Vec<String> = ordered.iter().map(|document| embedding_text(document)).collect();
+        let texts: Vec<String> = ordered
+            .iter()
+            .map(|document| embedding_text(document))
+            .collect();
         let vectors = self.embedding.embed_documents(&texts, None).await?;
         if vectors.len() < ordered.len() {
             return Err(Error::retrieval(format!(
@@ -311,10 +314,7 @@ pub fn blend_scores(
     } else {
         0.0
     };
-    let max_lexical = lexical
-        .iter()
-        .map(|hit| hit.score)
-        .fold(0.0_f64, f64::max);
+    let max_lexical = lexical.iter().map(|hit| hit.score).fold(0.0_f64, f64::max);
     let mut blended: BTreeMap<String, f64> = BTreeMap::new();
     for hit in lexical {
         let lexical_normalized = if max_lexical > 0.0 {
@@ -408,7 +408,10 @@ mod tests {
         assert_eq!(capped.len(), 2);
         // The first two keys in key order were embedded.
         let capped_scores = capped.scores("alpha").await.unwrap();
-        assert_eq!(capped_scores.keys().cloned().collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(
+            capped_scores.keys().cloned().collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
 
         let empty = make_scorer();
         assert_eq!(empty.index(&[]).await.unwrap(), 0);
@@ -431,15 +434,16 @@ mod tests {
         }
         let hits = scorer.search("alpha tasks", 0).await.unwrap();
         assert_eq!(hits.len(), 2);
-        let scores_are_descending = hits
-            .windows(2)
-            .all(|pair| pair[0].score >= pair[1].score);
+        let scores_are_descending = hits.windows(2).all(|pair| pair[0].score >= pair[1].score);
         assert!(scores_are_descending);
         // Deterministic: the same query ranks the same way twice.
         let again = scorer.search("alpha tasks", 0).await.unwrap();
         assert_eq!(again, hits);
         // top_k truncates from the head of that deterministic order.
-        assert_eq!(scorer.search("alpha tasks", 1).await.unwrap(), vec![hits[0].clone()]);
+        assert_eq!(
+            scorer.search("alpha tasks", 1).await.unwrap(),
+            vec![hits[0].clone()]
+        );
     }
 
     #[tokio::test]

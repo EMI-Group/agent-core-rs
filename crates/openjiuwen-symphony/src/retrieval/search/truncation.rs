@@ -1,7 +1,7 @@
 //! Score truncation and the bounded text/item helpers the renderers use.
 //!
 //! Ports Python `openjiuwen.symphony.retrieval.search.runtime.truncation` (v0.1.20) exactly
-//! — [`truncate_sorted_by_score`](crate::retrieval::search::truncation::truncate_sorted_by_score)
+//! — [`truncate_sorted_by_score`]
 //! and its decision record — and adds three Rust-only bounded helpers the disclosure
 //! renderers need ([`truncate_chars`], [`truncate_chars_with_ellipsis`], [`take_budget`]).
 //!
@@ -281,7 +281,10 @@ mod tests {
         values.to_vec()
     }
 
-    fn decision_of(values: &[f64], config: &ScoreTruncationConfig) -> (Vec<f64>, ScoreTruncationDecision) {
+    fn decision_of(
+        values: &[f64],
+        config: &ScoreTruncationConfig,
+    ) -> (Vec<f64>, ScoreTruncationDecision) {
         truncate_sorted_by_score(&scores(values), |score| *score, config)
     }
 
@@ -423,8 +426,14 @@ mod tests {
     #[test]
     fn char_truncation_is_char_boundary_safe() {
         assert_eq!(truncate_chars("能力树索引", 3), ("能力树".to_owned(), true));
-        assert_eq!(truncate_chars("能力树索引", 5), ("能力树索引".to_owned(), false));
-        assert_eq!(truncate_chars("能力树索引", 9), ("能力树索引".to_owned(), false));
+        assert_eq!(
+            truncate_chars("能力树索引", 5),
+            ("能力树索引".to_owned(), false)
+        );
+        assert_eq!(
+            truncate_chars("能力树索引", 9),
+            ("能力树索引".to_owned(), false)
+        );
         assert_eq!(truncate_chars("abc", 0), ("abc".to_owned(), false));
         assert_eq!(truncate_chars("", 3), (String::new(), false));
         assert_eq!(truncate_chars("能力树", 1), ("能".to_owned(), true));
@@ -449,7 +458,10 @@ mod tests {
         assert_eq!(text, "abc");
         assert!(truncated);
 
-        assert_eq!(truncate_chars_with_ellipsis("abcdef", 0), ("abcdef".to_owned(), false));
+        assert_eq!(
+            truncate_chars_with_ellipsis("abcdef", 0),
+            ("abcdef".to_owned(), false)
+        );
     }
 
     #[test]
