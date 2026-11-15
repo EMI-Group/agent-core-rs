@@ -111,8 +111,8 @@ static DESCRIPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "read_file",
-        "Read a file from the local filesystem. file_path must be an absolute path. By default, reads up to 2000 lines from the beginning and returns results with line numbers. Can read files only, not directories. For large files, use offset/limit to read a specific portion, or use grep to search for specific content.",
-        "从本地文件系统读取文件。file_path 必须是绝对路径。默认从文件开头最多读取 2000 行，结果带行号返回。只能读取文件，不能读取目录。大文件请用 offset/limit 读取指定部分，或用 grep 搜索具体内容。",
+        "Read a file from the local filesystem. file_path must be an absolute path. By default, reads up to 2000 lines from the beginning and returns results with line numbers. Can read files only, not directories. For large files, use offset/limit to read a specific portion, or use grep to search for specific content. For PDF files, pass pages to select 1-based pages ('3', '1-5' or '1-3,7'); each page is returned with its own page marker and line numbers, at most 20 pages per request. caption is not supported: image captioning needs a vision model, so the argument is rejected; use image_metadata for image container facts and read_file without caption for text.",
+        "从本地文件系统读取文件。file_path 必须是绝对路径。默认从文件开头最多读取 2000 行，结果带行号返回。只能读取文件，不能读取目录。大文件请用 offset/limit 读取指定部分，或用 grep 搜索具体内容。读取 PDF 时用 pages 选择页码（从 1 开始，如 '3'、'1-5'、'1-3,7'），每页带页码标记和行号返回，单次最多 20 页。不支持 caption：图片说明需要视觉模型，该参数会被拒绝；图片容器信息请用 image_metadata，文本请不带 caption 调用 read_file。",
     ),
     (
         "write_file",
@@ -873,16 +873,24 @@ mod tests {
     }
 
     #[test]
-    fn read_file_description_omits_the_deferred_readers() {
+    fn read_file_description_documents_pdf_pages_and_the_caption_gap() {
         let english = description("read_file", "en");
         assert_eq!(
             english,
             "Read a file from the local filesystem. file_path must be an absolute path. \
              By default, reads up to 2000 lines from the beginning and returns results with line \
              numbers. Can read files only, not directories. For large files, use offset/limit to \
-             read a specific portion, or use grep to search for specific content."
+             read a specific portion, or use grep to search for specific content. For PDF files, \
+             pass pages to select 1-based pages ('3', '1-5' or '1-3,7'); each page is returned \
+             with its own page marker and line numbers, at most 20 pages per request. caption is \
+             not supported: image captioning needs a vision model, so the argument is rejected; \
+             use image_metadata for image container facts and read_file without caption for text."
         );
-        assert!(!english.contains("PDF"));
-        assert!(!description("read_file", "cn").contains("PDF"));
+        // The PDF reader is no longer deferred, so the description documents it.
+        assert!(english.contains("PDF"));
+        assert!(english.contains("pages"));
+        assert!(english.contains("caption is not supported"));
+        assert!(description("read_file", "cn").contains("PDF"));
+        assert!(description("read_file", "cn").contains("pages"));
     }
 }

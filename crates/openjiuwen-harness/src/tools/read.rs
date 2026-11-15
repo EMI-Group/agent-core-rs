@@ -3,7 +3,24 @@
 //! The tool reads a window of a text file, renders it with `cat -n` style line numbers and
 //! records the observed lines in the read-before-write registry so `write_file`/`edit_file`
 //! can refuse to clobber content the model has never seen.
+//!
+//! PDF files take a second path. `pages` selects 1-based pages — a single page (`"3"`), an
+//! inclusive range (`"1-5"`) or a comma-separated union (`"1-3,7"`), at most
+//! [`PDF_MAX_PAGES_PER_READ`] pages — and every selected page is rendered with its own
+//! `## Page {n}` marker followed by that page's numbered text. Page selection is deliberately
+//! *not* a text read: a page read records the file fingerprint with **no** coverage, so
+//! `write_file` still refuses to overwrite a PDF whose text the model has only seen page by
+//! page. Only a whole-text read registers coverage.
+//!
+//! `caption` (Python's multimodal caption for images under `skills/`) is rejected with a typed
+//! failure: this build ships no vision model, and silently ignoring the request would let a
+//! caller believe the image had been described.
+//!
+//! Size note: this file overruns the 1000-line baseline only because the text reader, the PDF
+//! reader and the page-selection grammar keep their unit tests beside the code; the code above
+//! the test module is well under the limit.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,6 +30,7 @@ use serde_json::{json, Value};
 
 use openjiuwen_common::error::Result;
 use openjiuwen_foundation::tool::{Tool, ToolCard, ToolContext};
+use openjiuwen_retrieval::parsing::{PdfDocument, PdfParser};
 use openjiuwen_sysop::fs::types::{FileContent, LineRange, ReadFileParams, ReadMode};
 use openjiuwen_sysop::operation::FsOperation;
 
@@ -26,14 +44,30 @@ const MAX_LINES_TO_READ: usize = 2000;
 /// Maximum file size, in bytes, accepted by a read without an explicit `limit`.
 const MAX_SIZE_BYTES: u64 = 256 * 1024;
 
+/// Maximum number of pages a single PDF read selects
+/// (`ReadFileTool.PDF_MAX_PAGES_PER_READ`).
+const PDF_MAX_PAGES_PER_READ: usize = 20;
+
 /// The warning returned when a whole-file read finds no content.
 const EMPTY_FILE_WARNING: &str = "Warning: the file exists but the contents are empty.";
+
+/// The failure returned for a `caption` request.
+const CAPTION_UNSUPPORTED: &str = "caption is not supported: image captioning needs a vision \
+model and this build does not ship one. Use image_metadata for the image container facts \
+(format, dimensions, animation) and call read_file without caption to read text files.";
+
+/// The failure returned for `offset`/`limit` on a PDF read.
+const PDF_WINDOW_UNSUPPORTED: &str = "offset/limit do not apply to PDF reads: PDFs are read \
+page by page, so select 1-based pages instead (e.g. pages='1-5').";
+
+/// The hint appended to every page-range rejection.
+const PAGE_RANGE_HINT: &str = "Use formats like '3', '1-5', or '1-3,7'. Pages are 1-indexed.";
 
 /// Arguments of the `read_file` tool.
 ///
 /// Python parity: the `file_path`/`offset`/`limit`/`pages`/`caption` parameters of
-/// `ReadFileTool.invoke`. `pages` and `caption` are accepted and ignored because the PDF and
-/// image readers are deferred.
+/// `ReadFileTool.invoke`. `pages` selects PDF pages; `caption` is rejected because image
+/// captioning needs a vision model that is not part of this build.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ReadFileArgs {
     /// The absolute path to the file to read.
@@ -46,17 +80,17 @@ pub struct ReadFileArgs {
     #[serde(default)]
     #[schemars(with = "u64")]
     pub limit: Option<u64>,
-    /// PDF-only page range, e.g. '1-5', '3', '10-20'. Maximum 20 pages per request
+    /// PDF-only page range, e.g. '1-5', '3', '1-3,7'. Maximum 20 pages per request
     #[serde(default)]
     #[schemars(with = "String")]
     pub pages: Option<String>,
-    /// Image caption request; accepted and ignored (image reads are deferred).
+    /// Image caption request; rejected, because image captioning needs a vision model.
     #[serde(default)]
     #[schemars(with = "String")]
     pub caption: Option<String>,
 }
 
-/// Reads a text file, one window at a time, with line numbers.
+/// Reads a text or PDF file, one window (or one page selection) at a time.
 pub struct ReadFileTool {
     /// Path resolution, permission gate and description language.
     env: ToolEnv,
@@ -114,7 +148,7 @@ impl ReadFileTool {
             .join("\n")
     }
 
-    /// Reads the requested window and returns the tool payload.
+    /// Validates the arguments, resolves the path and dispatches to the text or PDF reader.
     async fn read(&self, inputs: &Value) -> ToolPayload {
         // Python reads `file_path` from the raw arguments and reports its absence with the
         // plain validation text rather than a schema error, so check it before parsing.
@@ -134,6 +168,11 @@ impl ReadFileTool {
         if args.file_path.is_empty() {
             return ToolPayload::fail("file_path is required");
         }
+        // The caption check runs before any I/O so the reason is deterministic: the argument is
+        // not a hint to be dropped, it asks for a capability this build does not have.
+        if args.caption.is_some() {
+            return ToolPayload::fail(CAPTION_UNSUPPORTED);
+        }
 
         let resolved = match self
             .env
@@ -144,9 +183,30 @@ impl ReadFileTool {
             Err(payload) => return payload,
         };
 
-        let Some(fs) = self.fs.as_ref() else {
+        let Some(fs) = self.fs.as_deref() else {
             return ToolPayload::fail("filesystem operation is not configured");
         };
+
+        if is_pdf(&resolved) {
+            self.read_pdf(&resolved, &args, fs).await
+        } else {
+            self.read_text(&resolved, &args, fs).await
+        }
+    }
+
+    /// Reads a window of a text file and registers the coverage it observed.
+    async fn read_text(
+        &self,
+        resolved: &Path,
+        args: &ReadFileArgs,
+        fs: &dyn FsOperation,
+    ) -> ToolPayload {
+        if args.pages.is_some() {
+            return ToolPayload::fail(format!(
+                "pages only applies to PDF files: '{}' is not a PDF. Use offset/limit for text files.",
+                resolved.display()
+            ));
+        }
 
         let user_supplied_limit = args.limit.is_some();
         let offset = usize::try_from(args.offset.unwrap_or(0)).unwrap_or(usize::MAX);
@@ -205,14 +265,14 @@ impl ReadFileTool {
         }));
 
         // A metadata failure only skips registration: the read itself already succeeded.
-        match tokio::fs::metadata(&resolved).await {
+        match tokio::fs::metadata(resolved).await {
             Ok(metadata) => {
                 let coverage = (line_count > 0).then(|| ReadCoverage {
                     start: offset.saturating_add(1),
                     end: offset.saturating_add(line_count),
                 });
                 self.state.record_read(
-                    &resolved,
+                    resolved,
                     file_fingerprint(&metadata),
                     coverage,
                     Some(raw_text),
@@ -229,6 +289,298 @@ impl ReadFileTool {
 
         payload
     }
+
+    /// Extracts the selected text pages of a PDF and renders them with page markers.
+    ///
+    /// The bytes come from the configured [`FsOperation`] in `bytes` mode, so a sandboxed
+    /// backend keeps enforcing its own policy; there is no raw-`std::fs` bypass.
+    async fn read_pdf(
+        &self,
+        resolved: &Path,
+        args: &ReadFileArgs,
+        fs: &dyn FsOperation,
+    ) -> ToolPayload {
+        let displayed = resolved.to_string_lossy().into_owned();
+        if args.offset.unwrap_or(0) != 0 || args.limit.is_some() {
+            return ToolPayload::fail(PDF_WINDOW_UNSUPPORTED);
+        }
+        let range = match args.pages.as_deref() {
+            Some(raw) => match PageRange::parse(raw) {
+                Ok(range) => Some(range),
+                Err(message) => return ToolPayload::fail(message),
+            },
+            None => None,
+        };
+
+        let bytes = match read_bytes(fs, resolved).await {
+            Ok(bytes) => bytes,
+            Err(message) => return ToolPayload::fail(message),
+        };
+        let document = match PdfParser::new().parse_bytes(&bytes) {
+            Ok(document) => document,
+            Err(error) => {
+                return ToolPayload::fail(format!("Failed to read PDF '{displayed}': {error}"));
+            }
+        };
+        let total_pages = document.page_count;
+        if !document.has_text {
+            return ToolPayload::fail(no_text_message(&displayed, total_pages));
+        }
+        let selected = match range {
+            None => {
+                if total_pages > PDF_MAX_PAGES_PER_READ {
+                    return ToolPayload::fail(format!(
+                        "This PDF has {total_pages} pages, which is too many to read at once. \
+                         Use the pages parameter to specify a range (e.g. pages='1-10'). \
+                         Maximum {PDF_MAX_PAGES_PER_READ} pages per request."
+                    ));
+                }
+                (1..=total_pages).collect()
+            }
+            Some(range) => {
+                let selected = range.resolve(total_pages);
+                if selected.is_empty() {
+                    return ToolPayload::fail(format!(
+                        "Page range '{}' selects no page of '{displayed}': the document has \
+                         {total_pages} page(s).",
+                        range.raw()
+                    ));
+                }
+                selected
+            }
+        };
+
+        let page_range = normalized_range(&selected);
+        let (content, line_count) = render_pages(&document, &selected);
+        self.record_pdf_read(resolved).await;
+        ToolPayload::ok(json!({
+            "content": content,
+            "file_path": displayed,
+            "line_count": line_count,
+            "total_pages": total_pages,
+            "selected_pages": selected,
+            "page_range": page_range,
+        }))
+    }
+
+    /// Records the fingerprint of a PDF page read without registering any coverage.
+    ///
+    /// A page read is never a full text read: coverage would let `write_file` overwrite a PDF
+    /// whose text the model has only seen one page at a time. Recording the fingerprint alone
+    /// still answers "was this file read?" and still detects an external change afterwards.
+    async fn record_pdf_read(&self, resolved: &Path) {
+        match tokio::fs::metadata(resolved).await {
+            Ok(metadata) => {
+                self.state
+                    .record_read(resolved, file_fingerprint(&metadata), None, None);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    path = %resolved.display(),
+                    %error,
+                    "skipping read-state registration: metadata unavailable"
+                );
+            }
+        }
+    }
+}
+
+/// A validated `pages` selection.
+///
+/// Python's `_parse_pdf_page_range` accepts one page or one inclusive range; this grammar adds
+/// the comma-separated union (`"1-3,7"`) and rejects everything it cannot honour instead of
+/// falling back to "the whole document".
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PageRange {
+    /// The selection as the model wrote it, trimmed.
+    raw: String,
+    /// 1-based page numbers, ascending and unique.
+    pages: Vec<usize>,
+}
+
+impl PageRange {
+    /// Parses `"3"`, `"1-5"` or `"1-3,7"` into ascending, unique page numbers.
+    ///
+    /// `Err` carries the model-facing message of the first rejection: an empty selection, an
+    /// empty list element, a non-numeric or zero page, a reversed range, or a selection that
+    /// exceeds [`PDF_MAX_PAGES_PER_READ`] pages.
+    fn parse(raw: &str) -> std::result::Result<Self, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(format!(
+                "Invalid PDF page range: the selection is empty. {PAGE_RANGE_HINT}"
+            ));
+        }
+        let mut pages: Vec<usize> = Vec::new();
+        for element in trimmed.split(',') {
+            let element = element.trim();
+            if element.is_empty() {
+                return Err(format!(
+                    "Invalid PDF page range '{trimmed}': empty element in the comma-separated \
+                     list. {PAGE_RANGE_HINT}"
+                ));
+            }
+            let (first, last) = match element.split_once('-') {
+                Some((first, last)) => (first.trim(), last.trim()),
+                None => (element, element),
+            };
+            let first = parse_page_number(first, element, trimmed)?;
+            let last = parse_page_number(last, element, trimmed)?;
+            if first > last {
+                return Err(format!(
+                    "Invalid PDF page range '{trimmed}': range '{element}' is reversed (the first \
+                     page must not exceed the last). {PAGE_RANGE_HINT}"
+                ));
+            }
+            if last - first + 1 > PDF_MAX_PAGES_PER_READ {
+                return Err(too_many_pages_message(trimmed, last - first + 1));
+            }
+            pages.extend(first..=last);
+        }
+        pages.sort_unstable();
+        pages.dedup();
+        if pages.len() > PDF_MAX_PAGES_PER_READ {
+            return Err(too_many_pages_message(trimmed, pages.len()));
+        }
+        Ok(Self {
+            raw: trimmed.to_owned(),
+            pages,
+        })
+    }
+
+    /// The selection as the model wrote it.
+    fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    /// Intersects the selection with the pages `total_pages` actually has.
+    ///
+    /// Python clamps an out-of-range page to the document end; keeping only the pages that
+    /// exist has the same effect for a single page and a range, and it never invents a page for
+    /// a union such as `"1,9"` on a three-page document. The payload always reports
+    /// `selected_pages` and `total_pages`, so a clamped or dropped page is visible to the model
+    /// instead of being silently ignored.
+    fn resolve(&self, total_pages: usize) -> Vec<usize> {
+        let mut pages: Vec<usize> = self
+            .pages
+            .iter()
+            .copied()
+            .filter(|page| *page <= total_pages)
+            .collect();
+        pages.sort_unstable();
+        pages.dedup();
+        pages
+    }
+}
+
+/// Parses one page number of a range element.
+fn parse_page_number(text: &str, element: &str, raw: &str) -> std::result::Result<usize, String> {
+    if text.is_empty() {
+        return Err(format!(
+            "Invalid PDF page range '{raw}': range '{element}' is missing a page number. \
+             {PAGE_RANGE_HINT}"
+        ));
+    }
+    let page: usize = text.parse().map_err(|_| {
+        format!("Invalid PDF page range '{raw}': '{text}' is not a page number. {PAGE_RANGE_HINT}")
+    })?;
+    if page == 0 {
+        return Err(format!(
+            "Invalid PDF page range '{raw}': page 0 is not a page (pages are 1-indexed). \
+             {PAGE_RANGE_HINT}"
+        ));
+    }
+    Ok(page)
+}
+
+/// Builds the "too many pages" rejection.
+fn too_many_pages_message(raw: &str, count: usize) -> String {
+    format!(
+        "Page range '{raw}' selects {count} pages, which exceeds the maximum of \
+         {PDF_MAX_PAGES_PER_READ} pages per request. Use a smaller or fully-bounded range \
+         (e.g. '1-20')."
+    )
+}
+
+/// Builds the "no extractable text" rejection of a scanned PDF.
+fn no_text_message(path: &str, total_pages: usize) -> String {
+    format!(
+        "PDF '{path}' has no extractable text ({total_pages} page(s)): it is probably a scanned \
+         document. OCR is not available in this build, so its page text cannot be read."
+    )
+}
+
+/// Returns `true` when `path` carries the PDF extension (Python `_is_pdf`).
+fn is_pdf(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+}
+
+/// Reads the whole file in byte mode through the filesystem backend.
+///
+/// `Err` carries the model-facing failure message, so the caller keeps ownership of the
+/// payload envelope (and this helper avoids a 150-byte `Err` variant).
+async fn read_bytes(fs: &dyn FsOperation, path: &Path) -> std::result::Result<Vec<u8>, String> {
+    let params = ReadFileParams {
+        path: path.to_string_lossy().into_owned(),
+        mode: ReadMode::Bytes,
+        ..ReadFileParams::default()
+    };
+    let result = fs.read_file(params).await;
+    if result.is_failure() {
+        return Err(result.message);
+    }
+    let Some(data) = result.data else {
+        return Err("read_file returned no data from the filesystem operation".to_owned());
+    };
+    Ok(match data.content {
+        FileContent::Bytes(bytes) => bytes,
+        FileContent::Text(text) => text.into_bytes(),
+    })
+}
+
+/// Renders the `pages` of `document` as `## Page {n}` blocks with per-page line numbers.
+///
+/// Returns the rendered content and the number of text lines it contains (page markers and the
+/// no-text note do not count).
+fn render_pages(document: &PdfDocument, pages: &[usize]) -> (String, usize) {
+    let mut blocks = Vec::with_capacity(pages.len());
+    let mut line_count = 0usize;
+    for page in pages {
+        let text = document.pages.get(page - 1).map_or("", String::as_str);
+        if text.is_empty() {
+            blocks.push(format!(
+                "## Page {page}\n(no extractable text on this page)"
+            ));
+        } else {
+            let numbered = ReadFileTool::number_lines(text);
+            line_count += numbered.lines().count();
+            blocks.push(format!("## Page {page}\n{numbered}"));
+        }
+    }
+    (blocks.join("\n\n"), line_count)
+}
+
+/// Renders ascending page numbers as a compact range string (`[1, 2, 3, 7]` -> `"1-3,7"`).
+fn normalized_range(pages: &[usize]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut remaining = pages.iter().copied().peekable();
+    while let Some(start) = remaining.next() {
+        let mut end = start;
+        while remaining
+            .peek()
+            .is_some_and(|next| *next == end.saturating_add(1))
+        {
+            end = end.saturating_add(1);
+            remaining.next();
+        }
+        if start == end {
+            parts.push(start.to_string());
+        } else {
+            parts.push(format!("{start}-{end}"));
+        }
+    }
+    parts.join(",")
 }
 
 /// Builds the Python "file too large" message for a `total_bytes` file.
@@ -288,6 +640,29 @@ mod tests {
         tool.invoke(inputs, &ToolContext::new()).await.unwrap()
     }
 
+    /// Builds a minimal PDF whose content streams hold `pages`, one stream per page.
+    ///
+    /// The retrieval parser walks `stream … endstream` regions in file order, so a plain
+    /// `BT (text) Tj ET` stream is a complete page as far as text extraction is concerned.
+    fn pdf_bytes(pages: &[&str]) -> Vec<u8> {
+        let mut document = String::from("%PDF-1.4\n");
+        for text in pages {
+            let stream = format!("BT ({text}) Tj ET\n");
+            let block = format!(
+                "<< /Length {} >>\nstream\n{stream}endstream\n",
+                stream.len()
+            );
+            document.push_str(&block);
+        }
+        document.push_str("%%EOF\n");
+        document.into_bytes()
+    }
+
+    /// Writes `pages` as a PDF at `name` inside `dir` and returns its payload path.
+    fn write_pdf(dir: &TempDir, name: &str, pages: &[&str]) {
+        std::fs::write(dir.path().join(name), pdf_bytes(pages)).unwrap();
+    }
+
     #[test]
     fn card_exposes_python_arguments() {
         let card = ReadFileTool::card_for("en");
@@ -314,6 +689,74 @@ mod tests {
             "     1\talpha\n     2\tbeta"
         );
         assert_eq!(ReadFileTool::number_lines(""), "");
+    }
+
+    #[test]
+    fn page_range_parses_single_pages_ranges_and_unions() {
+        assert_eq!(PageRange::parse("3").unwrap().pages, vec![3]);
+        assert_eq!(
+            PageRange::parse(" 1-5 ").unwrap().pages,
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(PageRange::parse("1-3,7").unwrap().pages, vec![1, 2, 3, 7]);
+        assert_eq!(PageRange::parse("7,1-3").unwrap().pages, vec![1, 2, 3, 7]);
+        assert_eq!(PageRange::parse("2,2,3").unwrap().pages, vec![2, 3]);
+        assert_eq!(PageRange::parse("1-3,2-4").unwrap().pages, vec![1, 2, 3, 4]);
+        // Exactly the cap is fine; deduplication happens before the cap is checked.
+        assert_eq!(PageRange::parse("1-20").unwrap().pages.len(), 20);
+        assert_eq!(PageRange::parse("1-15,5-10").unwrap().pages.len(), 15);
+    }
+
+    #[test]
+    fn page_range_rejects_every_malformed_selection() {
+        let cases = [
+            ("", "empty"),
+            ("   ", "empty"),
+            ("abc", "is not a page number"),
+            ("1,", "empty element"),
+            ("1,,2", "empty element"),
+            ("-", "missing a page number"),
+            ("1-", "missing a page number"),
+            ("-5", "missing a page number"),
+            ("0", "page 0 is not a page"),
+            ("0-2", "page 0 is not a page"),
+            ("1-0", "page 0 is not a page"),
+            ("5-2", "reversed"),
+            ("1-3,-2", "missing a page number"),
+            ("1.5", "is not a page number"),
+            ("1-21", "exceeds the maximum of 20 pages"),
+        ];
+        for (raw, expected) in cases {
+            let error = PageRange::parse(raw).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "selection {raw:?} produced {error:?}, expected {expected:?}"
+            );
+            assert!(
+                error.contains("1-indexed") || error.contains("20 pages"),
+                "selection {raw:?} lost its hint: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_range_resolution_keeps_only_pages_the_document_has() {
+        let range = PageRange::parse("1,9").unwrap();
+        assert_eq!(range.resolve(3), vec![1]);
+        let range = PageRange::parse("2-9").unwrap();
+        assert_eq!(range.resolve(3), vec![2, 3]);
+        let range = PageRange::parse("5,9").unwrap();
+        assert_eq!(range.resolve(3), Vec::<usize>::new());
+        assert_eq!(range.raw(), "5,9");
+    }
+
+    #[test]
+    fn normalized_range_groups_consecutive_pages() {
+        assert_eq!(normalized_range(&[1, 2, 3, 7]), "1-3,7");
+        assert_eq!(normalized_range(&[4]), "4");
+        assert_eq!(normalized_range(&[1, 2]), "1-2");
+        assert_eq!(normalized_range(&[1, 3, 5]), "1,3,5");
+        assert_eq!(normalized_range(&[]), "");
     }
 
     #[tokio::test]
@@ -367,6 +810,216 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pdf_single_page_selection_renders_its_marker_and_line_numbers() {
+        let (tool, _state, dir) = setup();
+        write_pdf(
+            &dir,
+            "doc.pdf",
+            &["first page", "second page", "third page"],
+        );
+
+        let out = invoke(&tool, json!({"file_path": "doc.pdf", "pages": "2"})).await;
+
+        assert_eq!(out["success"], json!(true), "payload: {out}");
+        assert_eq!(out["data"]["total_pages"], json!(3));
+        assert_eq!(out["data"]["selected_pages"], json!([2]));
+        assert_eq!(out["data"]["page_range"], json!("2"));
+        assert_eq!(out["data"]["line_count"], json!(1));
+        assert_eq!(
+            out["data"]["content"],
+            json!("## Page 2\n     1\tsecond page")
+        );
+        let path = out["data"]["file_path"].as_str().unwrap();
+        assert!(path.ends_with("doc.pdf"), "unexpected path: {path}");
+    }
+
+    #[tokio::test]
+    async fn pdf_range_and_comma_union_select_exactly_those_pages() {
+        let (tool, _state, dir) = setup();
+        write_pdf(&dir, "doc.pdf", &["alpha", "beta", "gamma", "delta"]);
+
+        let range = invoke(&tool, json!({"file_path": "doc.pdf", "pages": "1-2"})).await;
+        assert_eq!(range["success"], json!(true), "payload: {range}");
+        assert_eq!(range["data"]["selected_pages"], json!([1, 2]));
+        assert_eq!(
+            range["data"]["content"],
+            json!("## Page 1\n     1\talpha\n\n## Page 2\n     1\tbeta")
+        );
+        assert_eq!(range["data"]["line_count"], json!(2));
+
+        let union = invoke(&tool, json!({"file_path": "doc.pdf", "pages": "1,4"})).await;
+        assert_eq!(union["success"], json!(true), "payload: {union}");
+        assert_eq!(union["data"]["selected_pages"], json!([1, 4]));
+        assert_eq!(union["data"]["page_range"], json!("1,4"));
+        assert!(!union["data"]["content"].as_str().unwrap().contains("beta"));
+        assert!(union["data"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("## Page 4\n     1\tdelta"));
+    }
+
+    #[tokio::test]
+    async fn pdf_read_without_pages_reads_the_whole_document() {
+        let (tool, _state, dir) = setup();
+        write_pdf(&dir, "doc.pdf", &["one page", "two page"]);
+
+        let out = invoke(&tool, json!({"file_path": "doc.pdf"})).await;
+
+        assert_eq!(out["success"], json!(true), "payload: {out}");
+        assert_eq!(out["data"]["total_pages"], json!(2));
+        assert_eq!(out["data"]["selected_pages"], json!([1, 2]));
+        assert_eq!(out["data"]["page_range"], json!("1-2"));
+        assert_eq!(out["data"]["line_count"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn malformed_page_specs_are_typed_failures() {
+        let (tool, _state, dir) = setup();
+        write_pdf(&dir, "doc.pdf", &["one", "two", "three"]);
+
+        for (spec, expected) in [
+            ("", "the selection is empty"),
+            ("abc", "is not a page number"),
+            ("0", "page 0 is not a page"),
+            ("3-1", "reversed"),
+            ("1-21", "exceeds the maximum of 20 pages"),
+        ] {
+            let out = invoke(&tool, json!({"file_path": "doc.pdf", "pages": spec})).await;
+            assert_eq!(out["success"], json!(false), "spec {spec:?}: {out}");
+            let error = out["error"].as_str().unwrap();
+            assert!(
+                error.contains(expected),
+                "spec {spec:?} produced {error:?}, expected {expected:?}"
+            );
+            assert!(
+                error.contains("20 pages") || error.contains("1-indexed"),
+                "spec {spec:?} lost its hint: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn more_than_twenty_pages_without_a_selection_names_the_cap() {
+        let (tool, _state, dir) = setup();
+        let pages: Vec<String> = (1..=21).map(|index| format!("page {index}")).collect();
+        let borrowed: Vec<&str> = pages.iter().map(String::as_str).collect();
+        write_pdf(&dir, "long.pdf", &borrowed);
+
+        let out = invoke(&tool, json!({"file_path": "long.pdf"})).await;
+
+        assert_eq!(out["success"], json!(false));
+        let error = out["error"].as_str().unwrap();
+        assert!(error.contains("21 pages"), "unexpected error: {error}");
+        assert!(
+            error.contains("Maximum 20 pages per request"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pages_outside_the_document_are_rejected() {
+        let (tool, _state, dir) = setup();
+        write_pdf(&dir, "doc.pdf", &["one", "two"]);
+
+        let out = invoke(&tool, json!({"file_path": "doc.pdf", "pages": "9"})).await;
+
+        assert_eq!(out["success"], json!(false));
+        let error = out["error"].as_str().unwrap();
+        assert!(
+            error.contains("selects no page"),
+            "unexpected error: {error}"
+        );
+        assert!(error.contains("2 page(s)"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn pages_on_a_text_file_is_rejected() {
+        let (tool, _state, dir) = setup();
+        std::fs::write(dir.path().join("notes.txt"), "one\ntwo\n").unwrap();
+
+        let out = invoke(&tool, json!({"file_path": "notes.txt", "pages": "1"})).await;
+
+        assert_eq!(out["success"], json!(false));
+        let error = out["error"].as_str().unwrap();
+        assert!(error.contains("pages only applies to PDF"), "{error}");
+        assert!(error.contains("notes.txt"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn caption_is_rejected_with_the_unsupported_capability() {
+        let (tool, _state, dir) = setup();
+        std::fs::write(dir.path().join("notes.txt"), "one\n").unwrap();
+        write_pdf(&dir, "doc.pdf", &["one"]);
+
+        for path in ["notes.txt", "doc.pdf"] {
+            let out = invoke(
+                &tool,
+                json!({"file_path": path, "caption": "a red bicycle"}),
+            )
+            .await;
+            assert_eq!(out["success"], json!(false), "path {path}: {out}");
+            let error = out["error"].as_str().unwrap();
+            assert!(error.contains("caption is not supported"), "{error}");
+            assert!(error.contains("image_metadata"), "{error}");
+            assert!(error.contains("vision model"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pdf_without_extractable_text_reports_the_missing_ocr() {
+        let (tool, _state, dir) = setup();
+        // No `pages`, no streams: a scanned document as far as the parser is concerned.
+        std::fs::write(dir.path().join("scan.pdf"), b"%PDF-1.4\n%%EOF\n").unwrap();
+
+        let out = invoke(&tool, json!({"file_path": "scan.pdf", "pages": "1"})).await;
+
+        assert_eq!(out["success"], json!(false));
+        let error = out["error"].as_str().unwrap();
+        assert!(error.contains("no extractable text"), "{error}");
+        assert!(error.contains("OCR is not available"), "{error}");
+        assert!(error.contains("0 page(s)"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn pdf_offset_and_limit_are_rejected_instead_of_dropped() {
+        let (tool, _state, dir) = setup();
+        write_pdf(&dir, "doc.pdf", &["one", "two"]);
+
+        for inputs in [
+            json!({"file_path": "doc.pdf", "offset": 2}),
+            json!({"file_path": "doc.pdf", "limit": 10}),
+        ] {
+            let out = invoke(&tool, inputs).await;
+            assert_eq!(out["success"], json!(false), "payload: {out}");
+            let error = out["error"].as_str().unwrap();
+            assert!(error.contains("offset/limit do not apply"), "{error}");
+            assert!(error.contains("pages"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pdf_page_read_does_not_register_full_text_coverage() {
+        let (tool, state, dir) = setup();
+        let path = dir.path().join("doc.pdf");
+        write_pdf(&dir, "doc.pdf", &["alpha", "beta"]);
+
+        let out = invoke(&tool, json!({"file_path": "doc.pdf", "pages": "1"})).await;
+        assert_eq!(out["success"], json!(true), "payload: {out}");
+
+        let fingerprint = file_fingerprint(&std::fs::metadata(&path).unwrap());
+        // The file is known (not `NotRead`) but nothing was covered, so a whole-file write is
+        // still refused: the model has only seen page 1.
+        assert_eq!(
+            state.write_gate(&path, fingerprint, "alpha\nbeta\n"),
+            WriteGate::Partial {
+                lines_read: 0,
+                total_lines: 0,
+                resume_offset: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn missing_file_path_is_a_failure_payload() {
         let (tool, _state, _dir) = setup();
 
@@ -382,6 +1035,17 @@ mod tests {
         let (tool, _state, _dir) = setup();
 
         let out = invoke(&tool, json!({"file_path": "missing.txt"})).await;
+
+        assert_eq!(out["success"], json!(false));
+        let error = out["error"].as_str().unwrap();
+        assert!(!error.is_empty(), "expected a failure message");
+    }
+
+    #[tokio::test]
+    async fn nonexistent_pdf_returns_the_backend_failure() {
+        let (tool, _state, _dir) = setup();
+
+        let out = invoke(&tool, json!({"file_path": "missing.pdf", "pages": "1"})).await;
 
         assert_eq!(out["success"], json!(false));
         let error = out["error"].as_str().unwrap();
