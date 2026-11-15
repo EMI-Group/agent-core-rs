@@ -58,8 +58,9 @@ use crate::retrieval::types::{
 
 /// Writes the three index artifacts into `dir`, creating it when missing.
 ///
-/// The inputs are validated before anything touches the filesystem: a duplicate node
-/// `cid`, a duplicate record `cid`, or a record whose `cid` names no leaf node is an
+/// The inputs are validated before anything touches the filesystem: a manifest whose
+/// `count` does not describe `records`, a blank manifest `mode` or `item_type`, a duplicate
+/// node `cid`, a duplicate record `cid`, or a record whose `cid` names no leaf node is an
 /// [`Error::Validation`] naming the offending field, so a
 /// failed write leaves the previous index untouched.
 ///
@@ -68,7 +69,7 @@ use crate::retrieval::types::{
 ///
 /// # Errors
 ///
-/// [`Error::Validation`] for a malformed node or record
+/// [`Error::Validation`] for an inconsistent manifest or a malformed node or record
 /// set, [`Error::Config`] for an unusable target path, and
 /// [`Error::External`] for an I/O failure.
 pub async fn write_index(
@@ -78,6 +79,7 @@ pub async fn write_index(
     manifest: &IndexManifest,
 ) -> Result<()> {
     let dir = dir.as_ref();
+    validate_manifest(manifest, records)?;
     validate_nodes(nodes)?;
     validate_records(records, nodes)?;
     let tree = render_tree_yaml(nodes);
@@ -100,17 +102,29 @@ pub async fn write_index(
 
 /// Reads and validates one index directory into a [`LoadedIndex`].
 ///
-/// The tree is parsed first, then the catalog, then the manifest; the manifest must
-/// account for exactly the parsed catalog (`count`) and, when its `content_hash` is
-/// non-empty, match the catalog on disk. Records come back sorted by `cid`, and
-/// `item_paths` is derived from the parsed tree — only nodes reachable from the synthetic
-/// root contribute.
+/// The tree is parsed first, then the catalog, then the manifest. The three are then
+/// cross-checked, and the first check that fails is the error:
+///
+/// - the manifest `count` must equal the number of parsed records;
+/// - a non-empty manifest `content_hash` must match the catalog on disk (an empty one
+///   means "not recorded" — Python's own builds write no hash — and is not checked);
+/// - the manifest `item_type` must not be blank;
+/// - every record `cid` must be a `leaf` node of the parsed tree, which is what keeps a
+///   catalog from one build out of another build's tree.
+///
+/// It does *not* check the tree's shape ([`TreeSchema`](crate::retrieval::build::schema::TreeSchema)
+/// is a build-time guard, not a load guard), a record's `worker_id` against its leaf's, or
+/// the record text (`retrieval_text`, `category`, `branch_path`) against the tree: a catalog
+/// this crate wrote is trusted for those.
+///
+/// Records come back sorted by `cid`, and `item_paths` is derived from the parsed tree —
+/// only nodes reachable from the synthetic root contribute.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] naming the missing file,
 /// [`Error::Validation`] for an unusable document or an
-/// inconsistent manifest, and [`Error::External`] for an
+/// inconsistent manifest or catalog, and [`Error::External`] for an
 /// I/O failure.
 pub async fn load_index(dir: impl AsRef<Path>) -> Result<LoadedIndex> {
     let dir = dir.as_ref();
@@ -145,6 +159,7 @@ pub async fn load_index(dir: impl AsRef<Path>) -> Result<LoadedIndex> {
     if manifest.item_type.trim().is_empty() {
         return Err(validation(MANIFEST_FILENAME, "item_type must not be blank"));
     }
+    validate_record_leaves(&nodes, &records)?;
     let root = build_tree_root(&nodes, &records);
     let choices = root.flatten_choices();
     let mut item_paths = BTreeMap::new();
@@ -627,6 +642,27 @@ fn collect_item_paths(
     }
 }
 
+/// Validates the manifest of a write: it must describe exactly `records`.
+fn validate_manifest(manifest: &IndexManifest, records: &[CatalogRecord]) -> Result<()> {
+    if manifest.count != records.len() {
+        return Err(validation(
+            MANIFEST_FILENAME,
+            format!(
+                "count {} does not match {} catalog records",
+                manifest.count,
+                records.len()
+            ),
+        ));
+    }
+    if manifest.mode.trim().is_empty() {
+        return Err(validation(MANIFEST_FILENAME, "mode must not be blank"));
+    }
+    if manifest.item_type.trim().is_empty() {
+        return Err(validation(MANIFEST_FILENAME, "item_type must not be blank"));
+    }
+    Ok(())
+}
+
 /// Validates the node list of a write: no blank and no duplicate `cid`.
 fn validate_nodes(nodes: &[IndexNode]) -> Result<()> {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -650,11 +686,6 @@ fn validate_nodes(nodes: &[IndexNode]) -> Result<()> {
 
 /// Validates the catalog of a write: unique `cid`s, each naming a leaf node.
 fn validate_records(records: &[CatalogRecord], nodes: &[IndexNode]) -> Result<()> {
-    let leaves: BTreeSet<&str> = nodes
-        .iter()
-        .filter(|node| node.is_leaf())
-        .map(|node| node.cid.as_str())
-        .collect();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for record in records {
         let cid = record.cid.as_str();
@@ -664,6 +695,23 @@ fn validate_records(records: &[CatalogRecord], nodes: &[IndexNode]) -> Result<()
                 format!("duplicate cid `{cid}`"),
             ));
         }
+    }
+    validate_record_leaves(nodes, records)
+}
+
+/// Validates that every record `cid` names a `leaf` node of `nodes`.
+///
+/// Both the writer and the loader call this, so a catalog can never name a `cid` that its
+/// own tree does not terminate — the check that keeps a catalog from one build out of
+/// another build's tree.
+fn validate_record_leaves(nodes: &[IndexNode], records: &[CatalogRecord]) -> Result<()> {
+    let leaves: BTreeSet<&str> = nodes
+        .iter()
+        .filter(|node| node.is_leaf())
+        .map(|node| node.cid.as_str())
+        .collect();
+    for record in records {
+        let cid = record.cid.as_str();
         if !leaves.contains(cid) {
             return Err(validation(
                 CATALOG_FILENAME,
@@ -1096,14 +1144,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let records = sample_records();
         let manifest = manifest_for(&records);
+        let empty_manifest = manifest_for(&[]);
         let duplicated = vec![IndexNode::branch("A"), IndexNode::branch("A")];
-        let error = write_index(directory.path(), &duplicated, &[], &manifest)
+        let error = write_index(directory.path(), &duplicated, &[], &empty_manifest)
             .await
             .expect_err("must reject");
         assert!(error.message().contains("duplicate cid `A`"));
 
         let blank = vec![IndexNode::branch("  ")];
-        let error = write_index(directory.path(), &blank, &[], &manifest)
+        let error = write_index(directory.path(), &blank, &[], &empty_manifest)
             .await
             .expect_err("must reject");
         assert!(error.message().contains("node cid must not be blank"));
