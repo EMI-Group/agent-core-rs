@@ -448,6 +448,56 @@ The mutation order is replay lookup → digest conflict → `Running` gate → c
 `submit_evolution` applies successful transitions as an EMA on edge weights (`w' = (w + 1.0) / 2`); `semantic_search` re-embeds only when `CapabilityRegistry::revision()` changed, and without a semantic index it is `Error::Unsupported`.
 See [`runtime`](src/runtime/CONTEXT.md) for the full surface and rules.
 
+### `observation` (`src/observation/`)
+
+Caller-supplied execution evidence distilled into derived, immutable observation and merged graph revisions; the static `can_feed` graph is never rewritten.
+
+```rust
+pub const GRAPH_EVOLUTION_INPUT_SCHEMA: &str = "symphony.graph_evolution_input.v2";
+// refusal reasons: TRUNCATED_TRACE, TRACE_QUALITY_FLAGS, OUTCOME_NOT_STRONG,
+// CAPABILITY_IDENTITY_MISMATCH, UNKNOWN_STATIC_REVISION, UNKNOWN_MERGED_REVISION,
+// MERGED_STATIC_REVISION_MISMATCH, MERGED_OBSERVATION_REVISION_MISMATCH,
+// NO_QUALIFIED_EDGE_OUTCOME, SAFE_FALLBACK
+
+pub struct GraphEvolutionInput { schema_version, evidence_id, graph_scope_id, observed_at,
+                                 graph_snapshot: GraphSnapshotRef, trace: TraceEvidence,
+                                 task: TaskEvidence, planned_graph: Option<EvolutionGraph>,
+                                 execution_graph: EvolutionGraph }
+impl GraphEvolutionInput { pub fn validate(&self) -> Result<()>; pub fn normalized(self) -> Result<Self>; }
+impl TraceEvidence { pub fn from_trace_record(&TraceRecord) -> Self; }
+impl TaskOutcome { pub fn from_trace_record(&TraceRecord) -> Self; }
+impl TaskEvidence { pub fn from_trace_record(&TraceRecord) -> Self; }
+
+pub enum TaskOutcomeLabel;  pub enum EvidenceStrength;  pub enum FailureDomain;
+pub enum ObservationStatus { Accepted, AuditOnly, Duplicate }
+pub struct ObservationReceipt { evidence_id, graph_scope_id, sequence, status, reason }
+pub struct GraphSnapshotRef;  pub struct GraphSnapshot { graph_scope_id, static_revision,
+    observation_revision, merged_revision, high_water_sequence, overlay }
+
+pub fn stable_hash(value: &Value) -> String;
+pub const POINT_EDGE_IDENTITY_SCHEMA: &str = "symphony.point-edge.v1";
+pub struct EdgeIdentity;  pub struct StaticGraphIndex;   // from_graph / from_graph_with_descriptors
+pub fn edge_identity_from_observation(&EvolutionGraphEdge, &StaticGraphIndex) -> Option<EdgeIdentity>;
+
+pub struct EvidenceStore;  pub struct RevisionStore;    // append-only log + immutable revisions
+pub struct GraphObservationService;
+impl GraphObservationService {
+    pub fn new(artifacts: Arc<dyn GraphArtifactStore>, root: impl AsRef<Path>) -> Self;
+    pub async fn submit(&self, &GraphEvolutionInput) -> Result<ObservationReceipt>;
+    pub async fn get_snapshot(&self, &str, Option<&str>) -> Result<GraphSnapshot>;
+    pub async fn flush(&self) -> Result<()>;      pub async fn reproject(&self, &str) -> Result<GraphSnapshot>;
+    pub async fn reproject_all(&self) -> Result<Vec<GraphSnapshot>>;
+    pub async fn publish_safe_fallback(&self, &str, &str) -> Result<GraphSnapshot>;
+    pub async fn close(&self) -> Result<()>;
+}
+```
+
+Evidence is qualified before it may move a weight: a truncated trace, quality flags, weak evidence, unknown capability ids, a stale pinned snapshot, or an edge without a countable outcome becomes `audit_only` with its reason and never re-qualifies.
+Only `verified_success` edges and `orchestration`-attributed `verified_failure` edges count; `runtime_weight = 1.0 + clamp(0.05 * (success - failure), -1.0, 1.0)`.
+Rebinding yields `legacy_ignored | orphaned | invalidated | active_static | quarantined | active_runtime_only | insufficient_evidence`, and an edge absent from the static graph becomes plannable only after `MIN_RUNTIME_ONLY_SUCCESS_SESSIONS = 2` failure-free success sessions in the current static revision.
+`get_snapshot` reprojects rather than failing and publishes a neutral `safe_fallback` snapshot when projection fails.
+See [`observation`](src/observation/CONTEXT.md) for the full contract, qualification order, overlay record and on-disk layout.
+
 ### `discovery` (`src/discovery/`)
 
 SKILL.md discovery plus the lexical skill catalog: both Python scan modes (immediate-child and bounded recursive), per-skill diagnostics instead of scan failure, descriptor derivation with SHA-256 content hashes, an order-independent inventory fingerprint, BM25 search with excerpts, and the model-facing prompt surface.
@@ -585,6 +635,11 @@ The other typed deferrals live with their implementations: `ExperienceIndex`'s `
 - **Trace ingestion is deterministic, not statistical.** Python uses faiss k-means plus model distillation; the port groups by skill set and token Jaccard, picks a centroid query deterministically, and merges at a documented threshold — no RNG, no clock.
 - **The matcher cache is opt-in and signature-keyed.** The key covers the candidate, both fingerprint digests and `matcher_signature()` (prompt/version constants, model identity, threshold); cache failures degrade to a model call, never to stale matches.
 - **Static evaluation remains the offline default.** The suite ships deterministic card and trace metrics, and every LLM-backed metric carries a static rubric as its fallback.
+- **Observation state is a JSONL append log plus immutable content-hashed revisions.** Python's SQLite table and file locks become `evolution/evidence.jsonl` and per-scope `observations/<rev>/overlay.json` / `merged/<rev>/manifest.json`, with `tokio::fs` temp-sibling renames and an async mutex serialising writers; the crate declares no `sqlx`.
+- **Observation revision ids are content hashes that ignore `generated_at`.** Re-aggregating identical state reproduces the same ids, while republishing an existing id with different content is a validation error.
+- **Observation aggregation runs inside `submit` and `flush`.** The port drops Python's `ThreadPoolExecutor`: a failed projection is warned and surfaced by the next `flush()`, and `close()` is a documented no-op.
+- **Static edge identity is a point edge whose content hashes come from node metadata.** `CapabilityGraph` carries no `capability_hashes` map, so `metadata["content_hash"]` (or a descriptor's `compute_content_hash()` when supplied) stands in; a changed body invalidates prior evidence and a deleted endpoint orphans it.
+- **Observation timestamps are hand rolled.** `observed_at` parsing, offset→UTC normalisation and formatting live in `observation::timestamp` (integer Hinnant civil-date arithmetic) because `chrono` is not a dependency; timestamps never order or identify anything.
 
 ## Deferred Scope
 
@@ -599,7 +654,6 @@ Two kinds of gaps remain: typed `Error::Unsupported` entry points (GPU/ML stacks
 
 Pure-logic Python areas not ported:
 
-- `observation/` — graph-evolution input contract, append-only evidence log, qualification/rebind and merged overlays (`runtime::submit_evolution` takes a `PlanExecution` and applies only an EMA).
 - `discovery/{directory_toolkit,toolkit}.py` — the model-facing `skill_index` operations (directory view, list/search/read, request validation, pagination cursors); `SkillFs` provides `visible_skill_names`, `prompt_snapshot` and the persistable `SkillNoticeState` cursor.
 - `orchestration/graph/artifacts.py`'s artifact-embedded journal and any diffing beyond the request contract — the request digest, durable journal, source-revision CAS and change-set validation are implemented (see [`orchestration::mutation`](src/orchestration/mutation.rs) and `runtime::mutations`); the journal is a separate JSON document, its digests are not chained over the file, and `source_revision` is optional.
 - `orchestration/graph/matcher/{protocol,model}.py` — the `matches_by_candidate`/`diagnostics_by_candidate` helpers and the cache's file lock/pending-merge batching; the persistent match cache, identity digests, endpoint hashing and `sanitize_metadata` are implemented.
@@ -608,7 +662,7 @@ Pure-logic Python areas not ported:
 - `retrieval/build/**` and `agent/retrieval_toolkit.py` — LLM-driven index construction over the progressive retriever (~9k lines, overlapping `llm::TreeRetriever`).
 - `experience/cluster.py`'s faiss k-means and LLM pattern distillation — replaced by deterministic token-Jaccard clustering and the collector's similarity merge.
 
-Implemented with deterministic offline substitutes: S3/OBS, GCS and Azure Blob artifacts; SKILL.md scanning, the `SkillFs` catalog, prompt snapshot and notice cursor; flow distillation, redaction, ten-check review, `SkillPack` packaging, `SwarmFlow` script generation and package rendering; the mutation request contract, digest, durable idempotency journal and source-revision CAS; the experience bank, persisted index, trace ingestion, clustering and collector; evaluation static/trace metrics and windows; LLM matching (with cache), scoring, retrieval, fingerprinting and judging.
+Implemented with deterministic offline substitutes: S3/OBS, GCS and Azure Blob artifacts; SKILL.md scanning, the `SkillFs` catalog, prompt snapshot and notice cursor; flow distillation, redaction, ten-check review, `SkillPack` packaging, `SwarmFlow` script generation and package rendering; the mutation request contract, digest, durable idempotency journal and source-revision CAS; the experience bank, persisted index, trace ingestion, clustering and collector; evaluation static/trace metrics and windows; LLM matching (with cache), scoring, retrieval, fingerprinting and judging; the graph-observation contract, append-only evidence log, qualification gating, rebinding and merged revisions (a JSONL log and in-process aggregation replace SQLite and the thread pool).
 Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the stub shape, and `tests/{artifact_gcs,artifact_azure,experience_index}.rs` assert the remaining GPU/vendor boundaries.
 
 ## Error Strategy
@@ -645,6 +699,8 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
 - `tests/evaluation.rs` — static card metrics, structure conformance, mixed success rates, `Observed` latency, hand-computed percentile interpolation, window boundaries, aggregation precedence and confidence tiers, `cache_signature` stability, the offline/model-backed judge, and serde round-trips.
 - `tests/llm.rs` — every stage with a scripted model and with no model: tree walk/fallback, ontology consensus, scoring, fingerprint, judge repair, round-trips, error mode.
 - `tests/matcher_cache.rs` — identity digests, endpoint normalization, `sanitize_metadata`, cache round-trip and byte-stable layout, replay with zero model calls, `force` bypass, signature invalidation, malformed cache, degradation.
+- `tests/observation.rs` — contract validation (graph types, node labels/metadata, ports, edge endpoints, timezone, failure domain), `observed_at` UTC normalisation, the trace-record bridges, stable hashing and static-graph indexes, and the evidence/revision layout with dedupe, cursor, content-derived ids, immutability and atomic writes.
+- `tests/observation_service.rs` — one scenario per qualification reason, duplicate idempotency, the runtime-only threshold, symmetric bounded session-deduped weights, the high-water cursor, `safe_fallback` replay, quarantine/rebind across static republications, merged-revision pinning, persisted sanitisation and UTC persistence.
 - `tests/object_artifact.rs` — numbered revisions, `current` pointer/status, reopen persistence, object keys, pinned-version skipping, blank bucket, malformed `current.json`.
 - `tests/artifact_gcs.rs` / `tests/artifact_azure.rs` — full publish → read → status → versions round-trips against a stateful wiremock cloud emulator, plus auth-header assertions (bearer / `SharedKey` / SAS / anonymous), pagination, prefix sorting, 404 semantics and endpoint failure mapping.
 - `tests/deferred.rs` — the remaining `vLLM` stub and the `ivf*` algorithm deferral return `Error::Unsupported`, and `error::is_unsupported` recognizes them.
@@ -689,5 +745,11 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
 - `./src/runtime/` → `SymphonyRuntime`, config, lifecycle, evolution, mutations; see [`src/runtime/CONTEXT.md`](src/runtime/CONTEXT.md)
   - `./src/runtime/mod.rs` → lifecycle, planning/invocation, lazy semantic sync, evolution
   - `./src/runtime/mutations.rs` → the mutation path, `GraphMutationResult`, `MutationStatus`, journal-backed replay and source-revision CAS
+- `./src/observation/` → the graph-evolution evidence contract, identity, append-only evidence log, immutable observation/merged revisions and the `GraphObservationService`; see [`src/observation/CONTEXT.md`](src/observation/CONTEXT.md)
+  - `./src/observation/contracts/` → `GraphEvolutionInput`, evidence/enums, `validate`, `normalized`, trace bridges
+  - `./src/observation/identity.rs` → `stable_hash`, `EdgeIdentity`, `StaticGraphIndex`
+  - `./src/observation/store/` → the JSONL `EvidenceStore` and the per-scope `RevisionStore`
+  - `./src/observation/service/` → qualification, aggregation, rebinding, snapshot/fallback orchestration
+  - `./src/observation/payload.rs`, `timestamp.rs` → sanitised payload builder and the hand-rolled RFC 3339 layer
 - `./src/deferred.rs` → the remaining GPU-only `Error::Unsupported` stub (`vLLM` logit selection)
 - `./tests/` → behavior suites: `models`, `registry`, `search`, `graph`, `artifact`, `object_artifact`, `artifact_gcs`, `artifact_azure`, `planner`, `executor`, `runtime`, `mutation_journal`, `discovery`, `skill_prompt`, `experience`, `experience_index`, `experience_trace`, `flow`, `flow_codegen`, `redaction`, `evaluation`, `llm`, `matcher_cache`, `deferred`
