@@ -1,8 +1,11 @@
 //! Schema DDL, column list, and timestamp encoding of the `SQLite` team memory store.
 //!
 //! The table is one row per [`TeamMemoryRecord`](crate::team::model::TeamMemoryRecord),
-//! with the three structured columns (`visibility_json`, `tags_json`, `metadata_json`)
-//! stored as JSON text and every timestamp stored as an RFC 3339 UTC string.
+//! with the four structured columns (`visibility_json`, `tags_json`, `metadata_json`,
+//! `embedding_json`) stored as JSON text and every timestamp stored as an RFC 3339 UTC
+//! string. `embedding_json` is additive: it is created with the table and added to an
+//! existing table by [`ADD_EMBEDDING_COLUMN`], so a database written before team memory
+//! carried embeddings keeps its rows and gains NULL vectors.
 //!
 //! # Timestamp encoding
 //!
@@ -37,7 +40,8 @@ CREATE TABLE IF NOT EXISTS team_memories (
     source TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    expires_at TEXT
+    expires_at TEXT,
+    embedding_json TEXT
 )";
 /// Index backing the `updated_at` pagination of every listing.
 pub(super) const UPDATED_INDEX: &str = "
@@ -48,13 +52,26 @@ pub(super) const KIND_INDEX: &str =
 /// Index backing the member narrowing of `list`.
 pub(super) const MEMBER_INDEX: &str = "
 CREATE INDEX IF NOT EXISTS team_memories_team_member_idx ON team_memories (team_id, member_id)";
+/// The additive column holding a record embedding as a JSON array of numbers.
+///
+/// A database created before embeddings existed is upgraded by
+/// [`ADD_EMBEDDING_COLUMN`] when the column is absent (see
+/// [`SqliteTeamMemoryStore::from_pool`](super::SqliteTeamMemoryStore::from_pool)), which
+/// keeps the schema step idempotent without dropping or rewriting any row.
+pub(super) const EMBEDDING_COLUMN: &str = "embedding_json";
+/// The `ALTER TABLE` that adds [`EMBEDDING_COLUMN`] to a pre-existing table.
+///
+/// `SQLite` has no `ADD COLUMN IF NOT EXISTS`, so the caller checks `pragma_table_info`
+/// first; the statement is never run twice for the same database.
+pub(super) const ADD_EMBEDDING_COLUMN: &str =
+    "ALTER TABLE team_memories ADD COLUMN embedding_json TEXT";
 /// Every DDL statement, in creation order.
 pub(super) const DDL: [&str; 4] = [TABLE, UPDATED_INDEX, KIND_INDEX, MEMBER_INDEX];
 /// The column list every `SELECT` reads, in the order [`decode`](super::decode)
 /// expects.
 pub(super) const COLUMNS: &str = "id, team_id, member_id, session_id, kind, visibility_json, \
      title, content, importance, tags_json, metadata_json, source, created_at, updated_at, \
-     expires_at";
+     expires_at, embedding_json";
 /// Renders a timestamp as a lexicographically sortable RFC 3339 UTC string.
 pub(super) fn render_ts(timestamp: DateTime<Utc>) -> String {
     timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -116,9 +133,10 @@ mod tests {
     #[test]
     fn column_list_names_every_column() {
         let columns: Vec<&str> = COLUMNS.split(',').map(str::trim).collect();
-        assert_eq!(columns.len(), 15);
+        assert_eq!(columns.len(), 16);
         assert!(columns.contains(&"visibility_json"));
         assert!(columns.contains(&"expires_at"));
+        assert!(columns.contains(&EMBEDDING_COLUMN));
         assert_eq!(DDL.len(), 4);
     }
 }

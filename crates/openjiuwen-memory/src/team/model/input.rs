@@ -255,6 +255,9 @@ impl NewTeamMemory {
             title: self.title.as_deref().map(str::trim).map(str::to_owned),
             importance: self.resolve_importance(default_importance),
             tags: normalize_tags(self.tags.clone()),
+            // The embedding is derived state: only the facade that owns an embedder
+            // writes one, after the record is materialized.
+            embedding: None,
             metadata: self.metadata.clone(),
             created_at: now,
             updated_at: now,
