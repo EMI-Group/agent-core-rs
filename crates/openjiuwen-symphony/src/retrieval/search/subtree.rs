@@ -253,8 +253,8 @@ impl CurrentSubtreeProvider for DefaultCurrentSubtreeProvider {
         })?;
         let builder = self.builder.as_ref().ok_or_else(|| {
             unsupported(
-                "progressive subtree exposure without a fragment builder: configure one with \
-                 DefaultCurrentSubtreeProvider::with_builder",
+                "no fragment builder configured: progressive subtree exposure needs a renderer, \
+                 supplied with DefaultCurrentSubtreeProvider::with_builder",
             )
         })?;
         let fragment = builder(
