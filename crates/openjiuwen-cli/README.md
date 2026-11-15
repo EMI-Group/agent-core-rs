@@ -137,7 +137,9 @@ stdout keeps the run's output format:
 ```text
 resuming session cli-1a2b3c4d from the CLI session record (4 messages)
 resuming session sess-1 from the persistent session record via execution exec-7 (9 messages restored)
-resuming the most recent session exec-7 from execution exec-7 (9 messages restored)
+resuming session sess-1 from the persistent session record (9 messages restored)
+resuming session cli-1a2b3c4d from execution exec-7 (9 messages restored)
+resuming the most recent session cli-1a2b3c4d from the CLI session record (4 messages)
 ```
 
 `run --resume` continues the resolved session id: the kernel session and the CLI
@@ -621,7 +623,7 @@ is explicit where it cannot:
 `tests/` holds the process-level suites, all offline and hermetic (temporary
 working directory, temporary `OPENJIUWEN_HOME`, ambient `OPENJIUWEN_*` /
 `OPENAI_*` / `API_KEY` / `API_BASE` / `MODEL_*` removed, bounded child waits).
-The eight suites hold 78 tests; no case needs the network, credentials or a
+The ten suites hold 93 tests; no case needs the network, credentials or a
 terminal.
 
 | Suite | Covers |
@@ -632,6 +634,8 @@ terminal.
 | `tests/cli_features.rs` | `run --worktree` end to end (worktree created, stderr announcement, run inside it), `--worktree` outside a repository as a typed `config` error, and `chat --watch` starting the watcher on stderr and exiting on stdin EOF. |
 | `tests/cron.rs` | The empty store, `create`/`list`/`get` persistence, `toggle` both ways, `preview --count`, `run` plus the `runs` receipt, `status` counts, `cancel`, and the `not_found`/`validation` failures. |
 | `tests/lsp.rs` | The action and flag help, an unknown action as a usage error, a missing `--file` as `not_found` (also with `--json`), and a failing or unspawnable `--server-command` as a typed `tool` error. |
+| `tests/sessions.rs` | The catalogue command on hand-written CLI records and a damaged journal tree: the empty listing (text and JSON), newest-first rows with `--limit` and `--kind`, `show` in both modes, a corrupt journal being skipped, the unknown-id `not_found`, `prune` dry run/`--all`/`--older-than`, the selector-less `validation` error and the `--all`/`--older-than` clap conflict, and the three help pages. |
+| `tests/resume.rs` | The resume surface against the loopback mock model: `run --resume <cli-id>` continuing the record and the request transcript, `--continue` picking the newest record, the unknown-id and empty-catalogue `not_found`s, a persistent-agent state record resuming through its journal plan, an execution id resuming its journal and creating the session's CLI record, and `chat --resume` seeding a fresh REPL. |
 | `tests/team.rs` | A stub attach host behind a Unix socket: the grammar, one request per command with the documented arguments, the member/task/message/outcome renderings and empty markers, the JSON documents, a remote `not_found`, an unknown `--status`, and the missing-socket validation error. |
 | `tests/watch.rs` | `watch --list` text and JSON plans (targets plus skipped roots), an empty plan as a typed `config` error, and a live change reported as one JSON event with `--max-events 1` shutting the watcher down. |
 

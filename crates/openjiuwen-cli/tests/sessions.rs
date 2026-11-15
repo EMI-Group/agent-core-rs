@@ -71,7 +71,7 @@ fn write_record(sandbox: &Sandbox, id: &str, created_at: &str, messages: &[(&str
 }
 
 /// Returns the four tab-separated columns of one `list` row.
-fn columns<'a>(line: &'a str) -> Vec<&'a str> {
+fn columns(line: &str) -> Vec<&str> {
     line.split('\t').collect()
 }
 
