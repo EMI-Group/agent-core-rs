@@ -874,6 +874,7 @@ mod tests {
         };
         // Without an override the base model is the one that runs.
         let plain = StagedAnalyzer::from_config(config.clone(), Some(Arc::new(base)))
+            .expect("analyzer")
             .analyze(&conversation(), &CallOptions::new())
             .await
             .unwrap();
@@ -890,6 +891,7 @@ mod tests {
                 ..StageConfig::default()
             });
         let staged = StagedAnalyzer::from_config(config, Some(Arc::new(base_handle.clone())))
+            .expect("analyzer")
             .with_overrides(overrides);
         assert_eq!(
             staged
