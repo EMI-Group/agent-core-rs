@@ -8,6 +8,11 @@
 //! blank record; encrypted documents and object streams keep the parser's own
 //! `Unsupported` messages.
 //!
+//! A partially decodable document still loads, and says so: `pdf_incomplete`
+//! (`false`/`true`) and `pdf_skipped_filters` (the filter names of the streams the
+//! parser had to skip) are added to the document metadata next to `page_count`,
+//! `has_text`, and `source_type`, and a `warn` log names the skipped filters.
+//!
 //! [`DocumentLoader::load_bytes`] extracts text from in-memory bytes
 //! ([`PdfParser::parse_bytes`]) under the same rules, so an uploaded PDF needs no
 //! temporary path.
@@ -16,7 +21,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_common::logging::debug;
+use openjiuwen_common::logging::{debug, warn};
 
 use crate::common::{Document, Metadata};
 use crate::parsing::{PdfDocument, PdfParser};
@@ -45,12 +50,35 @@ fn document_from(document: PdfDocument, name: &str) -> Result<Document> {
             "PDF has no extractable text: {name}"
         )));
     }
+    if document.incomplete {
+        warn!(
+            file = name,
+            skipped_filters = ?document.skipped_filters,
+            skipped_streams = document.skipped_streams.len(),
+            "PDF text extraction skipped undecodable streams"
+        );
+    }
     let mut metadata = Metadata::new();
     metadata.insert("page_count".to_owned(), Value::from(document.page_count));
     metadata.insert("has_text".to_owned(), Value::Bool(document.has_text));
     metadata.insert(
         "source_type".to_owned(),
         Value::String("document".to_owned()),
+    );
+    metadata.insert(
+        "pdf_incomplete".to_owned(),
+        Value::Bool(document.incomplete),
+    );
+    metadata.insert(
+        "pdf_skipped_filters".to_owned(),
+        Value::Array(
+            document
+                .skipped_filters
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect(),
+        ),
     );
     Ok(Document::new(document.text).with_metadata(metadata))
 }
@@ -111,7 +139,44 @@ mod tests {
             document.metadata.get("source_type"),
             Some(&Value::String("document".to_owned()))
         );
+        assert_eq!(
+            document.metadata.get("pdf_incomplete"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            document.metadata.get("pdf_skipped_filters"),
+            Some(&Value::Array(Vec::new()))
+        );
         assert_eq!(document.id.len(), 36);
+    }
+
+    #[tokio::test]
+    async fn partially_decoded_pdfs_report_the_skipped_filters() {
+        let body = format!(
+            "{}\n3 0 obj\n<< /Filter /DCTDecode /Length 4 >>\nstream\nscan\nendstream\nendobj",
+            plain_stream("BT (Readable) Tj ET")
+        );
+        let bytes = pdf_document(&body);
+        let document = PdfLoader::new()
+            .load_bytes(&DocumentBytes::new("mixed.pdf", bytes), &LoadOptions::new())
+            .await
+            .unwrap();
+
+        assert_eq!(document.len(), 1);
+        assert_eq!(document[0].text, "Readable");
+        let metadata = &document[0].metadata;
+        assert_eq!(metadata.get("pdf_incomplete"), Some(&Value::Bool(true)));
+        assert_eq!(
+            metadata.get("pdf_skipped_filters"),
+            Some(&Value::Array(vec![Value::String("DCTDecode".to_owned())]))
+        );
+        // The metadata keys that predate the completeness markers still apply.
+        assert_eq!(metadata.get("page_count"), Some(&Value::from(1)));
+        assert_eq!(metadata.get("has_text"), Some(&Value::Bool(true)));
+        assert_eq!(
+            metadata.get("source_type"),
+            Some(&Value::String("document".to_owned()))
+        );
     }
 
     #[tokio::test]
@@ -184,7 +249,13 @@ mod tests {
         assert_eq!(from_bytes.len(), 1);
         assert_eq!(from_bytes[0].text, from_path[0].text);
         assert_eq!(from_bytes[0].text, "Hello PDF");
-        for key in ["page_count", "has_text", "source_type"] {
+        for key in [
+            "page_count",
+            "has_text",
+            "source_type",
+            "pdf_incomplete",
+            "pdf_skipped_filters",
+        ] {
             assert_eq!(
                 from_bytes[0].metadata.get(key),
                 from_path[0].metadata.get(key),

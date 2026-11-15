@@ -3,7 +3,7 @@
 //! Kept beside the module (like the `inflate` tests) so `pdf.rs` stays within the
 //! file-size budget; everything here is offline and deterministic.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 
 use openjiuwen_common::error::ErrorKind;
 
@@ -86,6 +86,8 @@ fn pages_are_ordered_and_text_free_documents_are_not_errors() {
     assert_eq!(parsed.text, "one\ntwo");
     assert!(parsed.has_text);
     assert!(!parsed.is_empty());
+    assert!(!parsed.incomplete);
+    assert!(parsed.skipped_filters.is_empty());
 
     let empty = PdfParser::new().parse_bytes(b"%PDF-1.4\n%%EOF\n").unwrap();
     assert_eq!(empty.text, "");
@@ -93,6 +95,7 @@ fn pages_are_ordered_and_text_free_documents_are_not_errors() {
     assert_eq!(empty.page_count, 0);
     assert!(!empty.has_text);
     assert!(empty.is_empty());
+    assert!(!empty.incomplete);
 }
 
 #[test]
@@ -111,42 +114,166 @@ fn encrypted_documents_and_object_streams_are_unsupported() {
 }
 
 #[test]
-fn filters_are_classified_from_the_stream_dictionary() {
-    assert!(matches!(
-        classify_stream(b"<< /Length 5 >>"),
-        StreamEncoding::Plain
-    ));
-    assert!(matches!(
-        classify_stream(b"<< /Filter /FlateDecode >>"),
-        StreamEncoding::Flate
-    ));
-    assert!(matches!(
-        classify_stream(b"<< /Filter /Fl >>"),
-        StreamEncoding::Flate
-    ));
-    assert!(matches!(
-        classify_stream(b"<< /Filter [/FlateDecode] >>"),
-        StreamEncoding::Flate
-    ));
-    assert!(matches!(
-        classify_stream(b"<< /Filter /DCTDecode >>"),
-        StreamEncoding::Unsupported("DCTDecode")
-    ));
-    assert!(matches!(
-        classify_stream(b"<< /Filter /ASCIIHexDecode >>"),
-        StreamEncoding::Unsupported("ASCIIHexDecode")
-    ));
-    assert!(matches!(
-        classify_stream(b"<< /Filter [/FlateDecode /LZWDecode] >>"),
-        StreamEncoding::Unsupported("LZWDecode")
-    ));
+fn stream_dictionaries_expose_their_filter_chain() {
+    // No `/Filter` key at all.
+    assert!(dictionary::parse_filter_chain(b"<< /Length 5 >>").is_empty());
+    // A single long or abbreviated name.
+    assert_eq!(
+        dictionary::parse_filter_chain(b"<< /Filter /FlateDecode >>"),
+        vec![filters::Filter::Flate]
+    );
+    assert_eq!(
+        dictionary::parse_filter_chain(b"<< /Filter /Fl >>"),
+        vec![filters::Filter::Flate]
+    );
+    // An array keeps the dictionary's decode order.
+    assert_eq!(
+        dictionary::parse_filter_chain(b"<< /Filter [/ASCII85Decode /ASCIIHexDecode] >>"),
+        vec![filters::Filter::Ascii85, filters::Filter::AsciiHex]
+    );
     // `/Filter` alone is not a filter name.
-    assert!(matches!(
-        classify_stream(b"<< /Filter >>"),
-        StreamEncoding::Plain
-    ));
+    assert!(dictionary::parse_filter_chain(b"<< /Filter >>").is_empty());
+    // `/Filters` is a different key.
+    assert!(dictionary::parse_filter_chain(b"<< /Filters 2 >>").is_empty());
+    // Image payload and aborting filters keep their classification.
+    let dct = dictionary::parse_filter_chain(b"<< /Filter /DCTDecode >>");
+    assert_eq!(dct, vec![filters::Filter::Dct]);
+    assert!(dct[0].is_image_payload());
+    let lzw = dictionary::parse_filter_chain(b"<< /Filter /LZWDecode >>");
+    assert_eq!(lzw, vec![filters::Filter::Lzw]);
+    assert!(lzw[0].aborts_extraction());
     assert!(contains_token(b"/Fl ", b"/Fl"));
     assert!(!contains_token(b"/FlateDecode", b"/Fl"));
+}
+
+#[test]
+fn decode_parms_are_read_from_the_stream_dictionary() {
+    assert_eq!(
+        dictionary::parse_decode_parms(b"<< /DecodeParms << /Predictor 12 /Columns 8 >> >>"),
+        vec![Some(predictor::PredictorParams {
+            predictor: 12,
+            columns: 8,
+            colors: 1,
+            bits_per_component: 8,
+        })]
+    );
+    assert_eq!(
+        dictionary::parse_decode_parms(b"<< /DP [null << /Predictor 11 >>] >>"),
+        vec![
+            None,
+            Some(predictor::PredictorParams {
+                predictor: 11,
+                ..predictor::PredictorParams::default()
+            }),
+        ]
+    );
+    assert!(dictionary::parse_decode_parms(b"<< /Length 5 >>").is_empty());
+}
+
+#[test]
+fn encoded_streams_are_decoded_before_the_text_operators_are_read() {
+    let hex = parse_pdf(&stream_object(
+        "/Filter /ASCIIHexDecode",
+        &ascii_hex_encode(b"BT (Hex decoded) Tj ET"),
+    ));
+    assert_eq!(hex.pages, vec!["Hex decoded"]);
+    assert!(!hex.incomplete);
+    assert!(hex.skipped_filters.is_empty());
+
+    let ascii85 = parse_pdf(&stream_object(
+        "/Filter /A85",
+        &ascii85_encode(b"BT (A85 decoded) Tj ET"),
+    ));
+    assert_eq!(ascii85.pages, vec!["A85 decoded"]);
+    assert!(!ascii85.incomplete);
+
+    let run_length = parse_pdf(&stream_object(
+        "/Filter /RunLengthDecode",
+        &run_length_encode(b"BT (Run length decoded) Tj ET"),
+    ));
+    assert_eq!(run_length.pages, vec!["Run length decoded"]);
+    assert!(!run_length.incomplete);
+}
+
+#[test]
+fn filter_chains_are_decoded_in_dictionary_order() {
+    // ASCII85 wraps the hex payload, so the array names ASCII85 first.
+    let payload = ascii85_encode(&ascii_hex_encode(b"BT (chained) Tj ET"));
+    let parsed = parse_pdf(&stream_object(
+        "/Filter [/ASCII85Decode /ASCIIHexDecode]",
+        &payload,
+    ));
+    assert_eq!(parsed.pages, vec!["chained"]);
+    assert!(!parsed.incomplete);
+
+    let payload = ascii85_encode(&run_length_encode(b"BT (run then a85) Tj ET"));
+    let parsed = parse_pdf(&stream_object("/Filter [/A85 /RL]", &payload));
+    assert_eq!(parsed.pages, vec!["run then a85"]);
+    assert!(!parsed.incomplete);
+}
+
+#[test]
+fn predictors_are_undone_after_their_filter() {
+    // Four-byte PNG `Up` rows over the padded content stream.
+    let rows = png_up_encode(b"BT (pred) Tj ET ", 4);
+    let payload = ascii_hex_encode(&rows);
+    let parsed = parse_pdf(&stream_object(
+        "/Filter /ASCIIHexDecode /DecodeParms << /Predictor 12 /Columns 4 >>",
+        &payload,
+    ));
+    assert_eq!(parsed.pages, vec!["pred"]);
+    assert!(!parsed.incomplete);
+
+    // A `null` entry before the predictor dictionary keeps its default.
+    let parsed = parse_pdf(&stream_object(
+        "/Filter [/A85 /ASCIIHexDecode] /DecodeParms [null << /Predictor 11 /Columns 4 >>]",
+        &ascii85_encode(&ascii_hex_encode(&png_up_encode(
+            b"BT (null safe) Tj ET",
+            4,
+        ))),
+    ));
+    assert_eq!(parsed.pages, vec!["null safe"]);
+    assert!(!parsed.incomplete);
+}
+
+#[test]
+fn skipped_streams_are_recorded_instead_of_disappearing() {
+    let mut body = stream_object(
+        "/Filter /ASCIIHexDecode",
+        &ascii_hex_encode(b"BT (kept) Tj ET"),
+    );
+    body.extend_from_slice(&stream_object("/Filter /DCTDecode", b"\xff\xd8\xff\xd9"));
+    body.extend_from_slice(&stream_object("/Filter /FlateDecode", b"not a zlib stream"));
+    body.extend_from_slice(&stream_object("/Filter /FooDecode", b"unknown payload"));
+    let parsed = parse_pdf(&body);
+
+    assert_eq!(parsed.pages, vec!["kept"]);
+    assert!(parsed.incomplete);
+    assert_eq!(
+        parsed.skipped_filters,
+        vec![
+            "DCTDecode".to_owned(),
+            "FlateDecode".to_owned(),
+            "FooDecode".to_owned(),
+        ]
+    );
+    assert_eq!(parsed.skipped_streams.len(), 3);
+    assert!(parsed.skipped_streams[0].starts_with("stream 1: image payload filter DCTDecode"));
+    assert!(parsed.skipped_streams[1].contains("FlateDecode decode failed"));
+    assert!(parsed.skipped_streams[2].contains("FooDecode"));
+}
+
+#[test]
+fn document_markers_default_to_a_complete_document() {
+    let parsed = parse_pdf(&stream_object("", b"BT (plain) Tj ET"));
+    assert_eq!(parsed.pages, vec!["plain"]);
+    assert!(!parsed.incomplete);
+    assert!(parsed.skipped_filters.is_empty());
+    assert!(parsed.skipped_streams.is_empty());
+    let default = PdfDocument::default();
+    assert!(!default.incomplete);
+    assert!(default.skipped_filters.is_empty());
+    assert!(default.skipped_streams.is_empty());
 }
 
 #[test]
@@ -174,4 +301,93 @@ fn literal_text(body: &str) -> String {
     let mut lexer = Lexer::new(input.as_bytes());
     lexer.pos = 1;
     decode_string(&lexer.read_literal())
+}
+
+/// Wraps `body` in a minimal PDF file.
+fn pdf_document(body: &[u8]) -> Vec<u8> {
+    let mut document = b"%PDF-1.7\n".to_vec();
+    document.extend_from_slice(body);
+    document.extend_from_slice(b"\n%%EOF\n");
+    document
+}
+
+/// Builds one stream object from extra dictionary entries and a payload.
+fn stream_object(dictionary_extra: &str, payload: &[u8]) -> Vec<u8> {
+    let mut object = format!(
+        "1 0 obj\n<< {dictionary_extra} /Length {} >>\nstream\n",
+        payload.len()
+    )
+    .into_bytes();
+    object.extend_from_slice(payload);
+    object.extend_from_slice(b"\nendstream\nendobj\n");
+    object
+}
+
+/// Parses a PDF built from `body`.
+fn parse_pdf(body: &[u8]) -> PdfDocument {
+    PdfParser::new().parse_bytes(&pdf_document(body)).unwrap()
+}
+
+/// Hex-encodes `data` with the `/ASCIIHexDecode` terminator.
+fn ascii_hex_encode(data: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = data
+        .iter()
+        .flat_map(|byte| format!("{byte:02X}").into_bytes())
+        .collect();
+    out.push(b'>');
+    out
+}
+
+/// Base-85 encodes `data` the way `/ASCII85Decode` expects.
+fn ascii85_encode(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for chunk in data.chunks(4) {
+        let mut group = [0u8; 4];
+        group[..chunk.len()].copy_from_slice(chunk);
+        let value = u32::from_be_bytes(group);
+        if chunk.len() == 4 && value == 0 {
+            out.push(b'z');
+            continue;
+        }
+        let mut digits = [0u8; 5];
+        let mut remaining = value;
+        for slot in digits.iter_mut().rev() {
+            *slot = (remaining % 85) as u8;
+            remaining /= 85;
+        }
+        let count = if chunk.len() == 4 { 5 } else { chunk.len() + 1 };
+        out.extend(digits.iter().take(count).map(|digit| b'!' + digit));
+    }
+    out.extend_from_slice(b"~>");
+    out
+}
+
+/// Run-length encodes `data` as literal runs plus one repeat run.
+fn run_length_encode(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for chunk in data.chunks(128) {
+        out.push((chunk.len() - 1) as u8);
+        out.extend_from_slice(chunk);
+    }
+    // A repeat run of two spaces, then the end-of-data marker.
+    out.push(255);
+    out.push(b' ');
+    out.push(128);
+    out
+}
+
+/// PNG `Up` encodes `data` as rows of `columns` bytes with a filter-type byte.
+fn png_up_encode(data: &[u8], columns: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut previous = vec![0u8; columns];
+    for row in data.chunks(columns) {
+        let mut raw = previous.clone();
+        raw[..row.len()].copy_from_slice(row);
+        out.push(2);
+        for index in 0..row.len() {
+            out.push(raw[index].wrapping_sub(previous[index]));
+        }
+        previous = raw;
+    }
+    out
 }

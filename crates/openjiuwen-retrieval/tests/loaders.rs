@@ -678,6 +678,14 @@ async fn auto_loader_reads_pdf_text_and_page_metadata() {
         documents[0].metadata.get("has_text"),
         Some(&Value::from(true))
     );
+    assert_eq!(
+        documents[0].metadata.get("pdf_incomplete"),
+        Some(&Value::from(false))
+    );
+    assert_eq!(
+        documents[0].metadata.get("pdf_skipped_filters"),
+        Some(&Value::Array(Vec::new()))
+    );
 }
 
 #[tokio::test]

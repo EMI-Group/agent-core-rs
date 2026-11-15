@@ -4,6 +4,7 @@
 
 Read binary documents without adding a compression, office-format, or PDF dependency.
 `DOCX`, `XLSX`, `PPTX`, and `ODT` are ZIP archives of XML parts and PDF content streams are often `zlib`-wrapped `DEFLATE`, so the module owns that container layer (reader plus a minimal writer), a tolerant XML parser, and the five document parsers built on them.
+PDF content streams are run through their `/Filter` chain (`ASCIIHexDecode`, `ASCII85Decode`, `RunLengthDecode`, `FlateDecode`) and `/DecodeParms` predictors before the text operators are read, and a stream that cannot be decoded is recorded on the document rather than dropped.
 Everything is offline and deterministic: no network, no OCR, no external binaries.
 Parsers return data structures (`DocxDocument`, `XlsxWorkbook`, `PptxDocument`, `OdtDocument`, `PdfDocument`); turning them into `crate::Document`s for indexing is a separate step, and XLSX is the only format that already exposes a `to_documents` conversion (via `TableData`).
 `ZipWriter` writes stored entries only — enough for DOCX/XLSX/PPTX/ODT fixtures in tests and tools without a ZIP crate.
@@ -91,12 +92,19 @@ Image text extraction (OCR) is unsupported in every format: images contribute no
 ### PDF (`pdf`)
 
 - `pdf::PdfParser` — `new()`, `parse_bytes(&[u8])`, async `parse_path(path)`.
-- `pdf::PdfDocument` — `text` (non-empty pages joined by `\n`), `pages` (one trimmed string per decoded content stream, in file order), `page_count`, `has_text`, `is_empty()`.
+- `pdf::PdfDocument` — `text` (non-empty pages joined by `\n`), `pages` (one trimmed string per decoded content stream, in file order), `page_count`, `has_text`, `is_empty()`, plus the completeness markers `incomplete`, `skipped_filters`, and `skipped_streams`, all `#[serde(default)]`.
+- `PdfDocument::incomplete` — `true` when at least one stream was skipped, so `text` is partial.
+- `PdfDocument::skipped_filters` — display names of the filters on skipped streams, deduplicated in first-seen order.
+- `PdfDocument::skipped_streams` — one record per skipped stream, `"stream {0-based ordinal}: {reason}"`, where the reason names the image payload filter or the filter whose decode failed.
 - `pdf::KERNING_SPACE_THRESHOLD` (-100.0) — negative `TJ` adjustments beyond it insert a space.
 - Text operators: `Tj`, `TJ` (strings and kerning numbers), `'`/`"` (newline first), `Td`/`TD`/`T*`/`Tm`/`BT`/`ET` (idempotent newline).
 - String decoding: literal strings with `\n \r \t \b \f \( \) \\`, balanced parentheses, line continuations and `\ddd` octal escapes; hex strings `<…>` (half byte completed with `0`); a UTF-16BE BOM switches either form to UTF-16BE, otherwise UTF-8 with a Latin-1 fallback.
-- Streams: uncompressed and `/FlateDecode` (`/Fl`) decoded with `zlib_decompress`; `/ASCIIHexDecode`, `/LZWDecode`, `/ASCII85Decode`, `/RunLengthDecode`, `/CCITTFaxDecode`, `/DCTDecode`, `/JPXDecode`, `/JBIG2Decode`, `/Crypt` are skipped with a `debug` log; an undecodable `FlateDecode` stream is skipped the same way.
-- Rejected with `Error::Unsupported`: `/Encrypt` anywhere in the file ("encrypted PDF"), and compressed object streams (`/Type /ObjStm`, which need cross-reference parsing).
+- Stream dictionary: `pdf::dictionary` reads the window before the `stream` keyword — `/Filter` (one `/Name` or a `[ … ]` array whose order is the decode order, long and abbreviated forms) and `/DecodeParms`/`/DP` (one `<< … >>` dictionary or an array aligned with the filters, `null` entries and indirect `N 0 R` values falling back to the defaults).
+- Filters (`pdf::filters`): `Filter` resolves `ASCIIHexDecode`/`AHx`, `ASCII85Decode`/`A85`, `LZWDecode`/`LZW`, `FlateDecode`/`Fl`, `RunLengthDecode`/`RL`, `CCITTFaxDecode`/`CCF`, `DCTDecode`/`DCT`, `JPXDecode`, `JBIG2Decode`, and `Crypt`, plus `Unknown(name)`; `is_image_payload()` marks CCITT/DCT/JPX/JBIG2 and `aborts_extraction()` marks LZW/Crypt.
+- Decoders (`pdf::filters::decode`, dispatched in dictionary order and each bounded by `DEFAULT_MAX_OUTPUT_BYTES`): `ascii_hex_decode` (hex pairs, `>` optional at the end, odd nibble completed low), `ascii85_decode` (`!`..`u` digits, `z` only between groups, `~>` optional at the end, 2..=4-character final group), `run_length_decode` (literal runs, repeat runs `257-len`, `128` end marker optional), `flate_decode` (`zlib_decompress`); an empty chain means the payload already is the content stream.
+- Predictors (`pdf::predictor`): `PredictorParams` (`predictor`, `columns`, `colors`, `bits_per_component`, defaults 1/1/1/8) is applied after the filter that names it — `1` is a passthrough, `2` is `TIFF` horizontal differencing for 1/2/4/8/16-bit samples, and `10`..`15` are the PNG row filters (None/Sub/Up/Average/Paeth over 8-bit components).
+- Skipped, recorded in the document markers with a `warn` log: a stream whose chain names an image payload filter, an unknown filter name, or a payload the filter chain or predictor cannot undo (the record says `"{filter} decode failed: {error}"`).
+- Rejected with `Error::Unsupported`: `/Encrypt` anywhere in the file ("encrypted PDF"), compressed object streams (`/Type /ObjStm`, which need cross-reference parsing), a `/LZWDecode` or `/Crypt` stream (`"… cannot be decoded: text extraction cannot continue"`), and a predictor value or bit depth that cannot be applied (`Predictor 3`, PNG predictor with `/BitsPerComponent 16`, TIFF predictor with `/BitsPerComponent 12`, `/Columns 0`).
 - A scanned or text-free document parses to `text == ""`, `pages == []`, `has_text == false` — never an error.
 - Page order is stream order (no xref table is parsed): one page per decoded content stream.
 
@@ -109,7 +117,7 @@ Image text extraction (OCR) is unsupported in every format: images contribute no
 
 - `Error::Validation` — structurally invalid data: bad `DEFLATE`/`zlib`/ZIP structure, malformed XML (unclosed element, mismatched end tag, unterminated comment/`CDATA`/processing instruction/attribute, text outside the root, nesting over `MAX_DEPTH`), malformed workbook/presentation/content part XML, `ZipWriter` limit violations, a PPTX archive with no reachable slide part (`"PPTX has no slides: …"`), and an ODT archive without `content.xml`.
 - `Error::Retrieval` — data ended early or failed integrity (`Adler-32`/`CRC-32` mismatch, truncated streams), and a DOCX/XLSX archive missing a required part (`word/document.xml`, `xl/workbook.xml`, a worksheet).
-- `Error::Unsupported` — deliberately unimplemented variants: `zlib` preset dictionaries, ZIP64/split/encrypted archives, non-stored/deflate methods, encrypted PDFs, PDF object streams, and stream filters the reader cannot interpret.
+- `Error::Unsupported` — deliberately unimplemented variants: `zlib` preset dictionaries, ZIP64/split/encrypted archives, non-stored/deflate methods, encrypted PDFs, PDF object streams, PDF `/LZWDecode` and `/Crypt` streams, and a PDF predictor or bit depth the crate cannot apply.
 - `Error::NotFound` — a requested ZIP entry or input file does not exist.
 - `Error::Transport` — any other I/O failure while reading a file.
 - Part parse failures carry their part path as context (`Error::with_context`) so the message names the part.
@@ -118,7 +126,8 @@ Image text extraction (OCR) is unsupported in every format: images contribute no
 
 - No new dependencies: everything is plain Rust over the existing workspace crates (`openjiuwen-common` only).
 - `#![forbid(unsafe_code)]`; files are read with `tokio::fs` so nothing blocks the runtime.
-- Every allocation is bounded by `max_output`/`DEFAULT_MAX_OUTPUT_BYTES` before bytes are appended; XML nesting is bounded by `MAX_DEPTH`, PDF arrays by depth and item count.
+- Every allocation is bounded by `max_output`/`DEFAULT_MAX_OUTPUT_BYTES` before bytes are appended (PDF filter decoders and predictors included); XML nesting is bounded by `MAX_DEPTH`, PDF arrays by depth and item count.
+- PDF filters and predictors are pure functions over bytes: no panics on crafted input, typed errors instead, `tracing` (`warn`/`debug`) only.
 - ZIP paths are byte-oriented: `/` separators and exact, case-sensitive lookups; `read_entry_ignore_case` is the documented ASCII-case-insensitive fallback; `ZipWriter` never normalises a name it is given.
 - Malformed input never panics: every slice access is bounds-checked or preceded by a length check.
 - Public data types are `serde`-serializable (`snake_case` with `#[serde(default)]` on documents), except the XML tree, which is an internal intermediate representation.
@@ -131,11 +140,13 @@ Image text extraction (OCR) is unsupported in every format: images contribute no
 - `xml.rs` unit tests: nesting/attributes/ordered children, entity decoding (named/decimal/hex/unknown), comments/`CDATA`/declarations/self-closing tags, preserved whitespace and multiple roots, every structural error, the depth guard, and local-name matching rules.
 - `docx.rs` unit tests: block rendering (headings, tabs/breaks, tables with escaped pipes, content-control wrappers), style-id → level mapping, cell text joining, blank paragraphs, missing document part.
 - `xlsx.rs` unit tests: shared/inline/numeric/boolean cells, gap rows and padding, multi-letter column references, number normalisation, rich-text shared strings with phonetic runs, relationship target normalisation, per-sheet ids and metadata, missing workbook part.
-- `pdf/tests.rs` unit tests: `Tj`/`TJ`/quote operators, kerning spaces, literal escapes/octal/nesting/continuations, hex and UTF-16BE strings, page ordering, stream dictionary classification, stream keyword delimiting, encrypted/object-stream rejections.
+- `pdf/tests.rs` unit tests: `Tj`/`TJ`/quote operators, kerning spaces, literal escapes/octal/nesting/continuations, hex and UTF-16BE strings, page ordering, `parse_filter_chain`/`parse_decode_parms` (single names, abbreviations, array order, `/Filter` alone, DCT image payload, LZW abort), end-to-end ASCIIHex/ASCII85/RunLength/chained/predicted streams, recorded skips, default markers, stream keyword delimiting, encrypted/object-stream rejections.
+- `pdf/filters.rs`, `pdf/predictor.rs`, and `pdf/dictionary.rs` keep their unit tests inline: every decoder's terminator/whitespace/overflow/bound case, both predictors' row reconstructions and unsupported parameters, dictionary keys versus look-alike names (`/Filters`, `/FlateDecode`, `/MyFilter`), `null`/indirect parameter entries, and array alignment.
 - `zip/writer/tests.rs` unit tests: stored-entry round-trips through `ZipArchive` (names, contents, order, `archive_size`, non-ASCII names), the empty archive, chaining, directory entries, the UTF-8/stored flags, every documented limit, and a hand-asserted single-entry byte layout.
 - `pptx/tests.rs` unit tests (fixtures via `ZipWriter`): presentation relationship order beating numeric order, numeric fallback (`slide2` before `slide10`), multi-run paragraphs and `<a:br>`, table Markdown with escaped pipes, notes and `sldNum` skipping, `dc:title`, missing slides, malformed parts, non-ZIP bytes, `parse_path`.
 - `odt/tests.rs` unit tests (fixtures via `ZipWriter`): headings with outline levels, paragraphs, inline space runs/tabs/line breaks/spans, tables with covered cells and escaped pipes, flattened lists, empty documents, missing/malformed `content.xml`, `meta.xml` title, `parse_path`, and JSON round-trip.
-- `tests/parsing_documents.rs` (integration): byte-built stored ZIP fixtures (`build_zip`) and `zlib_stored` PDF streams cover DOCX end to end (title, blocks, empty document, missing part, corrupt ZIP, `parse_path`), XLSX (two sheets with relative and absolute relationship targets, shared/inline/numeric/boolean cells, gap rows, four-column width, row and column documents with ids/metadata, missing parts, no-relationship fallback, empty workbook, `parse_path`), and PDF (uncompressed text, `TJ` kerning plus escapes and hex, `FlateDecode`, multi-stream ordering, unsupported-filter skipping, `/Encrypt`, `/ObjStm`, text-free documents, `parse_path`).
+- `tests/parsing_documents.rs` (integration): byte-built stored ZIP fixtures (`build_zip`) and `zlib_stored` PDF streams cover DOCX end to end (title, blocks, empty document, missing part, corrupt ZIP, `parse_path`), XLSX (two sheets with relative and absolute relationship targets, shared/inline/numeric/boolean cells, gap rows, four-column width, row and column documents with ids/metadata, missing parts, no-relationship fallback, empty workbook, `parse_path`), and PDF (uncompressed text, `TJ` kerning plus escapes and hex, `FlateDecode`, multi-stream ordering, skipped-image-stream recording, `/Encrypt`, `/ObjStm`, text-free documents with the completeness markers, `parse_path`).
+- `tests/parsing_pdf_filters.rs` (integration): the full filter pipeline with byte-built fixtures — ASCIIHex, ASCII85 (with a `z` group and a partial final group), RunLength, the `/ASCII85Decode`→`/ASCIIHexDecode` and `/ASCII85Decode`→`/RunLengthDecode` chains, Flate plus `/Predictor 12`, a `[null << /Predictor 11 >>]` parameter array, `/LZWDecode` and `/LZW` rejections, DCT/garbage-Flate/unknown-filter recording and dedup, and the serialised `incomplete`/`skipped_filters`/`skipped_streams` markers.
 - `tests/parsing_zip.rs` (integration): archives assembled byte by byte, stored and deflated entries, CRC/size failures, unsupported method/encryption/ZIP64/split archives, missing EOCD, `read_text`, `read_entry_ignore_case`, `open` against `tempfile`.
 - Tests are offline and deterministic; no wall-clock, no network, no random ordering.
 
@@ -153,6 +164,9 @@ Image text extraction (OCR) is unsupported in every format: images contribute no
 - `./pptx/tests.rs` → PPTX unit tests and `ZipWriter`-built fixtures
 - `./odt.rs` → `OdtParser`/`OdtDocument`, OpenDocument body walk, inline content, tables, `meta.xml` title
 - `./odt/tests.rs` → ODT unit tests and `ZipWriter`-built fixtures
-- `./pdf.rs` → `PdfParser`/`PdfDocument`, stream scanning, filter classification, content-stream text operators
+- `./pdf.rs` → `PdfParser`/`PdfDocument`, stream scanning, the decode pipeline (`decode_stream`, `ExtractedStreams`), content-stream text operators
+- `./pdf/filters.rs` → `Filter` and the ASCIIHex/ASCII85/RunLength/Flate decoders
+- `./pdf/predictor.rs` → `PredictorParams` and the TIFF/PNG predictor reconstruction
+- `./pdf/dictionary.rs` → `/Filter` chain and `/DecodeParms` window parsing
 - `./pdf/tests.rs` → PDF unit tests
 - `./mod.rs` → module root, re-exports, and the document-layer overview
