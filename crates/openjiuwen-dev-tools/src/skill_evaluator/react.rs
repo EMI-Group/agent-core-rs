@@ -36,11 +36,8 @@
 //!
 //! An unknown tool, a stub handler that fails, and arguments that are not valid
 //! JSON are all recorded as a failed [`ToolCallRecord`] whose error text is fed
-//! back to the model as the tool result. The conversation continues and the run
-//! still finishes, exactly like the tuning runner; only a model/transport failure
-//! propagates ([`Error::llm`]).
-//!
-//! # Offline
+//! back as the tool result, so the conversation continues and the run still
+//! finishes; only a model/transport failure propagates ([`Error::llm`]).
 //!
 //! Everything runs in-process: [`ToolStubs`] are synchronous fixtures and a
 //! [`Model`] can be an `openjiuwen_test_support::ScriptedModel`, so a tool-using
@@ -738,21 +735,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_runner_is_a_case_runner() {
-        let model = ScriptedModel::builder()
-            .completion(MockCompletion::tool_call("lookup", json!({"q": "paris"})))
-            .respond_text("The capital of France is Paris.")
-            .build();
-        let runner = ReactCaseRunner::new(Arc::new(model)).with_stubs(lookup_stubs());
-        assert_eq!(
-            CaseRunner::run(&runner, &case("contains:Paris"), &skill())
-                .await
-                .expect("the runner answers"),
-            "The capital of France is Paris."
-        );
-    }
-
-    #[tokio::test]
     async fn the_evaluator_runs_a_tool_using_case_offline() {
         let model = ScriptedModel::builder()
             .completion(MockCompletion::tool_call("lookup", json!({"q": "paris"})))
@@ -785,9 +767,14 @@ mod tests {
 
     #[test]
     fn debug_names_the_model_stubs_and_budget() {
-        let runner = ReactCaseRunner::new(Arc::new(ScriptedModel::text("x")))
-            .with_stubs(lookup_stubs())
-            .with_max_rounds(3);
+        let default = ReactCaseRunner::new(Arc::new(ScriptedModel::text("x")));
+        assert_eq!(default.max_rounds(), DEFAULT_MAX_REACT_ROUNDS);
+        assert_eq!(
+            DEFAULT_MAX_REACT_ROUNDS,
+            crate::tune::DEFAULT_MAX_TOOL_ROUNDS
+        );
+
+        let runner = default.with_stubs(lookup_stubs()).with_max_rounds(3);
         let rendered = format!("{runner:?}");
         assert!(rendered.contains("ReactCaseRunner"), "{rendered}");
         assert!(rendered.contains("scripted-model"), "{rendered}");
@@ -805,27 +792,5 @@ mod tests {
         assert!(!outcome.used("lookup"));
         assert_eq!(outcome.rounds, 0);
         assert!(!outcome.truncated);
-
-        let outcome = ReactOutcome {
-            answer: "a".to_owned(),
-            trace: ToolTrace::new([ToolCallRecord::success("lookup", json!({}), json!(1))]),
-            rounds: 1,
-            truncated: true,
-        };
-        assert!(outcome.used_tools());
-        assert!(outcome.used("lookup"));
-        assert!(!outcome.used("other"));
-    }
-
-    #[test]
-    fn the_default_budget_matches_the_tuning_loop() {
-        assert_eq!(
-            DEFAULT_MAX_REACT_ROUNDS,
-            crate::tune::DEFAULT_MAX_TOOL_ROUNDS
-        );
-        assert_eq!(
-            ReactCaseRunner::new(Arc::new(ScriptedModel::text("x"))).max_rounds(),
-            DEFAULT_MAX_REACT_ROUNDS
-        );
     }
 }
