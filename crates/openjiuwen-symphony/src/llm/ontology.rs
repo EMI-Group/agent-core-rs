@@ -18,8 +18,10 @@
 //! ```
 //!
 //! Blank fields and empty arrays are pruned so the prompt stays short, and descriptions
-//! are truncated to 240 characters. The reply must be
-//! `{"matches":[{"id","direction","confidence","reason"}]}`; everything after that is
+//! are truncated to 240 characters. The request shape itself — the system instruction,
+//! the direction tokens and the description budget — is built by the crate-private
+//! `llm::ontology_request` module; the reply must be
+//! `{"matches":[{"id","direction","confidence","reason"}]}`, and everything after that is
 //! validated here, never trusted:
 //!
 //! - an unknown id, a duplicate id, a direction other than `forward`/`reverse`, or a
@@ -50,6 +52,31 @@
 //! candidate's confidence, and [`MatchStrategy::TextualCoercion`](crate::orchestration::MatchStrategy) `0.75`. Every match
 //! then reports method [`METHOD_DETERMINISTIC`](crate::llm::ontology::METHOD_DETERMINISTIC) and `accepted = confidence >= threshold`.
 //! [`FallbackMode::Error`](crate::llm::FallbackMode) surfaces the model failure instead.
+//!
+//! # Provenance
+//!
+//! A matcher wraps an optional model and silently answers from the candidate rule when no
+//! model is wired, so a bare [`OntologyMatch`] cannot tell a caller which path produced it.
+//! [`MatchedVerdict`](crate::llm::ontology::MatchedVerdict) pairs the verdict with the
+//! [`StageProvenance`] that produced it, and the two detailed
+//! entry points — [`OntologyMatcher::match_candidates_detailed`] and
+//! [`OntologyMatcher::match_candidates_with_detailed`] — return it.
+//! [`OntologyMatcher::match_candidates`] and [`OntologyMatcher::match_candidates_with`]
+//! keep their signatures and return only the verdicts.
+//!
+//! | Path | Provenance | Log record |
+//! | --- | --- | --- |
+//! | nothing to match (every candidate is skipped) | — | none: nothing was asked and nothing was degraded |
+//! | no model configured | [`StageProvenance::NoModel`] | exactly one `tracing::debug!` naming the stage and the candidate rule |
+//! | the model answered (one pass, or both consensus passes) | [`StageProvenance::Model`] | none |
+//! | a cached answer was replayed | [`StageProvenance::Model`] | none — only a model answer is ever cached |
+//! | the model failed or answered unusably under [`FallbackMode::Deterministic`](crate::llm::FallbackMode) | [`StageProvenance::DeterministicFallback`] | exactly one `tracing::warn!` naming the stage and the candidate rule |
+//! | the model failed under [`FallbackMode::Error`](crate::llm::FallbackMode) | the typed [`Error::Llm`](crate::error::Error::Llm) is returned | no fallback record |
+//!
+//! Those are the only fallback records. Reply-validation diagnostics — a dropped malformed
+//! item, a skipped candidate whose capability is not in the catalog, an unusable cached
+//! answer — are per-candidate records of a different kind, so one call can log several of
+//! them without contradicting the single fallback record.
 //!
 //! # Bounds
 //!
@@ -99,12 +126,15 @@ use crate::llm::cache::{
 use crate::llm::identity::{
     canonical_json, graph_identity_sha256, stable_metadata_sha256, ModelIdentity, IDENTITY_VERSION,
 };
-use crate::model::{CapabilityDescriptor, CapabilityIo};
+use crate::model::CapabilityDescriptor;
 use crate::orchestration::{MatchStrategy, RelationCandidate};
 
+use super::ontology_request::{
+    request_json, DESCRIPTION_LIMIT, DIRECTION_FORWARD, DIRECTION_REVERSE, SYSTEM_PROMPT,
+};
 use super::{
-    clamp_unit, complete_json, dedupe_strings, truncate_text, CompletionModel, FallbackMode,
-    ModelConfig,
+    clamp_unit, complete_json, note_fallback, note_no_model, CompletionModel, FallbackMode,
+    ModelConfig, StageProvenance,
 };
 
 /// The `method` recorded for a single LLM pass.
@@ -125,17 +155,6 @@ const NO_MODEL_BACKEND: &str = "none";
 const DEFAULT_THRESHOLD: f64 = 0.7;
 /// The default cap on candidates matched per call.
 const DEFAULT_MAX_CANDIDATES: usize = 32;
-/// How many characters of a description are sent to the model.
-const DESCRIPTION_LIMIT: usize = 240;
-/// The system instruction sent with every match request.
-const SYSTEM_PROMPT: &str = "Validate whether each candidate Skill output can feed the target input. \
-Return JSON only: {\"matches\":[{\"id\":\"c1\",\"direction\":\"forward|reverse\",\"confidence\":0.0,\"reason\":\"optional short reason\"}]}. \
-Use \"forward\" when the source output feeds the target input and \"reverse\" when the target output feeds the source. \
-Confidence must be between 0 and 1. Omit candidates that cannot feed each other.";
-/// The forward direction token.
-const DIRECTION_FORWARD: &str = "forward";
-/// The reverse direction token.
-const DIRECTION_REVERSE: &str = "reverse";
 
 /// One validated `can_feed` verdict between two capabilities.
 ///
@@ -176,6 +195,44 @@ impl OntologyMatch {
             reasons: Vec::new(),
             accepted: false,
         }
+    }
+}
+
+/// One validated `can_feed` verdict plus where it came from.
+///
+/// [`OntologyMatch`] alone cannot distinguish a model verdict from the candidate rule the
+/// matcher falls back to, so the detailed entry points pair each verdict with the
+/// [`StageProvenance`] that produced it. A payload written before provenance existed
+/// deserializes as [`StageProvenance::NoModel`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", default)]
+pub struct MatchedVerdict {
+    /// The verdict itself, sorted and thresholded exactly as before.
+    pub verdict: OntologyMatch,
+    /// Where the verdict came from.
+    pub provenance: StageProvenance,
+}
+
+impl MatchedVerdict {
+    /// Builds a verdict with its provenance.
+    #[must_use]
+    pub fn new(verdict: OntologyMatch, provenance: StageProvenance) -> Self {
+        Self {
+            verdict,
+            provenance,
+        }
+    }
+
+    /// Whether the verdict passes the configured threshold.
+    #[must_use]
+    pub fn accepted(&self) -> bool {
+        self.verdict.accepted
+    }
+
+    /// Whether a model produced the verdict.
+    #[must_use]
+    pub fn is_model_backed(&self) -> bool {
+        self.provenance.is_model()
     }
 }
 
@@ -445,7 +502,9 @@ impl OntologyMatcher {
     /// Matches are sorted by `(source_id, target_id)`; low-confidence verdicts are
     /// returned with `accepted: false` so a caller can log them. Cache hits are honoured;
     /// use [`OntologyMatcher::match_candidates_with`] with
-    /// [`MatchOptions::with_force`] to bypass them.
+    /// [`MatchOptions::with_force`] to bypass them. Use
+    /// [`OntologyMatcher::match_candidates_detailed`] to learn where each verdict came
+    /// from.
     ///
     /// # Errors
     ///
@@ -470,15 +529,64 @@ impl OntologyMatcher {
         candidates: &[RelationCandidate],
         options: &MatchOptions,
     ) -> Result<Vec<OntologyMatch>> {
+        let detailed = self
+            .match_candidates_with_detailed(candidates, options)
+            .await?;
+        Ok(detailed
+            .into_iter()
+            .map(|verdict| verdict.verdict)
+            .collect())
+    }
+
+    /// Validates `candidates`, reporting each verdict with its [`StageProvenance`].
+    ///
+    /// The verdicts are exactly what [`OntologyMatcher::match_candidates`] returns, sorted
+    /// by `(source_id, target_id)`; the provenance tells a model answer from the
+    /// deterministic fallback (see the module docs for the per-path table).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Llm`] when [`FallbackMode::Error`] is configured and the model
+    /// call fails or its reply is unusable.
+    pub async fn match_candidates_detailed(
+        &self,
+        candidates: &[RelationCandidate],
+    ) -> Result<Vec<MatchedVerdict>> {
+        self.match_candidates_with_detailed(candidates, &MatchOptions::default())
+            .await
+    }
+
+    /// Validates `candidates` with explicit [`MatchOptions`], reporting each verdict with
+    /// its [`StageProvenance`].
+    ///
+    /// An empty batch answers no verdicts without logging: nothing was asked of a model
+    /// and nothing was degraded. With no model configured every verdict is
+    /// [`StageProvenance::NoModel`] and exactly one `debug!` is recorded. A successful
+    /// model pass (single or consensus) and every replayed cache hit are
+    /// [`StageProvenance::Model`]. A failed or unusable model pass under
+    /// [`FallbackMode::Deterministic`] answers from the candidate rule with
+    /// [`StageProvenance::DeterministicFallback`] and exactly one `warn!`; under
+    /// [`FallbackMode::Error`] the typed [`Error::Llm`] is returned instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Llm`] when [`FallbackMode::Error`] is configured and the model
+    /// call fails or its reply is unusable.
+    pub async fn match_candidates_with_detailed(
+        &self,
+        candidates: &[RelationCandidate],
+        options: &MatchOptions,
+    ) -> Result<Vec<MatchedVerdict>> {
         let batch = self.select_batch(candidates);
         if batch.is_empty() {
             return Ok(Vec::new());
         }
         let Some(model) = self.config.model.as_deref() else {
-            return Ok(self.deterministic_matches(&batch));
+            note_no_model("ontology matcher", "the candidate rule's own confidence");
+            return Ok(self.deterministic_verdicts(&batch, StageProvenance::NoModel));
         };
         let Some(cache) = self.cache.as_ref() else {
-            return Ok(self.resolve(model, &batch).await?.matches);
+            return Ok(self.resolve(model, &batch).await?.into_verdicts());
         };
 
         let signature = self.matcher_signature();
@@ -486,7 +594,7 @@ impl OntologyMatcher {
             .iter()
             .map(|entry| cache_key_for(entry, &signature))
             .collect();
-        let mut resolved: Vec<OntologyMatch> = Vec::new();
+        let mut resolved: Vec<MatchedVerdict> = Vec::new();
         let mut misses: Vec<(usize, BatchEntry<'_>)> = Vec::new();
         if options.force {
             misses.extend(batch.iter().cloned().enumerate());
@@ -497,7 +605,12 @@ impl OntologyMatcher {
             for (index, entry) in batch.iter().enumerate() {
                 if let Some(record) = guard.lookup(&keys[index]).await {
                     if let Some(matches) = decode_cached_matches(&record) {
-                        resolved.extend(matches);
+                        // Only a model answer is ever cached, so a replay is model-backed.
+                        resolved.extend(
+                            matches
+                                .into_iter()
+                                .map(|item| MatchedVerdict::new(item, StageProvenance::Model)),
+                        );
                         continue;
                     }
                     tracing::warn!(
@@ -509,14 +622,14 @@ impl OntologyMatcher {
             }
         }
         if misses.is_empty() {
-            sort_matches(&mut resolved);
+            sort_verdicts(&mut resolved);
             return Ok(resolved);
         }
 
         let miss_batch: Vec<BatchEntry<'_>> =
             misses.iter().map(|(_, entry)| entry.clone()).collect();
         let fresh = self.resolve(model, &miss_batch).await?;
-        if fresh.from_model {
+        if fresh.provenance.is_model() {
             let mut guard = cache.lock().await;
             for (index, entry) in &misses {
                 let selected: Vec<OntologyMatch> = fresh
@@ -544,8 +657,8 @@ impl OntologyMatcher {
                 }
             }
         }
-        resolved.extend(fresh.matches);
-        sort_matches(&mut resolved);
+        resolved.extend(fresh.into_verdicts());
+        sort_verdicts(&mut resolved);
         Ok(resolved)
     }
 
@@ -560,14 +673,14 @@ impl OntologyMatcher {
             Err(error) => {
                 return Ok(Resolved {
                     matches: self.on_failure(batch, &error)?,
-                    from_model: false,
+                    provenance: StageProvenance::DeterministicFallback,
                 });
             }
         };
         if !self.config.require_consensus {
             return Ok(Resolved {
                 matches: forward,
-                from_model: true,
+                provenance: StageProvenance::Model,
             });
         }
         let reverse = match self.ask(model, batch, true).await {
@@ -575,13 +688,13 @@ impl OntologyMatcher {
             Err(error) => {
                 return Ok(Resolved {
                     matches: self.on_failure(batch, &error)?,
-                    from_model: false,
+                    provenance: StageProvenance::DeterministicFallback,
                 });
             }
         };
         Ok(Resolved {
             matches: self.consensus(&forward, &reverse),
-            from_model: true,
+            provenance: StageProvenance::Model,
         })
     }
 
@@ -647,7 +760,11 @@ impl OntologyMatcher {
             .enumerate()
             .map(|(index, entry)| (format!("c{}", index + 1), entry))
             .collect();
-        let request = request_json(&labelled);
+        let described: Vec<(String, &CapabilityDescriptor, &CapabilityDescriptor)> = labelled
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.source, entry.target))
+            .collect();
+        let request = request_json(&described);
         let user = serde_json::to_string(&request).map_err(|error| {
             Error::llm(format!(
                 "ontology matcher: request could not be serialized: {error}"
@@ -826,12 +943,18 @@ impl OntologyMatcher {
     }
 
     /// Applies the configured fallback to a failed model pass.
+    ///
+    /// The deterministic rule answers under [`FallbackMode::Deterministic`] after exactly
+    /// one [`note_fallback`] record naming the stage and that rule; under
+    /// [`FallbackMode::Error`] the typed error is returned and nothing is logged as a
+    /// fallback.
     fn on_failure(&self, batch: &[BatchEntry<'_>], error: &Error) -> Result<Vec<OntologyMatch>> {
         match self.config.fallback {
             FallbackMode::Deterministic => {
-                tracing::warn!(
-                    %error,
-                    "ontology matcher: model pass failed; using the deterministic candidate confidence"
+                note_fallback(
+                    "ontology matcher",
+                    "the candidate rule's own confidence",
+                    error,
                 );
                 Ok(self.deterministic_matches(batch))
             }
@@ -840,6 +963,18 @@ impl OntologyMatcher {
                 error.message()
             ))),
         }
+    }
+
+    /// Derives the deterministic verdicts, marked with the `provenance` that caused them.
+    fn deterministic_verdicts(
+        &self,
+        batch: &[BatchEntry<'_>],
+        provenance: StageProvenance,
+    ) -> Vec<MatchedVerdict> {
+        self.deterministic_matches(batch)
+            .into_iter()
+            .map(|item| MatchedVerdict::new(item, provenance))
+            .collect()
     }
 }
 
@@ -860,8 +995,20 @@ struct BatchEntry<'a> {
 struct Resolved {
     /// The matches the passes produced.
     matches: Vec<OntologyMatch>,
-    /// Whether they came from the model (`false` means the deterministic fallback ran).
-    from_model: bool,
+    /// Where they came from: [`StageProvenance::Model`], or
+    /// [`StageProvenance::DeterministicFallback`] when the candidate rule answered.
+    provenance: StageProvenance,
+}
+
+impl Resolved {
+    /// Pairs every match with this resolution's provenance.
+    fn into_verdicts(self) -> Vec<MatchedVerdict> {
+        let provenance = self.provenance;
+        self.matches
+            .into_iter()
+            .map(|item| MatchedVerdict::new(item, provenance))
+            .collect()
+    }
 }
 
 /// Returns the cache key for one batch entry and the matcher `signature`.
@@ -882,96 +1029,6 @@ fn cache_key_for(entry: &BatchEntry<'_>, signature: &str) -> String {
     )
 }
 
-/// Builds the compact request batch, pruning blank fields and empty arrays.
-fn request_json(labelled: &[(String, &BatchEntry<'_>)]) -> Value {
-    let candidates: Vec<Value> = labelled
-        .iter()
-        .map(|(id, entry)| {
-            let mut object = Map::new();
-            object.insert("id".to_string(), Value::String(id.clone()));
-            object.insert("source".to_string(), brief(entry.source));
-            object.insert("target".to_string(), brief(entry.target));
-            let directions = directions(entry.source, entry.target);
-            if directions.as_object().is_some_and(|map| !map.is_empty()) {
-                object.insert("directions".to_string(), directions);
-            }
-            Value::Object(object)
-        })
-        .collect();
-    let mut root = Map::new();
-    root.insert("candidates".to_string(), Value::Array(candidates));
-    Value::Object(root)
-}
-
-/// The short source/target description sent to the model.
-fn brief(capability: &CapabilityDescriptor) -> Value {
-    let mut object = Map::new();
-    insert_text(&mut object, "name", &capability.name);
-    let description = truncate_text(&capability.description, DESCRIPTION_LIMIT);
-    insert_text(&mut object, "description", description);
-    Value::Object(object)
-}
-
-/// Both directions of one candidate, each pruned to its non-empty parts.
-fn directions(source: &CapabilityDescriptor, target: &CapabilityDescriptor) -> Value {
-    let mut object = Map::new();
-    let forward = direction(&source.outputs, &target.inputs);
-    if forward.as_object().is_some_and(|map| !map.is_empty()) {
-        object.insert(DIRECTION_FORWARD.to_string(), forward);
-    }
-    let reverse = direction(&target.outputs, &source.inputs);
-    if reverse.as_object().is_some_and(|map| !map.is_empty()) {
-        object.insert(DIRECTION_REVERSE.to_string(), reverse);
-    }
-    Value::Object(object)
-}
-
-/// One direction: the produced outputs, the consumed inputs, and their port names.
-fn direction(outputs: &[CapabilityIo], inputs: &[CapabilityIo]) -> Value {
-    let mut object = Map::new();
-    let produced = io_values(outputs);
-    if !produced.is_empty() {
-        object.insert("outputs".to_string(), Value::Array(produced));
-    }
-    let consumed = io_values(inputs);
-    if !consumed.is_empty() {
-        object.insert("inputs".to_string(), Value::Array(consumed));
-    }
-    let ports = dedupe_strings(outputs.iter().chain(inputs).map(|io| io.name.clone()));
-    if !ports.is_empty() {
-        object.insert(
-            "ports".to_string(),
-            Value::Array(ports.into_iter().map(Value::String).collect()),
-        );
-    }
-    Value::Object(object)
-}
-
-/// The pruned `{name, type}` list of one IO declaration list.
-fn io_values(ios: &[CapabilityIo]) -> Vec<Value> {
-    ios.iter()
-        .filter_map(|io| {
-            let mut object = Map::new();
-            insert_text(&mut object, "name", &io.name);
-            insert_text(&mut object, "type", &io.io_type);
-            if object.is_empty() {
-                None
-            } else {
-                Some(Value::Object(object))
-            }
-        })
-        .collect()
-}
-
-/// Inserts `text` under `key` unless it is blank.
-fn insert_text(object: &mut Map<String, Value>, key: &str, text: &str) {
-    let text = text.trim();
-    if text.is_empty() {
-        return;
-    }
-    object.insert(key.to_string(), Value::String(text.to_string()));
-}
-
 /// The unordered capability pair of a match, used to compare the two passes.
 fn unordered_pair(item: &OntologyMatch) -> (String, String) {
     if item.source_id <= item.target_id {
@@ -990,62 +1047,69 @@ fn sort_matches(matches: &mut [OntologyMatch]) {
     });
 }
 
+/// Sorts verdicts by `(source_id, target_id)`, leaving the provenance attached.
+fn sort_verdicts(verdicts: &mut [MatchedVerdict]) {
+    verdicts.sort_by(|left, right| {
+        left.verdict
+            .source_id
+            .cmp(&right.verdict.source_id)
+            .then(left.verdict.target_id.cmp(&right.verdict.target_id))
+    });
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+    use crate::llm::StaticCompletionModel;
+    use crate::model::CapabilityIo;
 
-    fn entry() -> Value {
-        let source = CapabilityDescriptor::new("tool", "a", "Extract")
-            .with_description("Extracts text from a document")
-            .with_outputs(vec![CapabilityIo::new("text", "string")]);
-        let target = CapabilityDescriptor::new("tool", "b", "Summarise")
-            .with_inputs(vec![CapabilityIo::new("text", "string")]);
-        directions(&source, &target)
+    /// The three-capability catalog the matcher tests describe candidates from.
+    fn catalog() -> Vec<CapabilityDescriptor> {
+        vec![
+            CapabilityDescriptor::new("tool", "a", "Extract")
+                .with_outputs(vec![CapabilityIo::new("text", "string")]),
+            CapabilityDescriptor::new("tool", "b", "Summarise")
+                .with_inputs(vec![CapabilityIo::new("text", "string")])
+                .with_outputs(vec![CapabilityIo::new("summary", "string")]),
+            CapabilityDescriptor::new("tool", "c", "Publish")
+                .with_inputs(vec![CapabilityIo::new("summary", "string")]),
+        ]
     }
 
-    #[test]
-    fn brief_prunes_blank_fields_and_truncates_descriptions() {
-        let capability = CapabilityDescriptor::new("tool", "a", "Name")
-            .with_description("x".repeat(DESCRIPTION_LIMIT + 40));
-        let value = brief(&capability);
-        let object = value.as_object().unwrap();
-        assert_eq!(object.len(), 2);
-        assert_eq!(
-            object["description"].as_str().unwrap().chars().count(),
-            DESCRIPTION_LIMIT
-        );
+    /// Builds a candidate from `tool:a` to `tool:b`.
+    fn candidate(strategy: MatchStrategy, confidence: f64) -> RelationCandidate {
+        crate::orchestration::RelationCandidate {
+            source: "tool:a".to_string(),
+            target: "tool:b".to_string(),
+            relation: CAN_FEED.to_string(),
+            confidence,
+            strategy,
+            matched_input: None,
+            matched_output: None,
+        }
     }
 
-    #[test]
-    fn directions_carry_outputs_inputs_and_ports() {
-        let value = entry();
-        let object = value.as_object().unwrap();
-        let forward = object[DIRECTION_FORWARD].as_object().unwrap();
-        assert_eq!(forward["outputs"][0]["name"], "text");
-        assert_eq!(forward["ports"][0], "text");
-        // The reverse direction has no outputs and no inputs, so it is pruned.
-        assert!(!object.contains_key(DIRECTION_REVERSE));
+    /// A model that always fails, reporting `name` as its identity.
+    struct FailingModel(&'static str);
 
-        let source = CapabilityDescriptor::new("tool", "a", "A")
-            .with_inputs(vec![CapabilityIo::new("in", "string")]);
-        let target = CapabilityDescriptor::new("tool", "b", "B")
-            .with_outputs(vec![CapabilityIo::new("out", "string")]);
-        let reverse_only = directions(&source, &target);
-        let object = reverse_only.as_object().unwrap();
-        assert!(!object.contains_key(DIRECTION_FORWARD));
-        let reverse = object[DIRECTION_REVERSE].as_object().unwrap();
-        assert_eq!(reverse["outputs"][0]["name"], "out");
-        assert_eq!(reverse["ports"][0], "out");
+    #[async_trait::async_trait]
+    impl CompletionModel for FailingModel {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        async fn complete(&self, _prompt: &str) -> Result<String> {
+            Err(Error::llm("provider unavailable"))
+        }
     }
 
-    #[test]
-    fn insert_text_skips_blank_values() {
-        let mut object = Map::new();
-        insert_text(&mut object, "name", "  ");
-        assert!(object.is_empty());
-        insert_text(&mut object, "name", " value ");
-        assert_eq!(object["name"], "value");
+    /// Wraps a scripted model replaying `replies` in order.
+    fn scripted(replies: &[&str]) -> Arc<StaticCompletionModel> {
+        Arc::new(StaticCompletionModel::new(
+            replies.iter().map(|reply| (*reply).to_string()).collect(),
+        ))
     }
 
     #[test]
@@ -1061,5 +1125,186 @@ mod tests {
             unordered_pair(&item),
             ("tool:a".to_string(), "tool:b".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn no_model_reports_no_model_provenance() {
+        let matcher = OntologyMatcher::new(catalog())
+            .with_config(OntologyConfig::new().with_consensus(false));
+        let verdicts = matcher
+            .match_candidates_detailed(&[
+                candidate(MatchStrategy::ExactIo, 1.0),
+                candidate(MatchStrategy::SemanticOverlap, 0.2),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(verdicts.len(), 2);
+        for verdict in &verdicts {
+            assert_eq!(verdict.provenance, StageProvenance::NoModel);
+            assert_eq!(verdict.verdict.method, METHOD_DETERMINISTIC);
+            assert_eq!(verdict.accepted(), verdict.verdict.confidence >= 0.7);
+            assert!(!verdict.is_model_backed());
+        }
+        assert!(verdicts[0].accepted(), "ExactIo is accepted");
+        assert!(!verdicts[1].accepted(), "0.2 is below the threshold");
+
+        // The verdict-only entry points return the same matches.
+        let matches = matcher
+            .match_candidates(&[candidate(MatchStrategy::ExactIo, 1.0)])
+            .await
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].method, METHOD_DETERMINISTIC);
+    }
+
+    #[tokio::test]
+    async fn scripted_model_reports_model_provenance() {
+        let matcher = OntologyMatcher::new(catalog()).with_config(
+            OntologyConfig::new()
+                .with_consensus(false)
+                .with_model(scripted(&[
+                    r#"{"matches":[{"id":"c1","direction":"forward","confidence":0.9}]}"#,
+                ])),
+        );
+        let verdicts = matcher
+            .match_candidates_detailed(&[candidate(MatchStrategy::TextualCoercion, 0.4)])
+            .await
+            .unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].provenance, StageProvenance::Model);
+        assert!(verdicts[0].is_model_backed());
+        assert_eq!(verdicts[0].verdict.method, METHOD_LLM);
+        assert_eq!(verdicts[0].verdict.confidence, 0.9);
+        assert!(verdicts[0].accepted());
+    }
+
+    #[tokio::test]
+    async fn consensus_reports_model_provenance() {
+        let forward = r#"{"matches":[{"id":"c1","direction":"forward","confidence":0.9}]}"#;
+        let reverse = r#"{"matches":[{"id":"c1","direction":"forward","confidence":0.8}]}"#;
+        let matcher = OntologyMatcher::new(catalog()).with_model(scripted(&[forward, reverse]));
+        let verdicts = matcher
+            .match_candidates_detailed(&[candidate(MatchStrategy::ExactIo, 1.0)])
+            .await
+            .unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].provenance, StageProvenance::Model);
+        assert_eq!(verdicts[0].verdict.method, METHOD_CONSENSUS);
+        assert_eq!(verdicts[0].verdict.confidence, 0.8);
+    }
+
+    #[tokio::test]
+    async fn failing_model_reports_deterministic_fallback() {
+        let matcher = OntologyMatcher::new(catalog()).with_config(
+            OntologyConfig::new()
+                .with_consensus(false)
+                .with_model(Arc::new(FailingModel("failing-model"))),
+        );
+        let verdicts = matcher
+            .match_candidates_detailed(&[candidate(MatchStrategy::TextualCoercion, 0.75)])
+            .await
+            .unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(
+            verdicts[0].provenance,
+            StageProvenance::DeterministicFallback
+        );
+        assert_eq!(verdicts[0].verdict.method, METHOD_DETERMINISTIC);
+        assert_eq!(verdicts[0].verdict.confidence, 0.75);
+        assert!(verdicts[0].accepted());
+    }
+
+    #[tokio::test]
+    async fn failing_model_in_error_mode_surfaces_the_failure() {
+        let matcher = OntologyMatcher::new(catalog()).with_config(
+            OntologyConfig::new()
+                .with_consensus(false)
+                .with_fallback(FallbackMode::Error)
+                .with_model(Arc::new(FailingModel("failing-model"))),
+        );
+        let error = matcher
+            .match_candidates_detailed(&[candidate(MatchStrategy::ExactIo, 1.0)])
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("ontology matcher"), "{error}");
+        assert!(error.message().contains("provider unavailable"), "{error}");
+        assert!(
+            matcher
+                .match_candidates(&[candidate(MatchStrategy::ExactIo, 1.0)])
+                .await
+                .is_err(),
+            "the verdict-only entry point surfaces the same error"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_replay_is_reported_as_model_backed() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Mutex::new(
+            MatchCache::open(directory.path().join("matches.json"))
+                .await
+                .unwrap(),
+        ));
+        let reply = r#"{"matches":[{"id":"c1","direction":"forward","confidence":0.9}]}"#;
+        let recording = OntologyMatcher::new(catalog())
+            .with_config(
+                OntologyConfig::new()
+                    .with_consensus(false)
+                    .with_model(scripted(&[reply])),
+            )
+            .with_cache(cache.clone());
+        let first = recording
+            .match_candidates_detailed(&[candidate(MatchStrategy::ExactIo, 1.0)])
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].provenance, StageProvenance::Model);
+
+        // The same catalog and matcher signature with a *failing* model still answers from
+        // disk, so a replayed hit is never charged as a fallback. The failing model
+        // reports the scripted model's name so the signature (and therefore the key) is
+        // unchanged.
+        let replaying = OntologyMatcher::new(catalog())
+            .with_config(
+                OntologyConfig::new()
+                    .with_consensus(false)
+                    .with_model(Arc::new(FailingModel("static-completion-model"))),
+            )
+            .with_cache(cache);
+        let second = replaying
+            .match_candidates_detailed(&[candidate(MatchStrategy::ExactIo, 1.0)])
+            .await
+            .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(second[0].provenance, StageProvenance::Model);
+    }
+
+    #[test]
+    fn matched_verdict_round_trips_and_tolerates_a_legacy_payload() {
+        let mut verdict = OntologyMatch::new("tool:a", "tool:b");
+        verdict.confidence = 0.9;
+        verdict.method = METHOD_LLM.to_string();
+        verdict.accepted = true;
+        let matched = MatchedVerdict::new(verdict, StageProvenance::Model);
+        let json = serde_json::to_value(&matched).unwrap();
+        assert_eq!(json["provenance"], "model");
+        assert_eq!(json["verdict"]["source_id"], "tool:a");
+        assert_eq!(
+            serde_json::from_value::<MatchedVerdict>(json).unwrap(),
+            matched
+        );
+
+        // A payload written before provenance existed reads as "no model".
+        let legacy = serde_json::from_value::<MatchedVerdict>(serde_json::json!({
+            "verdict": {"source_id": "tool:a", "target_id": "tool:b", "confidence": 0.5},
+            "future_field": true
+        }))
+        .unwrap();
+        assert_eq!(legacy.provenance, StageProvenance::NoModel);
+        assert_eq!(legacy.verdict.confidence, 0.5);
+
+        let empty = serde_json::from_value::<MatchedVerdict>(serde_json::json!({})).unwrap();
+        assert_eq!(empty, MatchedVerdict::default());
+        assert_eq!(empty.provenance, StageProvenance::NoModel);
     }
 }
