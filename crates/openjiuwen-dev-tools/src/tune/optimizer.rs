@@ -16,7 +16,8 @@
 //!   model rewrite, scored by the composite reward with convergence, drift, and
 //!   memory.
 //! - [`Trainer`] — optimisation on a train split, early stop on a validation
-//!   split.
+//!   split, reporting the in-sample and held-out scores and the split the winner
+//!   was chosen on.
 //!
 //! All optimizers share [`OptimizerConfig`], the tuning constants below, and one
 //! deterministic tie-break: higher score, then the earlier candidate, then the
@@ -64,6 +65,7 @@ pub use suggestion::placeholders;
 pub use trainer::{EvaluationSummary, Trainer};
 
 use crate::tune::base::Case;
+use crate::tune::dataset::CaseSplit;
 use crate::tune::IterationRecord;
 
 /// Python `TuneConstant.DEFAULT_EXAMPLE_NUM`.
@@ -105,8 +107,15 @@ pub const DEFAULT_MAX_NUM_SAMPLE_ERROR_CASES: usize = 10;
 /// reproducible), and `records` keeps the per-round candidates with their
 /// rewards.
 ///
-/// Only the three original fields are mandatory: every prompt-search field is
-/// serde-defaulted, so JSON written before they existed still deserializes.
+/// The split provenance is optional so an optimizer with a single case list can
+/// leave it empty: `train_score` is the winner's in-sample score (the split it
+/// was fitted on), `val_score` its held-out score, and `selected_on` the
+/// [`CaseSplit`] the winner was chosen on. All three are absent for the
+/// untagged optimizers, and a trainer reports them when it was given a split.
+///
+/// Only the three original fields are mandatory: every other field (the
+/// prompt-search bookkeeping and the split provenance) is serde-defaulted, so
+/// JSON written before they existed still deserializes.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct OptimizationResult {
@@ -126,6 +135,21 @@ pub struct OptimizationResult {
     pub run_id: String,
     /// Per-round records: the candidates tried and their rewards.
     pub records: Vec<IterationRecord>,
+    /// The winner's in-sample score, measured on the split it was fitted on.
+    ///
+    /// `None` when the optimizer never saw a training split (an untagged run
+    /// cannot separate in-sample from held-out scoring).
+    pub train_score: Option<f64>,
+    /// The winner's held-out score, measured on the split it was selected on.
+    ///
+    /// `None` when selection happened on the only case list available, which is
+    /// then reported as [`train_score`](Self::train_score) instead.
+    pub val_score: Option<f64>,
+    /// The split the winning prompt was chosen on, when the caller tagged one.
+    ///
+    /// `None` for an untagged selection; a trainer driving a validation split
+    /// reports [`CaseSplit::Val`].
+    pub selected_on: Option<CaseSplit>,
 }
 
 impl OptimizationResult {
@@ -155,6 +179,27 @@ impl OptimizationResult {
     #[must_use]
     pub fn with_records(mut self, records: Vec<IterationRecord>) -> Self {
         self.records = records;
+        self
+    }
+
+    /// Records the winner's in-sample score.
+    #[must_use]
+    pub fn with_train_score(mut self, train_score: f64) -> Self {
+        self.train_score = Some(train_score);
+        self
+    }
+
+    /// Records the winner's held-out score.
+    #[must_use]
+    pub fn with_val_score(mut self, val_score: f64) -> Self {
+        self.val_score = Some(val_score);
+        self
+    }
+
+    /// Records the split the winner was selected on.
+    #[must_use]
+    pub fn with_selected_on(mut self, split: CaseSplit) -> Self {
+        self.selected_on = Some(split);
         self
     }
 
@@ -315,6 +360,60 @@ mod tests {
         assert_eq!(result.token_usage.len(), 0);
         assert_eq!(result.run_id.len(), 0);
         assert_eq!(result.records.len(), 0);
+        assert!(result.train_score.is_none());
+        assert!(result.val_score.is_none());
+        assert!(result.selected_on.is_none());
+    }
+
+    #[test]
+    fn split_provenance_round_trips_with_an_untagged_default() {
+        let untagged = OptimizationResult {
+            best_prompt: "p".to_owned(),
+            score: 0.5,
+            iterations: 0,
+            ..OptimizationResult::default()
+        };
+        let value = serde_json::to_value(&untagged).unwrap();
+        assert_eq!(value["train_score"], Value::Null);
+        assert_eq!(value["val_score"], Value::Null);
+        assert_eq!(value["selected_on"], Value::Null);
+        let restored: OptimizationResult = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, untagged);
+
+        let tagged = untagged
+            .with_train_score(0.9)
+            .with_val_score(0.4)
+            .with_selected_on(CaseSplit::Val);
+        assert_eq!(tagged.train_score, Some(0.9));
+        assert_eq!(tagged.val_score, Some(0.4));
+        assert_eq!(tagged.selected_on, Some(CaseSplit::Val));
+
+        let value = serde_json::to_value(&tagged).unwrap();
+        assert_eq!(value["train_score"], Value::from(0.9));
+        assert_eq!(value["val_score"], Value::from(0.4));
+        assert_eq!(value["selected_on"], Value::from("val"));
+        let restored: OptimizationResult = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, tagged);
+    }
+
+    #[test]
+    fn legacy_json_defaults_every_split_provenance_field_to_none() {
+        let legacy: OptimizationResult = serde_json::from_str(
+            r#"{"best_prompt": "p", "score": 0.75, "iterations": 2, "selected_on": "val"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.best_prompt, "p");
+        assert!(legacy.train_score.is_none());
+        assert!(legacy.val_score.is_none());
+        // A payload written when only `selected_on` existed keeps that tag.
+        assert_eq!(legacy.selected_on, Some(CaseSplit::Val));
+
+        let older: OptimizationResult =
+            serde_json::from_str(r#"{"best_prompt": "p", "score": 0.75, "iterations": 2}"#)
+                .unwrap();
+        assert!(older.train_score.is_none());
+        assert!(older.val_score.is_none());
+        assert!(older.selected_on.is_none());
     }
 
     #[test]
@@ -355,6 +454,9 @@ mod tests {
             "token_usage",
             "run_id",
             "records",
+            "train_score",
+            "val_score",
+            "selected_on",
         ] {
             assert!(object.contains_key(key), "missing field {key}");
         }

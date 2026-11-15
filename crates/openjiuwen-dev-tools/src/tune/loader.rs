@@ -2,63 +2,27 @@
 //! shuffling and train/test splitting.
 //!
 //! Ports `CaseLoader` from the Python `openjiuwen/dev_tools/tune/`. The Python
-//! loader uses `random.shuffle`; here the shuffle is driven by a small,
-//! self-contained `xorshift64*` generator so the same seed always yields the
-//! same order and the crate needs no random-number dependency.
+//! loader uses `random.shuffle`; here the shuffle is driven by the module's one
+//! `Rng64` `xorshift64*` generator (in `tune::prng`) so the same seed always
+//! yields the same order and the crate needs no random-number dependency.
+//!
+//! Two cuts are offered. [`CaseLoader::split`] returns two plain loaders, which
+//! is what the tuning optimizers take; [`CaseLoader::split_tagged`] performs the
+//! identical cut and additionally tags the halves [`CaseSplit::Train`] and
+//! [`CaseSplit::Val`], so a score measured on one of them keeps its provenance.
 
 use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::tune::base::Case;
-
-/// A deterministic `xorshift64*` generator used by [`CaseLoader::shuffle`].
-///
-/// The algorithm is Marsaglia's xorshift64 shifted through a 64-bit multiply,
-/// which is plenty for a reproducible permutation and keeps the crate free of
-/// external random-number dependencies.
-struct Rng64 {
-    /// The generator state; never zero after construction.
-    state: u64,
-}
-
-impl Rng64 {
-    /// Seed the generator; seed `0` is remapped to the golden-ratio constant
-    /// because xorshift requires a non-zero state.
-    fn new(seed: u64) -> Self {
-        Self {
-            state: if seed == 0 {
-                0x9E37_79B9_7F4A_7C15
-            } else {
-                seed
-            },
-        }
-    }
-
-    /// The next pseudo-random 64-bit word.
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.state = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    /// A pseudo-random index in `0..bound`.
-    ///
-    /// The modulo bias is irrelevant for shuffling a short case list.
-    fn below(&mut self, bound: usize) -> usize {
-        if bound <= 1 {
-            return 0;
-        }
-        (self.next_u64() % bound as u64) as usize
-    }
-}
+use crate::tune::dataset::{CaseSplit, SplitDataset};
+use crate::tune::prng::Rng64;
 
 /// A collection of tuning [`Case`]s.
 ///
 /// Python: `openjiuwen.dev_tools.tune.CaseLoader`. Construction is infallible;
-/// ratio arguments are validated by [`CaseLoader::split`].
+/// ratio arguments are validated by [`CaseLoader::split`] and
+/// [`CaseLoader::split_tagged`].
 ///
 /// Serializes to a single-key object holding the cases in their current order,
 /// for example `{"cases": [{...}, {...}]}`. Deserialization is permissive: the
@@ -116,16 +80,13 @@ impl CaseLoader {
 
     /// Returns a copy of the loader with the cases in a shuffled order.
     ///
-    /// A deterministic Fisher-Yates shuffle: the same `random_seed` always
-    /// produces the same permutation of the same cases.
+    /// A deterministic Fisher-Yates shuffle driven by the module's shared
+    /// `Rng64` generator: the same `random_seed` always produces the same
+    /// permutation of the same cases.
     #[must_use]
     pub fn shuffle(&self, random_seed: u64) -> Self {
         let mut cases = self.cases.clone();
-        let mut rng = Rng64::new(random_seed);
-        for i in (1..cases.len()).rev() {
-            let j = rng.below(i + 1);
-            cases.swap(i, j);
-        }
+        Rng64::new(random_seed).shuffle(&mut cases);
         Self { cases }
     }
 
@@ -146,6 +107,31 @@ impl CaseLoader {
         let split_at = (ratio * self.cases.len() as f64).floor() as usize;
         let (left, right) = self.cases.split_at(split_at);
         Ok((Self::new(left.to_vec()), Self::new(right.to_vec())))
+    }
+
+    /// Splits the loader exactly like [`split`](Self::split) and tags the halves.
+    ///
+    /// The tagged sibling of [`split`](Self::split), which stays untagged and
+    /// unchanged: the cut is still `floor(ratio * size)`, but the left part
+    /// `[0, split)` comes back as a [`SplitDataset`] tagged [`CaseSplit::Train`]
+    /// and the right part `[split, size)` as one tagged [`CaseSplit::Val`], so
+    /// the provenance travels with the cases into
+    /// [`Trainer::train_split`](crate::tune::Trainer::train_split) and into the
+    /// [`EvaluationSummary`](crate::tune::EvaluationSummary) it reports.
+    ///
+    /// `ratio` `0.0` puts every case on the val side (an empty train split) and
+    /// `1.0` puts every case on the train side (an empty val split).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::validation`] when `ratio` is not finite or outside `0.0..=1.0`,
+    /// with the same message as [`split`](Self::split).
+    pub fn split_tagged(&self, ratio: f64) -> Result<(SplitDataset, SplitDataset)> {
+        let (train, val) = self.split(ratio)?;
+        Ok((
+            SplitDataset::new(CaseSplit::Train, train.into_cases()),
+            SplitDataset::new(CaseSplit::Val, val.into_cases()),
+        ))
     }
 }
 
@@ -271,6 +257,82 @@ mod tests {
         let (left, right) = CaseLoader::default().split(0.5).unwrap();
         assert!(left.is_empty());
         assert!(right.is_empty());
+    }
+
+    #[test]
+    fn split_tagged_tags_the_halves_train_and_val() {
+        let (train, val) = loader(4).split_tagged(0.5).unwrap();
+        assert_eq!(train.split, CaseSplit::Train);
+        assert_eq!(val.split, CaseSplit::Val);
+        assert_eq!(train.len(), 2);
+        assert_eq!(val.len(), 2);
+    }
+
+    #[test]
+    fn split_tagged_matches_the_untagged_split() {
+        for ratio in [0.0, 0.25, 0.5, 1.0 / 3.0, 0.75, 1.0] {
+            for count in [0, 1, 3, 5, 7] {
+                let loader = loader(count);
+                let (left, right) = loader.split(ratio).unwrap();
+                let (train, val) = loader.split_tagged(ratio).unwrap();
+                assert_eq!(train.len(), left.size(), "ratio {ratio}, count {count}");
+                assert_eq!(val.len(), right.size(), "ratio {ratio}, count {count}");
+                assert_eq!(
+                    train.cases(),
+                    left.cases(),
+                    "ratio {ratio}, count {count} keeps the train cases"
+                );
+                assert_eq!(
+                    val.cases(),
+                    right.cases(),
+                    "ratio {ratio}, count {count} keeps the val cases"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_tagged_at_zero_ratio_puts_everything_on_the_val_side() {
+        let (train, val) = loader(3).split_tagged(0.0).unwrap();
+        assert!(train.is_empty());
+        assert_eq!(train.split, CaseSplit::Train);
+        assert_eq!(
+            val.iter().map(|c| c.case_id.as_str()).collect::<Vec<_>>(),
+            ["0", "1", "2"]
+        );
+        assert_eq!(val.split, CaseSplit::Val);
+    }
+
+    #[test]
+    fn split_tagged_at_full_ratio_puts_everything_on_the_train_side() {
+        let (train, val) = loader(3).split_tagged(1.0).unwrap();
+        assert_eq!(
+            train.iter().map(|c| c.case_id.as_str()).collect::<Vec<_>>(),
+            ["0", "1", "2"]
+        );
+        assert_eq!(train.split, CaseSplit::Train);
+        assert!(val.is_empty());
+        assert_eq!(val.split, CaseSplit::Val);
+    }
+
+    #[test]
+    fn split_tagged_of_an_empty_loader_yields_two_empty_tagged_datasets() {
+        let (train, val) = CaseLoader::default().split_tagged(0.5).unwrap();
+        assert!(train.is_empty());
+        assert_eq!(train.split, CaseSplit::Train);
+        assert!(val.is_empty());
+        assert_eq!(val.split, CaseSplit::Val);
+    }
+
+    #[test]
+    fn split_tagged_rejects_invalid_ratios() {
+        for ratio in [-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = loader(3).split_tagged(ratio).unwrap_err();
+            assert!(
+                matches!(&error, Error::Validation(message) if message.contains("ratio")),
+                "unexpected error for {ratio}: {error}"
+            );
+        }
     }
 
     #[test]
