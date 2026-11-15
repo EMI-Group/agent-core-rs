@@ -289,111 +289,41 @@ Relation candidates, bounded planning, plan execution over `openjiuwen-graph`, a
 #[serde(rename_all = "snake_case")] pub enum PlanStatus { Ready, NeedsInput, NoPlan }
 #[serde(rename_all = "snake_case")] pub enum MatchStrategy { ExactIo, SemanticOverlap, TextualCoercion }
 #[serde(rename_all = "snake_case")] pub enum PlanMode { Fast, Beam }          // default Fast
-
-pub struct RelationCandidate { pub source: String, pub target: String, pub relation: String /* can_feed */,
-                               pub confidence: f64, pub strategy: MatchStrategy,
-                               pub matched_input: Option<String>, pub matched_output: Option<String> }
-pub struct CandidateConfig { pub min_confidence: f64 /*0.7*/, pub min_token_overlap: f64 /*0.6*/,
-                             pub max_candidates_per_source: usize /*32*/ }
-pub struct CandidateGenerator;
-impl CandidateGenerator {
-    pub fn new(config: CandidateConfig) -> Self;
-    pub fn generate(&self, capabilities: &[CapabilityDescriptor]) -> Vec<RelationCandidate>;
-    pub fn edges(&self, candidates: &[RelationCandidate]) -> Vec<CapabilityEdge>;
-}
-
-pub struct PlanStep { pub step_id: String /* qualified id */, pub capability_type: String, pub name: String,
-                      pub inputs: Vec<CapabilityIo>, pub outputs: Vec<CapabilityIo>,
-                      pub missing_inputs: Vec<String>, pub filled_inputs: Vec<String>, pub score: f64 }
-pub struct OrchestrationPlan { pub plan_id: String, pub query: String, pub language: String /* "cn" | "en" */,
-                               pub status: PlanStatus, pub title: String, pub message: Option<String>,
-                               pub steps: Vec<PlanStep>, pub edges: Vec<PlanEdge>, pub score: f64 }
-impl OrchestrationPlan { pub fn planned_graph(&self) -> Value; pub fn to_value(&self) -> Value;
-                         pub fn from_value(value: &Value) -> Result<Self>;
-                         pub fn stages(&self) -> Result<Vec<Vec<String>>>; pub fn is_empty(&self) -> bool; }
-
-pub struct PlanConfig { pub mode: PlanMode, pub top_k: usize /*3*/, pub max_depth: usize /*4*/,
-                        pub min_edge_confidence: f64 /*0.7*/, pub max_expansions: usize /*128*/,
-                        pub max_plans: usize /*256*/, pub dynamic_graph_enabled: bool /*false*/ }
-pub struct PlanRequest { pub query: String, pub candidate_ids: Option<Vec<String>>, pub disabled_ids: Vec<String>,
-                         pub provided_inputs: Vec<String>, pub language: String /*"cn"*/,
-                         pub top_k: Option<usize>, pub max_depth: Option<usize> }
-#[async_trait] pub trait SemanticScorer: Send + Sync {
-    async fn score(&self, query: &str, capabilities: &[CapabilityDescriptor]) -> Result<BTreeMap<String, f64>>;
-}
-pub struct LexicalSemanticScorer;                                             // deterministic default
-impl Planner { pub fn new(config: PlanConfig) -> Self;
-               pub fn with_scorer(config: PlanConfig, scorer: Arc<dyn SemanticScorer>) -> Self;
-               pub async fn plan(&self, request: &PlanRequest, graph: &CapabilityGraph,
-                                 capabilities: &[CapabilityDescriptor]) -> Result<OrchestrationPlan>; }
-pub fn normalize_language(raw: &str) -> String;                              // zh|cn|zh_cn -> "cn"; en -> "en"
-pub fn plan_title(query: &str, language: &str) -> String;                    // "计划：{query}" / "Plan: {query}"
-
-pub struct RunnerContext { pub step_id: String, pub session_id: Option<String>, pub cancellation: CancellationToken }
-#[async_trait] pub trait CapabilityRunner: Send + Sync {
-    async fn invoke(&self, capability: &CapabilityDescriptor, inputs: Value, context: &RunnerContext) -> Result<Value>;
-}
-pub struct UnsupportedRunner;                                                // invoke -> Error::Unsupported
-pub struct ExecutorConfig { pub max_steps: usize /*32*/, pub node_timeout_ms: Option<u64>, pub fail_fast: bool /*true*/ }
-pub struct StepOutcome { pub step_id: String, pub capability_type: String, pub success: bool,
-                         pub output: Value, pub error: Option<String>, pub duration_ms: u64 }
-pub struct PlanExecution { pub plan_id: String, pub graph_id: String, pub steps: BTreeMap<String, StepOutcome>,
-                           pub outputs: BTreeMap<String, Value>, pub state: Value }
-impl PlanExecutor {
-    pub fn new(runner: Arc<dyn CapabilityRunner>) -> Self;
-    pub fn compile(&self, plan: &OrchestrationPlan, capabilities: &[CapabilityDescriptor]) -> Result<CompiledGraph>;
-    pub async fn execute(&self, plan: &OrchestrationPlan, capabilities: &[CapabilityDescriptor], session: Option<Arc<dyn Session>>) -> Result<PlanExecution>;
-    pub async fn execute_with_inputs(&self, plan: &OrchestrationPlan, capabilities: &[CapabilityDescriptor], inputs: Value, session: Option<Arc<dyn Session>>) -> Result<PlanExecution>;
-}
-
-pub struct MutationRequest { pub request_id: String, pub operation: MutationOperation,
-                             pub source_revision: Option<String>, pub changed_skill_ids: Vec<String> }
-pub fn request_digest(request: &MutationRequest) -> String;
-pub fn validate_mutation_against_inventory(request: &MutationRequest, changed: &[String], inventory_ids: &[String]) -> Result<()>;
-pub struct JournalRecord { pub digest: String, pub operation: MutationOperation, pub revision: String,
-                           pub inserted_at: String, pub result: Option<Value> }
-pub struct MutationJournal;   // new/open/path/len/is_empty/contains/request_ids/lookup/record/clear
+pub struct RelationCandidate;  pub struct CandidateConfig;  pub struct CandidateGenerator;
+pub struct PlanStep;  pub struct OrchestrationPlan { plan_id, query, language, status, title,
+                                                     message, steps, edges, score }
+pub struct PlanConfig;  pub struct PlanRequest;
+pub struct Planner;                          // new / with_scorer / plan
+#[async_trait] pub trait SemanticScorer;     pub struct LexicalSemanticScorer;
+pub struct RunnerContext;  pub trait CapabilityRunner;  pub struct UnsupportedRunner;
+pub struct ExecutorConfig;  pub struct StepOutcome;  pub struct PlanExecution;  pub struct PlanExecutor;
+pub struct MutationRequest;  pub fn request_digest(&MutationRequest) -> String;
+pub fn validate_mutation_against_inventory(...) -> Result<()>;
+pub struct JournalRecord;  pub struct MutationJournal;
 ```
 
-Candidate rules: `ExactIo` (same normalized name and type, confidence `1.0`), `SemanticOverlap` (output/input token Jaccard `>= min_token_overlap`, confidence `0.70 + 0.25 * overlap`), `TextualCoercion` (`can_feed` plus a shared name token, confidence `0.75`); sorted by strategy rank, confidence, source, target; below `min_confidence` dropped; per-source cap.
-Plan score: `0.45*mean(semantic) + 0.25*mean(edge_confidence) + 0.20*input_coverage - 0.03*(steps - 1)`, ranked by `(-score, missing_inputs, step_count, step_ids, edge_weights)`; expansion is bounded by `max_depth`/`max_expansions`/`max_plans` (`Fast` greedy, `Beam` `top_k`), and `status` is `Ready`/`NeedsInput`/`NoPlan` from the best plan's root inputs.
-Execution maps each step to an `openjiuwen_graph` node writing `state[step_id] = {"success", "output", "error", "duration_ms"}`; `fail_fast` aborts with `Error::Graph`, while `Cancelled`/`Unsupported` keep their own `ErrorKind`.
-Mutations: `MutationRequest::prepare` trims/sorts/rejects, the digest is SHA-256 over canonical JSON of `{schema_version, request_id, operation, source_revision, changed_skill_ids}` (declared ids, not payloads), the inventory check requires the applied change set to equal the declared batch, and `MutationJournal` is a `BTreeMap`-ordered JSON document written through atomically (`inserted_at` is metadata; the malformed-envelope case names the file).
-See [`orchestration`](src/orchestration/CONTEXT.md) for the full rules, formulas, bounds and journal semantics.
+Candidate rules are `ExactIo` (same normalized name and type, confidence `1.0`), `SemanticOverlap` (output/input token Jaccard at least `0.6`) and `TextualCoercion` (`can_feed` plus a shared name token); results are ranked and capped per source.
+Plans are ranked by `0.45*mean(semantic) + 0.25*mean(edge_confidence) + 0.20*input_coverage - 0.03*(steps - 1)` under `max_depth`/`max_expansions`/`max_plans`, and `status` follows the best plan's root inputs.
+Execution compiles a plan into an `openjiuwen_graph` node per step, and the mutation contract adds a SHA-256 request digest over the declared id batch, a durable replay journal, source-revision CAS and change-set validation.
+See [`orchestration`](src/orchestration/CONTEXT.md) for the full surface, formulas, bounds and journal semantics.
 
 ### `evaluation` (`src/evaluation/`)
 
 Fail-soft evaluation over capability cards and recorded traces: static card metrics, trace metrics, event-time case windows, status-aware aggregation, and the LLM judge.
 
 ```rust
-pub struct EvaluationInput { pub capability: CapabilityDescriptor, pub target: Option<String>,
-                             pub trace: Option<EvaluationTrace>, pub window: Option<EvaluationWindow> }
-pub struct MetricScore { pub metric: String, pub score: Option<f64>, pub passed: bool,
-                         pub detail: Option<String>, pub status: MetricStatus }
+pub struct EvaluationInput { capability, target: Option<String>, trace: Option<EvaluationTrace>,
+                             window: Option<EvaluationWindow> }
+pub struct MetricScore { metric, score: Option<f64>, passed, detail: Option<String>, status: MetricStatus }
 #[serde(rename_all = "snake_case")] pub enum MetricStatus { Pass, Fail, NotApplicable, Error, Observed }
-#[async_trait] pub trait Metric: Send + Sync {
-    fn name(&self) -> &str; fn scope(&self) -> MetricScope; fn cache_key(&self) -> Option<String>;
-    async fn evaluate(&self, input: &EvaluationInput) -> Result<MetricScore>;
-}
-// static: CompletenessMetric, SchemaValidityMetric, StructureConformanceMetric,
-//         DescriptionQualityMetric, ClassificationConsistencyMetric, LlmJudgedMetric
-// trace:  SuccessRateMetric, LatencyMetric, AccuracyMetric, CapabilitySelectionMetric,
-//         CompositionEffectivenessMetric
-pub struct QualityResult { pub confidence: QualityConfidence, pub score: Option<f64>, pub aggregation: String,
-                           pub per_metric: BTreeMap<String, MetricScore> }
-pub fn percentile(values: &[f64], fraction: f64) -> f64;   pub fn latency_statistics(samples_ms: &[f64]) -> LatencyStatistics;
-pub fn select_cases(cases: &[EvaluationCase], window: Option<&EvaluationWindow>) -> Vec<&EvaluationCase>;
-pub fn aggregate_metric(scores: &[MetricScore]) -> MetricScore;
-
-impl EvaluationSuite {
-    pub fn default_suite() -> Self;                                  // completeness + schema validity
-    pub fn with_llm_judge(self) -> Self;   pub fn with_llm_judge_model(self, model: Arc<dyn CompletionModel>) -> Self;
-    pub async fn evaluate(&self, input: &EvaluationInput) -> EvaluationReport;
-    pub async fn evaluate_static(&self, input: &EvaluationInput) -> EvaluationReport;
-    pub async fn evaluate_case(&self, input: &EvaluationInput) -> EvaluationReport;
-    pub async fn evaluate_quality(&self, input: &EvaluationInput) -> QualityResult;
-    pub fn cache_signature(&self) -> Option<String>;   pub fn aggregate(&self, reports: &[EvaluationReport]) -> EvaluationReport;
-}
+#[async_trait] pub trait Metric;   // name / scope / cache_key / evaluate
+// static: Completeness, SchemaValidity, StructureConformance, DescriptionQuality,
+//         ClassificationConsistency, LlmJudged
+// trace:  SuccessRate, Latency, Accuracy, CapabilitySelection, CompositionEffectiveness
+pub struct QualityResult;  pub struct EvaluationSuite;   // default_suite / with_llm_judge / evaluate*
+pub fn percentile(&[f64], f64) -> f64;   pub fn latency_statistics(&[f64]) -> LatencyStatistics;
+pub fn select_cases(&[EvaluationCase], Option<&EvaluationWindow>) -> Vec<&EvaluationCase>;
+pub fn aggregate_metric(&[MetricScore]) -> MetricScore;
 pub const SYMPHONY_EVALUATION_PROTOCOL: &str = "symphony-evaluation-suite-v5";
 ```
 
@@ -432,6 +362,9 @@ impl SymphonyRuntime {
     pub async fn update_capabilities(&self, descriptors: Vec<CapabilityDescriptor>, request_id: &str) -> Result<GraphMutationResult>;
     pub async fn remove_capabilities(&self, keys: &[CapabilityKey], request_id: &str) -> Result<GraphMutationResult>;
     pub async fn submit_evolution(&self, execution: &PlanExecution) -> Result<EvolutionResult>;
+    pub async fn submit_observation(&self, &GraphEvolutionInput) -> Result<ObservationReceipt>;
+    pub async fn observation_snapshot(&self, &str, Option<&str>) -> Result<GraphSnapshot>;
+    pub async fn flush_observations(&self) -> Result<()>;
     pub fn capture_graph_snapshot(&self) -> BTreeMap<String, Value>;
 }
 pub struct InvokeRequest;   pub struct InvokeResponse { pub plan, pub execution: Option<PlanExecution>, pub graph_status }
@@ -446,7 +379,34 @@ Lifecycle: `Created` → `start` → `Running` → `stop`/`close` → `Stopped`;
 `start` publishes a graph when none exists; `build` re-derives it from the registry plus candidate edges.
 The mutation order is replay lookup → digest conflict → `Running` gate → change-set/CAS → apply → publish → record; a replay with a different digest or a stale `source_revision` is `Error::Validation` naming that field, and the ledger is in-memory unless a journal is configured.
 `submit_evolution` applies successful transitions as an EMA on edge weights (`w' = (w + 1.0) / 2`); `semantic_search` re-embeds only when `CapabilityRegistry::revision()` changed, and without a semantic index it is `Error::Unsupported`.
+The graph-observation service is built only when `graph_artifact_root` is configured (its append-only log lives at `<root>/evolution/`); otherwise `submit_observation`, `observation_snapshot` and `flush_observations` are `Error::Unsupported`, and `close` flushes it only when present.
 See [`runtime`](src/runtime/CONTEXT.md) for the full surface and rules.
+
+### `observation` (`src/observation/`)
+
+Caller-supplied execution evidence distilled into derived, immutable observation and merged graph revisions; the static `can_feed` graph is never rewritten.
+
+```rust
+pub const GRAPH_EVOLUTION_INPUT_SCHEMA: &str = "symphony.graph_evolution_input.v2";
+pub struct GraphEvolutionInput { schema_version, evidence_id, graph_scope_id, observed_at,
+                                 graph_snapshot, trace, task, planned_graph, execution_graph }
+impl GraphEvolutionInput { pub fn validate(&self) -> Result<()>; pub fn normalized(self) -> Result<Self>; }
+impl TraceEvidence { pub fn from_trace_record(&TraceRecord) -> Self; }
+impl TaskOutcome { pub fn from_trace_record(&TraceRecord) -> Self; }
+pub enum TaskOutcomeLabel;  pub enum EvidenceStrength;  pub enum FailureDomain;
+pub enum ObservationStatus { Accepted, AuditOnly, Duplicate }
+pub struct ObservationReceipt { evidence_id, graph_scope_id, sequence, status, reason }
+pub struct GraphSnapshot { graph_scope_id, static_revision, observation_revision,
+                           merged_revision, high_water_sequence, overlay }
+pub struct StaticGraphIndex;  pub struct EdgeIdentity;  pub fn stable_hash(&Value) -> String;
+pub struct EvidenceStore;  pub struct RevisionStore;  pub struct GraphObservationService;
+```
+
+Evidence is qualified first: a truncated trace, quality flags, weak evidence, unknown capability ids, a stale pinned snapshot or an edge without a countable outcome is `audit_only` with its reason (`TRUNCATED_TRACE`, `TRACE_QUALITY_FLAGS`, `OUTCOME_NOT_STRONG`, `CAPABILITY_IDENTITY_MISMATCH`, `UNKNOWN_STATIC_REVISION`, `UNKNOWN_MERGED_REVISION`, `MERGED_STATIC_REVISION_MISMATCH`, `MERGED_OBSERVATION_REVISION_MISMATCH`, `NO_QUALIFIED_EDGE_OUTCOME`) and never re-qualifies.
+Only `verified_success` edges and `orchestration`-attributed `verified_failure` edges count, so `runtime_weight = 1.0 + clamp(0.05 * (success - failure), -1.0, 1.0)`.
+Rebinding yields `legacy_ignored | orphaned | invalidated | active_static | quarantined | active_runtime_only | insufficient_evidence`; an edge absent from the static graph needs `MIN_RUNTIME_ONLY_SUCCESS_SESSIONS = 2` failure-free success sessions in the current static revision to become plannable.
+`GraphObservationService::{new, submit, get_snapshot, flush, reproject, reproject_all, publish_safe_fallback, close}` reads static revisions from a `GraphArtifactStore`; snapshot reads reproject rather than fail and publish a neutral `safe_fallback` snapshot when projection fails.
+See [`observation`](src/observation/CONTEXT.md) for the full contract, the overlay record and the on-disk layout.
 
 ### `discovery` (`src/discovery/`)
 
@@ -585,6 +545,11 @@ The other typed deferrals live with their implementations: `ExperienceIndex`'s `
 - **Trace ingestion is deterministic, not statistical.** Python uses faiss k-means plus model distillation; the port groups by skill set and token Jaccard, picks a centroid query deterministically, and merges at a documented threshold — no RNG, no clock.
 - **The matcher cache is opt-in and signature-keyed.** The key covers the candidate, both fingerprint digests and `matcher_signature()` (prompt/version constants, model identity, threshold); cache failures degrade to a model call, never to stale matches.
 - **Static evaluation remains the offline default.** The suite ships deterministic card and trace metrics, and every LLM-backed metric carries a static rubric as its fallback.
+- **Observation state is a JSONL append log plus immutable content-hashed revisions.** Python's SQLite table and file locks become `evolution/evidence.jsonl` and per-scope `observations/<rev>/overlay.json` / `merged/<rev>/manifest.json`, with `tokio::fs` temp-sibling renames and an async mutex serialising writers; the crate declares no `sqlx`.
+- **Observation revision ids are content hashes that ignore `generated_at`.** Re-aggregating identical state reproduces the same ids, while republishing an existing id with different content is a validation error.
+- **Observation aggregation runs inside `submit` and `flush`.** The port drops Python's `ThreadPoolExecutor`: a failed projection is warned and surfaced by the next `flush()`, and `close()` is a documented no-op.
+- **Static edge identity is a point edge whose content hashes come from node metadata.** `CapabilityGraph` carries no `capability_hashes` map, so `metadata["content_hash"]` (or a descriptor's `compute_content_hash()` when supplied) stands in; a changed body invalidates prior evidence and a deleted endpoint orphans it.
+- **Observation timestamps are hand rolled.** `observed_at` parsing, offset→UTC normalisation and formatting live in `observation::timestamp` (integer Hinnant civil-date arithmetic) because `chrono` is not a dependency; timestamps never order or identify anything.
 
 ## Deferred Scope
 
@@ -599,7 +564,6 @@ Two kinds of gaps remain: typed `Error::Unsupported` entry points (GPU/ML stacks
 
 Pure-logic Python areas not ported:
 
-- `observation/` — graph-evolution input contract, append-only evidence log, qualification/rebind and merged overlays (`runtime::submit_evolution` takes a `PlanExecution` and applies only an EMA).
 - `discovery/{directory_toolkit,toolkit}.py` — the model-facing `skill_index` operations (directory view, list/search/read, request validation, pagination cursors); `SkillFs` provides `visible_skill_names`, `prompt_snapshot` and the persistable `SkillNoticeState` cursor.
 - `orchestration/graph/artifacts.py`'s artifact-embedded journal and any diffing beyond the request contract — the request digest, durable journal, source-revision CAS and change-set validation are implemented (see [`orchestration::mutation`](src/orchestration/mutation.rs) and `runtime::mutations`); the journal is a separate JSON document, its digests are not chained over the file, and `source_revision` is optional.
 - `orchestration/graph/matcher/{protocol,model}.py` — the `matches_by_candidate`/`diagnostics_by_candidate` helpers and the cache's file lock/pending-merge batching; the persistent match cache, identity digests, endpoint hashing and `sanitize_metadata` are implemented.
@@ -608,7 +572,7 @@ Pure-logic Python areas not ported:
 - `retrieval/build/**` and `agent/retrieval_toolkit.py` — LLM-driven index construction over the progressive retriever (~9k lines, overlapping `llm::TreeRetriever`).
 - `experience/cluster.py`'s faiss k-means and LLM pattern distillation — replaced by deterministic token-Jaccard clustering and the collector's similarity merge.
 
-Implemented with deterministic offline substitutes: S3/OBS, GCS and Azure Blob artifacts; SKILL.md scanning, the `SkillFs` catalog, prompt snapshot and notice cursor; flow distillation, redaction, ten-check review, `SkillPack` packaging, `SwarmFlow` script generation and package rendering; the mutation request contract, digest, durable idempotency journal and source-revision CAS; the experience bank, persisted index, trace ingestion, clustering and collector; evaluation static/trace metrics and windows; LLM matching (with cache), scoring, retrieval, fingerprinting and judging.
+Implemented with deterministic offline substitutes: S3/OBS, GCS and Azure Blob artifacts; SKILL.md scanning, the `SkillFs` catalog, prompt snapshot and notice cursor; flow distillation, redaction, ten-check review, `SkillPack` packaging, `SwarmFlow` script generation and package rendering; the mutation request contract, digest, durable idempotency journal and source-revision CAS; the experience bank, persisted index, trace ingestion, clustering and collector; evaluation static/trace metrics and windows; LLM matching (with cache), scoring, retrieval, fingerprinting and judging; the graph-observation contract, append-only evidence log, qualification gating, rebinding and merged revisions (a JSONL log and in-process aggregation replace SQLite and the thread pool).
 Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the stub shape, and `tests/{artifact_gcs,artifact_azure,experience_index}.rs` assert the remaining GPU/vendor boundaries.
 
 ## Error Strategy
@@ -645,6 +609,9 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
 - `tests/evaluation.rs` — static card metrics, structure conformance, mixed success rates, `Observed` latency, hand-computed percentile interpolation, window boundaries, aggregation precedence and confidence tiers, `cache_signature` stability, the offline/model-backed judge, and serde round-trips.
 - `tests/llm.rs` — every stage with a scripted model and with no model: tree walk/fallback, ontology consensus, scoring, fingerprint, judge repair, round-trips, error mode.
 - `tests/matcher_cache.rs` — identity digests, endpoint normalization, `sanitize_metadata`, cache round-trip and byte-stable layout, replay with zero model calls, `force` bypass, signature invalidation, malformed cache, degradation.
+- `tests/observation.rs` — contract validation (graph types, node labels/metadata, ports, edge endpoints, timezone, failure domain), `observed_at` UTC normalisation, the trace-record bridges, stable hashing and static-graph indexes, and the evidence/revision layout with dedupe, cursor, content-derived ids, immutability and atomic writes.
+- `tests/observation_service.rs` — one scenario per qualification reason, duplicate idempotency, the runtime-only threshold, symmetric bounded session-deduped weights, the high-water cursor, `safe_fallback` replay, quarantine/rebind across static republications, merged-revision pinning, persisted sanitisation and UTC persistence.
+- `tests/observation_runtime.rs` — end-to-end submission through `SymphonyRuntime` (derived static edge, `active_static` weight, runtime snapshot), the `Unsupported` answer without a filesystem root, and rehydration after `close`.
 - `tests/object_artifact.rs` — numbered revisions, `current` pointer/status, reopen persistence, object keys, pinned-version skipping, blank bucket, malformed `current.json`.
 - `tests/artifact_gcs.rs` / `tests/artifact_azure.rs` — full publish → read → status → versions round-trips against a stateful wiremock cloud emulator, plus auth-header assertions (bearer / `SharedKey` / SAS / anonymous), pagination, prefix sorting, 404 semantics and endpoint failure mapping.
 - `tests/deferred.rs` — the remaining `vLLM` stub and the `ivf*` algorithm deferral return `Error::Unsupported`, and `error::is_unsupported` recognizes them.
@@ -689,5 +656,11 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
 - `./src/runtime/` → `SymphonyRuntime`, config, lifecycle, evolution, mutations; see [`src/runtime/CONTEXT.md`](src/runtime/CONTEXT.md)
   - `./src/runtime/mod.rs` → lifecycle, planning/invocation, lazy semantic sync, evolution
   - `./src/runtime/mutations.rs` → the mutation path, `GraphMutationResult`, `MutationStatus`, journal-backed replay and source-revision CAS
+- `./src/observation/` → the graph-evolution evidence contract, identity, append-only evidence log, immutable observation/merged revisions and the `GraphObservationService`; see [`src/observation/CONTEXT.md`](src/observation/CONTEXT.md)
+  - `./src/observation/contracts/` → `GraphEvolutionInput`, evidence/enums, `validate`, `normalized`, trace bridges
+  - `./src/observation/identity.rs` → `stable_hash`, `EdgeIdentity`, `StaticGraphIndex`
+  - `./src/observation/store/` → the JSONL `EvidenceStore` and the per-scope `RevisionStore`
+  - `./src/observation/service/` → qualification, aggregation, rebinding, snapshot/fallback orchestration
+  - `./src/observation/payload.rs`, `timestamp.rs` → sanitised payload builder and the hand-rolled RFC 3339 layer
 - `./src/deferred.rs` → the remaining GPU-only `Error::Unsupported` stub (`vLLM` logit selection)
 - `./tests/` → behavior suites: `models`, `registry`, `search`, `graph`, `artifact`, `object_artifact`, `artifact_gcs`, `artifact_azure`, `planner`, `executor`, `runtime`, `mutation_journal`, `discovery`, `skill_prompt`, `experience`, `experience_index`, `experience_trace`, `flow`, `flow_codegen`, `redaction`, `evaluation`, `llm`, `matcher_cache`, `deferred`

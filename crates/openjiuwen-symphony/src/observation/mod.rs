@@ -6,3 +6,10 @@
 //! `runtime_weight` / `binding_status` that only the planner reads.
 //!
 //! The static `can_feed` capability graph stays authoritative; nothing here rewrites it.
+
+pub mod contracts;
+pub mod identity;
+pub(crate) mod payload;
+pub mod service;
+pub mod store;
+pub(crate) mod timestamp;
