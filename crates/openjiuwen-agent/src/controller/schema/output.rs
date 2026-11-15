@@ -20,8 +20,11 @@ pub const TASK_PROCESSING: &str = "processing";
 pub const ALL_TASKS_PROCESSED: &str = "all_tasks_processed";
 /// Payload type discriminator.
 ///
-/// The first three values mirror [`super::event::EventType`]; the last two are
-/// controller stream sentinels.
+/// The first three values mirror [`super::event::EventType`];
+/// [`OutputKind::Processing`] and [`OutputKind::AllTasksProcessed`] are
+/// controller stream sentinels, while [`OutputKind::Reasoning`] marks a frame
+/// carrying a task's reasoning text, emitted only when the controller config
+/// exposes reasoning.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputKind {
@@ -36,6 +39,9 @@ pub enum OutputKind {
     Processing,
     /// Every queued task has been processed.
     AllTasksProcessed,
+    /// A task's reasoning text, exposed only when the controller config asks
+    /// for it.
+    Reasoning,
 }
 impl OutputKind {
     /// Returns the Python wire string of the payload kind.
@@ -47,6 +53,7 @@ impl OutputKind {
             Self::TaskFailed => "task_failed",
             Self::Processing => TASK_PROCESSING,
             Self::AllTasksProcessed => ALL_TASKS_PROCESSED,
+            Self::Reasoning => "reasoning",
         }
     }
 }
@@ -344,6 +351,24 @@ mod tests {
                 .payload,
             Some(ControllerOutputPayload::all_tasks_processed())
         );
+    }
+    #[test]
+    fn reasoning_kind_wire_shape() {
+        assert_eq!(OutputKind::Reasoning.as_str(), "reasoning");
+        assert_eq!(
+            serde_json::to_value(OutputKind::Reasoning).unwrap(),
+            json!("reasoning")
+        );
+        let parsed: OutputKind = serde_json::from_value(json!("reasoning")).unwrap();
+        assert_eq!(parsed, OutputKind::Reasoning);
+    }
+    #[test]
+    fn reasoning_kind_is_distinct_from_sentinels() {
+        assert_ne!(OutputKind::Reasoning.as_str(), TASK_PROCESSING);
+        assert_ne!(OutputKind::Reasoning.as_str(), ALL_TASKS_PROCESSED);
+        assert_ne!(OutputKind::Reasoning, OutputKind::Processing);
+        assert_ne!(OutputKind::Reasoning, OutputKind::AllTasksProcessed);
+        assert_ne!(OutputKind::Reasoning, OutputKind::default());
     }
     #[test]
     fn last_chunk_is_serialized_only_when_true() {
