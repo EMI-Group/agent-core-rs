@@ -1,10 +1,8 @@
 //! stdio transport and process entry points for the team MCP server.
 //!
-//! The workspace enables `rmcp` without `transport-io`, so `rmcp::transport::stdio()` and the
-//! `tokio::io::stdin` / `tokio::io::stdout` helpers (the `io-std` feature) are unavailable here.
-//! On Unix the process streams are reopened as `tokio::fs::File`s instead: a `File` is
-//! `AsyncRead`/`AsyncWrite`, and `(R, W)` converts into an `rmcp` transport through the enabled
-//! `transport-async-rw` feature. Other targets report [`Error::unsupported`].
+//! One platform-independent implementation serves over `rmcp::transport::stdio()`: the process's
+//! `tokio::io::Stdin`/`Stdout` pair (the `io-std` feature) converts into an `rmcp` transport through
+//! the `transport-async-rw` feature, on every target this crate builds for.
 //!
 //! The `openjiuwen-team-mcp` console entry point lives in this crate (`src/bin/`); this module
 //! provides the entry points it calls.
@@ -18,17 +16,14 @@ use std::sync::Arc;
 ///
 /// # Errors
 ///
-/// Returns [`Error::config`] when the process streams cannot be opened or the MCP session fails to
-/// initialize or terminates abnormally, and [`Error::unsupported`] on non-Unix targets.
+/// Returns [`Error::config`] when the MCP session fails to initialize or terminates abnormally.
 pub async fn serve_stdio(server: TeamMcpServer) -> Result<()> {
     serve_impl(server).await
 }
-#[cfg(unix)]
 async fn serve_impl(server: TeamMcpServer) -> Result<()> {
     let handler = TeamServerHandler::new(server);
-    let (read, write) = process_streams().await?;
     let service = handler
-        .serve((read, write))
+        .serve(rmcp::transport::stdio())
         .await
         .map_err(|error| Error::config(format!("MCP server initialization failed: {error}")))?;
     service
@@ -36,26 +31,6 @@ async fn serve_impl(server: TeamMcpServer) -> Result<()> {
         .await
         .map_err(|error| Error::config(format!("MCP server task failed: {error}")))?;
     Ok(())
-}
-#[cfg(not(unix))]
-async fn serve_impl(server: TeamMcpServer) -> Result<()> {
-    let _ = server;
-    Err(Error::unsupported(
-        "stdio MCP transport (rmcp/transport-io)",
-    ))
-}
-/// Opens the process's stdin/stdout as async streams.
-#[cfg(unix)]
-async fn process_streams() -> Result<(tokio::fs::File, tokio::fs::File)> {
-    let read = tokio::fs::File::open("/dev/stdin")
-        .await
-        .map_err(|error| Error::config(format!("cannot open /dev/stdin: {error}")))?;
-    let write = tokio::fs::File::options()
-        .write(true)
-        .open("/dev/stdout")
-        .await
-        .map_err(|error| Error::config(format!("cannot open /dev/stdout: {error}")))?;
-    Ok((read, write))
 }
 /// Resolves the join descriptor from `OPENJIUWEN_TEAM_JOIN` and serves over stdio.
 ///

@@ -105,7 +105,8 @@ Every result is a single plain-text MCP content block (`is_error` is always fals
 - `openjiuwen_common::error::{Error, Result}` only; `tracing` only (stderr is the log channel — stdout is the MCP wire).
 - No `unsafe`, no `unwrap`/`expect` outside `#[cfg(test)]`, no panics on user input.
 - `--no-default-features` must build: `mod.rs`, `dispatch.rs` and the tests are rmcp-free; every `rmcp` type stays inside `#[cfg(feature = "mcp")]`.
-- The workspace does not enable `rmcp/transport-io`, so `rmcp::transport::stdio()` and `tokio::io::stdin/stdout` (`io-std`) are unavailable; `stdio.rs` adapts the process streams through `tokio::fs::File` and returns `Error::Unsupported` on non-Unix targets.
+- `serve_stdio` serves over `rmcp::transport::stdio()` (the crate enables `rmcp/transport-io` and `tokio/io-std`), one platform-independent implementation with no `cfg(unix)`/`cfg(not(unix))` gate and no target-specific refusal.
+- `(tokio::io::Stdin, tokio::io::Stdout)` reaches the handler through rmcp's already-enabled `transport-async-rw` feature; a failed session initialization or a failed waiting task is `Error::config`.
 - A handler never closes the client: process exit releases handles (Python parity).
 - Files ≤1000 lines; split by responsibility.
 
@@ -125,7 +126,8 @@ Every result is a single plain-text MCP content block (`is_error` is always fals
 - `call_tool` for all ten operator tools, asserting the exact compact JSON text; `get_task` missing → `null`.
 - Failure text: unknown tool, member-scope `read_inbox`, missing required argument, and a client `Err` → `Internal error: ...`.
 - `run_mcp_server_from_env` is not covered (process env + stdio): the transport is out of scope, and the process environment is never mutated in a test.
-- `resolve_from_registry` for an unhosted team returns `ErrorKind::Config` with the exact message, and `run_mcp_server_with_descriptor` returns exit code `1` for that error (both `#[cfg(feature = "mcp")]`; neither installs nor clears the global registry, and neither mutates the process environment).
+- `resolve_from_registry` for an unhosted team returns `ErrorKind::Config` with the exact message, and `run_mcp_server_with_descriptor` returns exit code `1` for that error and for an injected resolver `Err` (all `#[cfg(feature = "mcp")]`; none installs or clears the global registry, and none mutates the process environment).
+- `stdio_transport_has_no_platform_gate` pins the platform-independent transport from the source (`include_str!("stdio.rs")` carries no `cfg(unix)`/`cfg(not(unix))`, no `/dev/stdin`, no `process_streams` and no `Error::unsupported`) and takes `serve_stdio` as a plain item; the process-level stdio round trip itself is not unit-tested.
 - Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` green.
 
 ## Deferred

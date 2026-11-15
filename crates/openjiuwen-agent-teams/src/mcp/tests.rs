@@ -611,4 +611,38 @@ mod live_attach {
             stdio::run_mcp_server_with_descriptor(descriptor, stdio::resolve_from_registry).await;
         assert_eq!(code, 1, "a resolver error exits 1 without opening stdio");
     }
+    #[tokio::test]
+    async fn run_mcp_server_with_descriptor_propagates_any_resolver_error() {
+        // The exit code belongs to the seam, not to the default resolver: an injected resolver that
+        // fails on any other ground exits `1` through the same path, before the transport starts.
+        let descriptor = unhosted_descriptor();
+        let code = stdio::run_mcp_server_with_descriptor(descriptor, |_| {
+            Err(openjiuwen_common::error::Error::config("injected failure"))
+        })
+        .await;
+        assert_eq!(code, 1);
+    }
+    #[test]
+    fn stdio_transport_has_no_platform_gate() {
+        // The transport is `rmcp::transport::stdio()`, which exists on every target. A `cfg` gate
+        // would still compile on this host, so the source is where its absence can be pinned: the
+        // previous build reopened `/dev/stdin` on Unix and refused every other target.
+        const SOURCE: &str = include_str!("stdio.rs");
+        for forbidden in [
+            "cfg(unix)",
+            "cfg(not(unix))",
+            "/dev/stdin",
+            "/dev/stdout",
+            "process_streams",
+            "Error::unsupported",
+        ] {
+            assert!(
+                !SOURCE.contains(forbidden),
+                "stdio.rs still carries the platform split: {forbidden}"
+            );
+        }
+        // And the entry point itself is a plain, gate-free item on every target.
+        let entry = stdio::serve_stdio;
+        let _ = entry;
+    }
 }
