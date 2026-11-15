@@ -59,7 +59,7 @@
 //!
 //! [`initialize`](super::provider::MemoryProvider::initialize) runs the same probe but
 //! honours its verdict: a rejected credential (`401`/`403`) or any other non-`2xx` answer
-//! is a typed error and the handle stays uninitialized, so "wrong api_key" can never be
+//! is a typed error and the handle stays uninitialized, so "wrong `api_key`" can never be
 //! mistaken for a healthy handle.
 //!
 //! # Pagination
