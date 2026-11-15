@@ -296,3 +296,49 @@ fn the_counter_adds_chat_framing_per_message() {
     // The workspace convention is a fixed four-token overhead per message.
     assert_eq!(tokenizer.count_messages(&messages), raw + 8);
 }
+
+#[test]
+fn a_malformed_template_id_warns_while_the_rest_of_the_framing_survives() {
+    let tokenizer = parse(
+        &serde_json::json!({
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"[CLS]": 0, "hello": 1, "world": 2, "[SEP]": 3},
+                "unk_token": "[CLS]"
+            },
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "single": [
+                    {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"SpecialToken": {"id": "[SEP]", "type_id": 0}}
+                ],
+                "special_tokens": {
+                    "[CLS]": {"id": "[CLS]", "ids": [0, "not-an-id"], "tokens": ["[CLS]"]},
+                    "[SEP]": {"id": "[SEP]", "ids": [3], "tokens": ["[SEP]"]}
+                }
+            }
+        })
+        .to_string(),
+    );
+
+    // The usable ids still frame the sequence, so only the malformed entry is lost.
+    assert_eq!(tokenizer.encode("hello world"), vec![0, 1, 2, 3]);
+    let warnings = tokenizer.warnings();
+    let malformed: Vec<&String> = warnings
+        .iter()
+        .filter(|warning| warning.contains("malformed"))
+        .collect();
+    assert_eq!(malformed.len(), 1, "one warning: {warnings:?}");
+    assert!(
+        malformed[0].contains("[CLS]"),
+        "the warning names the template piece: {}",
+        malformed[0]
+    );
+    assert!(
+        malformed[0].contains("not-an-id"),
+        "the warning names the malformed entry: {}",
+        malformed[0]
+    );
+}

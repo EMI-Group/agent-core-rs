@@ -6,19 +6,23 @@
 //! Everything is offline and deterministic: local files come from `tempfile`,
 //! downloads hit a `wiremock` server, and no test reads the host's tokenizer
 //! cache.
+use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use openjiuwen_common::error::ErrorKind;
 use openjiuwen_context::tokenizers::artifacts::{
-    artifact_name, default_cache_dir, sha256_hex, TokenizerArtifactManager, ARTIFACT_ERROR_CODES,
-    CACHE_DIR_ENV, DEFAULT_HUGGINGFACE_ENDPOINT, DEFAULT_MODELSCOPE_ENDPOINT,
+    artifact_name, default_cache_dir, sha256_hex, ArtifactLock, TokenizerArtifactManager,
+    ARTIFACT_ERROR_CODES, CACHE_DIR_ENV, DEFAULT_HUGGINGFACE_ENDPOINT, DEFAULT_MODELSCOPE_ENDPOINT,
     LOCAL_ARTIFACT_MISSING_CODE, PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE,
     REMOTE_DOWNLOAD_DISABLED_CODE, REMOTE_URL_NOT_ALLOWED_CODE, TIKTOKEN_MODEL_MISSING_CODE,
     TOKENIZER_DOWNLOAD_FAILED_CODE, TOKENIZER_JSON_MISSING_CODE,
-    TOKENIZER_NETWORK_UNAVAILABLE_CODE, TOKENIZER_NOT_IN_LOCAL_CACHE_CODE,
-    TOKENIZER_REVISION_UNAVAILABLE_CODE, TOKENIZER_SHA256_MISMATCH_CODE,
+    TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE, TOKENIZER_NETWORK_UNAVAILABLE_CODE,
+    TOKENIZER_NOT_IN_LOCAL_CACHE_CODE, TOKENIZER_REVISION_UNAVAILABLE_CODE,
+    TOKENIZER_SHA256_MISMATCH_CODE,
 };
+use openjiuwen_context::tokenizers::selector::NATIVE_ARTIFACT_UNDECODABLE_REASON;
 use openjiuwen_context::tokenizers::CompatibleTokenizerSpec;
 use openjiuwen_context::{
     ContextConfig, SelectedTokenizer, TokenCounterConfig, TokenCounterKind, TokenizerEngine,
@@ -27,8 +31,89 @@ use openjiuwen_context::{
 use openjiuwen_foundation::prompt::TokenCounter;
 use openjiuwen_test_support::fixtures::EnvGuard;
 use tempfile::TempDir;
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Level, Metadata, Subscriber};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+// ---------------------------------------------------------------------------
+// Tracing capture
+// ---------------------------------------------------------------------------
+
+/// A [`Subscriber`] keeping the level and rendered text of every event.
+///
+/// The selection ladder is synchronous, so a local subscriber captures exactly
+/// the warnings one `select()` emits.
+#[derive(Clone, Default)]
+struct EventCapture {
+    /// One `(level, rendered event)` pair per event.
+    events: Arc<Mutex<Vec<(Level, String)>>>,
+}
+
+impl EventCapture {
+    /// An empty capture.
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// The rendered text of every `warn` event, in emission order.
+    fn warnings(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .filter(|(level, _)| *level == Level::WARN)
+            .map(|(_, message)| message.clone())
+            .collect()
+    }
+
+    /// The warnings whose rendered text contains `needle`.
+    fn warnings_containing(&self, needle: &str) -> Vec<String> {
+        self.warnings()
+            .into_iter()
+            .filter(|warning| warning.contains(needle))
+            .collect()
+    }
+}
+
+impl Subscriber for EventCapture {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+        self.events
+            .lock()
+            .expect("capture lock")
+            .push((*event.metadata().level(), visitor.0));
+    }
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+}
+
+/// Renders every field of an event, so a warning's structured fields are
+/// asserted alongside its message.
+struct MessageVisitor(String);
+
+impl Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, " {}={value:?}", field.name());
+    }
+}
 
 /// A tiny BPE document the native decoder understands: `abc` is one token.
 const TOKENIZER_JSON: &str = r#"{
@@ -916,4 +1001,233 @@ fn selected_tokenizer_exposes_native_provenance() {
         openjiuwen_context::load_native_tokenizer(&file).expect("load");
     assert_eq!(selected.source(), TokenizerSource::NativeTokenizer);
     assert!(!selected.estimated());
+}
+
+// ---------------------------------------------------------------------------
+// A hand-placed artifact this loader cannot decode
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_model_type_code_is_exported_and_listed() {
+    assert_eq!(
+        TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE, MODEL_TYPE_UNSUPPORTED_CODE,
+        "the re-exported constant is the code the manager records"
+    );
+    assert!(ARTIFACT_ERROR_CODES.contains(&TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE));
+    assert_eq!(
+        ARTIFACT_ERROR_CODES.len(),
+        13,
+        "every compact code the manager can report is published once: {ARTIFACT_ERROR_CODES:?}"
+    );
+    let unique: std::collections::BTreeSet<&str> = ARTIFACT_ERROR_CODES.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        ARTIFACT_ERROR_CODES.len(),
+        "no code is listed twice"
+    );
+}
+
+#[test]
+fn a_hand_placed_artifact_of_an_undecoded_model_type_is_refused() {
+    let dir = TempDir::new().expect("temp dir");
+    let file = write_file(dir.path(), "tokenizer.json", UNDECODED_TOKENIZER_JSON);
+    let manager = offline_manager(dir.path());
+    let spec = local_spec(&file, TokenizerEngine::Native);
+
+    assert_eq!(manager.resolve_cached(&spec), None);
+    let recorded = manager.last_error().expect("the model type is recorded");
+    assert!(
+        recorded.starts_with(TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE),
+        "{recorded}"
+    );
+    assert!(recorded.contains("UnigramV2"), "{recorded}");
+    assert!(
+        recorded.contains(&file.display().to_string()),
+        "the refusal names the artifact: {recorded}"
+    );
+}
+
+#[tokio::test]
+async fn a_hand_placed_hub_artifact_of_an_undecoded_model_type_is_refused() {
+    let dir = TempDir::new().expect("temp dir");
+    let cached = write_file(
+        &dir.path().join("huggingface/acme/tok/main"),
+        "tokenizer.json",
+        UNDECODED_TOKENIZER_JSON,
+    );
+    let manager = offline_manager(dir.path());
+    let spec = hub_spec("huggingface", "acme/tok", TokenizerEngine::Native);
+
+    assert_eq!(manager.resolve_cached(&spec), None);
+    let recorded = manager.last_error().expect("the model type is recorded");
+    assert!(
+        recorded.starts_with(TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE),
+        "{recorded}"
+    );
+    assert!(
+        recorded.contains(&cached.display().to_string()),
+        "the refusal names the cached artifact: {recorded}"
+    );
+
+    // The asynchronous rung refuses it for the same typed reason.
+    assert_eq!(manager.resolve(&spec).await, None);
+    let recorded = manager.last_error().expect("the model type is recorded");
+    assert!(
+        recorded.starts_with(TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE),
+        "{recorded}"
+    );
+}
+
+#[test]
+fn an_undecoded_artifact_degrades_with_the_named_reason() {
+    let dir = TempDir::new().expect("temp dir");
+    let file = write_file(dir.path(), "tokenizer.json", UNDECODED_TOKENIZER_JSON);
+    let spec = local_spec(&file, TokenizerEngine::Native);
+    let selector = TokenizerSelector::new("acme", "acme-mini", Some(spec), None)
+        .with_artifact_manager(offline_manager(dir.path()));
+
+    let capture = EventCapture::new();
+    let selected = tracing::subscriber::with_default(capture.clone(), || selector.select());
+
+    assert_eq!(
+        selected.fallback_reason(),
+        Some(NATIVE_ARTIFACT_UNDECODABLE_REASON),
+        "the estimate names the decode failure, not a cache miss"
+    );
+    assert_eq!(
+        selected.fallback_reason(),
+        Some("native_artifact_undecodable")
+    );
+    assert!(selected.estimated());
+    assert_eq!(selected.source(), TokenizerSource::StringLengthFallback);
+
+    // Exactly one warning names the refused artifact and the typed error; the
+    // degradation warning of the estimate is a second, separate event.
+    let refused = capture.warnings_containing("could not be decoded");
+    assert_eq!(refused.len(), 1, "one warning: {:?}", capture.warnings());
+    let warning = &refused[0];
+    assert!(
+        warning.contains(&file.display().to_string()),
+        "the warning names the artifact: {warning}"
+    );
+    assert!(
+        warning.contains(TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE),
+        "the warning names the typed error: {warning}"
+    );
+    assert!(
+        warning.contains("UnigramV2"),
+        "the warning carries the declared model type: {warning}"
+    );
+}
+
+#[test]
+fn an_undecoded_artifact_that_falls_to_tiktoken_keeps_the_reason() {
+    let dir = TempDir::new().expect("temp dir");
+    let file = write_file(dir.path(), "tokenizer.json", UNDECODED_TOKENIZER_JSON);
+    let mut spec = local_spec(&file, TokenizerEngine::Native);
+    // The spec's own model wins for encoding resolution, so name the model here.
+    spec.model = "gpt-4o".to_owned();
+    let selector = TokenizerSelector::new("acme", "gpt-4o", Some(spec), None)
+        .with_artifact_manager(offline_manager(dir.path()));
+    let selected = selector.select();
+
+    assert_eq!(selected.source(), TokenizerSource::TiktokenFallback);
+    assert_eq!(
+        selected.fallback_reason(),
+        Some(NATIVE_ARTIFACT_UNDECODABLE_REASON)
+    );
+    assert!(selected.estimated());
+}
+
+#[test]
+fn an_undecoded_primary_artifact_names_its_cause_on_the_fallback_rung() {
+    let dir = TempDir::new().expect("temp dir");
+    let primary = write_file(
+        dir.path(),
+        "primary/tokenizer.json",
+        UNDECODED_TOKENIZER_JSON,
+    );
+    let sibling = write_file(dir.path(), "sibling/tokenizer.json", TOKENIZER_JSON);
+    let mut spec = local_spec(&primary, TokenizerEngine::Native);
+    spec.compatible_fallbacks = vec![CompatibleTokenizerSpec {
+        model: "acme-sibling".to_owned(),
+        tokenizer_id: Some("acme-sibling".to_owned()),
+        artifact_path: Some(sibling.to_string_lossy().into_owned()),
+        engine: TokenizerEngine::Native,
+        ..CompatibleTokenizerSpec::default()
+    }];
+    let selector = TokenizerSelector::new("acme", "acme-mini", Some(spec), None)
+        .with_artifact_manager(offline_manager(dir.path()));
+    let selected = selector.select();
+
+    assert_eq!(selected.source(), TokenizerSource::FamilyTokenizerFallback);
+    assert_eq!(
+        selected.fallback_reason(),
+        Some(NATIVE_ARTIFACT_UNDECODABLE_REASON),
+        "the sibling rung reports why the primary was not used"
+    );
+    assert_eq!(selected.tokenizer(), Some("acme-sibling"));
+    assert!(selected.estimated());
+    assert_eq!(selected.count_text("abc"), 1);
+}
+
+#[test]
+fn a_rejected_digest_still_names_the_digest() {
+    let dir = TempDir::new().expect("temp dir");
+    let file = write_file(dir.path(), "tokenizer.json", UNDECODED_TOKENIZER_JSON);
+    let manager = offline_manager(dir.path());
+    let mut spec = local_spec(&file, TokenizerEngine::Native);
+    spec.sha256 = Some("0".repeat(64));
+    assert_eq!(manager.resolve_cached(&spec), None);
+    assert_eq!(
+        manager.last_error().as_deref(),
+        Some(TOKENIZER_SHA256_MISMATCH_CODE),
+        "the digest is checked before the body"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Lock markers with a clock-skewed mtime
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_lock_marker_from_the_future_is_live_and_named() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join("skewed.lock");
+    let marker = std::fs::File::create(&path).expect("marker");
+    marker
+        .set_modified(SystemTime::now() + Duration::from_secs(600))
+        .expect("a future mtime");
+    drop(marker);
+    assert!(path.is_file());
+
+    let capture = EventCapture::new();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+    let error = ArtifactLock::acquire_within(path.clone(), Duration::from_millis(50))
+        .await
+        .expect_err("a future-dated marker is not stale");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(
+        path.is_file(),
+        "a live marker is never removed by the waiter"
+    );
+
+    // The waiter re-inspects the marker on every attempt, so the skew is logged
+    // once per poll; each warning names the marker and both mtimes.
+    let warned = capture.warnings_containing("clock skew");
+    assert!(
+        !warned.is_empty(),
+        "the skew is logged: {:?}",
+        capture.warnings()
+    );
+    for warning in &warned {
+        assert!(
+            warning.contains(&path.display().to_string()),
+            "the warning names the marker: {warning}"
+        );
+        assert!(
+            warning.contains("mtime_unix_ms") && warning.contains("now_unix_ms"),
+            "the warning carries both mtimes: {warning}"
+        );
+    }
 }
