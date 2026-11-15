@@ -5,17 +5,20 @@
 //! cooperative executors, the stub event handler, the counting recognizer, the
 //! recording session, and the turn helpers.
 use super::fixtures::{
-    await_counter, controller_with_cooperative_executor, controller_with_executor,
-    recording_session, submitted_task, test_session, CountingRecognizer, StubExecutor, StubHandler,
+    await_counter, bounded, controller_with_cooperative_executor, controller_with_executor,
+    recording_session, submitted_task, test_session, ContextExecutor, CountingRecognizer,
+    RecordingRecognizer, StallingExecutor, StubExecutor, StubHandler,
 };
 use super::{BaseController, Controller, EventHandlerOutcome, TASKS_STATE_KEY};
 use crate::card::AgentCard;
 use crate::controller::config::{ControllerConfig, DefaultResponse};
 use crate::controller::executors::{ExecutorInfo, LLMController};
 use crate::controller::group::GroupRouter;
+use crate::controller::history::{HistoryEntry, HistoryRole};
 use crate::controller::reasoner::TaskControl;
 use crate::controller::schema::{
-    ControllerOutput, ControllerOutputChunk, DataFrame, Event, Intent, OutputKind, Task, TaskStatus,
+    frames_text, ControllerOutput, ControllerOutputChunk, DataFrame, Event, Intent, OutputKind,
+    Task, TaskStatus,
 };
 use crate::controller::task_manager::TaskManager;
 use async_trait::async_trait;
@@ -576,4 +579,388 @@ async fn completion_sentinel_is_written_once_per_idle_stretch() {
         "the same idle stretch is signalled once"
     );
     controller.shutdown().await;
+}
+
+#[tokio::test]
+async fn history_records_user_then_assistant_with_the_task_id() {
+    let (controller, _) = controller_with_executor();
+    let session = test_session();
+    let output = Controller::invoke(
+        &controller,
+        json!({"query": "first"}),
+        Some(Arc::clone(&session)),
+    )
+    .await
+    .unwrap();
+
+    let entries = controller.history("s1");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0], HistoryEntry::user("first"));
+    assert_eq!(entries[0].role, HistoryRole::User);
+    let task_id = output.task_id.clone().expect("the turn names its task");
+    assert_eq!(
+        entries[1],
+        HistoryEntry::assistant("done").with_task_id(task_id)
+    );
+    assert_eq!(entries[1].role, HistoryRole::Assistant);
+    assert!(
+        controller.history("unknown").is_empty(),
+        "an unknown session has no history"
+    );
+}
+
+#[tokio::test]
+async fn history_is_trimmed_to_the_newest_window() {
+    let config = ControllerConfig::new().with_history_limit(3);
+    let controller = BaseController::new(AgentCard::new("ctrl"), config);
+    controller.add_executor("agent", Arc::new(StubExecutor::new("agent", "done").0));
+    let session = test_session();
+    for query in ["t1", "t2", "t3"] {
+        Controller::invoke(
+            &controller,
+            json!({"query": query}),
+            Some(Arc::clone(&session)),
+        )
+        .await
+        .unwrap();
+    }
+
+    let entries = controller.history("s1");
+    let texts: Vec<&str> = entries.iter().map(|entry| entry.text.as_str()).collect();
+    assert_eq!(texts, ["done", "t3", "done"], "the oldest entries are gone");
+    let roles: Vec<HistoryRole> = entries.iter().map(|entry| entry.role).collect();
+    assert_eq!(
+        roles,
+        [
+            HistoryRole::Assistant,
+            HistoryRole::User,
+            HistoryRole::Assistant
+        ]
+    );
+}
+
+#[tokio::test]
+async fn history_reaches_the_next_turn_recognizer_and_executor() {
+    let (recognizer, recorded) = RecordingRecognizer::new();
+    let controller = BaseController::with_recognizer(
+        AgentCard::new("ctrl"),
+        ControllerConfig::new(),
+        Arc::new(recognizer),
+    );
+    let (executor, executed, exposed) = ContextExecutor::new("agent", "done");
+    controller.add_executor("agent", Arc::new(executor));
+    let session = test_session();
+
+    let first = Controller::invoke(
+        &controller,
+        json!({"query": "one"}),
+        Some(Arc::clone(&session)),
+    )
+    .await
+    .unwrap();
+    let first_task = first
+        .task_id
+        .clone()
+        .expect("the first turn names its task");
+    Controller::invoke(
+        &controller,
+        json!({"query": "two"}),
+        Some(Arc::clone(&session)),
+    )
+    .await
+    .unwrap();
+
+    let recorded = recorded.lock().clone();
+    assert_eq!(recorded.len(), 2);
+    assert!(recorded[0].is_empty(), "the first turn has no history");
+    assert_eq!(
+        recorded[1],
+        vec![
+            HistoryEntry::user("one"),
+            HistoryEntry::assistant("done").with_task_id(first_task),
+        ]
+    );
+    assert!(
+        recorded[1].iter().all(|entry| entry.text != "two"),
+        "the current turn is excluded"
+    );
+
+    let executed = executed.lock().clone();
+    assert_eq!(executed.len(), 2);
+    assert!(executed[0].is_empty(), "the first run has no history");
+    assert_eq!(
+        executed[1], recorded[1],
+        "the executor sees what the recognizer saw"
+    );
+    assert_eq!(exposed.lock().as_slice(), [false, false]);
+}
+
+#[tokio::test]
+async fn history_limit_zero_retains_nothing() {
+    let (recognizer, recorded) = RecordingRecognizer::new();
+    let controller = BaseController::with_recognizer(
+        AgentCard::new("ctrl"),
+        ControllerConfig::new().with_history_limit(0),
+        Arc::new(recognizer),
+    );
+    controller.add_executor("agent", Arc::new(StubExecutor::new("agent", "done").0));
+    let session = test_session();
+    for query in ["one", "two", "three"] {
+        Controller::invoke(
+            &controller,
+            json!({"query": query}),
+            Some(Arc::clone(&session)),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(
+        controller.history("s1").is_empty(),
+        "a zero limit retains nothing"
+    );
+    let recorded = recorded.lock().clone();
+    assert_eq!(recorded.len(), 3);
+    assert!(
+        recorded.iter().all(Vec::is_empty),
+        "the recognizer never sees history"
+    );
+}
+
+#[tokio::test]
+async fn clear_history_drops_the_session_log() {
+    let (controller, _) = controller_with_executor();
+    let session = test_session();
+    Controller::invoke(
+        &controller,
+        json!({"query": "one"}),
+        Some(Arc::clone(&session)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(controller.history("s1").len(), 2);
+
+    controller.clear_history("s1");
+    assert!(
+        controller.history("s1").is_empty(),
+        "the cleared log is empty"
+    );
+    // Clearing an unknown session is harmless.
+    controller.clear_history("unknown");
+}
+
+#[tokio::test]
+async fn lowering_history_limit_retrims_the_next_read() {
+    let config = ControllerConfig::new().with_history_limit(50);
+    let controller = BaseController::new(AgentCard::new("ctrl"), config);
+    controller.add_executor("agent", Arc::new(StubExecutor::new("agent", "done").0));
+    let session = test_session();
+    for query in ["t1", "t2", "t3"] {
+        Controller::invoke(
+            &controller,
+            json!({"query": query}),
+            Some(Arc::clone(&session)),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(controller.history("s1").len(), 6);
+
+    controller.set_config(controller.config().with_history_limit(2));
+    let entries = controller.history("s1");
+    let texts: Vec<&str> = entries.iter().map(|entry| entry.text.as_str()).collect();
+    assert_eq!(texts, ["t3", "done"]);
+}
+
+#[tokio::test]
+async fn reasoning_is_dropped_when_not_exposed() {
+    let controller = BaseController::new(AgentCard::new("ctrl"), ControllerConfig::new());
+    let (executor, _histories, exposed) = ContextExecutor::new("agent", "done");
+    controller.add_executor("agent", Arc::new(executor.with_reasoning("why")));
+    let output = Controller::invoke(&controller, json!({"query": "go"}), Some(test_session()))
+        .await
+        .unwrap();
+
+    assert!(output
+        .frames
+        .iter()
+        .filter_map(|chunk| chunk.payload.as_ref())
+        .all(|payload| payload.kind != OutputKind::Reasoning));
+    let wire = serde_json::to_string(&output).unwrap();
+    assert!(!wire.contains("reasoning"), "no reasoning key anywhere");
+    assert!(!wire.contains("why"), "the reasoning text is dropped");
+    assert_eq!(exposed.lock().as_slice(), [false]);
+}
+
+#[tokio::test]
+async fn reasoning_is_exposed_as_a_frame_and_data_when_asked() {
+    let config = ControllerConfig::new().with_expose_reasoning(true);
+    let controller = BaseController::new(AgentCard::new("ctrl"), config);
+    let (executor, _histories, exposed) = ContextExecutor::new("agent", "done");
+    controller.add_executor("agent", Arc::new(executor.with_reasoning("why")));
+    let output = Controller::invoke(&controller, json!({"query": "go"}), Some(test_session()))
+        .await
+        .unwrap();
+
+    let reasoning: Vec<&ControllerOutputChunk> = output
+        .frames
+        .iter()
+        .filter(|chunk| {
+            chunk
+                .payload
+                .as_ref()
+                .is_some_and(|payload| payload.kind == OutputKind::Reasoning)
+        })
+        .collect();
+    assert_eq!(reasoning.len(), 1);
+    let frame = reasoning[0];
+    assert!(!frame.last_chunk);
+    assert_eq!(frame.index, 1, "the reasoning frame follows the run frame");
+    assert_eq!(
+        frames_text(&frame.payload.as_ref().unwrap().data).as_deref(),
+        Some("why")
+    );
+    let last = output.frames.last().expect("the turn has a terminal frame");
+    assert!(last.last_chunk);
+    assert_eq!(
+        last.payload.as_ref().unwrap().kind,
+        OutputKind::TaskCompletion
+    );
+    assert_eq!(
+        output.data.as_ref().unwrap()["tasks"][0]["reasoning"],
+        json!("why")
+    );
+    assert_eq!(exposed.lock().as_slice(), [true]);
+}
+
+#[tokio::test]
+async fn event_timeout_cancels_the_stalled_event() {
+    let config = ControllerConfig::new().with_event_timeout(20);
+    let controller = BaseController::new(AgentCard::new("ctrl"), config);
+    let (executor, started, finished) = StallingExecutor::new("agent", Duration::from_millis(200));
+    controller.add_executor("agent", Arc::new(executor));
+
+    let error = bounded(Controller::invoke(
+        &controller,
+        json!({"query": "slow"}),
+        Some(test_session()),
+    ))
+    .await
+    .expect_err("the event deadline expires");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(error
+        .message()
+        .contains("controller event handling timed out after 20 ms"));
+    assert_eq!(started.load(Ordering::SeqCst), 1);
+
+    // Ten times the deadline: the dropped run never completes.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(finished.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn event_timeout_zero_lets_a_slow_turn_finish() {
+    let config = ControllerConfig::new().with_event_timeout(0);
+    let controller = BaseController::new(AgentCard::new("ctrl"), config);
+    let (executor, started, finished) = StallingExecutor::new("agent", Duration::from_millis(200));
+    controller.add_executor("agent", Arc::new(executor));
+
+    let output = bounded(Controller::invoke(
+        &controller,
+        json!({"query": "slow"}),
+        Some(test_session()),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(output.output, "slow");
+    assert_eq!(started.load(Ordering::SeqCst), 1);
+    assert_eq!(finished.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn event_timeout_surfaces_as_the_stream_error_frame() {
+    let config = ControllerConfig::new().with_event_timeout(20);
+    let controller = BaseController::new(AgentCard::new("ctrl"), config);
+    let (executor, _started, finished) = StallingExecutor::new("agent", Duration::from_millis(200));
+    controller.add_executor("agent", Arc::new(executor));
+
+    let stream = Controller::stream(&controller, json!({"query": "slow"}), Some(test_session()));
+    let items = bounded(stream.collect::<Vec<_>>()).await;
+    assert_eq!(items.len(), 2, "the processing frame and one error");
+    assert_eq!(
+        items[0].as_ref().unwrap().payload.as_ref().unwrap().kind,
+        OutputKind::Processing
+    );
+    let error = items[1].as_ref().expect_err("the turn timed out");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(error
+        .message()
+        .contains("controller event handling timed out after 20 ms"));
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(finished.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn stream_first_frame_timeout_cancels_and_ends_the_stream() {
+    let config = ControllerConfig::new().with_stream_first_frame_timeout(20);
+    let controller = BaseController::new(AgentCard::new("ctrl"), config);
+    let (executor, started, finished) = StallingExecutor::new("agent", Duration::from_millis(200));
+    controller.add_executor("agent", Arc::new(executor));
+
+    let stream = Controller::stream(&controller, json!({"query": "slow"}), Some(test_session()));
+    let items = bounded(stream.collect::<Vec<_>>()).await;
+    assert_eq!(items.len(), 2, "the processing frame and one timeout error");
+    assert_eq!(
+        items[0].as_ref().unwrap().payload.as_ref().unwrap().kind,
+        OutputKind::Processing
+    );
+    let error = items[1]
+        .as_ref()
+        .expect_err("the first-frame deadline expired");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(error
+        .message()
+        .contains("controller stream first frame timed out after 20 ms"));
+    assert_eq!(started.load(Ordering::SeqCst), 1);
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(finished.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn stream_first_frame_timeout_zero_streams_the_slow_turn() {
+    let config = ControllerConfig::new().with_stream_first_frame_timeout(0);
+    let controller = BaseController::new(AgentCard::new("ctrl"), config);
+    let (executor, _started, finished) = StallingExecutor::new("agent", Duration::from_millis(200));
+    controller.add_executor("agent", Arc::new(executor));
+
+    let stream = Controller::stream(&controller, json!({"query": "slow"}), Some(test_session()));
+    let items = bounded(stream.collect::<Vec<_>>()).await;
+    assert!(items.iter().all(Result::is_ok), "no error frame");
+    let last = items.last().unwrap().as_ref().unwrap();
+    assert!(last.last_chunk);
+    assert_eq!(
+        last.payload.as_ref().unwrap().kind,
+        OutputKind::TaskCompletion
+    );
+    assert_eq!(finished.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn stream_first_frame_timeout_does_not_bound_invoke() {
+    let config = ControllerConfig::new().with_stream_first_frame_timeout(20);
+    let controller = BaseController::new(AgentCard::new("ctrl"), config);
+    let (executor, _started, finished) = StallingExecutor::new("agent", Duration::from_millis(200));
+    controller.add_executor("agent", Arc::new(executor));
+
+    let output = bounded(Controller::invoke(
+        &controller,
+        json!({"query": "slow"}),
+        Some(test_session()),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(output.output, "slow");
+    assert_eq!(finished.load(Ordering::SeqCst), 1);
 }

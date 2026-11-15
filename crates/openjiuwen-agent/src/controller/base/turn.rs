@@ -19,6 +19,7 @@ use super::{BaseController, Controller, EventHandlerOutcome, TurnState};
 use crate::card::AgentCard;
 use crate::controller::config::ControllerConfig;
 use crate::controller::executors::{TaskContext, TaskRun};
+use crate::controller::history::{trim_history, HistoryEntry};
 use crate::controller::schema::{
     frames_text, ControllerOutput, ControllerOutputChunk, ControllerOutputPayload, DataFrame,
     Event, EventType, Intent, IntentType, OutputKind, Task, TaskStatus,
@@ -27,10 +28,11 @@ use crate::run::resolve_session;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_session::Session;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, warn};
 
 impl TurnState {
@@ -61,9 +63,10 @@ impl BaseController {
         )
         .await?;
         let session = Arc::clone(run.session());
+        let config = self.config();
         self.start();
         self.bind_session(Arc::clone(&session)).await;
-        if self.config().enable_task_persistence {
+        if config.enable_task_persistence {
             self.load_state(session.as_ref()).await?;
         }
         if !self.push_event(event) {
@@ -74,13 +77,36 @@ impl BaseController {
         }
         let events = self.drain_events();
         let mut turn = TurnState::new(&events);
+        // A deadline needs the tokio timer, and the legacy wrapper still drives
+        // a turn inline from a non-tokio executor, where no timer exists.
+        let event_timeout_ms = config.event_timeout_ms;
+        let event_deadline = (event_timeout_ms != 0
+            && tokio::runtime::Handle::try_current().is_ok())
+        .then(|| Duration::from_millis(event_timeout_ms));
         let mut output: Option<ControllerOutput> = None;
         for event in &events {
-            if let Some(produced) = self.process_event(event, &session, &mut turn).await? {
+            let produced = match event_deadline {
+                Some(deadline) => {
+                    let handled = tokio::time::timeout(
+                        deadline,
+                        self.process_event(event, &session, &mut turn),
+                    )
+                    .await
+                    .map_err(|_| {
+                        Error::timeout(format!(
+                            "controller event handling timed out after {event_timeout_ms} ms"
+                        ))
+                    })?;
+                    handled?
+                }
+                None => self.process_event(event, &session, &mut turn).await?,
+            };
+            if let Some(produced) = produced {
                 output = Some(produced);
             }
         }
         let output = output.unwrap_or_else(|| self.fallback_output());
+        self.record_history(session.id(), &turn.query, &output);
         self.save_state(session.as_ref()).await?;
         // An idle session gets Python's `all_tasks_processed` sentinel; the
         // loop is only present when this controller started one, and the
@@ -95,6 +121,11 @@ impl BaseController {
 
     /// Streams one turn: a `processing` frame, the turn frames, and one final
     /// frame.
+    ///
+    /// The `processing` frame is the acknowledgment and never consumes
+    /// [`stream_first_frame_timeout_ms`](ControllerConfig::stream_first_frame_timeout_ms);
+    /// the deadline bounds the turn's first output frame, so a turn that does not
+    /// produce one sends one timeout error and ends the stream.
     fn stream_turn(
         &self,
         inputs: Value,
@@ -107,7 +138,22 @@ impl BaseController {
                 0,
                 ControllerOutputPayload::processing(),
             )));
-            match controller.invoke_turn(inputs, session).await {
+            let first_frame_timeout_ms = controller.config().stream_first_frame_timeout_ms;
+            let turn = controller.invoke_turn(inputs, session);
+            tokio::pin!(turn);
+            let result = if first_frame_timeout_ms == 0 {
+                turn.await
+            } else {
+                let deadline = Duration::from_millis(first_frame_timeout_ms);
+                let Ok(result) = tokio::time::timeout(deadline, turn).await else {
+                    let _ = tx.send(Err(Error::timeout(format!(
+                        "controller stream first frame timed out after {first_frame_timeout_ms} ms"
+                    ))));
+                    return;
+                };
+                result
+            };
+            match result {
                 Ok(output) => {
                     let mut index = 1_i64;
                     for frame in &output.frames {
@@ -147,16 +193,21 @@ impl BaseController {
     ///
     /// `Ok(None)` means the event contributed nothing (an ignored handler
     /// decision or an input that planned no task), so an earlier event's output
-    /// stays the turn output.
+    /// stays the turn output. The event handler and the recognizer see the
+    /// session's history of the previous turns, never the current one.
     async fn process_event(
         &self,
         event: &Event,
         session: &Arc<dyn Session>,
         turn: &mut TurnState,
     ) -> Result<Option<ControllerOutput>> {
+        let config = self.config();
+        let history = self.history(session.id());
         let handler = self.inner.handler.read().clone();
         if let Some(handler) = handler {
-            let ctx = TaskContext::new(Some(Arc::clone(session)), self.card().id());
+            let ctx = TaskContext::new(Some(Arc::clone(session)), self.card().id())
+                .with_history(history)
+                .with_expose_reasoning(config.expose_reasoning);
             return match handler.handle(event, &ctx).await? {
                 EventHandlerOutcome::Output(output) => Ok(Some(*output)),
                 EventHandlerOutcome::Ignored => Ok(None),
@@ -166,9 +217,9 @@ impl BaseController {
             };
         }
         if matches!(event.event_type, EventType::Input | EventType::FollowUp) {
-            let intents = if self.config().enable_intent_recognition {
+            let intents = if config.enable_intent_recognition {
                 let recognizer = self.inner.recognizer.read().clone();
-                recognizer.recognize(event).await?
+                recognizer.recognize_with_history(event, &history).await?
             } else {
                 vec![Intent::default_for(event.clone())]
             };
@@ -300,14 +351,21 @@ impl BaseController {
     }
 
     /// Dispatches `tasks` and aggregates the runs into one output.
+    ///
+    /// The dispatch context carries the turn's history and the configured
+    /// reasoning exposure; when reasoning is exposed, each run that reported a
+    /// non-empty reasoning text contributes one `reasoning` frame after its own
+    /// frame and a `reasoning` key in `data.tasks[]`.
     async fn dispatch_runs(
         &self,
         tasks: Vec<Task>,
         session: &Arc<dyn Session>,
     ) -> ControllerOutput {
-        let ctx = TaskContext::new(Some(Arc::clone(session)), self.card().id());
-        let runs = self.scheduler().dispatch(tasks, &ctx).await;
         let config = self.config();
+        let ctx = TaskContext::new(Some(Arc::clone(session)), self.card().id())
+            .with_history(self.history(session.id()))
+            .with_expose_reasoning(config.expose_reasoning);
+        let runs = self.scheduler().dispatch(tasks, &ctx).await;
         let mut frames = Vec::new();
         let mut index = 0_i64;
         let mut texts = Vec::new();
@@ -315,17 +373,33 @@ impl BaseController {
         for run in &runs {
             frames.extend(run.frames(index));
             index += 1;
+            let reasoning = if config.expose_reasoning {
+                run.reasoning().filter(|text| !text.is_empty())
+            } else {
+                None
+            };
+            if let Some(reasoning) = reasoning {
+                frames.push(ControllerOutputChunk::new(
+                    index,
+                    ControllerOutputPayload::text(OutputKind::Reasoning, reasoning),
+                ));
+                index += 1;
+            }
             if run.status() == TaskStatus::Completed {
                 let text = run.text();
                 if !text.is_empty() {
                     texts.push(text);
                 }
             }
-            entries.push(json!({
+            let mut entry = json!({
                 "task_id": run.task.task_id,
                 "status": run.status().as_str(),
                 "output": run.text(),
-            }));
+            });
+            if let Some(reasoning) = reasoning {
+                entry["reasoning"] = json!(reasoning);
+            }
+            entries.push(entry);
         }
         {
             // The turn's batch enters the store only after it ran, so the
@@ -453,6 +527,32 @@ impl BaseController {
         }
         task.outputs.push(chunk.clone());
         let _ = manager.update_task(task);
+    }
+
+    /// Appends this turn's messages to the session's conversation history.
+    ///
+    /// One user entry carries the turn's first non-empty event text, and one
+    /// assistant entry carries the turn's output when it is non-empty, attributed
+    /// to the producing task when the output names one. The log is trimmed at
+    /// append time but never below the entries this turn just added, so a turn
+    /// that alone exceeds [`history_limit`](ControllerConfig::history_limit) keeps
+    /// its own messages; `limit == 0` retains nothing.
+    fn record_history(&self, session_id: &str, query: &str, output: &ControllerOutput) {
+        let limit = self.config().history_limit;
+        let mut history = self.inner.history.write();
+        let log = history.entry(session_id.to_owned()).or_default();
+        let turn_start = log.len();
+        if !query.is_empty() {
+            log.push(HistoryEntry::user(query));
+        }
+        if !output.output.is_empty() {
+            let mut entry = HistoryEntry::assistant(&output.output);
+            if let Some(task_id) = output.task_id.as_deref().filter(|id| !id.is_empty()) {
+                entry = entry.with_task_id(task_id);
+            }
+            log.push(entry);
+        }
+        trim_history(log, limit, turn_start);
     }
 
     /// Output of a turn that produced nothing: the configured default response.
