@@ -5,6 +5,8 @@
 Expose remote capabilities as tools: a provider-neutral client trait, `rmcp`-backed stdio / streamable-HTTP / SSE transports with reconnect and a server-initiated event stream, an OpenAPI→tools transport, and `McpTool` wrapping a remote tool as a `Tool`.
 Ports `openjiuwen/core/foundation/tool/mcp/` (`base.py`, `client/mcp_client.py`, `client/reconnect.py`, `client/{stdio,sse,streamable_http,openapi}_client.py`); the Python `playwright` transport is a documented deferral because it needs a browser runtime.
 The streamable-HTTP transport also opens the MCP server-initiated `GET` event stream, so server notifications and server-initiated requests reach the client.
+Resource subscriptions (`resources/subscribe`, `resources/unsubscribe`) are optional in MCP: they are defaulted on `McpClient` and the `rmcp` client implements them behind the capability the server negotiated in its `initialize` result.
+The legacy SSE transport reopens its event stream with `Last-Event-ID`, so a server replays the events the client has not seen.
 The whole module is compiled only with the `mcp` feature (declared on `tool::mcp` in `src/tool/mod.rs`); nothing here may be referenced from outside that gate.
 
 ## API Surface
