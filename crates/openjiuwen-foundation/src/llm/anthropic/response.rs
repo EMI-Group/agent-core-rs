@@ -46,6 +46,11 @@ pub const THINKING_BLOCKS_METADATA_KEY: &str = "anthropic_thinking_blocks";
 /// become empty values; a payload that is not a JSON object is an
 /// [`Error::Llm`] because it cannot be a provider response.
 ///
+/// `thinking` blocks contribute their text to the message's
+/// `reasoning_content`, and every replayable `thinking`/`redacted_thinking`
+/// block is also stored under [`THINKING_BLOCKS_METADATA_KEY`] so the next
+/// request can echo it back.
+///
 /// # Errors
 ///
 /// Returns [`Error::Llm`] when the payload is not a JSON object.
