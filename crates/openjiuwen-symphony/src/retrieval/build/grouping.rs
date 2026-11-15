@@ -1641,6 +1641,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kmeans_cluster_count_bounds_the_paths() {
+        // `clusters` clamps into `[1, min(items, max_children)]`, so every case bounds the paths.
+        // The inventory holds exactly `DEFAULT_MAX_CHILDREN` items: a larger one would be split by
+        // this module's own fan-out rebalancing, which would hide the k-means cluster bound.
+        let items: Vec<SourceItem> = (0..DEFAULT_MAX_CHILDREN)
+            .map(|index| {
+                item(
+                    &format!("w{index:02}"),
+                    &format!("name {index}"),
+                    &format!("group-{}", index % 3),
+                    &[],
+                )
+            })
+            .collect();
+        let runtime = GroupingRuntime::new().with_embedding(Arc::new(HashEmbedding::new(64)));
+        let cases: [(Option<usize>, usize, usize); 5] = [
+            (Some(1), 1, 1),
+            (Some(3), 1, 3),
+            (Some(999), 1, DEFAULT_MAX_CHILDREN),
+            (Some(0), 1, DEFAULT_MAX_CHILDREN),
+            (None, 1, DEFAULT_MAX_CHILDREN),
+        ];
+        for (clusters, min_paths, max_paths) in cases {
+            let config = GroupingConfig::default()
+                .with_strategy(GroupingStrategy::Kmeans)
+                .with_clusters(clusters);
+            let outcome = group_items_with(&items, &config, &runtime).await.unwrap();
+            let distinct: BTreeSet<Vec<String>> = outcome
+                .assignments
+                .iter()
+                .map(|assignment| assignment.path.clone())
+                .collect();
+            assert!(
+                distinct.len() >= min_paths && distinct.len() <= max_paths,
+                "clusters {clusters:?} produced {} distinct paths, want {min_paths}..={max_paths}: {:?}",
+                distinct.len(),
+                paths(&outcome.assignments)
+            );
+            let placed: BTreeSet<&str> = outcome
+                .assignments
+                .iter()
+                .map(|assignment| assignment.worker_id.as_str())
+                .collect();
+            assert_eq!(outcome.assignments.len(), items.len(), "{clusters:?}");
+            assert_eq!(placed.len(), items.len(), "{clusters:?}");
+            assert_eq!(outcome.strategy, GroupingStrategy::Kmeans);
+            assert_eq!(outcome.provenance, GroupingProvenance::Embedding);
+        }
+    }
+
+    #[tokio::test]
     async fn llm_grouping_uses_the_model_runtime() {
         let items = inventory();
         let reply = r#"{"groups":[{"path":["Documents","PDFs","Forms"],"worker_ids":["a","b"]}]}"#;
