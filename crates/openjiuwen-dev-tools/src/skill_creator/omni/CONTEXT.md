@@ -104,6 +104,12 @@ An image `saved_path` must be relative, `/`-separated, rooted at `references/`, 
 - Video URLs and frame extraction, the platform-URL detection set, and the LLM "web plugin" scrape fallback: not ported.
 - Python's `append_reference_files` lead-in sentence ("For visual reference, …") and its `blocks_for_llm` structured block payload are not reproduced: the section is heading plus ``- `path` — description`` lines, and the prompt stays plain text with bundle-relative image paths.
 
+## Known Issues
+
+- `pipeline.rs:402`/`pipeline.rs:414` still document a `zip`/`gzip` page input as `Error::unsupported`, but `ArchiveUnpacker::unpack_auto` unpacks both (`pipeline/tests.rs`, `zip_and_gzip_page_inputs_unpack`); only ZIP64, encrypted entries, and non-stored/non-DEFLATE methods are `Unsupported`.
+- `filter.rs:495` accepts a payload whose declared `content-type` is a supported MIME without sniffing its magic bytes, so a mislabelled or corrupt body is persisted as an image.
+- Image dimensions are never decoded: `filter_images_with` calls `is_probable_icon(url, None, None)` (`filter.rs:308`), so Python's 80 px gate has no equivalent — only URL hints and the byte bounds survive.
+
 ## Test Strategy
 
 - Unit tests live beside each module: `fetch.rs` (loopback TCP server, size cap, schemes, scripted fetcher), `html/tests.rs` (fixtures, entities, malformed markup, url resolution), `archive/{tar,zip,gzip,inflate}` + their `tests.rs` siblings (archive matrix, DEFLATE golden/dynamic streams, gzip members, zip round-trip and rejections, caps), `crc.rs`/`sha256.rs` (published vectors), `filter/tests.rs` (sniffing, keep policy, extension mapping, icon heuristics, SHA-256 dedupe, slugify), `render.rs` (`strip_hallucinated_images` matrix, section rendering), `pipeline/tests.rs` (end-to-end URL→bundle read back through `SkillBundle::read`, archive page inputs, caps, blank page, model/fallback, saved-image provenance and persistence, determinism, config validation).
