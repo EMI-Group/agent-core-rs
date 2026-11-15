@@ -7,7 +7,13 @@
 //!   [`case_id`](Case::case_id)); [`EvaluatedCase`] adds the [`answer`](EvaluatedCase::answer),
 //!   [`score`](EvaluatedCase::score), and [`reason`](EvaluatedCase::reason) an
 //!   evaluator produced; [`CaseLoader`] is an in-memory collection with
-//!   deterministic [`shuffle`](CaseLoader::shuffle) and [`split`](CaseLoader::split).
+//!   deterministic [`shuffle`](CaseLoader::shuffle), [`split`](CaseLoader::split),
+//!   and the tagged [`split_tagged`](CaseLoader::split_tagged).
+//! - **Datasets** — [`CaseSplit`] and [`SplitDataset`] keep a train/validation
+//!   cut's provenance attached to its cases, [`CaseSampler`] (with
+//!   [`SequentialSampler`], [`RandomSampler`], and [`StratifiedSampler`]) picks a
+//!   reproducible subset, and [`BatchScheduler`] plans the
+//!   [`Epoch`]/[`Batch`] steps a training loop iterates.
 //! - **Evaluation** — [`CaseEvaluator`] scores a candidate prompt over cases.
 //!   [`DeterministicEvaluator`] does so offline from placeholder preservation,
 //!   instruction structure, case-term coverage, and hygiene;
