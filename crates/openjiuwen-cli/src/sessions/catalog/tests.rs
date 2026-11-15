@@ -39,7 +39,13 @@ fn row(id: &str, created_at: Option<&str>) -> Row {
 }
 
 /// Builds an execution journal row.
-fn execution_row(id: &str, agent: &str, session: &str, created_at: Option<&str>, usable: bool) -> Row {
+fn execution_row(
+    id: &str,
+    agent: &str,
+    session: &str,
+    created_at: Option<&str>,
+    usable: bool,
+) -> Row {
     row_of(
         id,
         created_at,
@@ -108,8 +114,7 @@ fn cli_messages_map_onto_kernel_roles() {
         Some("user".to_owned())
     );
     assert_eq!(
-        message_from_record(&message("assistant"))
-            .map(|message| message.role.as_str().to_owned()),
+        message_from_record(&message("assistant")).map(|message| message.role.as_str().to_owned()),
         Some("assistant".to_owned())
     );
     assert_eq!(
@@ -146,8 +151,7 @@ fn blank_timestamps_are_reported_as_missing() {
 async fn a_persistent_state_record_lists_resolves_and_prunes() {
     let fixtures = TempWorkspace::new().expect("temp workspace");
     let options = options(&fixtures);
-    let layout =
-        PersistentAgentLayout::for_workspace(&Workspace::new(options.workspace.clone()));
+    let layout = PersistentAgentLayout::for_workspace(&Workspace::new(options.workspace.clone()));
     let store = FileSessionStore::new(layout.sessions_root());
     let binding = SessionBinding {
         agent_id: "agent-one".to_owned(),
@@ -262,7 +266,13 @@ async fn an_unknown_id_and_an_empty_store_are_typed_not_found() {
 #[test]
 fn one_session_with_state_everywhere_folds_into_one_row() {
     let rows = merge_rows(vec![
-        execution_row("exec-1", CLI_AGENT_ID, "cli-1", Some("2024-01-01T00:00:00Z"), true),
+        execution_row(
+            "exec-1",
+            CLI_AGENT_ID,
+            "cli-1",
+            Some("2024-01-01T00:00:00Z"),
+            true,
+        ),
         row("cli-1", Some("2024-01-02T00:00:00Z")),
         state_row(CLI_AGENT_ID, "cli-1", Some("2024-01-03T00:00:00Z")),
     ]);
@@ -311,8 +321,20 @@ fn a_state_row_inherits_a_timestamp_it_does_not_have() {
 #[test]
 fn a_sessionless_execution_is_keyed_by_its_own_id() {
     let rows = merge_rows(vec![
-        execution_row("exec-1", CLI_AGENT_ID, "", Some("2024-01-01T00:00:00Z"), true),
-        execution_row("exec-2", CLI_AGENT_ID, "", Some("2024-01-02T00:00:00Z"), true),
+        execution_row(
+            "exec-1",
+            CLI_AGENT_ID,
+            "",
+            Some("2024-01-01T00:00:00Z"),
+            true,
+        ),
+        execution_row(
+            "exec-2",
+            CLI_AGENT_ID,
+            "",
+            Some("2024-01-02T00:00:00Z"),
+            true,
+        ),
     ]);
     assert_eq!(
         rows.len(),
@@ -324,7 +346,13 @@ fn a_sessionless_execution_is_keyed_by_its_own_id() {
 #[test]
 fn an_execution_of_a_session_folds_into_its_cli_row() {
     let rows = merge_rows(vec![
-        execution_row("exec-1", CLI_AGENT_ID, "cli-1", Some("2024-01-01T00:00:00Z"), true),
+        execution_row(
+            "exec-1",
+            CLI_AGENT_ID,
+            "cli-1",
+            Some("2024-01-01T00:00:00Z"),
+            true,
+        ),
         row("cli-1", Some("2024-01-02T00:00:00Z")),
     ]);
     assert_eq!(rows.len(), 1);
@@ -335,8 +363,20 @@ fn an_execution_of_a_session_folds_into_its_cli_row() {
 #[test]
 fn every_member_of_a_group_survives_as_a_source() {
     let rows = merge_rows(vec![
-        execution_row("exec-1", CLI_AGENT_ID, "cli-1", Some("2024-01-01T00:00:00Z"), true),
-        execution_row("exec-2", CLI_AGENT_ID, "cli-1", Some("2024-01-02T00:00:00Z"), true),
+        execution_row(
+            "exec-1",
+            CLI_AGENT_ID,
+            "cli-1",
+            Some("2024-01-01T00:00:00Z"),
+            true,
+        ),
+        execution_row(
+            "exec-2",
+            CLI_AGENT_ID,
+            "cli-1",
+            Some("2024-01-02T00:00:00Z"),
+            true,
+        ),
         row("cli-1", Some("2024-01-03T00:00:00Z")),
         state_row(CLI_AGENT_ID, "cli-1", None),
     ]);
@@ -389,5 +429,8 @@ fn only_a_group_of_unusable_journals_is_unresumable() {
         "the CLI record behind the row is resumable"
     );
 
-    assert!(row("cli-1", None).is_resumable(), "a CLI record is resumable");
+    assert!(
+        row("cli-1", None).is_resumable(),
+        "a CLI record is resumable"
+    );
 }

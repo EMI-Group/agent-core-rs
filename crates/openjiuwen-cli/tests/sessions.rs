@@ -10,8 +10,8 @@
 //! - **execution** — a `persistent_agent/logs` tree, here deliberately damaged
 //!   (a `meta.json` that is not JSON, a directory without one) to prove a broken
 //!   journal is skipped instead of failing the listing;
-//! - **state** — the `persistent_agent/sessions` tree, which this suite leaves
-//!   empty: the persistent-agent seeding cases live in `tests/resume.rs`.
+//! - **state** — the `persistent_agent/sessions` tree, written with the harness
+//!   API in the process for the one-session-across-all-three-stores case.
 //!
 //! Covered: the empty catalogue, newest-first listing with its kind filter and
 //! limit, `show` in both output modes, the skip-a-corrupt-journal rule, the
@@ -19,15 +19,30 @@
 //! `validation` error of a selector-less prune, the clap conflict of `--all` with
 //! `--older-than`, and the three help pages.
 //!
-//! Nothing here builds a model, binds a socket or touches the network: the suite
-//! is pure filesystem plus argv.
+//! Two cases go further and pin the dedupe: one hand-written fixture that writes
+//! the *same* session id into all three stores (one row, `--kind` matching every
+//! store, `prune` clearing all three trees), and one real `run` against the
+//! loopback mock model server, whose `--continue` must report the session it just
+//! wrote (and still list it once). The rest is pure filesystem plus argv.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod support;
 
+use std::path::PathBuf;
+
 use chrono::{SecondsFormat, Utc};
+use openjiuwen_core::foundation::prompt::BaseMessage;
+use openjiuwen_harness::{
+    EntryPayload, ExecutionIdentity, ExecutionLog, FileSessionStore, LogCapacity, ModelUsage,
+    PersistentAgentLayout, PersistentSessionRecord, RecordEnding, SessionBinding,
+    SessionStateStore, Workspace,
+};
+use openjiuwen_test_support::{MockLlmServer, ScriptedResponse, TEST_API_KEY};
 use serde_json::json;
-use support::{assert_exit, assert_success, has_row, non_empty_lines, parse_json, stderr, Sandbox};
+use support::{
+    assert_exit, assert_no_ansi, assert_success, has_row, non_empty_lines, parse_json, stderr,
+    Sandbox,
+};
 
 /// The `-w <workspace>` plus `sessions` prefix every invocation carries.
 ///
@@ -363,4 +378,309 @@ fn sessions_help_documents_the_commands() {
         text.contains("<ID>") || text.to_lowercase().contains("session"),
         "the show help documents its id argument: {text:?}"
     );
+}
+
+/// The session id the all-three-stores fixture writes into every store.
+const SHARED_SESSION: &str = "cli-run-1";
+/// The agent id a CLI run binds its persistent-agent state to.
+const CLI_AGENT: &str = "openjiuwen-cli";
+/// Execution id of the fixture's journalled turn.
+const FIXTURE_EXECUTION: &str = "exec-1";
+/// Request id the fixture's journalled turn ran under.
+const FIXTURE_REQUEST: &str = "req-1";
+/// Question and answer of the fixture's journalled turn.
+const FIXTURE_QUESTION: &str = "first question";
+/// Answer of the fixture's journalled turn.
+const FIXTURE_ANSWER: &str = "first answer";
+
+/// The answer the scripted model returns for every request.
+const ANSWER: &str = "hello from the scripted model";
+/// Prompt of the real-run case's first turn.
+const FIRST_QUESTION: &str = "first question";
+/// Prompt of the real-run case's `--continue` turn.
+const SECOND_QUESTION: &str = "second question";
+
+/// The two trees a pruned all-three-stores session must leave behind.
+struct Seeded {
+    /// The journal directory of [`FIXTURE_EXECUTION`].
+    journal: PathBuf,
+    /// The directory holding the fixture's `state.json`.
+    state_dir: PathBuf,
+}
+
+/// Writes one session id into all three stores, the way a CLI run leaves it.
+///
+/// The CLI record is hand-written (the shape `openjiuwen run` writes); the journal
+/// and the session record go through the harness API, because nothing outside the
+/// harness can produce a valid `meta.json`/`state.json` pair.
+async fn seed_all_three_stores(sandbox: &Sandbox) -> Seeded {
+    write_record(
+        sandbox,
+        SHARED_SESSION,
+        "2024-01-02T03:04:05Z",
+        &[("user", FIXTURE_QUESTION), ("assistant", FIXTURE_ANSWER)],
+    );
+    let layout = PersistentAgentLayout::for_workspace(&Workspace::new(sandbox.workspace()));
+    let identity = ExecutionIdentity::new(
+        "host",
+        CLI_AGENT,
+        SHARED_SESSION,
+        FIXTURE_REQUEST,
+        FIXTURE_EXECUTION,
+        "cli",
+    )
+    .expect("a valid execution identity");
+    let journal = layout.logs_root().join(identity.directory_name());
+    let log = ExecutionLog::open(journal.clone(), identity, LogCapacity::default())
+        .await
+        .expect("a journalled turn");
+    log.append(EntryPayload::execution_started(FIXTURE_QUESTION))
+        .await
+        .expect("the journal starts with the question");
+    log.append(EntryPayload::model_turn(
+        "mc_1",
+        FIXTURE_ANSWER,
+        ModelUsage::known(10, 5),
+    ))
+    .await
+    .expect("the journal records the answer");
+
+    let binding = SessionBinding::new(CLI_AGENT, SHARED_SESSION).expect("a valid binding");
+    let store = FileSessionStore::new(layout.sessions_root());
+    let state_path = store.path_for(&binding);
+    let mut record = PersistentSessionRecord::new(&binding).expect("a draft record");
+    record.messages = vec![
+        BaseMessage::user(FIXTURE_QUESTION),
+        BaseMessage::assistant(FIXTURE_ANSWER),
+    ];
+    let record = record
+        .with_ending(RecordEnding {
+            outcome: "completed".to_owned(),
+            request_id: FIXTURE_REQUEST.to_owned(),
+            execution_id: FIXTURE_EXECUTION.to_owned(),
+            ..RecordEnding::default()
+        })
+        .expect("an ended record");
+    store.save(&record).await.expect("a saved record");
+    Seeded {
+        journal,
+        state_dir: state_path
+            .parent()
+            .expect("the state file lives in a directory")
+            .to_path_buf(),
+    }
+}
+
+/// Returns the rows of one `sessions list --json` document.
+fn listed_rows(text: &str) -> Vec<serde_json::Value> {
+    parse_json(text)
+        .as_array()
+        .expect("a JSON array of rows")
+        .clone()
+}
+
+/// One session that left state in all three stores is listed exactly once.
+#[tokio::test]
+async fn a_session_in_all_three_stores_is_listed_and_pruned_once() {
+    let sandbox = Sandbox::new();
+    let seeded = seed_all_three_stores(&sandbox).await;
+    let cli_record = sandbox.path(format!("home/sessions/{SHARED_SESSION}.json"));
+
+    let text = assert_success(&sandbox.run(&args(&sandbox, &["list"])).await);
+    let lines = non_empty_lines(&text);
+    assert_eq!(lines.len(), 1, "one session, one line: {text:?}");
+    let kept = columns(lines[0]);
+    assert_eq!(kept[0], SHARED_SESSION);
+    assert_eq!(
+        kept[2], "state",
+        "the row is reported from the richest source: {text:?}"
+    );
+    assert!(
+        kept[3].contains(CLI_AGENT),
+        "the state detail names the agent: {text:?}"
+    );
+
+    let rows = listed_rows(&assert_success(
+        &sandbox.run(&args(&sandbox, &["list", "--json"])).await,
+    ));
+    assert_eq!(rows.len(), 1, "one row per session: {rows:?}");
+    assert_eq!(rows[0]["id"], SHARED_SESSION);
+    assert_eq!(rows[0]["kind"], "state");
+
+    for kind in ["cli", "execution", "state"] {
+        let rows = listed_rows(&assert_success(
+            &sandbox
+                .run(&args(&sandbox, &["list", "--kind", kind, "--json"]))
+                .await,
+        ));
+        assert_eq!(
+            rows.len(),
+            1,
+            "`--kind {kind}` still finds the session exactly once: {rows:?}"
+        );
+        assert_eq!(rows[0]["id"], SHARED_SESSION, "`--kind {kind}`");
+    }
+
+    let shown = parse_json(&assert_success(
+        &sandbox
+            .run(&args(&sandbox, &["show", SHARED_SESSION, "--json"]))
+            .await,
+    ));
+    let messages = shown["messages"]
+        .as_array()
+        .expect("a JSON array of messages");
+    assert!(
+        !messages.is_empty(),
+        "the resume seeds the traced window: {shown}"
+    );
+    assert!(
+        messages.iter().any(|message| message["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(FIXTURE_QUESTION)),
+        "the restored window carries the journalled question: {messages:?}"
+    );
+
+    let text = assert_success(
+        &sandbox
+            .run(&args(&sandbox, &["prune", "--all", "--dry-run"]))
+            .await,
+    );
+    assert_eq!(
+        non_empty_lines(&text),
+        vec![format!("would prune state\t{SHARED_SESSION}")],
+        "a dry run reports the session once"
+    );
+    assert_eq!(
+        listed_rows(&assert_success(
+            &sandbox.run(&args(&sandbox, &["list", "--json"])).await,
+        ))
+        .len(),
+        1,
+        "a dry run deletes nothing"
+    );
+
+    let text = assert_success(&sandbox.run(&args(&sandbox, &["prune", "--all"])).await);
+    assert_eq!(
+        non_empty_lines(&text),
+        vec![format!("pruned state\t{SHARED_SESSION}")],
+    );
+    let text = assert_success(&sandbox.run(&args(&sandbox, &["list"])).await);
+    assert_eq!(text.trim(), "no sessions", "every source is gone");
+    assert!(!seeded.journal.exists(), "the journal directory is deleted");
+    assert!(!seeded.state_dir.exists(), "the state directory is deleted");
+    assert!(!cli_record.exists(), "the CLI record is deleted");
+}
+
+/// Builds the model-connection and workspace flags of one real `run`.
+fn run_args(sandbox: &Sandbox, server: &MockLlmServer, tail: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        "--provider".to_owned(),
+        "openai".to_owned(),
+        "--api-base".to_owned(),
+        server.base_url().to_owned(),
+        "--api-key".to_owned(),
+        TEST_API_KEY.to_owned(),
+        "-m".to_owned(),
+        "mock-model".to_owned(),
+        "-w".to_owned(),
+        sandbox.workspace().display().to_string(),
+    ];
+    args.extend(tail.iter().map(|arg| (*arg).to_owned()));
+    args
+}
+
+/// Returns the `session_id` of a `run -f json` document.
+fn session_id_of(value: &serde_json::Value) -> String {
+    value["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the run document carries a session id: {value}"))
+        .to_owned()
+}
+
+/// A real `run` is one session, and `--continue` continues that very session.
+#[tokio::test]
+async fn a_real_run_lists_one_session_and_continue_continues_it() {
+    let sandbox = Sandbox::new();
+    let server = MockLlmServer::start().await;
+    server.set_fallback(ScriptedResponse::text(ANSWER));
+
+    let first = assert_success(
+        &sandbox
+            .run(&run_args(
+                &sandbox,
+                &server,
+                &["run", FIRST_QUESTION, "-f", "json"],
+            ))
+            .await,
+    );
+    assert_no_ansi(&first);
+    let session_id = session_id_of(&parse_json(&first));
+    assert!(
+        session_id.starts_with("cli-"),
+        "a fresh run mints a `cli-` session: {session_id}"
+    );
+
+    let rows = listed_rows(&assert_success(
+        &sandbox.run(&args(&sandbox, &["list", "--json"])).await,
+    ));
+    assert_eq!(
+        rows.len(),
+        1,
+        "the run's three stores are one row: {rows:?}"
+    );
+    assert_eq!(rows[0]["id"], session_id.as_str());
+    assert_eq!(
+        rows[0]["kind"], "state",
+        "the persistent session record is the richest source: {rows:?}"
+    );
+
+    let shown = parse_json(&assert_success(
+        &sandbox
+            .run(&args(&sandbox, &["show", &session_id, "--json"]))
+            .await,
+    ));
+    assert_eq!(shown["id"], session_id.as_str());
+    let messages = shown["messages"]
+        .as_array()
+        .expect("a JSON array of messages");
+    assert!(
+        !messages.is_empty(),
+        "the resumed turn seeds the run's own window: {shown}"
+    );
+
+    let output = sandbox
+        .run(&run_args(
+            &sandbox,
+            &server,
+            &["run", "--continue", SECOND_QUESTION, "-f", "json"],
+        ))
+        .await;
+    let continued = parse_json(&assert_success(&output));
+    assert_eq!(
+        session_id_of(&continued),
+        session_id,
+        "`--continue` continues the session the first run wrote"
+    );
+    let note = stderr(&output);
+    assert!(
+        note.contains(&format!("resuming the most recent session {session_id}")),
+        "got {note:?}"
+    );
+
+    let rows = listed_rows(&assert_success(
+        &sandbox.run(&args(&sandbox, &["list", "--json"])).await,
+    ));
+    let matching: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|row| row["id"] == session_id.as_str())
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "the continued session is still one row: {rows:?}"
+    );
+    assert_eq!(rows.len(), 1, "and no other session appeared: {rows:?}");
+
+    server.shutdown().await;
 }

@@ -367,7 +367,9 @@ impl Catalog {
             .into_iter()
             .find(|summary| summary.execution_id == id);
         if let Some(summary) = execution {
-            return self.resolve_execution(&catalog, &summary, most_recent).await;
+            return self
+                .resolve_execution(&catalog, &summary, most_recent)
+                .await;
         }
         Err(Error::not_found(format!("unknown session: {id}")))
     }
@@ -809,7 +811,6 @@ async fn remove_dir(path: &Path) -> Result<()> {
         Err(error) => Err(error.into()),
     }
 }
-
 
 #[cfg(test)]
 mod tests;
