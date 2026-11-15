@@ -424,6 +424,25 @@ mod tests {
     }
 
     #[test]
+    fn buffered_delivery_is_accepted_and_interleaved_is_typed_unsupported() {
+        assert!(check_delivery(&WorkflowRunOptions::default()).is_ok());
+
+        let failure = check_delivery(
+            &WorkflowRunOptions::default().with_stream_delivery(StreamDelivery::Interleaved),
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.kind(),
+            openjiuwen_common::error::ErrorKind::Unsupported
+        );
+        assert!(failure.message().contains("stream_actor"), "{failure}");
+        assert!(
+            failure.message().contains("StreamDelivery::Buffered"),
+            "{failure}"
+        );
+    }
+
+    #[test]
     fn interaction_wires_match_the_python_frame_shape() {
         let interactions = InteractionState::new();
         interactions.push_pending(crate::interrupt::WorkflowInteraction::new(

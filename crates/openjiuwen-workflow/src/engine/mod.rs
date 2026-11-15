@@ -103,10 +103,10 @@ pub enum StreamDelivery {
     /// Python's live `stream_actor` interleaving, where a producer's frames reach a
     /// consumer while both are running.
     ///
-    /// [`openjiuwen-graph`] does not port `stream_actor`, so this engine cannot provide it:
+    /// [`openjiuwen_graph`] does not port `stream_actor`, so this engine cannot provide it:
     /// every run entry point rejects this mode with a typed
-    /// [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) naming the gap
-    /// instead of degrading to [`StreamDelivery::Buffered`].
+    /// [`Error::Unsupported`] naming the gap instead of degrading to
+    /// [`StreamDelivery::Buffered`].
     Interleaved,
 }
 

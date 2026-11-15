@@ -844,6 +844,7 @@ fn run_options_are_chainable_and_permissive() {
     assert!(options.stream_modes.is_none());
     assert!(options.max_supersteps.is_none());
     assert!(!options.cancellation.is_cancelled());
+    assert_eq!(options.stream_delivery, StreamDelivery::Buffered);
 
     let token = CancellationToken::new();
     token.cancel();
@@ -855,11 +856,17 @@ fn run_options_are_chainable_and_permissive() {
         .with_interactive(interactive)
         .with_resume(true)
         .with_stream_modes(vec![StreamMode::Trace])
-        .with_max_supersteps(3);
+        .with_max_supersteps(3)
+        .with_stream_delivery(StreamDelivery::Interleaved);
     assert!(configured.cancellation.is_cancelled());
     assert_eq!(configured.timeout, Some(Duration::from_secs(1)));
     assert!(configured.interactive.is_some());
     assert!(configured.resume);
     assert_eq!(configured.stream_modes, Some(vec![StreamMode::Trace]));
     assert_eq!(configured.max_supersteps, Some(3));
+    assert_eq!(
+        configured.stream_delivery,
+        StreamDelivery::Interleaved,
+        "the delivery mode is recorded verbatim for the run funnel to check"
+    );
 }
