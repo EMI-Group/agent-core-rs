@@ -209,7 +209,7 @@ pub struct CombinedRecall { pub memories: Vec<RecallHit>, pub entities: Vec<grap
                             pub graph_error: Option<String> }
 impl CombinedRecall { pub fn is_partial(&self) -> bool; }
 ```
-`AddOutcome::degraded` names why duplicate detection could not run (the candidate scan failed), so a write that stored unchecked duplicates is distinguishable from a clean one; it is a diagnostic and is not counted by `len`/`is_empty`.
+`AddOutcome::degraded` names why duplicate detection could not run (the candidate scan failed), so a write that stored unchecked duplicates is distinguishable from a clean one; it is a diagnostic and is not counted by `len`/`is_empty`. `AddOutcome::deleted` is populated only by `Replace`: it names the row removed before the replacement was stored under that same id, so a replace counts once in `merged` and once in `deleted`.
 `AddMemResult::skipped`/`deleted`/`degraded` carry the write bookkeeping the records cannot: dedupe-skipped inputs, rows a replace removed, and why model extraction fell back to the heuristics.
 `CombinedRecall` lives in `graph::mod` as `{ memories, entities, graph_error }` and is re-exported; `graph_error` is `Some` when graph recall failed while the memory hits stayed complete, and `is_partial()` reports exactly that.
 

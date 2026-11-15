@@ -70,7 +70,7 @@ The `*_with_embedding` variants carry the handle a per-scope override resolved t
    - A scan that fails for any reason other than cancellation/timeout still writes the record and sets `AddOutcome::degraded` to the reason, so "the scope had no duplicates" is distinguishable from "the scope could not be scanned"; `Error::Cancelled`/`Error::Timeout` abort instead.
    - `Merge` => persist `merge_records(existing, incoming, now)` (same key, new embedding), outcome `merged`.
    - `Skip` => no write, outcome `skipped` (id of the incoming record).
-   - `Replace` => delete the existing record+embedding, write the incoming record under the existing id, outcome `merged`.
+   - `Replace` => delete the existing record+embedding, write the incoming record under the existing id, outcome `merged` for the replacement plus the removed id in `deleted`, so a caller sees the removal even though the id survives.
    - `Add` / no duplicate => write.
 5. Persist the record (KV) first, then index the embedding; if indexing fails, delete the KV record and return the error (no half-indexed records).
 6. Cancellation is checked before embedding and before each batch item; `CallOptions::run` wraps the embedding/model future. A cancelled batch returns `Error::Cancelled`; already written records stay.

@@ -16,7 +16,7 @@ Provider SPI (`provider.rs`):
 - `MemoryProvider` — `#[async_trait] Send + Sync`, all methods `&self`: `name`, `capabilities`, `initialize`, `add`, `search`, `get`, `update`, `delete`, `list`, `clear`, `health`.
 - `ProviderCapabilities { semantic_search, keyword_search, graph, variables, message_history, pagination, max_batch }` — `none()` is the conservative default, `local(has_embedding)` is the engine's report.
 - `ProviderHealth { healthy, detail, checked_at }` — `healthy()`, `degraded(detail)`, `with_detail(..)`.
-- Provided rail methods: `is_available()`, `is_initialized()` (`false`), `default_scope()` (`MemoryScope::default()`), `get_tool_schemas()`, `handle_tool_call(tool, args)`, `prefetch(query)`, `sync_turn(user_msg, assistant_msg)`, `system_prompt_block()` (`""`), `on_session_end(messages)` (no-op).
+- Provided rail methods: `is_available()`, `is_initialized()` (`false`, overridden by `EngineProvider` and by `RestProvider` to report its probe state), `default_scope()` (`MemoryScope::default()`), `get_tool_schemas()`, `handle_tool_call(tool, args)`, `prefetch(query)`, `sync_turn(user_msg, assistant_msg)`, `system_prompt_block()` (`""`), `on_session_end(messages)` (no-op).
 - The default rail dispatches `add_memory` / `search_memory` / `list_memories` / `delete_memory` against `default_scope()`; an unknown name answers `{"error": "unknown tool: <name>"}` and a backend failure answers `{"error": …}` (never a raised error), matching the Python rail.
 
 Rail helpers (`rail.rs`, pure, no I/O):
