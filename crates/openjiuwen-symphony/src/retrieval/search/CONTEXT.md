@@ -463,6 +463,7 @@ The model's line order is preserved and each `canonical_id` is emitted once (fir
 
 ## Known Issues
 
+- `DefaultTopKSelector::select_topk` degrades silently when `SelectionMode::Generate` has no generate selector under the default `FallbackMode::Deterministic`: it answers the lexical selection with no `tracing::warn!`, unlike the model-failure branch, so a misconfigured retriever is indistinguishable from a model-free walk.
 - `lexical.rs` (~1584 lines) and `render/expose.rs` (~1566 lines) exceed the 1000-line soft cap only because their in-file `#[cfg(test)]` suites stay beside the logic; split them for responsibility, never for size alone.
 - Two `SearchCursor` types exist and must not be confused: `retrieval::types::SearchCursor` (the build side's resumable pre-order plan) and `search::flow::SearchCursor` (the runtime's one-node traversal cursor).
 - Python's production disclosure defaults (`flatten_full_tree_in_prompt = true`, `max_exposure_depth_per_call = 99`, `exposure_threshold = 1e9`) are this crate's `ProgressiveSearchConfig::default()` too, so the depth/threshold machinery is only exercised when a caller overrides them.
