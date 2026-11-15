@@ -124,17 +124,23 @@ checklist; this file records only what is specific to this subtree.
 
 ## Test Strategy
 
-- 53 module-level unit tests live beside the code they exercise, all offline and deterministic
-  (`tempfile` workspaces, no network, no host locale):
-  `slice.rs` (validation order, line splitting, selection, chunk math, write-content composition),
-  `read.rs` (read text/bytes/slicing/max-size/binary policy/traversal denial/symlink escape, text
-  and byte stream shapes, the empty-file and tail-terminal-chunk cases), `write.rs` (newline
-  defaults, append semantics, flag-combination rejection, stale-digest and `create_if_absent`
-  conflicts with a byte-identical file), `transfer.rs` (upload/download paths, parent creation,
-  overwrite refusal, permissions, empty-source and multi-chunk stream shapes), `lock.rs`
-  (digest naming, config -> enablement/timeout mapping, shared/exclusive compatibility through
-  separate descriptors, timeout reason text, disabled manager creating nothing, guard `Send` +
-  release on drop), `list.rs`, `search.rs` and `ext.rs` cover their own modules.
+- Module-level unit tests live beside the code they exercise, all offline and deterministic
+  (`tempfile` workspaces, no network, no host locale); the crate-level totals are in
+  `../../CONTEXT.md`. Coverage by module:
+  `slice.rs` (validation order, line splitting, selection, chunk math, write-content
+  composition, `try_encoded_len` vs the `encoded_len` fallback), `read.rs` (read
+  text/bytes/slicing/max-size/binary policy/traversal denial/symlink escape, text and byte
+  stream shapes, the empty-file and tail-terminal-chunk cases), `write.rs` (newline defaults,
+  append semantics, flag-combination rejection, stale-digest and `create_if_absent` conflicts
+  with a byte-identical file, the declared write encodings, encoding rejection, and
+  `metadata_if_exists` distinguishing a missing file from an unreadable one), `transfer.rs`
+  (upload/download paths, parent creation, overwrite refusal, permissions, empty-source and
+  multi-chunk stream shapes, `ensure_source_file` error kinds), `lock.rs` (digest naming,
+  config -> enablement/timeout mapping, shared/exclusive compatibility through separate
+  descriptors, timeout reason text, disabled manager creating nothing, guard `Send` + release on
+  drop), `list.rs` (root-walk failure vs a skipped unreadable subdirectory, `root_error`,
+  `is_root_error`), `search.rs` (glob/regex matching, exclude patterns, the same root failure)
+  and `ext.rs` (`target_exists` error kinds, the ext operations) cover their own modules.
 - `local.rs` keeps only the delegation tests (`list_files`/`search_files`/ext ops) and the
   constructor tests, plus `#[cfg(test)] pub(crate) mod test_util` with the fixtures the sibling test
   modules import (`backend`, `restricted`, `canonical`, `read_back`).
@@ -149,8 +155,6 @@ checklist; this file records only what is specific to this subtree.
   `cargo clippy -p openjiuwen-sysop --all-targets --offline -- -D warnings`,
   `cargo test -p openjiuwen-sysop --features sandbox --offline`,
   `cargo clippy -p openjiuwen-sysop --all-targets --features sandbox --offline -- -D warnings`.
-  Current counts: 245 unit tests without the feature / 253 with it (1 `#[ignore]`d live sandbox
-  probe), 109 integration tests without the feature / 123 with it, 29 doc tests.
 
 ## Routing Table
 

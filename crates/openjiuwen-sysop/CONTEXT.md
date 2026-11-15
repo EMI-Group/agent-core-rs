@@ -7,7 +7,7 @@ Filesystem, shell, and code operations behind one card, mirroring the Python pac
 A [`SysOperationCard`] selects a mode; the [`SysOperation`] facade hands out the matching
 filesystem, shell, and code backends, so agent code is agnostic of where an operation runs.
 Local mode executes in-process on tokio with cross-process file locks, process-group
-lifecycle, optional PTY/`stdbuf` line buffering, and legacy CJK decoding.
+lifecycle, optional PTY/`stdbuf` line buffering, and legacy CJK decoding and writing.
 Sandbox mode forwards the same calls to a provider registered through
 [`sandbox::provider`], resolving the target container through a launcher lifecycle.
 
@@ -39,7 +39,8 @@ async fn execute_code(&self, CodeExecParams) -> OpResult<CodeOutput>   // conven
 
 `sandbox_with_lifecycle` resolves the endpoint through `SandboxLifecycle::ensure_endpoint`
 before the provider backends are built; `sandbox` keeps the static endpoint (`base_url` from
-the launcher config) and records no lifecycle binding.
+the launcher config) and records no lifecycle binding. A lifecycle endpoint that carries no
+isolation key is refused with 199010.
 
 ### Card and configuration — `card`, `config`, `mode`, `sandbox::config`
 
@@ -94,6 +95,8 @@ character for character.
 `ListDirsParams`, `ListFilesData`, `FileSystemItem` (Python `type` field), `SearchFilesParams/Data`,
 `SearchPatternMode`, `FileStat`, `MkdirParams/Data`, `DeleteParams/Data`, `CopyParams/Data`,
 `MoveParams/Data`, `ReadMode`, `FileContent`, `LineRange`, `SortBy`.
+`WriteFileParams.encoding` (`with_encoding`) selects the codec text content is written with;
+an unknown encoding or an unrepresentable character is a 199003 failure.
 `shell::types` — `ShellType`, `StreamKind`, `ShellExecParams`, `ShellArgvParams`, `ShellOutput`,
 `ShellChunk`, `ShellBackgroundOutput`.
 `code::types` — `Language`, `CodeExecParams`, `CodeOutput`, `CodeChunk`.
@@ -103,23 +106,32 @@ so [`tool`] builds tool schemas and tool-call argument parsing from the same def
 ### Support modules
 
 `workspace::PathPolicy` (resolution + traversal protection), `env`
-(`ExecutionEnvironment`, `resolve_environment`), `util` (timestamps, octal permissions,
-SHA-256, UTF-8-safe truncation), `tool` (`OperationToolSpec` generation), `constants`.
-`encoding` — `TextEncoding` (utf-8, utf-16le/be, latin-1, gb18030, big5, shift-jis),
-`detect_text_encoding` (BOM → UTF-8 → UTF-16 heuristic → strict GB18030/Big5 with Python's
-quality scoring → Latin-1), `decode_text`, `encode_text`, `is_binary`, `bom_encoding`,
-`strip_bom`, `detected_encoding_name`; `encoding::cjk` adds `CjkEncoding`, `decode`,
-`decode_strict`, and the streaming `CjkDecoder` over generated tables in `encoding::tables`.
+(`ExecutionEnvironment`, `resolve_environment`), `util` (timestamps including pre-epoch ones,
+octal permissions, SHA-256, UTF-8-safe truncation), `tool` (`OperationToolSpec` generation),
+`constants`.
+`encoding` — `TextEncoding` (utf-8, utf-16le/be, latin-1, gb18030, big5, shift-jis), every one
+of them both decoded and written, `detect_text_encoding` (BOM → UTF-8 → UTF-16 heuristic →
+strict GB18030/Big5 with Python's quality scoring → Latin-1), `decode_text`, `encode_text`,
+`is_binary`, `bom_encoding`, `strip_bom`, `detected_encoding_name`; `encoding::cjk` adds
+`CjkEncoding`, `decode`, `decode_strict`, and the streaming `CjkDecoder` over generated tables
+in `encoding::tables`, and `encoding::encode` holds the Latin-1 encoder plus the lazy reverse
+maps (`OnceLock<Vec<(char, Code)>>` + binary search) that make the CJK codecs writable.
+`fs::slice::try_encoded_len` is the fallible byte-length probe behind the streamed text read;
+`encoded_len` remains a bounded estimate.
 `fs::lock` — `FileLockManager`, `FileLockGuard`, `LockMode`, `LockError`, `lock_path_for`,
 `default_lock_root` (cross-process advisory `flock`).
 `shell::pty` (crate-internal, Unix) — `openpty`-backed streaming spawn with a documented pipe fallback.
 `sandbox::launcher` — `SandboxLauncher` trait, `LaunchedSandbox`, `SandboxStatus`
 (`Running`/`Paused`/`Stopped`/`Unknown`), `LauncherRegistry`, `PreDeploymentLauncher`,
-`global()`, error builders; only `launch` is required — the inherited `pause`/`resume`/`delete`
-refuse with `ErrorKind::Unsupported` naming the launcher, and the inherited `check_status`
-reports `SandboxStatus::Unknown` instead of claiming the container is running.
-`sandbox::lifecycle` — `SandboxRecord`, `Clock`/`SystemClock`/`FixedClock`,
-`SandboxLifecycle` (`ensure_endpoint`, `release`, `evict_idle`, `record(s)`), `global()`.
+`global()`, error builders; only `launch` is required — the defaulted `launcher_type()` reports
+`"custom"` (`PreDeploymentLauncher` reports `"pre_deploy"`), the inherited `pause`/`resume`/
+`delete` refuse with `ErrorKind::Unsupported` naming the launcher, the operation and the
+untouched container, and the inherited `check_status` reports `SandboxStatus::Unknown` instead
+of claiming the container is running.
+`sandbox::lifecycle` — `SandboxRecord` (carrying `container_config_hash` and `metadata`),
+`Clock`/`SystemClock`/`FixedClock`, `container_config_hash`, `container_metadata`,
+`refresh_container_config`, `SandboxLifecycle` (`ensure_endpoint`, `release`, `evict_idle`,
+`evict_idle_now`, `evict_idle_for`, `record(s)`), `global()`.
 
 ## Constraints
 
@@ -149,7 +161,7 @@ reports `SandboxStatus::Unknown` instead of claiming the container is running.
 | `local/shell_operation.py` (1049 lines) | `shell/local.rs`, `shell/allowlist.rs`, `shell/plan.rs`, `shell/process.rs`, `shell/pty.rs` |
 | `local/code_operation.py` | `code/local.rs` |
 | `local/utils.py` (`OperationUtils`, streaming decoding) | `env.rs`, `shell/process.rs`, `code/local.rs` |
-| `local/_text_encoding.py`, `_rw_lock_manager.py`, `_async_read_write_lock.py` | `encoding/` (detection + CJK tables), `fs/lock.rs` (cross-process `flock`), `fs/local.rs` (in-process lock map) |
+| `local/_text_encoding.py`, `_rw_lock_manager.py`, `_async_read_write_lock.py` | `encoding/` (detection, `encode.rs` encoders over the generated CJK tables), `fs/lock.rs` (cross-process `flock`), `fs/local.rs` (in-process lock map) |
 | `cwd.py` (`get_cwd`/`get_workspace`) | `workspace::PathPolicy` |
 | `execution_environment.py` | `env.rs` |
 | `shell_process_registry.py` | `shell/registry.rs` (process-group aware) |
@@ -175,8 +187,8 @@ Read (`local/test_fs_operation.py`):
 - Text streaming emits one chunk per line; an empty file emits **zero** chunks; an invalid
   head/tail emits exactly one empty terminal chunk.
 - `encoding="auto"` detects the encoding; BOM is stripped. Legacy CJK (`gbk`/`gb18030`,
-  `big5`, `shift_jis` and their aliases) decodes with `U+FFFD` replacement; writing them stays
-  unsupported.
+  `big5`, `shift_jis` and their aliases) decodes with `U+FFFD` replacement, and every encoding
+  this path decodes is also writable (see Write).
 
 Write:
 - `prepend_newline` defaults to **true** (a plain write gets a leading `\n`); `append_newline`
@@ -186,6 +198,16 @@ Write:
   file left byte-identical; `create_if_absent` distinguishes an empty file from a missing one
   and rejects both when the file exists.
 - `permissions` is applied best-effort on Unix as an octal string; not on Windows.
+- `WriteFileParams.encoding` selects the codec of text content and every encoding
+  `TextEncoding` parses is writable, so `decode_text(encode_text(s, encoding), encoding)`
+  returns `s`: utf-8, utf-16le/be, latin-1 (true single-byte, `é` → `0xE9`), gb18030 (also
+  `gbk`/`gb2312`/`cp936`, four-byte form and supplementary plane included), big5 (`cp950`,
+  `big5-hkscs`) and shift-jis (`sjis`, `cp932`, two-byte area plus halfwidth katakana).
+- Encoding failures surface as 199003: an unknown name and `auto` are `Error::config` (the
+  message lists the writable encodings), an unrepresentable character is `Error::validation`
+  (the message names the code point and the encoding).
+- Text content is encoded before the target is opened, so a rejected encoding fails the write
+  and leaves the target untouched, creating nothing.
 
 Upload/download: `local_path` is **not** sandbox-checked (host side), `target_path`/
 `source_path` are; existing destinations are rejected unless `overwrite`; parents are created
@@ -201,6 +223,9 @@ List/search:
   files only, applies `exclude_patterns` as globs, and treats no match as success with
   `total_matches == 0`. `search_files_with(..., SearchPatternMode::Regex)` is the additive
   regex variant.
+- A walk that fails at its root is a 199003 failure, never an empty success; an unreadable
+  subdirectory or an entry whose `stat` fails is skipped and logged at `warn!` (Python
+  `os.walk` parity).
 
 Shell (`local/test_shell_operation.py`):
 - Empty/blank command → 199004 `"command can not be empty"`, `exit_code = -1`.
@@ -268,21 +293,39 @@ Process groups and buffering (`shell_operation.py`, `shell_process_registry.py`)
   master read asynchronously, `\r` dropped. All PTY chunks are `StreamKind::Stdout` (a
   terminal merges stderr), and a PTY that cannot be allocated falls back to pipes silently.
   Captured `execute_cmd` always uses pipes, keeping stdout and stderr separate.
+- Teardown stays observable: a failed group kill, a reaping failure, the PTY→pipe fallback, a
+  reader error and an unusable exit status are logged instead of being dropped.
 
 Sandbox lifecycle (`sandbox/gateway/gateway.py`, `sandbox/launchers/`):
-- `SandboxLifecycle::ensure_endpoint` reuses a running record (refreshing `last_used`),
-  resumes a paused one, relaunches a stopped one, evicts idle records when
-  `idle_ttl_seconds` is set, and stores the new record. The map mutex is never held across a
-  launcher await; a concurrent launch keeps the first record and deletes the duplicate.
+- `SandboxLifecycle::ensure_endpoint` reuses a running record (refreshing `last_used` and its
+  configuration bookkeeping), resumes a paused one, relaunches a stopped one, evicts idle
+  records when `idle_ttl_seconds` is set, and stores the new record. The map mutex is never
+  held across a launcher await; a concurrent launch keeps the first record and deletes the
+  duplicate.
 - `release(isolation_key, on_stop)`: `Delete` destroys, `Pause` suspends and keeps the record
   (so the next lookup resumes that container), `Keep` only refreshes `last_used`; unknown keys
   are a no-op.
-- `evict_idle(ttl, now)` deletes every record idle for at least `ttl` regardless of `on_stop`
-  and returns the evicted keys; all time is injected (`Clock`, `FixedClock` in tests).
+- A launcher that cannot perform the call reports `ErrorKind::Unsupported` instead of a
+  success it did not achieve; the record is restored on every failure, so a refused teardown
+  is retryable and keeps its `container_config_hash`/`metadata`. Only a real `SysOp` launcher
+  failure becomes 199008.
+- `evict_idle(ttl, now)` deletes every record idle for at least `ttl` regardless of `on_stop`,
+  drops the record and returns its key even when the launcher cannot delete the container: the
+  container is logged as left behind at `warn!` with `launcher_type`/`sandbox_id`, and the
+  sweep continues to the remaining records. All time is injected (`Clock`, `FixedClock` in
+  tests), and sweeps are caller-driven — `ensure_endpoint` when `idle_ttl_seconds` is set, or
+  an explicit `evict_idle`/`evict_idle_now`/`evict_idle_for` call; there is no background task.
+- `SandboxRecord.container_config_hash` is the SHA-256 of the launcher config's canonical JSON
+  (`container_config_hash`) and `metadata` carries `launcher_type`, `sandbox_type` and the
+  string-valued `extra_params` (`container_metadata`); `refresh_container_config` merges both
+  after a successful launcher call on reuse and resume, keeps unrelated labels and logs a
+  changed hash at `debug` because a provider cache keyed by it would be invalidated.
 - Error mapping: launcher failures 199008, provider failures 199009, isolation-key problems
-  199010, gateway failures 199007 — all `ErrorKind::SysOp`. `ErrorKind::Unsupported` is
-  reserved for a genuinely absent transport: an unregistered `launcher_type`, an unregistered
-  `sandbox_type`, or the `sandbox` feature being off.
+  199010, gateway failures 199007 — all `ErrorKind::SysOp`. `map_launcher_failure` passes
+  `ErrorKind::Unsupported`/`Validation`/`Config` through unchanged, because they say what the
+  launcher is, not that a call failed. `ErrorKind::Unsupported` is also the answer for a
+  genuinely absent transport: an unregistered `launcher_type`, an unregistered `sandbox_type`,
+  or the `sandbox` feature being off.
 
 ## Security Model
 
@@ -316,34 +359,44 @@ Sandbox lifecycle (`sandbox/gateway/gateway.py`, `sandbox/launchers/`):
   launch, `release` by `OnStop`, `evict_idle` via an injected clock) manage containers per
   isolation key, exposed through `SysOperation::sandbox_with_lifecycle`,
   `release_sandbox`, `evict_idle_sandboxes*`. The `aio`/`jiuwenbox`/`yuanrong` transports and
-  their launchers still live in `openjiuwen-extensions` and are not ported here: no
+  their launchers live in `openjiuwen-extensions` and are not ported here: no
   provider/launcher registered for a type, or the `sandbox` feature off, yields
-  `Error::Unsupported`; a registered launcher that fails yields 199008. Also deferred: Python's
-  `container_config_hash`/`metadata`/provider cache, endpoint discovery beyond
-  `LaunchedSandbox`, auth-header/auth-query injection, the streaming wire format
-  (`invoke` stays `Unsupported`, surfaced as 199007), and any background idle sweeper
-  (idle-stop runs on `ensure_endpoint` when `idle_ttl_seconds` is set, or on an explicit
-  `evict_idle_sandboxes*` call). Deviations: `release(Pause)` keeps the record `paused` so the
-  next lookup resumes the same container (Python forgets it), and `evict_idle` compares `>=`
-  (Python `>`).
-- Legacy CJK decoding is table driven (`encoding::cjk` over generated `encoding::tables`) and
-  covers GB18030/GBK, Big5 and Shift-JIS with `U+FFFD` replacement. Gaps by design: no
-  Big5-HKSCS or CP932 vendor extensions (the alias names decode the standard code space), no
-  Shift-JIS auto-detection (Python does not attempt it either), legacy names rejected for
-  writing, and `auto` detection strict-decodes the whole in-memory buffer where Python samples
-  files above 8 MiB.
-- Writes are always UTF-8 (or UTF-16 when explicitly requested); Python can write arbitrary
-  codecs.
-- `PreDeploymentLauncher` inherits the trait defaults for `pause`/`resume`/`delete` and
-  `check_status` (which reports `Running`), so `SandboxLifecycle::release(Delete)` returns
-  `Ok` and drops the record without tearing anything down; Python's `pre_deployment_launcher.delete`
-  deletes `jiuwenbox`/`yuanrong` containers through the extension providers.
-- `SandboxLifecycle::evict_idle` drops a record and reports the key as evicted even when the
-  launcher delete fails or the launcher type is no longer registered (the container is leaked,
-  logged at `warn`); a duplicate launch whose cleanup delete fails is leaked the same way.
-- The HTTP gateway backends flatten `HttpSandboxGateway::invoke`'s `Error::Unsupported` into a
-  code 199007 `OpResult` failure (`sandbox/http.rs` `invoke_value`), so fs/shell/code callers
-  never see the `Unsupported` kind; only a direct `invoke` call does.
+  `Error::Unsupported`; a registered launcher that fails yields 199008. Still absent: the
+  provider cache Python keys by `container_config_hash` (this rewrite rebuilds providers from
+  the resolved endpoint), endpoint discovery beyond `LaunchedSandbox`, auth-header/auth-query
+  injection, the streaming wire format (`invoke` stays `Unsupported`, surfaced as code 199012),
+  and any background idle sweeper (idle-stop runs on `ensure_endpoint` when
+  `idle_ttl_seconds` is set, or on an explicit `evict_idle_sandboxes*` call). Deviations:
+  `release(Pause)` keeps the record `paused` so the next lookup resumes the same container
+  (Python forgets it), and `evict_idle` compares `>=` (Python `>`).
+- Legacy CJK is table driven in both directions — `encoding::cjk` over the generated
+  `encoding::tables` decodes, `encoding::encode` builds the reverse maps — and covers
+  GB18030/GBK, Big5 and Shift-JIS with `U+FFFD` replacement on decode. Gaps by design: no
+  Big5-HKSCS or CP932 vendor extensions (their alias names accept the standard code space); no
+  write aliases beyond the mapped code space; Big5's duplicate mappings pick the smallest code
+  (`十` → `0xA2CC`, where Python picks `0xA451`); Shift-JIS refuses the vendor single-byte `¥`,
+  whose byte `0x5C` decodes as `\`; Shift-JIS is never auto-detected (Python does not attempt
+  it either); and `auto` detection strict-decodes the whole in-memory buffer where Python
+  samples files above 8 MiB.
+- Writes cover the seven supported encodings (utf-8, utf-16le/be, latin-1, gb18030, big5,
+  shift-jis); Python can write arbitrary codecs.
+- `PreDeploymentLauncher` owns no handle on a shared-scope container, so it genuinely cannot
+  manage one: `pause`/`resume`/`delete` return `ErrorKind::Unsupported` naming the launcher,
+  the operation and the untouched container, `check_status` reports `Unknown`, and
+  `SandboxLifecycle::release(Delete)` therefore fails and restores the record instead of
+  reporting a teardown. Python's `pre_deployment_launcher.delete` deletes
+  `jiuwenbox`/`yuanrong` containers through the extension providers.
+- `SandboxLifecycle::evict_idle` drops the record and reports the key as evicted even when the
+  launcher cannot delete the container or its type is no longer registered, so that container
+  is leaked (logged at `warn` with `launcher_type`/`sandbox_id`); a duplicate launch whose
+  cleanup delete fails is leaked the same way.
+- The HTTP gateway reports a capability gap as code `199012` (`SysOpStatus::Unsupported`)
+  rather than 199007: `gateway_failure` maps `ErrorKind::Unsupported` through
+  `result::unsupported_failure`/`status::unsupported_message` in the same `sandbox gateway
+  error, operation: <method>, reason: <reason>` envelope it uses for every other kind, a
+  streaming call yields exactly one error chunk with that code, and `OpResult::into_result`/
+  `into_optional_result` turn 199012 back into `ErrorKind::Unsupported`. Serialization
+  failures, a non-zero `response.code` and a missing or undecodable payload stay 199007.
 - Hard links to one inode map to different sidecar lock files (Python's SQLite lock manager
   shares that limitation), and stale lock files are never swept (they are empty and reused).
 - POSIX streaming does not reproduce the macOS `script -q /dev/null` wrapper; macOS runs
@@ -360,7 +413,10 @@ Sandbox lifecycle (`sandbox/gateway/gateway.py`, `sandbox/launchers/`):
 ## Test Strategy
 
 - `#[cfg(test)]` modules next to the code cover unit behavior: parameter defaults, slicing,
-  encoding detection, allowlist parsing, path containment, truncation, result mapping.
+  encoding detection and writing (round-trips, byte fixtures, unknown and unrepresentable
+  names), allowlist parsing, path containment, truncation, result mapping, launcher refusals,
+  record `container_config_hash`/`metadata` bookkeeping, clock-driven idle sweeps, the lifecycle
+  `Debug` locked marker, unreadable walk roots, and pre-epoch timestamps.
 - Shell and code behavior ports live in `#[cfg(test)]` modules beside the backends:
   allowlist acceptance/rejection, deny patterns, timeout with partial output, bounded capture,
   env overlay/scrubbing, `execute_argv` without a shell, background early exit, stream chunk
@@ -369,14 +425,17 @@ Sandbox lifecycle (`sandbox/gateway/gateway.py`, `sandbox/launchers/`):
   strategy.
 - `tests/` holds cross-module behavior ports, each citing the Python test it ports:
   `card_json.rs` (14), `local_fs.rs` (18), `fs_edges.rs` (20), `traversal.rs` (12),
-  `shell_local.rs` (17), `code_local.rs` (10), `tool_specs.rs` (9), `encoding_cjk.rs` (16
-  offline GB18030/Big5/Shift-JIS fixtures), `file_locks.rs` (10: contention, timeout, and a
-  genuine second-process proof by re-executing the test binary), `process_group.rs` (5:
-  timeout/cancel/background-stop leave no grandchild), `pty_streaming.rs` (5: terminal
-  detection, line-buffered chunks, exit codes), `sandbox_lifecycle.rs` (23: registry,
-  reuse/resume/release/idle-stop, isolation keys, `aio`/`jiuwenbox`/`yuanrong` interop with
-  local registries), and `sandbox_stub.rs` (feature `sandbox`: unsupported remote calls,
-  isolation keys, provider dispatch).
+  `shell_local.rs` (17), `code_local.rs` (10), `tool_specs.rs` (9), `encoding_cjk.rs` (17
+  offline GB18030/Big5/Shift-JIS fixtures), `encoding_write.rs` (9: round-trips for every
+  encoding, known byte fixtures, unknown and unrepresentable failures), `file_locks.rs` (10:
+  contention, timeout, and a genuine second-process proof by re-executing the test binary),
+  `process_group.rs` (5: timeout/cancel/background-stop leave no grandchild),
+  `pty_streaming.rs` (5: terminal detection, line-buffered chunks, exit codes),
+  `sandbox_lifecycle.rs` (27: registry, reuse/resume/release/idle-stop, isolation keys, config
+  hash/metadata, `aio`/`jiuwenbox`/`yuanrong` interop with local registries),
+  `sandbox_stub.rs` (14, feature `sandbox`: unsupported remote calls, isolation keys, provider
+  dispatch), and `sandbox_gateway_errors.rs` (5, feature `sandbox`: 199012 for a capability gap
+  against 199007 for a real gateway failure, unary and streaming).
 - `src/sandbox/http.rs` and `src/sandbox/operation.rs` keep their tests inline: fake-provider
   forwarding (exact `OpResult` and stream passthrough), dispatch + per-session isolation-key
   resolution, missing provider (`ErrorKind::Unsupported`) and missing gateway/launcher config
@@ -387,8 +446,8 @@ Sandbox lifecycle (`sandbox/gateway/gateway.py`, `sandbox/launchers/`):
 - Gates: `cargo fmt -p openjiuwen-sysop`, `cargo test -p openjiuwen-sysop`,
   `cargo test -p openjiuwen-sysop --features sandbox`,
   `cargo clippy -p openjiuwen-sysop --all-targets -- -D warnings` (both feature sets).
-- Current counts: 295 unit tests (303 with `sandbox`, 1 `#[ignore]`d live probe), 159
-  integration tests (173 with `sandbox`), 34 doc tests.
+- Current counts: 343 unit tests (355 with `sandbox`, 1 `#[ignore]`d live probe), 173
+  integration tests across 13 files (192 across 15 with `sandbox`), 35 doc tests.
 
 ## Routing Table
 
@@ -400,7 +459,7 @@ Sandbox lifecycle (`sandbox/gateway/gateway.py`, `sandbox/launchers/`):
 - `./src/result.rs` → `OpResult`, failure builders, `Result` conversion
 - `./src/operation.rs` → `FsOperation`, `FsExtOperation`, `ShellOperation`, `CodeOperation`, `OpStream`, `OperationSet`
 - `./src/workspace.rs` → `PathPolicy`, path cleaning, symlink resolution, containment checks
-- `./src/encoding/` → `TextEncoding`, detection/BOM/binary sniff/`decode_text`, plus `cjk` decoders and generated `tables`; module detail in `src/encoding/CONTEXT.md`
+- `./src/encoding/` → `TextEncoding`, detection/BOM/binary sniff/`decode_text`/`encode_text`, plus the `cjk` decoders, the `encode` reverse maps and generated `tables`; module detail in `src/encoding/CONTEXT.md`
 - `./src/env.rs` → `ExecutionEnvironment`, `resolve_environment`, env-name validation
 - `./src/util.rs` → timestamp formatting, octal permissions, SHA-256, UTF-8-safe truncation
 - `./src/tool.rs` → `OperationToolSpec` generation from parameter schemas
@@ -454,6 +513,9 @@ Sandbox lifecycle (`sandbox/gateway/gateway.py`, `sandbox/launchers/`):
   idempotent so repeated `SysOperation::new` calls never fail.
 - `SandboxLifecycle` never holds its map mutex across a launcher await, and all time is passed
   in (`now_epoch_secs` or a `Clock`) so idle-stop is deterministic in tests.
+- Absence of state is never reported as empty state: a poisoned launcher/provider registry lock
+  is logged and renders as `["<poisoned>"]`, and a lifecycle `Debug` whose record map is busy
+  renders `("<locked>", Unknown)`; a launcher refusal is a typed error, never an `Ok(())`.
 - Sandbox forwarding backends (`SandboxFsOperation`, `SandboxShellOperation`,
   `SandboxCodeOperation`) never serialize, inspect, or re-map provider results: the provider
   owns the wire format. `supports_conditional_write` returns the provider's answer; the card's
