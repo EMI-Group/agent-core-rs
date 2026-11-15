@@ -128,8 +128,17 @@ pub(super) async fn execute_candidates(
 /// Executes one candidate over every case.
 ///
 /// One [`CaseResult`] per case, keyed `case-{index}` (a [`PromptTaskCase`] has no
-/// id of its own). A failing evaluation becomes that result's `error` and the
-/// run continues; the execution is marked failed only when every case failed.
+/// id of its own). Each case is evaluated through
+/// [`CaseEvaluator::evaluate_run`], so the run's measured
+/// [`RunTelemetry`](crate::tune::RunTelemetry) is kept on that case's
+/// [`CaseResult`] and merged into [`Execution::telemetry`]: the execution's
+/// latency and token totals are the sum over its cases. The legacy
+/// `latency_ms`/`total_tokens` fields are filled from that merged telemetry only
+/// when it was measured, so absent telemetry leaves them at `0.0`/`0` rather than
+/// fabricating a measurement.
+///
+/// A failing evaluation becomes that result's `error` and the run continues; the
+/// execution is marked failed only when every case failed.
 pub(super) async fn execute_candidate(
     evaluator: &dyn CaseEvaluator,
     candidate: PromptCandidate,
@@ -142,14 +151,16 @@ pub(super) async fn execute_candidate(
     for (index, case) in cases.iter().enumerate() {
         let case_id = format!("case-{index}");
         let is_hidden = hidden.get(index).copied().unwrap_or(false);
-        match evaluator.evaluate(&prompt, case).await {
-            Ok(result) => {
+        match evaluator.evaluate_run(&prompt, case).await {
+            Ok(run) => {
                 execution.push_result(
-                    CaseResult::new(&case_id, answer_text(&result.answer))
-                        .with_score(result.score)
-                        .with_hidden(is_hidden),
+                    CaseResult::new(&case_id, answer_text(&run.evaluated.answer))
+                        .with_score(run.evaluated.score)
+                        .with_hidden(is_hidden)
+                        .with_telemetry(run.telemetry),
                 );
-                evaluated.push(result);
+                execution.telemetry.merge(run.telemetry);
+                evaluated.push(run.evaluated);
             }
             Err(error) => {
                 let mut failure = CaseResult::new(&case_id, String::new()).with_hidden(is_hidden);
@@ -157,6 +168,10 @@ pub(super) async fn execute_candidate(
                 execution.push_result(failure);
             }
         }
+    }
+    if !execution.telemetry.is_empty() {
+        execution.latency_ms = execution.telemetry.latency_ms.unwrap_or(0.0);
+        execution.total_tokens = execution.telemetry.total_tokens().unwrap_or(0);
     }
     if !execution.results.is_empty() && execution.results.iter().all(|result| !result.ok()) {
         execution.error = Some(format!("all {} case(s) failed", execution.results.len()));

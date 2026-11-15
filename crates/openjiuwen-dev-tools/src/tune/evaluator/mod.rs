@@ -24,6 +24,17 @@
 //! aggregates them, and [`ToolUsageScorer`] requires that the declared tools
 //! were actually used.
 //!
+//! What a run cost travels beside the trace: `ModelPromptRunner` measures the
+//! wall-clock latency of the whole run and sums the prompt/completion tokens
+//! every model call reported into a
+//! [`RunTelemetry`](crate::tune::tool::RunTelemetry) (cost is never inferred —
+//! pricing is the caller's decision). [`CaseEvaluator::evaluate_run`] returns
+//! that telemetry with the scored case and trace as an [`EvaluatedRun`],
+//! [`CaseEvaluator::score_runs`] keeps one `EvaluatedRun` per case, and the
+//! telemetry-free `evaluate_traced`/`score_cases_traced` stay available for
+//! callers that only need traces. A scripted runner and
+//! [`DeterministicEvaluator`] measure nothing and report absent telemetry.
+//!
 //! [`ToolStubs`]: crate::tune::tool::ToolStubs
 //! [`ToolTrace`]: crate::tune::tool::ToolTrace
 //!
@@ -63,7 +74,7 @@ pub use self::runner::{
     DEFAULT_MAX_TOOL_ROUNDS,
 };
 pub use self::scorer::{CaseScorer, LabelScorer, ToolUsageScorer};
-pub use self::seam::{tool_usage, CaseEvaluator, ModelEvaluator, RunnerEvaluator};
+pub use self::seam::{tool_usage, CaseEvaluator, EvaluatedRun, ModelEvaluator, RunnerEvaluator};
 
 #[cfg(test)]
 mod tests;

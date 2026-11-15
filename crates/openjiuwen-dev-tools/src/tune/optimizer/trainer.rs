@@ -22,8 +22,9 @@
 //!
 //! [`Trainer::evaluate_traced`] is the observable form of
 //! [`Trainer::evaluate`]: it returns the same mean score and per-case results
-//! plus an [`EvaluationSummary`] carrying the tool calls behind them, so a
-//! report can show which tools a candidate prompt actually used.
+//! plus an [`EvaluationSummary`] carrying the tool calls behind them and the
+//! [`RunTelemetry`] summed over the evaluated cases, so a report can show which
+//! tools a candidate prompt actually used and what the run cost.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -41,12 +42,14 @@ use crate::tune::optimizer::suggestion::{
     default_evaluator, describe_model, ensure_placeholders, is_better,
 };
 use crate::tune::optimizer::OptimizationResult;
+use crate::tune::tool::{RunTelemetry, ToolTrace};
 
 /// The traced outcome of scoring one prompt over a case set.
 ///
 /// The score and results are exactly what [`Trainer::evaluate`] reports; the
 /// extra [`tool_usage`](Self::tool_usage) map says which tools the evaluated
-/// answers needed, summed over every case in the run.
+/// answers needed, summed over every case in the run, and
+/// [`telemetry`](Self::telemetry) says what the run cost.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct EvaluationSummary {
@@ -56,6 +59,11 @@ pub struct EvaluationSummary {
     pub results: Vec<EvaluatedCase>,
     /// Tool name -> number of calls made while producing those results.
     pub tool_usage: BTreeMap<String, usize>,
+    /// What the evaluated cases cost, summed over the run.
+    ///
+    /// Absent fields mean *not reported* rather than zero, so an evaluator that
+    /// measures nothing leaves this at [`RunTelemetry::default`].
+    pub telemetry: RunTelemetry,
 }
 
 impl EvaluationSummary {
@@ -155,28 +163,36 @@ impl Trainer {
         self.evaluator_for(prompt).score_cases(prompt, cases).await
     }
 
-    /// Scores `prompt` over `cases` and reports the tool calls behind each
-    /// result.
+    /// Scores `prompt` over `cases` and reports the tool calls and telemetry
+    /// behind each result.
     ///
     /// The mean score and the per-case results are the same as
     /// [`evaluate`](Self::evaluate)'s; the returned [`EvaluationSummary`] adds
-    /// the per-tool call counts of the whole run. The traces themselves are not
+    /// the per-tool call counts of the whole run and the [`RunTelemetry`] of
+    /// every evaluated case, summed in case order. The traces themselves are not
     /// exposed, because an [`EvaluatedCase`] keeps its wire shape. An empty
-    /// `cases` slice yields a `0.0` mean, no results, and no usage.
+    /// `cases` slice yields a `0.0` mean, no results, no usage, and absent
+    /// telemetry.
     ///
     /// # Errors
     ///
     /// The evaluator's own error.
     pub async fn evaluate_traced(&self, prompt: &str, cases: &[Case]) -> Result<EvaluationSummary> {
-        let (mean_score, traced) = self
-            .evaluator_for(prompt)
-            .score_cases_traced(prompt, cases)
-            .await?;
+        let (mean_score, runs) = self.evaluator_for(prompt).score_runs(prompt, cases).await?;
+        let traced: Vec<(EvaluatedCase, ToolTrace)> = runs
+            .iter()
+            .map(|run| (run.evaluated.clone(), run.trace.clone()))
+            .collect();
         let tool_usage = tool_usage(&traced);
+        let mut telemetry = RunTelemetry::default();
+        for run in &runs {
+            telemetry.merge(run.telemetry);
+        }
         Ok(EvaluationSummary {
             mean_score,
-            results: traced.into_iter().map(|(evaluated, _)| evaluated).collect(),
+            results: runs.into_iter().map(|run| run.evaluated).collect(),
             tool_usage,
+            telemetry,
         })
     }
 
@@ -268,7 +284,9 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::tune::evaluator::{DeterministicEvaluator, ModelPromptRunner, RunnerEvaluator};
+    use crate::tune::evaluator::{
+        DeterministicEvaluator, EvaluatedRun, ModelPromptRunner, RunnerEvaluator,
+    };
     use crate::tune::tool::{ToolCallRecord, ToolStub, ToolStubs, ToolTrace};
 
     fn case(id: &str, question: &str, answer: &str) -> Case {
@@ -524,6 +542,7 @@ mod tests {
         assert!(summary.mean_score.abs() < 1e-12);
         assert!(summary.tool_usage.is_empty());
         assert_eq!(summary.tool_names(), Vec::<&str>::new());
+        assert!(summary.telemetry.is_empty());
     }
 
     #[tokio::test]
@@ -549,15 +568,11 @@ mod tests {
                 EvaluatedCase::new(case.clone(), BTreeMap::new(), 0.25, "searched")
             }
 
-            async fn evaluate_traced(
-                &self,
-                prompt: &str,
-                case: &Case,
-            ) -> Result<(EvaluatedCase, ToolTrace)> {
+            async fn evaluate_run(&self, prompt: &str, case: &Case) -> Result<EvaluatedRun> {
                 let evaluated = self.evaluate(prompt, case).await?;
                 let trace =
                     ToolTrace::new([ToolCallRecord::success("search", json!({}), json!("ok"))]);
-                Ok((evaluated, trace))
+                Ok(EvaluatedRun::new(evaluated, trace, RunTelemetry::default()))
             }
         }
 
@@ -569,6 +584,59 @@ mod tests {
         assert!((summary.mean_score - 0.25).abs() < 1e-12);
         assert_eq!(summary.tool_usage.get("search"), Some(&1));
         assert_eq!(summary.tool_names(), vec!["search"]);
+        assert!(summary.telemetry.is_empty());
+    }
+
+    /// Scores every case `0.4`, calls `search` once, and reports 10 ms and 3+4
+    /// tokens per case.
+    struct Measured;
+
+    #[async_trait]
+    impl CaseEvaluator for Measured {
+        async fn evaluate(&self, _prompt: &str, case: &Case) -> Result<EvaluatedCase> {
+            EvaluatedCase::new(case.clone(), BTreeMap::new(), 0.4, "measured")
+        }
+
+        async fn evaluate_run(&self, prompt: &str, case: &Case) -> Result<EvaluatedRun> {
+            let evaluated = self.evaluate(prompt, case).await?;
+            let trace = ToolTrace::new([ToolCallRecord::success("search", json!({}), json!("ok"))]);
+            let telemetry = RunTelemetry::default()
+                .with_latency_ms(10.0)
+                .with_prompt_tokens(3)
+                .with_completion_tokens(4);
+            Ok(EvaluatedRun::new(evaluated, trace, telemetry))
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluate_traced_aggregates_the_run_telemetry() {
+        let cases = train();
+        let trainer = Trainer::new().with_evaluator(Arc::new(Measured));
+        let (mean, results) = trainer.evaluate(SEED, &cases).await.unwrap();
+        let summary = trainer.evaluate_traced(SEED, &cases).await.unwrap();
+
+        // Score, results, and tool usage are exactly `evaluate`'s.
+        assert!((summary.mean_score - mean).abs() < 1e-12);
+        assert_eq!(summary.results, results);
+        assert_eq!(
+            summary.tool_usage,
+            BTreeMap::from([("search".to_owned(), 2)])
+        );
+        // Telemetry is summed in case order.
+        assert_eq!(summary.telemetry.latency_ms, Some(20.0));
+        assert_eq!(summary.telemetry.prompt_tokens, Some(6));
+        assert_eq!(summary.telemetry.completion_tokens, Some(8));
+        assert_eq!(summary.telemetry.total_tokens(), Some(14));
+    }
+
+    #[tokio::test]
+    async fn evaluation_summary_without_measurements_has_absent_telemetry() {
+        let summary = Trainer::new()
+            .evaluate_traced(SEED, &train())
+            .await
+            .unwrap();
+        assert!(summary.telemetry.is_empty());
+        assert!(!summary.is_empty());
     }
 
     #[test]
@@ -579,13 +647,19 @@ mod tests {
             mean_score: 0.5,
             results: vec![evaluated],
             tool_usage: BTreeMap::from([("search".to_owned(), 2)]),
+            telemetry: RunTelemetry::default()
+                .with_latency_ms(1.5)
+                .with_prompt_tokens(2)
+                .with_completion_tokens(3),
         };
 
         let value = serde_json::to_value(&summary).unwrap();
         let object = value.as_object().unwrap();
-        for key in ["mean_score", "results", "tool_usage"] {
+        for key in ["mean_score", "results", "tool_usage", "telemetry"] {
             assert!(object.contains_key(key), "missing field {key}");
         }
+        assert_eq!(value["telemetry"]["latency_ms"], json!(1.5));
+        assert_eq!(value["telemetry"]["prompt_tokens"], json!(2));
         let restored: EvaluationSummary = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(restored, summary);
 
@@ -598,6 +672,8 @@ mod tests {
             serde_json::from_str(r#"{"mean_score": 0.0, "results": []}"#).unwrap();
         assert!(partial.is_empty());
         assert!(partial.tool_usage.is_empty());
+        // An older payload without the key deserializes with absent telemetry.
+        assert!(partial.telemetry.is_empty());
         let defaulted: EvaluationSummary = serde_json::from_str("{}").unwrap();
         assert_eq!(defaulted, EvaluationSummary::default());
     }

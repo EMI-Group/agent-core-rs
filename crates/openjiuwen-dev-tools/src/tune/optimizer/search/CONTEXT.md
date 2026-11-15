@@ -21,6 +21,9 @@ The module is private to `crate::tune`; `PromptSearchOptimizer` and `PromptSearc
 - The model rewrite receives the round seed, the worst cases, `PromptSearchConfig::policy_temperature`, and the round's policy context (the compressed lessons and the warm-start prompts).
 - `execute.rs` provides the round mechanics: `execute_candidate`/`execute_candidates` (batched by `OptimizerConfig::num_parallel`), `drift_scores`, `warm_start`, `policy_context`, `base_prompt`, `answer_text`, `best_index`, `observations`, `metrics_of`, `record_metadata`, and `CandidateOutcome`.
 - `execute_candidate` writes one `CaseResult` per case keyed `case-{index}`; a failing evaluation becomes that result's `error` and the run continues, and `Execution::error` is set only when every case failed.
+- `execute_candidate` evaluates each case through `CaseEvaluator::evaluate_run`, so the case's measured `RunTelemetry` is stored on its `CaseResult` and merged into `Execution::telemetry`: the execution's latency and token totals are the sum over its cases (merged in case order through `RunTelemetry::merge`).
+- The legacy `Execution::latency_ms`/`total_tokens` fields stay for wire compatibility: `execute_candidate` fills them from the merged telemetry only when it was measured, so an evaluator that reports nothing leaves them at `0.0`/`0` rather than fabricating a measurement.
+- An errored case contributes no telemetry, so a failed case leaves both its `CaseResult::telemetry` and the merge untouched.
 - `CandidateOutcome.evaluated` keeps the successfully evaluated cases, which are the evidence a rewrite is shown (`worst_cases`, at most `WORST_CASE_LIMIT` = 5).
 - `warm_start` takes the `WARM_START_LIMIT` = 3 most similar prior records, sorted by reward descending then prompt ascending.
 - `best_index` picks the highest score and keeps the earlier candidate on a tie.
@@ -35,7 +38,7 @@ The module is private to `crate::tune`; `PromptSearchOptimizer` and `PromptSearc
 - The evaluator, reward, drift judge, and memory are injected seams with deterministic defaults (`default_evaluator`, `CompositeReward::default().with_min_correctness(..).with_drift_penalty(..)`, `LexicalDriftJudge`, `NullPromptMemory`); nothing reads the environment or constructs a model from configuration.
 - Async-first: `optimize`, `optimize_task`, and the round mechanics are `async fn`; the deterministic path awaits only the evaluator seam.
 - Determinism: execution results keep input order regardless of completion order, the loop reads no clock and no random number generator, and every id is derived from the run counter or the run id.
-- The evaluator seam reports neither latency nor tokens, so every `Execution` carries `latency_ms = 0.0` and `total_tokens = 0`, the latency/token-usage/cost reward components are constant, and `OptimizationResult::token_usage` stays empty.
+- Only the evaluator seam can supply latency or tokens: a telemetry-free evaluator leaves every `Execution` at `latency_ms = 0.0`/`total_tokens = 0` (its latency/token-usage/cost reward components stay constant), while a measuring evaluator feeds them per case; `OptimizationResult::token_usage` stays empty either way.
 - Memory persistence is opt-in: without `with_memory` nothing is read or written, and a failing `store` is logged with `tracing::warn!` and never fails the run.
 - Shared vocabulary only: the module composes types from `../../prompt_search/`, the tunables of `../search_config.rs`, and the shared helpers of `../suggestion.rs`, and duplicates none of them.
 - Files stay small and single-purpose: the loop and its values live in `mod.rs`, the round mechanics in `execute.rs`, and the suite in `tests.rs`.
@@ -66,12 +69,15 @@ The module is private to `crate::tune`; `PromptSearchOptimizer` and `PromptSearc
 - Stopping: `converges_on_a_target_reward`, `converges_on_a_flat_plateau`, `stops_on_the_early_stop_score`, and `a_budget_bound_run_reports_no_convergence`.
 - Seams: `warm_starts_and_persists_through_the_memory` (warm start plus one persisted record) and `an_injected_drift_judge_penalises_a_marker_prompt`.
 - Task shape: `optimize_task_keeps_constraints_and_metadata` and `a_blank_base_prompt_falls_back_to_the_objective`.
+- Telemetry: `each_case_keeps_its_own_telemetry_and_the_execution_sums_them` (per-case `CaseResult::telemetry` plus the merged 15 ms/4+5-token execution, the legacy fields and `measured_*` readers) and `execute_candidates_carries_telemetry_per_candidate` (per-candidate telemetry in input order), both driven by a stub evaluator that implements only `evaluate_run`.
+- Telemetry absence: `a_telemetry_less_evaluator_keeps_the_legacy_fields_zero` (empty `Execution::telemetry`, `latency_ms == 0.0`, `total_tokens == 0`, and unchanged results/scores/error for an `evaluate`-only stub).
+- Telemetry and the decision: `telemetry_does_not_change_the_chosen_prompt_or_score` (a cost-carrying stub, whose component has zero reward weight, yields the same prompt, score, round count, and iterations, and a latency/token-carrying stub still picks the same prompt).
 - Readers: `debug_reports_the_model_choice` and `run_id_is_deterministic_and_task_sensitive`.
 
 ## Routing Table
 
 - `./mod.rs` → `PromptSearchOptimizer` (builders, readers, `run_id`, `optimize`/`optimize_task`), the `run`/`prepare`/`run_round`/`round_candidates` loop, the `Setup`/`Tracker`/`RoundInput`/`Collaborators` values, `record_round`, `stopping_reason`, `Debug`, and the persistence step
-- `./execute.rs` → per-candidate execution through `CaseEvaluator`, `num_parallel` batches, drift gathering, warm start, policy context, answer/observation/metric/metadata helpers
+- `./execute.rs` → per-candidate execution through `CaseEvaluator::evaluate_run` with the per-case telemetry merge, `num_parallel` batches, drift gathering, warm start, policy context, answer/observation/metric/metadata helpers
 - `./tests.rs` → the in-tree prompt-search loop suite
 - `../../prompt_search/` → the domain vocabulary this loop drives (models, reward, convergence, drift, memory, history); read-only here
 - `../search_config.rs` → `PromptSearchConfig` and its `DEFAULT_*` tunables (rounds, candidates, convergence, drift, gate, temperature)

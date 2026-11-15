@@ -340,10 +340,114 @@ fn distinct(names: &[&str]) -> Vec<String> {
     distinct
 }
 
+/// What one run cost: wall-clock latency, token counts, and money.
+///
+/// Every field is optional, and `None` means *not reported* rather than zero: a
+/// runner that measured nothing reports `RunTelemetry::default()`, a runner that
+/// called no model leaves the token fields absent, and cost is never inferred
+/// from tokens because pricing is the caller's decision.
+///
+/// Deserialization defaults every field, so an older payload without telemetry
+/// still parses and a partial payload keeps only the counters it carries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct RunTelemetry {
+    /// Wall-clock time the run took, in milliseconds.
+    pub latency_ms: Option<f64>,
+    /// Tokens consumed by the prompts sent to the model.
+    pub prompt_tokens: Option<u64>,
+    /// Tokens produced by the model.
+    pub completion_tokens: Option<u64>,
+    /// Monetary cost the caller attributes to the run.
+    pub cost: Option<f64>,
+}
+
+impl RunTelemetry {
+    /// Whether nothing was reported at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.latency_ms.is_none()
+            && self.prompt_tokens.is_none()
+            && self.completion_tokens.is_none()
+            && self.cost.is_none()
+    }
+
+    /// The token total, or `None` when neither side was reported.
+    ///
+    /// A reported side with an unreported counterpart counts the missing side as
+    /// zero, so a prompt-only measurement still yields a total.
+    #[must_use]
+    pub fn total_tokens(&self) -> Option<u64> {
+        match (self.prompt_tokens, self.completion_tokens) {
+            (None, None) => None,
+            (prompt, completion) => {
+                Some(prompt.unwrap_or(0).saturating_add(completion.unwrap_or(0)))
+            }
+        }
+    }
+
+    /// Sets the measured latency in milliseconds.
+    #[must_use]
+    pub fn with_latency_ms(mut self, latency_ms: f64) -> Self {
+        self.latency_ms = Some(latency_ms);
+        self
+    }
+
+    /// Sets the measured prompt token count.
+    #[must_use]
+    pub fn with_prompt_tokens(mut self, prompt_tokens: u64) -> Self {
+        self.prompt_tokens = Some(prompt_tokens);
+        self
+    }
+
+    /// Sets the measured completion token count.
+    #[must_use]
+    pub fn with_completion_tokens(mut self, completion_tokens: u64) -> Self {
+        self.completion_tokens = Some(completion_tokens);
+        self
+    }
+
+    /// Sets the attributed cost.
+    #[must_use]
+    pub fn with_cost(mut self, cost: f64) -> Self {
+        self.cost = Some(cost);
+        self
+    }
+
+    /// Adds every value `other` reports, leaving absent values untouched.
+    ///
+    /// Adding an absent value changes nothing, so merging an empty telemetry is
+    /// the identity; merging into an empty one copies `other`.
+    pub fn merge(&mut self, other: RunTelemetry) {
+        self.latency_ms = sum_f64(self.latency_ms, other.latency_ms);
+        self.prompt_tokens = sum_u64(self.prompt_tokens, other.prompt_tokens);
+        self.completion_tokens = sum_u64(self.completion_tokens, other.completion_tokens);
+        self.cost = sum_f64(self.cost, other.cost);
+    }
+}
+
+/// Adds two optional `f64`s, treating an absent value as "no contribution".
+fn sum_f64(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (Some(left), Some(right)) => Some(left + right),
+    }
+}
+
+/// Adds two optional `u64`s, treating an absent value as "no contribution".
+fn sum_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+    }
+}
+
 /// What one run produced: the answer map plus the tool calls behind it.
 ///
-/// Deserialization defaults both fields, so an older payload that only carries
-/// an answer still parses and reports an empty trace.
+/// Deserialization defaults every field, so an older payload that only carries
+/// an answer still parses and reports an empty trace and absent telemetry.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct RunOutcome {
@@ -351,20 +455,33 @@ pub struct RunOutcome {
     pub answer: BTreeMap<String, Value>,
     /// The tool calls executed while producing `answer`.
     pub trace: ToolTrace,
+    /// What the run cost, when the runner measured it.
+    pub telemetry: RunTelemetry,
 }
 
 impl RunOutcome {
-    /// Wraps an answer with an empty trace.
+    /// Wraps an answer with an empty trace and absent telemetry.
     pub fn new(answer: BTreeMap<String, Value>) -> Self {
         Self {
             answer,
-            trace: ToolTrace::default(),
+            ..Self::default()
         }
     }
 
     /// Wraps an answer with the trace that produced it.
     pub fn with_trace(answer: BTreeMap<String, Value>, trace: ToolTrace) -> Self {
-        Self { answer, trace }
+        Self {
+            answer,
+            trace,
+            ..Self::default()
+        }
+    }
+
+    /// Attaches what the run cost.
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: RunTelemetry) -> Self {
+        self.telemetry = telemetry;
+        self
     }
 
     /// Consumes the outcome and returns its answer map.
@@ -659,7 +776,7 @@ mod tests {
         let outcome = RunOutcome::with_trace(answer, ToolTrace::new([success("calc")]));
         let value = serde_json::to_value(&outcome).unwrap();
         let object = value.as_object().unwrap();
-        for key in ["answer", "trace"] {
+        for key in ["answer", "trace", "telemetry"] {
             assert!(object.contains_key(key), "missing field {key}");
         }
         assert!(object["trace"].is_array(), "the trace stays a bare array");
@@ -668,6 +785,94 @@ mod tests {
 
         let partial: RunOutcome = serde_json::from_str(r#"{"answer": {"output": "4"}}"#).unwrap();
         assert!(partial.trace.is_empty());
+        assert!(partial.telemetry.is_empty());
         assert_eq!(partial.answer.len(), 1);
+    }
+
+    #[test]
+    fn telemetry_reports_absence_and_token_totals() {
+        let empty = RunTelemetry::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.total_tokens(), None);
+        let prompt_only = RunTelemetry::default().with_prompt_tokens(7);
+        assert!(!prompt_only.is_empty());
+        assert_eq!(prompt_only.total_tokens(), Some(7));
+        let completion_only = RunTelemetry::default().with_completion_tokens(3);
+        assert_eq!(completion_only.total_tokens(), Some(3));
+        let both = RunTelemetry::default()
+            .with_prompt_tokens(7)
+            .with_completion_tokens(3);
+        assert_eq!(both.total_tokens(), Some(10));
+        let latency_only = RunTelemetry::default().with_latency_ms(12.5);
+        assert!(!latency_only.is_empty());
+        assert_eq!(latency_only.total_tokens(), None);
+        assert_eq!(latency_only.latency_ms, Some(12.5));
+        let priced = RunTelemetry::default().with_cost(0.25);
+        assert_eq!(priced.cost, Some(0.25));
+        assert_eq!(priced.total_tokens(), None);
+    }
+
+    #[test]
+    fn telemetry_merge_sums_present_values() {
+        let mut telemetry = RunTelemetry::default();
+        telemetry.merge(RunTelemetry::default());
+        assert!(telemetry.is_empty());
+        telemetry.merge(RunTelemetry::default().with_latency_ms(10.0));
+        assert_eq!(telemetry.latency_ms, Some(10.0));
+        telemetry.merge(
+            RunTelemetry::default()
+                .with_latency_ms(2.5)
+                .with_prompt_tokens(4)
+                .with_completion_tokens(6)
+                .with_cost(0.5),
+        );
+        assert_eq!(telemetry.latency_ms, Some(12.5));
+        assert_eq!(telemetry.prompt_tokens, Some(4));
+        assert_eq!(telemetry.completion_tokens, Some(6));
+        assert_eq!(telemetry.total_tokens(), Some(10));
+        assert_eq!(telemetry.cost, Some(0.5));
+        let mut copy = RunTelemetry::default();
+        copy.merge(telemetry);
+        assert_eq!(copy, telemetry);
+        assert_eq!(copy.total_tokens(), Some(10));
+    }
+
+    #[test]
+    fn telemetry_json_round_trip_and_defaults() {
+        let telemetry = RunTelemetry::default()
+            .with_latency_ms(1.5)
+            .with_prompt_tokens(2)
+            .with_completion_tokens(3)
+            .with_cost(0.004);
+        let value = serde_json::to_value(telemetry).unwrap();
+        assert_eq!(value["latency_ms"], json!(1.5));
+        assert_eq!(value["prompt_tokens"], json!(2));
+        assert_eq!(value["completion_tokens"], json!(3));
+        assert_eq!(value["cost"], json!(0.004));
+        let restored: RunTelemetry = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, telemetry);
+        let partial: RunTelemetry = serde_json::from_str(r#"{"prompt_tokens": 5}"#).unwrap();
+        assert_eq!(partial.prompt_tokens, Some(5));
+        assert_eq!(partial.completion_tokens, None);
+        assert_eq!(partial.total_tokens(), Some(5));
+        let empty: RunTelemetry = serde_json::from_str("{}").unwrap();
+        assert!(empty.is_empty());
+        let unknown: RunTelemetry =
+            serde_json::from_str(r#"{"latency_ms": 2.0, "wall": 9}"#).unwrap();
+        assert_eq!(unknown, RunTelemetry::default().with_latency_ms(2.0));
+    }
+
+    #[test]
+    fn run_outcome_carries_telemetry() {
+        let mut answer = BTreeMap::new();
+        answer.insert("output".to_owned(), Value::String("4".to_owned()));
+        let plain = RunOutcome::new(answer.clone());
+        assert!(plain.telemetry.is_empty());
+        let measured = RunTelemetry::default().with_latency_ms(3.0);
+        let outcome = RunOutcome::with_trace(answer, ToolTrace::new([success("calc")]))
+            .with_telemetry(measured);
+        assert_eq!(outcome.telemetry, measured);
+        assert_eq!(outcome.telemetry.latency_ms, Some(3.0));
+        assert_eq!(outcome.into_answer().len(), 1);
     }
 }
