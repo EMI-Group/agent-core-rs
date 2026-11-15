@@ -2,6 +2,7 @@
 //!
 //! A merge list is applied highest-priority-first, exactly as the artifact declared it: the pair with the lowest rank merges first, all of its occurrences merge left to right, and the pass repeats until no ranked pair remains.
 //! `continuing_subword_prefix` is applied to the initial symbols (the vocabulary stores it inside the piece), so merges concatenate the stored spellings.
+//! Decoding reverses the spelling rules: the continuation prefix and the end-of-word suffix are stripped again, and consecutive `<0xXX>` fallback tokens are reassembled into bytes, so an artifact that declares no decoder still round-trips.
 
 use std::collections::HashMap;
 
@@ -109,6 +110,51 @@ impl BpeModel {
             }
         }
         emitted
+    }
+
+    /// Decodes token spellings into the text they were cut from.
+    ///
+    /// Each piece loses the continuation prefix at its start and the end-of-word suffix at its end, so the merge-time spellings are undone.
+    /// A `<0xXX>` token contributes its byte (only when the model declares `byte_fallback`); consecutive such tokens form one byte run that is decoded as UTF-8 once the run ends, so a character split across several fallback tokens is reassembled.
+    /// With `fuse_unk`, a run of unknown-token spellings collapses into the first spelling of that run, mirroring how encoding fuses such a run into one id.
+    pub(crate) fn decode(&self, tokens: &[String]) -> String {
+        let unknown = self.unk_id.and_then(|id| self.id_to_token(id));
+        let mut out = String::new();
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut previous_unknown = false;
+        for token in tokens {
+            let byte = if self.byte_fallback {
+                super::model::hex_byte_token(token)
+            } else {
+                None
+            };
+            if let Some(byte) = byte {
+                bytes.push(byte);
+                previous_unknown = false;
+                continue;
+            }
+            super::model::flush_byte_run(&mut bytes, &mut out);
+            let is_unknown = unknown == Some(token.as_str());
+            if is_unknown && self.fuse_unk && previous_unknown {
+                continue;
+            }
+            out.push_str(self.strip_affixes(token));
+            previous_unknown = is_unknown;
+        }
+        super::model::flush_byte_run(&mut bytes, &mut out);
+        out
+    }
+
+    /// Removes the continuation prefix and the end-of-word suffix a piece carries.
+    fn strip_affixes<'a>(&self, token: &'a str) -> &'a str {
+        let mut piece = token;
+        if let Some(prefix) = &self.continuing_subword_prefix {
+            piece = piece.strip_prefix(prefix.as_str()).unwrap_or(piece);
+        }
+        if let Some(suffix) = &self.end_of_word_suffix {
+            piece = piece.strip_suffix(suffix.as_str()).unwrap_or(piece);
+        }
+        piece
     }
 
     /// The number of vocabulary entries.
@@ -258,5 +304,114 @@ mod tests {
         let mut ids = Vec::new();
         model.encode_piece("ab", &mut ids);
         assert_eq!(ids, vec![3]);
+    }
+
+    fn decode_fixture(extra: Value) -> BpeModel {
+        let mut value = extra;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("type".to_owned(), Value::from("BPE"));
+        }
+        let mut warnings = Vec::new();
+        BpeModel::from_json(&value, &mut warnings).expect("BPE fixture")
+    }
+
+    fn spellings(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|token| (*token).to_owned()).collect()
+    }
+
+    #[test]
+    fn decode_strips_the_continuation_prefix() {
+        let model = decode_fixture(json!({
+            "vocab": {"a": 0, "##b": 1, "##c": 2},
+            "merges": [],
+            "continuing_subword_prefix": "##"
+        }));
+        assert_eq!(model.decode(&spellings(&["a", "##b", "##c"])), "abc");
+        // The prefix is stripped wherever it appears: decoding cannot know which pieces the encoder prefixed.
+        assert_eq!(model.decode(&spellings(&["##a", "##b"])), "ab");
+    }
+
+    #[test]
+    fn decode_strips_the_end_of_word_suffix() {
+        let model = decode_fixture(json!({
+            "vocab": {"hel": 0, "lo</w>": 1, "world</w>": 2},
+            "merges": [],
+            "end_of_word_suffix": "</w>"
+        }));
+        assert_eq!(model.decode(&spellings(&["hel", "lo</w>"])), "hello");
+        assert_eq!(model.decode(&spellings(&["world</w>"])), "world");
+    }
+
+    #[test]
+    fn decode_reassembles_a_multi_byte_character_from_fallback_tokens() {
+        let model = decode_fixture(json!({
+            "vocab": {"<0xC3>": 0, "<0xA9>": 1, "<0xE4>": 2, "<0xB8>": 3, "<0xAD>": 4},
+            "merges": [],
+            "byte_fallback": true
+        }));
+        // `é` is `0xC3 0xA9`; `中` is the three bytes `0xE4 0xB8 0xAD`.
+        assert_eq!(model.decode(&spellings(&["<0xC3>", "<0xA9>"])), "é");
+        assert_eq!(
+            model.decode(&spellings(&["<0xE4>", "<0xB8>", "<0xAD>"])),
+            "中"
+        );
+        // The run ends at a real token, so text and bytes alternate without leaking into each other.
+        assert_eq!(model.decode(&spellings(&["<0xC3>", "<0xA9>", "a"])), "éa");
+    }
+
+    #[test]
+    fn decode_keeps_byte_tokens_literal_without_byte_fallback() {
+        let model = decode_fixture(json!({
+            "vocab": {"<0xC3>": 0, "<0xA9>": 1},
+            "merges": []
+        }));
+        assert_eq!(
+            model.decode(&spellings(&["<0xC3>", "<0xA9>"])),
+            "<0xC3><0xA9>"
+        );
+    }
+
+    #[test]
+    fn decode_fuses_an_unknown_run_only_when_asked() {
+        let fused = decode_fixture(json!({
+            "vocab": {"<unk>": 0, "a": 1},
+            "merges": [],
+            "unk_token": "<unk>",
+            "fuse_unk": true
+        }));
+        assert_eq!(
+            fused.decode(&spellings(&["a", "<unk>", "<unk>", "a"])),
+            "a<unk>a"
+        );
+
+        let unfused = decode_fixture(json!({
+            "vocab": {"<unk>": 0, "a": 1},
+            "merges": [],
+            "unk_token": "<unk>"
+        }));
+        assert_eq!(
+            unfused.decode(&spellings(&["a", "<unk>", "<unk>", "a"])),
+            "a<unk><unk>a"
+        );
+    }
+
+    #[test]
+    fn byte_fallback_round_trips_through_encode() {
+        let model = decode_fixture(json!({
+            "vocab": {"<0xC3>": 0, "<0xA9>": 1, "<0xE4>": 2, "<0xB8>": 3, "<0xAD>": 4},
+            "merges": [],
+            "byte_fallback": true
+        }));
+        let text = "é中";
+        let mut ids = Vec::new();
+        for character in text.chars() {
+            model.encode_piece(&character.to_string(), &mut ids);
+        }
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+        let spellings: Vec<String> = ids
+            .iter()
+            .filter_map(|id| model.id_to_token(*id).map(str::to_owned))
+            .collect();
+        assert_eq!(model.decode(&spellings), text);
     }
 }
