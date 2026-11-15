@@ -177,7 +177,6 @@ The instruction optimizer is only ever handed `train.cases()`, so a held-out cas
 
 ## Deferred
 
-- Python's dataset samplers (`openjiuwen/dev_tools/tune/dataset/` beyond `CaseLoader`) are not ported: they schedule batches from external stores, while the port keeps the case list in memory and leaves splitting to `CaseLoader`.
 - Python's `tune/chat_agent/` adapters (`ChatAgent`, `ChatConfig`) are not ported: they bind an optimizer to a Python agent runtime, whereas here an optimizer is driven by a `CaseEvaluator` the caller composes, so no agent adapter is needed.
 - Python's prompt-search `policy.py` (`LLMPromptPolicy`'s multi-candidate JSON generation) is not ported: candidate generation is the deterministic mutation bank plus one model rewrite per round.
 - Python's prompt-search `environment.py` (`LLMEnvironment`/`CallableEnvironment`) is not ported: candidates run through the caller's `CaseEvaluator`.
