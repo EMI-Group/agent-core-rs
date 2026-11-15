@@ -77,6 +77,7 @@ fn entities(names: &[&str]) -> Extraction {
             .map(|name| entity(name, "Concept", None))
             .collect(),
         relations: Vec::new(),
+        degraded: None,
     }
 }
 
@@ -92,6 +93,7 @@ async fn store_chain(memory: &GraphMemory, scope: &MemoryScope) {
             relation("Alice", "Acme", "works_at"),
             relation("Acme", "Rust", "uses"),
         ],
+        degraded: None,
     };
     let (entities, relations) = memory
         .add_extracted(scope, &extraction)
@@ -114,6 +116,7 @@ async fn add_extracted_persists_entities_relations_and_stats() {
             relation("Alice", "Acme", "works_at"),
             relation("Acme", "Rust", "uses"),
         ],
+        degraded: None,
     };
     let (stored_entities, stored_relations) = memory
         .add_extracted(&scope, &extraction)
@@ -171,6 +174,7 @@ async fn repeat_add_merges_properties_and_keeps_the_id() {
             &Extraction {
                 entities: vec![entity("Alice", "Person", Some(0.2))],
                 relations: Vec::new(),
+                degraded: None,
             },
         )
         .await
@@ -192,6 +196,7 @@ async fn repeat_add_merges_properties_and_keeps_the_id() {
             &Extraction {
                 entities: vec![entity("Alice", "Person", Some(0.6))],
                 relations: Vec::new(),
+                degraded: None,
             },
         )
         .await
@@ -419,6 +424,7 @@ async fn scope_isolation() {
                     entity("Acme", "Project", None),
                 ],
                 relations: vec![relation("Alice", "Acme", "works_at")],
+                degraded: None,
             },
         )
         .await

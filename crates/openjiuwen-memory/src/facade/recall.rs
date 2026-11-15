@@ -2,9 +2,11 @@
 //!
 //! Ranking is the engine's job; this module only decides whether graph recall runs and
 //! keeps memory recall working when it does not. A graph failure never fails a recall:
-//! memory degrades to records only and the failure is logged.
+//! memory degrades to records only, the failure is logged, and it is reported on
+//! [`CombinedRecall::graph_error`] so callers can tell "the graph had no match" from
+//! "the graph could not be asked".
 
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{ErrorKind, Result};
 
 use crate::graph::{CombinedRecall, GraphRecallHit, GraphSearchOptions};
 use crate::record::{MemoryScope, RecallHit, SearchOptions};
@@ -46,12 +48,20 @@ impl LongTermMemory {
     /// Recalls memory records and, when graph memory is enabled, graph entities.
     ///
     /// The memory hits are returned first and their errors propagate; graph recall is
-    /// best-effort, so a graph failure is logged and reported as an empty entity list
-    /// (the rail parity rule: memory degrades, it never breaks the turn).
+    /// best-effort, so a graph failure is logged, reported on
+    /// [`CombinedRecall::graph_error`], and leaves
+    /// [`CombinedRecall::entities`] empty (the rail parity rule: memory degrades, it
+    /// never breaks the turn). A partial result is therefore visible instead of looking
+    /// like a graph with no matches; check [`CombinedRecall::is_partial`].
+    ///
+    /// Cancellation is the one exception: a graph recall cancelled through
+    /// [`SearchOptions::call`] propagates `Error::Cancelled` rather than being reported
+    /// as a degradation.
     ///
     /// # Errors
     ///
-    /// See [`LongTermMemory::search`].
+    /// See [`LongTermMemory::search`], plus `Error::Cancelled` when the call's token is
+    /// triggered during graph recall.
     pub async fn search_all(
         &self,
         scope: &MemoryScope,
@@ -59,19 +69,28 @@ impl LongTermMemory {
         options: &SearchOptions,
     ) -> Result<CombinedRecall> {
         let memories = self.search(scope, query, options).await?;
-        let entities = self.graph_entities(scope, query, options).await;
-        Ok(CombinedRecall { memories, entities })
+        let (entities, graph_error) = self.graph_entities(scope, query, options).await?;
+        Ok(CombinedRecall {
+            memories,
+            entities,
+            graph_error,
+        })
     }
 
-    /// Runs graph recall when graph memory is wired, degrading on failure.
+    /// Runs graph recall when graph memory is wired, reporting a failure without
+    /// failing the call.
+    ///
+    /// Returns the entity hits plus the degradation reason (`None` when graph memory is
+    /// not wired, when it has no match, or when it answered). Cancellation is
+    /// propagated instead of being reported as a degradation.
     async fn graph_entities(
         &self,
         scope: &MemoryScope,
         query: &str,
         options: &SearchOptions,
-    ) -> Vec<GraphRecallHit> {
+    ) -> Result<(Vec<GraphRecallHit>, Option<String>)> {
         let Some(graph) = &self.graph else {
-            return Vec::new();
+            return Ok((Vec::new(), None));
         };
         let config = self.config();
         let graph_options = GraphSearchOptions {
@@ -83,14 +102,16 @@ impl LongTermMemory {
             call: options.call.clone(),
         };
         match graph.search(scope, query, &graph_options).await {
-            Ok(entities) => entities,
+            Ok(entities) => Ok((entities, None)),
+            Err(error) if error.kind() == ErrorKind::Cancelled => Err(error),
             Err(error) => {
+                let reason = error.to_string();
                 tracing::warn!(
                     target: TARGET,
                     %error,
                     "graph recall failed; returning memory hits only"
                 );
-                Vec::new()
+                Ok((Vec::new(), Some(reason)))
             }
         }
     }
@@ -135,6 +156,8 @@ mod tests {
             .expect("search all");
         assert_eq!(combined.memories.len(), 1);
         assert_eq!(combined.entities.len(), 0);
+        assert_eq!(combined.graph_error, None, "no graph, no graph failure");
+        assert!(!combined.is_partial());
     }
 
     #[tokio::test]
@@ -165,6 +188,11 @@ mod tests {
             .expect("search all");
         assert_eq!(combined.memories.len(), 1);
         assert_eq!(combined.entities.len(), 0);
+        assert_eq!(
+            combined.graph_error, None,
+            "an empty graph has no matches, which is not a failure"
+        );
+        assert!(!combined.is_partial());
     }
 
     #[tokio::test]
@@ -229,6 +257,64 @@ mod tests {
             .expect("search all");
         assert_eq!(combined.memories.len(), 1);
         assert_eq!(combined.entities.len(), 0);
+        let reason = combined
+            .graph_error
+            .as_deref()
+            .expect("the graph failure must be reported");
+        assert!(
+            reason.contains("embedding backend unavailable"),
+            "the reason must carry the provider error: {reason}"
+        );
+        assert!(combined.is_partial());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_graph_recall_propagates_cancelled() {
+        struct CancellingEmbedding;
+
+        #[async_trait::async_trait]
+        impl openjiuwen_retrieval::embedding::Embedding for CancellingEmbedding {
+            fn model_name(&self) -> &'static str {
+                "cancelling"
+            }
+
+            async fn embed_query(&self, _text: &str) -> openjiuwen_common::error::Result<Vec<f32>> {
+                Err(openjiuwen_common::error::Error::cancelled())
+            }
+
+            async fn embed_documents(
+                &self,
+                _texts: &[String],
+                _batch_size: Option<usize>,
+            ) -> openjiuwen_common::error::Result<Vec<Vec<f32>>> {
+                Err(openjiuwen_common::error::Error::cancelled())
+            }
+        }
+
+        // Only graph recall touches the embedder (memory recall below is keyword-only),
+        // so the cancellation surfaces there and must not be reported as a degradation.
+        let ltm = LongTermMemory::builder(graph_enabled())
+            .embedding(std::sync::Arc::new(CancellingEmbedding))
+            .build()
+            .expect("facade");
+        ltm.add(
+            &scope(),
+            NewMemory::semantic("alice prefers dark mode"),
+            &AddOptions::default().skip_embedding(),
+        )
+        .await
+        .expect("add");
+        let options = SearchOptions::default()
+            .with_threshold(0.0)
+            .with_mode(crate::record::SearchMode::Keyword);
+        let error = ltm
+            .search_all(&scope(), "dark mode", &options)
+            .await
+            .expect_err("a cancelled graph recall must not look like a partial result");
+        assert!(
+            matches!(error, openjiuwen_common::error::Error::Cancelled),
+            "got {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -242,6 +328,7 @@ mod tests {
                 importance: None,
             }],
             relations: Vec::new(),
+            degraded: None,
         };
         ltm.graph()
             .expect("graph")
@@ -254,5 +341,6 @@ mod tests {
             .expect("search all");
         assert_eq!(combined.memories.len(), 1);
         assert_eq!(combined.entities.len(), 1);
+        assert_eq!(combined.graph_error, None);
     }
 }
