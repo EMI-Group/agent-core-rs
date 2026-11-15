@@ -17,7 +17,8 @@ checklist; this file records only what is specific to this subtree.
 - `read::{read_file, read_file_stream}` — `pub(crate)` entry points behind the two read trait
   methods; `prepare_read_stream`, `load_for_read`, `read_bytes_locked` are the private steps.
 - `write::write_file` — `pub(crate)` entry point behind the write trait method;
-  `validate_write`, `write_locked`, `version_conflict`, `apply_permissions` are private.
+  `validate_write`, `write_locked`, `version_conflict`, `metadata_if_exists`,
+  `apply_permissions` are private.
 - `transfer::{upload_file, upload_file_stream, download_file, download_file_stream}` —
   `pub(crate)` entry points behind the four transfer trait methods; `prepare_upload`,
   `prepare_download`, `transfer`, `transfer_stream`, `copy_file`, `copy_chunks` are private.
@@ -30,15 +31,14 @@ checklist; this file records only what is specific to this subtree.
   (Unix; a no-op guard elsewhere). `FileLockManager` is cheaply cloneable and exposes
   `new`/`with_root`/`with_timeout`, `is_enabled`, `timeout`, `lock_path`, `try_acquire` and
   `acquire`.
-- `list::{list_files, list_directories, file_system_item}` — directory listing with recursion,
-  depth, suffix filter and sorting; `file_system_item` is the single `FileSystemItem` constructor
-  shared with search.
-- `search::search_files(policy, params, mode)` — Python `rglob` glob matching (`Glob`) plus the
-  additive `Regex` variant; returns files only.
-- `ext::{stat, exists, mkdir, delete, copy, move_path}` — Rust-only extension operations.
+- `list::{list_files, list_directories, file_system_item, is_root_error, root_error}` — directory listing with recursion, depth, suffix filter and sorting; `file_system_item` is the single `FileSystemItem` constructor shared with search, and `root_error` turns a failed root walk into the 199003 reason.
+- `search::search_files(policy, params, mode)` — Python `rglob` glob matching (`Glob`) plus the additive `Regex` variant; returns files only, and a failed root walk is the 199003 reason built by `root_error`.
+- `ext::{stat, exists, mkdir, delete, copy, move_path}` — Rust-only extension operations; `target_exists` turns a failed target `stat` into the 199003 reason `copy`/`move_path` report.
 - `slice::{LineSelection, validate_read_params, split_lines_keep_ends, select_lines,
-  take_first_chunk, effective_chunk_size, encoded_len, write_bytes}` — pure, allocation-light
-  helpers for read validation/slicing and write-content composition.
+  take_first_chunk, effective_chunk_size, encoded_len, try_encoded_len, write_bytes}` — pure,
+  allocation-light helpers for read validation/slicing and write-content composition;
+  `try_encoded_len` is the fallible variant the streamed read uses, `encoded_len` is a
+  documented bounded-size estimate on an encode failure.
 
 ## Constraints
 
@@ -80,6 +80,18 @@ checklist; this file records only what is specific to this subtree.
   chunk (Python parity).
 - `write_file` opens `create_new` for `create_if_absent`, `append + create` for `append`, otherwise
   `write + create + truncate`, and flushes explicitly (`tokio::fs::File` buffers writes).
+- A failed root walk in `list_files`/`list_directories`/`search_files` is a 199003 failure, never
+  an empty success; an unreadable subdirectory is skipped (Python `os.walk` parity) and logged at
+  `warn!` with its path, as is an entry whose `stat` fails.
+- `write_file`, `upload_file`, `ext::stat`/`exists`/`copy`/`move_path` distinguish `NotFound` from
+  every other `stat` error: a permission or IO error keeps the OS message instead of being
+  reported as "File does not exist"/"Source not found", and a target that cannot be inspected is
+  not overwritten.
+- `lock_path_for` logs at `warn!` when an absolute path cannot be resolved, because the relative
+  fallback could point two processes at different sidecars for one file.
+- `write_file` encodes text content with `WriteFileParams.encoding` before opening the target, so
+  an unknown encoding or an unrepresentable character is a 199003 failure that leaves the target
+  untouched.
 - `move_path` falls back to copy-then-delete on any rename error whose kind is not
   `NotFound`/`PermissionDenied`/`AlreadyExists`, because stable `ErrorKind` has no cross-device
   variant.
