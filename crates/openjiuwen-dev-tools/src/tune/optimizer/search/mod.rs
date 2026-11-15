@@ -21,12 +21,17 @@
 //!   so the result is never worse than the starting prompt.
 //! - The *environment* is the [`CaseEvaluator`]
 //!   ([`crate::tune::CaseEvaluator`]) seam, so the same loop runs offline
-//!   against the deterministic evaluator or through a model. That seam reports
-//!   neither latency nor token usage, so every
-//!   [`Execution`](crate::tune::Execution) carries `latency_ms = 0.0` and
-//!   `total_tokens = 0`; the latency, token-usage, and cost reward components
-//!   are therefore constant in this port (they never separate two candidates),
-//!   and [`OptimizationResult::token_usage`] stays empty.
+//!   against the deterministic evaluator or through a model. Each case runs
+//!   through [`CaseEvaluator::evaluate_run`], so the run's measured
+//!   [`RunTelemetry`](crate::tune::RunTelemetry) is kept per
+//!   [`CaseResult`](crate::tune::CaseResult) and merged into the
+//!   [`Execution`](crate::tune::Execution): the execution's latency and token
+//!   totals are the sum over its cases, and its legacy `latency_ms`/
+//!   `total_tokens` fields mirror them only when they were measured. An
+//!   evaluator that measures nothing leaves both at zero, so the latency,
+//!   token-usage, and cost reward components stay constant for it, while a
+//!   measuring evaluator feeds them. [`OptimizationResult::token_usage`] stays
+//!   empty either way because the result reports no run-level counters.
 //! - The round budget is the smaller of [`PromptSearchConfig::max_iterations`]
 //!   and the shared [`OptimizerConfig::iterations`], so the Python RLAF budget
 //!   is capped by the tuning budget; with the defaults that is
