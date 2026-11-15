@@ -23,7 +23,7 @@
 //!   for a host, though: every failure is recorded on the exporter
 //!   ([`TraceFileExporter::dropped_spans`],
 //!   [`TraceFileExporter::failed_exports`], [`TraceFileExporter::last_error`]),
-//!   and a handle built with [`ExporterType::File`] exposes the exporter through
+//!   and a handle built with [`crate::otel::ExporterType::File`] exposes the exporter through
 //!   `TracerHandle::file_exporter`, so a host can assert that export is working
 //!   while `export` itself stays infallible.
 //! - Trace files whose mtime predates `retention_days` are lazily pruned at most

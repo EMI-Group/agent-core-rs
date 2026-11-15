@@ -26,9 +26,9 @@
 //!
 //! # Entry points
 //!
-//! The kernel's `CheckpointerKind` has no Redis variant, so
-//! [`crate::checkpointer::build_checkpointer`] cannot select this backend:
-//! construct it with [`RedisCheckpointer::new`] (lazy connect) or
+//! The kernel factory's `CheckpointerKind::Redis` builds the kernel's own Redis
+//! checkpointer, so [`crate::checkpointer::build_checkpointer`] never returns
+//! this backend: construct it with [`RedisCheckpointer::new`] (lazy connect) or
 //! [`RedisCheckpointer::connect`] / [`RedisCheckpointer::create`] (eager connect,
 //! which also verifies the server answers `PING`).
 //!
