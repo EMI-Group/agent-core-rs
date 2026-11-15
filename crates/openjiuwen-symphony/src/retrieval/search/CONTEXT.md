@@ -465,7 +465,6 @@ The model's line order is preserved and each `canonical_id` is emitted once (fir
 
 - `lexical.rs` (~1584 lines) and `render/expose.rs` (~1566 lines) exceed the 1000-line soft cap only because their in-file `#[cfg(test)]` suites stay beside the logic; split them for responsibility, never for size alone.
 - Two `SearchCursor` types exist and must not be confused: `retrieval::types::SearchCursor` (the build side's resumable pre-order plan) and `search::flow::SearchCursor` (the runtime's one-node traversal cursor).
-- `artifacts::write_index` cannot publish a zero-node index: it renders `nodes:` with no entries, which its own `parse_tree_yaml` rejects as "`nodes` is not a sequence". That is a limitation of the build half, not of this module, so a caller must publish at least one node.
 - Python's production disclosure defaults (`flatten_full_tree_in_prompt = true`, `max_exposure_depth_per_call = 99`, `exposure_threshold = 1e9`) are this crate's `ProgressiveSearchConfig::default()` too, so the depth/threshold machinery is only exercised when a caller overrides them.
 - `TraversalConfig::max_parallel_branches`, `TraversalConfig::enable_parallel_branches` and `GenerationConfig::trie_constrained_decoding_enabled` change nothing; they exist so a Python config round-trips.
 
@@ -521,4 +520,4 @@ The model's line order is preserved and each `canonical_id` is emitted once (fir
 - Publicization is the only place that maps internal ids to public ones; adding a public field to `RetrievalResult` means deriving it from the trimmed `CandidateRecord` rows so `search` and `search_details` cannot diverge.
 - `top_k == 0` is the crate's unlimited sentinel everywhere in this module; a new stage that slices by `top_k` must handle it.
 - Prompt text belongs in `render/prompt.rs` and is intentionally Chinese (the reference's text); do not translate or reflow it, and keep the `{…}` placeholders substituted in one pass.
-- `artifacts::write_index` cannot round-trip a zero-node index (see Known Issues); a fixture that needs an empty catalog uses a hand-built `LoadedIndex` instead.
+- An empty catalog round-trips: `artifacts::write_index` renders `nodes: []` for a zero-node index and `load_index` accepts it, so a fixture may build an empty index instead of hand-building a `LoadedIndex`.

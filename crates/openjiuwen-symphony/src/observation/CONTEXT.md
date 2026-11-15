@@ -239,8 +239,6 @@ A revision document whose stored content (ignoring `generated_at`) differs from 
 - `payload.rs` and `timestamp.rs` are `pub(crate)`: they are implementation detail, and `crate::observation::payload::*` wire-key constants are the single source for payload/overlay field names inside this package.
 - `contracts/tests.rs` and `service/tests.rs` are `#[cfg(test)] mod tests;` children of their `mod.rs`, so they reach private items through `use super::*;` and keep the implementation file under the soft cap.
 - Integration coverage for this package lives in the parent-owned `crates/openjiuwen-symphony/tests/observation*.rs` suites; do not add cross-module scenarios here, and do not edit those tests from this node.
-- The crate-level `CONTEXT.md` still describes this package as unported scope; the parent agent owns that table and the routing entry.
-- A pre-existing `rustdoc::redundant_explicit_links` warning lives outside this node in `src/object_artifact/http.rs:5` (`[`openjiuwen_common::http`](openjiuwen_common::http)`); it is the only `cargo doc` warning in the crate and must be fixed at crate level.
 
 ## Test Strategy
 
