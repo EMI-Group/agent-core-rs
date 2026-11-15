@@ -645,6 +645,14 @@ Independent of the layout, three further surfaces live under the same root:
 - Gates (all must be green): `cargo fmt -p openjiuwen-memory`, `cargo test -p openjiuwen-memory --offline` (971 tests), the same with `--all-features` (1048), `cargo clippy -p openjiuwen-memory --all-targets --all-features --offline -- -D warnings`, and `cargo doc -p openjiuwen-memory --no-deps` with and without the feature.
 - Module-level (`//!`) doc links in this directory must be absolute (`crate::lite::<module>::<Item>`): `//!` docs resolve in the parent module's scope.
 
+## Known Issues
+
+- File-level defects of each subtree live in that directory's `## Known Issues` (`markdown`, `embed`, `facts`, `session`, `local`); this list holds only cross-file ones.
+- `watch.rs` logs a `notify`-reported watcher error with `warn!` and keeps running, so a watch that stops delivering after `MemoryWatcher::start` returned `Ok` has no API-level signal.
+- `LocalCodingMemory::write_mode`'s `WritePlan::Skipped(None)` arm reports the incoming fact as stored with `mode = Skip`; `MemUpdateChecker::plan` never returns `Skipped(None)` today, so the arm is latent silent-success code rather than live behaviour.
+- `LocalCodingMemoryBuilder::open` never calls `CodingMemoryConfig::validate`, and `local::store::resolve_fact_type` folds an unparsable `default_fact_type` into `CodingFactType::Project` (debug log only), so a misspelled default degrades silently.
+- `CodingMemory::{list, find_record}` (via `CodingFact::from_record`) drop a `Coding`-kind record whose metadata has no non-blank `name` or lacks `coding_fact = true`, so such a record is invisible to `read`/`list`/`delete` and a later write of the same name creates a second record.
+
 ## Deferred (Python `core.memory.lite` features not ported)
 
 - `sqlite_vec`/native ANN search and Python's `files`/`chunks`/`chunks_fts`/`chunks_vec`/`meta` schema: vectors live in memory and the content-hash cache is the only durable part, so recall is an exact brute-force cosine scan. The workspace has no `sqlite_vec` extension or ANN dependency and adding one would need a native build.
