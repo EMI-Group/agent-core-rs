@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use openjiuwen_agent::{AgentChunk, AgentOutput};
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{ErrorKind, Result};
 use openjiuwen_session::Session;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -16,11 +16,12 @@ use tracing::{debug, warn};
 use super::super::initial_input::parse_initial_input;
 use super::super::leader;
 use super::super::memory_bind;
+use super::super::tool_dispatch;
 use super::TeamAgent;
 use crate::constants::USER_PSEUDO_MEMBER_NAME;
-use crate::interaction::{DeliverResult, HumanAgentMessage, InteractPayload};
+use crate::interaction::{DeliverResult, HumanAgentMessage, HumanAgentToolCall, InteractPayload};
 use crate::member::MemberSpawner;
-use crate::schema::{MemberLifetime, TeamSnapshot};
+use crate::schema::{MemberLifetime, TeamRole, TeamSnapshot};
 
 impl TeamAgent {
     /// Starts the team: the transport, the leader runtime and the interaction gate.
@@ -201,18 +202,23 @@ impl TeamAgent {
     /// * [`InteractPayload::Operator`] / [`InteractPayload::GroupChat`] /
     ///   [`InteractPayload::GodView`] — the interaction gate, then one persisted row addressed to
     ///   the leader.
-    /// * [`InteractPayload::HumanAgentToolCall`] and [`InteractPayload::ExternalTeam`] — rejected as
-    ///   unsupported capabilities.
+    /// * [`InteractPayload::HumanAgentToolCall`] — the interaction gate, then one relayed team tool
+    ///   call executed under the passive human's identity; the answer carries `{ok, output, data}`
+    ///   and, on a refusal, one of the stable tokens `human_agent_not_enabled`,
+    ///   `unknown_human_agent:<name>`, `tool_passthrough_avatar_not_supported`,
+    ///   `unknown_tool:<tool>`, `invalid_arguments:<tool>` or `tool_failed:<tool>`.
+    /// * [`InteractPayload::ExternalTeam`] — rejected as `unsupported:external_team_transport`:
+    ///   this build ships no distributed transport.
     pub async fn deliver(&self, payload: InteractPayload) -> DeliverResult {
         match payload {
             InteractPayload::HumanAgent(message) => self.deliver_human_agent(message).await,
             InteractPayload::Operator(_)
             | InteractPayload::GroupChat(_)
             | InteractPayload::GodView(_) => self.deliver_leader_bound(payload).await,
-            InteractPayload::HumanAgentToolCall(_) => {
-                DeliverResult::unsupported("human_agent_tool_call")
+            InteractPayload::HumanAgentToolCall(call) => self.deliver_tool_call(call).await,
+            InteractPayload::ExternalTeam(_) => {
+                DeliverResult::unsupported("external_team_transport")
             }
-            InteractPayload::ExternalTeam(_) => DeliverResult::unsupported("external_team"),
         }
     }
 
@@ -265,6 +271,83 @@ impl TeamAgent {
                 "send_failed:{}: {error}",
                 self.leader_member_name()
             )),
+        }
+    }
+
+    /// Relays one team tool call on behalf of a passive human member.
+    ///
+    /// Python parity: `TeamAgent._dispatch_tool` in
+    /// `openjiuwen/agent_teams/runtime/manager.py`. A passive human has no avatar, so the runtime
+    /// executes the call verbatim under `call.human_name`'s identity: assignee locks, reviewer
+    /// guards and sender-bound message rows all follow from that name.
+    ///
+    /// The call is admitted through the same gate as every other leader-bound payload (so an
+    /// inactive team answers `not_active` and a closing one `gate_closed`), then checked in order:
+    /// the human-agent channel must be enabled, `human_name` must be on the roster, that member must
+    /// be a [`TeamRole::PassiveHuman`] (an avatar keeps its own governed LLM tool loop), and the
+    /// tool name must be one of the [`tool_dispatch`] team tools. Only then is the call dispatched.
+    ///
+    /// A successful call answers `{ok: true, output, data}`: `output` is the model-facing text and
+    /// `data` the raw tool payload, so an external protocol can show the human the effect
+    /// synchronously. A failure answers `ok: false` with one stable token and no `output`/`data`.
+    async fn deliver_tool_call(&self, call: HumanAgentToolCall) -> DeliverResult {
+        let admitted = self.inner.gate.dispatch(
+            InteractPayload::HumanAgentToolCall(call.clone()),
+            self.is_started(),
+        );
+        if !admitted.ok {
+            return admitted;
+        }
+        if !self.inner.inbox.is_enabled() {
+            return DeliverResult::failed("human_agent_not_enabled");
+        }
+        let Some(member) = self.inner.backend.member(&call.human_name) else {
+            return DeliverResult::failed(format!("unknown_human_agent:{}", call.human_name));
+        };
+        if member.role() != TeamRole::PassiveHuman {
+            return DeliverResult::failed("tool_passthrough_avatar_not_supported");
+        }
+        // Checked before dispatching, so a board refusal can never be mistaken for an unknown tool.
+        if !tool_dispatch::is_supported_tool(&call.tool_name) {
+            return DeliverResult::failed(format!("unknown_tool:{}", call.tool_name));
+        }
+        match tool_dispatch::dispatch_tool(
+            &self.inner.backend,
+            &call.human_name,
+            &call.tool_name,
+            &call.tool_args,
+        )
+        .await
+        {
+            Ok(value) => DeliverResult {
+                ok: true,
+                message_id: None,
+                reason: None,
+                output: tool_dispatch::render_tool_output(&value),
+                data: value,
+            },
+            Err(error) => {
+                // The token stays stable and short; the human-readable detail goes to the log.
+                if error.kind() == ErrorKind::Validation {
+                    debug!(
+                        team = self.team_name(),
+                        human = %call.human_name,
+                        tool = %call.tool_name,
+                        error = %error,
+                        "a relayed tool call carried invalid arguments"
+                    );
+                    DeliverResult::failed(format!("invalid_arguments:{}", call.tool_name))
+                } else {
+                    warn!(
+                        team = self.team_name(),
+                        human = %call.human_name,
+                        tool = %call.tool_name,
+                        error = %error,
+                        "a relayed tool call failed"
+                    );
+                    DeliverResult::failed(format!("tool_failed:{}", call.tool_name))
+                }
+            }
         }
     }
 
