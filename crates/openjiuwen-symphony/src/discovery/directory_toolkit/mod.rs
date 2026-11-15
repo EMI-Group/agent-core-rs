@@ -12,6 +12,7 @@
 //! | [`validate`](validate::validate) | `directory_toolkit.py` argument layer | the typed request, the six enums, every per-field rule, and Python's simple-shape defaults |
 //! | [`matcher`] | Python `str.casefold`/`fnmatch`/`==` | case folding, glob matching, literal match ranking |
 //! | [`ops`] | `directory_toolkit.py` `_list`/`_search`/`_read`/`_apply_pipeline` | operation dispatch, multi-query search assembly, snippets, pipelines |
+//! | [`layout`] | Python's `skillfs_layout`/`index_state` reporting | the derived catalog layout, the index baseline, and the missing/fresh/stale state |
 //! | [`toolkit`](toolkit::SkillIndexToolkit) | `directory_toolkit.py` `InstalledSkillsDirectoryToolkit` | the model-facing tool: `invoke`/`execute`, the card, pagination cursors, the notice cursor |
 //!
 //! # Design
@@ -47,6 +48,7 @@
 //! Everything here is synchronous, offline, and deterministic: no I/O, no clock, no
 //! model.
 
+pub mod layout;
 pub mod matcher;
 pub mod ops;
 pub mod render;
@@ -54,6 +56,12 @@ pub mod toolkit;
 pub mod validate;
 pub mod view;
 
+mod cursor;
+
+pub use layout::{
+    index_fingerprint, index_state_for, layout_for_records, skillfs_layout, IndexBaseline,
+    IndexState, SkillFsLayout, INDEX_FRESH, INDEX_MISSING, INDEX_STALE, LAYOUT_FLAT, LAYOUT_TREE,
+};
 pub use matcher::{case_fold, glob_match, has_wildcard, literal_match_rank};
 pub use ops::{
     apply_pipeline, content_hits, entry_hits, execute_list, execute_read, execute_search,
