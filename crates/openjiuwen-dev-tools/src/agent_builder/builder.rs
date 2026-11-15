@@ -10,10 +10,15 @@
 //! - [`AgentBuilder::build_agent`] / [`AgentBuilder::build_agent_at`] keep the
 //!   single-round-trip behavior: one model answer that is either a fenced JSON
 //!   artifact or a plain-text clarification.
-//! - [`AgentBuilder::build_with_pipeline`] runs the staged pipeline —
-//!   clarification, then the workflow designer/generator/reflector chain or the
-//!   LLM-agent generation plus deterministic repair — and falls back to the
-//!   deterministic stage implementations whenever a model answer is unusable.
+//! - [`AgentBuilder::build_with_pipeline`] runs the staged pipeline — intention,
+//!   optional refinement, clarification, then the three-pass workflow design with
+//!   its bounded repair loop or the LLM-agent generation plus deterministic
+//!   repair — and falls back to the deterministic stage implementations whenever
+//!   a model answer is unusable.
+//!
+//! [`AgentBuilder::build_with_pipeline_stream`] exposes the same pipeline as a
+//! [`PipelineEvent`] stream, and [`AgentBuilder::record_result`] persists a
+//! streamed result into a session.
 //!
 //! Time comes from [`now_millis`], and the only random values are the DSL agent
 //! ids.
@@ -24,21 +29,27 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures::stream::BoxStream;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::{Model, ModelRequestConfig};
 use openjiuwen_foundation::BaseMessage;
 use serde::{Deserialize, Serialize};
 
-use super::clarifier::{Clarification, Clarifier};
-use super::designer::WorkflowDesigner;
-use super::dl_generator::DlGenerator;
-use super::dl_reflector::DlReflector;
 use super::dsl::LlmAgentDsl;
 use super::history::{DialogueMessage, HistoryManager, DEFAULT_MAX_HISTORY_SIZE};
-use super::outcome::{map_state_to_status, BuildOutput, BuildResult, BuildState, BuildStatus};
+use super::outcome::{
+    map_state_to_status, BuildOutput, BuildResult, BuildState, BuildStatus, GenerationProvenance,
+    GenerationSource,
+};
+use super::progress::ProgressStage;
 use super::spec::LlmAgentSpec;
 use super::workflow_dsl::WorkflowDsl;
 use crate::util::extract_json_fence;
+
+mod pipeline;
+mod stream;
+
+pub use stream::PipelineEvent;
 
 /// The instruction sent to the model when an LLM agent is requested.
 ///
@@ -164,6 +175,10 @@ struct SessionState {
     state: BuildState,
     /// The artifact the session is building.
     agent_type: AgentType,
+    /// The newest workflow document the session produced, if any.
+    ///
+    /// The next request consults it for a refinement intention.
+    workflow: Option<WorkflowDsl>,
 }
 
 /// A session-based, model-driven builder for LLM agents and workflows.
@@ -266,6 +281,7 @@ impl AgentBuilder {
                 history: HistoryManager::new(DEFAULT_MAX_HISTORY_SIZE),
                 state: BuildState::Initial,
                 agent_type,
+                workflow: None,
             });
         session.agent_type = agent_type;
         session.state = BuildState::Processing;
@@ -279,57 +295,57 @@ impl AgentBuilder {
         };
         let text = choice.message.text().into_owned();
 
-        let (output, state) = artifact_from_answer(&text, agent_type, timestamp_ms);
+        let (output, state, source) = artifact_from_answer(&text, agent_type, timestamp_ms);
+        let (output, state, provenance) = legacy_provenance(output, state, source, agent_type);
         let status = map_state_to_status(state, agent_type);
 
         session.history.add_assistant_message(text);
         session.state = state;
+        if state == BuildState::Completed {
+            if let Some(workflow) = workflow_of(&output) {
+                session.workflow = Some(workflow.clone());
+            }
+        }
 
         Ok(BuildResult {
             status,
             session_id: session_id.to_owned(),
             agent_type,
             output,
+            provenance,
             ..BuildResult::default()
         })
     }
 
     /// Builds the requested artifact through the staged pipeline.
     ///
-    /// Stage 1 always runs [`Clarifier`]; when the request is incomplete the
-    /// session stops with a clarifying response. A ready request then runs the
-    /// workflow stages ([`WorkflowDesigner`] -> [`DlGenerator`] -> [`DlReflector`])
-    /// or the LLM-agent stage, falling back deterministically whenever a model
-    /// answer is unusable. Only a blank query is an error; use this variant when
-    /// a full artifact is wanted, and [`Self::build_agent_at`] for the legacy
-    /// single round trip.
+    /// The stages run in this order:
+    ///
+    /// 1. intention detection ([`IntentionDetector`]) — deterministic on a first
+    ///    request and model-assisted once the session holds turns;
+    /// 2. refinement ([`DlGenerator::refine`]) when the session holds a workflow
+    ///    document and the detector reports `Refine`;
+    /// 3. clarification ([`Clarifier`]) — a not-ready request stops the build with
+    ///    its question;
+    /// 4. a workflow request runs the three-pass designer, the DL generator, and
+    ///    the bounded repair loop; an LLM-agent request runs one generation round
+    ///    trip plus the deterministic document repair.
     ///
     /// Sessions behave exactly like [`Self::build_agent_at`]: a blank query is
     /// rejected before any session exists, the session is created on first use,
     /// its `agent_type` is set, the user turn is appended, and the state becomes
-    /// [`BuildState::Processing`]. The clarifier receives the turns retained
-    /// *before* this request, so the query is not duplicated.
+    /// [`BuildState::Processing`]. The clarifier and the detector receive the
+    /// turns retained *before* this request, so the query is not duplicated.
     ///
-    /// A not-ready clarification becomes [`BuildOutput::Response`] holding the
-    /// question, or else the summary, or else
-    /// `DEFAULT_CLARIFICATION_QUESTION`, with state
-    /// [`BuildState::Clarifying`]. A ready workflow request designs, generates,
-    /// and reflects a document; an unusable reflection falls back to the
-    /// deterministic generation of the same design. A ready LLM-agent request
-    /// makes one model call, repairs the parsed document deterministically, and
-    /// falls back to `deterministic_agent_dsl` when the answer is unparseable
-    /// or the call fails. Both successes complete the session.
-    ///
-    /// The assistant text (the JSON document, or the clarification) is appended
-    /// to the session history and the final state is stored, so
-    /// [`Self::status`] reports two more retained turns per call.
+    /// The returned [`BuildResult`] carries the provenance of every stage and the
+    /// repair report of the workflow path; the assistant text and the final state
+    /// are persisted through [`Self::record_result`], so [`Self::status`] reports
+    /// two more retained turns per call.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`] for a blank query, which is the only error
-    /// a caller can trigger; a failing model answer never propagates. Stage
-    /// output that cannot be represented (serialization) or a structurally
-    /// impossible design would surface as [`Error::Validation`] as well.
+    /// a caller can trigger; a failing model answer never propagates.
     pub async fn build_with_pipeline(
         &mut self,
         query: &str,
@@ -340,9 +356,8 @@ impl AgentBuilder {
         if query.trim().is_empty() {
             return Err(Error::validation("query must not be blank"));
         }
-
         // The borrow of the session ends here so no async stage holds it.
-        let prior = {
+        let (prior, previous) = {
             let session = self
                 .sessions
                 .entry(session_id.to_owned())
@@ -350,57 +365,106 @@ impl AgentBuilder {
                     history: HistoryManager::new(DEFAULT_MAX_HISTORY_SIZE),
                     state: BuildState::Initial,
                     agent_type,
+                    workflow: None,
                 });
             session.agent_type = agent_type;
             session.state = BuildState::Processing;
             let prior = session.history.clone();
+            let previous = session.workflow.clone();
             session.history.add_user_message(query);
-            prior
+            (prior, previous)
         };
-
-        let model = Arc::clone(&self.model);
-        let clarification = Clarifier::with_model(Arc::clone(&model))
-            .clarify(query, &prior)
-            .await?;
-
-        let (output, state) = if clarification.ready {
-            match agent_type {
-                AgentType::Workflow => {
-                    let workflow = workflow_pipeline(&model, query).await?;
-                    (BuildOutput::Workflow(workflow), BuildState::Completed)
-                }
-                AgentType::LlmAgent => {
-                    let mut history = prior.clone();
-                    history.add_user_message(query);
-                    let dsl = llm_agent_pipeline(&model, query, &history, timestamp_ms).await?;
-                    (BuildOutput::Dsl(dsl), BuildState::Completed)
-                }
-            }
-        } else {
-            let text = clarification_text(clarification);
-            (BuildOutput::Response(text), BuildState::Clarifying)
-        };
-
-        let assistant_text = match &output {
-            BuildOutput::Dsl(dsl) => dsl.to_json_string()?,
-            BuildOutput::Workflow(workflow) => workflow.to_json_string()?,
-            BuildOutput::Response(text) => text.clone(),
-        };
-
-        if let Some(session) = self.sessions.get_mut(session_id) {
-            session.history.add_assistant_message(assistant_text);
-            session.state = state;
-        }
-
-        Ok(BuildResult {
-            status: map_state_to_status(state, agent_type),
-            session_id: session_id.to_owned(),
+        let result = pipeline::run(
+            &self.model,
+            query,
+            session_id,
             agent_type,
-            output,
-            ..BuildResult::default()
-        })
+            &prior,
+            previous.as_ref(),
+            timestamp_ms,
+        )
+        .await?;
+        self.record_result(session_id, agent_type, &result)?;
+        Ok(result)
     }
-
+    /// Builds the requested artifact through the staged pipeline as a stream.
+    ///
+    /// The stream owns a snapshot of the model, the request, the session's
+    /// retained turns, and its newest workflow document, so it is
+    /// `Send + 'static` and never borrows the builder.
+    /// Every stage is announced with [`PipelineEvent::StageStarted`] and
+    /// [`PipelineEvent::StageCompleted`], every clarification round with
+    /// [`PipelineEvent::Clarified`], every repair attempt with
+    /// [`PipelineEvent::Repaired`], and a successful run ends with exactly one
+    /// [`PipelineEvent::Final`] holding the same [`BuildResult`]
+    /// [`Self::build_with_pipeline`] would return for the same inputs.
+    /// A blank query yields one [`Error::Validation`] and no `Final`.
+    ///
+    /// The stream does not mutate any session: persist the `Final` result with
+    /// [`Self::record_result`] to append the assistant turn and to keep the
+    /// workflow artifact for the next request.
+    pub fn build_with_pipeline_stream(
+        &self,
+        query: &str,
+        session_id: &str,
+        agent_type: AgentType,
+        timestamp_ms: i64,
+    ) -> BoxStream<'static, Result<PipelineEvent>> {
+        let (prior, previous) = match self.sessions.get(session_id) {
+            Some(session) => (session.history.clone(), session.workflow.clone()),
+            None => (HistoryManager::new(DEFAULT_MAX_HISTORY_SIZE), None),
+        };
+        stream::pipeline_stream(
+            Arc::clone(&self.model),
+            query.to_string(),
+            session_id.to_string(),
+            agent_type,
+            prior,
+            previous,
+            timestamp_ms,
+        )
+    }
+    /// Persists one build result into a session.
+    ///
+    /// The assistant text is derived from the result's output (the serialized
+    /// document, or the plain response), the state is `completed` for a document
+    /// and `clarifying` for a response, and a workflow document becomes the
+    /// session's newest artifact for the next refinement request.
+    /// The session is created when the id is unknown, so a streaming caller can
+    /// persist a `Final` result without a prior build.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] when a produced document cannot be
+    /// serialized.
+    pub fn record_result(
+        &mut self,
+        session_id: &str,
+        agent_type: AgentType,
+        result: &BuildResult,
+    ) -> Result<()> {
+        let (assistant_text, state) = match &result.output {
+            BuildOutput::Dsl(dsl) => (dsl.to_json_string()?, BuildState::Completed),
+            BuildOutput::Workflow(workflow) => (workflow.to_json_string()?, BuildState::Completed),
+            BuildOutput::Response(text) => (text.clone(), BuildState::Clarifying),
+        };
+        let session = self
+            .sessions
+            .entry(session_id.to_owned())
+            .or_insert_with(|| SessionState {
+                history: HistoryManager::new(DEFAULT_MAX_HISTORY_SIZE),
+                state: BuildState::Initial,
+                agent_type,
+                workflow: None,
+            });
+        session.agent_type = agent_type;
+        session.history.add_assistant_message(assistant_text);
+        session.state = state;
+        if let BuildOutput::Workflow(workflow) = &result.output {
+            session.workflow = Some(workflow.clone());
+        }
+        Ok(())
+    }
     /// Returns the retained dialogue of a session, oldest first.
     ///
     /// `k` limits the answer to the newest `k` turns ([`HistoryManager`] treats
@@ -464,21 +528,63 @@ fn build_system_prompt(agent_type: AgentType) -> &'static str {
     }
 }
 
-/// The output and build state implied by a model answer.
+/// The output, build state, and generation source implied by a model answer.
 ///
-/// A parseable artifact completes the session; anything else is a plain-text
-/// answer awaiting clarification.
+/// A parseable artifact completes the session with a model answer; anything else
+/// is a plain-text answer awaiting clarification, recorded as a fallback.
 fn artifact_from_answer(
     text: &str,
     agent_type: AgentType,
     timestamp_ms: i64,
-) -> (BuildOutput, BuildState) {
+) -> (BuildOutput, BuildState, GenerationSource) {
     match parse_artifact(text, agent_type, timestamp_ms) {
-        Some(output) => (output, BuildState::Completed),
+        Some(output) => (output, BuildState::Completed, GenerationSource::Model),
         None => (
             BuildOutput::Response(text.to_owned()),
             BuildState::Clarifying,
+            GenerationSource::Fallback,
         ),
+    }
+}
+
+/// Records where a legacy single-round-trip artifact came from.
+///
+/// An accepted answer records the artifact's own stage as `model`; an answer that
+/// could not be parsed records the same stage as `fallback`, naming the artifact
+/// type. The provenance is warned about once before it is returned.
+fn legacy_provenance(
+    output: BuildOutput,
+    state: BuildState,
+    source: GenerationSource,
+    agent_type: AgentType,
+) -> (BuildOutput, BuildState, GenerationProvenance) {
+    let mut provenance = GenerationProvenance::new();
+    let artifact = artifact_stage(agent_type);
+    match source {
+        GenerationSource::Model => provenance.record_model(artifact),
+        other => provenance.record(
+            artifact,
+            other,
+            format!("model answer was not a {} document", agent_type.as_str()),
+        ),
+    }
+    provenance.warn_if_degraded();
+    (output, state, provenance)
+}
+
+/// The stage that produces `agent_type`'s artifact.
+fn artifact_stage(agent_type: AgentType) -> ProgressStage {
+    match agent_type {
+        AgentType::LlmAgent => ProgressStage::GeneratingConfig,
+        AgentType::Workflow => ProgressStage::GeneratingDl,
+    }
+}
+
+/// The workflow document an output holds, if any.
+fn workflow_of(output: &BuildOutput) -> Option<&WorkflowDsl> {
+    match output {
+        BuildOutput::Workflow(workflow) => Some(workflow),
+        _ => None,
     }
 }
 
@@ -520,88 +626,6 @@ fn parse_artifact(text: &str, agent_type: AgentType, timestamp_ms: i64) -> Optio
                 None
             }
         },
-    }
-}
-
-/// The text a not-ready clarification is answered with.
-///
-/// The clarifier's question wins, then its detected-signal summary, then the
-/// generic [`DEFAULT_CLARIFICATION_QUESTION`].
-fn clarification_text(clarification: Clarification) -> String {
-    if !clarification.question.is_empty() {
-        clarification.question
-    } else if !clarification.summary.is_empty() {
-        clarification.summary
-    } else {
-        DEFAULT_CLARIFICATION_QUESTION.to_string()
-    }
-}
-
-/// Designs, generates, and reflects one workflow.
-///
-/// The reflector repairs the generated document with its deterministic rules; a
-/// failing reflection falls back to the generator's deterministic document for
-/// the same design rather than failing the request.
-async fn workflow_pipeline(model: &Arc<dyn Model>, query: &str) -> Result<WorkflowDsl> {
-    let design = WorkflowDesigner::with_model(Arc::clone(model))
-        .design(query)
-        .await?;
-    let generator = DlGenerator::with_model(Arc::clone(model));
-    let candidate = generator.generate_with_model(&design).await?;
-
-    match DlReflector::with_model(Arc::clone(model)).reflect(&candidate) {
-        Ok(reflection) => Ok(reflection.repaired),
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                "workflow reflection failed; using the deterministic document"
-            );
-            generator.generate(&design)
-        }
-    }
-}
-
-/// Asks the model for one LLM-agent document and repairs it deterministically.
-///
-/// A failed call, a choice-less answer, or an unparseable answer is logged and
-/// replaced by [`deterministic_agent_dsl`], so this entry point never reports a
-/// model problem as an error.
-async fn llm_agent_pipeline(
-    model: &Arc<dyn Model>,
-    query: &str,
-    history: &HistoryManager,
-    timestamp_ms: i64,
-) -> Result<LlmAgentDsl> {
-    let messages = conversation(history, AgentType::LlmAgent);
-    let request = ModelRequestConfig::new(model.model_name());
-    let response = match model.invoke(&messages, &request).await {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                "LLM-agent model call failed; using the deterministic document"
-            );
-            return Ok(deterministic_agent_dsl(query, timestamp_ms));
-        }
-    };
-    let Some(choice) = response.choices.into_iter().next() else {
-        tracing::debug!("LLM-agent model returned no choices; using the deterministic document");
-        return Ok(deterministic_agent_dsl(query, timestamp_ms));
-    };
-
-    let text = choice.message.text().into_owned();
-    let parsed = extract_json_fence(&text)
-        .ok_or_else(|| Error::validation("model answer contained no JSON code fence"))
-        .and_then(LlmAgentDsl::from_value);
-    match parsed {
-        Ok(dsl) => Ok(repair_llm_dsl(dsl, query, timestamp_ms)),
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                "LLM-agent answer is not a DSL document; using the deterministic document"
-            );
-            Ok(deterministic_agent_dsl(query, timestamp_ms))
-        }
     }
 }
 
@@ -720,3 +744,5 @@ mod tests;
 
 #[cfg(test)]
 mod pipeline_tests;
+#[cfg(test)]
+mod stream_tests;
