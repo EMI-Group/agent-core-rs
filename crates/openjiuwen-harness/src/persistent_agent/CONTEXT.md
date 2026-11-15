@@ -180,6 +180,10 @@ Re-exports:
 - Session `list()` decodes the directory names it walked (the store's own encoding is the inverse) and falls back to the record's ids only when a name does not decode, so a summary describes the path the file was actually found at.
 - The plan's JSON view is a contract: `ResumePlan` is data only, so serializing it and parsing it back is lossless, and a host resumes by feeding `seed_messages` into its model window.
 
+## Known Issues
+
+- `ExecutionRecordRail`'s pending-call map (`rails.rs` `state`, keyed by tool-call id) is never pruned: `mark_completed` only flips a flag, so one entry survives per distinct call id for the life of the rail (one rail per execution, so growth is bounded by the execution's tool calls, not released early).
+
 ## Test Strategy
 
 - Inline unit tests per module: canonical JSON/digest/percent-encoding, entry serde round-trips and redaction, log append/rotation/replay/digest, hard-budget truncation at every boundary, digest and redaction serialization-failure fallbacks, log preview skipping unrenderable lines, 32 concurrent appends staying contiguous and replayable, session record round-trip with unknown fields, validation rules, window assembly under tight/loose budgets with elision reports, control flags, emitter sequencing and failure policy, share bundle round-trip and tamper rejection, handoff transfer, continuation links and resume.
