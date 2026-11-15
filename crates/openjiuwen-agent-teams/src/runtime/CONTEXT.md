@@ -345,8 +345,8 @@ The observer is applied only on the metadata path: an injected `deps.memory` is 
 
 Live means `memory_bind::is_live`: a row that started at least once and has not departed — so a failed spawn leaves no join record and an unstarted row gets no handoff note, keeping the join/leave pair symmetric.
 The turn seam is the mailbox: every coordination message (member send, human-agent delivery, leader-bound operator/group-chat/god-view payload) ends in exactly one `direct_row` (one addressee, one turn) or one `broadcast_row` (`to: None`), so relayed content is never buffered twice and the memory tools' own `remember`/`forget` writes buffer nothing.
-Extraction has exactly two points: a member turn is **buffered only** (no write), then one settled run appends the leader's answer as one turn and `memory_bind::record_settled_run` extracts and writes everything buffered in a single `flush`; `stop` flushes the leftovers and exports, and a cancelled run extracts nothing so its turns reach the store only through that `stop` flush.
-The leader answer is the one turn no mailbox row carries, so it is truncated to `MAX_TURN_CONTENT_CHARS` (never byte-sliced) instead of being rejected by the engine's per-turn limit.
+Extraction has exactly two points: a member turn is **buffered only** (no write), then `memory_bind::record_settled_run` runs on every settled run and flushes everything buffered in a single `flush`, appending the leader's answer as one extra turn only when that answer is non-blank; `stop` flushes the leftovers and exports, and a cancelled run extracts nothing so its turns reach the store only through that `stop` flush.
+The leader answer is the one turn no mailbox row carries, so it is truncated to `MAX_TURN_CONTENT_CHARS` (never byte-sliced) instead of being rejected by the engine's per-turn limit; a blank answer is skipped rather than buffered as an empty turn.
 `flush()` clears the buffer, so a later `stop` flush finds nothing to re-extract and a second settled run does not duplicate the first; retries rely on the engine's deterministic record ids (an upsert).
 `stop` closes memory out last: handoff notes for live members, then `flush`, then `export` when `MemoryConfig::export_on_stop` is set (the export gates on that flag itself); a repeated `stop`/`export` flushes nothing new and stores no new record, though the rendered document's `generated_at` header moves.
 The toolkit reaches a member through `MemberHarnessContext::with_memory_toolkit(wiring.toolkit(member, Some(team session)))`: the build path does it for the leader, `TeamMemberSpawner::build_harness_runtime` for a teammate, and `NativeMemberFactory` turns it into the four `team_memory_*` tools in `src/harness/`.
@@ -654,7 +654,8 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   `reason: "settled"`, and the leader answer in `AgentOutput.output`; an open task keeps the stream
   open until the board settles; cancellation ends the run and publishes no completion event; a settled run
   over an injected wiring extracts the leader answer and the mailbox turn in one flush, and a later
-  `flush`/`stop` re-extracts neither; over a store that refuses `upsert` the run still returns the unchanged
+  `flush`/`stop` re-extracts neither; a settled run whose leader answer is blank still flushes the
+  mailbox-buffered turn (nothing buffered for the answer, buffer drained at settle); over a store that refuses `upsert` the run still returns the unchanged
   leader answer, writes nothing and keeps both turns buffered, and a `stop` after recovery retries that batch
   once (two distinct decisions, buffer drained).
 - `manager.rs`: activate → live, session-mismatch rejection for a temporary team, `interact` unknown
