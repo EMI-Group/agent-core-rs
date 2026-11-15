@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 
 use super::super::model::{DlCondition, DlNodeType, DlVariable};
 use super::{
-    convert_reference, index_value, llm_model_config, llm_param, object_with, template,
+    convert_reference, index_value, llm_model_config, llm_param, non_blank, object_with, template,
     NodeConversion, CONSTANT, DEFAULT_EXPRESSION, DRAFT_PLUGIN_VERSION, REF,
 };
 
@@ -197,12 +197,14 @@ fn code(conversion: &mut NodeConversion<'_>) -> Result<Map<String, Value>> {
 /// The plugin node: the resolved plugin parameters and the plugin output
 /// defaults.
 fn plugin(conversion: &mut NodeConversion<'_>) -> Result<Map<String, Value>> {
-    let tool_id = conversion.config("tool_id")?;
-    let resource = conversion
-        .resources
-        .iter()
-        .find(|resource| resource.tool_id == tool_id);
-    let plugin_param = plugin_param(resource);
+    let tool_id = conversion.optional_config("tool_id")?;
+    let resource = non_blank(tool_id.as_deref()).and_then(|tool_id| {
+        conversion
+            .resources
+            .iter()
+            .find(|resource| resource.tool_id == tool_id)
+    });
+    let plugin_param = plugin_param(conversion, resource)?;
 
     let parameters = conversion.inputs()?;
     let mut outputs = conversion.outputs();
@@ -241,6 +243,10 @@ fn output(conversion: &mut NodeConversion<'_>) -> Result<Map<String, Value>> {
 
 /// The intent-detection node: the prompt, the intent list, and the
 /// `classification_id` output.
+///
+/// An intent id supplied by the DL document is used verbatim; otherwise a fresh
+/// uuid4 is generated, exactly as in Python, so the rendered ids differ between
+/// two conversions of the same document.
 fn intent_detection(conversion: &mut NodeConversion<'_>) -> Result<Map<String, Value>> {
     let prompt = conversion.config("prompt")?;
     let parameters = conversion.inputs()?;
@@ -256,7 +262,7 @@ fn intent_detection(conversion: &mut NodeConversion<'_>) -> Result<Map<String, V
     let node_id = conversion.id().to_string();
     let mut intents = Vec::new();
     let mut ports = Vec::new();
-    for (position, condition) in conditions.iter().enumerate() {
+    for condition in &conditions {
         let expression = intent_expression(&node_id, condition)?;
         if expression == DEFAULT_EXPRESSION {
             continue;
@@ -265,7 +271,7 @@ fn intent_detection(conversion: &mut NodeConversion<'_>) -> Result<Map<String, V
         let id = condition
             .intent_id
             .clone()
-            .unwrap_or_else(|| format!("intent_{node_id}_{position}"));
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         intents.push(object_with([
             ("name", Value::String(name)),
             ("id", Value::String(id.clone())),
@@ -538,33 +544,47 @@ fn exception_config() -> Value {
     })
 }
 
-/// The plugin parameters of a resolved resource (or the empty defaults).
-fn plugin_param(resource: Option<&super::PluginResource>) -> Map<String, Value> {
-    let Some(resource) = resource else {
-        return object_with([
-            ("toolID", Value::String(String::new())),
-            ("toolName", Value::String(String::new())),
-            ("pluginID", Value::String(String::new())),
-            ("pluginName", Value::String(String::new())),
-            (
-                "pluginVersion",
-                Value::String(DRAFT_PLUGIN_VERSION.to_string()),
-            ),
-        ]);
-    };
+/// Builds `plugin_param`: one entry per field, each resolving to the first
+/// non-blank value of the matched resource, the node's `configs`, and the field
+/// default.
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] when a resolved `configs` entry is present but
+/// is not a JSON string.
+fn plugin_param(
+    conversion: &NodeConversion<'_>,
+    resource: Option<&super::PluginResource>,
+) -> Result<Map<String, Value>> {
+    let resource = resource.cloned().unwrap_or_default();
+    let entries = [
+        ("toolID", "tool_id", resource.tool_id.as_str(), ""),
+        ("toolName", "tool_name", resource.tool_name.as_str(), ""),
+        ("pluginID", "plugin_id", resource.plugin_id.as_str(), ""),
+        (
+            "pluginName",
+            "plugin_name",
+            resource.plugin_name.as_str(),
+            "",
+        ),
+        (
+            "pluginVersion",
+            "plugin_version",
+            resource.plugin_version.as_str(),
+            DRAFT_PLUGIN_VERSION,
+        ),
+    ];
 
-    let version = if resource.plugin_version.trim().is_empty() {
-        DRAFT_PLUGIN_VERSION.to_string()
-    } else {
-        resource.plugin_version.clone()
-    };
-    object_with([
-        ("toolID", Value::String(resource.tool_id.clone())),
-        ("toolName", Value::String(resource.tool_name.clone())),
-        ("pluginID", Value::String(resource.plugin_id.clone())),
-        ("pluginName", Value::String(resource.plugin_name.clone())),
-        ("pluginVersion", Value::String(version)),
-    ])
+    let mut parameters = Map::new();
+    for (name, key, resolved, fallback) in entries {
+        let configured = conversion.optional_config(key)?;
+        let value = non_blank(Some(resolved))
+            .or(non_blank(configured.as_deref()))
+            .unwrap_or(fallback);
+        parameters.insert(name.to_string(), Value::String(value.to_string()));
+    }
+
+    Ok(parameters)
 }
 
 /// Python's `PLUGIN_DEFAULT_OUTPUTS`, in insertion order.

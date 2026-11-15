@@ -16,8 +16,11 @@
 //!   the node, which would silently lose part of a workflow.
 //! - The shared variable index restarts at `0` for every node: inputs consume
 //!   indices first, outputs afterwards, one index per declared variable.
-//! - Generated ids are deterministic (no `uuid` reads): an intent without an
-//!   [`DlCondition::intent_id`] becomes `intent_<node_id>_<position>`.
+//! - An intent without a [`DlCondition::intent_id`] receives a fresh uuid4, so
+//!   generation is non-deterministic per conversion exactly as in Python while
+//!   an id supplied by the DL document is used verbatim.
+//! - Intent ports reuse the resolved id, so a generated id always equals the
+//!   `source_port_id` of its intent edge.
 //!
 //! Python's `ConverterUtils.convert_to_dict` null policy is applied later, in
 //! [`PlatformWorkflow::to_value`]; the converters here simply leave optional
@@ -46,7 +49,8 @@ pub(super) const CONSTANT: &str = "constant";
 pub(super) const POSITION_STEP: usize = 20;
 /// The expression marking a branch as the fallback branch.
 pub(super) const DEFAULT_EXPRESSION: &str = "default";
-/// The version used when a plugin resource carries none.
+/// The plugin version used when neither the matched resource nor the node's
+/// `configs.plugin_version` supplies one.
 pub(super) const DRAFT_PLUGIN_VERSION: &str = "draft";
 
 /// The plugin information a plugin node resolves against.
@@ -61,7 +65,8 @@ pub struct PluginResource {
     pub plugin_id: String,
     /// The human-readable plugin name.
     pub plugin_name: String,
-    /// The plugin version; blank means "draft".
+    /// The plugin version; blank means the node's `configs.plugin_version`, then
+    /// `"draft"`, applies.
     pub plugin_version: String,
 }
 
@@ -95,8 +100,11 @@ impl DlTransformer {
     /// `resources`.
     ///
     /// A plugin node matches the first resource whose
-    /// [`PluginResource::tool_id`] equals its `configs.tool_id`; without a match
-    /// every plugin parameter is empty and the version is `"draft"`.
+    /// [`PluginResource::tool_id`] equals its non-blank `configs.tool_id`.
+    /// Each plugin parameter resolves per field to the first non-blank value of
+    /// the matched resource, the node's matching `configs` entry, and the field
+    /// default, which is `"draft"` for `pluginVersion` and the empty string for
+    /// the other four.
     ///
     /// # Errors
     ///
@@ -192,16 +200,25 @@ impl<'a> NodeConversion<'a> {
     /// Returns [`Error::Validation`] when `configs.<key>` is absent
     /// (`configs.<key> is required`) or is not a JSON string.
     pub(super) fn config(&self, key: &str) -> Result<String> {
+        self.optional_config(key)?.ok_or_else(|| {
+            Error::validation(format!("node {}: configs.{key} is required", self.node.id))
+        })
+    }
+
+    /// Reads an optional string configuration entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] when `configs.<key>` is present but is not a
+    /// JSON string.
+    pub(super) fn optional_config(&self, key: &str) -> Result<Option<String>> {
         match self.node.parameters.configs.get(key) {
-            Some(Value::String(text)) => Ok(text.clone()),
+            Some(Value::String(text)) => Ok(Some(text.clone())),
             Some(_) => Err(Error::validation(format!(
                 "node {}: configs.{key} must be a string",
                 self.node.id
             ))),
-            None => Err(Error::validation(format!(
-                "node {}: configs.{key} is required",
-                self.node.id
-            ))),
+            None => Ok(None),
         }
     }
 
