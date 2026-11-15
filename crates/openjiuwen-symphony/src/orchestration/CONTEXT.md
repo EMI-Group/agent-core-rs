@@ -292,7 +292,7 @@ individual record is warned about and skipped.
   does so under the runtime's mutation lock.
 - Validation failures are typed errors, never silent no-ops; `delete` skipping an unregistered key is
   the documented exception at the runtime level, not here.
-- Files stay ≲1000 lines and split by responsibility (`mutation.rs` is the request contract only).
+- Files stay ≲1000 lines and split by responsibility (`mutation.rs` is the request contract only); `executor.rs` sits over the soft cap because its in-file `#[cfg(test)]` suite for the failure-classification rules stays beside the logic, like `flow/pack.rs`.
 
 ## Notes for Agents
 
