@@ -118,6 +118,9 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - `ReplCommand`'s `Unknown skill:` branch is unreachable from `handle_input` (unknown names are rejected by `parse_skill_command` first and surface as `Unknown command: /name`).
 - `crates/openjiuwen-harness/tests/cli.rs` covers the pre-extension surface only; the new features are covered by `src/cli/tests/{commands,features,resume}.rs` instead (that file is outside this node).
 - A resumed REPL turn is not interruptible in a new way: `Repl::seed_history` seeds a built REPL only, so a host that resumes into `chat` must call it before the first turn and after any `agent.configure`.
+- `run_once_resumed` has no behavioural test: it resolves a real provider through `CliOptions::build_model`, so every offline suite drives `run_with_model_resumed` (which differs only by that call); `crates/openjiuwen-harness/tests/public_surface.rs` only signature-pins it.
+- `build_agent_with` installs `CliPermissionHost` with a freshly generated `run::session_id()`, not the caller's run/REPL session id, so `PermissionHost::session_id()` never matches the id in `<home>/sessions/<id>.json`.
+- The one-shot `run` path never emits colour, even on a terminal: `run_cli` resolves colour only in the `chat` branch and hands `run` a `CliIo::stdio_non_interactive()` whose colour flag stays off.
 
 ## Deferred Python areas
 
