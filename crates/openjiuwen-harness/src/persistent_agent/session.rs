@@ -21,10 +21,14 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::identity::{LinkRelation, SessionBinding};
-use super::util::{is_valid_identifier, percent_encode_identifier, read_json, write_json_atomic};
+use super::layout::PersistentAgentLayout;
+use super::util::{
+    is_valid_identifier, percent_decode_identifier, percent_encode_identifier, read_json,
+    write_json_atomic,
+};
 use crate::workspace::Workspace;
 
 /// Schema version of a persisted session record.
@@ -44,12 +48,6 @@ pub const RECORD_INVALID_PREFIX: &str = "session state record is invalid: ";
 
 /// Outcome of a session that stopped to await the initiator's confirmation.
 const AWAITING_CONFIRMATION: &str = "awaiting_confirmation";
-
-/// Workspace node (or `<root_path>` fallback) holding persistent-agent state.
-const PERSISTENT_AGENT_NODE: &str = "persistent_agent";
-
-/// Directory under the persistent-agent node holding the per-session records.
-const SESSIONS_DIR: &str = "sessions";
 
 /// Name of the file holding one session record.
 const STATE_FILE: &str = "state.json";
@@ -568,6 +566,31 @@ pub struct FileSessionStore {
     root: PathBuf,
 }
 
+/// One persisted session record as [`FileSessionStore::list`] reports it.
+///
+/// The summary carries the identity and the boundary flags a host needs in order to decide which
+/// session to resume, together with the `state.json` path so it can be read or handed on directly.
+/// It deliberately does not carry the message window, so listing a large store stays cheap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    /// `(agent, session)` pair the record belongs to.
+    pub binding: SessionBinding,
+    /// Whether the session is blocked on the initiator's confirmation.
+    pub waiting: bool,
+    /// Identity of the current model window, when one was committed.
+    #[serde(default)]
+    pub current_window_id: Option<String>,
+    /// Sequence number of the current model window, when one was committed.
+    #[serde(default)]
+    pub window_seq: Option<u64>,
+    /// Whether the record carries an active checkpoint.
+    pub has_checkpoint: bool,
+    /// Whether the record carries a terminal ending.
+    pub has_ending: bool,
+    /// Path of the `state.json` file the summary was read from.
+    pub state_path: PathBuf,
+}
+
 impl FileSessionStore {
     /// Builds a store rooted at `root`.
     #[must_use]
@@ -581,10 +604,13 @@ impl FileSessionStore {
     /// `<root_path>/persistent_agent/sessions`, the same rule the goal and cron stores use.
     #[must_use]
     pub fn for_workspace(workspace: &Workspace) -> Self {
-        let node = workspace
-            .get_node_path(PERSISTENT_AGENT_NODE)
-            .unwrap_or_else(|| workspace.root_path.join(PERSISTENT_AGENT_NODE));
-        Self::new(node.join(SESSIONS_DIR))
+        Self::new(PersistentAgentLayout::for_workspace(workspace).sessions_root())
+    }
+
+    /// Returns the root directory the per-binding records live under.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Returns the file holding the record of `binding`.
@@ -595,6 +621,122 @@ impl FileSessionStore {
             .join(percent_encode_identifier(&binding.session_id))
             .join(STATE_FILE)
     }
+
+    /// Lists every readable session record under the store root.
+    ///
+    /// A missing root is not an error: it yields an empty list. The scan walks
+    /// `<root>/<encoded agent>/<encoded session>/state.json`; the binding comes from the
+    /// percent-decoded directory names, falling back to the record's own ids when a name does not
+    /// decode. Listing is best effort per record — an unreadable directory, a malformed file, or a
+    /// record that fails validation is logged with `tracing::warn!` and skipped, so one corrupt
+    /// record never hides the healthy ones. The result is ordered by agent id, then session id.
+    ///
+    /// # Errors
+    /// `Error::Session` naming the root when it exists but cannot be read at all.
+    pub async fn list(&self) -> Result<Vec<SessionSummary>> {
+        let mut summaries = Vec::new();
+        for (agent_name, agent_dir) in subdirectories(&self.root, "session store root").await? {
+            for (session_name, session_dir) in
+                subdirectories(&agent_dir, "session agent directory").await?
+            {
+                let state_path = session_dir.join(STATE_FILE);
+                let record = match read_json::<PersistentSessionRecord>(&state_path).await {
+                    Ok(Some(record)) => record,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %state_path.display(),
+                            %error,
+                            "skipping unreadable persistent-agent session record"
+                        );
+                        continue;
+                    }
+                };
+                if let Some(reason) = record.invalid_reason() {
+                    tracing::warn!(
+                        path = %state_path.display(),
+                        %reason,
+                        "skipping invalid persistent-agent session record"
+                    );
+                    continue;
+                }
+                let agent_id = percent_decode_identifier(&agent_name)
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| record.agent_id.clone());
+                let session_id = percent_decode_identifier(&session_name)
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| record.session_id.clone());
+                summaries.push(SessionSummary {
+                    binding: SessionBinding {
+                        agent_id,
+                        session_id,
+                    },
+                    waiting: record.is_waiting(),
+                    current_window_id: record.current_window_id.clone(),
+                    window_seq: record.window_seq,
+                    has_checkpoint: record.checkpoint.is_some(),
+                    has_ending: record.ending.is_some(),
+                    state_path,
+                });
+            }
+        }
+        summaries.sort_by(|left, right| {
+            left.binding
+                .agent_id
+                .cmp(&right.binding.agent_id)
+                .then_with(|| left.binding.session_id.cmp(&right.binding.session_id))
+        });
+        Ok(summaries)
+    }
+}
+
+/// Returns the sorted `(name, path)` subdirectories of `root`, or an empty list when it is absent.
+///
+/// A single unreadable entry is logged and skipped; only a root that cannot be opened at all is an
+/// error, so one damaged directory never hides its siblings. `label` names the root in messages.
+async fn subdirectories(root: &Path, label: &str) -> Result<Vec<(String, PathBuf)>> {
+    let mut read_dir = match tokio::fs::read_dir(root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(Error::session(format!(
+                "failed to read {label} {}: {error}",
+                root.display()
+            )));
+        }
+    };
+    let mut found = Vec::new();
+    loop {
+        let entry = match read_dir.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(
+                    root = %root.display(),
+                    %error,
+                    "stopping the persistent-agent directory scan after an unreadable entry"
+                );
+                break;
+            }
+        };
+        match entry.file_type().await {
+            Ok(kind) if kind.is_dir() => {
+                if let Some(name) = entry.file_name().to_str() {
+                    found.push((name.to_string(), entry.path()));
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    %error,
+                    "skipping an unreadable persistent-agent directory entry"
+                );
+            }
+        }
+    }
+    found.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(found)
 }
 
 #[async_trait]
@@ -1269,6 +1411,98 @@ mod tests {
         assert!(!path.exists());
         assert_eq!(store.load(&binding()).await.unwrap(), None);
         assert!(!store.delete(&binding()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn listing_a_missing_session_root_is_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = FileSessionStore::new(dir.path().join("absent"));
+        assert_eq!(store.list().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_decodes_directory_names_and_reports_boundary_flags() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = FileSessionStore::new(dir.path());
+        let mut waiting = PersistentSessionRecord::new(&binding()).unwrap();
+        waiting.current_window_id = Some("window-1".to_string());
+        waiting.window_seq = Some(2);
+        let waiting = waiting.with_ending(awaiting_ending("request")).unwrap();
+        store.save(&waiting).await.unwrap();
+
+        let other = SessionBinding::new("agent-2", "plain").unwrap();
+        let checkpointed = PersistentSessionRecord::new(&other)
+            .unwrap()
+            .with_checkpoint(RecordCheckpoint {
+                request_id: "request".to_string(),
+                execution_id: "exec".to_string(),
+                iteration_seq: 1,
+                kind: CheckpointKind::ReactIteration,
+                last_group_message_id: None,
+            })
+            .unwrap();
+        store.save(&checkpointed).await.unwrap();
+
+        let summaries = store.list().await.unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].binding, binding(), "the encoded dir decodes");
+        assert_eq!(summaries[0].binding.session_id, "s/1");
+        assert!(summaries[0].waiting);
+        assert_eq!(summaries[0].current_window_id.as_deref(), Some("window-1"));
+        assert_eq!(summaries[0].window_seq, Some(2));
+        assert!(summaries[0].has_ending);
+        assert!(!summaries[0].has_checkpoint);
+        assert_eq!(summaries[0].state_path, store.path_for(&binding()));
+
+        assert_eq!(summaries[1].binding, other);
+        assert!(!summaries[1].waiting);
+        assert!(summaries[1].has_checkpoint);
+        assert!(!summaries[1].has_ending);
+        assert_eq!(summaries[1].current_window_id, None);
+    }
+
+    #[tokio::test]
+    async fn list_skips_malformed_records_and_missing_state_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = FileSessionStore::new(dir.path());
+        store
+            .save(&PersistentSessionRecord::new(&binding()).unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.path().join("broken").join("session"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.path().join("broken").join("session").join("state.json"),
+            b"{not json",
+        )
+        .await
+        .unwrap();
+        // A directory pair without a `state.json` is not a record.
+        tokio::fs::create_dir_all(dir.path().join("empty").join("session"))
+            .await
+            .unwrap();
+
+        let summaries = store.list().await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].binding, binding());
+    }
+
+    #[tokio::test]
+    async fn list_falls_back_to_the_record_ids_when_a_directory_name_does_not_decode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = FileSessionStore::new(dir.path());
+        let target = dir.path().join("agent").join("%ZZ");
+        tokio::fs::create_dir_all(&target).await.unwrap();
+        let record = PersistentSessionRecord::new(&binding()).unwrap();
+        write_json_atomic(&target.join("state.json"), &record)
+            .await
+            .unwrap();
+
+        let summaries = store.list().await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].binding, binding());
+        assert_eq!(summaries[0].state_path, target.join("state.json"));
     }
 
     #[test]

@@ -103,6 +103,39 @@ pub fn percent_encode_identifier(value: &str) -> String {
     encoded
 }
 
+/// Decodes a path component produced by [`percent_encode_identifier`].
+///
+/// Returns `None` when an escape is not a complete `%XX` pair or when the decoded bytes are not
+/// valid UTF-8, so a directory name that a store cannot prove it wrote is never reused as an id.
+#[must_use]
+pub fn percent_decode_identifier(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex_value(*bytes.get(index + 1)?)?;
+            let low = hex_value(*bytes.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// Returns the value of one ASCII hex digit, or `None` for any other byte.
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
 /// Returns whether `value` is a usable identifier.
 ///
 /// An identifier has between 1 and [`IDENTIFIER_MAX_CHARS`] Unicode scalar values and contains
@@ -306,8 +339,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        atomic_write, canonical_json, digest_hex, is_valid_identifier, percent_encode_identifier,
-        read_json, sha256_hex_str, truncate_chars, write_json_atomic, IDENTIFIER_MAX_CHARS,
+        atomic_write, canonical_json, digest_hex, is_valid_identifier, percent_decode_identifier,
+        percent_encode_identifier, read_json, sha256_hex_str, truncate_chars, write_json_atomic,
+        IDENTIFIER_MAX_CHARS,
     };
 
     #[test]
@@ -366,6 +400,24 @@ mod tests {
         assert_eq!(percent_encode_identifier("a-b_c.d~e"), "a-b_c.d~e");
         assert_eq!(percent_encode_identifier("100%"), "100%25");
         assert_eq!(percent_encode_identifier(""), "");
+    }
+
+    #[test]
+    fn percent_decoding_inverts_the_encoder_and_rejects_damage() {
+        for value in ["a:b", "s/1", "é", "a-b_c.d~e", "100%", "", "exec%2F1"] {
+            assert_eq!(
+                percent_decode_identifier(&percent_encode_identifier(value)).as_deref(),
+                Some(value)
+            );
+        }
+        assert_eq!(
+            percent_decode_identifier("exec%2F1").as_deref(),
+            Some("exec/1")
+        );
+        assert_eq!(percent_decode_identifier("%C3%A9").as_deref(), Some("é"));
+        assert_eq!(percent_decode_identifier("%2"), None, "truncated escape");
+        assert_eq!(percent_decode_identifier("%ZZ"), None, "non-hex escape");
+        assert_eq!(percent_decode_identifier("%FF"), None, "invalid UTF-8");
     }
 
     #[test]
