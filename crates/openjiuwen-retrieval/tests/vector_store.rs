@@ -394,30 +394,65 @@ async fn search_injects_doc_and_chunk_ids_into_result_metadata() {
 }
 
 #[tokio::test]
-async fn search_skips_dimension_mismatch_and_handles_zero_query() {
+async fn search_rejects_dimension_mismatch_and_scores_zero_queries() {
+    // A consistent 2-dimensional store: a 3-dimensional query is a typed error.
     let store = InMemoryVectorStore::new();
     store
+        .upsert(vec![
+            record("two-d", vec![1.0, 0.0]),
+            record("also-two-d", vec![0.0, 1.0]),
+        ])
+        .await
+        .unwrap();
+    let error = store
+        .search(VectorQuery::new(vec![1.0, 0.0, 0.0]).with_top_k(10))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let message = error.to_string();
+    assert!(message.contains("vector dimension mismatch"), "{message}");
+    assert!(message.contains("2-dimensional"), "{message}");
+    assert!(message.contains("3 dimensions"), "{message}");
+
+    // A store mixing widths is reported as internally inconsistent, not filtered.
+    let mixed = InMemoryVectorStore::new();
+    mixed
         .upsert(vec![
             record("two-d", vec![1.0, 0.0]),
             record("three-d", vec![1.0, 0.0, 0.0]),
         ])
         .await
         .unwrap();
-
-    let hits = store
+    let error = mixed
         .search(VectorQuery::new(vec![1.0, 0.0]).with_top_k(10))
         .await
-        .unwrap();
-    assert_eq!(hit_ids(&hits), ["two-d"]);
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let message = error.to_string();
+    assert!(message.contains("internally inconsistent"), "{message}");
+    assert!(
+        message.contains("`two-d`") && message.contains("`three-d`"),
+        "{message}"
+    );
+
+    // An empty store knows no width, so every query width yields no hits.
+    let empty = InMemoryVectorStore::new();
+    for width in [0, 2, 3] {
+        let hits = empty
+            .search(VectorQuery::new(vec![0.5; width]).with_top_k(10))
+            .await
+            .unwrap();
+        assert_eq!(hits, Vec::<SearchResult>::new());
+    }
 
     // A zero query vector scores 0.5 after normalization instead of producing NaN.
     let zero = store
         .search(VectorQuery::new(vec![0.0, 0.0]).with_top_k(10))
         .await
         .unwrap();
-    assert_eq!(hit_ids(&zero), ["two-d"]);
-    assert!(zero[0].score.is_finite());
-    assert!((zero[0].score - 0.5).abs() < TOLERANCE);
+    assert_eq!(hit_ids(&zero), ["two-d", "also-two-d"]);
+    assert!(zero.iter().all(|hit| hit.score.is_finite()));
+    assert!(zero.iter().all(|hit| (hit.score - 0.5).abs() < TOLERANCE));
 }
 
 #[tokio::test]
