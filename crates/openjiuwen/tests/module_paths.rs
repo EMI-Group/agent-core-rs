@@ -632,8 +632,10 @@ fn notify_feature_gates_the_workspace_watcher_backend() {
     // with `notify` the plan validation answers `Config`, without it `start()` answers
     // `Unsupported` before it looks at the plan at all. Nothing is watched, touched or
     // spawned here.
-    let error = poll_once(openjiuwen::harness::watcher::WorkspaceWatcher::new().start())
-        .expect_err("an empty watch plan is never accepted");
+    let Err(error) = poll_once(openjiuwen::harness::watcher::WorkspaceWatcher::new().start())
+    else {
+        panic!("an empty watch plan is never accepted");
+    };
     if cfg!(feature = "notify") {
         assert_eq!(error.kind(), ErrorKind::Config);
         assert!(
