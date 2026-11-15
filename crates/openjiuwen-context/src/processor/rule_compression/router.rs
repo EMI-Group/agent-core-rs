@@ -6,8 +6,9 @@
 //!
 //! 1. `SOURCE_FILE` when the tool call named a source/markup/config/prose file —
 //!    the content sniffers cannot tell JSX from HTML,
-//! 2. `JSON_ARRAY` when serde parses an array, or the text starts with `[` and
-//!    the lenient repair ([`repair_json_array`]) produces one,
+//! 2. `JSON_ARRAY` when serde parses an array, or the body starts with `[` (once
+//!    a code fence is dropped) and the lenient repair ([`repair_json_array`])
+//!    produces one,
 //! 3. `HTML` on a doctype/root-tag prefix or two structural tags,
 //! 4. `LOG` when any line matches the build/test/logger line patterns,
 //! 5. `GIT_DIFF` on `diff --git ` or `@@ … @@` lines,
@@ -18,6 +19,20 @@
 //! Display line-number prefixes (`  12\t`, `   12 | `) are stripped before
 //! sniffing; a git diff keeps its body whitespace, and plain text and source
 //! files are routed verbatim.
+//!
+//! Two passes outrank that ladder:
+//!
+//! - [`sniff_content`] classifies the payload itself ([`SniffKind`]): a UTF-16
+//!   body is re-encoded to UTF-8 first, and a binary or replacement-heavy body is
+//!   passed through untouched instead of compressed.
+//! - [`is_timestamp_line`] folds full-width and Arabic-Indic decimal digits (and
+//!   `NFKC` compatibility forms) before the ISO shape check, so a localized log
+//!   line is still a timestamp and not a `path:line:` search hit.
+//!
+//! [`ContentType`] is the router's single routing label and has no binary
+//! variant, so a pass-through reports `PLAIN_TEXT`; the [`SniffKind`] names the
+//! reason in the result's `details` and in one `tracing::debug!` line.
+use self::repair::strip_code_fence;
 use super::common::{
     find_word, is_source_file_path, strip_display_line_prefixes,
     strip_display_line_prefixes_preserving_body_whitespace,
@@ -31,7 +46,17 @@ use super::compressors::search_results::SearchResultsCompressor;
 use super::compressors::source_file::SourceFileCompressor;
 use super::compressors::RuleCompressor;
 use super::types::{ContentType, RuleCompressionResult, RuleContext};
-use serde_json::Value;
+use serde_json::{Map, Value};
+use unicode_normalization::UnicodeNormalization;
+
+mod repair;
+mod sniff;
+
+pub use repair::{repair_json, repair_json_array, repair_json_array_checked, JsonRepairFailure};
+pub use sniff::{
+    sniff_bytes, sniff_content, SniffKind, SniffedContent, BINARY_SNIFF_BYTES,
+    MAX_CONTROL_RATIO_PERCENT, REPLACEMENT_CHAR_MIN, REPLACEMENT_CHAR_RATIO_PERCENT,
+};
 /// Structural tag names the HTML sniffer counts (Python's `_HTML_STRUCTURAL_TAG_RE`).
 const HTML_STRUCTURAL_TAGS: &[&str] = &[
     "html", "head", "body", "article", "main", "section", "div", "script", "style", "nav",
@@ -62,6 +87,10 @@ impl RuleContentRouter {
         Self
     }
     /// Types `content` for the tool call described by `ctx`.
+    ///
+    /// The payload is sniffed first ([`sniff_content`]): a UTF-16 body is typed
+    /// from its UTF-8 re-encoding, and a binary or replacement-heavy body is
+    /// typed as `PLAIN_TEXT` because no compressor may touch it.
     #[must_use]
     pub fn detect(&self, content: &str, ctx: &RuleContext) -> ContentType {
         if ctx
@@ -71,6 +100,15 @@ impl RuleContentRouter {
         {
             return ContentType::SourceFile;
         }
+        let sniffed = sniff_content(content);
+        if sniffed.is_passthrough() {
+            return ContentType::PlainText;
+        }
+        Self::detect_text(sniffed.text())
+    }
+
+    /// Types an already-sniffed UTF-8 body.
+    fn detect_text(content: &str) -> ContentType {
         let text = content.trim();
         if text.is_empty() {
             return ContentType::PlainText;
@@ -120,18 +158,41 @@ impl RuleContentRouter {
         ContentType::PlainText
     }
     /// Detects the content type and compresses accordingly.
+    ///
+    /// A binary or replacement-heavy payload is passed through untouched: the
+    /// input is returned with `modified = false` and a `details` payload naming
+    /// the [`SniffKind`], plus one `tracing::debug!` line. Every other body is
+    /// compressed from its sniffed UTF-8 text, and a re-encoded `UTF-16` body
+    /// carries its conversion in `details`.
     #[must_use]
     pub fn compress(&self, content: &str, ctx: &RuleContext) -> RuleCompressionResult {
-        let content_type = self.detect(content, ctx);
+        let sniffed = sniff_content(content);
+        if sniffed.is_passthrough() {
+            tracing::debug!(
+                kind = sniffed.kind.as_str(),
+                bytes = content.len(),
+                nul_bytes = sniffed.nul_bytes,
+                control_ratio = sniffed.control_ratio,
+                replacement_characters = sniffed.replacement_characters,
+                "rule compression: payload passed through untouched"
+            );
+            return RuleCompressionResult::declined(
+                content,
+                ContentType::PlainText,
+                sniffed.details(),
+            );
+        }
+        let text = sniffed.text();
+        let content_type = Self::detect_text(text);
         let routed = match content_type {
-            ContentType::GitDiff => strip_display_line_prefixes_preserving_body_whitespace(content),
+            ContentType::GitDiff => strip_display_line_prefixes_preserving_body_whitespace(text),
             ContentType::Html
             | ContentType::JsonArray
             | ContentType::SearchResults
-            | ContentType::Log => strip_display_line_prefixes(content),
-            ContentType::PlainText | ContentType::SourceFile => content.to_owned(),
+            | ContentType::Log => strip_display_line_prefixes(text),
+            ContentType::PlainText | ContentType::SourceFile => text.to_owned(),
         };
-        match content_type {
+        let result = match content_type {
             ContentType::JsonArray => JsonArrayCompressor.compress(&routed, ctx),
             ContentType::GitDiff => DiffCompressor.compress(&routed, ctx),
             ContentType::Html => HtmlCompressor::default().compress(&routed, ctx),
@@ -139,98 +200,67 @@ impl RuleContentRouter {
             ContentType::Log => LogCompressor.compress(&routed, ctx),
             ContentType::SourceFile => SourceFileCompressor.compress(&routed, ctx),
             ContentType::PlainText => PlainTextCompressor.compress(&routed, ctx),
+        };
+        with_sniff_details(result, &sniffed)
+    }
+}
+
+/// Merges the sniff facts of a re-encoded body into a compressor's `details`.
+///
+/// A body that was not re-encoded (and is not a pass-through) keeps its
+/// compressor's `details` byte for byte, so sniffing changes nothing for the
+/// ordinary UTF-8 path.
+fn with_sniff_details(
+    result: RuleCompressionResult,
+    sniffed: &SniffedContent,
+) -> RuleCompressionResult {
+    let Some(extra) = sniffed.details() else {
+        return result;
+    };
+    let RuleCompressionResult {
+        content,
+        content_type,
+        modified,
+        lossy,
+        details,
+    } = result;
+    let mut merged = match details {
+        Some(Value::Object(map)) => map,
+        Some(other) => {
+            let mut map = Map::new();
+            map.insert("compressor_details".to_owned(), other);
+            map
         }
+        None => Map::new(),
+    };
+    if let Value::Object(sniff) = extra {
+        for (key, value) in sniff {
+            merged.entry(key).or_insert(value);
+        }
+    }
+    RuleCompressionResult {
+        content,
+        content_type,
+        modified,
+        lossy,
+        details: Some(Value::Object(merged)),
     }
 }
 /// Python's alias for [`RuleContentRouter`].
 pub type ContentRouter = RuleContentRouter;
 /// Whether `text` parses (or leniently repairs) into a JSON array.
+///
+/// The gate keeps Python's precedence: a body must start with `[` once a code
+/// fence is dropped, so prose that merely mentions an array stays plain text
+/// while a fenced or truncated array is still recognised.
 fn is_json_array(text: &str) -> bool {
     if serde_json::from_str::<Value>(text).is_ok_and(|value| value.is_array()) {
         return true;
     }
+    if !strip_code_fence(text).starts_with('[') {
+        return false;
+    }
     repair_json_array(text).is_some_and(|value| value.is_array())
-}
-/// Leniently repairs `text` into a JSON array.
-///
-/// Only `[`-rooted text is attempted. The repair drops a surrounding code fence,
-/// truncates anything after the array's closing bracket, removes trailing commas,
-/// and retries once with single quotes rewritten when the array uses no double
-/// quotes. Returns `None` when the repaired text still does not parse — the
-/// Python reference delegates to `json_repair`, whose wider grammar is not
-/// reimplemented here.
-#[must_use]
-pub fn repair_json_array(text: &str) -> Option<Value> {
-    let trimmed = text.trim();
-    if !trimmed.starts_with('[') {
-        return None;
-    }
-    let fenced = if trimmed.starts_with("```") {
-        trimmed
-            .split_once('\n')
-            .map_or(trimmed, |(_, rest)| rest.trim_end().trim_end_matches("```"))
-    } else {
-        trimmed
-    };
-    let body = truncate_at_array_end(fenced);
-    for candidate in [
-        body.to_owned(),
-        strip_trailing_commas(body),
-        strip_trailing_commas(body).replace('\'', "\""),
-    ] {
-        if let Ok(value) = serde_json::from_str::<Value>(&candidate) {
-            if value.is_array() {
-                return Some(value);
-            }
-        }
-    }
-    None
-}
-/// Cuts `text` right after the bracket that closes its first `[`.
-fn truncate_at_array_end(text: &str) -> &str {
-    let mut depth = 0_i64;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (index, value) in text.char_indices() {
-        if let Some(active) = quote {
-            if escaped {
-                escaped = false;
-            } else if value == '\\' {
-                escaped = true;
-            } else if value == active {
-                quote = None;
-            }
-            continue;
-        }
-        match value {
-            '"' | '\'' => quote = Some(value),
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &text[..=index];
-                }
-            }
-            _ => {}
-        }
-    }
-    text
-}
-/// Removes `,` that directly precedes a closing bracket or brace.
-fn strip_trailing_commas(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for (index, value) in text.char_indices() {
-        if value == ','
-            && matches!(
-                text[index + 1..].chars().find(|next| !next.is_whitespace()),
-                Some(']' | '}')
-            )
-        {
-            continue;
-        }
-        out.push(value);
-    }
-    out
 }
 /// Whether `text` looks like an HTML document.
 fn looks_like_html(text: &str) -> bool {
@@ -491,25 +521,54 @@ fn is_arrow_location(line: &str) -> bool {
 fn is_hunk_header(line: &str) -> bool {
     line.starts_with("@@ ") && line[3..].contains(" @@")
 }
-/// `^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\b`
-pub(crate) fn is_timestamp_line(line: &str) -> bool {
-    let bytes = line.as_bytes();
-    if bytes.len() < 19 {
+/// `^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\b`, with any decimal digits.
+///
+/// The line is folded twice before the ASCII shape check: `NFKC` maps the
+/// full-width forms (`２０２４`, `：`, `－`, the ideographic space) onto their ASCII
+/// equivalents, and `digit_value` maps the Arabic-Indic blocks (`٠١٢…` and
+/// `۰۱۲…`) onto `0`–`9`.
+/// The 19-character shape is counted in characters, not bytes, so a localized
+/// line whose digits take three bytes each is still recognised — and, because it
+/// is a timestamp, is no longer miscounted as a `path:line:` search hit.
+#[must_use]
+pub fn is_timestamp_line(line: &str) -> bool {
+    let folded: Vec<char> = line
+        .nfkc()
+        .map(|value| match digit_value(value) {
+            Some(digit) => char::from_digit(digit, 10).unwrap_or(value),
+            None => value,
+        })
+        .collect();
+    if folded.len() < 19 {
         return false;
     }
     let digits_at = |positions: &[usize]| {
         positions
             .iter()
-            .all(|position| bytes.get(*position).is_some_and(u8::is_ascii_digit))
+            .all(|position| folded.get(*position).is_some_and(char::is_ascii_digit))
     };
     if !digits_at(&[0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]) {
         return false;
     }
-    bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && matches!(bytes[10], b' ' | b'T')
-        && bytes[13] == b':'
-        && bytes[16] == b':'
+    folded[4] == '-'
+        && folded[7] == '-'
+        && matches!(folded[10], ' ' | 'T')
+        && folded[13] == ':'
+        && folded[16] == ':'
+}
+/// The decimal value of `value`, for the scripts `NFKC` leaves alone.
+///
+/// `char::to_digit` only knows ASCII, and `NFKC` folds the full-width forms but
+/// not the Arabic-Indic digits, so those two blocks are mapped here.
+fn digit_value(value: char) -> Option<u32> {
+    if let Some(digit) = value.to_digit(10) {
+        return Some(digit);
+    }
+    match value {
+        '\u{0660}'..='\u{0669}' => Some(u32::from(value) - 0x0660),
+        '\u{06f0}'..='\u{06f9}' => Some(u32::from(value) - 0x06f0),
+        _ => None,
+    }
 }
 /// `^.+?:\d+[:\-].+$` — a `path:line:` hit.
 fn is_search_line(line: &str) -> bool {
@@ -543,11 +602,51 @@ mod tests {
         );
     }
     #[test]
-    fn json_arrays_are_repaired() {
-        let repaired = repair_json_array("[{\"a\": 1,}, {\"b\": 2,}]").expect("repaired");
-        assert_eq!(repaired.as_array().map(Vec::len), Some(2));
-        assert!(repair_json_array("not json").is_none());
-        assert!(repair_json_array("[{'a': 1}]").is_some());
+    fn a_truncated_or_fenced_array_is_still_a_json_array() {
+        let router = RuleContentRouter;
+        let ctx = RuleContext::new(1_000);
+        let truncated = "[{\"a\": 1}, {\"b\": 2";
+        assert_eq!(router.detect(truncated, &ctx), ContentType::JsonArray);
+        assert_eq!(
+            router.detect("```json\n[1, 2, 3]\n```", &ctx),
+            ContentType::JsonArray
+        );
+        // Prose that merely mentions an array keeps Python's plain-text routing.
+        assert_eq!(
+            router.detect("the rows are [1, 2, 3] as shown", &ctx),
+            ContentType::PlainText
+        );
+    }
+
+    #[test]
+    fn localized_timestamps_are_recognised() {
+        assert!(is_timestamp_line("2024-01-01T00:00:00 ERROR boom"));
+        // Full-width digits, a full-width colon and an ideographic space.
+        assert!(is_timestamp_line(
+            "２０２４-０１-０１　００：００：００ ERROR boom"
+        ));
+        // Arabic-Indic digits, which `NFKC` leaves alone.
+        assert!(is_timestamp_line("٢٠٢٤-٠١-٠١T٠٠:٠٠:٠٠ ERROR boom"));
+        assert!(!is_timestamp_line("2024/01/01 00:00:00"));
+        assert!(!is_timestamp_line("short 2024-01-01"));
+    }
+
+    #[test]
+    fn binary_payloads_are_passed_through() {
+        let router = RuleContentRouter;
+        let ctx = RuleContext::new(10);
+        let binary = "payload\u{0}with\u{0}nuls";
+        assert_eq!(router.detect(binary, &ctx), ContentType::PlainText);
+        let result = router.compress(binary, &ctx);
+        assert!(!result.modified);
+        assert_eq!(result.content, binary);
+        assert_eq!(
+            result
+                .details
+                .as_ref()
+                .and_then(|value| value["content_kind"].as_str()),
+            Some("binary")
+        );
     }
     #[test]
     fn logs_diffs_and_search_hits_are_recognised() {

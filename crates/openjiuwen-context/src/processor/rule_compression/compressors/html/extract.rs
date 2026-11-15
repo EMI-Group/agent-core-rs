@@ -1,7 +1,24 @@
 //! The dependency-free readability extractor behind [`super::HtmlCompressor`].
 //!
 //! Parsing, tag stripping, metadata reading, entity decoding and block rendering live here; the compressor above only gates and renders the report.
-use crate::processor::rule_compression::common::contains_word;
+//! Two passes decide what the model sees:
+//!
+//! 1. the renderer emits one markdown block per heading, paragraph, list item,
+//!    table and code fence (`script`/`style`/`nav`/`footer`/… subtrees are gone
+//!    before rendering, which is the ladder's secondary filter),
+//! 2. [`super::ladder`] scores those blocks and keeps the highest-scoring
+//!    contiguous run, so a link menu, a sidebar or a repeated footer line is
+//!    dropped even when no tag marks it as chrome.
+//!
+//! A selection that keeps fewer than
+//! [`MIN_REGION_VISIBLE_CHARS`](super::ladder::MIN_REGION_VISIBLE_CHARS) visible
+//! characters falls back to the whole document (`ladder_fallback`), and an
+//! extraction that would come out empty falls back to the plain-text strip, so a
+//! page with text never extracts to nothing.
+//!
+//! Report-shaped HTML is pruned before the ladder runs: see [`super::report`].
+use super::ladder::select_blocks;
+use super::report::{looks_like_report_html, prune_report_rows};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Elements whose whole subtree is discarded.
@@ -9,23 +26,6 @@ const NOISE_TAGS: &[&str] = &[
     "script", "style", "noscript", "template", "svg", "nav", "footer", "aside", "form", "iframe",
     "head",
 ];
-/// Table rows that keep a report row.
-const REPORT_ROW_KEEP_WORDS: &[&str] = &[
-    "fail",
-    "failed",
-    "failure",
-    "error",
-    "broken",
-    "skipped",
-    "xfailed",
-    "xpassed",
-    "rerun",
-    "unexpected",
-    "assertionerror",
-    "traceback",
-];
-/// Table rows a report drops once something failed.
-const REPORT_ROW_DROP_WORDS: &[&str] = &["pass", "passed", "ok"];
 /// What [`HTMLExtractor`] renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,6 +97,14 @@ pub struct HTMLExtractionResult {
     pub duplicate_block_count: usize,
     /// Report rows dropped.
     pub report_rows_removed: usize,
+    /// Blocks the readability ladder kept.
+    pub selected_block_count: usize,
+    /// Blocks the ladder dropped as page chrome.
+    pub boilerplate_block_count: usize,
+    /// The score of the ladder's selected run.
+    pub best_region_score: f64,
+    /// Why the ladder kept the whole document, when it did.
+    pub ladder_fallback: Option<String>,
 }
 impl HTMLExtractionResult {
     /// `(1 - compression_ratio) * 100`.
@@ -157,23 +165,28 @@ impl HTMLExtractor {
         if report {
             report_rows_removed = prune_report_rows(&mut blocks);
         }
-        if let Some(title) = title.as_ref() {
-            if !blocks.iter().any(|block| block_headline(block, title)) {
-                blocks.insert(0, format!("# {title}"));
+        let ladder = select_blocks(&blocks);
+        let mut ladder_fallback = ladder.fallback.map(str::to_owned);
+        let mut boilerplate_block_count = ladder.dropped;
+        let mut selected_block_count = ladder.blocks.len();
+        let best_region_score = ladder.best_run_score;
+        let mut outcome = self.render_blocks(ladder.blocks, title.as_deref());
+        if outcome.extracted.is_empty() && !blocks.is_empty() {
+            // A page that carried text must never extract to nothing: strip the
+            // whole document and say that the ladder was bypassed.
+            let whole = self.render_blocks(blocks, title.as_deref());
+            if !whole.extracted.is_empty() {
+                ladder_fallback = Some("empty_selection".to_owned());
+                boilerplate_block_count = 0;
+                selected_block_count = whole.blocks.len();
+                outcome = whole;
             }
         }
-        let (blocks, duplicate_block_count) = deduplicate_blocks(blocks);
-        let extracted = match self.config.output_format {
-            HtmlOutputFormat::Markdown => blocks.join("\n\n"),
-            HtmlOutputFormat::Text => plain_text(&blocks.join("\n\n")),
-        }
-        .trim()
-        .to_owned();
         let original_length = html.chars().count();
-        let extracted_length = extracted.chars().count();
+        let extracted_length = outcome.extracted.chars().count();
         HTMLExtractionResult {
             compression_ratio: extracted_length as f64 / original_length.max(1) as f64,
-            extracted,
+            extracted: outcome.extracted,
             original_length,
             extracted_length,
             title,
@@ -184,33 +197,49 @@ impl HTMLExtractor {
             link_count: renderer.link_count,
             table_count: renderer.table_count,
             code_block_count: renderer.code_block_count,
-            output_block_count: blocks.len(),
-            duplicate_block_count,
+            duplicate_block_count: outcome.duplicate_block_count,
+            output_block_count: outcome.blocks.len(),
             report_rows_removed,
+            selected_block_count,
+            boilerplate_block_count,
+            best_region_score,
+            ladder_fallback,
+        }
+    }
+
+    /// Inserts the title heading, deduplicates and renders `blocks`.
+    fn render_blocks(self, mut blocks: Vec<String>, title: Option<&str>) -> RenderOutcome {
+        if let Some(title) = title {
+            if !blocks.iter().any(|block| block_headline(block, title)) {
+                blocks.insert(0, format!("# {title}"));
+            }
+        }
+        let (blocks, duplicate_block_count) = deduplicate_blocks(blocks);
+        let joined = blocks.join("\n\n");
+        let extracted = match self.config.output_format {
+            HtmlOutputFormat::Markdown => joined,
+            HtmlOutputFormat::Text => plain_text(&joined),
+        }
+        .trim()
+        .to_owned();
+        RenderOutcome {
+            extracted,
+            blocks,
+            duplicate_block_count,
         }
     }
 }
 
-/// Whether `html` looks like a generated test report.
-pub(super) fn looks_like_report_html(html: &str) -> bool {
-    let lowered: String = html.chars().take(20_000).collect::<String>().to_lowercase();
-    if lowered.contains("pytest-html") || lowered.contains("results-table") {
-        return true;
-    }
-    let tables = lowered.matches("<table").count();
-    let markers = [
-        "pytest-html",
-        "results-table",
-        "environment",
-        "test results",
-        "tests took",
-        "report generated",
-    ]
-    .iter()
-    .filter(|marker| lowered.contains(*marker))
-    .count();
-    tables >= 2 && markers >= 2
+/// The rendered output of one block list.
+struct RenderOutcome {
+    /// The rendered markdown or plain text.
+    extracted: String,
+    /// The blocks the rendering kept, title heading included.
+    blocks: Vec<String>,
+    /// Blocks dropped as duplicates.
+    duplicate_block_count: usize,
 }
+
 /// Drops `<!-- … -->` comments.
 fn remove_comments(html: &str) -> (String, usize) {
     let mut out = String::with_capacity(html.len());
@@ -478,42 +507,6 @@ fn deduplicate_blocks(blocks: Vec<String>) -> (Vec<String>, usize) {
 fn block_headline(block: &str, title: &str) -> bool {
     let headline = block.trim_start_matches(['#', ' ']);
     collapse_whitespace(headline).to_lowercase() == collapse_whitespace(title).to_lowercase()
-}
-/// Drops "passed" report rows once the table also holds a failure row.
-fn prune_report_rows(blocks: &mut [String]) -> usize {
-    let has_keep = blocks.iter().any(|block| {
-        block
-            .lines()
-            .any(|line| contains_word(&line.to_lowercase(), REPORT_ROW_KEEP_WORDS))
-    });
-    if !has_keep {
-        return 0;
-    }
-    let mut removed = 0_usize;
-    for block in blocks.iter_mut() {
-        if !block.contains('|') {
-            continue;
-        }
-        let kept: Vec<&str> = block
-            .lines()
-            .filter(|line| {
-                let lowered = line.to_lowercase();
-                if contains_word(&lowered, REPORT_ROW_KEEP_WORDS) {
-                    return true;
-                }
-                let droppable = contains_word(&lowered, REPORT_ROW_DROP_WORDS)
-                    || lowered.contains("::test")
-                    || lowered.starts_with("tests/");
-                if droppable {
-                    removed += 1;
-                    return false;
-                }
-                true
-            })
-            .collect();
-        *block = kept.join("\n");
-    }
-    removed
 }
 /// One tokenizer token.
 enum Token<'a> {
