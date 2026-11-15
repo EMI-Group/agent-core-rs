@@ -29,6 +29,7 @@
 //! A trainer can also report its evaluation as an [`EvaluationSummary`], which
 //! pairs the mean score and per-case results with the tool calls behind them.
 
+mod adopt;
 mod config;
 mod example;
 mod instruction;
@@ -44,6 +45,7 @@ use std::collections::BTreeMap;
 use openjiuwen_common::error::Result;
 use serde_json::Value;
 
+pub use adopt::*;
 pub use config::OptimizerConfig;
 pub use example::{format_prompt, render_examples, ExampleOptimizer};
 pub use instruction::InstructionOptimizer;

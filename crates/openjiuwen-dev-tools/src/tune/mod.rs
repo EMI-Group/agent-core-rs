@@ -76,11 +76,18 @@
 //! ```
 
 mod base;
+mod binding;
+mod chat_agent;
+mod dataset;
 mod evaluator;
 mod loader;
 mod optimizer;
 mod prompt_search;
 mod tool;
+
+pub use binding::*;
+pub use chat_agent::*;
+pub use dataset::*;
 
 pub use base::{Case, EvaluatedCase};
 pub use evaluator::{

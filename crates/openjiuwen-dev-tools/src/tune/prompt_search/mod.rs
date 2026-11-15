@@ -69,6 +69,9 @@ mod history;
 mod memory;
 mod models;
 mod reward;
+mod run_log;
+
+pub use run_log::*;
 
 pub use convergence::{population_variance, ConvergenceDetector, ConvergenceState};
 pub use drift::{DriftJudge, LexicalDriftJudge, ModelDriftJudge, NullDriftJudge};
