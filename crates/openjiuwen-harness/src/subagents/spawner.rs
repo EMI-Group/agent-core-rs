@@ -232,7 +232,7 @@ impl fmt::Debug for RuntimeSubAgentSpawner {
             .field("active_permits", &self.active_permits())
             .field("tracked", &self.tracked())
             .field("parent_session_id", &self.runtime.parent_session_id())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -339,7 +339,7 @@ impl SubAgentSpawner for RuntimeSubAgentSpawner {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 
     use std::time::Duration;
 

@@ -489,10 +489,10 @@ impl DeepAgent {
 
     /// Returns the production sub-agent seam wired into the default subagent rail.
     ///
-    /// [`DeepAgentBuilder`](super::DeepAgentBuilder) registers a
-    /// [`RuntimeSubAgentSpawner`](crate::subagents::RuntimeSubAgentSpawner) over the
-    /// sub-agent runtime it mounts, so hosts can delegate through
-    /// [`SubAgentSpawner`] without owning the runtime.
+    /// [`DeepAgentBuilder`] registers a
+    /// [`RuntimeSubAgentSpawner`](crate::subagents::RuntimeSubAgentSpawner) over the sub-agent
+    /// runtime it mounts, so hosts can delegate through [`SubAgentSpawner`] without owning the
+    /// runtime.
     ///
     /// `None` when sub-agents are not mounted (`subagents` is empty and
     /// `add_general_purpose_agent` is off), and when the caller supplied its own

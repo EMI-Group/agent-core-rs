@@ -10,7 +10,7 @@
 //!
 //! Everything is offline and deterministic: a temp workspace, a scripted model, and one
 //! gated fake agent whose only wait is released explicitly. Awaits are bounded at 10 s.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 
 use std::sync::Arc;
 use std::time::Duration;
