@@ -3,7 +3,7 @@
 //! Kept beside the module (like the `inflate` tests) so `pdf.rs` stays within the
 //! file-size budget; everything here is offline and deterministic.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 
 use openjiuwen_common::error::ErrorKind;
 
@@ -341,8 +341,7 @@ fn ascii_hex_encode(data: &[u8]) -> Vec<u8> {
 /// Base-85 encodes `data` the way `/ASCII85Decode` expects.
 fn ascii85_encode(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    let mut chunks = data.chunks(4).peekable();
-    while let Some(chunk) = chunks.next() {
+    for chunk in data.chunks(4) {
         let mut group = [0u8; 4];
         group[..chunk.len()].copy_from_slice(chunk);
         let value = u32::from_be_bytes(group);

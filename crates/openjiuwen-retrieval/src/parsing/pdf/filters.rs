@@ -184,7 +184,7 @@ pub(crate) fn ascii85_decode(data: &[u8], max_output: usize) -> Result<Vec<u8>> 
                 group[count] = byte - b'!';
                 count += 1;
                 if count == 5 {
-                    let bytes = ascii85_group(&group)?;
+                    let bytes = ascii85_group(group)?;
                     check_capacity(out.len(), 4, max_output)?;
                     out.extend_from_slice(&bytes);
                     count = 0;
@@ -209,7 +209,7 @@ pub(crate) fn ascii85_decode(data: &[u8], max_output: usize) -> Result<Vec<u8>> 
             for slot in group.iter_mut().skip(partial) {
                 *slot = 84;
             }
-            let bytes = ascii85_group(&group)?;
+            let bytes = ascii85_group(group)?;
             let kept = partial - 1;
             check_capacity(out.len(), kept, max_output)?;
             out.extend_from_slice(&bytes[..kept]);
@@ -219,9 +219,9 @@ pub(crate) fn ascii85_decode(data: &[u8], max_output: usize) -> Result<Vec<u8>> 
 }
 
 /// Packs one five-digit ASCII85 group into four big-endian bytes.
-fn ascii85_group(group: &[u8; 5]) -> Result<[u8; 4]> {
+fn ascii85_group(group: [u8; 5]) -> Result<[u8; 4]> {
     let mut value: u32 = 0;
-    for &digit in group {
+    for digit in group {
         value = value
             .checked_mul(85)
             .and_then(|value| value.checked_add(u32::from(digit)))
@@ -292,7 +292,7 @@ fn check_capacity(current: usize, additional: usize, max_output: usize) -> Resul
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 mod tests {
     use openjiuwen_common::error::ErrorKind;
 

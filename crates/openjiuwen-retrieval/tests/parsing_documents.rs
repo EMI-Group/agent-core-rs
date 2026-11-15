@@ -1,6 +1,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::assert_is_empty,
     clippy::cast_possible_truncation
 )]
 //! Integration tests for the DOCX, XLSX, and PDF parsers.
@@ -534,6 +535,9 @@ fn pdf_reads_uncompressed_text() {
     assert_eq!(parsed.pages, vec!["Hello"]);
     assert_eq!(parsed.page_count, 1);
     assert!(parsed.has_text);
+    assert!(!parsed.incomplete);
+    assert!(parsed.skipped_filters.is_empty());
+    assert!(parsed.skipped_streams.is_empty());
 }
 
 #[test]
@@ -571,6 +575,15 @@ fn pdf_skips_streams_with_unsupported_filters() {
     body.extend_from_slice(&plain_stream("BT (also kept) Tj ET"));
     let parsed = PdfParser::new().parse_bytes(&pdf_document(&body)).unwrap();
     assert_eq!(parsed.pages, vec!["kept", "also kept"]);
+    // The skipped image stream is reported instead of disappearing.
+    assert!(parsed.incomplete);
+    assert_eq!(parsed.skipped_filters, vec!["DCTDecode"]);
+    assert_eq!(parsed.skipped_streams.len(), 1);
+    assert!(
+        parsed.skipped_streams[0].contains("stream 1: image payload filter DCTDecode"),
+        "unexpected record: {}",
+        parsed.skipped_streams[0]
+    );
 }
 
 #[test]
@@ -599,6 +612,9 @@ fn pdf_without_text_is_not_an_error() {
     assert_eq!(parsed.pages, Vec::<String>::new());
     assert_eq!(parsed.page_count, 0);
     assert!(parsed.is_empty());
+    assert!(parsed.incomplete);
+    assert!(parsed.skipped_filters.contains(&"DCTDecode".to_owned()));
+    assert_eq!(parsed.skipped_streams.len(), 1);
 }
 
 #[tokio::test]

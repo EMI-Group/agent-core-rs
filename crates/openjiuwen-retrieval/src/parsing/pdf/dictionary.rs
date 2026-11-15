@@ -274,7 +274,7 @@ fn next_token(slice: &[u8], cursor: usize) -> Option<(&[u8], usize)> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 mod tests {
     use super::*;
 

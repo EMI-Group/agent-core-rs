@@ -180,7 +180,7 @@ fn apply_png(data: &[u8], params: &PredictorParams, max_output: usize) -> Result
                         0
                     };
                     let above = u16::from(previous[index]);
-                    current[index] = current[index].wrapping_add(((left + above) / 2) as u8);
+                    current[index] = current[index].wrapping_add(u16::midpoint(left, above) as u8);
                 }
             }
             // Paeth: the closest of left, above, and above-left.
@@ -319,7 +319,7 @@ fn pack_samples(samples: &[usize], row_bytes: usize, bits: usize, out: &mut Vec<
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 mod tests {
     use openjiuwen_common::error::ErrorKind;
 

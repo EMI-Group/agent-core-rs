@@ -8,7 +8,8 @@
 //! (`/Filter` plus `/DecodeParms`), in the order the dictionary lists it:
 //!
 //! - the decodable filters — `ASCIIHexDecode`, `ASCII85Decode`,
-//!   `RunLengthDecode`, and `FlateDecode` (through [`zlib_decompress`]), long and
+//!   `RunLengthDecode`, and `FlateDecode` (through
+//!   [`zlib_decompress`](crate::parsing::inflate::zlib_decompress)), long and
 //!   abbreviated (`/AHx`, `/A85`, `/RL`, `/Fl`) forms included — with predictors
 //!   `2` (`TIFF` differencing) and `10`..`15` (PNG row filters) undone after the
 //!   filter that names them;
@@ -287,10 +288,10 @@ fn decode_stream(
                     error,
                 }
             })?;
-        let params = parms.get(index).copied().flatten().unwrap_or_default();
-        if !params.is_identity() {
+        let entry = parms.get(index).copied().flatten().unwrap_or_default();
+        if !entry.is_identity() {
             decoded =
-                predictor::apply(&decoded, &params, DEFAULT_MAX_OUTPUT_BYTES).map_err(|error| {
+                predictor::apply(&decoded, &entry, DEFAULT_MAX_OUTPUT_BYTES).map_err(|error| {
                     StreamFailure {
                         filter: filter.name().to_owned(),
                         error,
