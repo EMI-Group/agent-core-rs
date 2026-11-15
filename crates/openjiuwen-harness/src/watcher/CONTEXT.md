@@ -56,7 +56,7 @@ Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path ins
   - `<workspace>/.openjiuwen/agents` (`crate::spec::AGENTS_DIR`) — `Spec`, recursive, label `spec:workspace`;
   - `<home>/.openjiuwen/agents` — `Spec`, recursive, label `spec:home`;
   - `<workspace>/.openjiuwen/plugins` — `Spec`, recursive, label `spec:plugins`;
-  - `<workspace>/IDENTITY.md`, `<home>/IDENTITY.md`, `<home>/OPENJIUWEN.md`, `<workspace>/OPENJIUWEN.md` — `InstructionFile` file targets, labels `instruction:<source>`;
+  - `<workspace>/IDENTITY.md`, `<home>/IDENTITY.md`, `<home>/OPENJIUWEN.md`, `<workspace>/OPENJIUWEN.md` — `InstructionFile` file targets, labels `instruction:workspace:IDENTITY.md`, `instruction:home:IDENTITY.md`, `instruction:home:OPENJIUWEN.md`, `instruction:workspace:OPENJIUWEN.md` (the filename is part of the label);
   - every `crate::cli::paths::mcp_config_paths(home, workspace, env)` entry — `McpConfig` file targets, labels `mcp:home` / `mcp:workspace` / `mcp:override`.
   - `existing_only()` keeps targets whose `watch_path()` exists and records every dropped path in `skipped()` (transparent, never silent).
 - `validate()` maps a missing watch path to `Error::not_found`, a permission failure to `Error::sys_op`, a file/directory mismatch to `Error::config`; the path and the target label are always in the message.
