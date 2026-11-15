@@ -11,9 +11,10 @@
 //! reproducible:
 //!
 //! - Sampling uses the same seeded `xorshift64*` Fisher-Yates shuffle as
-//!   [`CaseLoader::shuffle`](crate::tune::CaseLoader), so one seed always
-//!   evaluates the same candidates in the same order instead of Python's
-//!   unseeded `random.sample`.
+//!   [`CaseLoader::shuffle`](crate::tune::CaseLoader) — both run on the module's
+//!   single `Rng64` generator in `tune::prng` — so one seed always evaluates the
+//!   same candidates in the same order instead of Python's unseeded
+//!   `random.sample`.
 //! - `search_best` never reads a variable that only exists inside its loop: a
 //!   parameter set with no alternatives after dropping the baseline returns the
 //!   baseline with `evaluated == 0` and empty `best_cases`, where Python raises
@@ -39,56 +40,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::tune::base::EvaluatedCase;
+use crate::tune::prng::Rng64;
 
 /// Python `DEFAULT_CANDIDATES_SAMPLE_NUM`: how many parameter candidates one
 /// search evaluates.
 pub const DEFAULT_CANDIDATES_SAMPLE_NUM: usize = 6;
-
-/// A deterministic `xorshift64*` generator used by the candidate shuffle.
-///
-/// The algorithm matches the generator behind
-/// [`CaseLoader::shuffle`](crate::tune::CaseLoader) — Marsaglia's xorshift64
-/// pushed through a 64-bit multiply — and is repeated here because that one is
-/// private to the loader module. It keeps the crate free of random-number
-/// dependencies while staying reproducible.
-struct Rng64 {
-    /// The generator state; never zero after construction.
-    state: u64,
-}
-
-impl Rng64 {
-    /// Seeds the generator; seed `0` is remapped to the golden-ratio constant
-    /// because xorshift requires a non-zero state.
-    fn new(seed: u64) -> Self {
-        Self {
-            state: if seed == 0 {
-                0x9E37_79B9_7F4A_7C15
-            } else {
-                seed
-            },
-        }
-    }
-
-    /// The next pseudo-random 64-bit word.
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.state = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    /// A pseudo-random index in `0..bound`.
-    ///
-    /// The modulo bias is irrelevant for shuffling a short candidate list.
-    fn below(&mut self, bound: usize) -> usize {
-        if bound <= 1 {
-            return 0;
-        }
-        (self.next_u64() % bound as u64) as usize
-    }
-}
 
 /// Expands per-parameter choice lists into their cross product.
 ///
@@ -287,7 +243,7 @@ impl ParameterSearcher {
             candidates.remove(0);
         }
         let mut rng = Rng64::new(self.seed);
-        shuffle(&mut candidates, &mut rng);
+        rng.shuffle(&mut candidates);
         candidates.truncate(self.sample_num);
 
         let mut best_score = base_score;
@@ -318,14 +274,6 @@ impl ParameterSearcher {
             last_score,
             evaluated,
         })
-    }
-}
-
-/// Fisher-Yates shuffle driven by a seeded [`Rng64`].
-fn shuffle(candidates: &mut [BTreeMap<String, Value>], rng: &mut Rng64) {
-    for i in (1..candidates.len()).rev() {
-        let j = rng.below(i + 1);
-        candidates.swap(i, j);
     }
 }
 

@@ -82,6 +82,7 @@ mod dataset;
 mod evaluator;
 mod loader;
 mod optimizer;
+mod prng;
 mod prompt_search;
 mod tool;
 
