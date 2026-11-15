@@ -24,6 +24,22 @@
 //! [`SpawnerRegistry::route`]); with only a single spawner it can only confirm
 //! that spawner, so a hint naming a different backend is
 //! [`openjiuwen_common::error::Error::Config`] instead of a silent misroute.
+//!
+//! # Spawning is backend-selected, not mode-selected
+//!
+//! [`Runner::spawn_agent`] and [`Runner::spawn_agent_with`] deliberately **do
+//! not** consult [`crate::config::RunnerConfig::require_local`]: a spawned child
+//! is chosen by its backend, not by the runner's transport mode. A local child
+//! (`subprocess`, `external_command`, `in_process`) and the HTTP `remote_http`
+//! client need no distributed transport, so they keep working on a
+//! distributed-configured runner — the mode governs how *runs* are executed, not
+//! where a host's child processes live. Each backend already refuses its own
+//! deferred transport: a `remote_mq`/`remote_a2a` spawn is
+//! `Error::Unsupported` from
+//! [`DeferredSpawner`](crate::spawn::DeferredSpawner), naming the missing
+//! transport, and `RemoteProtocol::{Mq, A2a}` are refused when a client is built.
+//! Nothing here falls back to an in-process run: a spawn either reaches an
+//! installed backend or is a typed error.
 
 use crate::monitor::{RunKind, RunStatus};
 use crate::runner::Runner;

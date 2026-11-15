@@ -69,8 +69,13 @@
 //!   accessors live in the crate's `runner_dreaming` module, beside this file.
 //! - **Team transports** — `openjiuwen_multiagent::{TeamTransport, TransportKind,
 //!   build_transport}`, reached through the `Team` seam only: `Pulsar` is
-//!   `Error::Unsupported`, `RunnerConfig::distributed_mode` is refused by
-//!   [`Runner::start`], and `RemoteProtocol::{Mq, A2a}` are deferred.
+//!   `Error::Unsupported`, `RemoteProtocol::{Mq, A2a}` are deferred, and a
+//!   `RunnerConfig::distributed_mode` runner is refused by [`Runner::start`], by
+//!   every execution entry point, and by pool admission — one guard
+//!   ([`RunnerConfig::require_local`] via [`RunServices::require_local`]) with one
+//!   message, so nothing runs in-process under a distributed name. The spawn seam
+//!   is deliberately exempt: a spawned child is backend-selected, not
+//!   mode-selected.
 use crate::callback::{bind_guardrails, CallbackFramework, CallbackId};
 use crate::config::RunnerConfig;
 use crate::dreaming::DreamService;
@@ -219,8 +224,9 @@ impl Runner {
     /// backend with [`Runner::set_spawner`] or [`Runner::set_spawner_registry`].
     ///
     /// `config.distributed_mode` is accepted and preserved, but a distributed
-    /// runner cannot start: [`Runner::start`] refuses it until a distributed
-    /// transport lands.
+    /// runner executes nothing: [`Runner::start`], the six execution entry
+    /// points, and pool admission all refuse it with the shared
+    /// [`RunnerConfig::require_local`] guard until a distributed transport lands.
     #[must_use]
     pub fn with_config(config: RunnerConfig) -> Arc<Self> {
         let queue: Arc<dyn MessageQueue> = mq::build_message_queue(&config.message_queue);
@@ -414,11 +420,12 @@ impl Runner {
     /// `Error::Unsupported` when the live configuration selects
     /// `distributed_mode` — the distributed transports are deferred, so a
     /// distributed runner refuses to start rather than running in-process under a
-    /// distributed name (see [`RunnerConfig::distributed_mode`]) — or when
-    /// `create_message_queue` rejects the configured kind (`Error::Unsupported`
-    /// for the deferred broker backends) or the checkpointer cannot be built
-    /// (`Error::Validation` / `Error::Unsupported`). The runner stays stopped on
-    /// any error.
+    /// distributed name (see [`RunnerConfig::distributed_mode`]; the message comes
+    /// from [`RunnerConfig::require_local`], the guard every entry point shares) —
+    /// or when `create_message_queue` rejects the configured kind
+    /// (`Error::Unsupported` for the deferred broker backends) or the checkpointer
+    /// cannot be built (`Error::Validation` / `Error::Unsupported`). The runner
+    /// stays stopped on any error.
     pub async fn start(&self) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().await;
         if self.is_started() {
@@ -426,18 +433,13 @@ impl Runner {
             return Ok(());
         }
         let config = self.config();
-        if config.distributed_mode {
+        if let Err(error) = config.require_local() {
             tracing::warn!(
                 target: LOG_TARGET,
                 runner_id = %self.runner_id,
                 "refusing to start a distributed runner; the transports are deferred"
             );
-            return Err(error::unsupported(
-                "distributed runner mode (`drunner`)",
-                "the distributed transports are deferred (Pulsar/ZeroMQ reply-topic \
-                 routing, `RemoteProtocol::Mq`/`A2a`, cross-process attach); run \
-                 in-process or enable distributed execution once a transport lands",
-            ));
+            return Err(error);
         }
         let queue = match mq::create_message_queue(&config.message_queue).await {
             Ok(queue) => queue,
@@ -550,8 +552,11 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// Returns `Error::NotFound` for an unregistered id, the abort error of a
-    /// blocking callback, `Error::Cancelled`, or `Error::Timeout`.
+    /// `Error::Unsupported` when the runner is configured for distributed mode
+    /// (the guard is shared with every other entry point: no transport is
+    /// available, so nothing runs in-process under a distributed name), then
+    /// `Error::NotFound` for an unregistered id, the abort error of a blocking
+    /// callback, `Error::Cancelled`, or `Error::Timeout`.
     pub async fn run_agent(
         &self,
         agent: impl Into<AgentRef>,
@@ -563,7 +568,9 @@ impl Runner {
 
     /// Runs an agent and yields its frames as they arrive.
     ///
-    /// Delegates to [`crate::run::stream_agent`].
+    /// Delegates to [`crate::run::stream_agent`]. A distributed-configured runner
+    /// refuses as the stream's single terminal `Err` frame
+    /// (`Error::Unsupported`), before any work starts.
     pub fn run_agent_streaming(
         &self,
         agent: impl Into<AgentRef>,
@@ -579,7 +586,8 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// Returns `Error::NotFound` for an unregistered id, or the workflow
+    /// `Error::Unsupported` when the runner is configured for distributed mode,
+    /// then `Error::NotFound` for an unregistered id, or the workflow
     /// engine's error.
     pub async fn run_workflow(
         &self,
@@ -592,7 +600,9 @@ impl Runner {
 
     /// Runs a workflow and yields its frames as they arrive.
     ///
-    /// Delegates to [`crate::run::stream_workflow`].
+    /// Delegates to [`crate::run::stream_workflow`]. A distributed-configured
+    /// runner refuses as the stream's single terminal `Err` frame
+    /// (`Error::Unsupported`), before any work starts.
     pub fn run_workflow_streaming(
         &self,
         workflow: impl Into<WorkflowRef>,
@@ -609,8 +619,9 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// Returns `Error::NotFound` for an unregistered id, `Error::Cancelled` when
-    /// the run's cancellation token fires, `Error::Timeout` when the run deadline
+    /// `Error::Unsupported` when the runner is configured for distributed mode,
+    /// then `Error::NotFound` for an unregistered id, `Error::Cancelled` when the
+    /// run's cancellation token fires, `Error::Timeout` when the run deadline
     /// expires, or the team's error.
     pub async fn run_agent_team(
         &self,
@@ -623,7 +634,9 @@ impl Runner {
 
     /// Runs an agent team and yields its frames as they arrive.
     ///
-    /// Delegates to [`crate::run::stream_team`].
+    /// Delegates to [`crate::run::stream_team`]. A distributed-configured runner
+    /// refuses as the stream's single terminal `Err` frame
+    /// (`Error::Unsupported`), before any work starts.
     pub fn run_agent_team_streaming(
         &self,
         team: impl Into<TeamRef>,
@@ -652,9 +665,11 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// `Error::Validation` when the key already has a live run
-    /// ([`crate::pool::PoolError::Busy`]), `Error::Config` when the pool was
-    /// closed or the call is made outside a tokio runtime, and
+    /// `Error::Unsupported` when the runner is configured for distributed mode —
+    /// pool admission consults the shared guard first, so nothing is queued,
+    /// created, or observed — then `Error::Validation` when the key already has a
+    /// live run ([`crate::pool::PoolError::Busy`]), `Error::Config` when the pool
+    /// was closed or the call is made outside a tokio runtime, and
     /// `Error::Cancelled` when the run was cancelled while queued.
     pub async fn start_agent_team(
         &self,
@@ -681,9 +696,11 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// `Error::Validation` when the key already has a live run, `Error::Config`
-    /// when no permit is available, when the pool was closed, or when the call is
-    /// made outside a tokio runtime.
+    /// `Error::Unsupported` when the runner is configured for distributed mode
+    /// (checked ahead of every other admission outcome), `Error::Validation` when
+    /// the key already has a live run, `Error::Config` when no permit is
+    /// available, when the pool was closed, or when the call is made outside a
+    /// tokio runtime.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // deliberate: see the doc comment
     pub async fn try_start_agent_team(
         &self,
@@ -708,6 +725,8 @@ impl Runner {
     ///
     /// # Errors
     ///
+    /// `Error::Unsupported` when the runner is configured for distributed mode —
+    /// a distributed runner creates nothing and joins nothing — then
     /// `Error::Config` when the pool was closed or the call is made outside a
     /// tokio runtime, and `Error::Cancelled` when a run was cancelled while queued
     /// for a permit.
