@@ -3,7 +3,7 @@
 ## Intent
 
 Port the prompt-search (RLAF-P) domain layer of `openjiuwen/dev_tools/tune/optimizer/prompt_search/`: the task/execution vocabulary, the composite reward model with its anti-reward-hacking guards, convergence detection, the drift judge, the prompt memory, and the history compressor.
-The RLAF-P optimization loop is ported above this node, in `../optimizer/search/` (`PromptSearchOptimizer`), and is built exclusively from these types; Python's `policy`, `environment`, `run_log`, and `service` modules are not ported.
+The RLAF-P optimization loop is ported above this node, in `../optimizer/search/` (`PromptSearchOptimizer`), and is built exclusively from these types; the run log Python keeps in `run_log.py` is ported here as `run_log.rs`, and Python's `policy`, `environment`, and `service` modules are not ported.
 Everything is offline and deterministic — no clocks, environment reads, randomness, or global state — and it is a layer-5 consumer of `openjiuwen_foundation` models plus the shared `crate::tune::base::Case`.
 
 ## API Surface
@@ -32,8 +32,13 @@ Everything is offline and deterministic — no clocks, environment reads, random
 - Drift (`drift.rs`): `#[async_trait] DriftJudge { async fn deviation(objective, candidate) -> f64 }`, `NullDriftJudge` (always `0.0`), `LexicalDriftJudge` (default: lowercased word-token sets, `1 - |objective ∩ prompt| / |objective|`, blank prompt `1.0`, blank objective `0.0`), `ModelDriftJudge::new(Arc<dyn Model>)` (one `invoke`, fenced or bare `{"deviation": …}`, clamped, failures → `0.0`, blank prompt → `1.0` without a call).
 - Memory (`memory.rs`): `PromptMemory` trait (`&self` methods, interior mutability) with `store`, `search_similar(&PromptTaskSpec, top_k)`, `best_for_objective`, `pending(threshold)`, `mark_applied -> Result<bool>`, `records`; `NullPromptMemory`; `JsonlPromptMemory::new(dir) -> Result<Self>` with `path()` and `skipped_lines()`.
 - History (`history.rs`): `HistoryEntry { index, reward, prompt, observations }` (`new(index, reward, prompt)`, `with_observations`, `render()`, `render_with_limit(limit)`), `OptimizationHistory { entries, compressed }` (`add`, `best_reward`, `best_prompt`, `render_recent(limit)`, `render`, `is_empty`), `HistoryCompressor { budget: 1200 }` (`new`, `with_budget`, `budget`, `compress`).
+- Run log (`run_log.rs`): `RunLogRecord { iteration: usize, candidate: PromptCandidate, candidate_prompts: Vec<String>, scores: BTreeMap<String, f64>, reward: f64, reward_components: BTreeMap<String, f64>, reward_notes: Vec<String>, best_score: f64, drift: f64, convergence: Option<ConvergenceState>, converged: bool, convergence_reason: Option<String>, adopt: Option<crate::tune::AdoptDecision>, selected: bool, timestamp: f64, run_id: String, observation: Option<String> }`, all serde-defaulted, with `new(iteration, candidate)` and one `with_*` builder per field, the readers `iteration`/`candidate`/`reward`/`is_improvement`/`adopted`, and the `to_json_line`/`from_json_line` codec (`from_json_line` returns `None` for anything that is not a JSON object of the record's shape).
+  `best_score` is the run's best reward *after* the round, `selected` is whether the round moved the elite, `converged`/`convergence_reason` mirror the round's stopping verdict, and `observation` is the winner's observations joined with `"; "`.
+- `RunLog` — `record(&mut self, &RunLogRecord) -> Result<()>` plus a provided `record_all`, `Send + Sync`, object safe so an optimizer can hold `Arc<Mutex<dyn RunLog>>`.
+  `JsonlRunLog::new(path)` (creates the parent directories and keeps existing lines) / `create(path)` (truncates, Python's `reset`) / `path()`, writing one compact JSON object per line in fixed struct-field order so a record always serializes to the same bytes; a failed write or serialization is logged with `tracing::warn!` and reported as `Ok(())`.
+  `NullRunLog` discards (logging at `debug`), `InMemoryRunLog` keeps the records (`records`, `into_records`, `last`, `len`, `is_empty`, `clear`), and `read_run_log(path)` / `read_run_log_limited(path, limit)` read a log back: a missing file is an empty list, blank and foreign lines are skipped, and `limit == 0` means *no limit*.
 - The module root re-exports every public item; `models`, `reward`, `convergence`, `drift`, `memory`, `history` stay private, as do the `token_set`/`jaccard` helpers shared between memory and drift.
-- How the search loop consumes this surface (`../optimizer/search/`): each round builds `PromptCandidate`s and `Execution`s, scores them into `Evaluation { execution, reward: RewardBreakdown }`, records an `IterationRecord`, compresses a `HistoryEntry` into `OptimizationHistory`, asks a `DriftJudge` for deviations (skipped at `drift_penalty == 0`), asks a `ConvergenceDetector` whether to stop, persists the elite as a `PromptRecord`, and returns `OptimizationResult::records` as `Vec<IterationRecord>`.
+- How the search loop consumes this surface (`../optimizer/search/`): each round builds `PromptCandidate`s and `Execution`s, scores them into `Evaluation { execution, reward: RewardBreakdown }`, records an `IterationRecord`, compresses a `HistoryEntry` into `OptimizationHistory`, asks a `DriftJudge` for deviations (skipped at `drift_penalty == 0`), asks a `ConvergenceDetector` whether to stop, writes one `RunLogRecord` per round to a caller-supplied `RunLog`, persists the elite as a `PromptRecord`, and returns `OptimizationResult::records` as `Vec<IterationRecord>`.
 
 ## Constraints
 
@@ -44,6 +49,7 @@ Everything is offline and deterministic — no clocks, environment reads, random
 - `RewardComponent::score` is synchronous (deviation from Python's `async def`) because components only read an `Execution`; only `DriftJudge` stays async because it may call a model.
 - A panicking `StructuredValidationReward`/`CustomReward` closure is not caught (deviation from Python's broad `except`): a panic is caller code failure, not a case outcome.
 - No `unsafe`, no printing, no panics on user input or a poisoned memory lock; tests may `unwrap`.
+- The run log is best-effort: a rejecting sink and a poisoned log mutex are logged with `tracing::warn!` and swallowed, so a broken log can never fail or change a search run.
 - Files stay at or below ~1000 lines; shared tokenization and Jaccard live only in `memory.rs` (`pub(crate)`).
 
 ## Design Decisions
@@ -73,6 +79,7 @@ Everything is offline and deterministic — no clocks, environment reads, random
 - `drift.rs` covers the null and lexical bands, the model judge's fenced/bare/clamped/blank-prompt paths, unusable answers, provider failures, and the recorded request.
 - `memory.rs` covers tokenization/Jaccard, the no-op memory, store/reopen round trips, malformed-line skipping, ranking by overlap then reward, `top_k`, fallbacks, `best_for_objective`, `pending` gain ordering, and `mark_applied` persistence and unknown ids.
 - `history.rs` covers the exact render bytes (em dash, truncation), empty-history defaults, best prompt/reward ties, recent-section limits, single- and multi-entry compression, lesson deduplication, budget truncation, and serialization.
+- `run_log.rs` covers the full record round trip through a JSONL file (every field, including the adoption verdict and the convergence state), `NullRunLog`, `InMemoryRunLog`, parent-directory creation and recreation, blank-path validation on all four entry points, the tolerant codec (arrays, scalars, `null`, wrong field types, blank lines), the `with_convergence` mirroring, `is_improvement`/`adopted`, and a failed append (a path replaced by a directory) staying `Ok`.
 - `mod.rs` composes the re-exports into one round (task → executions → reward → iteration → history → memory → convergence) and reaches all three judges.
 
 ## Routing Table
@@ -84,6 +91,7 @@ Everything is offline and deterministic — no clocks, environment reads, random
 - `./drift.rs` → `DriftJudge`, `NullDriftJudge`, `LexicalDriftJudge`, `ModelDriftJudge`
 - `./memory.rs` → `PromptMemory`, `NullPromptMemory`, `JsonlPromptMemory`, shared `token_set`/`jaccard`
 - `./history.rs` → `HistoryEntry`, `OptimizationHistory`, `HistoryCompressor`
+- `./run_log.rs` → `RunLogRecord` (the typed one-record-per-round payload), the `RunLog` trait, `JsonlRunLog`/`NullRunLog`/`InMemoryRunLog`, and the tolerant `read_run_log`/`read_run_log_limited` readers
 - `./mod.rs` → module docs and the public re-export surface
 - `../../base.rs` → shared `Case` consumed by `PromptTaskCase` (outside this node — read-only, escalate writes to `src/tune`)
 - `../../tool.rs` → `RunTelemetry` carried by `CaseResult`/`Execution` (outside this node — read-only, escalate writes to `src/tune`)

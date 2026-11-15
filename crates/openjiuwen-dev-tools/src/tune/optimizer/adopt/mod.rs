@@ -45,6 +45,8 @@
 //!     AdoptPolicy, AdoptReason, AdoptService, PromptCandidate, PromptTaskSpec,
 //! };
 //!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), openjiuwen_common::error::Error> {
 //! let policy = AdoptPolicy::new();
 //! let candidate = PromptCandidate::new("Answer {{question}} briefly.", "seed");
 //!
@@ -58,7 +60,6 @@
 //! assert!(!policy.decide(0.41, 1.0, 0.0, &[0.4]).adopted());
 //!
 //! // The async service measures, gates, decides, and archives in one call.
-//! async fn sketch() -> Result<(), openjiuwen_common::error::Error> {
 //! let service = AdoptService::new(policy);
 //! let outcome = service
 //!     .decide(
@@ -71,8 +72,8 @@
 //!     )
 //!     .await?;
 //! assert!(outcome.adopted());
-//! Ok(())
-//! }
+//! # Ok(())
+//! # }
 //! ```
 
 mod cases;

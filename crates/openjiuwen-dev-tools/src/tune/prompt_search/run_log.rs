@@ -19,9 +19,9 @@
 //! - [`RunLogRecord`] — one iteration: `iteration` (1-based), the winning
 //!   [`PromptCandidate`], the other `candidate_prompts` tried that round, the
 //!   per-candidate-id `scores`, the winner's `reward` with its raw
-//!   `reward_components` and `reward_notes`, the `best_score` it had to beat,
-//!   the `drift` deviation, the optional [`ConvergenceState`] with the mirrored
-//!   `converged`/`convergence_reason` flags, the optional
+//!   `reward_components` and `reward_notes`, the run's `best_score` after the
+//!   round, the `drift` deviation, the optional [`ConvergenceState`] with the
+//!   mirrored `converged`/`convergence_reason` flags, the optional
 //!   [`AdoptDecision`](crate::tune::AdoptDecision), whether it was `selected` as
 //!   the run's elite, the caller-supplied `timestamp` (seconds), the `run_id`,
 //!   and an optional `observation`. [`RunLogRecord::new`] plus the `with_*`
@@ -55,12 +55,6 @@
 //! `max(1, limit)`, and no `logger.debug` rendering of the payload (the discard
 //! path logs at `debug` instead).
 
-// The whole surface belongs at the `tune` root: until `crate::tune` re-exports
-// it, no path outside this crate can name it, so the reachability and dead-code
-// lints are structurally inert (the same pattern the `adopt` family used before
-// its root re-export landed).
-#![allow(dead_code, unreachable_pub)]
-
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -75,10 +69,11 @@ use crate::tune::AdoptDecision;
 
 /// One iteration of a prompt-search run, as written to the run log.
 ///
-/// `best_score` is the reward the round's winner had to beat (the run's best
-/// before the round); a caller with no history leaves it at `0.0`. `converged`
-/// and `convergence_reason` mirror `convergence` for readers that only need the
-/// verdict, and `selected` says whether this candidate became the run's elite.
+/// `best_score` is the run's best reward *after* the round, so a reader can
+/// compare a round against the run it belonged to; a caller with no history
+/// leaves it at `0.0`. `converged` and `convergence_reason` mirror the round's
+/// stopping verdict for readers that only need it, and `selected` says whether
+/// this candidate moved the run's elite.
 ///
 /// Every field defaults on deserialization, so a legacy or hand-written line
 /// that carries only `iteration` and `candidate` still loads, and unknown keys
@@ -100,7 +95,7 @@ pub struct RunLogRecord {
     pub reward_components: BTreeMap<String, f64>,
     /// The winner's reward-adjustment notes (gate, overfitting, drift).
     pub reward_notes: Vec<String>,
-    /// The best reward recorded before this round: the score to beat.
+    /// The run's best reward after this round.
     pub best_score: f64,
     /// The winner's semantic deviation from the task objective.
     pub drift: f64,
@@ -178,7 +173,7 @@ impl RunLogRecord {
         self
     }
 
-    /// Sets the best reward the round had to beat.
+    /// Sets the run's best reward after the round.
     #[must_use]
     pub fn with_best_score(mut self, best_score: f64) -> Self {
         self.best_score = best_score;
@@ -272,10 +267,14 @@ impl RunLogRecord {
         self.reward
     }
 
-    /// Whether the round's winner beat [`RunLogRecord::best_score`].
+    /// Whether the round's winner's reward exceeds
+    /// [`RunLogRecord::best_score`].
     ///
-    /// An equal reward is not an improvement: the reward is a clamped float and
-    /// the loop keeps the incumbent on a tie.
+    /// The comparison is strict, and it is a plain field comparison rather than
+    /// an elite report: the search writes the run's *post-round* best into
+    /// `best_score`, so a round that established the elite reports `reward ==
+    /// best_score` and [`RunLogRecord::selected`] is the flag that says the
+    /// elite moved.
     #[must_use]
     pub fn is_improvement(&self) -> bool {
         self.reward > self.best_score

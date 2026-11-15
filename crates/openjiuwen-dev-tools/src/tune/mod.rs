@@ -138,6 +138,10 @@ pub use prompt_search::{
     PromptRecord, PromptTaskCase, PromptTaskSpec, RewardBreakdown, RewardComponent,
     StructuredValidationReward, TokenUsageReward, OVERFIT_MARGIN, OVERFIT_PENALTY,
 };
+pub use prompt_search::{
+    read_run_log, read_run_log_limited, InMemoryRunLog, JsonlRunLog, NullRunLog, RunLog,
+    RunLogRecord,
+};
 pub use tool::{
     RunOutcome, RunTelemetry, ToolCallRecord, ToolHandler, ToolStub, ToolStubs, ToolTrace,
 };
