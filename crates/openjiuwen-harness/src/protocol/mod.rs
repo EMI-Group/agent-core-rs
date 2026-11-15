@@ -480,7 +480,10 @@ impl HarnessProtocol for NativeHarness {
         if !context.system_prompt.is_empty() {
             let mut config = self.inner.agent.config();
             config.system_prompt = Some(context.system_prompt.clone());
-            self.inner.agent.configure(config);
+            self.inner
+                .agent
+                .configure(config)
+                .map_err(|error| HarnessError::protocol(error.to_string()))?;
         }
         if let Some(restored) = restored.as_ref() {
             let mode = AgentMode::parse(&restored.plan_mode).unwrap_or_default();
@@ -911,7 +914,10 @@ impl HarnessModelControl for NativeHarness {
                     config.model_config = Some(request);
                 }
             }
-            self.inner.agent.configure(config);
+            self.inner
+                .agent
+                .configure(config)
+                .map_err(|error| HarnessError::protocol(error.to_string()))?;
         }
         {
             let mut state = self.inner.state.lock();

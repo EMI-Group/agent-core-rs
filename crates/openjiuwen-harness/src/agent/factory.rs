@@ -253,7 +253,7 @@ pub fn apply_deep_agent_parts(agent: &Arc<DeepAgent>, parts: DeepAgentParts) -> 
         rails,
         tools,
     } = parts;
-    agent.configure(config);
+    agent.configure(config)?;
     agent.apply_extra_tools(tools);
     for rail in rails {
         agent.add_rail(rail);

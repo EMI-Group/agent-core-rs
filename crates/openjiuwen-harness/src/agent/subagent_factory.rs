@@ -129,6 +129,49 @@ impl SubAgentFactory for DeepAgentSubAgentFactory {
     }
 }
 
+/// Which sub-agent tool surface a configuration selects.
+///
+/// Python parity: `SubagentRail` has three modes and resolves them in this order —
+/// `enable_subagent_runtime` wins over `enable_async_subagent`, which wins over the
+/// synchronous `task_tool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubagentMode {
+    /// The persistent runtime tools (`subagent_spawn`/`_wait`/`_list`/…), selected by
+    /// [`DeepAgentConfig::enable_subagent_runtime`].
+    Runtime,
+    /// The asynchronous lifecycle subset needed to drive background sessions
+    /// (`subagent_spawn`, `subagent_wait`, `subagent_list`, `subagent_close`),
+    /// selected by [`DeepAgentConfig::enable_async_subagent`] without the runtime.
+    ///
+    /// Python's equivalent is `sessions_spawn`/`sessions_list`/`sessions_cancel`; the
+    /// session toolkit itself is not ported, so the same operations run on the
+    /// persistent runtime tools.
+    AsyncSession,
+    /// The synchronous `task_tool` only — the default, and the pre-flag behaviour of
+    /// Python's rail.
+    SyncTask,
+}
+
+/// The runtime tools the [`SubagentMode::AsyncSession`] surface mounts.
+const ASYNC_SESSION_TOOL_NAMES: [&str; 4] = [
+    "subagent_spawn",
+    "subagent_wait",
+    "subagent_list",
+    "subagent_close",
+];
+
+/// Resolves the sub-agent tool mode of `config`.
+#[must_use]
+pub(crate) fn subagent_mode(config: &DeepAgentConfig) -> SubagentMode {
+    if config.enable_subagent_runtime {
+        SubagentMode::Runtime
+    } else if config.enable_async_subagent {
+        SubagentMode::AsyncSession
+    } else {
+        SubagentMode::SyncTask
+    }
+}
+
 /// Assembles the sub-agent runtime and its model-facing tools.
 ///
 /// Registers the built-in presets for `config.language`, every configured
@@ -137,12 +180,13 @@ impl SubAgentFactory for DeepAgentSubAgentFactory {
 /// with an empty parent session id: the per-spawn child session id is allocated
 /// by the runtime itself.
 ///
+/// The mounted tools follow [`subagent_mode`]: the synchronous `task_tool` is always
+/// present, [`SubagentMode::Runtime`] adds the seven-tool
+/// [`subagent_tools_with_transcript`] set, [`SubagentMode::AsyncSession`] adds its four
+/// lifecycle tools, and [`SubagentMode::SyncTask`] adds none of them.
+///
 /// A wired sub-agent runtime with its model-facing tools and their cards.
 pub(crate) type SubagentWiring = (Arc<SubAgentRuntime>, Vec<Arc<dyn Tool>>, Vec<ToolCard>);
-/// The returned tools are the `task` delegation tool followed by the model-facing
-/// `subagent_*` tools (the seven-tool [`subagent_tools_with_transcript`] set, which keeps
-/// the six Python parity tools and adds the Rust-only `subagent_transcript` reader), with
-/// their cards in the same order.
 ///
 /// # Errors
 ///
@@ -173,7 +217,15 @@ pub(crate) fn wire_subagents(
     };
     let runtime = Arc::new(SubAgentRuntime::new(registry, factory, ""));
     let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(TaskTool::new(runtime.clone()))];
-    tools.extend(subagent_tools_with_transcript(runtime.clone()));
+    match subagent_mode(config) {
+        SubagentMode::Runtime => tools.extend(subagent_tools_with_transcript(runtime.clone())),
+        SubagentMode::AsyncSession => tools.extend(
+            subagent_tools_with_transcript(runtime.clone())
+                .into_iter()
+                .filter(|tool| ASYNC_SESSION_TOOL_NAMES.contains(&tool.card().name.as_str())),
+        ),
+        SubagentMode::SyncTask => {}
+    }
     let cards = tools.iter().map(|tool| tool.card().clone()).collect();
     Ok((runtime, tools, cards))
 }
@@ -184,7 +236,7 @@ mod tests {
 
     use openjiuwen_test_support::TempWorkspace;
 
-    use super::{wire_subagents, DeepAgentSubAgentFactory};
+    use super::{subagent_mode, wire_subagents, DeepAgentSubAgentFactory, SubagentMode};
     use crate::schema::{DeepAgentConfig, PromptMode, SubAgentConfig};
     use crate::subagents::SubAgentFactory;
     use crate::workspace::Workspace;
@@ -236,7 +288,9 @@ mod tests {
     fn wire_subagents_builds_the_task_and_runtime_tools() {
         let temp = TempWorkspace::new().unwrap();
         let workspace = Workspace::for_language(temp.workspace(), "en");
-        let config = DeepAgentConfig::default().with_add_general_purpose_agent(true);
+        let config = DeepAgentConfig::default()
+            .with_add_general_purpose_agent(true)
+            .with_enable_subagent_runtime(true);
         let (runtime, tools, cards) = wire_subagents(&config, &workspace, None, None).unwrap();
         // Five built-in presets plus the general-purpose fallback.
         assert_eq!(runtime.registry().len(), 6);
@@ -252,6 +306,61 @@ mod tests {
                 .filter(|card| card.name.starts_with("subagent_"))
                 .count(),
             7
+        );
+    }
+
+    #[test]
+    fn the_default_mode_mounts_only_the_synchronous_task_tool() {
+        let temp = TempWorkspace::new().unwrap();
+        let workspace = Workspace::for_language(temp.workspace(), "en");
+        let config = DeepAgentConfig::default().with_add_general_purpose_agent(true);
+        let (_, tools, cards) = wire_subagents(&config, &workspace, None, None).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].name, "task_tool");
+    }
+
+    #[test]
+    fn the_async_mode_mounts_the_lifecycle_subset_and_runtime_wins() {
+        let temp = TempWorkspace::new().unwrap();
+        let workspace = Workspace::for_language(temp.workspace(), "en");
+        let async_config = DeepAgentConfig::default()
+            .with_add_general_purpose_agent(true)
+            .with_enable_async_subagent(true);
+        let (_, _, cards) = wire_subagents(&async_config, &workspace, None, None).unwrap();
+        let names: Vec<&str> = cards.iter().map(|card| card.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "task_tool",
+                "subagent_spawn",
+                "subagent_wait",
+                "subagent_list",
+                "subagent_close"
+            ]
+        );
+
+        let both = async_config.clone().with_enable_subagent_runtime(true);
+        let (_, _, cards) = wire_subagents(&both, &workspace, None, None).unwrap();
+        assert_eq!(cards.len(), 8, "the runtime mode wins over the async mode");
+    }
+
+    #[test]
+    fn the_mode_precedence_matches_python() {
+        let base = DeepAgentConfig::default();
+        assert_eq!(subagent_mode(&base), SubagentMode::SyncTask);
+        assert_eq!(
+            subagent_mode(&base.clone().with_enable_async_subagent(true)),
+            SubagentMode::AsyncSession
+        );
+        assert_eq!(
+            subagent_mode(
+                &base
+                    .clone()
+                    .with_enable_async_subagent(true)
+                    .with_enable_subagent_runtime(true)
+            ),
+            SubagentMode::Runtime
         );
     }
 }

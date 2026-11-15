@@ -199,7 +199,9 @@ fn new_and_configure_round_trip() {
         .any(|name| name == "harness_prompt"));
 
     let config = DeepAgentConfig::default().with_language("en".to_string());
-    agent.configure(config.clone());
+    agent
+        .configure(config.clone())
+        .expect("the default configuration is valid");
     assert_eq!(agent.config(), config);
 }
 

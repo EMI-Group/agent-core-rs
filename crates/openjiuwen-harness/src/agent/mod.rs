@@ -27,6 +27,10 @@
 //!   persisted transcript into the kernel `"main"` conversation context and a
 //!   host-built `deepagent` state payload into a session
 //! - `state_store` — the session-persisted [`DeepAgentState`]
+//! - `invocation_log` — the bounded per-invocation JSONL journal behind
+//!   [`DeepAgentConfig::invocation_log_dir`], written from `Driver::run_resolved`
+//! - `resilience` — the per-tool retry budget behind
+//!   [`DeepAgentConfig::enable_tool_resilience_rail`], installed on the kernel agent
 //! - `subagent_factory` — the default [`crate::subagents::SubAgentFactory`]
 //!   and sub-agent tool wiring
 //! - `tests` — offline unit and integration suite
@@ -50,8 +54,10 @@
 
 mod builder;
 mod factory;
+mod invocation_log;
 mod prompt_rail;
 mod rail_events;
+mod resilience;
 mod round;
 mod seed;
 mod state_store;
@@ -228,16 +234,21 @@ impl DeepAgent {
 
     /// Replaces the data configuration.
     ///
-    /// Validation failures are logged, not returned: `configure` is synchronous
-    /// and must stay callable from non-async contexts. The new configuration is
-    /// stored, the prompt sections are rebuilt from it (plus the mounted tool
-    /// cards), the inner kernel config is re-applied, and the permission policy
-    /// is refreshed when a permission engine exists and the new section is
-    /// enabled. Tools are never re-mounted.
-    pub fn configure(&self, config: DeepAgentConfig) {
-        if let Err(error) = config.validate() {
-            tracing::warn!(error = %error, "invalid DeepAgent configuration");
-        }
+    /// The configuration is validated first: an invalid one is rejected with the
+    /// error [`DeepAgentConfig::validate`] reports (the Python `__post_init__`
+    /// message text) and nothing is installed, so the previously configured agent
+    /// keeps its prompt, kernel settings, permission policy and tool set.
+    ///
+    /// A valid configuration replaces the stored one, rebuilds the prompt sections
+    /// from it (plus the mounted tool cards), re-applies the inner kernel config and
+    /// the tool retry budget, and refreshes the permission policy when a permission
+    /// engine exists and the new section is enabled. Tools are never re-mounted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::config`] when [`DeepAgentConfig::validate`] rejects `config`.
+    pub fn configure(&self, config: DeepAgentConfig) -> Result<()> {
+        config.validate()?;
         if let Some(section) = config
             .permissions
             .as_ref()
@@ -250,10 +261,12 @@ impl DeepAgent {
         let cards = self.tool_cards.read().clone();
         builder::replace_prompt_state(&self.prompt, &config, &cards);
         builder::apply_react_config(&self.inner, &config, &self.prompt.system_text());
+        resilience::apply(&self.inner, &config, &cards);
         if !self.initialized.load(Ordering::Acquire) {
             self.wired.store(false, Ordering::Release);
         }
         *self.config.write() = config;
+        Ok(())
     }
 
     /// Returns a copy of the data configuration.
@@ -543,6 +556,7 @@ impl DeepAgent {
         });
         let config = self.config.read().clone();
         builder::apply_react_config(&self.inner, &config, &self.prompt.system_text());
+        resilience::apply(&self.inner, &config, &cards);
     }
 
     /// Builds the internal driver used by invocation and stream tasks.
@@ -785,14 +799,29 @@ impl Driver {
         let task_loop =
             config.enable_task_loop && config.max_iterations_hard_limit.is_none() && !interactive;
         let recording = self.begin_recording(normalized, session).await;
-        let output = if task_loop {
+        let journal = invocation_log::InvocationJournal::open(
+            &config,
+            &self.card.id,
+            &self.card.name,
+            session.id(),
+            &recorded_query(normalized),
+        )
+        .await;
+        let outcome = if task_loop {
             self.run_task_loop(normalized, session.clone(), loaded, stream_tx)
-                .await?
+                .await
         } else {
             self.round_handle(Some(session.clone()), stream_tx)
                 .execute(normalized)
-                .await?
+                .await
         };
+        if let Some(journal) = &journal {
+            match &outcome {
+                Ok(output) => journal.finish(output).await,
+                Err(error) => journal.finish_error(&error.to_string()).await,
+            }
+        }
+        let output = outcome?;
 
         if let Err(error) = self.persist_state(session).await {
             // Deviation from Python (which propagates): an answer must not be

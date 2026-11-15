@@ -212,7 +212,9 @@ mod tests {
         let agent = build_agent(scripted.clone());
         // `configure` re-applies the kernel config and drops every pooled
         // context, so the seed has to follow it — this is the documented order.
-        agent.configure(DeepAgentConfig::default().with_language("en".to_string()));
+        agent
+            .configure(DeepAgentConfig::default().with_language("en".to_string()))
+            .expect("the default configuration is valid");
         let session = session("seed-configure");
 
         agent

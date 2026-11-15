@@ -29,6 +29,7 @@ use crate::permission::builtin;
 use crate::permission::file_guard::FileGuardChecker;
 use crate::permission::model::{PermissionLevel, PermissionResult, PermissionsSection};
 use crate::permission::net_guard::NetGuardChecker;
+use crate::permission::paths;
 use crate::permission::rules;
 use crate::permission::tiered;
 
@@ -49,6 +50,12 @@ pub struct PermissionEngineConfig {
     pub permissions: PermissionsSection,
     /// Workspace root relative file paths are resolved against.
     pub workspace_root: Option<PathBuf>,
+    /// Project identity anchor (repository root) every path must stay inside.
+    ///
+    /// Python parity: the `project_root` layer of the CWD state, which the filesystem
+    /// guards treat as an allowed root. `None` leaves the workspace root as the only
+    /// boundary.
+    pub project_root: Option<PathBuf>,
     /// Runtime trusted directories; a non-empty list enables the file guard.
     pub trusted_dirs: Vec<PathBuf>,
     /// Whether the pipeline runs at all; a disabled engine allows everything.
@@ -60,6 +67,7 @@ impl Default for PermissionEngineConfig {
         Self {
             permissions: PermissionsSection::default(),
             workspace_root: None,
+            project_root: None,
             trusted_dirs: Vec::new(),
             enabled: true,
         }
@@ -84,6 +92,12 @@ impl PermissionEngineConfig {
         self
     }
 
+    /// Sets the project root every path must stay inside.
+    #[must_use]
+    pub fn with_project_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.project_root = Some(root.into());
+        self
+    }
     /// Sets the runtime trusted directories.
     #[must_use]
     pub fn with_trusted_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
@@ -231,6 +245,8 @@ pub struct PermissionEngine {
     policy: RwLock<CompiledPolicy>,
     /// Workspace root both the engine and the file guard resolve against.
     workspace_root: Option<PathBuf>,
+    /// Optional project root every touched path must stay inside.
+    project_root: Option<PathBuf>,
     /// Runtime trusted directories compiled into the file guard.
     trusted_dirs: Vec<PathBuf>,
     /// Whether the whole pipeline is enabled (the `enabled` config switch).
@@ -245,6 +261,7 @@ impl PermissionEngine {
         let PermissionEngineConfig {
             permissions,
             workspace_root,
+            project_root,
             trusted_dirs,
             enabled,
         } = config;
@@ -259,6 +276,7 @@ impl PermissionEngine {
                 net_guard,
             }),
             workspace_root,
+            project_root,
             trusted_dirs,
             enabled,
         }
@@ -282,6 +300,11 @@ impl PermissionEngine {
         self.workspace_root.clone()
     }
 
+    /// The project root every touched path must stay inside, when configured.
+    #[must_use]
+    pub fn project_root(&self) -> Option<PathBuf> {
+        self.project_root.clone()
+    }
     /// The runtime trusted directories compiled into the file guard.
     #[must_use]
     pub fn trusted_dirs(&self) -> Vec<PathBuf> {
@@ -354,6 +377,12 @@ impl PermissionEngine {
             external_paths = result.external_paths;
         }
 
+        // 2b. Project-root boundary: a path outside the configured root is denied.
+        if let Some(paths) = self.project_root_violations(&tool, args) {
+            permission = PermissionLevel::Deny;
+            matched_rule = format!("{matched_rule}|project_root");
+            external_paths = Some(paths);
+        }
         // 3. Pipeline C: network guard (deny only).
         if let Some(result) = policy
             .net_guard
@@ -384,6 +413,27 @@ impl PermissionEngine {
             Some(paths) => result.with_external_paths(paths),
             None => result,
         }
+    }
+
+    /// Paths of this call that fall outside the configured project root.
+    ///
+    /// Python parity: `project_root` is an access boundary for the filesystem guards, so
+    /// a `file_path` pointing outside it is denied even when the workspace itself would
+    /// allow it. The comparison is lexical (the engine performs no IO); the tools resolve
+    /// and canonicalize the same path before touching it. `None` without a project root or
+    /// while every touched path stays inside it.
+    fn project_root_violations(&self, tool: &str, args: &Value) -> Option<Vec<String>> {
+        let root = paths::normalize_lexically(self.project_root.as_deref()?);
+        let violations: Vec<String> = paths::extract_file_accesses(tool, args, &root)
+            .into_iter()
+            .filter(|access| access.path.is_absolute())
+            .filter(|access| {
+                let path = paths::normalize_lexically(&access.path);
+                !(path == root || path.starts_with(&root))
+            })
+            .map(|access| access.path.to_string_lossy().into_owned())
+            .collect();
+        (!violations.is_empty()).then_some(violations)
     }
 
     /// Evaluates pipeline A only, ignoring the enabled switch and both guards.

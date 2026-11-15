@@ -26,8 +26,9 @@ use crate::permission::{
     PermissionEngine, PermissionEngineConfig, PermissionHost, PermissionInterruptRail,
 };
 use crate::prompts::{
-    identity, mode_instructions, safety, subagent_section, task_loop_section, tools_section,
-    workspace_section, HarnessPromptBuilder, PromptCategory, PromptSection, SectionName,
+    identity, mode_instructions, safety, subagent_section, task_loop_section, todo_section,
+    tools_section, workspace_section, HarnessPromptBuilder, PromptCategory, PromptSection,
+    SectionName,
 };
 use crate::rails::{
     HarnessRail, HarnessRailRegistry, MemoryRail, MemoryRecall, MemoryWriteBack, SubAgentSpawner,
@@ -38,13 +39,13 @@ use crate::schema::{
 };
 use crate::subagents::{RuntimeSubAgentSpawner, SubAgentFactory};
 use crate::task_loop::LoopQueues;
-use crate::tools::{ToolRegistry, UserAsker};
+use crate::tools::{BuiltinTool, ToolRegistry, UserAsker};
 use crate::workspace::Workspace;
 
 use super::factory::{default_goal_rail, is_goal_tool_name, GOAL_RAIL_NAME, SUBAGENT_RAIL_NAME};
 use super::prompt_rail::{PromptRail, PromptState};
 use super::rail_events::{RailEventBus, RailEventDrain};
-use super::{subagent_factory, DeepAgent, Driver};
+use super::{resilience, subagent_factory, DeepAgent, Driver};
 
 /// Prompt priority of the identity section (matches [`identity`]).
 const IDENTITY_PRIORITY: i32 = 10;
@@ -219,10 +220,12 @@ impl DeepAgentBuilder {
             .as_ref()
             .filter(|section| section.enabled)
             .map(|section| {
-                Arc::new(PermissionEngine::new(
-                    PermissionEngineConfig::new(section.clone())
-                        .with_workspace_root(workspace.root_path.clone()),
-                ))
+                let mut engine = PermissionEngineConfig::new(section.clone())
+                    .with_workspace_root(workspace.root_path.clone());
+                if let Some(root) = config.project_root.clone() {
+                    engine = engine.with_project_root(root);
+                }
+                Arc::new(PermissionEngine::new(engine))
             });
 
         let mut registry = ToolRegistry::new(workspace.clone());
@@ -237,9 +240,17 @@ impl DeepAgentBuilder {
         }
         registry = registry.with_language(language.clone());
         registry = registry.with_workspace_memory();
+        registry = registry.with_project_root(config.project_root.clone());
 
         let mut tools = registry.build();
         let mut cards = registry.cards(&language);
+        if !config.enable_task_planning {
+            // Python parity: the `todo_*` tools belong to `TaskPlanningRail`, which is
+            // mounted only when `enable_task_planning` is set, so a default agent has no
+            // plan tool and its tools prompt section carries no todo card.
+            tools.retain(|tool| !is_planning_tool_name(&tool.card().name));
+            cards.retain(|card| !is_planning_tool_name(&card.name));
+        }
         for tool in &extra_tools {
             tools.push(tool.clone());
             cards.push(tool.card().clone());
@@ -369,6 +380,12 @@ pub(crate) fn build_prompt_builder(
     if config.enable_task_loop {
         sections.push(task_loop_section());
     }
+    if config.enable_task_planning {
+        // Python parity: `TaskPlanningRail` injects the todo guidance (plus the current
+        // plan) into the prompt; the Rust rail layer keeps the plan in the todo store, so
+        // the builder contributes the static guidance when planning is enabled.
+        sections.push(todo_section(&[]));
+    }
     if config.default_mode == AgentMode::Plan {
         sections.push(mode_instructions(AgentMode::Plan));
     }
@@ -399,6 +416,21 @@ fn identity_section(config: &DeepAgentConfig) -> PromptSection {
         }
         None => identity(),
     }
+}
+
+/// Whether `name` is one of the four todo tools gated by
+/// [`DeepAgentConfig::enable_task_planning`].
+///
+/// Python parity: `TaskPlanningRail` registers exactly these four tools; without the
+/// rail the agent has no plan tool at all.
+pub(crate) fn is_planning_tool_name(name: &str) -> bool {
+    [
+        BuiltinTool::TodoCreate.name(),
+        BuiltinTool::TodoList.name(),
+        BuiltinTool::TodoGet.name(),
+        BuiltinTool::TodoModify.name(),
+    ]
+    .contains(&name)
 }
 
 /// Derives the plan-mode bookkeeping from the configured default mode.
@@ -448,6 +480,7 @@ pub(crate) fn apply_react_config(inner: &ReActAgent, config: &DeepAgentConfig, p
 pub(crate) fn wire(driver: &Driver, tools: Vec<Arc<dyn Tool>>) -> Result<()> {
     let config = driver.config.read().clone();
     apply_react_config(&driver.inner, &config, &driver.prompt.system_text());
+    resilience::apply(&driver.inner, &config, &driver.tool_cards.read().clone());
     if !tools.is_empty() {
         driver.inner.add_tools(tools);
     }

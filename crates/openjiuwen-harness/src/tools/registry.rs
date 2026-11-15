@@ -181,6 +181,17 @@ impl ToolRegistry {
         self
     }
 
+    /// Narrows every tool's path resolution to the project root, when configured.
+    ///
+    /// Python parity: `project_root` (`init_cwd`'s project identity anchor) is one of the
+    /// allowed roots the filesystem guards accept. `None` keeps the workspace root as the
+    /// only boundary; a configured root also rejects a path outside it that the workspace
+    /// itself would allow (a sibling directory of the project root, for instance).
+    #[must_use]
+    pub fn with_project_root(mut self, project_root: Option<PathBuf>) -> Self {
+        self.env = self.env.clone().with_access_root(project_root);
+        self
+    }
     /// Wires the permission engine the tools consult before touching a path.
     #[must_use]
     pub fn with_permissions(mut self, engine: Arc<PermissionEngine>) -> Self {

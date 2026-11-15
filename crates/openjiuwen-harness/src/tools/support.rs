@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use openjiuwen_foundation::tool::ToolCard;
-use openjiuwen_sysop::workspace::clean_path;
+use openjiuwen_sysop::workspace::{canonicalize_containing, clean_path, is_within};
 
 use crate::permission::{PermissionEngine, PermissionLevel};
 use crate::workspace::Workspace;
@@ -271,6 +271,12 @@ pub struct ToolEnv {
     permission: Option<Arc<PermissionEngine>>,
     /// Description language; defaults to `"cn"` like the Python tools.
     language: String,
+    /// Optional access boundary every resolved path must stay inside.
+    ///
+    /// Python parity: the `project_root` layer of
+    /// `openjiuwen/core/sys_operation/cwd.py`, which the filesystem and shell guards use as
+    /// one of their allowed roots. `None` keeps the workspace root as the only boundary.
+    access_root: Option<PathBuf>,
 }
 
 impl ToolEnv {
@@ -281,7 +287,25 @@ impl ToolEnv {
             workspace,
             permission: None,
             language: "cn".to_owned(),
+            access_root: None,
         }
+    }
+
+    /// Narrows path resolution to `root`, or widens it back to the workspace with `None`.
+    ///
+    /// A configured root is an access boundary, not a resolution root: relative paths still
+    /// resolve against the workspace, and a resolved path outside `root` is rejected as an
+    /// access denial.
+    #[must_use]
+    pub fn with_access_root(mut self, root: Option<PathBuf>) -> Self {
+        self.access_root = root;
+        self
+    }
+
+    /// The access boundary of this environment, when one is configured.
+    #[must_use]
+    pub fn access_root(&self) -> Option<&Path> {
+        self.access_root.as_deref()
     }
 
     /// Wires the permission engine used by [`Self::deny_reason`].
@@ -420,10 +444,30 @@ impl ToolEnv {
             ));
         }
         let relative = self.relative_for_resolution(raw).await?;
-        self.workspace
+        let resolved = self
+            .workspace
             .resolve(&relative)
             .await
-            .map_err(|error| ToolPayload::fail(format!("Invalid path '{raw}': {error}")))
+            .map_err(|error| ToolPayload::fail(format!("Invalid path '{raw}': {error}")))?;
+        self.check_access_root(raw, &resolved).await
+    }
+
+    /// Rejects `resolved` when it falls outside the configured access boundary.
+    ///
+    /// The boundary is the project root (Python's `project_root` CWD layer). It only ever
+    /// narrows what the workspace already allows, so an environment without a boundary
+    /// keeps the workspace root as the single restriction.
+    async fn check_access_root(&self, raw: &str, resolved: &Path) -> Result<PathBuf, ToolPayload> {
+        let Some(root) = self.access_root.as_deref() else {
+            return Ok(resolved.to_path_buf());
+        };
+        let boundary = canonicalize_containing(root).await;
+        if is_within(&canonicalize_containing(resolved).await, &boundary) {
+            return Ok(resolved.to_path_buf());
+        }
+        Err(ToolPayload::fail(format!(
+            "Access denied: '{raw}' is outside the project root."
+        )))
     }
 
     /// Turns `raw` into a path [`Workspace::resolve`] accepts.
