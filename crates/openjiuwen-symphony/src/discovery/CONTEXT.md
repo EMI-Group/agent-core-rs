@@ -219,7 +219,7 @@ The registry is the owned substitute for Python's process-global `_STATES` map: 
 `IncrementalNoticeSession::append` is Python's rollback protocol: a reminder that does not fit `output_budget` is not acknowledged, so the next call offers it again; a call with no additions still advances the cursor.
 ### The `skill_index` tool (`directory_toolkit/`)
 ```rust
-// view: the virtual category tree (see view.rs)
+// view: the virtual category tree (see view/)
 pub struct SkillDirectoryView;   // from_catalog / from_records / normalize_path / node / node_paths / children /
                                  // skill_count / record / record_ids / record_path / entries / tree_entries /
                                  // searchable_entries / scoped_records / metadata_path / resolve_metadata_path /
@@ -237,7 +237,7 @@ pub fn fit_rows(rows: &[Row], summary: &ResponseSummary, budget: Option<usize>, 
 pub fn summary_line(summary: &ResponseSummary) -> String;   pub fn summary_line / bounded_summary_line / compact / append_note
 pub fn metadata_card(record: &SkillRecord) -> String;       pub fn empty_message(operation: &str, category: Option<&str>) -> String;
 pub fn sanitize_model_text(value: &str) -> String;          pub fn inline_text(value: &str) -> String;
-// validate: the typed request and the validation pass (see validate.rs)
+// validate: the typed request and the validation pass (see validate/)
 pub struct SkillIndexRequest;   // operation, category, skills, paths, query, view, recursive, directory_entry,
                                 // directories_only, match, result, case_insensitive, fixed_strings, max_depth,
                                 // read_mode, line_count, start_line, end_line, per_query_limit, pipeline,
@@ -246,7 +246,7 @@ pub struct ValidatedRequest;    // the above, parsed into enums with validated s
 pub struct RequestIssue { pub field: String, pub message: String }
 pub fn validate(request: &SkillIndexRequest) -> std::result::Result<ValidatedRequest, Vec<RequestIssue>>;
 pub fn apply_simple_defaults(request: &SkillIndexRequest) -> std::result::Result<ValidatedRequest, Vec<RequestIssue>>;
-// ops: execution (see ops.rs)
+// ops: execution (see ops/)
 pub fn execute_list(view: &SkillDirectoryView, paths: &[String], request: &ValidatedRequest) -> Result<Execution>;
 pub fn execute_search(catalog: &SkillFs, view: &SkillDirectoryView, paths: &[String], request: &ValidatedRequest) -> Result<Execution>;
 pub fn execute_read(view: &SkillDirectoryView, skills: &[String], request: &ValidatedRequest) -> Result<Execution>;
@@ -300,7 +300,7 @@ The notice reminder is appended last and never lets the response exceed its budg
 - `tests/skill_prompt.rs` — visible-name ordering and disabled-skill exclusion, exact pinned snapshot text (plain, category sections, empty), multi-byte `max_chars` truncation with `included`/`omitted`/`truncated` and fingerprint bookkeeping, `worker_id` filtering, fingerprint stability/content sensitivity, added/removed/changed notices with the exact Python reminder, reminder fallback and custom tool name, deterministic ordering, idempotent second consume, serde persistence, and `SkillFs::notice_state`.
 - `tests/discovery_toolkit_notice.rs` — the notice session layer: the tool-id digest and its validation, card normalization (fallbacks, 300-char word-boundary shortening, escaping, ordering), pinned reminder text and its budget fallback, registry baseline/one-shot delta/LRU eviction/capacity clamp/clear, session rollback then later delivery, serde round-trip, byte-identical reruns.
 - `tests/discovery_toolkit.rs` — the tool: category-tree building (`~n` collisions, depth cap), path normalization, `children`/`skill_count`/`entries`/`tree_entries`/`searchable_entries`/`scoped_records`, metadata paths, category lookups (unknown and ambiguous), every pinned row/summary/message rendering, `fit_rows` truncation with multi-byte budgets, the full validation matrix, then end-to-end `invoke`/`execute` for list/search/read, multi-query interleaving, `result = matches` snippets, pagination without gaps or duplicates, cursor mismatch/stale/unknown errors and the 32-entry bound, pipelines with `output_mode = count`, output-budget shortening and `disable_output_truncation`, notice delivery, the pinned tool card, and byte-identical repeated calls.
-- Unit tests beside `catalog.rs` pin the plain/category/empty renderings; beside `notice.rs` the reminder wording, the `textwrap.shorten` behavior and state round-tripping; beside `ops.rs` the pipeline and search-assembly helpers.
+- Unit tests beside `catalog.rs` pin the plain/category/empty renderings; beside `notice.rs` the reminder wording, the `textwrap.shorten` behavior and state round-tripping; beside `ops/` the pipeline and search-assembly helpers.
 
 ## Routing Table
 
