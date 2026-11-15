@@ -14,6 +14,8 @@ Mirrors the Python `openjiuwen.harness_protocol` package (v0.1.20): the vocabula
 - Constants: `PROTOCOL_VERSION` (`"1.0"`), `EVENT_WIRE_SCHEMA_VERSION` (`"1"`), `MAX_CHECKPOINT_BYTES`, `AUTH_FALLBACK_REQUEST_TYPE`, `AUTH_FALLBACK_EVENT_TYPE`, `TERMINAL_TURN_EVENT_KINDS`.
 - Functions: `harness_event_to_dict`/`harness_event_from_dict` (+ JSON string forms), `event_retention`, `validate_interaction_response`, `event_cursor_stream`, JSON helpers.
 - Aliases: `JsonValue`/`JsonObject`, `HarnessResult`, `HarnessEventStream`, `DynHarness`, `DynHarnessProvider`, `DynModelControl`.
+- Handles/adapters: `McpInstance` (opaque in-process MCP server handle), `EventCursorStream` (cursor→`Stream` adapter), `VecEventCursor` (in-memory cursor), `crate_name()`.
+- Error helpers: `HarnessError::{protocol, state, unsupported_capability, checkpoint_conflict, validation}`, `kind()`, `message()`, `From<serde_json::Error>` → `Protocol`.
 - Everything is re-exported flat from the crate root (Python's eager `__init__.__all__`); modules stay public for qualified paths.
 
 ## Constraints
@@ -59,6 +61,8 @@ Mirrors the Python `openjiuwen.harness_protocol` package (v0.1.20): the vocabula
 - Fakes (`FakeHarness`, `FakeProvider`, `FakeCheckpointSink`, `FakeInteractionHandler`, `FakeToolGateway`, `FakeHookDispatcher`, `FakeTelemetry`) live inside the test files and double as usage examples.
 - Wire tests assert exact key presence and exact `event_type`/payload key sets, so accidental shape changes fail loudly.
 - Definition of done: `cargo fmt -p openjiuwen-harness-protocol`, `cargo test -p openjiuwen-harness-protocol`, `cargo clippy -p openjiuwen-harness-protocol --all-targets -- -D warnings` all clean.
+- Test inventory: 6 integration binaries (`events` 18, `models` 12, `protocol` 15, `results` 12, `serialization` 13, `services` 28 = 98 tests) plus 100 inline unit tests; none is `#[ignore]`d or feature-gated.
+- Size: 23 files / ~8.7k lines under `src/`, ~5.6k lines under `tests/`.
 
 - `./src/interactions.rs` is intentionally ~1070 lines (five request/response families plus the tagged dispatch enums and inline tests); split it only when a new interaction family is added
 
@@ -93,5 +97,9 @@ Mirrors the Python `openjiuwen.harness_protocol` package (v0.1.20): the vocabula
 - Interaction handler obligations a provider must honour: cancel every pending request before aborting a turn or finishing `stop`, always return the response type and `request_id` paired with the request (`validate_interaction_response`, `src/interactions.rs:737`), and treat `deadline_at` as finite Unix-epoch seconds.
 - `EventBufferConfig::default()` is `capacity: 1024`, `overflow: CoalesceOrBlock` (`src/events/buffer.rs:30`); the crate only advertises the contract, emission and overflow handling are the provider's job (`event_retention` in `src/events/payloads.rs:403` classifies each payload as required/coalescible/best-effort).
 - There is no subprocess/stdio transport seam: the crate defines no process, pipe, JSON-line/NDJSON helper and no transport trait (`McpTransport::Stdio` names an MCP server target, not a harness transport), so a CLI-backed harness brings its own process plumbing in its own crate.
+- `McpServerConfig::instance: Option<McpInstance>` is `#[serde(skip)]` + `#[schemars(skip)]`; `McpInstance`'s `PartialEq` compares presence only (every handle equals every other) and `Debug` prints `<opaque instance>`.
+- `McpServerConfig::validate` requires exactly one of `command`/`url`/`instance`, rejects `env` off stdio and `headers` off HTTP, and checks the name first.
+- `HarnessCard::fork_modes` lists the natively supported session-fork modes (`full`, `before`); an empty set means no native fork and a host must not emulate one.
+- `HarnessCheckpoint::size_bytes()` is the compact `serde_json::to_vec(&data).len()` that validation compares against `MAX_CHECKPOINT_BYTES` (4 MiB).
 - `HarnessEvent` implements `Serialize`/`Deserialize` by hand (delegating to `serialization::encode_event`/`decode_event`), so serde and the wire codec can never diverge; `HarnessEventPayload` is not serde at all.
 - A new implementation starts from `HarnessCard::new(name, implementation_version)` + `capabilities`/`*_host_capabilities` (`src/models/card.rs`), and `start` must call `HarnessCard::validate_host(&protocol_version, &host_capabilities)`.

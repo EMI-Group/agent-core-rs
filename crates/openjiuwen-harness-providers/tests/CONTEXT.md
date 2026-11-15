@@ -28,7 +28,7 @@ Counts as measured today (`cargo test -p openjiuwen-harness-providers --offline 
 
 | Suite | default | `vendor` | `vendor,native-v2` | `--no-default-features` |
 |---|---|---|---|---|
-| lib (`src/`) | 198 | 274 | 283 | 190 |
+| lib (`src/`) | 198 | 276 | 285 | 190 |
 | `io_adapter.rs` | 20 | 20 | 20 | 20 |
 | `native.rs` | 9 | 9 | 9 | 4 |
 | `registry.rs` | 23 | 26 | 26 | 18 |
@@ -41,7 +41,7 @@ Counts as measured today (`cargo test -p openjiuwen-harness-providers --offline 
 | `vendor_cli.rs` | 11 | 11 | 11 | 11 |
 | `vendor_rpc.rs` | 6 | 6 | 6 | 6 |
 | `vendor_supervisor.rs` | 14 | 14 | 14 | 14 |
-| **total** | **314** | **467** | **488** | **296** |
+| **total** | **314** | **469** | **490** | **296** |
 
 ## Routing Table
 

@@ -56,7 +56,7 @@ Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path ins
   - `<workspace>/.openjiuwen/agents` (`crate::spec::AGENTS_DIR`) — `Spec`, recursive, label `spec:workspace`;
   - `<home>/.openjiuwen/agents` — `Spec`, recursive, label `spec:home`;
   - `<workspace>/.openjiuwen/plugins` — `Spec`, recursive, label `spec:plugins`;
-  - `<workspace>/IDENTITY.md`, `<home>/IDENTITY.md`, `<home>/OPENJIUWEN.md`, `<workspace>/OPENJIUWEN.md` — `InstructionFile` file targets, labels `instruction:<source>`;
+  - `<workspace>/IDENTITY.md`, `<home>/IDENTITY.md`, `<home>/OPENJIUWEN.md`, `<workspace>/OPENJIUWEN.md` — `InstructionFile` file targets, labels `instruction:workspace:IDENTITY.md`, `instruction:home:IDENTITY.md`, `instruction:home:OPENJIUWEN.md`, `instruction:workspace:OPENJIUWEN.md` (the filename is part of the label);
   - every `crate::cli::paths::mcp_config_paths(home, workspace, env)` entry — `McpConfig` file targets, labels `mcp:home` / `mcp:workspace` / `mcp:override`.
   - `existing_only()` keeps targets whose `watch_path()` exists and records every dropped path in `skipped()` (transparent, never silent).
 - `validate()` maps a missing watch path to `Error::not_found`, a permission failure to `Error::sys_op`, a file/directory mismatch to `Error::config`; the path and the target label are always in the message.
@@ -112,6 +112,8 @@ Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path ins
 - `WatcherConfig` derives `Debug, Clone, PartialEq, Eq` only — no `Serialize`/`Deserialize`; a host that persists watcher settings maps them itself, and a host that carries them in a flag or env var uses `str::parse::<WatcherConfig>()` (`FromStr`) and `to_string()` (`Display`).
 - `Subscription::recv().await` is an inherent method, so consuming updates needs no `futures` import; only `StreamExt`/`BoxStream` usage does (the `futures::Stream` impl at `handle.rs:121` is public).
 - `pub mod watcher` is not feature-gated (`lib.rs:45`), so every type compiles without `notify`; enabling the backend is the single feature line `notify = ["dep:notify"]` (`Cargo.toml:63`) and pulls only already-locked, already-cached crates.
+- The only consumer in the workspace is the `openjiuwen-cli` binary crate (`crates/openjiuwen-cli/src/watch.rs`), which takes `openjiuwen-harness = { workspace = true, features = ["notify"] }` and exposes `openjiuwen watch [--json|--list|--max-events N|--debounce-ms N]` plus `chat --watch` (report on stderr) through `WatchPlan::existing_only`, the three reload handlers and one `Subscription` select loop with `ctrl_c`.
+- `openjiuwen` (umbrella) forwards the feature as `notify = ["openjiuwen-harness/notify"]` (`crates/openjiuwen/Cargo.toml:46`); `openjiuwen-e2e` and `openjiuwen-test-support` do not enable it.
 
 ## Constraints
 
@@ -120,7 +122,7 @@ Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path ins
 - Reload handlers never run on the intake task: publication and debouncing stay independent of handler latency, and handlers of one event still run sequentially so two bodies never race for the same file.
 - A panicking reload handler kills only the dispatcher task; its events keep being published, the dispatch queue reports `WatchUpdate::Dropped(Dispatch)`, and `shutdown()` reports the panic as `Error::sys_op`.
 - Errors: `openjiuwen_common::error::{Error, Result}`; OS-watcher mapping is `PathNotFound → Error::not_found`, `Io(PermissionDenied) → Error::sys_op`, `MaxFilesWatch → Error::sys_op`, `InvalidConfig`/`Generic`/backend construction → `Error::config`; every message names the path and the target label.
-- Feature-off: the whole module compiles and every type above exists; `WorkspaceWatcher::start` returns `Error::unsupported` naming the `notify` feature. Nothing else is gated, so callers (and tests) can build plans and units without the feature.
+- Feature-off: the whole module compiles and every type above exists; `WorkspaceWatcher::start` returns `Error::Unsupported` with the message `workspace watcher requires the \`notify\` feature: rebuild openjiuwen-harness with \`--features notify\``. Nothing else is gated, so callers (and tests) can build plans and units without the feature.
 - Runtime OS errors are logged at `warn` and published as `WatchUpdate::WatcherFailed`, with consecutive identical messages collapsed so a removed subtree cannot produce an error storm; a missing path observed at runtime is downgraded to `debug`.
 - Watch coverage follows the OS backend: parents named by a `WatchPlan` are registered up front, but a directory created *after* `start()` is watched only once the backend delivers its creation event, so a file written into it immediately afterwards can be missed (the directory event itself is still delivered). Pre-create watched parents before `start()` or wait for the directory event when a target subtree is built at runtime.
 - Secrets: no configuration content is logged; only paths, target labels and handler names.
