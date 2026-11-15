@@ -74,6 +74,7 @@ pub mod progressive;
 pub mod reduce;
 pub mod render;
 pub mod selector;
+pub mod service;
 pub mod subtree;
 pub mod truncation;
 
@@ -116,6 +117,10 @@ pub use render::{
 pub use selector::{
     is_abstain_output, query_text, DefaultTopKSelector, LexicalTopKSelector, ABSTAIN_HINTS,
     FRAGMENT_SELECTED_EVENT, MODE_GENERATE, MODE_LEXICAL,
+};
+pub use service::{
+    runtime_config_from_config, CandidateRecord, GenerationConfig, RenderConfig, RetrievalResult,
+    Retriever, RetrieverConfig, SearchRequest, TraversalConfig,
 };
 pub use subtree::{
     build_progressive_branch_description, build_progressive_item_label, build_progressive_root,
