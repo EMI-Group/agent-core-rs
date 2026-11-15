@@ -861,7 +861,7 @@ async fn delete_docs_by_filters_pages_and_filters_locally_without_a_translation(
         .and(body_json(json!({
             "query": {"match_all": {}},
             "_source": true,
-            "size": FILTER_DELETE_PAGE,
+            "size": SEARCH_PAGE_SIZE,
             "from": 0,
             "sort": ["_doc"],
         })))
