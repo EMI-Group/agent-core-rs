@@ -86,6 +86,7 @@ pub mod case;
 pub mod eval;
 pub mod evaluator;
 pub mod judge_scoring;
+pub mod react;
 pub mod report;
 pub mod runner;
 pub mod scoring;
@@ -105,6 +106,7 @@ pub use judge_scoring::{
     design_report_from_verdict, design_rubric, safety_rubric, DesignJudgement, SafetyJudgement,
     SkillJudge,
 };
+pub use react::{ReactCaseRunner, ReactOutcome, DEFAULT_MAX_REACT_ROUNDS};
 pub use report::{
     grade_for, AutoFailCode, CaseResult, CaseSummary, DesignReport, EvaluationReport,
     EvaluatorScore, EvaluatorScores, FinalScore, FunctionalReport, JudgeRecord, SafetyFinding,
