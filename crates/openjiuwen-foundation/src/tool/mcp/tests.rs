@@ -11,19 +11,21 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openjiuwen_common::error::ErrorKind;
+use async_trait::async_trait;
+use openjiuwen_common::error::{ErrorKind, Result};
 use rmcp::model::{
     Annotated, CallToolResult, Content, RawAudioContent, RawContent, ResourceContents,
 };
-use serde_json::{json, Map};
+use serde_json::{json, Map, Value};
 
 use crate::tool::card::ToolCard;
 use crate::tool::context::ToolContext;
 use crate::tool::traits::{Tool, EMPTY_SUCCESS_TEXT};
 
 use super::client::{
-    connect_mcp_server, reconnect_attempt_budget, reconnect_delay, FakeMcpClient, McpClient,
-    McpClientType, McpRemoteTool, McpServerConfig,
+    connect_mcp_server, reconnect_attempt_budget, reconnect_delay, FakeMcpClient,
+    FakeSubscriptionAction, FakeSubscriptionCall, McpClient, McpClientType, McpRemoteTool,
+    McpServerConfig,
 };
 use super::http::{SseFrame, SseParser};
 use super::result::{
@@ -683,4 +685,134 @@ async fn fake_client_connection_state_follows_disconnect() {
     client.disconnect().await.unwrap();
 
     assert!(!client.is_connected().await);
+}
+
+// --- resource subscriptions -------------------------------------------------
+
+/// A client that implements only the required [`McpClient`] methods.
+struct BareClient;
+
+#[async_trait]
+impl McpClient for BareClient {
+    fn server_name(&self) -> &'static str {
+        "bare"
+    }
+
+    async fn connect(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn disconnect(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn is_connected(&self) -> bool {
+        false
+    }
+
+    async fn list_tools(&self) -> Result<Vec<McpRemoteTool>> {
+        Ok(Vec::new())
+    }
+
+    async fn call_tool_with(
+        &self,
+        _tool_name: &str,
+        _arguments: Value,
+        _timeout: Option<Duration>,
+        _include_image_content: bool,
+    ) -> Result<McpToolResult> {
+        Ok(McpToolResult::success(Map::new()))
+    }
+}
+
+#[tokio::test]
+async fn default_subscription_methods_report_unsupported_naming_the_transport() {
+    let client = BareClient;
+
+    assert!(!client.supports_resource_subscriptions());
+    let subscribe = client
+        .subscribe_resource("file:///tmp/report.md")
+        .await
+        .expect_err("the default must not subscribe");
+    let unsubscribe = client
+        .unsubscribe_resource("file:///tmp/report.md")
+        .await
+        .expect_err("the default must not unsubscribe");
+
+    assert_eq!(subscribe.kind(), ErrorKind::Unsupported);
+    assert_eq!(unsubscribe.kind(), ErrorKind::Unsupported);
+    assert!(subscribe.message().contains("transport"), "{subscribe}");
+    assert!(
+        subscribe.message().contains("resources/subscribe"),
+        "{subscribe}"
+    );
+    assert!(
+        unsubscribe.message().contains("resources/unsubscribe"),
+        "{unsubscribe}"
+    );
+}
+
+#[tokio::test]
+async fn fake_client_reports_the_scripted_subscription_capability() {
+    let client = FakeMcpClient::new("srv-id", "files");
+
+    assert!(!client.supports_resource_subscriptions());
+
+    client.set_resource_subscriptions_supported(true);
+
+    assert!(client.supports_resource_subscriptions());
+}
+
+#[tokio::test]
+async fn fake_client_records_subscription_requests() {
+    let client = FakeMcpClient::new("srv-id", "files");
+    client.set_resource_subscriptions_supported(true);
+
+    client
+        .subscribe_resource("file:///tmp/report.md")
+        .await
+        .unwrap();
+    client
+        .unsubscribe_resource("file:///tmp/report.md")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        client.subscription_calls().await,
+        vec![
+            FakeSubscriptionCall {
+                action: FakeSubscriptionAction::Subscribe,
+                uri: "file:///tmp/report.md".to_owned(),
+            },
+            FakeSubscriptionCall {
+                action: FakeSubscriptionAction::Unsubscribe,
+                uri: "file:///tmp/report.md".to_owned(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn fake_client_reports_a_scripted_subscription_failure() {
+    let client = FakeMcpClient::new("srv-id", "files");
+    client.set_resource_subscriptions_supported(true);
+    client
+        .set_subscription_failure("resource is write-only")
+        .await;
+
+    let error = client
+        .subscribe_resource("file:///tmp/report.md")
+        .await
+        .expect_err("scripted failure");
+
+    assert_eq!(error.kind(), ErrorKind::Mcp);
+    assert!(error.message().contains("write-only"), "{error}");
+
+    client.clear_subscription_failure().await;
+    client
+        .subscribe_resource("file:///tmp/report.md")
+        .await
+        .unwrap();
+
+    assert_eq!(client.subscription_calls().await.len(), 2);
 }
