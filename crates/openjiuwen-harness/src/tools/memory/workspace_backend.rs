@@ -988,7 +988,8 @@ mod tests {
 
     #[test]
     fn query_tokens_drop_short_words_and_duplicates() {
-        assert_eq!(query_tokens("The BUILD build steps"), ["build", "steps"]);
+        assert_eq!(query_tokens("go to the SHOP"), ["the", "shop"]);
+        assert_eq!(query_tokens("build BUILD steps"), ["build", "steps"]);
         assert_eq!(query_tokens("go"), ["go"]);
         assert!(query_tokens(" ... ").is_empty());
     }
