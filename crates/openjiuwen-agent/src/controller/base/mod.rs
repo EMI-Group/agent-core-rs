@@ -43,6 +43,16 @@
 //! The turn pipeline lives in `turn` (event processing, intent routing, task
 //! dispatch, and aggregation) and the task persistence in `state`; this module
 //! holds the controller surface, its shared state, and the plain wiring.
+//!
+//! The controller also keeps one conversation log per session
+//! ([`BaseController::history`]), so intent recognition and task executors see
+//! the same bounded context: a turn records its prompt and answer after it
+//! produced its output, and every read inside a turn therefore observes the
+//! previous turns only. The log is bounded by
+//! [`ControllerConfig::history_limit`](super::ControllerConfig::history_limit)
+//! messages, trimmed at append time (never dropping the current turn's own
+//! entries) and again on every read, so a configuration change re-trims
+//! immediately.
 mod state;
 mod turn;
 
@@ -57,6 +67,7 @@ use super::executors::{
     TaskSchedulerLoop,
 };
 use super::group::{require_group, GroupMethod, GroupRouter};
+use super::history::{window, HistoryEntry};
 use super::intent::{IntentRecognizer, Planner, RuleIntentRecognizer};
 use super::reasoner::{Reasoner, TaskControl, TaskOp, TaskOpOutcome};
 use super::schema::{ControllerOutput, ControllerOutputChunk, Event, Intent, TaskStatus};
@@ -213,6 +224,13 @@ pub(super) struct Inner {
     /// Sessions this controller is currently bound to, shared with the
     /// background scheduler's session lookup.
     pub(super) sessions: Arc<RwLock<BTreeMap<String, Arc<dyn Session>>>>,
+    /// Per-session conversation log, oldest entry first.
+    ///
+    /// A turn appends its prompt and answer once it produced its output, so a
+    /// read during a turn sees the previous turns only. Reads trim the log to
+    /// [`ControllerConfig::history_limit`] again, so lowering the limit applies
+    /// to the next read.
+    pub(super) history: RwLock<BTreeMap<String, Vec<HistoryEntry>>>,
     /// Whether the controller loop is marked running.
     pub(super) running: RwLock<bool>,
     /// The lazily started background task scheduler, once [`BaseController::start`]
@@ -262,6 +280,7 @@ impl BaseController {
                 events: RwLock::new(VecDeque::new()),
                 tasks,
                 sessions: Arc::new(RwLock::new(BTreeMap::new())),
+                history: RwLock::new(BTreeMap::new()),
                 running: RwLock::new(false),
                 scheduler_loop: RwLock::new(None),
                 group: RwLock::new(None),
@@ -630,6 +649,26 @@ impl BaseController {
     #[must_use]
     pub fn bound_sessions(&self) -> Vec<String> {
         self.inner.sessions.read().keys().cloned().collect()
+    }
+
+    /// Returns the conversation history recorded for `session_id`.
+    ///
+    /// The entries are oldest first and already trimmed to the newest
+    /// [`history_limit`](ControllerConfig::history_limit) messages, so a
+    /// [`set_config`](Self::set_config) with a smaller limit re-trims on the very
+    /// next read. An unknown session has no history.
+    #[must_use]
+    pub fn history(&self, session_id: &str) -> Vec<HistoryEntry> {
+        let limit = self.inner.config.read().history_limit;
+        let logs = self.inner.history.read();
+        logs.get(session_id)
+            .map(|entries| window(entries, limit).to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Drops the conversation history recorded for `session_id`.
+    pub fn clear_history(&self, session_id: &str) {
+        self.inner.history.write().remove(session_id);
     }
 
     /// Builds the reasoner over the current configuration, with this controller

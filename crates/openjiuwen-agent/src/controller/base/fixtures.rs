@@ -8,6 +8,7 @@ use super::{BaseController, Controller, EventHandler, EventHandlerOutcome};
 use crate::card::AgentCard;
 use crate::controller::config::ControllerConfig;
 use crate::controller::executors::{TaskContext, TaskExecutor};
+use crate::controller::history::HistoryEntry;
 use crate::controller::intent::IntentRecognizer;
 use crate::controller::schema::{ControllerOutput, Event, Intent, Task, TaskResult, TaskStatus};
 use async_trait::async_trait;
@@ -16,7 +17,9 @@ use openjiuwen_session::{
     AgentSession, InteractionRequest, InteractionResponse, Session, SessionType, StreamItem,
     TraceSink,
 };
+use parking_lot::Mutex as SyncMutex;
 use serde_json::json;
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +29,11 @@ use tokio::sync::Mutex;
 pub(crate) const STUB_DESCRIPTION: &str = "stub executor";
 /// Name reported by [`StubHandler`] and [`CountingRecognizer`].
 pub(crate) const STUB_NAME: &str = "stub";
+
+/// Histories captured per dispatch or per recognition call.
+pub(crate) type RecordedHistories = Arc<SyncMutex<Vec<Vec<HistoryEntry>>>>;
+/// `TaskContext::expose_reasoning` flags captured per dispatch.
+pub(crate) type RecordedExposure = Arc<SyncMutex<Vec<bool>>>;
 
 /// Executor that records its calls and answers with a fixed text.
 pub(crate) struct StubExecutor {
@@ -118,6 +126,113 @@ impl TaskExecutor for CooperativeExecutor {
     }
 }
 
+/// Executor that records the dispatch context it was handed and answers with a
+/// fixed text, optionally carrying a reasoning text.
+pub(crate) struct ContextExecutor {
+    task_type: &'static str,
+    text: &'static str,
+    reasoning: Option<&'static str>,
+    pub(crate) histories: RecordedHistories,
+    pub(crate) exposed: RecordedExposure,
+}
+
+impl ContextExecutor {
+    pub(crate) fn new(
+        task_type: &'static str,
+        text: &'static str,
+    ) -> (Self, RecordedHistories, RecordedExposure) {
+        let histories = Arc::new(SyncMutex::new(Vec::new()));
+        let exposed = Arc::new(SyncMutex::new(Vec::new()));
+        (
+            Self {
+                task_type,
+                text,
+                reasoning: None,
+                histories: Arc::clone(&histories),
+                exposed: Arc::clone(&exposed),
+            },
+            histories,
+            exposed,
+        )
+    }
+
+    /// Reports `reasoning` on every run.
+    pub(crate) fn with_reasoning(mut self, reasoning: &'static str) -> Self {
+        self.reasoning = Some(reasoning);
+        self
+    }
+}
+
+#[async_trait]
+impl TaskExecutor for ContextExecutor {
+    fn task_type(&self) -> &str {
+        self.task_type
+    }
+
+    fn description(&self) -> &str {
+        STUB_DESCRIPTION
+    }
+
+    async fn execute(&self, _task: &Task, ctx: &TaskContext<'_>) -> Result<TaskResult> {
+        self.histories.lock().push(ctx.history.clone());
+        self.exposed.lock().push(ctx.expose_reasoning);
+        let result = TaskResult::text(self.text);
+        Ok(match self.reasoning {
+            Some(reasoning) => result.with_reasoning(reasoning),
+            None => result,
+        })
+    }
+}
+
+/// Executor whose run sleeps before it finishes, for the turn deadlines.
+///
+/// `started` counts every poll that entered the run and `finished` only the runs
+/// that outlived the sleep, so a cancelled run leaves `finished` untouched.
+pub(crate) struct StallingExecutor {
+    task_type: &'static str,
+    delay: Duration,
+    pub(crate) started: Arc<AtomicUsize>,
+    pub(crate) finished: Arc<AtomicUsize>,
+}
+
+impl StallingExecutor {
+    pub(crate) fn new(
+        task_type: &'static str,
+        delay: Duration,
+    ) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                task_type,
+                delay,
+                started: Arc::clone(&started),
+                finished: Arc::clone(&finished),
+            },
+            started,
+            finished,
+        )
+    }
+}
+
+#[async_trait]
+impl TaskExecutor for StallingExecutor {
+    fn task_type(&self) -> &str {
+        self.task_type
+    }
+
+    fn description(&self) -> &str {
+        STUB_DESCRIPTION
+    }
+
+    async fn execute(&self, _task: &Task, _ctx: &TaskContext<'_>) -> Result<TaskResult> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        self.finished.fetch_add(1, Ordering::SeqCst);
+        Ok(TaskResult::text("slow"))
+    }
+}
+
 /// Handler that answers every event with one fixed outcome.
 pub(crate) struct StubHandler {
     pub(crate) outcome: EventHandlerOutcome,
@@ -155,6 +270,44 @@ impl IntentRecognizer for CountingRecognizer {
                     .with_name(format!("t{call}{index}"))
             })
             .collect())
+    }
+}
+
+/// Recognizer that records the history it was handed and then delegates to its
+/// own plain recognition.
+pub(crate) struct RecordingRecognizer {
+    pub(crate) histories: RecordedHistories,
+}
+
+impl RecordingRecognizer {
+    pub(crate) fn new() -> (Self, RecordedHistories) {
+        let histories = Arc::new(SyncMutex::new(Vec::new()));
+        (
+            Self {
+                histories: Arc::clone(&histories),
+            },
+            histories,
+        )
+    }
+}
+
+#[async_trait]
+impl IntentRecognizer for RecordingRecognizer {
+    fn name(&self) -> &str {
+        STUB_NAME
+    }
+
+    async fn recognize(&self, event: &Event) -> Result<Vec<Intent>> {
+        Ok(vec![Intent::default_for(event.clone())])
+    }
+
+    async fn recognize_with_history(
+        &self,
+        event: &Event,
+        history: &[HistoryEntry],
+    ) -> Result<Vec<Intent>> {
+        self.histories.lock().push(history.to_vec());
+        self.recognize(event).await
     }
 }
 
@@ -263,6 +416,14 @@ pub(crate) async fn await_counter(counter: &AtomicUsize, count: usize) {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+/// Awaits `future` under a 10 s guard, so a stuck operation fails the test
+/// instead of hanging it.
+pub(crate) async fn bounded<F: Future>(future: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(10), future)
+        .await
+        .expect("the operation finishes within the test bound")
 }
 
 /// Invokes `controller` with an empty query after queueing one control event

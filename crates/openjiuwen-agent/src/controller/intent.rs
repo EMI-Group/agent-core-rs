@@ -8,6 +8,7 @@
 //! [`LlmIntentRecognizer`] asks the model for a JSON intent list and
 //! [`RuleIntentRecognizer`] offers an offline keyword recognizer. [`Planner`]
 //! then turns the recognized intents into [`Task`]s.
+use super::history::{HistoryEntry, HistoryRole};
 use super::schema::{Event, EventType, Intent, IntentType, Task};
 use async_trait::async_trait;
 use openjiuwen_common::error::Result;
@@ -116,6 +117,29 @@ pub trait IntentRecognizer: Send + Sync {
     /// Returns [`openjiuwen_common::error::Error`] when the recognizer cannot
     /// inspect the event at all; user text itself never fails recognition.
     async fn recognize(&self, event: &Event) -> Result<Vec<Intent>>;
+
+    /// Recognizes the intents carried by `event`, given the conversation so far.
+    ///
+    /// `history` is the controller's trimmed conversation history of the session:
+    /// oldest entry first, at most
+    /// [`ControllerConfig::history_limit`](super::ControllerConfig::history_limit)
+    /// messages, and the current turn excluded. The default implementation
+    /// ignores it — every recognizer that does not need context therefore keeps
+    /// exactly the behaviour of [`IntentRecognizer::recognize`] — while
+    /// [`LlmIntentRecognizer`] replays it as prior turns. The controller calls
+    /// this method instead of `recognize`.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`IntentRecognizer::recognize`].
+    async fn recognize_with_history(
+        &self,
+        event: &Event,
+        history: &[HistoryEntry],
+    ) -> Result<Vec<Intent>> {
+        let _ = history;
+        self.recognize(event).await
+    }
 }
 
 /// Default recognizer: keyword rules, or one `default` create-task intent.
@@ -204,6 +228,13 @@ Each array element is an object with:
 Prefer create_task whenever the request asks for new work; use unknown_task only \
 when the request cannot be classified.";
 
+/// Most conversation-history entries replayed ahead of the current event.
+///
+/// The replay is bounded so recognition stays deterministic and cheap no matter
+/// how long the session's history is: only the newest
+/// `HISTORY_REPLAY_LIMIT` non-empty entries reach the model.
+const HISTORY_REPLAY_LIMIT: usize = 8;
+
 /// LLM-backed recognizer: asks the model for a JSON intent list.
 ///
 /// Recognition never aborts a turn: a missing answer, malformed JSON, an
@@ -255,6 +286,53 @@ impl LlmIntentRecognizer {
     #[must_use]
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    /// Builds the model messages of one recognition.
+    ///
+    /// Always the system prompt first and `text` last, with the newest
+    /// [`HISTORY_REPLAY_LIMIT`] non-empty `history` entries replayed in between
+    /// as prior turns (oldest first, [`HistoryRole::User`] as a user message and
+    /// [`HistoryRole::Assistant`] as an assistant message).
+    fn messages_for(&self, text: &str, history: &[HistoryEntry]) -> Vec<BaseMessage> {
+        let replayed: Vec<&HistoryEntry> = history
+            .iter()
+            .filter(|entry| !entry.text.is_empty())
+            .collect();
+        let start = replayed.len().saturating_sub(HISTORY_REPLAY_LIMIT);
+        let replayed = &replayed[start..];
+        let mut messages = Vec::with_capacity(replayed.len() + 2);
+        messages.push(BaseMessage::system(self.prompt.clone()));
+        messages.extend(replayed.iter().map(|entry| match entry.role {
+            HistoryRole::User => BaseMessage::user(entry.text.clone()),
+            HistoryRole::Assistant => BaseMessage::assistant(entry.text.clone()),
+        }));
+        messages.push(BaseMessage::user(text));
+        messages
+    }
+
+    /// Calls the model with `messages` and parses its answer for `event`.
+    ///
+    /// Fail-open, exactly like every other recognition path: a model failure
+    /// falls back to the `default` create-task intent.
+    async fn recognize_with_messages(
+        &self,
+        event: &Event,
+        messages: &[BaseMessage],
+    ) -> Result<Vec<Intent>> {
+        match self.model.invoke(messages, &self.request).await {
+            Ok(response) => {
+                let answer = response
+                    .message()
+                    .map(|message| message.text().into_owned())
+                    .unwrap_or_default();
+                Ok(self.parse(&answer, event))
+            }
+            Err(error) => {
+                warn!(%error, "intent recognition model call failed; using the default intent");
+                Ok(vec![Intent::default_for(event.clone())])
+            }
+        }
     }
 
     /// Tolerantly parses a model answer into intents.
@@ -322,23 +400,20 @@ impl IntentRecognizer for LlmIntentRecognizer {
         let Some(text) = event.text().filter(|text| !text.is_empty()) else {
             return Ok(vec![Intent::default_for(event.clone())]);
         };
-        let messages = [
-            BaseMessage::system(self.prompt.clone()),
-            BaseMessage::user(text),
-        ];
-        match self.model.invoke(&messages, &self.request).await {
-            Ok(response) => {
-                let answer = response
-                    .message()
-                    .map(|message| message.text().into_owned())
-                    .unwrap_or_default();
-                Ok(self.parse(&answer, event))
-            }
-            Err(error) => {
-                warn!(%error, "intent recognition model call failed; using the default intent");
-                Ok(vec![Intent::default_for(event.clone())])
-            }
-        }
+        let messages = self.messages_for(&text, &[]);
+        self.recognize_with_messages(event, &messages).await
+    }
+
+    async fn recognize_with_history(
+        &self,
+        event: &Event,
+        history: &[HistoryEntry],
+    ) -> Result<Vec<Intent>> {
+        let Some(text) = event.text().filter(|text| !text.is_empty()) else {
+            return Ok(vec![Intent::default_for(event.clone())]);
+        };
+        let messages = self.messages_for(&text, history);
+        self.recognize_with_messages(event, &messages).await
     }
 }
 
@@ -914,5 +989,124 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].task_id, "s1_task_1");
         assert_eq!(planner.next_seq(), 2);
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use openjiuwen_foundation::Role;
+    use openjiuwen_test_support::{ModelCall, ScriptedModel};
+
+    /// The text of every message of `call`, in order.
+    fn texts(call: &ModelCall) -> Vec<String> {
+        call.messages
+            .iter()
+            .map(|message| message.text().into_owned())
+            .collect()
+    }
+
+    /// A one-answer scripted recognizer with the prompt `"p"`.
+    fn scripted(answer: &str) -> (LlmIntentRecognizer, ScriptedModel) {
+        let model = ScriptedModel::builder().respond_text(answer).build();
+        let recognizer = LlmIntentRecognizer::new(Arc::new(model.clone())).with_prompt("p");
+        (recognizer, model)
+    }
+
+    const ANSWER: &str = r#"[{"intent_type":"create_task","description":"x"}]"#;
+
+    #[tokio::test]
+    async fn default_history_hook_matches_plain_recognition() {
+        let recognizer = RuleIntentRecognizer::new();
+        let event = Event::user_input("hi");
+        let plain = recognizer.recognize(&event).await.unwrap();
+        let with_history = recognizer
+            .recognize_with_history(
+                &event,
+                &[
+                    HistoryEntry::user("earlier"),
+                    HistoryEntry::assistant("reply"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(with_history, plain);
+        assert_eq!(with_history.len(), 1);
+        assert_eq!(with_history[0].intent_type, IntentType::CreateTask);
+        assert_eq!(with_history[0].label(), "default");
+    }
+
+    #[tokio::test]
+    async fn llm_recognizer_replays_history_as_prior_turns() {
+        let (recognizer, model) = scripted(ANSWER);
+        let history = [
+            HistoryEntry::user("earlier"),
+            HistoryEntry::assistant("reply").with_task_id("t1"),
+        ];
+        let intents = recognizer
+            .recognize_with_history(&Event::user_input("current"), &history)
+            .await
+            .unwrap();
+        let call = model.last_call().unwrap();
+        assert_eq!(texts(&call), ["p", "earlier", "reply", "current"]);
+        assert_eq!(call.messages[0].role, Role::System);
+        assert_eq!(call.messages[1].role, Role::User);
+        assert_eq!(call.messages[2].role, Role::Assistant);
+        assert_eq!(call.messages[3].role, Role::User);
+        assert_eq!(model.call_count(), 1);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].description(), Some("x"));
+    }
+
+    #[tokio::test]
+    async fn llm_recognizer_bounds_the_replayed_history() {
+        let (recognizer, model) = scripted(ANSWER);
+        let history: Vec<HistoryEntry> = (0..HISTORY_REPLAY_LIMIT + 2)
+            .map(|index| HistoryEntry::user(format!("h{index}")))
+            .collect();
+        recognizer
+            .recognize_with_history(&Event::user_input("current"), &history)
+            .await
+            .unwrap();
+        let call = model.last_call().unwrap();
+        assert_eq!(call.messages.len(), HISTORY_REPLAY_LIMIT + 2);
+        assert_eq!(call.messages[1].text(), "h2");
+        assert_eq!(
+            call.messages[HISTORY_REPLAY_LIMIT].text(),
+            format!("h{}", HISTORY_REPLAY_LIMIT + 1)
+        );
+        assert_eq!(call.messages[HISTORY_REPLAY_LIMIT + 1].text(), "current");
+    }
+
+    #[tokio::test]
+    async fn llm_recognizer_skips_empty_history_entries() {
+        let (recognizer, model) = scripted(ANSWER);
+        let history = [
+            HistoryEntry::user("kept-1"),
+            HistoryEntry::user(""),
+            HistoryEntry::assistant(""),
+            HistoryEntry::assistant("kept-2"),
+        ];
+        recognizer
+            .recognize_with_history(&Event::user_input("now"), &history)
+            .await
+            .unwrap();
+        let call = model.last_call().unwrap();
+        assert_eq!(texts(&call), ["p", "kept-1", "kept-2", "now"]);
+    }
+
+    #[tokio::test]
+    async fn llm_recognizer_skips_empty_event_text_with_history() {
+        let (recognizer, model) = scripted("unused");
+        let intents = recognizer
+            .recognize_with_history(
+                &Event::new(EventType::Input),
+                &[HistoryEntry::user("earlier")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(model.call_count(), 0);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].label(), "default");
     }
 }
