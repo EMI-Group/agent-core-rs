@@ -52,7 +52,8 @@ Both reuse paths refresh the record's configuration bookkeeping after the launch
 - `SandboxGatewayConfig::auth_headers`/`auth_query_params` are carried but never applied; `GatewayInvokeRequest`/`GatewayResponse` are the only wire-envelope types.
 - `sandbox_types()` enumerates the filesystem map only, so a type registered with shell/code alone is not listed.
 - `openjiuwen-core` (and therefore `openjiuwen-extensions`) does not forward the `sandbox` feature; the `http` module compiles only for a direct `openjiuwen-sysop` dependency with `features = ["sandbox"]`.
-- Forwarding wrappers never serialize, inspect, or re-map parameters or `OpResult`; failures stay values with code 199007 and `"sandbox gateway error, operation: <method>, reason: <reason>"`.
+- Forwarding wrappers never serialize, inspect, or re-map parameters or `OpResult`; failures stay values with the `"sandbox gateway error, operation: <method>, reason: <reason>"` envelope — code 199007 for a real gateway/provider failure, code 199012 (`SysOpStatus::Unsupported`, a Rust-only addition) when the backend does not implement the capability.
+- `sandbox::http::gateway_failure` is the single mapping from a shared `Error` to an `OpResult`: `ErrorKind::Unsupported` → 199012 via `result::unsupported_failure`, every other kind → 199007; `OpResult::into_result`/`into_optional_result` turn 199012 back into `ErrorKind::Unsupported`.
 - `register_builtin_providers` is inert unless the `sandbox` feature is on and `launcher.base_url` is non-blank; `install` checks `has_fs`/`has_shell`/`has_code` first, so a provider registered externally before construction wins, while a later duplicate `register_*` returns `ErrorKind::SysOp` ("already registered").
 - Tests register fakes in local registries (`LauncherRegistry::new`, `SandboxProviderRegistry::new`) and never in `provider::global()`/`launcher::global()`; the only global assertions are read-only (`has("pre_deploy")`, identity, empty lifecycle sweep).
 
@@ -62,6 +63,7 @@ Both reuse paths refresh the record's configuration bookkeeping after the launch
 | --- | --- | --- | --- |
 | card/gateway configuration (`launcher_config` missing, managed launcher via the sync path) | 199002 | `card::card_param_error` | `SysOp` |
 | gateway transport failure | 199007 | `gateway_error` / `sandbox_gateway_message` | `SysOp` |
+| gateway backend does not implement the capability (`ErrorKind::Unsupported`) | 199012 | `result::unsupported_failure` / `status::unsupported_message` | `Unsupported` (restored by `into_result`) |
 | launcher `launch`/`resume`/`delete`/`pause`/`check_status` failure | 199008 | `launcher_error` / `sandbox_launcher_message` | `SysOp` |
 | launcher cannot perform `pause`/`resume`/`delete` at all (trait defaults, `pre_deploy`) | — | `unsupported_launcher_error` / `unsupported_launcher_message` | `Unsupported` |
 | provider failure | 199009 | `provider_error` / `sandbox_provider_message` | `SysOp` |
@@ -74,7 +76,7 @@ Both reuse paths refresh the record's configuration bookkeeping after the launch
 - Launcher lifecycle is in-process only: `PreDeploymentLauncher` is the sole built-in, and the container transports (`aio`, `jiuwenbox`, `yuanrong`) are expected from `openjiuwen-extensions`, whose registration is not ported here (no network, no vendor SDKs, offline tests).
 - `PreDeploymentLauncher::delete`/`pause`/`resume` refuse with `ErrorKind::Unsupported` and its `check_status` reports `SandboxStatus::Unknown` (Python tears shared-scope containers down through the extension providers, which are not ported); a managed launcher must override whichever calls its runtime can actually perform.
 - Python's provider cache is not ported (providers are rebuilt from the resolved endpoint per operation), but its `container_config_hash`/`metadata` inputs are: the hash is the SHA-256 of the launcher config's canonical JSON and the labels are `launcher_type`/`sandbox_type` plus the string-valued `extra_params` entries.
-- Endpoint discovery beyond `launch`'s `LaunchedSandbox`, auth-header/auth-query injection, and the streaming wire format remain unimplemented (`sandbox::http::invoke` is `Unsupported`, 199007).
+- Endpoint discovery beyond `launch`'s `LaunchedSandbox`, auth-header/auth-query injection, and the streaming wire format remain unimplemented (`sandbox::http::invoke` is `Unsupported`, surfaced by `gateway_failure` as code 199012 with the `Unsupported` message as the reason, not as a 199007 gateway failure).
 - `evict_idle` compares with `>=` (Python uses `>`), and a failed eviction is logged rather than returned: the sweep keeps going so one broken container cannot pin the rest, but a container whose launcher cannot delete is logged as leaked and its record is still dropped.
 - No background sweeper: idle-stop runs on `ensure_endpoint` (when `idle_ttl_seconds` is set) and when a host calls `SysOperation::evict_idle_sandboxes*`.
 
