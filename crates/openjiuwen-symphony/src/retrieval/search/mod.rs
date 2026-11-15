@@ -64,6 +64,7 @@ pub mod codebooks;
 pub mod config;
 pub mod contracts;
 pub mod embedding;
+pub mod engine;
 pub mod expand;
 pub mod flow;
 pub mod lexical;
