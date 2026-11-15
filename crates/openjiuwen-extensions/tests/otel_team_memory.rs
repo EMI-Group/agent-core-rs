@@ -528,7 +528,7 @@ fn assert_json_span(span: &Value, event: &MemoryEvent) {
     assert_json_meta_data(span, event);
 }
 
-/// Asserts the OTel status of an OTLP/JSON span.
+/// Asserts the `OTel` status of an OTLP/JSON span.
 fn assert_json_status(span: &Value, event: &MemoryEvent) {
     match event.outcome {
         Outcome::Ok => assert_eq!(span["status"], json!({"code": "STATUS_CODE_OK"})),
