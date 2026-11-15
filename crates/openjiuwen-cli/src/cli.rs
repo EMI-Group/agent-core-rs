@@ -7,7 +7,7 @@
 //! It owns the outer layer the harness has no words for: the global options
 //! (duplicated flag-for-flag, because clap needs one `Command` tree to parse),
 //! the `auto-harness` command group, and the harness-surface commands the
-//! binary exposes directly (`lsp`, `cron`, `team`, `watch`).
+//! binary exposes directly (`lsp`, `cron`, `team`, `watch`, `sessions`).
 //!
 //! Conversion is explicit: [`Cli::to_harness`] builds the harness [`Cli`] from
 //! the parsed globals, and [`run`] hands `run`/`chat` back to
@@ -90,6 +90,17 @@ pub(crate) struct RunCliArgs {
     /// directory), and the run's workspace becomes the worktree path.
     #[arg(long, value_name = "NAME")]
     pub(crate) worktree: Option<String>,
+    /// Continue an earlier session instead of starting a new one.
+    ///
+    /// The id is looked up in the CLI session records, the persistent-agent
+    /// session records and the execution journals (see `openjiuwen sessions`);
+    /// the restored history is seeded into this run. The note naming what was
+    /// resumed goes to stderr, so stdout keeps its output format.
+    #[arg(long, value_name = "ID", conflicts_with = "continue_")]
+    pub(crate) resume: Option<String>,
+    /// Continue the most recent resumable session.
+    #[arg(long = "continue", conflicts_with = "resume")]
+    pub(crate) continue_: bool,
 }
 
 /// `chat`: the harness arguments plus the binary's own additions.
@@ -108,19 +119,34 @@ pub(crate) struct ChatCliArgs {
     /// Create (or reuse) a git worktree of the workspace repository and chat in it.
     #[arg(long, value_name = "NAME")]
     pub(crate) worktree: Option<String>,
+    /// Continue an earlier session instead of starting a new one.
+    ///
+    /// The restored transcript is seeded into the REPL, which then continues
+    /// under a fresh session id (the note on stderr names both).
+    #[arg(long, value_name = "ID", conflicts_with = "continue_")]
+    pub(crate) resume: Option<String>,
+    /// Continue the most recent resumable session.
+    #[arg(long = "continue", conflicts_with = "resume")]
+    pub(crate) continue_: bool,
 }
 
 /// Subcommands of the `openjiuwen` binary.
 ///
 /// `run` and `chat` wrap the harness argument types so their parsing is the
-/// harness's own; `auto-harness`, `lsp`, `cron`, `team` and `watch` are new here
-/// and dispatched by this crate.
+/// harness's own; `auto-harness`, `lsp`, `cron`, `team`, `watch` and `sessions`
+/// are new here and dispatched by this crate.
 #[derive(Debug, Clone, clap::Subcommand)]
 pub(crate) enum Command {
     /// Run a single prompt and exit.
     Run(RunCliArgs),
     /// Start the interactive chat REPL.
     Chat(ChatCliArgs),
+    /// List, inspect and prune the sessions a conversation can be resumed from.
+    ///
+    /// Shows the CLI session records, the persistent-agent execution journals and
+    /// the persistent-agent session records together, newest first; `run`/`chat`
+    /// resume any of them with `--resume <ID>` or `--continue`.
+    Sessions(crate::sessions::SessionsCli),
     /// Query a language server: diagnostics, navigation, call hierarchy.
     ///
     /// Drives the harness `lsp` tool from the terminal against the built-in
@@ -172,6 +198,7 @@ impl Cli {
                 | Command::Cron(_)
                 | Command::Team(_)
                 | Command::Watch(_)
+                | Command::Sessions(_)
                 | Command::AutoHarness(_),
             )
             | None => None,
@@ -191,7 +218,8 @@ impl Cli {
 
 /// Runs the parsed command line.
 ///
-/// `auto-harness`, `lsp`, `cron`, `team` and `watch` are executed here;
+/// `auto-harness`, `lsp`, `cron`, `team`, `watch` and `sessions` are executed
+/// here;
 /// `run`/`chat` go through [`crate::extras`], which applies the binary's own
 /// flags and then delegates to [`openjiuwen_harness::cli::run_cli`], which
 /// resolves options, dispatches on the terminal and runs the one-shot prompt or
@@ -201,7 +229,8 @@ impl Cli {
 ///
 /// Returns whatever the harness CLI or the binary's own commands report; see
 /// [`openjiuwen_harness::cli::run_cli`], [`auto_harness::run`], [`crate::lsp::run`],
-/// [`crate::cron::run`], [`crate::team::run`] and [`crate::watch::run`].
+/// [`crate::cron::run`], [`crate::team::run`], [`crate::watch::run`] and
+/// [`crate::sessions::run`].
 pub(crate) async fn run(cli: Cli) -> Result<()> {
     match &cli.command {
         Some(Command::AutoHarness(args)) => auto_harness::run(args, &cli.to_harness()).await,
@@ -209,6 +238,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Some(Command::Cron(args)) => crate::cron::run(args, &cli.to_harness()).await,
         Some(Command::Team(args)) => crate::team::run(args).await,
         Some(Command::Watch(args)) => crate::watch::run(args, &cli.to_harness()).await,
+        Some(Command::Sessions(args)) => crate::sessions::run(args, &cli.to_harness()).await,
         Some(Command::Run(args)) => crate::extras::run_run(args, &cli.to_harness()).await,
         Some(Command::Chat(args)) => crate::extras::run_chat(args, &cli.to_harness()).await,
         None => openjiuwen_harness::cli::run_cli(cli.to_harness()).await,
