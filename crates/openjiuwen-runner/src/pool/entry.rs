@@ -28,7 +28,7 @@ use tracing::debug;
 use crate::hitl::{InteractPayload, InteractionHub, RunBinding};
 use crate::monitor::{RunKind, RunMonitor, RunPhase, RunStart, RunStatusGuard};
 
-use super::error::{rebuild, PoolError};
+use super::error::rebuild;
 use super::key::PoolKey;
 use super::LOG_TARGET;
 
@@ -59,7 +59,7 @@ pub struct ActiveTeamInfo {
     pub label: String,
     /// The run's phase; terminal phases describe a retained finished run.
     pub state: RunPhase,
-    /// Whether the entry's interaction gate is closed (paused).
+    /// Whether the entry's interaction gate is closed (finalised).
     pub gate_closed: bool,
     /// Whether the run holds a concurrency permit and is in flight.
     pub running: bool,
@@ -75,8 +75,8 @@ pub struct ActiveTeamInfo {
 /// **best effort**: a subscriber that falls behind sees
 /// `broadcast::error::RecvError::Lagged` and loses the missed frames, because
 /// frames are never replayed. [`PoolFrame::Started`] is emitted once when the
-/// run is admitted, [`PoolFrame::Paused`]/[`PoolFrame::Resumed`] once per
-/// coordination signal, [`PoolFrame::Output`] once per stream frame, and the
+/// run is admitted, [`PoolFrame::Payload`] once per buffered inbound payload,
+/// [`PoolFrame::Output`] once per stream frame, and the
 /// terminal [`PoolFrame::Completed`] / [`PoolFrame::Failed`] /
 /// [`PoolFrame::Cancelled`] exactly once.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,10 +91,6 @@ pub enum PoolFrame {
         /// The session the run is bound to.
         session_id: String,
     },
-    /// The entry was paused (a coordination signal; the team keeps running).
-    Paused,
-    /// The entry was resumed.
-    Resumed,
     /// One inbound human payload reached the run's buffer.
     Payload {
         /// The payload that arrived.
@@ -246,10 +242,8 @@ pub(crate) struct Entry {
     binding: Mutex<Option<RunBinding>>,
     /// Whether finalisation already happened.
     finalised: AtomicBool,
-    /// The hub the run is registered on, when any (`pause`/`resume`/`cancel`).
+    /// The hub the run is registered on, when any (`cancel`).
     hub: Option<Arc<InteractionHub>>,
-    /// The monitor the run mirrors into, when any.
-    monitor: Option<Arc<RunMonitor>>,
     /// The buffered inbound payloads.
     payloads: Mutex<VecDeque<InteractPayload>>,
 }
@@ -263,7 +257,7 @@ impl Entry {
     pub(crate) fn new(init: EntryInit) -> Self {
         let detail = json!({"team": init.key.team_name});
         let status = RunStatusGuard::begin(
-            init.monitor.clone(),
+            init.monitor,
             &init.run_id,
             RunStart::new(RunKind::Team, init.label.clone())
                 .with_session(init.key.session_id.clone())
@@ -295,7 +289,6 @@ impl Entry {
             binding: Mutex::new(None),
             finalised: AtomicBool::new(false),
             hub: init.hub,
-            monitor: init.monitor,
             payloads: Mutex::new(VecDeque::new()),
         }
     }
@@ -451,44 +444,6 @@ impl Entry {
         state.gate_closed = false;
     }
 
-    /// Closes the entry's gate (a coordination signal, not a suspension).
-    ///
-    /// # Errors
-    ///
-    /// [`ErrorKind::NotFound`] when the run is already terminal.
-    pub(crate) fn pause(&self) -> Result<()> {
-        {
-            let mut state = self.state.lock();
-            if state.phase.is_terminal() {
-                return Err(PoolError::not_found(&self.key).into_error());
-            }
-            state.phase = RunPhase::Paused;
-            state.gate_closed = true;
-        }
-        self.mirror_pause();
-        self.emit(PoolFrame::Paused);
-        Ok(())
-    }
-
-    /// Opens the entry's gate again (a coordination signal).
-    ///
-    /// # Errors
-    ///
-    /// [`ErrorKind::NotFound`] when the run is already terminal.
-    pub(crate) fn resume(&self) -> Result<()> {
-        {
-            let mut state = self.state.lock();
-            if state.phase.is_terminal() {
-                return Err(PoolError::not_found(&self.key).into_error());
-            }
-            state.phase = RunPhase::Running;
-            state.gate_closed = false;
-        }
-        self.mirror_resume();
-        self.emit(PoolFrame::Resumed);
-        Ok(())
-    }
-
     /// Trips the run's token so the worker finishes it as cancelled.
     pub(crate) fn cancel(&self) {
         if self.is_terminal() {
@@ -632,36 +587,6 @@ impl Entry {
         *self.permit.lock() = None;
         self.wake.notify_waiters();
         true
-    }
-
-    /// Mirrors a pause into the hub and the monitor, best effort.
-    fn mirror_pause(&self) {
-        let detail = json!({"team": self.key.team_name});
-        if let Some(hub) = self.hub.as_ref() {
-            if let Err(error) = hub.pause(&self.run_id) {
-                debug!(target: LOG_TARGET, run_id = %self.run_id, %error, "hub pause failed");
-            }
-        }
-        if let Some(monitor) = self.monitor.as_ref() {
-            if let Err(error) = monitor.update(&self.run_id, RunPhase::Paused, detail) {
-                debug!(target: LOG_TARGET, run_id = %self.run_id, %error, "monitor pause failed");
-            }
-        }
-    }
-
-    /// Mirrors a resume into the hub and the monitor, best effort.
-    fn mirror_resume(&self) {
-        let detail = json!({"team": self.key.team_name});
-        if let Some(hub) = self.hub.as_ref() {
-            if let Err(error) = hub.resume(&self.run_id) {
-                debug!(target: LOG_TARGET, run_id = %self.run_id, %error, "hub resume failed");
-            }
-        }
-        if let Some(monitor) = self.monitor.as_ref() {
-            if let Err(error) = monitor.update(&self.run_id, RunPhase::Running, detail) {
-                debug!(target: LOG_TARGET, run_id = %self.run_id, %error, "monitor resume failed");
-            }
-        }
     }
 
     /// Mirrors a cancellation into the hub, best effort.
@@ -815,25 +740,6 @@ mod tests {
         assert_eq!(entry.leases(), 0);
     }
 
-    #[test]
-    fn pause_and_resume_signal_the_entry_and_refuse_a_terminal_run() {
-        let entry = entry("run-1");
-        entry.mark_running();
-        assert_eq!(entry.phase(), RunPhase::Running);
-        entry.pause().unwrap();
-        assert_eq!(entry.info().state, RunPhase::Paused);
-        assert!(entry.info().gate_closed);
-        entry.resume().unwrap();
-        assert_eq!(entry.info().state, RunPhase::Running);
-        assert!(!entry.info().gate_closed);
-
-        entry.finalise(&FinalOutcome::Cancelled("stop".to_owned()), 1);
-        let error = entry.pause().unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::NotFound);
-        let error = entry.resume().unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::NotFound);
-    }
-
     #[tokio::test]
     async fn payloads_are_bounded_dropping_the_oldest() {
         let entry = entry("run-1");
@@ -957,8 +863,6 @@ mod tests {
                 },
                 "started",
             ),
-            (PoolFrame::Paused, "paused"),
-            (PoolFrame::Resumed, "resumed"),
             (PoolFrame::Output { value: json!(1) }, "output"),
             (
                 PoolFrame::Completed {

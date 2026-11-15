@@ -151,7 +151,7 @@ impl fmt::Debug for PoolRun {
 /// `TeamPoolConfig::idle_timeout` passes (and a still-running orphan is stopped
 /// at the same deadline). Dropping a lease releases it.
 pub struct PoolLease {
-    /// The pool the run belongs to (for `pause`/`resume`).
+    /// The pool the run belongs to (for `pause`/`resume`/`stop`).
     pool: TeamPool,
     /// The run the lease holds.
     run: PoolRun,
@@ -190,20 +190,21 @@ impl PoolLease {
         self.run.wait().await
     }
 
-    /// Pauses the leased run (a coordination signal; the team keeps running).
+    /// Refuses to pause the leased run; see [`TeamPool::pause`].
     ///
     /// # Errors
     ///
-    /// [`PoolError::NotFound`] when the run left the pool.
+    /// [`PoolError::NotFound`] when the run left the pool or already finished,
+    /// and [`Error::Unsupported`] for a live run (nothing can suspend it).
     pub fn pause(&self) -> Result<()> {
         self.pool.pause(self.run.key())
     }
 
-    /// Resumes the leased run (a coordination signal).
+    /// Refuses to resume the leased run; see [`TeamPool::pause`].
     ///
     /// # Errors
     ///
-    /// [`PoolError::NotFound`] when the run left the pool.
+    /// Same as [`PoolLease::pause`].
     pub fn resume(&self) -> Result<()> {
         self.pool.resume(self.run.key())
     }
@@ -428,33 +429,48 @@ impl TeamPool {
         Ok(true)
     }
 
-    /// Closes the entry's gate and reports it as paused.
+    /// Refuses to pause the run pooled under `key`.
     ///
-    /// A coordination signal only: it does not suspend the team loop (Python's
-    /// live `InteractGate` wake-up is deferred).
+    /// A live run answers [`Error::Unsupported`]: the in-process team strategy
+    /// owns no mid-flight suspension seam, so nothing can suspend the invocation
+    /// (Python's live `InteractGate` wake-up is deferred), and reporting
+    /// [`RunPhase::Paused`] would describe a run that keeps running. The refusal
+    /// changes nothing — no phase, no gate, no frame, no monitor transition — and
+    /// a host that must stop the run calls [`TeamPool::stop`] or
+    /// [`PoolRun::cancel`], which trip the run's cancellation token.
     ///
     /// # Errors
     ///
-    /// [`PoolError::NotFound`] when no live run is pooled under `key`.
+    /// [`PoolError::NotFound`] when no live run is pooled under `key` (unknown
+    /// key, or an entry that already finished), and [`Error::Unsupported`] for a
+    /// live one.
     pub fn pause(&self, key: &PoolKey) -> Result<()> {
-        let entry = self
-            .inner
-            .entry(key)
-            .ok_or_else(|| PoolError::not_found(key).into_error())?;
-        entry.pause()
+        self.refuse_suspension("pause", key)
     }
 
-    /// Opens the entry's gate and reports it as resumed.
+    /// Refuses to resume the run pooled under `key`; see [`TeamPool::pause`].
     ///
     /// # Errors
     ///
-    /// [`PoolError::NotFound`] when no live run is pooled under `key`.
+    /// Same as [`TeamPool::pause`].
     pub fn resume(&self, key: &PoolKey) -> Result<()> {
+        self.refuse_suspension("resume", key)
+    }
+
+    /// The typed refusal a pause/resume of `key` reports.
+    ///
+    /// Shared so the two verbs cannot drift: the negative answers (unknown key,
+    /// finished entry) keep their [`PoolError::NotFound`] wording, and a live
+    /// entry names the missing suspension seam.
+    fn refuse_suspension(&self, action: &str, key: &PoolKey) -> Result<()> {
         let entry = self
             .inner
             .entry(key)
             .ok_or_else(|| PoolError::not_found(key).into_error())?;
-        entry.resume()
+        if entry.is_terminal() {
+            return Err(PoolError::not_found(key).into_error());
+        }
+        Err(crate::error::no_suspension_seam(action, entry.run_id()))
     }
 
     /// Drains the buffered inbound human payloads of the run under `key`.

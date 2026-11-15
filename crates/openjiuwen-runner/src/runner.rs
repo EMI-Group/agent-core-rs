@@ -814,30 +814,35 @@ impl Runner {
         self.team_pool().stop(&key).await
     }
 
-    /// Pauses the pooled team run bound to `(team_name, session_id)`.
+    /// Refuses to pause the pooled team run bound to `(team_name, session_id)`.
     ///
-    /// A coordination signal, not a scheduler: it closes the run's interaction
-    /// gate and reports the run as paused, but does not suspend the team loop
-    /// (Python's live `InteractGate` wake-up is deferred).
+    /// A live run answers `Error::Unsupported`: the in-process team strategy owns
+    /// no mid-flight suspension seam, so nothing can suspend the invocation
+    /// (Python's live `InteractGate` wake-up is deferred) and reporting the run as
+    /// paused would describe a run that keeps running. The refusal changes
+    /// nothing — no phase, no gate, no frame, no monitor transition — and
+    /// [`Runner::stop_agent_team`] cancels the run for real.
     ///
     /// Kept `async` so the facade's team controls share one shape and a future
     /// gate-aware pause can await without an API change.
     ///
     /// # Errors
     ///
-    /// `Error::NotFound` when no live run is pooled under the key.
+    /// `Error::NotFound` when no live run is pooled under the key, and
+    /// `Error::Unsupported` for a live one.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // deliberate: see the doc comment
     pub async fn pause_agent_team(&self, team_name: &str, session_id: &str) -> Result<()> {
         self.team_pool().pause(&PoolKey::new(team_name, session_id))
     }
 
-    /// Resumes a paused pooled team run bound to `(team_name, session_id)`.
+    /// Refuses to resume the pooled team run bound to `(team_name, session_id)`.
     ///
-    /// A coordination signal; see [`Runner::pause_agent_team`].
+    /// Same refusal as [`Runner::pause_agent_team`].
     ///
     /// # Errors
     ///
-    /// `Error::NotFound` when no live run is pooled under the key.
+    /// `Error::NotFound` when no live run is pooled under the key, and
+    /// `Error::Unsupported` for a live one.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // deliberate: see `pause_agent_team`
     pub async fn resume_agent_team(&self, team_name: &str, session_id: &str) -> Result<()> {
         self.team_pool()
