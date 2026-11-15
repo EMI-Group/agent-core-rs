@@ -251,7 +251,8 @@ pub struct ClaudeCodeHarnessConfig {
     /// How the host system prompt combines with the CLI preset.
     #[serde(default)]
     pub system_prompt_mode: ClaudeSystemPromptMode,
-    /// Stream partial assistant messages instead of complete ones.
+    /// Ask the CLI for partial-message stream events (`--include-partial-messages`), which the
+    /// driver projects as text/thinking deltas in addition to the complete message blocks.
     #[serde(default = "default_true")]
     pub include_partial_messages: bool,
     /// Maximum number of agent turns per query.
@@ -441,9 +442,12 @@ pub fn provider() -> ClaudeCodeHarnessProvider {
 
 /// Returns the capability card of the Claude Code adapter.
 ///
-/// The card declares what the subprocess adapter exploits: steering, graceful abort, persistent
-/// sessions, checkpoints, MCP tools, model selection/discovery over endpoint models and the
-/// authentication fallback to `fallback_model`.
+/// The declarations follow Python's card (the registry-facing contract): steering, graceful abort,
+/// persistent sessions, checkpoints, MCP tools, model selection/discovery, endpoint models and the
+/// authentication fallback to `fallback_model`. Two of them are metadata this adapter does not act
+/// on: the host's MCP servers are never forwarded to the CLI (no `--mcp-config` bridge), and the
+/// shell exposes no `HarnessModelControl` seam, so nothing implements model selection or
+/// discovery — see the crate's `CONTEXT.md` for both documented gaps.
 #[must_use]
 pub fn card() -> HarnessCard {
     vendor::vendor_card(

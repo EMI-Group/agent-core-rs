@@ -33,8 +33,8 @@
 //! - [`build_harness_context`] silently *drops* MCP servers for the `native` provider (see its
 //!   documentation) instead of raising.
 //! - Provider descriptors distinguish [`Error::NotFound`] (unknown name), [`Error::Unsupported`]
-//!   (declared but not implemented) and [`Error::Validation`] (invalid input) where Python raises a
-//!   single `ValueError`.
+//!   (declared but not available in this build) and [`Error::Validation`] (invalid input) where
+//!   Python raises a single `ValueError`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -186,8 +186,9 @@ pub fn available_providers() -> Vec<String> {
 /// Resolves `name` to the provider that serves it.
 ///
 /// The built-in table is consulted first and its result is returned verbatim, including the
-/// `Unsupported` error of a declared-but-deferred provider. Only names outside the table reach the
-/// registry; a registered factory is invoked after the registry lock is released.
+/// `Unsupported` error of a declared provider whose feature this build was compiled without. Only
+/// names outside the table reach the registry; a registered factory is invoked after the registry
+/// lock is released.
 ///
 /// # Errors
 ///
