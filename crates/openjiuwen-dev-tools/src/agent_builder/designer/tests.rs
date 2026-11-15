@@ -4,6 +4,7 @@
 //! Every case runs offline on scripted models: no network, no environment reads,
 //! and no wall-clock dependence.
 use super::*;
+use crate::agent_builder::outcome::GenerationSource;
 use openjiuwen_common::error::ErrorKind;
 use openjiuwen_test_support::{ScriptedModel, ScriptedTurn};
 use serde_json::json;
@@ -533,4 +534,96 @@ fn debug_reports_whether_a_model_is_configured() {
     let model = Arc::new(ScriptedModel::text(MODEL_FENCE));
     let wired = WorkflowDesigner::with_model(dynamic(&model));
     assert_eq!(format!("{wired:?}"), "WorkflowDesigner { has_model: true }");
+}
+
+#[tokio::test]
+async fn design_with_provenance_records_the_deterministic_stage() {
+    let designer = WorkflowDesigner::new();
+    let query = "Collect the order.";
+    let outcome = designer
+        .design_with_provenance(query)
+        .await
+        .expect("design outcome");
+
+    assert_eq!(
+        outcome.design,
+        designer.design_offline(query).expect("offline design"),
+        "the single-pass design is unchanged"
+    );
+    assert_eq!(outcome.provenance.len(), 1);
+    let record = &outcome.provenance.stages[0];
+    assert_eq!(record.stage, ProgressStage::GeneratingWorkflowDesign);
+    assert_eq!(record.source, GenerationSource::Deterministic);
+    assert_eq!(
+        record.detail,
+        "no model configured; deterministic design synthesis"
+    );
+    assert_eq!(
+        outcome
+            .provenance
+            .stages_matching(GenerationSource::Model)
+            .len(),
+        0
+    );
+    assert!(!outcome.provenance.has_fallback());
+}
+
+#[tokio::test]
+async fn design_with_provenance_records_the_model_stage() {
+    let model = Arc::new(ScriptedModel::text(MODEL_FENCE));
+    let designer = WorkflowDesigner::with_model(dynamic(&model));
+    let outcome = designer
+        .design_with_provenance("handle an order")
+        .await
+        .expect("design outcome");
+
+    assert_eq!(outcome.design.name, "order-flow");
+    assert_eq!(outcome.provenance.len(), 1);
+    let record = &outcome.provenance.stages[0];
+    assert_eq!(record.source, GenerationSource::Model);
+    assert_eq!(record.detail, "");
+    assert!(!outcome.provenance.has_deviation());
+    assert_eq!(model.call_count(), 1);
+}
+
+#[tokio::test]
+async fn design_with_provenance_records_a_rejected_answer() {
+    let model = Arc::new(ScriptedModel::text(INVALID_FENCE));
+    let designer = WorkflowDesigner::with_model(dynamic(&model));
+    let query = "Collect the order.";
+    let outcome = designer
+        .design_with_provenance(query)
+        .await
+        .expect("design outcome");
+
+    assert_eq!(
+        outcome.design,
+        designer.design_offline(query).expect("offline design")
+    );
+    assert_eq!(outcome.provenance.fallback_count(), 1);
+    let record = &outcome.provenance.stages[0];
+    assert_eq!(record.source, GenerationSource::Fallback);
+    assert!(
+        record.detail.contains("exactly one start node"),
+        "detail names the validation failure: {}",
+        record.detail
+    );
+    assert_eq!(model.call_count(), 1);
+}
+
+#[test]
+fn design_outcome_round_trips_through_json() {
+    let outcome = DesignOutcome {
+        design: sample_design(),
+        provenance: GenerationProvenance::default(),
+    };
+
+    let text = serde_json::to_string(&outcome).expect("serialize");
+    let parsed: DesignOutcome = serde_json::from_str(&text).expect("parse");
+    assert_eq!(parsed, outcome);
+
+    let partial: DesignOutcome =
+        serde_json::from_str(r#"{"design": {"name": "kept"}}"#).expect("parse");
+    assert_eq!(partial.design.name, "kept");
+    assert!(partial.provenance.is_empty());
 }
