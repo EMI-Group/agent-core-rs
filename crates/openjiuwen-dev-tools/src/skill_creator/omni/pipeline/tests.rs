@@ -375,10 +375,12 @@ async fn model_assisted_generation_uses_the_fenced_json() {
     );
     let creation = OmniCreation::new(Arc::new(ScriptedFetcher::new()))
         .with_model(Arc::new(ScriptedModel::text(answer)));
-    let definition = creation
-        .generate_with_model(&page, &[])
+    let generated = creation
+        .generate_with_model_profiled(&page, &[])
         .await
         .expect("models the skill");
+    assert_eq!(generated.provenance, GenerationProvenance::Model);
+    let definition = generated.definition;
 
     assert_eq!(definition.name, "model-widget");
     assert_eq!(
@@ -412,28 +414,124 @@ async fn model_failures_fall_back_to_the_deterministic_skill() {
     let garbage = OmniCreation::new(Arc::new(ScriptedFetcher::new()))
         .with_model(Arc::new(ScriptedModel::text("Sure, here you go")));
     let fallback = garbage
-        .generate_with_model(&page, &[])
+        .generate_with_model_profiled(&page, &[])
         .await
         .expect("falls back without a fence");
-    assert_eq!(fallback, deterministic);
+    assert_eq!(fallback.provenance, GenerationProvenance::Deterministic);
+    assert_eq!(fallback.definition, deterministic);
 
     let malformed = OmniCreation::new(Arc::new(ScriptedFetcher::new())).with_model(Arc::new(
-        ScriptedModel::text("```json\n{\"name\": \"bad name\"}\n```"),
+        ScriptedModel::text("```json\n{\"name\": \"only a name\"}\n```"),
     ));
     let fallback = malformed
-        .generate_with_model(&page, &[])
+        .generate_with_model_profiled(&page, &[])
         .await
         .expect("falls back on an incomplete payload");
-    assert_eq!(fallback, deterministic);
+    assert_eq!(fallback.provenance, GenerationProvenance::Deterministic);
+    assert_eq!(fallback.definition, deterministic);
 
     let failing = OmniCreation::new(Arc::new(ScriptedFetcher::new())).with_model(Arc::new(
         ScriptedModel::new([ScriptedTurn::fail("provider down")]),
     ));
     let fallback = failing
-        .generate_with_model(&page, &[])
+        .generate_with_model_profiled(&page, &[])
         .await
         .expect("falls back on a model error");
-    assert_eq!(fallback, deterministic);
+    assert_eq!(fallback.provenance, GenerationProvenance::Deterministic);
+    assert_eq!(fallback.definition, deterministic);
+
+    // A complete payload whose name is not a valid skill name passes parsing
+    // but fails definition validation, which also falls back.
+    let invalid = OmniCreation::new(Arc::new(ScriptedFetcher::new())).with_model(Arc::new(
+        ScriptedModel::text(
+            "```json\n\
+             {\"name\": \"bad name\", \"description\": \"Desc\", \"instructions\": \"Body\"}\n\
+             ```",
+        ),
+    ));
+    let fallback = invalid
+        .generate_with_model_profiled(&page, &[])
+        .await
+        .expect("falls back on an invalid definition");
+    assert_eq!(fallback.provenance, GenerationProvenance::Deterministic);
+    assert_eq!(fallback.definition, deterministic);
+}
+
+#[tokio::test]
+async fn generate_profiled_reports_the_deterministic_generator() {
+    let page = scraped_main().await;
+    let creation = OmniCreation::new(Arc::new(ScriptedFetcher::new()));
+    let generated = creation.generate_profiled(&page, &[]).expect("generates");
+
+    assert_eq!(generated.provenance, GenerationProvenance::Deterministic);
+    assert_eq!(
+        generated.definition,
+        creation.generate(&page, &[]).expect("generates")
+    );
+    assert_eq!(
+        GenerationProvenance::default(),
+        GenerationProvenance::Deterministic
+    );
+    assert_eq!(
+        GenerationProvenance::Deterministic.as_str(),
+        "deterministic"
+    );
+    assert_eq!(GenerationProvenance::Model.as_str(), "model");
+    assert_eq!(GenerationProvenance::Model.to_string(), "model");
+}
+
+#[tokio::test]
+async fn run_records_the_generation_provenance() {
+    let deterministic = TempWorkspace::new().expect("temp workspace");
+    let outcome = OmniCreation::new(Arc::new(page_fetcher()))
+        .run(MAIN_URL, deterministic.root())
+        .await
+        .expect("runs without a model");
+    assert_eq!(outcome.provenance, GenerationProvenance::Deterministic);
+
+    let modelled = TempWorkspace::new().expect("temp workspace");
+    let answer = format!(
+        "```json\n{}\n```\n",
+        serde_json::to_string_pretty(&json!({
+            "name": "model-widget",
+            "description": "Install the widget with confidence.",
+            "instructions": "# Install\n\n1. Download the package."
+        }))
+        .expect("payload serializes")
+    );
+    let outcome = OmniCreation::new(Arc::new(page_fetcher()))
+        .with_model(Arc::new(ScriptedModel::text(answer)))
+        .run(MAIN_URL, modelled.root())
+        .await
+        .expect("runs with a model");
+    assert_eq!(outcome.provenance, GenerationProvenance::Model);
+    assert_eq!(outcome.definition.name, "model-widget");
+}
+
+#[test]
+fn outcome_json_round_trips_the_provenance() {
+    let outcome = OmniOutcome {
+        definition: crate::skill_creator::SkillDefinition::new("demo", "Desc", "Body"),
+        resources: vec![SOURCES_RESOURCE.to_owned()],
+        bundle_path: std::path::PathBuf::from("skills/demo"),
+        provenance: GenerationProvenance::Model,
+    };
+    let encoded = serde_json::to_value(&outcome).expect("serializes");
+    assert_eq!(encoded["provenance"], json!("model"));
+
+    let decoded: OmniOutcome = serde_json::from_value(encoded.clone()).expect("deserializes");
+    assert_eq!(decoded, outcome);
+
+    // JSON written before the field existed still deserializes: the serde
+    // default is the deterministic provenance.
+    let mut legacy = encoded;
+    legacy
+        .as_object_mut()
+        .expect("an object")
+        .remove("provenance");
+    let decoded: OmniOutcome =
+        serde_json::from_value(legacy).expect("deserializes the legacy JSON");
+    assert_eq!(decoded.provenance, GenerationProvenance::Deterministic);
 }
 
 #[tokio::test]
@@ -858,13 +956,14 @@ async fn blank_instructions_after_stripping_fall_back_to_the_deterministic_skill
     let creation = OmniCreation::new(Arc::new(ScriptedFetcher::new())).with_model(Arc::new(
         instructions_model("![hallucinated](references/img_99.png)"),
     ));
-    let definition = creation
-        .generate_with_model(&page, &downloaded)
+    let generated = creation
+        .generate_with_model_profiled(&page, &downloaded)
         .await
         .expect("falls back to the deterministic generator");
 
-    assert_eq!(definition, deterministic);
-    definition.validate().expect("valid definition");
+    assert_eq!(generated.provenance, GenerationProvenance::Deterministic);
+    assert_eq!(generated.definition, deterministic);
+    generated.definition.validate().expect("valid definition");
 }
 
 #[tokio::test]

@@ -21,7 +21,12 @@
 //! - [`filter`] — image sniffing, icon heuristics, content/url deduplication,
 //!   link deduplication, and [`filter::slugify`].
 //! - [`pipeline`] — [`pipeline::OmniCreation`]: scrape → download → generate →
-//!   save, plus model-assisted generation.
+//!   save, plus model-assisted generation. The generation stages report a
+//!   [`pipeline::GenerationProvenance`] (deterministic template or drafting
+//!   model) through [`pipeline::GeneratedSkill`] and
+//!   [`pipeline::OmniOutcome::provenance`], so a caller can tell a model-drafted
+//!   skill from the deterministic fallback; the fallback is also logged with
+//!   `openjiuwen_common::logging::warn!`.
 //! - [`render`] — the deterministic document and model-prompt rendering the
 //!   pipeline calls: skill name/description, `SKILL.md` body, `references/`
 //!   documents, and the drafting prompt.
@@ -47,5 +52,8 @@ pub use filter::{
     is_probable_icon, slugify, sniff_image, ImageCandidate, ResourceFilter,
 };
 pub use html::{resolve_url, Heading, HtmlDocument, Image, Link};
-pub use pipeline::{DownloadedResource, OmniConfig, OmniCreation, OmniOutcome, ScrapedPage};
+pub use pipeline::{
+    DownloadedResource, GeneratedSkill, GenerationProvenance, OmniConfig, OmniCreation,
+    OmniOutcome, ScrapedPage,
+};
 pub use sha256::{digest, hex_digest};
