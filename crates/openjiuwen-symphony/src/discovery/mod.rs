@@ -21,6 +21,15 @@
 //! - [`notice`](crate::discovery::notice) —
 //!   [`SkillNoticeState`](crate::discovery::SkillNoticeState), the persistable cursor
 //!   that diffs a later inventory and renders Python's incremental skill reminder;
+//! - [`toolkit`](crate::discovery::toolkit) — the session-level notice layer:
+//!   [`IncrementalNoticeRegistry`](crate::discovery::IncrementalNoticeRegistry) and
+//!   [`IncrementalNoticeSession`](crate::discovery::IncrementalNoticeSession), the owned
+//!   replacement for Python's process-global per-session state;
+//! - [`directory_toolkit`](crate::discovery::directory_toolkit) — the model-facing
+//!   `skill_index` tool: the virtual category
+//!   [`SkillDirectoryView`](crate::discovery::SkillDirectoryView), the pinned row
+//!   renderers, request validation, and the
+//!   [`SkillIndexToolkit`](crate::discovery::SkillIndexToolkit) execution engine;
 //! - [`settings`](crate::discovery::settings) —
 //!   [`DiscoverySettings`](crate::discovery::DiscoverySettings), the result/output/token
 //!   budget for one discovery round.
@@ -73,6 +82,21 @@ pub use scanner::{
     RECURSIVE_SKILL_FILE, SKILL_CAPABILITY_TYPE, SKILL_FILE_NAMES,
 };
 pub use settings::{DiscoverySettings, DEFAULT_MAX_OUTPUT_CHARS, DEFAULT_MAX_RESULTS};
+
+pub use directory_toolkit::{
+    apply_pipeline, empty_message, execute_list, execute_read, execute_search, fit_rows, list_row,
+    metadata_card, sanitize_model_text, search_directory_row, search_row, tool_input_schema,
+    validate_request, DirectoryEntry, DirectoryNode, EntryKind, FittedRows, ListView, Operation,
+    OutputMode, PipelineOperation, PipelineStage, ReadMode, RequestIssue, ResponseSummary, Row,
+    SearchMatch, SearchResult, SkillDirectoryView, SkillIndexConfig, SkillIndexRequest,
+    SkillIndexResult, SkillIndexToolCard, SkillIndexToolkit, ValidatedRequest, CURSOR_MAX_CHARS,
+    MAX_CURSORS, MAX_OUTPUT_CHARS, MIN_OUTPUT_CHARS, ROOT_PATH, SHORTENED_MARKER,
+};
+pub use toolkit::{
+    cards_from_inventory, normalize_cards, tool_id, IncrementalNoticeRegistry,
+    IncrementalNoticeSession, SkillCard, SkillCardSnapshot, SkillCards, MAX_SESSION_STATES,
+    TOOL_ID_DOMAIN,
+};
 
 pub use scanner::{
     DIAGNOSTIC_DUPLICATE_SKILL, DIAGNOSTIC_INVALID_SKILL, DIAGNOSTIC_MALFORMED_FRONT_MATTER,
