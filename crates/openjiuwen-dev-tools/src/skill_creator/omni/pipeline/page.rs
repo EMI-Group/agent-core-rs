@@ -7,7 +7,7 @@
 //! can stay focused on orchestration. Everything here is a pure function of its
 //! inputs: no I/O, no configuration, and no ordering beyond document order.
 
-use super::super::archive::ArchiveEntry;
+use super::super::archive::{ArchiveEntry, ArchiveEntryKind};
 use super::super::fetch::FetchedResource;
 use super::super::html::{resolve_url, Heading, HtmlDocument, Image, Link};
 use super::ScrapedPage;
@@ -15,16 +15,27 @@ use super::ScrapedPage;
 /// How many leading bytes are inspected when sniffing an archive entry for NULs.
 const BINARY_SNIFF_BYTES: usize = 512;
 
-/// Builds a page from a `tar` archive's text entries.
+/// Builds a page from a `tar` archive's file entries.
 ///
-/// Directory entries, non-UTF-8 entries, and entries with a NUL in their first
-/// 512 bytes are skipped (the skips are logged at `debug`); the remaining text
-/// is joined with blank lines, and the first level-1 ATX heading becomes the
-/// title.
+/// Only [`ArchiveEntryKind::File`] entries contribute text; directory, symlink,
+/// and hardlink entries are skipped (the skips are logged at `debug`). Links are
+/// never followed and their targets are never read as content, so a symlink or
+/// hardlink entry cannot invent a text block: the archive reader leaves their
+/// `bytes` empty, and this filter keeps them out even if a container ever
+/// carries a payload beside one. File entries are additionally skipped when they
+/// are not UTF-8 or carry a NUL in their first 512 bytes (both logged at
+/// `debug`). The remaining text is joined with blank lines in archive order, and
+/// the first level-1 ATX heading becomes the title.
 pub(super) fn archive_page(url: &str, entries: &[ArchiveEntry]) -> ScrapedPage {
     let mut texts = Vec::new();
     for entry in entries {
-        if entry.is_dir {
+        if entry.kind != ArchiveEntryKind::File {
+            tracing::debug!(
+                path = %entry.path,
+                kind = ?entry.kind,
+                link_target = entry.link_target.as_deref().unwrap_or_default(),
+                "skipping a non-file archive entry"
+            );
             continue;
         }
         let text = match std::str::from_utf8(&entry.bytes) {

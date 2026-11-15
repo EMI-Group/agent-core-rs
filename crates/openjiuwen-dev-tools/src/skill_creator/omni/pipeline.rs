@@ -456,13 +456,17 @@ impl OmniCreation {
     ///
     /// HTML pages become title, description, text, headings, links, images, and
     /// code blocks, with every link and image resolved to an absolute `http(s)`
-    /// URL. A `tar` body is unpacked and read as markdown: file entries with
-    /// valid UTF-8 and no NUL byte in their first 512 bytes contribute text,
-    /// ATX headings (`#`…`######` plus a space), and fenced code blocks; the
-    /// title is the first level-1 heading. A resource that names a document the
-    /// kernel's retrieval loaders read (`PDF`, `DOCX`, `XLSX`, `PPTX`, `ODT`, and
-    /// the text, Markdown, `CSV`/`TSV`, and `JSON` formats — by URL suffix, else
-    /// by `content-type`) is extracted by
+    /// URL. A `tar` body is unpacked and read as markdown: only file entries
+    /// (never directory, symlink, or hardlink entries, whose link targets are
+    /// not followed) with valid UTF-8 and no NUL byte in their first 512 bytes
+    /// contribute text, ATX headings (`#`…`######` plus a space), and fenced
+    /// code blocks; the title is the first level-1 heading. The archive format
+    /// is sniffed by magic bytes first and by the URL suffix second, so a
+    /// `bzip2`/`xz`/`zstd` container is recognized (and refused for its missing
+    /// decoder) even when its body carries no usable signature. A resource that
+    /// names a document the kernel's retrieval loaders read (`PDF`, `DOCX`,
+    /// `XLSX`, `PPTX`, `ODT`, and the text, Markdown, `CSV`/`TSV`, and `JSON`
+    /// formats — by URL suffix, else by `content-type`) is extracted by
     /// `documents` instead, so a usable page can come from a
     /// binary document. An office document is a `ZIP` container, so such a
     /// resource is dispatched to its loader before the archive reader unpacks the
@@ -485,7 +489,7 @@ impl OmniCreation {
         } else {
             resource.final_url.clone()
         };
-        let page = match archive::detect(&resource.body) {
+        let page = match archive::detect_named(&final_url, &resource.body) {
             // An office document (`DOCX`/`XLSX`/`PPTX`/`ODT`) is itself a ZIP
             // container, so a resource that names one is handed to its document
             // loader instead of having the package parts unpacked as text. The
@@ -496,23 +500,26 @@ impl OmniCreation {
                 if let Some(page) = document_page(&resource, &final_url).await? {
                     page
                 } else {
-                    let entries = ArchiveUnpacker::unpack_auto(&resource.body)?;
+                    let entries = ArchiveUnpacker::unpack(ArchiveFormat::Zip, &resource.body)?;
                     archive_page(&final_url, &entries)
                 }
             }
             // `tar` is unpacked in-process; `zip`/`gzip` propagate their typed
-            // validation errors from `unpack_auto`, and `bzip2`/`xz`/`zstd`
+            // validation errors from `unpack`, and `bzip2`/`xz`/`zstd`
             // propagate its typed `Unsupported` error naming the codec instead
-            // of being read as plain text.
+            // of being read as plain text. The format is the one the sniff
+            // settled on, so a body whose signature is unrecognized but whose
+            // URL names a `bzip2`/`xz`/`zstd` container still reports that
+            // codec's capability error instead of a generic parse failure.
             Some(
-                ArchiveFormat::Tar
+                format @ (ArchiveFormat::Tar
                 | ArchiveFormat::Zip
                 | ArchiveFormat::Gzip
                 | ArchiveFormat::Bzip2
                 | ArchiveFormat::Xz
-                | ArchiveFormat::Zstd,
+                | ArchiveFormat::Zstd),
             ) => {
-                let entries = ArchiveUnpacker::unpack_auto(&resource.body)?;
+                let entries = ArchiveUnpacker::unpack(format, &resource.body)?;
                 archive_page(&final_url, &entries)
             }
             None if resource.is_html() => html_page(&resource, &final_url),

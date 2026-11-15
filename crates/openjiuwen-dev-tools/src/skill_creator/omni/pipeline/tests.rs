@@ -97,11 +97,14 @@ async fn scraped_main() -> ScrapedPage {
         .expect("scrapes")
 }
 
-/// One `ustar` header for a regular file, with a valid checksum.
-fn tar_header(name: &str, size: usize, typeflag: u8) -> [u8; 512] {
+/// One `ustar` header, with a valid checksum, for `name`, `size`, and
+/// `typeflag`, carrying `link` in the linkname field.
+fn tar_header_fields(name: &str, size: usize, typeflag: u8, link: &str) -> [u8; 512] {
     assert!(name.len() < 100, "tar name field overflow: {name}");
+    assert!(link.len() < 100, "tar linkname field overflow: {link}");
     let mut header = [0_u8; 512];
     header[..name.len()].copy_from_slice(name.as_bytes());
+    header[157..157 + link.len()].copy_from_slice(link.as_bytes());
     let size_field = format!("{size:o}");
     let size_bytes = size_field.as_bytes();
     header[124..124 + size_bytes.len()].copy_from_slice(size_bytes);
@@ -116,24 +119,52 @@ fn tar_header(name: &str, size: usize, typeflag: u8) -> [u8; 512] {
     header
 }
 
+/// One `ustar` header for a regular file, with a valid checksum.
+fn tar_header(name: &str, size: usize, typeflag: u8) -> [u8; 512] {
+    tar_header_fields(name, size, typeflag, "")
+}
+
+/// One `ustar` header for a link entry: `typeflag` `1` (hard link) or `2`
+/// (symbolic link), its target in the linkname field, and a zero size.
+fn tar_link_header(name: &str, typeflag: u8, target: &str) -> [u8; 512] {
+    tar_header_fields(name, 0, typeflag, target)
+}
+
 /// The padding needed to align a payload of `size` bytes to the next block.
 fn padding(size: usize) -> usize {
     (512 - size % 512) % 512
 }
 
+/// The markdown payload every `tar` test archive carries.
+const TAR_GUIDE: &str = "# Install\n\nRun the installer.\n\n```sh\ncargo install widget\n```";
+
 /// A `tar` archive holding one markdown file and one binary file.
 fn tar_archive() -> Vec<u8> {
-    let guide = "# Install\n\nRun the installer.\n\n```sh\ncargo install widget\n```";
     let mut binary = b"logo payload".to_vec();
     binary.push(0);
     let mut archive = Vec::new();
-    let bytes = guide.as_bytes();
+    let bytes = TAR_GUIDE.as_bytes();
     archive.extend_from_slice(&tar_header("guide.md", bytes.len(), b'0'));
     archive.extend_from_slice(bytes);
     archive.resize(archive.len() + padding(bytes.len()), 0);
     archive.extend_from_slice(&tar_header("assets/logo.bin", binary.len(), b'0'));
     archive.extend_from_slice(&binary);
     archive.resize(archive.len() + padding(binary.len()), 0);
+    archive.extend_from_slice(&[0_u8; 1024]);
+    archive
+}
+
+/// A `tar` archive holding one markdown file, one directory entry, one symlink,
+/// and one hardlink, each link pointing at the markdown file.
+fn tar_archive_with_links() -> Vec<u8> {
+    let bytes = TAR_GUIDE.as_bytes();
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&tar_header("guide.md", bytes.len(), b'0'));
+    archive.extend_from_slice(bytes);
+    archive.resize(archive.len() + padding(bytes.len()), 0);
+    archive.extend_from_slice(&tar_link_header("assets/", b'5', ""));
+    archive.extend_from_slice(&tar_link_header("guide-link.md", b'2', "guide.md"));
+    archive.extend_from_slice(&tar_link_header("guide-hard.md", b'1', "guide.md"));
     archive.extend_from_slice(&[0_u8; 1024]);
     archive
 }
@@ -230,6 +261,70 @@ async fn tar_page_input_yields_markdown_entries() {
     assert_eq!(page.code_blocks, vec!["cargo install widget".to_owned()]);
     assert!(page.text.contains("Run the installer."));
     assert!(!page.text.contains("logo"), "binary entry must be skipped");
+}
+
+#[tokio::test]
+async fn tar_link_and_directory_entries_contribute_no_page_text() {
+    let url = "https://example.com/links.tar";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(url, "application/x-tar", tar_archive_with_links());
+    let page = OmniCreation::new(Arc::new(fetcher))
+        .scrape(url)
+        .await
+        .expect("scrapes the archive");
+
+    // The page holds the single file entry and nothing else: a directory,
+    // symlink, or hardlink entry is neither text nor a followed link target, so
+    // it can neither add an empty text block nor a copy of the file it points at.
+    assert_eq!(page.text, TAR_GUIDE);
+    assert_eq!(page.title, "Install");
+    assert_eq!(
+        page.headings,
+        vec![Heading {
+            level: 1,
+            text: "Install".to_owned(),
+        }]
+    );
+    assert_eq!(page.code_blocks, vec!["cargo install widget".to_owned()]);
+}
+
+#[tokio::test]
+async fn undecodable_container_suffixes_surface_unsupported_without_magic_bytes() {
+    let bzip2_url = "https://example.com/skill.tar.bz2";
+    let xz_url = "https://example.com/skill.txz";
+    let zstd_url = "https://example.com/skill.tar.zstd";
+    let fetcher = ScriptedFetcher::new();
+    // None of these bodies starts with a recognized signature, so only the URL
+    // suffix names the codec: the sniff falls back to the filename, and the
+    // archive route reports the missing decoder instead of the body being read
+    // as plain text.
+    fetcher.with_page(
+        bzip2_url,
+        "application/octet-stream",
+        b"opaque bzip2 payload".to_vec(),
+    );
+    fetcher.with_page(
+        xz_url,
+        "application/octet-stream",
+        b"opaque xz payload".to_vec(),
+    );
+    fetcher.with_page(
+        zstd_url,
+        "application/octet-stream",
+        b"opaque zstd payload".to_vec(),
+    );
+    let creation = OmniCreation::new(Arc::new(fetcher));
+
+    for (url, codec) in [(bzip2_url, "bzip2"), (xz_url, "xz"), (zstd_url, "zstd")] {
+        let error = creation
+            .scrape(url)
+            .await
+            .expect_err("no decoder is bundled for this codec");
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{url}: {error}");
+        let message = error.to_string();
+        assert!(message.contains(codec), "{url}: {message}");
+        assert!(message.contains("decoder"), "{url}: {message}");
+    }
 }
 
 #[tokio::test]
