@@ -31,7 +31,8 @@ use openjiuwen_graph::{FnRouter, Router, RouterContext};
 use serde_json::json;
 
 use openjiuwen_workflow::{
-    ComponentAbility, ComponentOptions, EndComponent, StartComponent, Workflow,
+    Component, ComponentAbility, ComponentOptions, EndComponent, LoopBound, LoopComponent,
+    LoopConfig, LoopGroupComponent, LoopGroupConfig, LoopType, StartComponent, Workflow,
 };
 
 use common::{card, session, CollectorComponent, EchoComponent, StreamingProducer};
@@ -386,4 +387,95 @@ async fn streaming_an_invalid_workflow_yields_one_compile_error() {
         failure.message().contains("no start component"),
         "{failure}"
     );
+}
+
+/// `start → loop → end` around `component`, the shape every loop build test uses.
+fn loop_shaped(id: &str, component: impl Component + 'static) -> Workflow {
+    let mut workflow = Workflow::new(card(id));
+    workflow
+        .set_start_comp("start", StartComponent::new(), ComponentOptions::new())
+        .add_workflow_comp("loop", component, ComponentOptions::new())
+        .set_end_comp("end", EndComponent::new(), ComponentOptions::new())
+        .add_connection("start", "loop")
+        .add_connection("loop", "end");
+    workflow
+}
+
+/// The loop body used by the group cases.
+fn echo_body() -> Vec<Arc<dyn Component>> {
+    vec![Arc::new(EchoComponent::new()) as Arc<dyn Component>]
+}
+
+// port of tests/unit_tests/core/component/test_loop_comp.py::test_loop_number
+#[tokio::test]
+async fn a_loop_without_its_bound_parameter_fails_at_build_time() {
+    // Python rejects the config with `COMPONENT_LOOP_PARAM_INVALID` (`101030`) while
+    // parsing it; `Component::validate_config` moves that check into `Workflow::build`,
+    // so no run starts on a loop that cannot resolve its bound.
+    let failure = build_error(&loop_shaped(
+        "loop-missing-bound",
+        LoopComponent::new(
+            LoopConfig::new(LoopType::Number),
+            vec![Arc::new(EchoComponent::new())],
+        ),
+    ));
+    assert!(failure.contains("[101030]"), "{failure}");
+    assert!(
+        failure.contains("loop_number variable not found"),
+        "{failure}"
+    );
+}
+
+#[tokio::test]
+async fn a_group_over_its_iteration_cap_fails_at_build_time() {
+    let workflow = loop_shaped(
+        "group-over-cap",
+        LoopGroupComponent::new(
+            LoopGroupConfig::new()
+                .with_loop_number(5)
+                .with_max_iterations(2),
+            echo_body(),
+        ),
+    );
+    let failure = build_error(&workflow);
+    assert!(failure.contains("[101030]"), "{failure}");
+    assert!(failure.contains("maximum limit 2"), "{failure}");
+    // `stream` reuses the same compile step, so it fails the same way.
+    let items: Vec<_> = workflow
+        .stream(json!({}), session("group-over-cap"))
+        .collect()
+        .await;
+    assert_eq!(items.len(), 1);
+    assert!(items.into_iter().next().unwrap().is_err());
+}
+
+#[tokio::test]
+async fn a_group_without_a_terminator_fails_at_build_time() {
+    // A break-only container needs a `LoopBreakComponent` in its body to ever stop.
+    let failure = build_error(&loop_shaped(
+        "group-no-terminator",
+        LoopGroupComponent::new(
+            LoopGroupConfig::new()
+                .with_loop_type(LoopBound::UntilBreak)
+                .with_max_iterations(10),
+            echo_body(),
+        ),
+    ));
+    assert!(failure.contains("[101030]"), "{failure}");
+    assert!(failure.contains("cannot terminate"), "{failure}");
+}
+
+#[tokio::test]
+async fn a_valid_bounded_group_compiles_and_runs() {
+    let workflow = loop_shaped(
+        "group-valid",
+        LoopGroupComponent::new(LoopGroupConfig::new().with_loop_number(2), echo_body()),
+    );
+    let compiled = workflow.build().expect("the bound is valid");
+    assert!(compiled.ability("loop").is_some());
+    let output = workflow
+        .invoke(json!({"q": 1}), session("group-valid"))
+        .await
+        .expect("the run completes");
+    assert_eq!(output.result["output"]["loop_count"], json!(2));
 }
