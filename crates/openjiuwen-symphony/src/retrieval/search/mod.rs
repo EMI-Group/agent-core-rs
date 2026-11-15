@@ -62,9 +62,14 @@
 
 pub mod codebooks;
 pub mod config;
+pub mod contracts;
 pub mod embedding;
+pub mod expand;
 pub mod flow;
 pub mod lexical;
+pub mod reduce;
+pub mod selector;
+pub mod subtree;
 pub mod truncation;
 
 pub use codebooks::{
@@ -73,7 +78,12 @@ pub use codebooks::{
 pub use config::{
     DisclosureConfig, EmbeddingScoringConfig, ProgressiveSearchConfig, SelectionMode, DEFAULT_TOP_K,
 };
+pub use contracts::{
+    BranchReducer, CurrentSubtreeProvider, FragmentBuildFn, GenerateFn, GenerateFragmentSelector,
+    GenerateRequest, SelectRequest, TargetExpander, TopKSelector,
+};
 pub use embedding::{blend_scores, cosine_similarity, EmbeddingScorer};
+pub use expand::DefaultTargetExpander;
 pub use flow::{
     ChatMessage, ChildSearchCursor, CurrentSubtree, ExpansionPlan, ExposedFragment, ExposedNode,
     NodeSearchResult, PromptBundle, SearchCursor, SelectableResolution, SelectableTarget,
@@ -82,6 +92,15 @@ pub use flow::{
 pub use lexical::{
     compile_matcher, tokenize, LexicalDocument, LexicalHit, LexicalIndex, QueryMatcher, BM25_B,
     BM25_K1, FIELD_WEIGHTS, IDENTITY_BONUS, PHRASE_FIELD_WEIGHTS,
+};
+pub use reduce::DefaultBranchReducer;
+pub use selector::{
+    is_abstain_output, query_text, DefaultTopKSelector, LexicalTopKSelector, ABSTAIN_HINTS,
+    FRAGMENT_SELECTED_EVENT, MODE_GENERATE, MODE_LEXICAL,
+};
+pub use subtree::{
+    build_progressive_branch_description, build_progressive_item_label, build_progressive_root,
+    choices_cache_key, DefaultCurrentSubtreeProvider, ItemCounterFn,
 };
 pub use truncation::{
     take_budget, truncate_chars, truncate_chars_with_ellipsis, truncate_sorted_by_score,
