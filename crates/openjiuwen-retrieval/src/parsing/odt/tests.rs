@@ -1,5 +1,6 @@
 //! Unit tests for the `ODT` reader: block rendering, inline content, tables,
-//! lists, metadata, error paths, and file parsing.
+//! lists, metadata, error paths, file parsing, and the reporting of elements
+//! that contribute no text.
 
 use openjiuwen_common::error::ErrorKind;
 
@@ -224,8 +225,99 @@ fn documents_round_trip_through_json() {
     let json = serde_json::to_string(&document).unwrap();
     let restored: OdtDocument = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, document);
+    assert_eq!(document.unsupported_elements, Vec::<String>::new());
     assert_eq!(
         serde_json::from_str::<OdtDocument>("{}").unwrap(),
         OdtDocument::default()
     );
+    // The new field round-trips, and old payloads without it still deserialise.
+    let skipped = parse_content("<text:p><draw:frame/></text:p>");
+    let json = serde_json::to_string(&skipped).unwrap();
+    let restored: OdtDocument = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.unsupported_elements, skipped.unsupported_elements);
+    assert_ne!(restored.unsupported_elements, Vec::<String>::new());
+    let legacy = serde_json::from_str::<OdtDocument>(r#"{"text":"body"}"#).unwrap();
+    assert_eq!(legacy.text, "body");
+    assert_eq!(legacy.unsupported_elements, Vec::<String>::new());
+}
+
+#[test]
+fn reports_elements_that_contribute_no_text() {
+    let document = parse_content(concat!(
+        r#"<text:p>Before</text:p>"#,
+        r#"<text:p><draw:frame><draw:image href="Pictures/a.png"/></draw:frame></text:p>"#,
+        r#"<text:p><text:note><text:note-citation>1</text:note-citation>"#,
+        r#"<text:note-body><text:p>footnote</text:p></text:note-body></text:note></text:p>"#,
+        r#"<text:table-of-content text:name="toc"/>"#,
+        r#"<foo:bar>baz</foo:bar>"#,
+        r#"<text:p>After</text:p>"#,
+    ));
+    // The surrounding paragraphs still render; the rest contributes no text.
+    assert_eq!(document.text(), "Before\nAfter");
+    assert_eq!(document.paragraph_count, 2);
+    assert_eq!(document.table_count, 0);
+    assert_eq!(
+        document.unsupported_elements,
+        vec![
+            "draw:frame (×1)".to_owned(),
+            "draw:image (×1)".to_owned(),
+            "foo:bar (×1)".to_owned(),
+            "text:note (×1)".to_owned(),
+            "text:table-of-content (×1)".to_owned(),
+        ]
+    );
+    assert!(
+        document
+            .unsupported_elements
+            .windows(2)
+            .all(|pair| pair[0] <= pair[1]),
+        "entries are sorted by element name: {:?}",
+        document.unsupported_elements
+    );
+}
+
+#[test]
+fn repeated_elements_collapse_into_one_counted_entry() {
+    let document = parse_content(concat!(
+        r#"<text:p><draw:frame><draw:image href="a.png"/></draw:frame></text:p>"#,
+        r#"<text:p><draw:frame><draw:image href="b.png"/></draw:frame></text:p>"#,
+    ));
+    assert_eq!(document.text(), "");
+    assert_eq!(document.paragraph_count, 0);
+    assert_eq!(
+        document.unsupported_elements,
+        vec!["draw:frame (×2)".to_owned(), "draw:image (×2)".to_owned(),]
+    );
+
+    // A nested table inside a paragraph is reported as well, with no text.
+    let nested = parse_content(concat!(
+        r#"<text:p><table:table><table:table-row><table:table-cell>"#,
+        r#"<text:p>hidden</text:p></table:table-cell></table:table-row></table:table></text:p>"#,
+    ));
+    assert_eq!(nested.text(), "");
+    assert_eq!(
+        nested.unsupported_elements,
+        vec!["table:table (×1)".to_owned()]
+    );
+}
+
+#[test]
+fn clean_documents_report_no_unsupported_elements() {
+    let document = parse_content(concat!(
+        r#"<text:h text:outline-level="1">Title</text:h>"#,
+        r#"<text:p>Body</text:p>"#,
+        r#"<table:table><table:table-row>"#,
+        r#"<table:table-cell><text:p>Name</text:p></table:table-cell>"#,
+        r#"</table:table-row><table:table-row>"#,
+        r#"<table:table-cell><text:p>alice</text:p></table:table-cell>"#,
+        r#"</table:table-row></table:table>"#,
+        r#"<text:list><text:list-item><text:p>item</text:p></text:list-item></text:list>"#,
+    ));
+    assert_eq!(
+        document.text(),
+        "# Title\nBody\n| Name |\n| --- |\n| alice |\nitem"
+    );
+    assert_eq!(document.paragraph_count, 3);
+    assert_eq!(document.table_count, 1);
+    assert_eq!(document.unsupported_elements, Vec::<String>::new());
 }
