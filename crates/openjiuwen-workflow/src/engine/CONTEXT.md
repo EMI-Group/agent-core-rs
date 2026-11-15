@@ -10,7 +10,9 @@ Fan-in follows Python's `wait_for_all`: CNF barriers by default, first-arrival (
 declares `wait_for_all = false`.
 Everything about supersteps, channels, barriers, checkpoints, and Mermaid rendering belongs to
 `openjiuwen-graph`; this module never reimplements it.
-SVG rendering is delegated to `crate::render` and only driven from here.
+SVG rendering is delegated to `crate::render` and only driven from here, and rendering a definition that does
+not compile is a typed error rather than a fabricated document.
+Per-run topology mutation (`mutation.rs`) compiles a mutated *copy* of the recorded definition for one run.
 
 ## API Surface
 
@@ -46,6 +48,10 @@ not `Debug`). Helpers: `new`, `with_config`, `insert_component(id, component, no
 `component(id)`, `component_ids()`, `add_edge(sources, target, kind)`, `add_conditional(from, to, router)`,
 `record_problem`, `spec() -> WorkflowSpec`, `supported_abilities(id) -> Vec<ComponentAbility>` (declared when
 non-empty, else `Component::abilities()`), `selected_ability(id) -> ComponentAbility`.
+Mutation helpers (implemented in `mutation.rs`): `component_mut(id) -> Option<&mut Entry>`,
+`remove_component(id)` (drops the node, its edges, its conditional references, and a start/end choice naming it),
+`remove_edges_to(target)`, and `retarget_edge(source, target, new_target) -> bool` (a miss is reported, not
+silently ignored).
 
 `spec()` builds the Python-compatible `WorkflowSpec`: `edges` / `stream_edges` from regular / stream edges
 (one entry per source, insertion order), `comp_configs` (`NodeSpec` per node: `io_configs`,
@@ -143,7 +149,8 @@ impl CompiledWorkflow {
     pub fn start_comp_id(&self) -> &str;  pub fn end_comp_id(&self) -> &str;
     pub fn ability(&self, id: &str) -> Option<ComponentAbility>;
     pub fn is_streaming(&self) -> bool;
-    pub fn to_mermaid(&self) -> String;   pub fn to_svg(&self) -> String;   // never fail
+    pub fn to_mermaid(&self) -> Result<String>;   // compile error when the graph cannot be built
+    pub fn to_svg(&self) -> Result<String>;       // same; no error document is fabricated
     pub async fn invoke(&self, inputs: Value, session: Arc<dyn Session>, options: WorkflowRunOptions) -> Result<WorkflowOutput>;
     pub fn stream(&self, inputs: Value, session: Arc<dyn Session>, options: WorkflowRunOptions) -> BoxStream<'static, Result<WorkflowChunk>>;
     pub async fn resume(&self, interactive: InteractiveInput, session: Arc<dyn Session>, options: WorkflowRunOptions) -> Result<WorkflowOutput>;
@@ -151,7 +158,9 @@ impl CompiledWorkflow {
 pub struct WorkflowRunOptions { pub cancellation, pub timeout: Option<Duration>, pub interactive: Option<InteractiveInput>,
     pub answers: BTreeMap<String, Vec<Value>> /* per-id FIFO answers replayed before `interactive` */,
     pub resume: bool, pub stream_modes: Option<Vec<StreamMode>>, pub max_supersteps: Option<usize>,
-    pub depth: usize /* 0 at top level, child run = parent + 1 */ }
+    pub depth: usize /* 0 at top level, child run = parent + 1 */,
+    pub stream_delivery: StreamDelivery /* Buffered (default) | Interleaved (typed Unsupported) */ }
+pub enum StreamDelivery { Buffered, Interleaved }   // wire "buffered" | "interleaved"; `as_str`/`Display`
 ```
 
 `build` validates, computes `spec`, derives `is_streaming` from the end node's selected ability, and stores the
@@ -187,8 +196,15 @@ yields exactly one `Err` on any other failure; a guard aborts the run task when 
 boundary re-runs the interrupted superstep, so the component's question is answered by the seeded answer
 instead of halting again. The stream generator drops its `RunScope` right after compiling the graph (only the
 graph's nodes keep a frame-sink clone) and before it starts reading frames; keeping the scope alive would keep
-the sink open and stall the frame loop. `to_svg` renders through `crate::render::render_svg` (explicit end node,
-card name as title) and degrades to `crate::render::error_svg` when the definition does not compile.
+the sink open and stall the frame loop. `to_svg` renders through `crate::render::render_svg` (explicit end node, card name as title) and returns the
+compile error when the definition cannot be compiled; `to_mermaid` does the same. Neither fabricates an SVG
+document or a Mermaid comment, so a rendered failure can never be mistaken for a diagram. `crate::render::error_svg`
+stays a public utility for callers that explicitly want an error document, and the engine no longer uses it.
+`stream_delivery` is checked by `check_delivery` at the top of `run_blocking` (the funnel `invoke` and `resume`
+share) and of `stream`, i.e. before any session mutation, interaction seeding, or graph compile:
+`StreamDelivery::Buffered` is the documented composition model, while `StreamDelivery::Interleaved` (Python's live
+`stream_actor`) is a typed `Error::Unsupported` naming that gap and pointing at `Buffered`, which `stream`
+delivers as its single `Err` item.
 
 ## Constraints
 
@@ -202,14 +218,16 @@ card name as title) and degrades to `crate::render::error_svg` when the definiti
 
 - Streaming is buffered: a `Stream` / `Transform` producer's frames are stored under its id rather than fed to
   live consumers, and end-node frames are replayed in template order — observable text and order match for
-  finite streams, live interleaving does not.
+  finite streams, live interleaving does not. The gap is explicit: `StreamDelivery::Interleaved` is a typed
+  `Error::Unsupported` on every run entry point, so a caller asking for Python's `stream_actor` behaviour is told
+  what is missing instead of silently receiving composed frames.
 - Error recovery is inline: Python only substitutes `default_outputs` through a registered
   `component_error_recovery` callback, while `ComponentNode::run` applies the declared `ExceptionConfig`
   directly once the graph's retries are exhausted.
 - A first-arrival node whose only fan-in is a declared conditional edge stays CNF: the graph layer's
   group-less trigger channel needs a dynamic edge per predecessor, so no static edge may target the join.
-- Diagrams render the recorded topology, not the first-arrival rewiring; `to_mermaid`/`to_svg` never fail (a
-  bad definition yields an error document or an error placeholder).
+- Diagrams render the recorded topology, not the first-arrival rewiring; `to_mermaid`/`to_svg` return the compile
+  error for a definition that cannot be compiled (no error document, no placeholder).
 - Interaction indices and pending frames are tracked by `InteractionState`, not a session broker.
 - LLM `response_format` shaping and `enable_history` insertion live in the component
   (`src/components/llm/`), not in the engine; the engine only resolves schemas and writes node state.
@@ -219,9 +237,10 @@ card name as title) and degrades to `crate::render::error_svg` when the definiti
 - `./definition.rs` → `WorkflowDefinition`, `NodeConfig`, `Edge`, `ConditionalSource`, ability selection, `spec()`
 - `./validate.rs` → compile-time validation and coded problem messages
 - `./node.rs` → `RunScope`, `NodeRuntime`, `ComponentNode` graph adapter (schema resolution, dispatch, tracing, interrupt propagation, error recovery); crate-visible only (`pub(crate)`), and its `project_output` helper is reused by `src/single.rs`
-- `./mod.rs` → `CompiledWorkflow`, `WorkflowRunOptions`, `CombinedRouter`, graph compilation (CNF + first-arrival wiring), SVG entry point, `test_support` fakes
+- `./mod.rs` → `CompiledWorkflow`, `WorkflowRunOptions`, `StreamDelivery`, `CombinedRouter`, graph compilation (CNF + first-arrival wiring), rendering entry points, `test_support` fakes
+- `./mutation.rs` → per-run mutation: `WorkflowDefinition::{component_mut, remove_component, remove_edges_to, retarget_edge}` and `CompiledWorkflow::{mutated, invoke_mutated, stream_mutated}`
 - `./run.rs` → `CompiledWorkflow::{invoke, resume, stream}`, `run_blocking`, interaction-wire projection (`pub(crate) interaction_wires`, also used by `src/single.rs`), seed/timeout/depth helpers, `AbortOnDrop`
-- `./tests.rs` → engine unit tests (stream termination, buffered frames, snapshot lifecycle, interrupt and failure resume, facade accessors)
+- `./tests.rs` → engine unit tests (stream termination, buffered frames, snapshot lifecycle, interrupt and failure resume, facade accessors, render-error propagation)
 
 ## Test Strategy
 
@@ -229,8 +248,13 @@ Validation is covered through `tests/builder_validation.rs`; run semantics throu
 `references.rs`, `branch.rs`, `fan_in.rs`, `streaming.rs`, `end_template.rs`, `llm_component.rs`,
 `llm_semantics.rs`, `tool_component.rs`, `retrieval_component.rs`, `loop_component.rs`, `http_component.rs`,
 `questioner_component.rs`, `intent_detection.rs`, `react_agent.rs`, `sub_workflow.rs`, `exception_recovery.rs`,
-`draw.rs`, `session_state.rs`, `checkpoint_resume.rs`, and `card_spec.rs`.
+`draw.rs`, `session_state.rs`, `checkpoint_resume.rs`, `per_run_mutation.rs`, and `card_spec.rs`.
 `tests/single_component.rs` exercises the reused `project_output` / `interaction_wires` helpers outside a graph (input/output templates, interrupt wires, seeded answer).
 The engine's own unit tests cover termination of a stream whose run emits no frames, buffered producer frames
-versus end wires, snapshot lifecycle (deleted on completion, kept on interruption), and resume semantics for
-both an interrupted superstep and a plain node failure.
+versus end wires, snapshot lifecycle (deleted on completion, kept on interruption), resume semantics for both an
+interrupted superstep and a plain node failure, and the compile-error propagation of `to_mermaid`/`to_svg`
+(no SVG document, no Mermaid comment, no `"could not be compiled"` placeholder).
+`tests/streaming.rs` pins the `StreamDelivery` contract (default `Buffered`, wire names, `Interleaved` rejected by
+`invoke`/`stream`/`resume` with no session mutation first), and `tests/per_run_mutation.rs` pins per-run mutation
+(end template swap, node insert/remove with edge retargeting, invalid mutations reporting `[100100]`, refusal of
+`Interleaved` on a mutated run, mutated frames from `stream_mutated`, and the original staying runnable).

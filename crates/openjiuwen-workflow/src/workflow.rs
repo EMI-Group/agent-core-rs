@@ -12,7 +12,13 @@
 //!
 //! Drawing follows the same split: [`Workflow::draw`] renders Mermaid text and SVG locally,
 //! and reports [`DrawFormat::Png`] as a typed `Error::Unsupported` because Python produces
-//! PNG through the external mermaid.ink service.
+//! PNG through the external mermaid.ink service. A definition that cannot be compiled is a
+//! compile error, never an error-shaped diagram.
+//!
+//! A run never mutates the builder or the compiled workflow. Python's per-run graph mutation
+//! is expressed on [`CompiledWorkflow`] instead: `mutated`, `invoke_mutated`, and
+//! `stream_mutated` compile a mutated copy of the recorded definition for one run
+//! (`crate::engine::mutation`), so the original topology keeps serving later runs.
 //!
 //! ```
 //! use openjiuwen_workflow::{
@@ -204,6 +210,11 @@ impl ComponentOptions {
 /// happens in [`Workflow::build`] (or implicitly in `invoke` / `stream`). A `Workflow` is
 /// not mutated by a run, so one instance may be invoked concurrently.
 ///
+/// Python's per-run graph mutation has no builder counterpart: a caller compiles once and
+/// asks the compiled workflow for a mutated copy for one run (`mutated`, `invoke_mutated`,
+/// `stream_mutated` on [`CompiledWorkflow`]), leaving this builder and the compiled original
+/// untouched.
+///
 /// ```
 /// use openjiuwen_workflow::{
 ///     ComponentOptions, EndComponent, StartComponent, Workflow, WorkflowCard,
@@ -394,20 +405,21 @@ impl Workflow {
     ///
     /// # Errors
     ///
-    /// Returns the same compile error as [`Workflow::build`]; rendering itself cannot fail
-    /// (an uncompilable graph renders as a Mermaid comment).
+    /// Returns the same compile error as [`Workflow::build`]; an uncompilable definition is
+    /// never rendered as placeholder Mermaid text.
     pub fn to_mermaid(&self) -> Result<String> {
-        self.build().map(|compiled| compiled.to_mermaid())
+        self.build()?.to_mermaid()
     }
 
     /// Renders the workflow as a standalone SVG document.
     ///
     /// # Errors
     ///
-    /// Returns the same compile error as [`Workflow::build`]; once a workflow compiles,
-    /// [`CompiledWorkflow::to_svg`] always returns a document.
+    /// Returns the same compile error as [`Workflow::build`]; an uncompilable definition is
+    /// never rendered as an error document (a caller that wants one can build it with
+    /// [`crate::render::error_svg`]).
     pub fn to_svg(&self) -> Result<String> {
-        self.build().map(|compiled| compiled.to_svg())
+        self.build()?.to_svg()
     }
 
     /// Renders the workflow in `format`.
@@ -421,8 +433,8 @@ impl Workflow {
     /// # Errors
     ///
     /// Returns `Error::Unsupported` for [`DrawFormat::Png`], otherwise the same compile
-    /// error as [`Workflow::build`]; once a workflow compiles, rendering itself cannot
-    /// fail.
+    /// error as [`Workflow::build`]. Rendering a definition that does not compile fails
+    /// instead of producing an error document.
     pub fn draw(&self, format: DrawFormat) -> Result<String> {
         match format {
             DrawFormat::Mermaid => self.to_mermaid(),

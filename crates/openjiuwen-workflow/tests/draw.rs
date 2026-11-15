@@ -89,7 +89,7 @@ fn draw_svg_produces_a_document() {
     );
 
     let compiled = workflow.build().unwrap();
-    let compiled_svg = compiled.to_svg();
+    let compiled_svg = compiled.to_svg().unwrap();
     assert!(compiled_svg.starts_with("<?xml"));
     assert!(compiled_svg.contains("data-id=\"middle\""));
     assert_eq!(compiled_svg, svg, "draw and to_svg agree");
@@ -210,8 +210,20 @@ fn draw_png_is_unsupported() {
         "the reason names the external service:\n{message}"
     );
     assert!(
+        message.contains("output_format=\"png\""),
+        "the reason names Python's PNG output format:\n{message}"
+    );
+    assert!(
+        message.contains("no local rasterizer"),
+        "the reason names the missing capability:\n{message}"
+    );
+    assert!(
         message.contains("DrawFormat::Svg"),
         "the message points at the supported alternative:\n{message}"
+    );
+    assert!(
+        message.contains("DrawFormat::Mermaid"),
+        "the message names both supported formats:\n{message}"
     );
 
     // The rejection never silently degrades to another format's output.
@@ -235,6 +247,39 @@ fn png_rejection_does_not_affect_mermaid_or_svg() {
     assert!(svg.starts_with("<?xml"), "{svg}");
     assert_eq!(mermaid, workflow.to_mermaid().unwrap());
     assert_eq!(svg, workflow.to_svg().unwrap());
+}
+
+#[test]
+fn an_uncompilable_workflow_is_not_rendered_as_a_document() {
+    // A workflow without a start component cannot compile, so drawing it reports the compile
+    // error instead of fabricating an error SVG or a Mermaid comment.
+    let workflow = Workflow::new(WorkflowCard::new("draw-broken"));
+
+    let failures = [
+        workflow.to_svg().unwrap_err(),
+        workflow.to_mermaid().unwrap_err(),
+        workflow.draw(DrawFormat::Svg).unwrap_err(),
+        workflow.draw(DrawFormat::Mermaid).unwrap_err(),
+    ];
+    for failure in &failures {
+        let rendered = failure.to_string();
+        assert!(
+            rendered.contains("no start component"),
+            "the compile error is reported:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("<?xml"),
+            "no SVG document is fabricated:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("flowchart"),
+            "no Mermaid text is fabricated:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("could not be compiled"),
+            "no error placeholder is fabricated:\n{rendered}"
+        );
+    }
 }
 
 #[test]
