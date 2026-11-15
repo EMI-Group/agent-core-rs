@@ -24,6 +24,30 @@
 //! on success, a `healthy: false` detail carrying the error on failure) while
 //! still returning the probe's own result to the caller.
 //!
+//! **A cadence the backend cannot honour is supervised here.**
+//! [`crate::spawn::SpawnedAgent::set_health_interval`] forwards to the wrapped
+//! handle first: a backend that runs its own loop keeps owning its cadence and the
+//! decorator records nothing extra, because a cadence is configuration, not a
+//! lifecycle transition. When the backend answers
+//! [`openjiuwen_common::error::Error::Unsupported`] the decorator starts — and on
+//! the next call re-tunes — one supervised loop of its own over the wrapped handle
+//! and returns `Ok(())`: a monitored handle honours the cadence even when the
+//! backend cannot, and a [`Duration::ZERO`] interval stops that loop (the zero is
+//! still forwarded to the backend). The loop is one owned task, so a re-tune
+//! reschedules instead of accumulating, and `shutdown`, `force_kill`, a terminal
+//! finish, [`Drop`] and the run reaching a terminal phase all stop it.
+//!
+//! Each supervised tick records exactly what
+//! [`crate::spawn::SpawnedAgent::health`] records — the same probe, the same
+//! `backend`/`alive`/`healthy`/`pid` detail on success, the same `healthy: false`
+//! plus `error` detail on failure, and the same dead-child rule — and an
+//! observation error is discarded with `let _ =`, so it never fails the spawn. The
+//! one difference is deliberate: a backend whose own probe is
+//! [`openjiuwen_common::error::Error::Unsupported`] (a bare host handle) is
+//! observed by liveness, because `is_alive`/`pid` are real data while a fabricated
+//! probe result would not be; that tick records
+//! `{"backend", "alive", "healthy", "pid", "probe": "liveness_only"}`.
+//!
 //! **A dead child is terminal.** Liveness is the one thing the decorator can
 //! decide without a backend-specific probe, so it is what ends a run whose child
 //! exited on its own: after every probe, and after a `send`/`stream` (or their
@@ -33,8 +57,8 @@
 //! The call itself is unaffected — the probe result and the error are returned
 //! unchanged — and a failure against a *live* child (a protocol desync, a
 //! timed-out probe) leaves the run active, because the child is still there.
-//! Nothing is polled in the background; a host that never probes or calls a dead
-//! child keeps seeing it as active.
+//! Nothing is polled unless a cadence was asked for; a host that never probes,
+//! never calls a dead child, and never sets an interval keeps seeing it as active.
 //!
 //! **Finished exactly once.** `shutdown`, `force_kill`, [`Drop`] and the dead-child
 //! rule all finish the run, and a [`std::sync::atomic::AtomicBool`] latches the
@@ -48,17 +72,19 @@ use crate::spawn::{SpawnBackend, SpawnHealth, SpawnedAgent};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use openjiuwen_agent::output::{AgentChunk, AgentOutput};
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{ErrorKind, Result};
 use serde_json::{json, Value};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// A [`SpawnedAgent`] decorator that reports its child's lifecycle into a
 /// [`RunMonitor`].
 ///
-/// See the [module docs](self) for the transitions it records; every
+/// See the [module docs](self) for the transitions it records and for the health
+/// cadence it supervises when the wrapped backend cannot; every
 /// [`SpawnedAgent`] method forwards to the wrapped handle unchanged.
 pub struct MonitoredSpawnedAgent {
     /// The wrapped child handle.
@@ -72,6 +98,11 @@ pub struct MonitoredSpawnedAgent {
     /// Shared with the [`SpawnWatch`] a returned stream carries, so a stream frame
     /// and the handle itself contend for the same latch.
     closed: Arc<AtomicBool>,
+    /// The supervised health loop, when the wrapped backend cannot re-tune its own.
+    ///
+    /// Nothing runs until a caller asks for a cadence the backend rejects with
+    /// [`openjiuwen_common::error::Error::Unsupported`].
+    supervisor: Arc<HealthSupervisor>,
 }
 
 /// The observation state a returned stream needs, detached from the handle.
@@ -114,6 +145,162 @@ impl SpawnWatch {
             json!({"reason": "child_exited", "backend": self.inner.backend().as_str()}),
         ));
     }
+
+    /// Probes the wrapped child and records the observation into the monitor.
+    ///
+    /// Both the explicit probe path
+    /// ([`SpawnedAgent::health`](crate::spawn::SpawnedAgent::health)) and the
+    /// supervised tick funnel through here, so they record the same details: a
+    /// successful probe records `{"backend", "alive", "healthy", "pid"}`, a failed
+    /// one `{"healthy": false, "error"}`.
+    ///
+    /// `mode` decides what an *unimplemented* probe means: the explicit path
+    /// records it as the failure it is, while a supervised tick records the
+    /// liveness it can still read (`{"backend", "alive", "healthy", "pid",
+    /// "probe": "liveness_only"}`), because there is a real difference between "the
+    /// child is up but cannot answer a probe" and "the child is gone".
+    ///
+    /// Every monitor call is discarded with `let _ =` — an observation error must
+    /// never fail the spawn — and the probe's own result is returned unchanged,
+    /// including the dead-child rule that finishes the run after it.
+    async fn record_probe(&self, mode: ProbeMode) -> Result<bool> {
+        let result = self.inner.health().await;
+        match &result {
+            Ok(healthy) => {
+                let _ = self.monitor.update(
+                    &self.run_id,
+                    RunPhase::Running,
+                    json!({
+                        "backend": self.inner.backend().as_str(),
+                        "alive": self.inner.is_alive(),
+                        "healthy": healthy,
+                        "pid": self.inner.pid(),
+                    }),
+                );
+            }
+            Err(error) if mode == ProbeMode::Tick && error.kind() == ErrorKind::Unsupported => {
+                let _ = self.monitor.update(
+                    &self.run_id,
+                    RunPhase::Running,
+                    json!({
+                        "backend": self.inner.backend().as_str(),
+                        "alive": self.inner.is_alive(),
+                        "healthy": self.inner.is_healthy(),
+                        "pid": self.inner.pid(),
+                        "probe": "liveness_only",
+                    }),
+                );
+            }
+            Err(error) => {
+                let _ = self.monitor.update(
+                    &self.run_id,
+                    RunPhase::Running,
+                    json!({"healthy": false, "error": error.to_string()}),
+                );
+            }
+        }
+        self.finish_if_child_exited();
+        result
+    }
+}
+
+/// Which observation a probe result is recorded as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeMode {
+    /// An explicit [`crate::spawn::SpawnedAgent::health`] call: record the probe's
+    /// own answer, and an unimplemented probe as the failed observation it is.
+    Probe,
+    /// A supervised tick: an unimplemented probe is recorded by liveness instead of
+    /// as a fabricated failure.
+    Tick,
+}
+
+/// One supervised health loop, plus the signal that stops it.
+struct SupervisedLoop {
+    /// Cancels the loop between observations, so a re-tune never abandons a probe.
+    stop: CancellationToken,
+    /// The loop task; joined by [`HealthSupervisor::stop`], aborted on drop.
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Owns the decorator's one supervised health loop.
+///
+/// A backend that implements
+/// [`SpawnedAgent::set_health_interval`](crate::spawn::SpawnedAgent::set_health_interval)
+/// supervises itself, so the decorator never starts a loop for it. A backend that
+/// answers [`openjiuwen_common::error::Error::Unsupported`] cannot, so the
+/// decorator owns the cadence here: one slot, which means a re-tune cancels and
+/// joins the previous loop before arming the next (no task is ever leaked), and a
+/// [`Duration::ZERO`] interval leaves the slot empty.
+///
+/// The loop task holds only a [`SpawnWatch`] and a stop token, never an [`Arc`] of
+/// this supervisor, so it can never keep its own owner alive.
+#[derive(Default)]
+struct HealthSupervisor {
+    /// The running loop, if a cadence was requested and the backend refused it.
+    slot: parking_lot::Mutex<Option<SupervisedLoop>>,
+}
+
+impl HealthSupervisor {
+    /// A supervisor with no loop running.
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cancels and joins the running loop, if any.
+    async fn stop(&self) {
+        let Some(running) = self.slot.lock().take() else {
+            return;
+        };
+        running.stop.cancel();
+        let _ = running.task.await;
+    }
+
+    /// Replaces the running loop with one observing every `interval`.
+    ///
+    /// A [`Duration::ZERO`] interval stops the loop and arms nothing.
+    async fn retune(&self, interval: Duration, watch: SpawnWatch) {
+        self.stop().await;
+        if interval.is_zero() {
+            return;
+        }
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(supervised_health_loop(interval, watch, stop.clone()));
+        *self.slot.lock() = Some(SupervisedLoop { stop, task });
+    }
+}
+
+impl Drop for HealthSupervisor {
+    /// Aborts the supervised loop when the last handle goes away.
+    fn drop(&mut self) {
+        if let Some(running) = self.slot.get_mut().take() {
+            running.stop.cancel();
+            running.task.abort();
+        }
+    }
+}
+
+/// The supervised loop: one observation per interval until the run finishes.
+///
+/// The loop ends on the stop token, on the crate's own latch (a terminal finish
+/// from a shutdown, a kill, a dead child, or a dropped handle), and therefore
+/// always within one interval of the run finishing.
+async fn supervised_health_loop(interval: Duration, watch: SpawnWatch, stop: CancellationToken) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick completes immediately; consume it so the first observation
+    // comes one whole interval after the re-tune.
+    ticker.tick().await;
+    loop {
+        if watch.closed.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::select! {
+            () = stop.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+        let _ = watch.record_probe(ProbeMode::Tick).await;
+    }
 }
 
 /// Wraps `inner` so a terminal error frame from a dead child finishes the run.
@@ -154,6 +341,7 @@ impl MonitoredSpawnedAgent {
             monitor,
             run_id: run_id.into(),
             closed: Arc::new(AtomicBool::new(false)),
+            supervisor: Arc::new(HealthSupervisor::new()),
         }
     }
 
@@ -334,14 +522,17 @@ impl SpawnedAgent for MonitoredSpawnedAgent {
 
     /// Forwards the graceful shutdown and records its result.
     ///
-    /// A graceful exit finishes the run as
-    /// [`RunOutcome::completed`] with `{"graceful": graceful}`; an error finishes
-    /// it as [`RunOutcome::failed`] with the message and is returned unchanged.
+    /// The supervised health loop — if one is running — is cancelled and joined
+    /// before the shutdown exchange, so no probe can race it. A graceful exit then
+    /// finishes the run as [`RunOutcome::completed`] with `{"graceful": graceful}`;
+    /// an error finishes it as [`RunOutcome::failed`] with the message and is
+    /// returned unchanged.
     ///
     /// # Errors
     ///
     /// Whatever the inner handle reports.
     async fn shutdown(&self, timeout: Duration) -> Result<bool> {
+        self.supervisor.stop().await;
         match self.inner.shutdown(timeout).await {
             Ok(graceful) => {
                 self.finish_once(
@@ -358,7 +549,8 @@ impl SpawnedAgent for MonitoredSpawnedAgent {
 
     /// Forwards the kill and records its result.
     ///
-    /// A successful kill finishes the run as [`RunOutcome::cancelled`] with
+    /// The supervised health loop — if one is running — is cancelled and joined
+    /// first. A successful kill finishes the run as [`RunOutcome::cancelled`] with
     /// `{"reason": "force_kill"}`; an error finishes it as failed with the message
     /// and is returned unchanged.
     ///
@@ -366,6 +558,7 @@ impl SpawnedAgent for MonitoredSpawnedAgent {
     ///
     /// Whatever the inner handle reports.
     async fn force_kill(&self) -> Result<()> {
+        self.supervisor.stop().await;
         match self.inner.force_kill().await {
             Ok(()) => {
                 self.finish_once(
@@ -410,45 +603,42 @@ impl SpawnedAgent for MonitoredSpawnedAgent {
     ///
     /// Whatever the inner handle's probe reports.
     async fn health(&self) -> Result<bool> {
-        let result = self.inner.health().await;
-        match &result {
-            Ok(healthy) => {
-                let _ = self.monitor.update(
-                    &self.run_id,
-                    RunPhase::Running,
-                    json!({
-                        "backend": self.inner.backend().as_str(),
-                        "alive": self.inner.is_alive(),
-                        "healthy": healthy,
-                        "pid": self.inner.pid(),
-                    }),
-                );
-            }
-            Err(error) => {
-                let _ = self.monitor.update(
-                    &self.run_id,
-                    RunPhase::Running,
-                    json!({"healthy": false, "error": error.to_string()}),
-                );
-            }
-        }
-        self.finish_if_child_exited();
-        result
+        self.watch().record_probe(ProbeMode::Probe).await
     }
 
-    /// Forwards a health-interval re-tune to the inner handle.
+    /// Forwards a health-interval re-tune to the inner handle, supervising the
+    /// cadence here when the backend cannot.
     ///
-    /// A monitored subprocess handle therefore stays re-tunable; nothing extra is
-    /// recorded, because a cadence change is a configuration choice, not a
-    /// lifecycle transition.
+    /// The forward happens first and its answer decides:
+    ///
+    /// - the backend accepted, so its own loop owns the cadence (a decorator loop
+    ///   would report every observation twice) and any supervised loop is stopped;
+    /// - the backend answered [`openjiuwen_common::error::Error::Unsupported`], so
+    ///   the decorator starts — or re-tunes — one supervised loop over the wrapped
+    ///   handle and returns `Ok(())`: the handle honours the cadence, and a
+    ///   [`Duration::ZERO`] interval stops that loop without cancelling a request;
+    /// - anything else is the backend's own failure (a stopped child, say) and is
+    ///   returned unchanged, with no supervised loop started.
+    ///
+    /// Nothing is recorded either way: a cadence change is a configuration choice,
+    /// not a lifecycle transition.
     ///
     /// # Errors
     ///
-    /// Whatever the inner handle reports — including
-    /// [`openjiuwen_common::error::Error::Unsupported`] from a backend with no
-    /// background loop.
+    /// Whatever the inner handle reports other than
+    /// [`openjiuwen_common::error::Error::Unsupported`].
     async fn set_health_interval(&self, interval: Duration) -> Result<()> {
-        self.inner.set_health_interval(interval).await
+        match self.inner.set_health_interval(interval).await {
+            Ok(()) => {
+                self.supervisor.stop().await;
+                Ok(())
+            }
+            Err(error) if error.kind() == ErrorKind::Unsupported => {
+                self.supervisor.retune(interval, self.watch()).await;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Forwards task cancellation to the inner handle.
@@ -474,7 +664,9 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::monitor::RunEvent;
     use openjiuwen_common::error::{Error, Result};
+    use openjiuwen_test_support::eventually;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::Mutex;
 
@@ -968,6 +1160,328 @@ mod tests {
         assert!(
             monitor.snapshot("child-10").is_err(),
             "no run to finish either: the drop is a discarded NotFound"
+        );
+    }
+
+    // --- the supervised health loop -----------------------------------------
+
+    /// A child that inherits the default `set_health_interval`, so the decorator
+    /// must supervise the cadence, and answers a configurable probe.
+    ///
+    /// `probe` of `None` is a probe the backend does not implement (the shape of
+    /// the trait default), which the supervised tick must observe by liveness.
+    struct TickChild {
+        /// Stable handle id.
+        id: String,
+        /// Whether the handle reports itself alive.
+        alive: AtomicBool,
+        /// The probe answer, or `None` for "not implemented".
+        probe: Option<bool>,
+        /// How many probes the decorator ran.
+        probes: AtomicUsize,
+    }
+
+    impl TickChild {
+        /// An alive child under `id` answering `probe`.
+        fn new(id: &str, probe: Option<bool>) -> Arc<Self> {
+            Arc::new(Self {
+                id: id.to_owned(),
+                alive: AtomicBool::new(true),
+                probe,
+                probes: AtomicUsize::new(0),
+            })
+        }
+
+        /// How many probes arrived.
+        fn probes(&self) -> usize {
+            self.probes.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl SpawnedAgent for TickChild {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn is_alive(&self) -> bool {
+            self.alive.load(Ordering::Acquire)
+        }
+
+        fn pid(&self) -> Option<u32> {
+            Some(5151)
+        }
+
+        async fn send(&self, inputs: Value) -> Result<AgentOutput> {
+            Ok(AgentOutput {
+                output: format!("echo: {inputs}"),
+                ..AgentOutput::default()
+            })
+        }
+
+        fn stream(&self, _inputs: Value) -> BoxStream<'static, Result<AgentChunk>> {
+            Box::pin(futures::stream::empty())
+        }
+
+        async fn shutdown(&self, _timeout: Duration) -> Result<bool> {
+            self.alive.store(false, Ordering::Release);
+            Ok(true)
+        }
+
+        async fn force_kill(&self) -> Result<()> {
+            self.alive.store(false, Ordering::Release);
+            Ok(())
+        }
+
+        fn backend(&self) -> SpawnBackend {
+            SpawnBackend::InProcess
+        }
+
+        async fn health(&self) -> Result<bool> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            match self.probe {
+                Some(healthy) => Ok(healthy),
+                None => Err(crate::error::unsupported(
+                    "agent health probe",
+                    "the tick fake has no probe",
+                )),
+            }
+        }
+    }
+
+    /// A tracked decorator over a [`TickChild`] and its monitor.
+    fn tracked_tick(
+        id: &str,
+        probe: Option<bool>,
+    ) -> (MonitoredSpawnedAgent, Arc<TickChild>, Arc<RunMonitor>) {
+        let monitor = Arc::new(RunMonitor::new());
+        let child = TickChild::new(id, probe);
+        let handle = MonitoredSpawnedAgent::track(
+            Arc::clone(&child) as Arc<dyn SpawnedAgent>,
+            Arc::clone(&monitor),
+            Some("s-1"),
+            json!({"backend": "in_process"}),
+        );
+        (handle, child, monitor)
+    }
+
+    /// Collects up to `want` events, giving up at `within`.
+    async fn observations(
+        events: &mut tokio::sync::broadcast::Receiver<RunEvent>,
+        want: usize,
+        within: Duration,
+    ) -> Vec<RunEvent> {
+        let deadline = tokio::time::Instant::now() + within;
+        let mut collected = Vec::new();
+        while collected.len() < want {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Ok(event)) => collected.push(event),
+                _ => break,
+            }
+        }
+        collected
+    }
+
+    #[tokio::test]
+    async fn a_backend_without_a_loop_is_supervised_at_the_requested_cadence() {
+        let (handle, child, monitor) = tracked_tick("child-17", Some(true));
+        let mut events = monitor.subscribe();
+
+        handle
+            .set_health_interval(Duration::from_millis(5))
+            .await
+            .expect("the decorator honours a cadence the backend refuses");
+        assert!(
+            !handle.is_finished(),
+            "a cadence change is not a lifecycle transition"
+        );
+
+        let observed = observations(&mut events, 3, Duration::from_secs(2)).await;
+        assert_eq!(observed.len(), 3, "the supervised loop must observe");
+        for event in &observed {
+            assert_eq!(event.run_id, "child-17");
+            assert_eq!(event.phase, RunPhase::Running);
+            assert_eq!(
+                event.detail,
+                json!({
+                    "backend": "in_process",
+                    "alive": true,
+                    "healthy": true,
+                    "pid": 5151,
+                }),
+                "a supervised tick records the probe's own observation"
+            );
+        }
+        assert!(
+            child.probes() >= 3,
+            "each tick calls the inner probe: {} probes",
+            child.probes()
+        );
+        assert_eq!(
+            monitor.snapshot(handle.run_id()).unwrap().detail,
+            observed.last().unwrap().detail,
+            "the status follows the last observation"
+        );
+        handle.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_re_tune_reschedules_the_supervised_loop_and_zero_stops_it() {
+        let (handle, child, monitor) = tracked_tick("child-18", Some(true));
+        let mut events = monitor.subscribe();
+
+        handle
+            .set_health_interval(Duration::from_millis(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            observations(&mut events, 2, Duration::from_secs(2))
+                .await
+                .len(),
+            2,
+            "the first cadence observes"
+        );
+
+        // A second cadence replaces the loop; it does not add a second one.
+        handle
+            .set_health_interval(Duration::from_millis(20))
+            .await
+            .unwrap();
+        assert_eq!(
+            observations(&mut events, 2, Duration::from_secs(2))
+                .await
+                .len(),
+            2,
+            "the re-tuned loop keeps observing"
+        );
+
+        handle.set_health_interval(Duration::ZERO).await.unwrap();
+        while events.try_recv().is_ok() {}
+        let probes = child.probes();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(120), events.recv())
+                .await
+                .is_err(),
+            "a zero interval stops the supervised loop"
+        );
+        assert_eq!(
+            child.probes(),
+            probes,
+            "nothing probes once the cadence is stopped"
+        );
+        assert!(!handle.is_finished(), "stopping a cadence is not terminal");
+        handle.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_supervised_tick_escalates_a_dead_child_to_failed() {
+        let (handle, child, monitor) = tracked_tick("child-19", Some(true));
+        let mut events = monitor.subscribe();
+        handle
+            .set_health_interval(Duration::from_millis(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            observations(&mut events, 1, Duration::from_secs(2))
+                .await
+                .len(),
+            1,
+            "the loop is running before the child is killed"
+        );
+
+        child.alive.store(false, Ordering::Release);
+        eventually(Duration::from_secs(2), || {
+            let status = monitor.snapshot("child-19");
+            std::future::ready(matches!(status, Ok(status) if status.phase == RunPhase::Failed))
+        })
+        .await
+        .expect("the supervised loop must finish a dead child");
+
+        let status = monitor.snapshot(handle.run_id()).unwrap();
+        assert_eq!(status.phase, RunPhase::Failed);
+        assert_eq!(
+            status.detail,
+            json!({"reason": "child_exited", "backend": "in_process"})
+        );
+        assert!(handle.is_finished());
+        assert_eq!(monitor.list_active().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_supervised_tick_of_an_unimplemented_probe_observes_liveness_only() {
+        let (handle, _child, monitor) = tracked_tick("child-20", None);
+        let mut events = monitor.subscribe();
+        handle
+            .set_health_interval(Duration::from_millis(5))
+            .await
+            .unwrap();
+
+        let observed = observations(&mut events, 2, Duration::from_secs(2)).await;
+        assert_eq!(observed.len(), 2);
+        let detail = &observed[0].detail;
+        assert_eq!(detail["probe"], json!("liveness_only"));
+        assert_eq!(detail["backend"], json!("in_process"));
+        assert_eq!(detail["alive"], json!(true));
+        assert_eq!(
+            detail["healthy"],
+            json!(true),
+            "the default health answer follows liveness"
+        );
+        assert_eq!(detail["pid"], json!(5151));
+        assert!(
+            detail.get("error").is_none(),
+            "a missing probe is not a fabricated failure: {detail:?}"
+        );
+        handle.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_and_drop_stop_the_supervised_loop() {
+        let (handle, _child, monitor) = tracked_tick("child-21", Some(true));
+        let mut events = monitor.subscribe();
+        handle
+            .set_health_interval(Duration::from_millis(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            observations(&mut events, 2, Duration::from_secs(2))
+                .await
+                .len(),
+            2
+        );
+        handle.shutdown(Duration::from_secs(1)).await.unwrap();
+        while events.try_recv().is_ok() {}
+        assert!(
+            tokio::time::timeout(Duration::from_millis(120), events.recv())
+                .await
+                .is_err(),
+            "a shutdown joins the supervised loop"
+        );
+
+        // A dropped handle takes its loop with it.
+        let (handle, _child, monitor) = tracked_tick("child-22", Some(true));
+        let mut events = monitor.subscribe();
+        handle
+            .set_health_interval(Duration::from_millis(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            observations(&mut events, 2, Duration::from_secs(2))
+                .await
+                .len(),
+            2
+        );
+        drop(handle);
+        let terminal = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("the drop reports its terminal transition")
+            .expect("an event");
+        assert_eq!(terminal.phase, RunPhase::Completed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(120), events.recv())
+                .await
+                .is_err(),
+            "a dropped handle stops observing"
         );
     }
 }
