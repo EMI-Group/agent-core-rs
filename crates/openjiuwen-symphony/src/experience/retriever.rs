@@ -944,7 +944,7 @@ mod tests {
         let top = unfiltered.hits[0].score;
         let lowest = unfiltered.hits.last().expect("three hits").score;
         assert!(top > lowest);
-        let threshold = (top + lowest) / 2.0;
+        let threshold = f64::midpoint(top, lowest);
 
         // Both survivors pass the filter; only the strong one clears the threshold.
         let filtered = retriever
