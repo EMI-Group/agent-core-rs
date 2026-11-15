@@ -20,11 +20,13 @@
 //!
 //! Intentional differences from Python, all documented per module:
 //!
-//! - matching is regex-free and hand-rolled (no `regex` crate) but stays
-//!   Unicode-aware: log lines fold with full Unicode lowercasing, and
-//!   [`is_timestamp_line`] folds `unicode-normalization` `NFKC` plus the
-//!   Arabic-Indic decimal blocks, so full-width and localized timestamp spellings
-//!   are recognised instead of only ASCII ones;
+//! - matching here is hand-rolled and Unicode-aware (`NFKC` folding, Arabic-Indic
+//!   digits), and the crate's `regex` dependency is for the tokenizer nodes,
+//!   never this node.
+//!   Log lines fold with full Unicode lowercasing, and [`is_timestamp_line`]
+//!   folds `unicode-normalization` `NFKC` plus the Arabic-Indic decimal blocks,
+//!   so full-width and localized timestamp spellings are recognised instead of
+//!   only ASCII ones;
 //! - `json_repair` is replaced by the documented repair ladder in
 //!   `router::repair` (fence, span, smart quotes, single quotes, Python
 //!   literals, unquoted keys, trailing commas, close truncated, drop incomplete
