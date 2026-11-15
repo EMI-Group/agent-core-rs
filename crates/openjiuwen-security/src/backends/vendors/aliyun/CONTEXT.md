@@ -30,16 +30,18 @@ Headers: `host`, `x-acs-action: TextModeration`, `x-acs-version`, `x-acs-date` (
 `Bearer` auth adds `Authorization: Bearer <token>`.
 `Aksk` auth adds `Authorization: ACS3-HMAC-SHA256 Credential=<id>,SignedHeaders=<names>,Signature=<hex>`, signing `host;x-acs-action;x-acs-content-sha256;x-acs-date;x-acs-signature-nonce;x-acs-version` over `ACS3-HMAC-SHA256\n<sha256(canonical request)>`.
 Response: `{"Code": 200, "Message": "OK", "RequestId": "...", "Data": {"Labels": "a,b", "Reason": "...", "Result": [{"Label": "a", "Confidence": 95.5, "RiskWords": "..."}]}}`.
-`Code` != 200 / missing / non-integer => `Error::transport("aliyun green returned code <code>")`.
+`Code` missing or non-integer, or a `Data` value that is not an object carrying `Labels` or `Result` => `Error::validation` naming the `TextModeration` envelope fields, never a safe assessment.
+An integer `Code` other than `200` => `Error::transport("aliyun green returned code <code>")`.
 Labels are the union of `Data.Labels` (comma-separated, `nonLabel` ignored) and `Data.Result[].Label`, order-preserving and deduplicated.
-A reply is safe only when that union is empty and no `Result` entry carries a positive confidence.
+A recognized reply is safe only when that union is empty and no `Result` entry carries a positive confidence.
+Unknown or out-of-range confidence values keep their documented clamp into the severity bands and never error.
 Risky replies map the maximum confidence through `>= 90` Critical, `>= 75` High, `>= 50` Medium, else Low (labels without a usable score => High); `risk_type` is the first label, falling back to `config.risk_type`; `confidence = max/100` rounded to 4 dp.
 `details = {"provider": "aliyun", "service", "region", "labels": [union], "confidence", "request_id"}`; `RiskWords`, `Reason`, and the scanned text are never emitted.
 
 ## Constraints
 
 - Empty/whitespace `GuardrailContext::text_view()` short-circuits to a safe assessment with no HTTP request.
-- Errors are `openjiuwen_common::error::{Error, Result}` only; configuration problems are `Error::Validation`, transport/business-code/parse problems are `Error::Transport`.
+- Errors are `openjiuwen_common::error::{Error, Result}` only; configuration problems and unrecognized reply schemas are `Error::Validation`, transport/business-code/parse problems are `Error::Transport`.
 - No credential, no scanned text, and no vendor matched words appear in `Debug`, `details`, logs, or error messages.
 - No new dependencies: signing uses `sha2` (in-module HMAC-SHA256, RFC 2104), ids use `uuid`, timestamps use `chrono`.
 - Tests are offline and loopback-only (`wiremock`); the signature helper is deterministic for fixed `(date, nonce, body)` inputs while the live adapter stamps the current time.
@@ -56,5 +58,6 @@ Risky replies map the maximum confidence through `>= 90` Critical, `>= 75` High,
 - `signing.rs` unit tests pin HMAC-SHA256 against RFC 4231 vectors and assert the canonical-request layout plus signature determinism.
 - `tests.rs` asserts the outgoing request (path, auth header shape, `x-acs-*` headers, body hash equals SHA-256 of the recorded body, JSON-string `ServiceParameters`) for both auth modes against a loopback `wiremock` server.
 - `parse_response` fixtures cover every confidence band, `nonLabel`/blank labels, Result-sourced labels (the false-negative regression), label-only replies, business-code failures, and the absence of `RiskWords`/`Reason` in serialized details.
+- `tests.rs` also pins the envelope boundary: `json!({})`, a missing/non-integer `Code`, and an absent or non-object `Data` assert `ErrorKind::Validation` with a message naming the vendor and the envelope fields, while a recognized benign reply still yields `RiskLevel::Safe`.
 - Crate-level behavior through the pipeline lives in `crates/openjiuwen-security/tests/adapters.rs`.
 - Gates: `cargo fmt -p openjiuwen-security`, `cargo test -p openjiuwen-security --offline`, `cargo clippy -p openjiuwen-security --all-targets --offline -- -D warnings`, `cargo doc -p openjiuwen-security --no-deps --offline`.
