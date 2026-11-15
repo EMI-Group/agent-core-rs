@@ -358,6 +358,14 @@ impl HarnessMemberRuntime {
                     );
                     return context;
                 }
+                if let Some(raw) = &record.unrecognised_state {
+                    warn!(
+                        member = %self.session_id,
+                        card = %self.card_id,
+                        state = %raw,
+                        "stored member checkpoint recorded an unrecognised state; restoring it as idle"
+                    );
+                }
                 if let Some(envelope) = record.protocol {
                     context = context.with_checkpoint(envelope);
                 }

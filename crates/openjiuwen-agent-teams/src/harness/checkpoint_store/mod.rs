@@ -15,6 +15,13 @@
 //! * the **envelope** is the provider's own [`openjiuwen_harness_protocol::HarnessCheckpoint`],
 //!   opaque to this layer and the only thing a native harness can actually resume from.
 //!
+//! A record may additionally carry [`MemberCheckpointRecord::unrecognised_state`]: the raw state
+//! value the envelope held when it was not a
+//! [`HarnessState`](openjiuwen_harness_protocol::HarnessState) this build knows. The payload's
+//! state is `Idle` on that path (restoring stays tolerant), the sink logs the degradation, and the
+//! flag lets a caller tell a fresh idle member from one restored out of a corrupt or foreign
+//! record.
+//!
 //! Storage is JSON only — never pickle (see
 //! [`NativeCheckpoint`](crate::harness::checkpoint::NativeCheckpoint) for the decode rules) — and
 //! last-write-wins: a save replaces the record for that identity and returns a fresh revision, so
@@ -36,7 +43,7 @@
 //! | --- | --- |
 //! | `policy` | [`CheckpointResume`], [`MemberCheckpointPolicy`] |
 //! | `store` | [`MemberCheckpointRecord`], [`MemberCheckpointStore`], in-memory and file backends |
-//! | `sink` | [`MemberCheckpointSink`] over the harness-protocol sink SPI |
+//! | `sink` | [`MemberCheckpointSink`] over the harness-protocol sink SPI (tolerant state projection plus the unrecognised-state flag) |
 
 mod policy;
 mod sink;
