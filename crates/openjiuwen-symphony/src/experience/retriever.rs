@@ -6,11 +6,27 @@
 //! retrieve over a store-backed [`ExperienceBank`], a
 //! persisted [`ExperienceIndex`], or both.
 //!
+//! # Skill filters
+//!
+//! A request's `required_skills`/`excluded_skills` reach every configured catalog, but by
+//! two different routes, because [`ExperienceIndex::search`] has no skill-filter seam:
+//!
+//! - the [`ExperienceBank`] applies them itself (its search options carry them), so bank
+//!   hits arrive already filtered,
+//! - the retriever applies them to the [`ExperienceIndex`] hits itself, with the same
+//!   predicate the bank uses: an item listing any excluded skill is rejected, and the
+//!   required skills must all be present — or, with `require_all_skills == false`, at
+//!   least one of them.
+//!
+//! A filtered request therefore asks the index for `top_k = 0` (unlimited) and truncates
+//! only after filtering, so a filtered-out index hit never consumes a caller's budget; an
+//! unfiltered request keeps the single-shot `top_k` query.
+//!
 //! # Merge rules
 //!
-//! Each configured catalog is queried with *its own* ranking (the same `top_k`,
-//! skill filters, and `min_score`-free request), so a catalog behaves exactly as it does
-//! when called directly. The returned hits are then merged on
+//! Each configured catalog is queried with *its own* ranking (the same `top_k` and a
+//! `min_score`-free request), so a catalog behaves exactly as it does when called
+//! directly. The returned hits are then merged on
 //! [`ExperienceItem::dedupe_key`](crate::experience::ExperienceItem::dedupe_key):
 //!
 //! - the highest score wins; on an exact tie the smaller item id is kept,
@@ -31,6 +47,10 @@
 //! an embedder, `Lexical` as soon as one catalog fell back to the deterministic term
 //! coverage score. A caller can therefore tell "these hits are semantic" from "these hits
 //! are lexical" without inspecting the configuration.
+//!
+//! Skill filters change which hits survive, never how they were scored: the reporting is
+//! the same whether a request filters or not, and a request whose every hit is filtered
+//! out reports an empty `hits` list with the catalogs and provenance it queried.
 
 use std::cmp::Ordering;
 use std::collections::btree_map::Entry;
@@ -255,7 +275,13 @@ pub struct RetrievalReport {
     /// The report-wide provenance: `Embedding` only when every catalog scored with an
     /// embedder, `Lexical` as soon as one fell back.
     pub ranking: RankingProvenance,
-    /// The number of catalog hits examined before dedupe, truncation, and `min_score`.
+    /// The hits the catalogs returned, counted before the retriever's client-side skill
+    /// filter, dedupe, truncation, and `min_score`.
+    ///
+    /// The bank applies the request's skill filters itself, so its contribution is already
+    /// filtered; the index has no skill-filter seam, so its contribution counts the hits it
+    /// returned *before* the retriever dropped the ones the filter rejects. A request that
+    /// filters every index hit away therefore still reports `total_candidates > 0`.
     pub total_candidates: usize,
 }
 
@@ -357,6 +383,13 @@ impl ExperienceRetriever {
 
     /// Retrieves the experience entries that answer `request`.
     ///
+    /// The request's skill filters reach both catalogs: the bank applies them inside
+    /// [`ExperienceBank::search_with_options`], and the retriever applies them to the
+    /// [`ExperienceIndex`] hits with `passes_skill_filters`, the same rule the bank uses.
+    /// A filtered request queries the index unlimited and truncates after filtering, so
+    /// filtering never shortens the budget; `min_score` still applies last, and the
+    /// reported provenance is unaffected by filtering.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::error::Error::Validation`] for a blank `query` or when no catalog
@@ -379,8 +412,18 @@ impl ExperienceRetriever {
             excluded_skills: request.excluded_skills.clone(),
             require_all_skills: request.require_all_skills,
         };
+        // The index has no skill-filter seam, so the retriever filters its hits after the
+        // fact. Asking it for `top_k` first would let filtered-out hits consume the budget,
+        // so a filtered request asks for the whole catalog (`0` = unlimited) and the merge
+        // stage truncates once every hit satisfies the filter. The unfiltered path keeps
+        // the single-shot bounded request: same result, no extra ranking work.
+        let index_top_k = if has_skill_filter(request) {
+            0
+        } else {
+            request.top_k
+        };
         let ranking = ExperienceRanking {
-            top_k: request.top_k,
+            top_k: index_top_k,
             min_score: None,
             require_all_skills: request.require_all_skills,
         };
@@ -406,7 +449,17 @@ impl ExperienceRetriever {
             // so there is no lexical fallback to report.
             let index_ranking = RankingProvenance::Embedding;
             for hit in index.search(&request.query, &ranking).await? {
+                // Counted before the client-side filter below: `total_candidates` reports
+                // what the catalogs returned, not what the request kept.
                 total_candidates = total_candidates.saturating_add(1);
+                if !passes_skill_filters(
+                    &hit.item,
+                    &request.required_skills,
+                    &request.excluded_skills,
+                    request.require_all_skills,
+                ) {
+                    continue;
+                }
                 absorb(&mut merged, hit, RetrieveSource::Index, index_ranking);
             }
             sources.push(RetrieveSource::Index);
@@ -487,6 +540,51 @@ fn combine(left: RankingProvenance, right: RankingProvenance) -> RankingProvenan
         RankingProvenance::Lexical
     } else {
         RankingProvenance::Embedding
+    }
+}
+
+/// Reports whether `request` asks for any skill filtering at all.
+///
+/// Used only to pick the index request's budget: an empty filter needs no client-side pass.
+fn has_skill_filter(request: &RetrieveRequest) -> bool {
+    !request.required_skills.is_empty() || !request.excluded_skills.is_empty()
+}
+
+/// Reports whether `item` satisfies the skill filters of a request.
+///
+/// This is the retriever's copy of the rule the bank applies inside its search options, so
+/// a hit is kept or dropped identically whichever catalog produced it: an item listing any
+/// excluded skill is rejected first, and with no required skills that is the whole filter;
+/// otherwise every required skill must be present, or — with `require_all_skills == false`
+/// — at least one of them.
+///
+/// The edge cases match the bank exactly: skill matching is the case-sensitive exact
+/// comparison of [`ExperienceItem::has_skill`], an empty filter keeps every item, repeated
+/// required ids do not change the verdict, and a required id no item lists (`""` included)
+/// rejects every item under `require_all_skills == false` as well.
+fn passes_skill_filters(
+    item: &ExperienceItem,
+    required_skills: &[String],
+    excluded_skills: &[String],
+    require_all_skills: bool,
+) -> bool {
+    if excluded_skills
+        .iter()
+        .any(|excluded| item.has_skill(excluded))
+    {
+        return false;
+    }
+    if required_skills.is_empty() {
+        return true;
+    }
+    if require_all_skills {
+        required_skills
+            .iter()
+            .all(|required| item.has_skill(required))
+    } else {
+        required_skills
+            .iter()
+            .any(|required| item.has_skill(required))
     }
 }
 
@@ -676,6 +774,305 @@ mod tests {
         let report = retriever.retrieve(&excluded).await.expect("retrieve");
         assert_eq!(report.hits.len(), 2);
         assert!(report.ids().iter().all(|id| *id != "exp_0003"));
+    }
+
+    #[tokio::test]
+    async fn index_hits_are_filtered_by_required_skills() {
+        let index = index_with(vec![
+            item("Summarize the report", &["summarizer", "report"]),
+            item("Summarize the report", &["summarizer"]),
+            item("Summarize the report", &["report"]),
+        ])
+        .await;
+        let retriever = ExperienceRetriever::for_index(index);
+
+        // Every required skill must be present.
+        let all = RetrieveRequest::new("summarize the report")
+            .with_required_skills(["summarizer", "report"]);
+        let report = retriever.retrieve(&all).await.expect("retrieve");
+        assert_eq!(report.ids(), vec!["exp_0001"]);
+        // The index returned all three; the retriever dropped two of them.
+        assert_eq!(report.total_candidates, 3);
+        assert_eq!(report.ranking, RankingProvenance::Embedding);
+
+        // Only one of them is enough with `require_all_skills == false`.
+        let any = RetrieveRequest::new("summarize the report")
+            .with_required_skills(["summarizer", "report"])
+            .with_require_all_skills(false);
+        let report = retriever.retrieve(&any).await.expect("retrieve");
+        assert_eq!(report.hits.len(), 3);
+        assert_eq!(report.total_candidates, 3);
+    }
+
+    #[tokio::test]
+    async fn index_hits_are_filtered_by_excluded_skills() {
+        let index = index_with(vec![
+            item("Summarize the report", &["summarizer"]),
+            item("Summarize the report", &["summarizer", "legacy"]),
+        ])
+        .await;
+        let retriever = ExperienceRetriever::for_index(index);
+        let report = retriever
+            .retrieve(
+                &RetrieveRequest::new("summarize the report").with_excluded_skills(["legacy"]),
+            )
+            .await
+            .expect("retrieve");
+        assert_eq!(report.ids(), vec!["exp_0001"]);
+        assert_eq!(report.total_candidates, 2);
+    }
+
+    #[tokio::test]
+    async fn an_index_filter_that_matches_nothing_leaves_an_empty_report() {
+        let index = index_with(vec![
+            item("Summarize the report", &["summarizer"]),
+            item("Translate text", &["translator"]),
+        ])
+        .await;
+        let retriever = ExperienceRetriever::for_index(index);
+
+        let required = RetrieveRequest::new("summarize").with_required_skills(["missing"]);
+        let report = retriever.retrieve(&required).await.expect("retrieve");
+        assert!(report.hits.is_empty());
+        assert_eq!(report.total_candidates, 2);
+        assert_eq!(report.sources, vec![RetrieveSource::Index]);
+        assert_eq!(report.ranking, RankingProvenance::Embedding);
+
+        let excluded =
+            RetrieveRequest::new("summarize").with_excluded_skills(["summarizer", "translator"]);
+        let report = retriever.retrieve(&excluded).await.expect("retrieve");
+        assert!(report.hits.is_empty());
+        assert_eq!(report.total_candidates, 2);
+        assert_eq!(report.query, "summarize");
+    }
+
+    #[tokio::test]
+    async fn an_unfiltered_index_request_returns_every_hit() {
+        let index = index_with(vec![
+            item("Summarize the report", &["summarizer"]),
+            item("Summarize the report", &["summarizer", "legacy"]),
+            item("Translate text", &["translator"]),
+        ])
+        .await;
+        let retriever = ExperienceRetriever::for_index(index);
+        let unfiltered = retriever
+            .retrieve(&RetrieveRequest::unlimited("summarize the report"))
+            .await
+            .expect("retrieve");
+        assert_eq!(unfiltered.hits.len(), 3);
+        assert_eq!(unfiltered.total_candidates, 3);
+        assert!(unfiltered.ids().contains(&"exp_0002"));
+
+        let filtered = retriever
+            .retrieve(
+                &RetrieveRequest::new("summarize the report").with_excluded_skills(["legacy"]),
+            )
+            .await
+            .expect("retrieve");
+        assert_eq!(filtered.total_candidates, 3);
+        // The surviving order is the unfiltered order minus the dropped hit.
+        let kept: Vec<&str> = unfiltered
+            .ids()
+            .into_iter()
+            .filter(|id| *id != "exp_0002")
+            .collect();
+        assert_eq!(filtered.ids(), kept);
+        assert_eq!(filtered.hits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn index_filters_apply_before_top_k_truncation() {
+        // One distinct skill per item, so excluding the top hit's skill drops exactly that
+        // hit and nothing else.
+        let index = index_with(vec![
+            item("Summarize the report", &["summarizer"]),
+            item("Summarize the report", &["reporting"]),
+            item("Summarize the report", &["legacy"]),
+        ])
+        .await;
+        let retriever = ExperienceRetriever::for_index(index);
+        let unfiltered = retriever
+            .retrieve(&RetrieveRequest::unlimited("summarize the report"))
+            .await
+            .expect("retrieve");
+        assert_eq!(unfiltered.hits.len(), 3);
+        let ranked = unfiltered.ids();
+        let (top_id, runner_up_id) = (ranked[0].to_string(), ranked[1].to_string());
+        let top_skill = unfiltered.hits[0]
+            .item
+            .skill_ids
+            .first()
+            .expect("single-skill fixture")
+            .clone();
+
+        // Unfiltered, the single slot goes to the strongest hit.
+        let bounded = retriever
+            .retrieve(&RetrieveRequest::new("summarize the report").with_top_k(1))
+            .await
+            .expect("retrieve");
+        assert_eq!(bounded.ids(), vec![top_id.as_str()]);
+
+        // Excluding the top hit's skill removes it *before* the truncation, so the budget
+        // goes to the next surviving hit instead of being consumed by a rejected one.
+        let filtered = retriever
+            .retrieve(
+                &RetrieveRequest::new("summarize the report")
+                    .with_top_k(1)
+                    .with_excluded_skills([top_skill]),
+            )
+            .await
+            .expect("retrieve");
+        assert_eq!(filtered.ids(), vec![runner_up_id.as_str()]);
+        assert_eq!(filtered.total_candidates, 3);
+    }
+
+    #[tokio::test]
+    async fn index_filters_compose_with_the_score_threshold() {
+        let index = index_with(vec![
+            item("Translate the document", &["translator"]),
+            item("Translate the document", &["translator", "legacy"]),
+            item("Bake a cake", &["baker"]),
+        ])
+        .await;
+        let retriever = ExperienceRetriever::for_index(index);
+
+        let unfiltered = retriever
+            .retrieve(&RetrieveRequest::unlimited("translate the document"))
+            .await
+            .expect("retrieve");
+        assert_eq!(unfiltered.hits.len(), 3);
+        let top = unfiltered.hits[0].score;
+        let lowest = unfiltered.hits.last().expect("three hits").score;
+        assert!(top > lowest);
+        let threshold = (top + lowest) / 2.0;
+
+        // Both survivors pass the filter; only the strong one clears the threshold.
+        let filtered = retriever
+            .retrieve(
+                &RetrieveRequest::new("translate the document")
+                    .with_excluded_skills(["legacy"])
+                    .with_min_score(threshold),
+            )
+            .await
+            .expect("retrieve");
+        assert_eq!(filtered.ids(), vec!["exp_0001"]);
+        assert_eq!(filtered.total_candidates, 3);
+
+        // A filter that keeps only the weak hit leaves nothing above the threshold.
+        let strict = retriever
+            .retrieve(
+                &RetrieveRequest::new("translate the document")
+                    .with_required_skills(["baker"])
+                    .with_min_score(threshold),
+            )
+            .await
+            .expect("retrieve");
+        assert!(strict.hits.is_empty());
+        assert_eq!(strict.total_candidates, 3);
+    }
+
+    #[tokio::test]
+    async fn both_catalogs_apply_the_skill_filter_to_their_own_hits() {
+        let bank = bank_with(vec![
+            item("Summarize the report", &["summarizer"]).with_id("exp_0002"),
+            item("Summarize the report", &["summarizer", "legacy"]).with_id("exp_0004"),
+        ])
+        .await;
+        let index = index_with(vec![
+            item("Summarize the report quickly", &["summarizer"]).with_id("exp_0001"),
+            item("Summarize the report quickly", &["summarizer", "legacy"]).with_id("exp_0003"),
+        ])
+        .await;
+        let retriever = ExperienceRetriever::new().with_bank(bank).with_index(index);
+
+        let request = RetrieveRequest::unlimited("summarize the report")
+            .with_required_skills(["summarizer"])
+            .with_excluded_skills(["legacy"]);
+        let report = retriever.retrieve(&request).await.expect("retrieve");
+        assert_eq!(
+            report.sources,
+            vec![RetrieveSource::Bank, RetrieveSource::Index]
+        );
+        // One bank hit (filtered by the bank) plus two index hits (filtered by the
+        // retriever, which drops `exp_0003` afterwards).
+        assert_eq!(report.total_candidates, 3);
+        assert_eq!(report.hits.len(), 2);
+        let bank_hit = report
+            .hits
+            .iter()
+            .find(|hit| hit.id() == "exp_0002")
+            .expect("bank hit survives");
+        assert_eq!(bank_hit.sources, vec![RetrieveSource::Bank]);
+        let index_hit = report
+            .hits
+            .iter()
+            .find(|hit| hit.id() == "exp_0001")
+            .expect("index hit survives");
+        assert_eq!(index_hit.sources, vec![RetrieveSource::Index]);
+        assert!(report
+            .hits
+            .iter()
+            .all(|hit| hit.item.has_skill("summarizer")));
+        assert!(report.hits.iter().all(|hit| !hit.item.has_skill("legacy")));
+        assert_eq!(report.ranking, RankingProvenance::Lexical);
+
+        // Without the filter the index's legacy hit is part of the merged answer.
+        let unfiltered = retriever
+            .retrieve(&RetrieveRequest::unlimited("summarize the report"))
+            .await
+            .expect("retrieve");
+        assert!(unfiltered.ids().contains(&"exp_0003"));
+    }
+
+    #[tokio::test]
+    async fn the_retriever_skill_filter_matches_the_bank_rules() {
+        let items = vec![
+            item("summarize", &["a", "b"]).with_id("exp_0001"),
+            item("summarize", &["a"]).with_id("exp_0002"),
+            item("summarize", &["b"]).with_id("exp_0003"),
+            item("summarize", &[]).with_id("exp_0004"),
+            item("summarize duplicate", &["a", "a"]).with_id("exp_0005"),
+        ];
+        let bank = bank_with(items.clone()).await;
+        let filters: [(Vec<&str>, Vec<&str>, bool); 10] = [
+            (vec![], vec![], true),
+            (vec![], vec![], false),
+            (vec!["a"], vec![], true),
+            (vec!["a", "b"], vec![], true),
+            (vec!["a", "b"], vec![], false),
+            (vec!["a", "a"], vec![], true),
+            (vec![], vec!["a"], true),
+            (vec!["a"], vec!["b"], true),
+            (vec![""], vec![], false),
+            (vec!["missing"], vec![], false),
+        ];
+        for (required, excluded, require_all_skills) in filters {
+            let required: Vec<String> = required.into_iter().map(Into::into).collect();
+            let excluded: Vec<String> = excluded.into_iter().map(Into::into).collect();
+            let options = SearchOptions {
+                top_k: 0,
+                min_score: None,
+                required_skills: required.clone(),
+                excluded_skills: excluded.clone(),
+                require_all_skills,
+            };
+            let from_bank: Vec<String> = bank
+                .search_with_options("summarize", &options)
+                .await
+                .expect("bank search")
+                .iter()
+                .map(|hit| hit.id().to_string())
+                .collect();
+            let expected: Vec<String> = items
+                .iter()
+                .filter(|item| passes_skill_filters(item, &required, &excluded, require_all_skills))
+                .map(|item| item.id.clone())
+                .collect();
+            assert_eq!(
+                from_bank, expected,
+                "filters required={required:?} excluded={excluded:?} all={require_all_skills}"
+            );
+        }
     }
 
     #[tokio::test]
