@@ -33,14 +33,18 @@ use url::Url;
 pub mod elasticsearch;
 #[cfg(feature = "redis")]
 pub mod redis;
+#[cfg(feature = "sqlite")]
+pub mod sqlite_vector;
 pub use openjiuwen_core::foundation::store::{
     CollectionSchema, Document, DocumentStore, ElasticsearchConfig, ElasticsearchDocumentStore,
-    InMemoryDocumentStore, InMemoryKvStore, InMemoryVectorStore, KvStore, KvValue,
+    FieldSchema, InMemoryDocumentStore, InMemoryKvStore, InMemoryVectorStore, KvStore, KvValue,
     LocalFileDocumentStore, LocalFileKvStore, LocalFileVectorStore, Metric, Query, SortOrder,
-    VectorQuery, VectorSearchResult, VectorStore,
+    VectorDataType, VectorQuery, VectorSearchResult, VectorStore,
 };
 #[cfg(feature = "sqlite")]
 pub use openjiuwen_core::foundation::store::{SqliteDocumentStore, SqliteKvStore};
+#[cfg(feature = "sqlite")]
+pub use sqlite_vector::SqliteVectorStore;
 /// The index-prefix default shared by the configuration decoders and the
 /// `Elasticsearch` backend (Python's `ElasticsearchVectorStore` default).
 fn default_index_prefix() -> String {
@@ -282,20 +286,19 @@ pub async fn build_document_store(backend: &StoreBackend) -> Result<Arc<dyn Docu
 ///
 /// # Errors
 ///
-/// Returns the kernel's construction error for the `file` backend and
-/// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
-/// for `sqlite` (the kernel has no SQLite vector backend), the `redis`
-/// backend's configuration and connection errors (a missing `url` is a
-/// validation error, and a disabled `redis` feature is
+/// Returns the kernel's construction error for the `file` backend, the
+/// connection error of the brute-force `sqlite` backend (an unavailable `sqlite`
+/// feature is reported as
+/// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)),
+/// the `redis` backend's configuration and connection errors (a missing `url` is
+/// a validation error, and a disabled `redis` feature is
 /// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)),
 /// plus the `elasticsearch` backend's own construction error.
 pub async fn build_vector_store(backend: &StoreBackend) -> Result<Arc<dyn VectorStore>> {
     match backend {
         StoreBackend::Memory => Ok(Arc::new(InMemoryVectorStore::new())),
         StoreBackend::File { root } => Ok(Arc::new(LocalFileVectorStore::new(root).await?)),
-        StoreBackend::Sqlite { .. } => Err(Error::unsupported(
-            "sqlite has no vector store backend; use the in-memory or file vector store",
-        )),
+        StoreBackend::Sqlite { url } => sqlite_vector_store(url).await,
         StoreBackend::Redis { url } => redis_vector_store(url.as_deref()).await,
         StoreBackend::Elasticsearch {
             url, index_prefix, ..
@@ -448,6 +451,24 @@ async fn sqlite_document_store(_url: &str) -> Result<Arc<dyn DocumentStore>> {
         "sqlite document store backend is unavailable; enable the `sqlite` feature or use the in-memory or file backend",
     ))
 }
+/// Builds the SQLite vector store: a brute-force backend that keeps each
+/// collection's schema, metric, documents, and little-endian `f32` embedding
+/// blobs in the database (see [`sqlite_vector`] for the layout).
+#[cfg(feature = "sqlite")]
+async fn sqlite_vector_store(url: &str) -> Result<Arc<dyn VectorStore>> {
+    Ok(Arc::new(SqliteVectorStore::connect(url).await?))
+}
+
+/// Reports that the `sqlite` feature is off; keeps the factory match arms
+/// uniform.
+#[cfg(not(feature = "sqlite"))]
+#[allow(clippy::unused_async)] // mirrors the async SQLite helper
+async fn sqlite_vector_store(_url: &str) -> Result<Arc<dyn VectorStore>> {
+    Err(Error::unsupported(
+        "sqlite has no vector store backend; use the in-memory or file vector store",
+    ))
+}
+
 /// Builds the Redis key-value store, or reports a missing `url`.
 #[cfg(feature = "redis")]
 async fn redis_kv_store(url: Option<&str>) -> Result<Arc<dyn KvStore>> {
