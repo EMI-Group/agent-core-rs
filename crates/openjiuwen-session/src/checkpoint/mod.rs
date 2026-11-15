@@ -12,10 +12,16 @@
 //! `redis` client library); its key layout and behaviour are documented in
 //! [`redis`].
 //!
+//! JSON stays the native checkpoint format; [`pickle`] reads and writes
+//! Python-produced payloads (Python persists checkpoints as pickles), so a
+//! checkpoint written by the Python SDK can be mapped onto [`Checkpoint`] and
+//! back.
+//!
 //! Deviations from Python (intentional, documented in the crate `CONTEXT.md`):
 //!
-//! - Checkpoints are JSON documents, not pickles; only JSON-compatible state is
-//!   preserved.
+//! - Checkpoints are JSON documents by default; Python-pickle interop is an
+//!   explicit codec ([`pickle`]), not the storage format, and tuple/`bytes`
+//!   payloads are mapped as documented there.
 //! - There is no process-global checkpointer singleton and no ambient session
 //!   `ContextVar`: callers inject `Arc<dyn Checkpointer>` explicitly.
 //! - The workflow/agent lifecycle hooks (`pre_workflow_execute`,
@@ -42,6 +48,7 @@ use crate::tracer::TracePosition;
 
 pub mod file;
 pub mod memory;
+pub mod pickle;
 pub mod redis;
 pub mod resp;
 #[cfg(feature = "sqlite")]
@@ -49,6 +56,7 @@ pub mod sqlite;
 
 pub use file::FileCheckpointer;
 pub use memory::MemoryCheckpointer;
+pub use pickle::{checkpoint_from_pickle, checkpoint_to_pickle};
 pub use redis::{RedisCheckpointer, RedisOptions};
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteCheckpointer;
