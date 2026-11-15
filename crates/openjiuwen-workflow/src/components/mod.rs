@@ -5,12 +5,16 @@
 //! the leaf components take their runtime collaborators (models, tools, knowledge bases,
 //! memory stores) through their constructors.
 
+pub mod advanced_loop;
 pub mod branch;
 pub mod end;
 pub mod http_request;
 pub mod intent_detection;
 pub mod llm;
 pub mod loop_;
+pub mod loop_control;
+pub mod loop_driver;
+pub mod loop_group;
 pub mod memory;
 pub mod questioner;
 pub mod react_agent;
@@ -19,6 +23,7 @@ pub mod start;
 pub mod sub_workflow;
 pub mod tool;
 
+pub use advanced_loop::{AdvancedLoopComponent, AdvancedLoopConfig};
 pub use branch::{BranchComponent, BranchRouterAdapter};
 pub use end::{EndComponent, EndConfig};
 pub use http_request::{
@@ -30,6 +35,12 @@ pub use http_request::{
 pub use intent_detection::{IntentDetectionCompConfig, IntentDetectionComponent, IntentRouter};
 pub use llm::{LLMCompConfig, LLMComponent, LlmCompConfig, LlmComponent, LlmResponseFormat};
 pub use loop_::{LoopComponent, LoopConfig, LoopType};
+pub use loop_control::{
+    LoopBreakComponent, LoopBreakConfig, LoopSetVariableComponent, LoopSetVariableConfig,
+    LOOP_BREAK_MARKER, LOOP_SET_VARIABLES_MARKER,
+};
+pub use loop_driver::LoopBound;
+pub use loop_group::{LoopGroupComponent, LoopGroupConfig};
 pub use memory::{MemoryRecall, MemoryRecord, MemoryRetrievalComponent, MemoryWriteComponent};
 pub use questioner::{FieldInfo, QuestionerComponent, QuestionerConfig};
 pub use react_agent::{
