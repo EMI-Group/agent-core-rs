@@ -68,13 +68,31 @@
 //! [`ExperienceIndex`](crate::experience::ExperienceIndex). Python's LLM distillation is
 //! replaced by the cluster's centroid query and a deterministic token-similarity merge, so
 //! the whole input half works offline.
+//!
+//! # Query-time retrieval, batching, and grading
+//!
+//! Three support modules complete the pipeline. `embed.rs` wraps an
+//! [`openjiuwen_retrieval::Embedding`] in a batching, bounded-FIFO caching client
+//! ([`EmbeddingClient`](crate::experience::EmbeddingClient)), so a document list is sent
+//! in provider-sized chunks and no text is embedded twice. `retriever.rs` answers a
+//! [`RetrieveRequest`](crate::experience::RetrieveRequest) over a bank, the persisted
+//! index, or both: it queries each catalog with its own ranking, merges on the dedupe key,
+//! and reports whether the hits were ranked by embeddings or by the lexical fallback
+//! ([`RankingProvenance`](crate::experience::RankingProvenance)). `evaluator.rs` grades
+//! recorded traces with a deterministic signal rubric
+//! ([`TraceEvaluator`](crate::experience::TraceEvaluator)) and an opt-in judged pass over
+//! the crate's [`LlmJudgeMetric`](crate::llm::LlmJudgeMetric) seam, recording where every
+//! final score came from ([`JudgementProvenance`](crate::experience::JudgementProvenance)).
 #![allow(clippy::module_name_repetitions)]
 
 mod bank;
 pub mod cluster;
 pub mod collector;
+pub mod embed;
+pub mod evaluator;
 mod index;
 mod ranking;
+pub mod retriever;
 mod store;
 pub mod trace;
 
@@ -101,6 +119,19 @@ pub use store::{
     ExperienceStore, JsonFileExperienceStore, MemoryExperienceStore, DEFAULT_KEY_PREFIX,
 };
 pub use trace::{SessionPaths, TraceRecord, TraceStore, TraceToolCall};
+
+pub use embed::{
+    EmbeddingClient, EmbeddingClientStats, DEFAULT_BATCH_SIZE, DEFAULT_CACHE_CAPACITY,
+    MAX_BATCH_SIZE,
+};
+pub use evaluator::{
+    EvaluationConfig, EvaluationSummary, JudgementProvenance, QualitySignal, TraceEvaluator,
+    TraceGrade, PASS_THRESHOLD,
+};
+pub use retriever::{
+    ExperienceRetriever, RankingProvenance, RetrievalReport, RetrieveRequest, RetrieveSource,
+    RetrievedExperience,
+};
 
 /// The prefix of every generated experience id (`exp_0001`, `exp_0002`, ...).
 pub const ID_PREFIX: &str = "exp_";
