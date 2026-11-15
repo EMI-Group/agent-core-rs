@@ -5,8 +5,15 @@
 //! `ModelClientConfig`s are built explicitly (provider `openai`, the mock server as
 //! `api_base`, a dummy key, `max_retries = 0`) so a fallback can be observed as an
 //! exact request count per endpoint.
+//!
+//! The throttling and deadline suites drive in-process [`StubModel`]s and a
+//! [`ManualClock`], so a 60 s rate-limit window costs no wall-clock time; only the
+//! deadline suites use real (very short) timers.
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use openjiuwen_common::error::{Error, ErrorKind};
 use openjiuwen_common::security::SecretString;
@@ -18,14 +25,15 @@ use super::compiler::{
     compile_model_selection, compile_route, merge_request_defaults, resolve_model_group_routes,
     ROUTING_PLAN_KEY,
 };
+use super::limit::{LimitKey, ManualClock, RATE_LIMIT_WINDOW};
 use super::model::{is_retryable_failure, RoutingModel};
 use super::schema::{
     ModelSelection, ModelSelectionWire, ResolvedModel, ResolvedModelGroup, ResolvedRoute,
     ResolvedRoutingConfig, RoutingStrategy, SelectionKind,
 };
 use crate::llm::config::ModelRequestConfig;
-use crate::llm::model::{Model, StreamChunk};
-use crate::prompt::BaseMessage;
+use crate::llm::model::{ChatResponse, Choice, FinishReason, Model, StreamChunk};
+use crate::prompt::{BaseMessage, Usage};
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -112,6 +120,117 @@ fn sse_template(body: &str) -> ResponseTemplate {
     ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
         .set_body_string(body.to_owned())
+}
+
+/// A scripted in-process model: fixed usage, optional delay, optional failure.
+///
+/// The throttling and deadline suites need a model that answers without HTTP (so
+/// the reserved and reported tokens are exact) and that counts how often it was
+/// called (so a timed-out or throttled attempt is observable).
+struct StubModel {
+    provider: String,
+    model_name: String,
+    delay: Option<Duration>,
+    usage: Usage,
+    fails: bool,
+    calls: AtomicUsize,
+}
+
+impl StubModel {
+    /// A healthy model for `model_name` reporting 3 prompt and 4 completion tokens.
+    fn new(provider: &str, model_name: &str) -> Self {
+        Self {
+            provider: provider.to_owned(),
+            model_name: model_name.to_owned(),
+            delay: None,
+            usage: Usage::new(3, 4),
+            fails: false,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// Overrides the usage the model reports.
+    fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = usage;
+        self
+    }
+
+    /// Makes every call sleep before answering, so a deadline can expire.
+    fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = Some(delay);
+        self
+    }
+
+    /// Makes every call fail with a retryable provider error.
+    fn failing(mut self) -> Self {
+        self.fails = true;
+        self
+    }
+
+    /// How many calls this model received.
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl Model for StubModel {
+    fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    async fn invoke(
+        &self,
+        _messages: &[BaseMessage],
+        _request: &ModelRequestConfig,
+    ) -> openjiuwen_common::error::Result<ChatResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(delay) = self.delay {
+            tokio::time::sleep(delay).await;
+        }
+        if self.fails {
+            return Err(Error::llm("stub route failed"));
+        }
+        Ok(ChatResponse {
+            id: "chatcmpl-stub".to_owned(),
+            model: self.model_name.clone(),
+            choices: vec![Choice {
+                index: 0,
+                message: BaseMessage::assistant("stub answer"),
+                finish_reason: Some(FinishReason::Stop),
+            }],
+            usage: self.usage.clone(),
+        })
+    }
+
+    fn stream(
+        &self,
+        _messages: Vec<BaseMessage>,
+        _request: ModelRequestConfig,
+    ) -> BoxStream<'static, openjiuwen_common::error::Result<StreamChunk>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let chunks = if self.fails {
+            vec![Err(Error::llm("stub route failed"))]
+        } else {
+            vec![
+                Ok(StreamChunk::Delta {
+                    index: 0,
+                    role: None,
+                    content: Some("stub answer".to_owned()),
+                    reasoning: None,
+                    tool_call: None,
+                    finish_reason: Some(FinishReason::Stop),
+                }),
+                Ok(StreamChunk::Usage(self.usage.clone())),
+                Ok(StreamChunk::Done),
+            ]
+        };
+        Box::pin(futures::stream::iter(chunks))
+    }
 }
 
 /// A valid SSE completion.
@@ -926,5 +1045,376 @@ async fn stream_errors_after_the_first_chunk_are_propagated() {
         request_count(&second).await,
         0,
         "the router must not splice a second answer onto partial output"
+    );
+}
+
+// --- rate limits and attempt deadlines --------------------------------------
+
+/// A routing model over the given route models, with a manual clock installed.
+fn routing_with_clock(
+    group: &ResolvedModelGroup,
+    models: Vec<Arc<dyn Model>>,
+    clock: &ManualClock,
+) -> RoutingModel {
+    RoutingModel::with_models(group, models)
+        .expect("the routing model builds")
+        .with_clock(Arc::new(clock.clone()))
+}
+
+/// The key a route of [`resolved_model`] resolves to.
+fn openai_key(model_name: &str) -> LimitKey {
+    LimitKey::new("openai", model_name)
+}
+
+#[tokio::test]
+async fn rpm_bound_returns_a_typed_timeout_naming_rpm() {
+    let clock = ManualClock::new();
+    let stub = Arc::new(StubModel::new("openai", "gpt-4o-mini"));
+    let mut group = group(vec![route(
+        "r-1",
+        resolved_model("m-1", "gpt-4o-mini", "http://127.0.0.1:9"),
+    )]);
+    group.routes[0].rpm = Some(2.0);
+    group.timeout_seconds = Some(1.0);
+    let routing = routing_with_clock(&group, vec![stub.clone() as Arc<dyn Model>], &clock);
+
+    for _ in 0..2 {
+        routing
+            .invoke(&[BaseMessage::user("hello")], &ModelRequestConfig::new(""))
+            .await
+            .expect("the first two requests fit the rpm budget");
+    }
+    let error = routing
+        .invoke(&[BaseMessage::user("hello")], &ModelRequestConfig::new(""))
+        .await
+        .expect_err("the third request cannot fit the 60 s window");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    let message = error.message().to_string();
+    assert!(message.contains("TPM/RPM"), "{message}");
+    assert!(message.contains("rpm=2"), "{message}");
+    assert_eq!(
+        stub.calls(),
+        2,
+        "a throttled request never reaches the model"
+    );
+}
+
+#[tokio::test]
+async fn rpm_waits_then_proceeds_once_the_clock_advances() {
+    let clock = ManualClock::new();
+    let stub = Arc::new(StubModel::new("openai", "gpt-4o-mini"));
+    let mut group = group(vec![route(
+        "r-1",
+        resolved_model("m-1", "gpt-4o-mini", "http://127.0.0.1:9"),
+    )]);
+    group.routes[0].rpm = Some(2.0);
+    // No group/route deadline: the third request waits for the window instead of
+    // failing.
+    let routing = Arc::new(routing_with_clock(
+        &group,
+        vec![stub.clone() as Arc<dyn Model>],
+        &clock,
+    ));
+
+    for _ in 0..2 {
+        routing
+            .invoke(&[BaseMessage::user("hello")], &ModelRequestConfig::new(""))
+            .await
+            .expect("the first two requests fit the rpm budget");
+    }
+    let pending = tokio::spawn({
+        let routing = Arc::clone(&routing);
+        async move {
+            routing
+                .invoke(&[BaseMessage::user("hello")], &ModelRequestConfig::new(""))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    clock.advance(RATE_LIMIT_WINDOW);
+    let response = pending
+        .await
+        .expect("the task joins")
+        .expect("the throttled request proceeds once the window expires");
+    assert_eq!(
+        response.message().expect("one choice").text(),
+        "stub answer"
+    );
+    assert_eq!(stub.calls(), 3);
+    assert_eq!(
+        routing
+            .rate_limiter()
+            .usage(&openai_key("gpt-4o-mini"))
+            .requests,
+        1,
+        "the two expired requests left the window"
+    );
+}
+
+#[tokio::test]
+async fn tpm_reservation_reconciles_the_reported_usage() {
+    let clock = ManualClock::new();
+    // 2 tokens used per call, while the prompt estimate for `user("hello")` is 6.
+    let stub = Arc::new(StubModel::new("openai", "gpt-4o-mini").with_usage(Usage::new(1, 1)));
+    let mut group = group(vec![route(
+        "r-1",
+        resolved_model("m-1", "gpt-4o-mini", "http://127.0.0.1:9"),
+    )]);
+    group.routes[0].tpm = Some(10.0);
+    group.timeout_seconds = Some(1.0);
+    let routing = routing_with_clock(&group, vec![stub.clone() as Arc<dyn Model>], &clock);
+
+    // Estimates alone would need 6 + 6 + 6 = 18 > 10; reconciling each request to
+    // its reported 2 tokens keeps the window at 4 before the third reservation.
+    for _ in 0..3 {
+        routing
+            .invoke(&[BaseMessage::user("hello")], &ModelRequestConfig::new(""))
+            .await
+            .expect("the reconciled budget admits the request");
+    }
+    assert_eq!(stub.calls(), 3);
+    assert_eq!(
+        routing
+            .rate_limiter()
+            .usage(&openai_key("gpt-4o-mini"))
+            .tokens,
+        6,
+        "three reconciled requests of two tokens each"
+    );
+}
+
+#[tokio::test]
+async fn tpm_reservation_blocks_a_request_that_would_exceed_the_window() {
+    let clock = ManualClock::new();
+    let stub = Arc::new(StubModel::new("openai", "gpt-4o-mini").with_usage(Usage::new(5, 5)));
+    let mut group = group(vec![route(
+        "r-1",
+        resolved_model("m-1", "gpt-4o-mini", "http://127.0.0.1:9"),
+    )]);
+    group.routes[0].tpm = Some(10.0);
+    group.timeout_seconds = Some(1.0);
+    let routing = routing_with_clock(&group, vec![stub.clone() as Arc<dyn Model>], &clock);
+
+    routing
+        .invoke(&[BaseMessage::user("hello")], &ModelRequestConfig::new(""))
+        .await
+        .expect("the first request fits the tpm budget");
+    assert_eq!(
+        routing
+            .rate_limiter()
+            .usage(&openai_key("gpt-4o-mini"))
+            .tokens,
+        10,
+        "the reservation was reconciled to the reported total"
+    );
+
+    let error = routing
+        .invoke(&[BaseMessage::user("hello")], &ModelRequestConfig::new(""))
+        .await
+        .expect_err("10 used + 6 estimated exceeds the 10 tpm budget");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    let message = error.message().to_string();
+    assert!(message.contains("TPM/RPM"), "{message}");
+    assert!(message.contains("tpm=10"), "{message}");
+    assert_eq!(
+        stub.calls(),
+        1,
+        "the blocked request never reached the model"
+    );
+
+    clock.advance(RATE_LIMIT_WINDOW);
+    routing
+        .invoke(&[BaseMessage::user("hello")], &ModelRequestConfig::new(""))
+        .await
+        .expect("the window expired, so the same request is admitted");
+    assert_eq!(stub.calls(), 2);
+}
+
+#[tokio::test]
+async fn rate_limit_budgets_are_isolated_per_provider() {
+    let clock = ManualClock::new();
+    let openai = Arc::new(StubModel::new("openai", "gpt-4o-mini").failing());
+    let anthropic = Arc::new(StubModel::new("anthropic", "claude-3-5-sonnet"));
+    let mut second_model = resolved_model("m-2", "claude-3-5-sonnet", "http://127.0.0.1:9");
+    second_model.provider = "anthropic".to_owned();
+    let mut group = group(vec![
+        route(
+            "r-openai",
+            resolved_model("m-1", "gpt-4o-mini", "http://127.0.0.1:9"),
+        ),
+        route("r-anthropic", second_model),
+    ]);
+    group.routes[0].rpm = Some(2.0);
+    group.routes[1].rpm = Some(2.0);
+    group.timeout_seconds = Some(1.0);
+    let routing = routing_with_clock(
+        &group,
+        vec![
+            openai.clone() as Arc<dyn Model>,
+            anthropic.clone() as Arc<dyn Model>,
+        ],
+        &clock,
+    );
+
+    // Each call spends one request of *each* provider: the failing OpenAI route
+    // falls over to the Anthropic one.
+    for _ in 0..2 {
+        routing
+            .invoke(&[BaseMessage::user("hello")], &ModelRequestConfig::new(""))
+            .await
+            .expect("both providers still have their own budget");
+    }
+    assert_eq!(openai.calls(), 2);
+    assert_eq!(anthropic.calls(), 2);
+    assert_eq!(
+        routing
+            .rate_limiter()
+            .usage(&LimitKey::new("anthropic", "claude-3-5-sonnet"))
+            .requests,
+        2,
+        "the second provider keeps a budget of its own"
+    );
+
+    // The OpenAI budget is now spent; the Anthropic one would still admit a third
+    // request, which is exactly what a shared budget would have prevented.
+    let error = routing
+        .invoke(&[BaseMessage::user("hello")], &ModelRequestConfig::new(""))
+        .await
+        .expect_err("the OpenAI budget is exhausted");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(error.message().contains("openai/gpt-4o-mini"), "{error}");
+    assert_eq!(anthropic.calls(), 2, "the blocked attempt never got there");
+}
+
+#[tokio::test]
+async fn an_invalid_rate_limit_is_a_validation_error() {
+    let clock = ManualClock::new();
+    let stub = Arc::new(StubModel::new("openai", "gpt-4o-mini"));
+    let mut group = group(vec![route(
+        "r-1",
+        resolved_model("m-1", "gpt-4o-mini", "http://127.0.0.1:9"),
+    )]);
+    group.routes[0].tpm = Some(0.0);
+    let routing = routing_with_clock(&group, vec![stub.clone() as Arc<dyn Model>], &clock);
+
+    let error = routing
+        .invoke(&[BaseMessage::user("hello")], &ModelRequestConfig::new(""))
+        .await
+        .expect_err("a zero token budget cannot be satisfied");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.message().contains("tpm=0"), "{error}");
+    assert_eq!(stub.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_slow_route_times_out_and_failover_reaches_the_next_route() {
+    let clock = ManualClock::new();
+    let slow = Arc::new(StubModel::new("openai", "gpt-4o-mini").with_delay(Duration::from_secs(5)));
+    let fast = Arc::new(StubModel::new("openai", "gpt-4o"));
+    let mut group = group(vec![
+        route(
+            "r-slow",
+            resolved_model("m-1", "gpt-4o-mini", "http://127.0.0.1:9"),
+        ),
+        route(
+            "r-fast",
+            resolved_model("m-2", "gpt-4o", "http://127.0.0.1:9"),
+        ),
+    ]);
+    // The route's own timeout wins over the far larger group deadline.
+    group.routes[0].timeout = Some(0.02);
+    group.timeout_seconds = Some(3600.0);
+    let routing = routing_with_clock(
+        &group,
+        vec![
+            slow.clone() as Arc<dyn Model>,
+            fast.clone() as Arc<dyn Model>,
+        ],
+        &clock,
+    );
+
+    let response = routing
+        .invoke(&[BaseMessage::user("hello")], &ModelRequestConfig::new(""))
+        .await
+        .expect("the second route answers");
+    assert_eq!(response.model, "gpt-4o");
+    assert_eq!(
+        slow.calls(),
+        1,
+        "the slow route was attempted and timed out"
+    );
+    assert_eq!(fast.calls(), 1);
+}
+
+#[tokio::test]
+async fn every_route_timing_out_is_a_typed_timeout() {
+    let clock = ManualClock::new();
+    let first =
+        Arc::new(StubModel::new("openai", "gpt-4o-mini").with_delay(Duration::from_secs(5)));
+    let second = Arc::new(StubModel::new("openai", "gpt-4o").with_delay(Duration::from_secs(5)));
+    let mut group = group(vec![
+        route(
+            "r-1",
+            resolved_model("m-1", "gpt-4o-mini", "http://127.0.0.1:9"),
+        ),
+        route("r-2", resolved_model("m-2", "gpt-4o", "http://127.0.0.1:9")),
+    ]);
+    // The group deadline applies to every route, since no route sets its own.
+    group.timeout_seconds = Some(0.02);
+    let routing = routing_with_clock(
+        &group,
+        vec![
+            first.clone() as Arc<dyn Model>,
+            second.clone() as Arc<dyn Model>,
+        ],
+        &clock,
+    );
+
+    let error = routing
+        .invoke(&[BaseMessage::user("hello")], &ModelRequestConfig::new(""))
+        .await
+        .expect_err("every route exceeded the deadline");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    let message = error.message().to_string();
+    assert!(message.contains("all routes failed"), "{message}");
+    assert!(
+        message.contains("r-1") && message.contains("r-2"),
+        "{message}"
+    );
+    assert!(message.contains("timeout"), "{message}");
+    assert!(message.contains("routing timeout"), "{message}");
+    assert_eq!(first.calls(), 1);
+    assert_eq!(second.calls(), 1);
+}
+
+#[tokio::test]
+async fn a_stream_reconciles_its_usage_when_it_finishes() {
+    let clock = ManualClock::new();
+    let stub = Arc::new(StubModel::new("openai", "gpt-4o-mini").with_usage(Usage::new(3, 4)));
+    let mut group = group(vec![route(
+        "r-1",
+        resolved_model("m-1", "gpt-4o-mini", "http://127.0.0.1:9"),
+    )]);
+    group.routes[0].tpm = Some(100.0);
+    let routing = routing_with_clock(&group, vec![stub.clone() as Arc<dyn Model>], &clock);
+
+    let mut stream = routing.stream(
+        vec![BaseMessage::user("hello")],
+        ModelRequestConfig::new(""),
+    );
+    let mut done = false;
+    while let Some(item) = stream.next().await {
+        if matches!(item.expect("every chunk decodes"), StreamChunk::Done) {
+            done = true;
+        }
+    }
+    assert!(done, "the stream terminates with Done");
+    assert_eq!(
+        routing
+            .rate_limiter()
+            .usage(&openai_key("gpt-4o-mini"))
+            .tokens,
+        7,
+        "the prompt estimate was replaced by the streamed usage"
     );
 }

@@ -134,13 +134,17 @@ pub struct ResolvedRoute {
     pub enabled: bool,
     /// Request values merged **above** the group config.
     pub request_overrides: Value,
-    /// Tokens-per-minute hint from the resolved record; not enforced (no limiter).
+    /// Tokens per rolling minute, enforced by
+    /// [`RateLimiter`](super::limit::RateLimiter); `None` means no token throttle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tpm: Option<f64>,
-    /// Requests-per-minute hint from the resolved record; not enforced (no limiter).
+    /// Requests per rolling minute, enforced by
+    /// [`RateLimiter`](super::limit::RateLimiter); `None` means no request throttle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm: Option<f64>,
-    /// Per-route timeout in seconds; applied to the route client's request timeout.
+    /// Per-route timeout in seconds: applied to the route client's request timeout
+    /// and bounds both the throttling wait and the attempt itself. It wins over the
+    /// group `timeout_seconds`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<f64>,
     /// Additive Rust field: higher priorities are tried first.
@@ -197,7 +201,8 @@ pub struct ResolvedModelGroup {
     /// `enabled_routes - 1`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_retries: Option<u32>,
-    /// Whole-group deadline in seconds; recorded in the compiled plan, not enforced.
+    /// Whole-group deadline in seconds; bounds every route attempt (and its
+    /// throttling wait) unless the route sets its own `timeout`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<f64>,
     /// Default tag for a `tag-filtered` strategy when `strategy_kwargs` names none.
@@ -324,7 +329,8 @@ pub struct ResolvedRoutingConfig {
     pub num_retries: u32,
     /// Strategy arguments; an empty object means "no arguments".
     pub strategy_kwargs: Value,
-    /// Whole-group deadline in seconds; recorded, not enforced.
+    /// Whole-group deadline in seconds; bounds every route attempt (and its
+    /// throttling wait) unless the route sets its own `timeout`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<f64>,
 }
