@@ -71,6 +71,9 @@ pub(super) fn context_percent(tokens: usize, context_max: Option<u32>) -> Option
 }
 
 /// `before - after` as a signed delta; `None` until the pass produced a history.
+///
+/// The saving inherits estimation from both sides, so a delta of two estimates is
+/// never published as an exact one.
 pub(super) fn saved_delta(
     before: &ContextCompressionMetric,
     after: Option<&ContextCompressionMetric>,
@@ -90,6 +93,7 @@ pub(super) fn saved_delta(
         messages: before_messages.saturating_sub(after_messages),
         tokens: saved_tokens,
         percent,
+        estimated: before.estimated || after.estimated,
     })
 }
 

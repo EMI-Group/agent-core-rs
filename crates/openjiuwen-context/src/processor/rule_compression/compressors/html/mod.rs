@@ -7,14 +7,22 @@
 //! lists, tables and paragraph text, and collapses whitespace into markdown (or
 //! plain text).
 //!
+//! The tag block list is only the secondary filter: `ladder` scores every
+//! rendered block (text density, link density, boilerplate ratio, digit and
+//! punctuation density) and keeps the highest-scoring contiguous run, so an
+//! unmarked menu, sidebar or footer is dropped as well.
+//! Report-shaped HTML (`pytest-html`, `results-table`, or two tables plus two
+//! report markers) is pruned by `report` first, exactly like the Python
+//! `BeautifulSoup` fallback.
+//!
 //! [`HtmlCompressor`] accepts a candidate only when its text is at least
-//! `html_min_content_chars` long and [`meets_savings_ratio`] passes. Report-shaped
-//! HTML (`pytest-html`, `results-table`, or two tables plus two report markers)
-//! prunes the "passed" table rows once a failure row exists, exactly like the
-//! Python `BeautifulSoup` fallback.
+//! `html_min_content_chars` long and [`meets_savings_ratio`] passes, and its
+//! `details` report the ladder's selection alongside the extraction counters.
 //!
 //! [`meets_savings_ratio`]: crate::processor::rule_compression::common::meets_savings_ratio
 mod extract;
+mod ladder;
+mod report;
 
 #[cfg(test)]
 mod tests;
@@ -24,8 +32,8 @@ use crate::processor::rule_compression::common::meets_savings_ratio;
 use crate::processor::rule_compression::types::{ContentType, RuleContext};
 use serde_json::json;
 
-use extract::looks_like_report_html;
 pub use extract::{HTMLExtractionResult, HTMLExtractor, HTMLExtractorConfig, HtmlOutputFormat};
+use report::looks_like_report_html;
 
 /// Compresses HTML through [`HTMLExtractor`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -63,6 +71,10 @@ impl RuleCompressor for HtmlCompressor {
             "table_count": extracted.table_count,
             "code_block_count": extracted.code_block_count,
             "output_block_count": extracted.output_block_count,
+            "selected_block_count": extracted.selected_block_count,
+            "boilerplate_block_count": extracted.boilerplate_block_count,
+            "best_region_score": extracted.best_region_score,
+            "ladder_fallback": extracted.ladder_fallback,
         });
         // `_plain_text` only replaces characters one-for-one, so its length is the
         // candidate's length; the check is the candidate size against the floor.

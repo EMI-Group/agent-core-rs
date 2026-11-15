@@ -34,6 +34,7 @@ use crate::events::ContextEvent;
 use crate::offload::{OffloadScope, OffloadStore};
 use crate::recall::RecallArchiveStore;
 use crate::session_memory::SessionMemoryStore;
+use crate::session_memory_agent::SessionMemoryAgent;
 
 /// A small, thread-safe JSON bag a processor keeps its cross-run counters in.
 ///
@@ -117,6 +118,28 @@ impl ProcessorState {
     /// instead of wrapping.
     pub fn record_tokens(&self, key: &str, value: usize) {
         self.set_u64(key, u64::try_from(value).unwrap_or(u64::MAX));
+    }
+
+    /// Records a text value under `key`.
+    ///
+    /// Text entries are the processor's diagnostic channel for outcomes that are
+    /// not a change: a refusal reason, the source of a written artefact, or the
+    /// last error a fallback swallowed. They are persisted with the rest of the
+    /// state and never influence a transform.
+    pub fn set_text(&self, key: &str, value: impl Into<String>) {
+        with_object(&self.inner, |object| {
+            object.insert(key.to_owned(), serde_json::Value::from(value.into()));
+        });
+    }
+
+    /// The text value stored under `key`, `None` when it is absent or not a
+    /// string.
+    #[must_use]
+    pub fn text(&self, key: &str) -> Option<String> {
+        lock_state(&self.inner)
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
     }
 
     /// Adds `delta` to the integer counter `key`, creating it when absent.
@@ -238,6 +261,14 @@ pub struct ProcessorContext<'a> {
     /// `None` when no store was configured; [`crate::processor::FullCompactProcessor`]
     /// then falls back to the model or offline summary path.
     pub session_memory: Option<&'a dyn SessionMemoryStore>,
+    /// Agent a full compaction may run to extract the notes the store lacks.
+    ///
+    /// This is the per-request override of the agent the processor itself holds:
+    /// a caller that sets it wins, so one pipeline can be driven with different
+    /// extractors. `None` leaves the processor's own agent (or its absence) in
+    /// charge, and the compaction then reports why the session-memory branch
+    /// could not run.
+    pub session_memory_agent: Option<Arc<SessionMemoryAgent>>,
 }
 
 /// Serializable description of one processor.

@@ -43,6 +43,9 @@ impl ConversationContext {
             cancellation: &self.cancellation,
             recall: self.recall.as_deref(),
             session_memory: self.session_memory.as_deref(),
+            // The prepare pass holds no agent: extraction belongs to the
+            // compaction pass, which is the only one that replaces history.
+            session_memory_agent: None,
         };
         self.pipeline.run_in_phase(messages, &cx, phase).await
     }

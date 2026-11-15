@@ -10,26 +10,42 @@
 //!    query terms come from the latest user message plus the triggering tool call,
 //!    and `tool_name`/`file_path` come from that call,
 //! 4. the router compresses, and a modified result is returned as a copy of the
-//!    message with the new text and the `rule_compressed_*` metadata keys,
-//! 5. the optional dump writes one JSON file, and one `tracing::info!` line
-//!    records the pass.
+//!    message with the new text, the `rule_compressed_*` metadata keys, and the
+//!    candidate's honesty flag (`rule_compression_lossy`),
+//! 5. the optional dump writes one record — a pretty JSON file per application or
+//!    one JSONL line per application — and one `tracing::info!` line records the
+//!    pass.
+//!
+//! The dump carries the real session and context ids: the caller passes the
+//! [`crate::offload::OffloadScope`] it runs under (see
+//! [`RuleCompressionPipeline::compress_in_messages_with_scope`]), and the
+//! placeholders [`crate::processor::rule_compression::dump::UNKNOWN_SESSION_ID`] and
+//! [`crate::processor::rule_compression::dump::UNKNOWN_CONTEXT_ID`] appear only
+//! when that scope genuinely has none.
 //!
 //! The pass is synchronous and deterministic; only the dump touches the
-//! filesystem, and a failed dump never fails the pass.
+//! filesystem, and a failed dump never fails the pass. A dump directory that
+//! cannot be written is reported once per directory, naming the path and the
+//! error, instead of repeating the warning on every application.
 use std::collections::BTreeSet;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::prompt::{BaseMessage, MessageContent, Role};
 use serde_json::{json, Value};
 
 use super::common::extract_file_path_argument;
-use super::dump::{resolve_dump_dir, write_dump, DumpRecord};
+use super::dump::{
+    resolve_dump_dir, write_record, DumpRecord, DumpTemplateVars, RuleCompressionDumpFormat,
+};
 use super::query_terms::extract_query_terms;
 use super::router::RuleContentRouter;
-use super::types::{RuleCompressionResult, RuleContext, CHARACTERS_PER_TOKEN};
+use super::types::{
+    RuleCompressionResult, RuleCompressionStrategy, RuleContext, CHARACTERS_PER_TOKEN,
+};
+use crate::offload::OffloadScope;
 use crate::processor::offloader::resolve_tool_call;
 
 /// Metadata key: wall-clock time of the compression.
@@ -42,6 +58,8 @@ pub const RULE_COMPRESSION_PASS_KEY: &str = "rule_compression_pass";
 pub const RULE_COMPRESSION_DETAILS_KEY: &str = "rule_compression_details";
 /// Metadata key: path of the debug dump, when one was written.
 pub const RULE_COMPRESSION_DUMP_PATH_KEY: &str = "rule_compression_dump_path";
+/// Metadata key: whether the accepted candidate dropped information.
+pub const RULE_COMPRESSION_LOSSY_KEY: &str = "rule_compression_lossy";
 /// Pass name of the pass that runs when a tool result is added.
 pub const ADD_PASS: &str = "add";
 /// Pass name of the pass that compresses whatever survived its time to live.
@@ -56,6 +74,11 @@ pub struct RuleCompressionPipeline {
     clock: RuleClock,
     enable_dump: bool,
     dump_dir: Option<PathBuf>,
+    dump_format: RuleCompressionDumpFormat,
+    strategy: RuleCompressionStrategy,
+    /// Last dump directory a write failure was reported for, so the warning is
+    /// emitted once per directory rather than once per application.
+    warned_dump_dir: Arc<Mutex<Option<String>>>,
 }
 
 impl std::fmt::Debug for RuleCompressionPipeline {
@@ -63,6 +86,8 @@ impl std::fmt::Debug for RuleCompressionPipeline {
         f.debug_struct("RuleCompressionPipeline")
             .field("enable_dump", &self.enable_dump)
             .field("dump_dir", &self.dump_dir)
+            .field("dump_format", &self.dump_format)
+            .field("strategy", &self.strategy)
             .finish_non_exhaustive()
     }
 }
@@ -82,6 +107,9 @@ impl RuleCompressionPipeline {
             clock: Arc::new(system_now),
             enable_dump: false,
             dump_dir: None,
+            dump_format: RuleCompressionDumpFormat::default(),
+            strategy: RuleCompressionStrategy::default(),
+            warned_dump_dir: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -94,11 +122,34 @@ impl RuleCompressionPipeline {
         }
     }
 
-    /// Enables dumps into `dir` (or the environment variable when `dir` is `None`).
+    /// Enables dumps into `dir` (or the environment variable, else the workspace
+    /// default [`super::dump::DEFAULT_DUMP_DIR`], when `dir` is `None`).
+    ///
+    /// `dir` may carry the `{session_id}`, `{context_id}`, `{date}` and
+    /// `{timestamp}` templates, which are expanded per application.
     #[must_use]
     pub fn with_dump(mut self, enable: bool, dir: Option<String>) -> Self {
         self.enable_dump = enable;
         self.dump_dir = dir.as_deref().map(PathBuf::from);
+        self
+    }
+
+    /// Selects how a dump is written (one JSON file per application, the default,
+    /// or one appended JSONL line per application).
+    #[must_use]
+    pub fn with_dump_format(mut self, format: RuleCompressionDumpFormat) -> Self {
+        self.dump_format = format;
+        self
+    }
+
+    /// Selects which tier this pipeline belongs to.
+    ///
+    /// The pipeline *is* the rule tier, so [`RuleCompressionStrategy::TruncateOnly`]
+    /// makes every pass a no-op; the caller keys its own summary/offload tier off
+    /// the same value.
+    #[must_use]
+    pub fn with_strategy(mut self, strategy: RuleCompressionStrategy) -> Self {
+        self.strategy = strategy;
         self
     }
 
@@ -112,6 +163,18 @@ impl RuleCompressionPipeline {
     #[must_use]
     pub fn dump_dir(&self) -> Option<&std::path::Path> {
         self.dump_dir.as_deref()
+    }
+
+    /// How a dump is written.
+    #[must_use]
+    pub fn dump_format(&self) -> RuleCompressionDumpFormat {
+        self.dump_format
+    }
+
+    /// The strategy this pipeline runs under.
+    #[must_use]
+    pub fn strategy(&self) -> RuleCompressionStrategy {
+        self.strategy
     }
 
     /// The router this pipeline dispatches through.
@@ -160,7 +223,10 @@ impl RuleCompressionPipeline {
     /// Compresses the tool message at `index` in `messages`.
     ///
     /// The routing hints and query terms are resolved from the surrounding
-    /// messages, so this is the entry point a processor uses.
+    /// messages, so this is the entry point a processor uses. The dump this pass
+    /// may write carries no session or context id; use
+    /// [`RuleCompressionPipeline::compress_in_messages_with_scope`] when the
+    /// caller knows them.
     pub fn compress_in_messages(
         &self,
         messages: &[BaseMessage],
@@ -168,6 +234,32 @@ impl RuleCompressionPipeline {
         pass_name: &str,
         max_chars: usize,
         force: bool,
+    ) -> Result<BaseMessage> {
+        self.compress_in_messages_with_scope(
+            messages,
+            index,
+            pass_name,
+            max_chars,
+            force,
+            &OffloadScope::default(),
+        )
+    }
+
+    /// Compresses the tool message at `index` in `messages` under `scope`.
+    ///
+    /// `scope` supplies the real session and context ids a dump records and the
+    /// `{session_id}`/`{context_id}` templates it expands; when the scope carries
+    /// neither, the dump falls back to [`super::dump::UNKNOWN_SESSION_ID`] and
+    /// [`super::dump::UNKNOWN_CONTEXT_ID`] (a processor always has a scope, so the
+    /// placeholders only appear for a standalone caller).
+    pub fn compress_in_messages_with_scope(
+        &self,
+        messages: &[BaseMessage],
+        index: usize,
+        pass_name: &str,
+        max_chars: usize,
+        force: bool,
+        scope: &OffloadScope,
     ) -> Result<BaseMessage> {
         let message = messages
             .get(index)
@@ -177,7 +269,7 @@ impl RuleCompressionPipeline {
         let tool_name = tool_call.map(|call| call.name.as_str());
         let tool_arguments = tool_call.map(|call| call.arguments.as_str());
         let ctx = self.context_for(max_chars, messages, tool_name, tool_arguments);
-        self.compress(&message, &ctx, pass_name, max_chars, force)
+        self.compress_with_scope(&message, &ctx, pass_name, max_chars, force, scope)
     }
 
     /// Compresses `message` with `ctx`, or returns it unchanged.
@@ -193,7 +285,27 @@ impl RuleCompressionPipeline {
         max_chars: usize,
         force: bool,
     ) -> Result<BaseMessage> {
-        if message.role != Role::Tool {
+        self.compress_with_scope(
+            message,
+            ctx,
+            pass_name,
+            max_chars,
+            force,
+            &OffloadScope::default(),
+        )
+    }
+
+    /// Compresses `message` with `ctx` under `scope`, or returns it unchanged.
+    pub fn compress_with_scope(
+        &self,
+        message: &BaseMessage,
+        ctx: &RuleContext,
+        pass_name: &str,
+        max_chars: usize,
+        force: bool,
+        scope: &OffloadScope,
+    ) -> Result<BaseMessage> {
+        if message.role != Role::Tool || !self.strategy.runs_rule_compression() {
             return Ok(message.clone());
         }
         let Some(text) = message.content.as_text() else {
@@ -227,22 +339,26 @@ impl RuleCompressionPipeline {
         compressed
             .metadata
             .insert(RULE_COMPRESSION_PASS_KEY.to_owned(), json!(pass_name));
+        compressed
+            .metadata
+            .insert(RULE_COMPRESSION_LOSSY_KEY.to_owned(), json!(result.lossy));
         if let Some(details) = result.details.as_ref().filter(|details| is_truthy(details)) {
             compressed
                 .metadata
                 .insert(RULE_COMPRESSION_DETAILS_KEY.to_owned(), details.clone());
         }
-        if let Some(path) = self.dump(&text, &result, pass_name, tool_call_id) {
+        if let Some(path) = self.dump(&text, &result, pass_name, tool_call_id, scope) {
             compressed.metadata.insert(
                 RULE_COMPRESSION_DUMP_PATH_KEY.to_owned(),
                 json!(path.to_string_lossy()),
             );
         }
         tracing::info!(
-            "[RuleCompression] applied tool_call_id={} pass={} type={} chars={}->{}",
+            "[RuleCompression] applied tool_call_id={} pass={} type={} lossy={} chars={}->{}",
             tool_call_id,
             pass_name,
             result.content_type.as_str(),
+            result.lossy,
             text.chars().count(),
             result.content.chars().count(),
         );
@@ -264,34 +380,43 @@ impl RuleCompressionPipeline {
         extract_query_terms(latest_user, tool_name, tool_arguments)
     }
 
-    /// Writes the debug dump of one application, returning its path on success.
+    /// Writes the dump of one application, returning its path on success.
+    ///
+    /// The record carries the scope's real ids, the resolved template directory,
+    /// and the format this pipeline was configured with. A failure is reported
+    /// once per directory (`warn` naming the path and the error) and never fails
+    /// the pass.
     fn dump(
         &self,
         original: &str,
         result: &RuleCompressionResult,
         pass_name: &str,
         tool_call_id: &str,
+        scope: &OffloadScope,
     ) -> Option<PathBuf> {
         if !self.enable_dump {
             return None;
         }
+        let timestamp = self.current_time();
+        let vars = DumpTemplateVars::from_scope(scope, timestamp);
         let configured = self
             .dump_dir
             .as_ref()
             .map(|dir| dir.to_string_lossy().into_owned());
-        let dir = resolve_dump_dir(configured.as_deref())?;
+        let dir = resolve_dump_dir(configured.as_deref(), &vars);
         let record = DumpRecord {
-            timestamp: self.current_time(),
-            session_id: "unknown_session",
-            context_id: "unknown_context",
+            timestamp,
+            session_id: vars.session_or_unknown(),
+            context_id: vars.context_or_unknown(),
             tool_call_id,
             content_type: result.content_type.as_str(),
             pass_name,
+            lossy: result.lossy,
             original,
             compressed: &result.content,
             details: result.details.as_ref(),
         };
-        match write_dump(&record, &dir) {
+        match write_record(&record, &dir, self.dump_format) {
             Ok(path) => {
                 tracing::info!(
                     "[RuleCompression] dumped compression payload path={}",
@@ -300,10 +425,32 @@ impl RuleCompressionPipeline {
                 Some(path)
             }
             Err(error) => {
-                tracing::warn!("[RuleCompression] failed to dump compression payload: {error}");
+                self.warn_dump_failure(&dir, &error);
                 None
             }
         }
+    }
+
+    /// Warns about a dump failure once per directory.
+    ///
+    /// Repeating the same message on every application would drown the log, and
+    /// guessing another location would hide the failure, so the first failure
+    /// under a directory is reported with its path and error and later ones stay
+    /// silent.
+    fn warn_dump_failure(&self, dir: &Path, error: &Error) {
+        let key = dir.to_string_lossy().into_owned();
+        let mut last = self
+            .warned_dump_dir
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if last.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        tracing::warn!(
+            "[RuleCompression] cannot write compression dumps under {}: {error}",
+            dir.display()
+        );
+        *last = Some(key);
     }
 }
 
@@ -434,6 +581,79 @@ mod tests {
             .compress_in_messages(&messages, 2, TTL_PASS, 100_000, true)
             .expect("ok");
         assert!(!forced.metadata.is_empty());
+    }
+
+    #[test]
+    fn the_accepted_candidate_bench_stamps_the_lossy_flag() {
+        let call = ToolCall {
+            id: Some("call_1".to_owned()),
+            name: "grep".to_owned(),
+            arguments: "{\"pattern\": \"duplicate\"}".to_owned(),
+            ..ToolCall::default()
+        };
+        let mut content = String::new();
+        for index in 0..200 {
+            let _ = writeln!(content, "the same progress line {}", index % 3);
+        }
+        let messages = conversation("progress", call, &content);
+        let pipeline = RuleCompressionPipeline::with_clock(|| 7.5);
+        let compressed = pipeline
+            .compress_in_messages(&messages, 2, ADD_PASS, 500, false)
+            .expect("ok");
+        assert_eq!(compressed.metadata[RULE_COMPRESSION_LOSSY_KEY], json!(true));
+    }
+
+    #[test]
+    fn truncate_only_makes_the_rule_tier_a_no_op() {
+        let call = ToolCall {
+            id: Some("call_1".to_owned()),
+            name: "grep".to_owned(),
+            arguments: "{}".to_owned(),
+            ..ToolCall::default()
+        };
+        let mut content = String::new();
+        for index in 0..200 {
+            let _ = writeln!(content, "the same progress line {}", index % 3);
+        }
+        let messages = conversation("progress", call, &content);
+        let pipeline =
+            RuleCompressionPipeline::new().with_strategy(RuleCompressionStrategy::TruncateOnly);
+        assert_eq!(pipeline.strategy(), RuleCompressionStrategy::TruncateOnly);
+        let untouched = pipeline
+            .compress_in_messages(&messages, 2, ADD_PASS, 500, false)
+            .expect("ok");
+        assert!(untouched.metadata.is_empty());
+        assert_eq!(untouched.content.as_text(), messages[2].content.as_text());
+    }
+
+    #[test]
+    fn a_failed_dump_is_remembered_per_directory() {
+        let pipeline = RuleCompressionPipeline::new();
+        let first = Path::new("/this/path/does/not/exist/for/the/test");
+        let second = Path::new("/another/missing/directory");
+        let error = Error::sys_op("create dump dir: boom");
+        pipeline.warn_dump_failure(first, &error);
+        // Same directory again: the warning is not repeated.
+        pipeline.warn_dump_failure(first, &error);
+        assert_eq!(
+            warned_dir(&pipeline).as_deref(),
+            Some(first.to_string_lossy().as_ref())
+        );
+        // A different directory is reported again.
+        pipeline.warn_dump_failure(second, &error);
+        assert_eq!(
+            warned_dir(&pipeline).as_deref(),
+            Some(second.to_string_lossy().as_ref())
+        );
+    }
+
+    /// The directory the last dump failure was reported for.
+    fn warned_dir(pipeline: &RuleCompressionPipeline) -> Option<String> {
+        pipeline
+            .warned_dump_dir
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     #[test]

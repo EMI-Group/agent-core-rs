@@ -19,8 +19,8 @@ use openjiuwen_foundation::llm::Model;
 use openjiuwen_foundation::prompt::{BaseMessage, Usage};
 
 use super::compressor::{
-    CurrentRoundCompressor, DialogueCompressor, FullCompactProcessor, MicroCompactProcessor,
-    RoundLevelCompressor,
+    CurrentRoundCompressor, DialogueCompressor, FullCompactProcessor, FullCompactProcessorConfig,
+    MicroCompactProcessor, RoundLevelCompressor,
 };
 use super::config::{ProcessorConfig, ProcessorContext};
 use super::offloader::{MessageOffloader, ToolResultBudgetProcessor};
@@ -35,6 +35,7 @@ use crate::offload::OffloadStore;
 use crate::processor::compressor::reinjection::SnapshotRegistry;
 use crate::recall::RecallArchiveStore;
 use crate::session_memory::SessionMemoryStore;
+use crate::session_memory_agent::SessionMemoryAgent;
 use crate::stats::compute_stats;
 use crate::telemetry::{
     with_operation, CompressionStatePhase, CompressionStateStatus, ContextCompressionUsage,
@@ -59,6 +60,12 @@ pub struct PipelineDeps {
     pub recall: Option<Arc<dyn RecallArchiveStore>>,
     /// Session-memory notes full compaction reinjects.
     pub session_memory: Option<Arc<dyn SessionMemoryStore>>,
+    /// Agent full compaction runs to extract notes the session-memory store lacks.
+    ///
+    /// `None` lets [`ContextPipeline::from_configs_with`] build the default
+    /// agent whenever a session-memory store is mounted for an enabled
+    /// session-memory strategy; an explicitly supplied agent always wins.
+    pub session_memory_agent: Option<Arc<SessionMemoryAgent>>,
     /// Host-rendered state sections full compaction reinjects after a pass.
     pub reinjection: Option<Arc<SnapshotRegistry>>,
     /// Recorder every processor pass of the built pipeline reports to.
@@ -75,6 +82,10 @@ impl std::fmt::Debug for PipelineDeps {
             .field("has_model", &self.model.is_some())
             .field("has_recall", &self.recall.is_some())
             .field("has_session_memory", &self.session_memory.is_some())
+            .field(
+                "has_session_memory_agent",
+                &self.session_memory_agent.is_some(),
+            )
             .field("has_reinjection", &self.reinjection.is_some())
             .field("has_recorder", &self.recorder.is_some())
             .finish()
@@ -90,6 +101,7 @@ impl PipelineDeps {
             model: None,
             recall: None,
             session_memory: None,
+            session_memory_agent: None,
             reinjection: None,
             recorder: None,
         }
@@ -123,6 +135,18 @@ impl PipelineDeps {
     #[must_use]
     pub fn with_reinjection(mut self, reinjection: Option<Arc<SnapshotRegistry>>) -> Self {
         self.reinjection = reinjection;
+        self
+    }
+
+    /// Sets the agent full compaction runs to extract missing session-memory notes.
+    ///
+    /// [`ContextPipeline::from_configs_with`] falls back to
+    /// [`SessionMemoryAgent::default`] when a store is mounted and no agent is
+    /// supplied, so an explicit agent is the only way to change the extraction
+    /// configuration of a pipeline.
+    #[must_use]
+    pub fn with_session_memory_agent(mut self, agent: Option<Arc<SessionMemoryAgent>>) -> Self {
+        self.session_memory_agent = agent;
         self
     }
 
@@ -297,11 +321,18 @@ impl ContextPipeline {
     ///
     /// This is [`ContextPipeline::from_configs`] plus the seams that are not
     /// part of a [`ProcessorConfig`]: [`FullCompactProcessor`] receives
-    /// [`PipelineDeps::session_memory`], [`PipelineDeps::reinjection`] and
-    /// [`PipelineDeps::model`], and
+    /// [`PipelineDeps::session_memory`], [`PipelineDeps::session_memory_agent`],
+    /// [`PipelineDeps::reinjection`] and [`PipelineDeps::model`], and
     /// [`MessageSummaryOffloader`] receives [`PipelineDeps::model`]. The recall
     /// store is not held by a processor; it reaches them through
     /// [`ProcessorContext::recall`] when the pipeline runs.
+    ///
+    /// The session-memory agent follows one precedence: the
+    /// [`PipelineDeps::session_memory_agent`] the caller supplied, otherwise a
+    /// default [`SessionMemoryAgent`] whenever a store is mounted and
+    /// [`FullCompactProcessorConfig::session_memory_enabled`] is on, otherwise
+    /// none — and the compaction then reports why its session-memory branch
+    /// could not run.
     ///
     /// # Errors
     ///
@@ -361,15 +392,7 @@ impl ContextPipeline {
                 ProcessorConfig::FullCompact(config) => {
                     // The session-memory notes are preferred over a model
                     // summary; without notes the model or offline path runs.
-                    let mut processor = FullCompactProcessor::new(
-                        config.clone(),
-                        deps.model.clone(),
-                        deps.session_memory.clone(),
-                    );
-                    if let Some(registry) = deps.reinjection.as_ref() {
-                        processor = processor.with_reinjection(Arc::clone(registry));
-                    }
-                    processors.push(Arc::new(processor));
+                    processors.push(full_compact_processor(config, deps));
                 }
                 ProcessorConfig::MicroCompact(config) => {
                     config.validate()?;
@@ -709,4 +732,32 @@ fn with_pass_context<'a>(
         input = input.with_context_max(context_max);
     }
     input
+}
+
+/// Builds the full-compaction processor, including its session-memory agent.
+///
+/// The agent precedence is an explicit [`PipelineDeps::session_memory_agent`] →
+/// a default [`SessionMemoryAgent`] whenever a store is mounted for an enabled
+/// session-memory strategy → none, in which case the compaction reports why its
+/// session-memory branch could not run.
+fn full_compact_processor(
+    config: &FullCompactProcessorConfig,
+    deps: &PipelineDeps,
+) -> Arc<dyn ContextProcessor> {
+    let mut processor = FullCompactProcessor::new(
+        config.clone(),
+        deps.model.clone(),
+        deps.session_memory.clone(),
+    );
+    let agent = deps.session_memory_agent.clone().or_else(|| {
+        (config.session_memory_enabled && deps.session_memory.is_some())
+            .then(|| Arc::new(SessionMemoryAgent::default()))
+    });
+    if let Some(agent) = agent {
+        processor = processor.with_session_memory_agent(agent);
+    }
+    if let Some(registry) = deps.reinjection.as_ref() {
+        processor = processor.with_reinjection(Arc::clone(registry));
+    }
+    Arc::new(processor)
 }

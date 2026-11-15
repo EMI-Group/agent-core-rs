@@ -283,6 +283,7 @@ mod tests {
                 cancellation: &self.cancellation,
                 recall: None,
                 session_memory: None,
+                session_memory_agent: None,
             }
         }
     }
@@ -495,6 +496,7 @@ mod tests {
             cancellation: &fixture.cancellation,
             recall: None,
             session_memory: None,
+            session_memory_agent: None,
         };
         processor
             .process(&mut messages, &cx)

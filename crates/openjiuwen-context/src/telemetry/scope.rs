@@ -114,6 +114,10 @@ impl CompressionOperation {
     /// [`CompressionOperation::request_purpose`] and
     /// [`CompressionOperation::context_operation_id`] instead and report them
     /// through its own callback.
+    ///
+    /// An `extra` that is neither an object nor `null` cannot hold the keys, so
+    /// the request keeps its value and the pass is logged as uncorrelated at
+    /// `warn`; the model call itself still runs.
     pub fn apply_to(&self, request: &mut ModelRequestConfig) {
         let kwargs = self.model_kwargs();
         if kwargs.is_empty() {
@@ -126,9 +130,13 @@ impl CompressionOperation {
                 }
             }
             Value::Null => request.extra = Value::Object(kwargs),
-            other => tracing::debug!(
-                extra = ?other,
-                "cannot stamp the compaction correlation: request extra is not an object"
+            other => tracing::warn!(
+                extra_shape = json_shape(other),
+                operation_id = self.context_operation_id().unwrap_or_default(),
+                request_purpose = self.request_purpose(),
+                "cannot stamp the compaction correlation: the request's `extra` is neither a JSON \
+                 object nor null, so `request_purpose`/`context_operation_id` are dropped and this \
+                 model call stays uncorrelated"
             ),
         }
     }
@@ -140,6 +148,18 @@ impl CompressionOperation {
         };
         extra.remove(REQUEST_PURPOSE_KEY);
         extra.remove(CONTEXT_OPERATION_ID_KEY);
+    }
+}
+
+/// The JSON shape of `value`, for a warning that names what it received.
+fn json_shape(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 
