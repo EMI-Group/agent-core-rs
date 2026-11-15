@@ -5,7 +5,7 @@
 //! `openjiuwen/extensions/observability/otlp_codec.py` (see
 //! [`address_payload`]).
 //!
-//! The GenAI convention has every model call state its whole input: the
+//! The `GenAI` convention has every model call state its whole input: the
 //! messages, the tool definitions, the system instructions.
 //! That is right for the protocol and wasteful for storage, because
 //! consecutive calls of one conversation repeat almost all of it.
@@ -49,11 +49,13 @@
 //! is SDK-only and stays on the export path (`crate::otel::otlp`'s JSON
 //! encoder); [`address_payload`] is the storage-path transformation itself,
 //! which operates on an already-decoded OTLP payload and is pure JSON.
-use std::collections::BTreeMap;
+use crate::otel::semconv::{
+    GEN_AI_INPUT_MESSAGES, GEN_AI_OUTPUT_MESSAGES, GEN_AI_SYSTEM_INSTRUCTIONS,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use crate::otel::semconv::{GEN_AI_INPUT_MESSAGES, GEN_AI_OUTPUT_MESSAGES, GEN_AI_SYSTEM_INSTRUCTIONS};
+use std::collections::BTreeMap;
 /// Version prefix of a stored reference.
 ///
 /// It exists so a later change of hash algorithm or node shape stays
@@ -64,7 +66,7 @@ pub const SEQUENCE_REFERENCE_PREFIX: &str = "@oj-seq";
 /// Wire name `gen_ai.tool.definitions` — the tool-definition payload an LLM
 /// call restates on every request.
 ///
-/// [`crate::otel::semconv`] re-exports the other three GenAI payload keys but
+/// [`crate::otel::semconv`] re-exports the other three `GenAI` payload keys but
 /// has no constant for this one yet, so the wire name lives here.
 const GEN_AI_TOOL_DEFINITIONS: &str = "gen_ai.tool.definitions";
 /// The attributes a conversation restates on every call, and which the storage
@@ -129,9 +131,7 @@ pub fn content_hash(bytes: &[u8]) -> String {
 /// Returns the value stored in place of a sequence: `@oj-seq:1:<hash>:<depth>`.
 #[must_use]
 pub fn sequence_reference(seq_hash: &str, depth: usize) -> String {
-    format!(
-        "{SEQUENCE_REFERENCE_PREFIX}:{SEQUENCE_REFERENCE_VERSION}:{seq_hash}:{depth}"
-    )
+    format!("{SEQUENCE_REFERENCE_PREFIX}:{SEQUENCE_REFERENCE_VERSION}:{seq_hash}:{depth}")
 }
 /// Returns the hash and depth a reference names, or `None` for a plain value.
 ///
@@ -293,12 +293,16 @@ pub fn addressable_attributes(payload: &Value, keys: &[&str]) -> Vec<(String, St
 #[must_use]
 pub fn address_payload(payload: &mut Value, keys: &[&str]) -> Vec<AddressedSequence> {
     let mut sequences = Vec::new();
-    let Some(resource_spans) = payload.get_mut("resourceSpans").and_then(Value::as_array_mut)
+    let Some(resource_spans) = payload
+        .get_mut("resourceSpans")
+        .and_then(Value::as_array_mut)
     else {
         return sequences;
     };
     for resource_span in resource_spans {
-        let Some(scope_spans) = resource_span.get_mut("scopeSpans").and_then(Value::as_array_mut)
+        let Some(scope_spans) = resource_span
+            .get_mut("scopeSpans")
+            .and_then(Value::as_array_mut)
         else {
             continue;
         };
@@ -363,12 +367,12 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use std::collections::BTreeMap;
 
-    use serde_json::{json, Value};
     use super::{
         address_payload, addressable_attributes, build_sequence, content_hash,
         parse_sequence_reference, rebuild_value, sequence_reference, split_elements,
         ADDRESSED_ATTRIBUTE_KEYS, SEQUENCE_REFERENCE_PREFIX, SEQUENCE_REFERENCE_VERSION,
     };
+    use serde_json::{json, Value};
     /// A conversation of `count` user messages, as the convention states it.
     fn messages(count: usize) -> String {
         let turns: Vec<Value> = (0..count)
@@ -377,7 +381,7 @@ mod tests {
         serde_json::to_string(&turns).expect("a message list serializes")
     }
     /// One decoded OTLP payload with one span carrying `attributes`.
-    fn payload(attributes: Value) -> Value {
+    fn payload(attributes: &Value) -> Value {
         json!({
             "resourceSpans": [{
                 "scopeSpans": [{
@@ -446,9 +450,11 @@ mod tests {
         let original = build_sequence("gen_ai.input.messages", &messages(5)).unwrap();
         let mut edited: Value = serde_json::from_str(&messages(5)).unwrap();
         edited.as_array_mut().unwrap()[1]["content"] = json!("compacted");
-        let forked =
-            build_sequence("gen_ai.input.messages", &serde_json::to_string(&edited).unwrap())
-                .unwrap();
+        let forked = build_sequence(
+            "gen_ai.input.messages",
+            &serde_json::to_string(&edited).unwrap(),
+        )
+        .unwrap();
         assert_eq!(original.nodes[0].seq_hash, forked.nodes[0].seq_hash);
         assert_ne!(original.nodes[1].seq_hash, forked.nodes[1].seq_hash);
         assert_ne!(original.seq_hash, forked.seq_hash);
@@ -540,7 +546,7 @@ mod tests {
     }
     #[test]
     fn addressable_attributes_finds_only_named_string_attributes() {
-        let payload = payload(json!([
+        let payload = payload(&json!([
             {"key": "gen_ai.input.messages", "value": {"stringValue": messages(2)}},
             {"key": "gen_ai.request.model", "value": {"stringValue": "model-x"}},
             {"key": "gen_ai.system_instructions", "value": {"intValue": "3"}},
@@ -562,14 +568,15 @@ mod tests {
             json!({"resourceSpans": [{"scopeSpans": [{"spans": [{"attributes": "no"}]}]}]}),
             json!({"resourceSpans": [{"scopeSpans": [{"spans": [{"attributes": [1, "x"]}]}]}]}),
         ] {
-            assert!(addressable_attributes(&payload, &ADDRESSED_ATTRIBUTE_KEYS).is_empty());
+            let found = addressable_attributes(&payload, &ADDRESSED_ATTRIBUTE_KEYS);
+            assert_eq!(found, Vec::new());
         }
     }
     #[test]
     fn addressing_replaces_restated_attributes_with_references() {
         // The storage path carries references; the sequences state the content.
         let instructions = r#"[{"type":"text","content":"be brief"}]"#;
-        let mut payload = payload(json!([
+        let mut payload = payload(&json!([
             {"key": "gen_ai.input.messages", "value": {"stringValue": messages(4)}},
             {"key": "gen_ai.system_instructions", "value": {"stringValue": instructions}},
             // An addressed key whose value is not an array stays as it is,
@@ -578,15 +585,22 @@ mod tests {
             {"key": "gen_ai.request.model", "value": {"stringValue": "model-x"}}
         ]));
         let sequences = address_payload(&mut payload, &ADDRESSED_ATTRIBUTE_KEYS);
-        let by_key: BTreeMap<&str, &super::AddressedSequence> =
-            sequences.iter().map(|sequence| (sequence.key.as_str(), sequence)).collect();
+        let by_key: BTreeMap<&str, &super::AddressedSequence> = sequences
+            .iter()
+            .map(|sequence| (sequence.key.as_str(), sequence))
+            .collect();
         assert_eq!(
             by_key.keys().copied().collect::<Vec<&str>>(),
             vec!["gen_ai.input.messages", "gen_ai.system_instructions"]
         );
         let stated: BTreeMap<String, String> = addressable_attributes(
             &payload,
-            &["gen_ai.input.messages", "gen_ai.system_instructions", "gen_ai.tool.definitions", "gen_ai.request.model"],
+            &[
+                "gen_ai.input.messages",
+                "gen_ai.system_instructions",
+                "gen_ai.tool.definitions",
+                "gen_ai.request.model",
+            ],
         )
         .into_iter()
         .collect();
