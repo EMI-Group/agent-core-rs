@@ -13,10 +13,14 @@
 //! returns [`openjiuwen_common::error::Error::validation`] naming the parser and its expected dialects,
 //! so a backend can never grade an unrecognizable reply as `Safe`.
 //!
-//! A *recognized* shape whose level value is unknown is a different case: the
-//! value maps onto the parser's configured default level
-//! ([`QwenGuardParser::with_default_risk_level`], `RiskLevel::High` in a
-//! fail-safe deployment), and no error is returned.
+//! A *recognized* shape whose level value is unknown or missing is a different
+//! case: the value maps onto the parser's configured default level
+//! ([`QwenGuardParser::with_default_risk_level`]), which defaults to
+//! `RiskLevel::Critical` so an unmappable verdict errs upward and blocks; no
+//! error is returned. [`QwenGuardParser::with_default_risk_level`] with
+//! `RiskLevel::Safe` is the explicit opt-in for Python's grading.
+//! [`BertBinaryParser`] likewise errs upward: a predicted attack whose reply
+//! carries no usable confidence is `RiskLevel::High`, never `Safe`.
 
 use openjiuwen_common::error::Result;
 use serde::{Deserialize, Serialize};
@@ -69,7 +73,8 @@ pub trait ModelOutputParser: Send + Sync {
 /// The parser only escalates a predicted attack when the model is confident
 /// enough, which keeps borderline predictions from producing false positives.
 /// A confidence below [`Thresholds::low`] is treated as safe, then the value
-/// falls into `low`/`medium`/`high` bands.
+/// falls into `low`/`medium`/`high` bands. A predicted attack that supplies no
+/// usable confidence is [`crate::RiskLevel::High`] instead, never `Safe`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Thresholds {

@@ -5,6 +5,10 @@
 //! class `0` is safe and the configurable attack class (default `1`) is an
 //! attack. The predicted class is the primary signal and the confidence only
 //! escalates it when the model is sure, which keeps false positives down.
+//! A predicted *attack* whose reply carries no usable confidence (the field is
+//! missing, non-numeric or non-finite) is [`RiskLevel::High`] — the same level a
+//! confident attack gets — because a missing field must never make an attack
+//! look clean.
 //!
 //! Parsing is fallible: a reply in none of the accepted dialects is
 //! [`Error::validation`] rather than a silent `Safe` grade, so a mis-pointed
@@ -73,15 +77,19 @@ impl BertBinaryParser {
         self
     }
 
-    /// Maps a predicted class and confidence to a risk level.
-    fn determine_risk_level(&self, predicted_class: i64, confidence: f64) -> RiskLevel {
+    /// Maps a predicted class and an optional confidence to a risk level.
+    ///
+    /// A class other than [`Self::attack_class_id`] is the model's own safe
+    /// verdict, whatever the confidence. For a predicted attack a present,
+    /// finite confidence keeps the threshold bands; a missing or non-finite
+    /// confidence errs upward to [`RiskLevel::High`] instead of reading as
+    /// `Safe`.
+    fn determine_risk_level(&self, predicted_class: i64, confidence: Option<f64>) -> RiskLevel {
         if predicted_class != self.attack_class_id {
             return RiskLevel::Safe;
         }
-        let confidence = if confidence.is_finite() {
-            confidence
-        } else {
-            0.0
+        let Some(confidence) = confidence.filter(|value| value.is_finite()) else {
+            return RiskLevel::High;
         };
         let thresholds = self.confidence_thresholds;
         if confidence < thresholds.low {
@@ -96,9 +104,14 @@ impl BertBinaryParser {
     }
 
     /// Builds the assessment Python's `BertBinaryParser.parse` returns.
-    fn assess(&self, predicted_class: i64, confidence: f64) -> RiskAssessment {
+    ///
+    /// The `details` shape is unchanged: an absent confidence is reported as
+    /// `0.0` there and only the level reflects the upward error, so existing
+    /// consumers of `predicted_class`/`attack_confidence` keep working.
+    fn assess(&self, predicted_class: i64, confidence: Option<f64>) -> RiskAssessment {
         let risk_level = self.determine_risk_level(predicted_class, confidence);
         let has_risk = risk_level != RiskLevel::Safe;
+        let confidence = confidence.filter(|value| value.is_finite()).unwrap_or(0.0);
         let attack_confidence = if predicted_class == self.attack_class_id {
             confidence
         } else {
@@ -146,28 +159,33 @@ fn unrecognized_output() -> Error {
 /// Extracts `(predicted_class, confidence)` from the first matching shape.
 ///
 /// The order mirrors the Python `if` chain exactly, so a payload that carries
-/// several keys is interpreted the same way. `None` means that no dialect
-/// matched, which is deliberately distinguishable from a real `(0, 0.0)`
-/// prediction.
-fn extract_prediction(output: &Value, attack_class_id: i64) -> Option<(i64, f64)> {
+/// several keys is interpreted the same way. The outer `None` means that no
+/// dialect matched, which is deliberately distinguishable from a real
+/// `(0, 0.0)` prediction. The inner `None` means the dialect matched but carried
+/// no usable confidence (the field is absent, non-numeric or non-finite), which
+/// [`BertBinaryParser::determine_risk_level`] resolves upward for a predicted
+/// attack.
+fn extract_prediction(output: &Value, attack_class_id: i64) -> Option<(i64, Option<f64>)> {
     if let Value::Object(map) = output {
         if let Some(value) = map.get("predicted_class") {
-            return Some((integer_of(value), float_or_zero(map.get("confidence"))));
+            return Some((integer_of(value), confidence_of(map.get("confidence"))));
         }
         if let Some(value) = map.get("label") {
-            let confidence = float_or_zero(map.get("score").or_else(|| map.get("confidence")));
+            let confidence = confidence_of(map.get("score").or_else(|| map.get("confidence")));
             return Some((integer_of(value), confidence));
         }
         if let Some(Value::Array(probabilities)) = map.get("probabilities") {
             if probabilities.len() >= 2 {
                 let values: Vec<f64> = probabilities.iter().map(float_of).collect();
-                return Some(argmax(&values));
+                let (predicted_class, confidence) = argmax(&values);
+                return Some((predicted_class, Some(confidence)));
             }
         }
         if let Some(Value::Array(logits)) = map.get("logits") {
             if logits.len() >= 2 {
                 let values: Vec<f64> = logits.iter().map(float_of).collect();
-                return Some(argmax(&softmax(&values)));
+                let (predicted_class, confidence) = argmax(&softmax(&values));
+                return Some((predicted_class, Some(confidence)));
             }
         }
     }
@@ -175,7 +193,8 @@ fn extract_prediction(output: &Value, attack_class_id: i64) -> Option<(i64, f64)
     if let Value::Array(values) = output {
         if values.len() >= 2 {
             let numbers: Vec<f64> = values.iter().map(float_of).collect();
-            return Some(argmax(&numbers));
+            let (predicted_class, confidence) = argmax(&numbers);
+            return Some((predicted_class, Some(confidence)));
         }
     }
 
@@ -185,7 +204,7 @@ fn extract_prediction(output: &Value, attack_class_id: i64) -> Option<(i64, f64)
             .filter(|value| value.is_finite())
             .unwrap_or(0.0);
         let predicted_class = if confidence > 0.5 { attack_class_id } else { 0 };
-        return Some((predicted_class, confidence));
+        return Some((predicted_class, Some(confidence)));
     }
 
     None
@@ -242,19 +261,29 @@ fn integer_of(value: &Value) -> i64 {
 
 /// Reads a JSON number, or a numeric string, as a finite `f64`.
 ///
-/// Missing, non-numeric, and non-finite values degrade to `0.0`.
-fn float_of(value: &Value) -> f64 {
+/// A missing, non-numeric, or non-finite value is `None`.
+fn parse_float(value: &Value) -> Option<f64> {
     let parsed = match value {
         Value::Number(number) => number.as_f64(),
         Value::String(text) => text.trim().parse::<f64>().ok(),
         _ => None,
     };
-    parsed.filter(|number| number.is_finite()).unwrap_or(0.0)
+    parsed.filter(|number| number.is_finite())
 }
 
-/// [`float_of`] for an optional value, defaulting to `0.0`.
-fn float_or_zero(value: Option<&Value>) -> f64 {
-    value.map_or(0.0, float_of)
+/// Reads a JSON number, or a numeric string, as a finite `f64`.
+///
+/// Missing, non-numeric, and non-finite values degrade to `0.0`.
+fn float_of(value: &Value) -> f64 {
+    parse_float(value).unwrap_or(0.0)
+}
+
+/// Reads an optional confidence, reporting whether a usable value was present.
+///
+/// `None` covers an absent field, a non-numeric value, and a non-finite number:
+/// the reply carries no confidence to grade with.
+fn confidence_of(value: Option<&Value>) -> Option<f64> {
+    value.and_then(parse_float)
 }
 
 #[cfg(test)]
@@ -376,10 +405,43 @@ mod tests {
         let falls_back_to_confidence =
             parse(&parser, json!({"label": 1, "confidence": 0.9})).unwrap();
         assert_eq!(falls_back_to_confidence.risk_level, RiskLevel::Medium);
+    }
 
+    #[test]
+    fn a_predicted_attack_without_confidence_errs_upward() {
+        let parser = BertBinaryParser::new();
+
+        // No score at all: the class still says "attack", so the level errs
+        // upward instead of reading as safe.
         let missing_score = parse(&parser, json!({"label": 1})).unwrap();
-        assert_eq!(missing_score.risk_level, RiskLevel::Safe);
+        assert!(missing_score.has_risk);
+        assert_eq!(missing_score.risk_level, RiskLevel::High);
+        assert_eq!(missing_score.risk_type.as_deref(), Some("attack_detected"));
         assert!(missing_score.confidence.abs() < f64::EPSILON);
+        assert_eq!(
+            missing_score.details.as_ref().unwrap(),
+            &json!({"predicted_class": 1, "attack_confidence": 0.0}),
+            "the details key set and values stay stable"
+        );
+
+        // The same for `predicted_class`, a null confidence and a non-numeric
+        // confidence.
+        for output in [
+            json!({"predicted_class": 1}),
+            json!({"label": 1, "confidence": null}),
+            json!({"label": 1, "confidence": "not-a-number"}),
+            json!({"label": 1, "score": "not-a-number"}),
+        ] {
+            let assessment = parse(&parser, output.clone()).unwrap();
+            assert!(assessment.has_risk, "{output} must not grade safe");
+            assert_eq!(assessment.risk_level, RiskLevel::High, "{output}");
+        }
+
+        // The model's own safe class stays safe without a score.
+        let safe = parse(&parser, json!({"label": 0})).unwrap();
+        assert!(!safe.has_risk);
+        assert_eq!(safe.risk_level, RiskLevel::Safe);
+        assert_eq!(safe.risk_type, None);
     }
 
     #[test]

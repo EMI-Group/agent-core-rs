@@ -10,9 +10,13 @@
 //! Parsing is fallible: a reply outside those dialects (an empty object, an
 //! unrelated key set, `null`, a boolean, a number, an array, or free text with
 //! no verdict marker) is [`Error::validation`], never a silent `Safe` grade.
-//! Inside a recognized dialect an unknown level *value* still maps onto
-//! [`QwenGuardParser::default_risk_level`] (fail-safe when configured as
-//! `RiskLevel::High`), matching Python.
+//! Inside a recognized dialect a verdict that cannot be mapped — an unknown
+//! level *token* or a *missing* verdict — maps onto
+//! [`QwenGuardParser::default_risk_level`], which [`QwenGuardParser::new`] sets
+//! to [`RiskLevel::Critical`] so it blocks under the default
+//! `block_level = Critical`. [`QwenGuardParser::with_default_risk_level`] with
+//! [`RiskLevel::Safe`] is the explicit opt-in for Python's behaviour, which
+//! graded every unmappable verdict `Safe`.
 
 use std::sync::LazyLock;
 
@@ -39,32 +43,40 @@ static CATEGORIES_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Parser for `Qwen3Guard` moderation output.
 ///
-/// The default configuration reproduces the Python constructor
-/// (`risk_type = "content_risk"`, `default_risk_level = Safe`).
+/// The default configuration keeps Python's `risk_type = "content_risk"` and
+/// deviates on one field: `default_risk_level` is [`RiskLevel::Critical`] rather
+/// than Python's `Safe`, so an unmappable or missing verdict errs upward.
 #[derive(Debug, Clone)]
 pub struct QwenGuardParser {
     /// Risk name reported when the model flags content but names no category
     /// (`"content_risk"` by default).
     pub risk_type: String,
-    /// Level used when the model's verdict cannot be mapped onto the
-    /// `safe`/`controversial`/`unsafe` table.
+    /// Level used when the model's verdict cannot be mapped onto the level
+    /// table, and when a recognized dialect carries no verdict at all.
+    ///
+    /// [`RiskLevel::Critical`] by default; set [`RiskLevel::Safe`] through
+    /// [`Self::with_default_risk_level`] for Python's grading.
     pub default_risk_level: RiskLevel,
 }
 
 impl Default for QwenGuardParser {
-    /// The Python default configuration.
+    /// [`Self::new`].
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl QwenGuardParser {
-    /// A parser with the Python defaults.
+    /// A parser with the crate defaults.
+    ///
+    /// `risk_type = "content_risk"` (Python) and `default_risk_level =
+    /// RiskLevel::Critical` (a deliberate deviation from Python's `Safe`: an
+    /// unrecognizable verdict token blocks under the default `block_level`).
     #[must_use]
     pub fn new() -> Self {
         Self {
             risk_type: "content_risk".to_owned(),
-            default_risk_level: RiskLevel::Safe,
+            default_risk_level: RiskLevel::Critical,
         }
     }
 
@@ -76,6 +88,8 @@ impl QwenGuardParser {
     }
 
     /// Uses `default_risk_level` for verdicts outside the risk map.
+    ///
+    /// Pass [`RiskLevel::Safe`] for Python's grading of an unmappable verdict.
     #[must_use]
     pub fn with_default_risk_level(mut self, default_risk_level: RiskLevel) -> Self {
         self.default_risk_level = default_risk_level;
@@ -84,15 +98,20 @@ impl QwenGuardParser {
 
     /// Maps a model verdict onto a risk level.
     ///
-    /// Lowercases and trims the verdict; an exact table key wins, otherwise the
-    /// first keyword contained in the verdict (checked longest first, so
-    /// `"unsafe"` beats `"safe"`), otherwise [`Self::default_risk_level`].
+    /// Lowercases and trims the verdict; an exact table key wins (including the
+    /// severity words `critical`/`high`/`medium`/`low`), otherwise the first
+    /// keyword contained in the verdict (checked longest first, so `"unsafe"`
+    /// beats `"safe"`), otherwise [`Self::default_risk_level`]. Containment is
+    /// deliberately limited to `controversial`/`unsafe`/`safe`: `low` is a
+    /// substring of words like `below`.
     fn map_risk_level(&self, value: &str) -> RiskLevel {
         let normalized = value.trim().to_lowercase();
         let exact = match normalized.as_str() {
             "safe" => Some(RiskLevel::Safe),
-            "controversial" => Some(RiskLevel::Medium),
-            "unsafe" => Some(RiskLevel::High),
+            "low" => Some(RiskLevel::Low),
+            "controversial" | "medium" => Some(RiskLevel::Medium),
+            "unsafe" | "high" => Some(RiskLevel::High),
+            "critical" => Some(RiskLevel::Critical),
             _ => None,
         };
         if let Some(level) = exact {
@@ -148,7 +167,7 @@ impl QwenGuardParser {
 
     /// Standard `safety` / `categories` object dialect.
     fn parse_standard_object(&self, data: &Map<String, Value>) -> RiskAssessment {
-        let safety = string_or(data.get("safety"), "safe");
+        let safety = string_or(data.get("safety"), "");
         let categories = categories_of(data.get("categories"));
         let risk_level = self.map_risk_level(&safety);
         let risk_type = categories
@@ -167,7 +186,7 @@ impl QwenGuardParser {
         let analysis = data.get("analysis").and_then(Value::as_object);
         let field = |key: &str| analysis.and_then(|map| map.get(key));
 
-        let risk_level = self.map_risk_level(&string_or(field("risk_level"), "safe"));
+        let risk_level = self.map_risk_level(&string_or(field("risk_level"), ""));
         let risk_categories = categories_of(field("risk_categories"));
         let risk_type = risk_categories
             .first()
@@ -192,7 +211,7 @@ impl QwenGuardParser {
 
     /// Legacy simple `judgment` object dialect.
     fn parse_simple_object(&self, data: &Map<String, Value>) -> RiskAssessment {
-        let judgment = string_or(data.get("judgment"), "Safe");
+        let judgment = string_or(data.get("judgment"), "");
         let risk_level = self.map_risk_level(&judgment);
         let reason = data.get("reason").cloned().unwrap_or(Value::Null);
         let language = string_or(data.get("language"), "unknown");
@@ -205,7 +224,7 @@ impl QwenGuardParser {
 
     /// Legacy API `severity_level` object dialect.
     fn parse_api_object(&self, data: &Map<String, Value>) -> RiskAssessment {
-        let severity = string_or(data.get("severity_level"), "safe");
+        let severity = string_or(data.get("severity_level"), "");
         let risk_level = self.map_risk_level(&severity);
         let reason = data.get("reason").cloned().unwrap_or(Value::Null);
         let language = string_or(data.get("language"), "unknown");
@@ -219,7 +238,7 @@ impl QwenGuardParser {
     /// Fallback object dialect: `risk_level` (or `level`) plus `risk_type`.
     fn parse_generic_object(&self, data: &Map<String, Value>) -> RiskAssessment {
         let level_value = data.get("risk_level").or_else(|| data.get("level"));
-        let risk_level = self.map_risk_level(&string_or(level_value, "safe"));
+        let risk_level = self.map_risk_level(&string_or(level_value, ""));
         let risk_type = data
             .get("risk_type")
             .map_or_else(|| self.risk_type.clone(), string_value);
@@ -518,14 +537,25 @@ mod tests {
 
     #[test]
     fn standard_text_category_only() {
+        // A `Categories:` block with no `Safety:` verdict is a recognized reply
+        // without a verdict, so it takes the fail-safe default level.
         let parser = QwenGuardParser::new();
         let assessment = parse(&parser, json!("category: violence, hate")).unwrap();
-        assert!(!assessment.has_risk);
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::Critical);
+        assert_eq!(assessment.risk_type.as_deref(), Some("violence"));
         assert_eq!(
             details(&assessment)["categories"],
             json!(["violence", "hate"])
         );
         assert_eq!(details(&assessment)["safety"], json!("unknown"));
+
+        // Python's grading is the explicit opt-in.
+        let python = QwenGuardParser::new().with_default_risk_level(RiskLevel::Safe);
+        let allowed = parse(&python, json!("category: violence, hate")).unwrap();
+        assert!(!allowed.has_risk);
+        assert_eq!(allowed.risk_level, RiskLevel::Safe);
+        assert_eq!(allowed.risk_type, None);
     }
 
     #[test]
@@ -602,8 +632,11 @@ mod tests {
     fn full_object_defaults_missing_fields() {
         let parser = QwenGuardParser::new();
         let assessment = parse(&parser, json!({"analysis": {}})).unwrap();
-        assert!(!assessment.has_risk);
+        assert!(assessment.has_risk, "a missing verdict is not safe");
+        assert_eq!(assessment.risk_level, RiskLevel::Critical);
+        assert_eq!(assessment.risk_type.as_deref(), Some("content_risk"));
         let details = details(&assessment);
+        assert_eq!(details["risk_categories"], json!([]));
         assert_eq!(details["evidence"], Value::Null);
         assert_eq!(details["language"], json!("unknown"));
         assert_eq!(details["decision"], json!("unknown"));
@@ -642,11 +675,10 @@ mod tests {
             json!("unsafe")
         );
 
-        // `"HIGH"` is not one of the three model verdicts, so Python's map
-        // falls back to the configured default.
+        // `"HIGH"` matches the severity vocabulary case-insensitively.
         let high = parse(&parser, json!({"severity_level": "HIGH"})).unwrap();
-        assert!(!high.has_risk);
-        assert_eq!(high.risk_level, RiskLevel::Safe);
+        assert!(high.has_risk);
+        assert_eq!(high.risk_level, RiskLevel::High);
         assert_eq!(details(&high)["severity_level"], json!("HIGH"));
     }
 
@@ -734,15 +766,24 @@ mod tests {
             );
         }
 
-        // A recognized shape with an unknown *value* is not an error: it falls
-        // back to the configured (fail-safe) default level.
+        // A recognized shape with an unknown *value* is not an error: it errs
+        // upward at the `new()` default level.
         let fallback = parse(
-            &QwenGuardParser::new().with_default_risk_level(RiskLevel::High),
+            &QwenGuardParser::new(),
             json!({"safety": "totally-unheard-of"}),
         )
         .unwrap();
         assert!(fallback.has_risk);
-        assert_eq!(fallback.risk_level, RiskLevel::High);
+        assert_eq!(fallback.risk_level, RiskLevel::Critical);
+
+        // Python's grading of an unmappable verdict is the explicit opt-in.
+        let python = parse(
+            &QwenGuardParser::new().with_default_risk_level(RiskLevel::Safe),
+            json!({"safety": "totally-unheard-of"}),
+        )
+        .unwrap();
+        assert!(!python.has_risk);
+        assert_eq!(python.risk_level, RiskLevel::Safe);
     }
 
     #[test]
@@ -753,8 +794,21 @@ mod tests {
         assert_eq!(assessment.risk_level, RiskLevel::Medium);
         assert_eq!(assessment.risk_type.as_deref(), Some("content_risk"));
 
-        let explicit = parse(&parser, json!({"risk_level": "high"})).unwrap();
-        assert_eq!(explicit.risk_level, RiskLevel::Medium);
+        // The severity words now map exactly, ahead of the configured default.
+        for (verdict, expected) in [
+            ("high", RiskLevel::High),
+            ("critical", RiskLevel::Critical),
+            ("low", RiskLevel::Low),
+            ("medium", RiskLevel::Medium),
+            ("safe", RiskLevel::Safe),
+        ] {
+            let explicit = parse(&parser, json!({"risk_level": verdict})).unwrap();
+            assert_eq!(explicit.risk_level, expected, "{verdict}");
+        }
+
+        // A token outside the vocabulary still takes the configured default.
+        let unknown = parse(&parser, json!({"risk_level": "elevated"})).unwrap();
+        assert_eq!(unknown.risk_level, RiskLevel::Medium);
     }
 
     #[test]
@@ -769,13 +823,72 @@ mod tests {
             parser.map_risk_level("controversial content"),
             RiskLevel::Medium
         );
-        assert_eq!(parser.map_risk_level("perfectly fine"), RiskLevel::Safe);
+
+        // The severity words are exact-match only, case-insensitively.
+        assert_eq!(parser.map_risk_level("Critical"), RiskLevel::Critical);
+        assert_eq!(parser.map_risk_level(" HIGH "), RiskLevel::High);
+        assert_eq!(parser.map_risk_level("medium"), RiskLevel::Medium);
+        assert_eq!(parser.map_risk_level("low"), RiskLevel::Low);
+        // Not containment matches: `low` is a substring of `below`.
+        assert_eq!(
+            parser.map_risk_level("below the threshold"),
+            RiskLevel::Critical
+        );
+        assert_eq!(parser.map_risk_level("perfectly fine"), RiskLevel::Critical);
     }
 
     #[test]
-    fn constructor_defaults_match_python() {
+    fn constructor_defaults_with_a_fail_safe_verdict_level() {
+        // `risk_type` matches Python; the verdict fallback is intentionally
+        // `Critical` instead of Python's `Safe` so an unmappable token blocks.
         let parser = QwenGuardParser::default();
         assert_eq!(parser.risk_type, "content_risk");
-        assert_eq!(parser.default_risk_level, RiskLevel::Safe);
+        assert_eq!(parser.default_risk_level, RiskLevel::Critical);
+        assert_eq!(
+            QwenGuardParser::new().default_risk_level,
+            RiskLevel::Critical
+        );
+    }
+
+    #[test]
+    fn an_unmappable_verdict_or_missing_verdict_is_not_safe() {
+        let parser = QwenGuardParser::new();
+
+        // Recognized dialects carrying an unknown token or no verdict at all.
+        for output in [
+            json!({"safety": "totally-unheard-of"}),
+            json!({"analysis": {}}),
+            json!({"judgment": null}),
+            json!({"severity_level": ""}),
+            json!({"risk_level": "elevated"}),
+        ] {
+            let assessment = parse(&parser, output.clone()).unwrap();
+            assert!(assessment.has_risk, "{output} must not grade safe");
+            assert_eq!(assessment.risk_level, RiskLevel::Critical, "{output}");
+            assert_eq!(
+                assessment.risk_type.as_deref(),
+                Some("content_risk"),
+                "{output}"
+            );
+        }
+
+        // A `Categories:`-only text reply has no `Safety:` line either.
+        let categories_only = parse(&parser, json!("Categories: Violent")).unwrap();
+        assert!(categories_only.has_risk);
+        assert_eq!(categories_only.risk_level, RiskLevel::Critical);
+        assert_eq!(categories_only.risk_type.as_deref(), Some("Violent"));
+
+        // A genuine safe verdict still grades safe and stays finding-free.
+        for output in [
+            json!({"safety": "safe"}),
+            json!({"severity_level": "safe"}),
+            json!({"analysis": {"risk_level": "safe"}}),
+            json!("Safety: Safe"),
+        ] {
+            let assessment = parse(&parser, output.clone()).unwrap();
+            assert!(!assessment.has_risk, "{output}");
+            assert_eq!(assessment.risk_level, RiskLevel::Safe, "{output}");
+            assert_eq!(assessment.risk_type, None, "{output}");
+        }
     }
 }

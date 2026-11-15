@@ -623,14 +623,20 @@ mod parsers {
         assert!(api.has_risk);
         assert_eq!(api.risk_level, RiskLevel::High);
 
-        // `HIGH` is not one of the three model verdicts, so it degrades to the
-        // parser default (`Safe`), exactly like Python's `_map_risk_level`. An
-        // unknown *level value* inside a recognized shape is not a parse error.
+        // `HIGH` is a recognized severity word, so it maps exactly. An unknown
+        // *level value* inside a recognized shape is never a parse error: it
+        // errs upward at the parser's `Critical` default.
         let unrelated = parser
             .parse(&json!({"severity_level": "HIGH"}))
             .expect("a recognized dialect");
-        assert!(!unrelated.has_risk);
-        assert_eq!(unrelated.risk_level, RiskLevel::Safe);
+        assert!(unrelated.has_risk);
+        assert_eq!(unrelated.risk_level, RiskLevel::High);
+
+        let unmappable = parser
+            .parse(&json!({"severity_level": "totally-unheard-of"}))
+            .expect("a recognized dialect");
+        assert!(unmappable.has_risk);
+        assert_eq!(unmappable.risk_level, RiskLevel::Critical);
 
         // Generic `risk_level` fallback.
         let generic = parser
