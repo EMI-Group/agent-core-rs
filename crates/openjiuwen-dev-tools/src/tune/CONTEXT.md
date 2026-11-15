@@ -99,6 +99,8 @@ The mutation bank is an ordered, marker-identified list (step-by-step reasoning,
 - Ids are deterministic: `candidate_id` is an FNV-1a hash of `"{index}\x1f{prompt}"`, `PromptSearchOptimizer::run_id` hashes the objective, base prompt, and case count, and memory timestamps are caller-supplied; no clock or uuid is read.
 - `OptimizationResult::token_usage` stays empty and every `Execution` carries `latency_ms = 0.0` / `total_tokens = 0`, because `CaseEvaluator` reports neither; the latency, token-usage, and cost reward components are therefore constant (a documented adaptation), and correctness, completeness, and structured validation carry the signal.
 - Prompt-memory persistence and warm starts are opt-in: without `with_memory`, `NullPromptMemory` answers empty and nothing is written; a failing store is logged, never fatal.
+- A truncated tool loop is unmarked: hitting `ModelPromptRunner::max_tool_rounds` returns the model's current text, and neither `ToolTrace` nor `RunOutcome` carries a truncation flag, so a caller cannot distinguish it from a completed run.
+- Model-path degradations are visible only through `tracing` warnings, not through the returned value: a failed or unusable rewrite, an unusable example index list, and a drift-judge outage all fall back silently, and `OptimizationResult` carries no fallback flag.
 - Files ≤1000 lines, one responsibility per file; shared candidate-generation helpers live in `optimizer/suggestion.rs`, never duplicated per optimizer.
 
 ## Design Decisions
