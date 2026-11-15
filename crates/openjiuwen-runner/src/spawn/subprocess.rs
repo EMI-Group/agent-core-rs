@@ -18,7 +18,7 @@
 //! with the wire in [`crate::spawn::protocol`] and the bounded line framing in
 //! [`crate::spawn::frames`].
 //! Cancellation is a frame, not a signal:
-//! [`SpawnedAgent::cancel_task`](crate::spawn::SpawnedAgent::cancel_task) writes
+//! [`SpawnedAgent::cancel_task`] writes
 //! one `cancel` frame carrying the request id (and an optional reason) down the
 //! same serialized stdin writer, so a child that tracks its in-flight requests can
 //! cancel exactly the named one and echo the id in a `cancel_ack`; a child that
