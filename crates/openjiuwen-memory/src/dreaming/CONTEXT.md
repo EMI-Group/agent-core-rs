@@ -144,6 +144,16 @@ Any other lock failure (`Validation`, `Cancelled`, `External`) still propagates 
 - **Retention is a policy object, not a timer.** `DreamRetention` is a pure value; the orchestrator's tick or a caller can run `purge_expired(now)`, which is idempotent by construction (age first, then newest-first caps).
 - **`RecordOnlySink` is the default sink.** Deciding and writing are separated so the pipeline can be exercised offline; a store-backed sink is the application's injection point.
 
+## Known Issues
+
+- A claimed job whose transition write fails (`complete`/`fail` returning `Err`) stays `Running`: `planner` propagates the error, `run_leased` releases the lease first (so takeover cannot see it), and neither backend can re-claim a `Running` row without an expired lease row, so the job is orphaned and keeps counting under `Running`.
+- Neither backend persists `DreamOutcome::notes` (`complete` stores state + metrics only, in-memory `complete` and the `dream_jobs` table have no notes field), so a degraded LLM fallback, a partial model answer and `NoopConsolidator`'s "no consolidator configured" are indistinguishable from a clean success once the sweep summary is gone.
+- `RecordOnlySink` returns the plan's own counters, so a default-sink (dry-run) job persists `records_merged`/`records_deleted`/`tokens_saved` for actions nothing applied.
+- `sqlite::decode_state` maps an unparseable persisted `state` to `Pending` (warn only); `get`/`list` therefore report such a row as pending while the claim query, which matches `state = 'pending'` in SQL, never selects it.
+- `DreamJob::validate` does not constrain `state`, so `enqueue` accepts a `Running`/terminal job that no claim path (and, for `Running`, no lease takeover) can ever pick up.
+- `DreamMetrics::duration_ms` is never populated by the planner or the pipeline; only tests set it.
+- `DreamOrchestrator::tick_with` records neither `ticks` nor `last_error` when the sweep-lock acquisition returns `Err`, and `record_failed_tick` leaves a stale `last_summary` in place.
+
 ## Deferred
 
 - ML-based salience (`SalienceBackend::Ml` is typed `Unsupported`): no inference runtime and no training data pipeline.

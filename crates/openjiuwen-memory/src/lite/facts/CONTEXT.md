@@ -68,6 +68,15 @@ The module owns the file and document formats only: `render_level`/`parse_level`
 - `stamp` counts only `*.md` regular files, saturates `total_len`, and reports an absent directory as `DirStamp::default()`.
 - Filesystem failures are `Error::External` with the failing path as context; validation failures are `Error::Validation`; nothing panics on user input.
 
+## Known Issues
+
+- `FactFiles::read_all` skips every fact file it cannot decode and returns the survivors as if the list were complete, so a fact whose hand edit drops `type:`, the `---` fence, or the `name` becomes invisible to `list`/`search`/the rendered indexes with only a `tracing::warn!` and no partial-result signal to the caller (`mod.rs:202-220`).
+- `FactFiles::read_all` discards each fact's source path, and `path_for`/`remove` address only the canonical `<slug>-<hash>.md`, so a fact file at a non-canonical path (a `name:` edited without renaming the file, or a copied file) is never reconciled: it survives `remove`, and its possibly stale copy can win the name-keyed `upsert` in `local::facts_mode::adopt_facts`, silently reverting an edit.
+- `FactFiles::write` renders `name` through `single_line`/`trim` (`file.rs:166`) while `path_for` hashes the raw name, so a name with edge whitespace or an embedded newline is stored under a different name than the one that selects its file.
+- `FactDocument::to_fact` decodes a present-but-unparsable `updated_at` to the Unix epoch without a diagnostic, which sinks the fact in `updated_at`-ordered listing and excludes it from `daily_memory` rollups (`file.rs:210`).
+- `split::parse_level` exposes only `MarkdownMemory::facts`, so entries under an unrecognized `## <Type>` heading are dropped with no error and no warning; `local::facts_mode::import_index` then re-renders both index documents from the parsed facts, erasing those entries from disk (`split.rs:106-108`).
+- `FactFiles::stamp` swallows `metadata.modified()`/`duration_since(UNIX_EPOCH)` failures, contradicting its documented `Error::External` contract, and both `stamp` and `markdown_files` fold an absent `facts/` directory into empty, which the local store reads as "no facts" (`mod.rs:268-270`, `mod.rs:293-297`, `mod.rs:307-311`).
+
 ## Routing Table
 
 - `./mod.rs` → module docs, layout constants, `DirStamp`, `FactFiles` (write/read/read_all/remove/contains/stamp), temporary-path and I/O helpers
