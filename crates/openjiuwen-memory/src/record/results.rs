@@ -40,9 +40,20 @@ pub struct AddOutcome {
     pub deleted: Vec<String>,
     /// Ids of inputs dropped by the dedupe policy.
     pub skipped: Vec<String>,
+    /// Reason duplicate detection did not run, when it degraded.
+    ///
+    /// `None` means the duplicate check ran (or was not requested), so the outcome is
+    /// complete. `Some(reason)` means the write had to continue without duplicate
+    /// detection — the candidate scan failed — so the records in this outcome were stored
+    /// unchecked and a duplicate of an existing record may exist. Cancellation and
+    /// timeouts still abort the write; they never degrade it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
 }
 impl AddOutcome {
     /// Total number of entries across `added`, `merged`, `deleted`, and `skipped`.
+    ///
+    /// [`AddOutcome::degraded`] is a diagnostic, not an entry, so it is not counted.
     #[must_use]
     pub fn len(&self) -> usize {
         self.added.len() + self.merged.len() + self.deleted.len() + self.skipped.len()
@@ -159,13 +170,38 @@ mod tests {
             merged: vec![hit("b", 0.1).record],
             deleted: vec!["c".to_owned()],
             skipped: vec!["d".to_owned()],
+            degraded: None,
         };
         assert_eq!(outcome.len(), 4);
         assert!(!outcome.is_empty());
         let json = serde_json::to_value(&outcome).unwrap();
         assert_eq!(json["skipped"], serde_json::json!(["d"]));
+        assert!(
+            json.get("degraded").is_none(),
+            "a complete outcome must not serialize a degraded reason"
+        );
         let restored: AddOutcome = serde_json::from_value(json).unwrap();
         assert_eq!(restored, outcome);
+    }
+    #[test]
+    fn add_outcome_degraded_reason_is_optional_and_round_trips() {
+        let outcome = AddOutcome {
+            added: vec![hit("a", 0.1).record],
+            degraded: Some("candidate scan failed".to_owned()),
+            ..AddOutcome::default()
+        };
+        assert_eq!(outcome.len(), 1, "degraded is a diagnostic, not an entry");
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(
+            json["degraded"],
+            serde_json::json!("candidate scan failed"),
+            "a degraded outcome must serialize its reason"
+        );
+        let restored: AddOutcome = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, outcome);
+        let tolerant: AddOutcome =
+            serde_json::from_value(serde_json::json!({ "unknown_field": true })).unwrap();
+        assert_eq!(tolerant, AddOutcome::default());
     }
     #[test]
     fn memory_stats_serde_round_trip() {
