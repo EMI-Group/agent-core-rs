@@ -454,9 +454,14 @@ impl super::MemoryEngine {
             }
             DedupePolicy::Replace => {
                 self.storage().delete_record(&existing).await?;
+                // The superseded row is a real removal, so it is reported as one even
+                // though the replacement reuses its id: `deleted` names the row that was
+                // removed and `merged` carries the record that now holds that id.
+                let replaced_id = existing.id.clone();
                 record.id = existing.id;
                 record.embedding = None;
                 self.persist(&record, embedding.as_deref()).await?;
+                outcome.deleted.push(replaced_id);
                 outcome.merged.push(record);
             }
         }
@@ -776,6 +781,12 @@ mod tests {
         assert_eq!(outcome.merged.len(), 1);
         assert_eq!(outcome.merged[0].id, existing_id);
         assert_eq!(outcome.merged[0].content, "Alice prefers dark mode!");
+        // The superseded row is a real deletion, so the outcome reports it even though
+        // the replacement reuses the id; nothing else was merged, skipped, or added.
+        assert_eq!(outcome.deleted, vec![existing_id.clone()]);
+        assert_eq!(outcome.added.len(), 0);
+        assert_eq!(outcome.skipped.len(), 0);
+        assert_eq!(outcome.degraded, None);
         let stored = engine
             .list(&MemoryFilter::for_scope(&scope))
             .await

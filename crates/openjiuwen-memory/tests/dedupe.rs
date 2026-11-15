@@ -20,6 +20,7 @@ use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::store::{
     CollectionSchema, InMemoryVectorStore, VectorQuery, VectorSearchResult, VectorStore,
 };
+use openjiuwen_memory::analyzer::ExtractionInput;
 use openjiuwen_memory::config::MemoryEngineConfig;
 use openjiuwen_memory::facade::LongTermMemory;
 use openjiuwen_memory::record::{
@@ -376,6 +377,10 @@ async fn replace_policy_keeps_the_id_but_takes_the_incoming_content() {
         .expect("replace duplicate");
     assert_eq!(replaced.added.len(), 0);
     assert_eq!(replaced.merged.len(), 1);
+    // The superseded row was really removed, so the outcome reports the deletion even
+    // though the replacement is stored under the same id.
+    assert_eq!(replaced.deleted, vec![id.clone()]);
+    assert_eq!(replaced.skipped.len(), 0);
     let record = &replaced.merged[0];
 
     // Actual `Replace` semantics: the existing id survives, and the whole incoming
@@ -820,6 +825,62 @@ async fn a_failed_candidate_scan_is_reported_and_the_record_is_still_stored() {
         "the unchecked record is stored beside the existing one"
     );
     assert!(listed.iter().any(|record| record.id == first_id));
+}
+
+#[tokio::test]
+async fn remember_reports_a_degraded_write_and_still_stores_the_fact() {
+    let vector = ArmedSearchStore::new();
+    let ltm = LongTermMemory::builder(MemoryEngineConfig::default())
+        .stores(stores_with(Arc::new(vector.clone())))
+        .embedding(Arc::new(HashEmbedding::new(16)))
+        .build()
+        .expect("facade");
+    let scope = scope();
+
+    // One stored user-profile record creates the vector collection the scan reads, so the
+    // armed failure is reached instead of the scan short-circuiting on "no collection".
+    ltm.add(
+        &scope,
+        NewMemory::new("Alice prefers tea", MemoryType::UserProfile),
+        &AddOptions::default(),
+    )
+    .await
+    .expect("add");
+
+    // The read half of the vector store is broken before the `remember` write, so the
+    // analyzer's fact is stored without any duplicate check.
+    vector.fail_search();
+    let conversation = ExtractionInput::from_text("I prefer dark mode.");
+    let report = ltm
+        .remember(&scope, &conversation, &AddOptions::default())
+        .await
+        .expect("remember");
+    assert_eq!(report.extracted, 1, "{report:?}");
+    assert_eq!(report.added, 1, "{report:?}");
+    assert_eq!(report.merged, 0, "{report:?}");
+    assert_eq!(report.skipped, 0, "{report:?}");
+    assert_eq!(report.gated, None, "{report:?}");
+
+    // The write's degradation is the report's: an unchecked fact write must not look
+    // like a clean one just because the analysis pass was clean.
+    let reason = report
+        .degraded
+        .as_deref()
+        .expect("a fact stored without a duplicate check must be caller-visible");
+    assert!(
+        reason.contains("duplicate candidate scan failed"),
+        "{reason}"
+    );
+    assert!(reason.contains("vector index is unavailable"), "{reason}");
+
+    // The fact is still stored: the failed scan degrades the check, never the write.
+    let stored = ltm.list(&scope, &[]).await.expect("list");
+    assert_eq!(stored.len(), 2, "the unchecked fact is still stored");
+    let unchecked = stored
+        .iter()
+        .find(|record| record.content.contains("dark mode"))
+        .expect("the unchecked fact");
+    assert_eq!(unchecked.kind, MemoryType::UserProfile);
 }
 
 #[tokio::test]

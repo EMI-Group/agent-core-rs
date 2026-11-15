@@ -37,6 +37,12 @@ pub struct AddOutcome {
     /// Records merged into or replaced by an existing memory.
     pub merged: Vec<MemoryRecord>,
     /// Ids of existing records that were removed.
+    ///
+    /// Only a replace-style write populates this list: it removes the row it supersedes
+    /// before storing the replacement, so the superseded id appears here, while the
+    /// replacement record (stored under that same id) appears in
+    /// [`AddOutcome::merged`]. The deletion is therefore visible even though the id
+    /// survives. Merge, skip, and add never remove a row.
     pub deleted: Vec<String>,
     /// Ids of inputs dropped by the dedupe policy.
     pub skipped: Vec<String>,
@@ -53,7 +59,9 @@ pub struct AddOutcome {
 impl AddOutcome {
     /// Total number of entries across `added`, `merged`, `deleted`, and `skipped`.
     ///
-    /// [`AddOutcome::degraded`] is a diagnostic, not an entry, so it is not counted.
+    /// [`AddOutcome::degraded`] is a diagnostic, not an entry, so it is not counted. A
+    /// replace-style write contributes one entry to both `merged` (the replacement) and
+    /// `deleted` (the row it superseded), because it really did both.
     #[must_use]
     pub fn len(&self) -> usize {
         self.added.len() + self.merged.len() + self.deleted.len() + self.skipped.len()

@@ -26,6 +26,7 @@ use crate::config::MemoryScopeConfig;
 use crate::engine::VariableWrite;
 use crate::record::{AddOptions, MemoryRecord, MemoryScope, DEFAULT_ID};
 
+use super::integrations::note_write_degraded;
 use super::record_input;
 use super::LongTermMemory;
 
@@ -58,7 +59,13 @@ pub struct VariableAssignmentReport {
     pub records_merged: usize,
     /// Number of remaining facts dropped by the dedupe policy.
     pub records_skipped: usize,
-    /// Why a deterministic fallback ran instead of the model, when one did.
+    /// Why the call was not fully analysed or fully checked, when it was not.
+    ///
+    /// The analysis pass degrading to the deterministic rules (the model call or its
+    /// payload failed) and a record write whose duplicate candidate scan failed both land
+    /// here, because either one makes the result less trustworthy than a clean report.
+    /// When both happened both are named: the analysis reason keeps its place and the
+    /// first write reason follows it (only the first — later facts share its cause).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded: Option<String>,
     /// Why the proactive stage withheld the batch, when it did.
@@ -265,6 +272,12 @@ impl LongTermMemory {
     /// [`LongTermMemory::remember_with_assignments`]: cancellation is checked between
     /// facts, each write is one engine call, a rejected variable name fails the call with
     /// the fact index and name, and `report` accumulates the counters.
+    ///
+    /// The loop also folds the writes' diagnostics into `report.degraded`: the first
+    /// [`AddOutcome::degraded`](crate::record::AddOutcome::degraded) a record write
+    /// reports (a failed duplicate candidate scan, so the fact was stored unchecked)
+    /// reaches the report through `note_write_degraded`, keeping an analysis-pass
+    /// reason that is already there.
     async fn write_assignment_facts(
         &self,
         scope: &MemoryScope,
@@ -273,6 +286,7 @@ impl LongTermMemory {
         report: &mut VariableAssignmentReport,
         embedding: Option<&Arc<dyn Embedding>>,
     ) -> Result<()> {
+        let mut write_degraded = None;
         for (index, fact) in facts.iter().enumerate() {
             options.call.check()?;
             let Some((name, value)) = variable_assignment(fact) else {
@@ -286,6 +300,9 @@ impl LongTermMemory {
                 report.records_added += outcome.added.len();
                 report.records_merged += outcome.merged.len();
                 report.records_skipped += outcome.skipped.len();
+                if write_degraded.is_none() {
+                    write_degraded = outcome.degraded;
+                }
                 continue;
             };
             match self
@@ -303,6 +320,7 @@ impl LongTermMemory {
                 }
             }
         }
+        note_write_degraded(&mut report.degraded, write_degraded);
         Ok(())
     }
 
