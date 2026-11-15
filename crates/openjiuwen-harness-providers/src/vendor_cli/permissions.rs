@@ -1,17 +1,21 @@
 //! Host permission translation shared by the vendor CLI harnesses.
 //!
-//! A vendor CLI has its own permission model: Claude Code asks for tool approval, Codex asks for
-//! command approval, DSH asks for notifications. Every adapter has to answer those prompts from the
-//! *host's* declared capabilities ([`HostCapability::ToolApproval`],
+//! A vendor CLI has its own permission model: Claude Code asks for tool approval and user input,
+//! Codex asks for command approval and user input. The adapters that receive such prompts answer
+//! them from the *host's* declared capabilities ([`HostCapability::ToolApproval`],
 //! [`HostCapability::UserInput`], [`HostCapability::DynamicToolCall`],
 //! [`HostCapability::NativeToolGateway`]) and the host's installed
 //! [`HarnessInteractionHandler`].
 //!
 //! [`PermissionPolicy`] captures that decision once per start; [`ask_tool_approval`] and
-//! [`ask_user_input`] are the two request shapes every vendor CLI reduces to. When the host did not
+//! [`ask_user_input`] are the two request shapes those adapters reduce to. When the host did not
 //! declare the capability, or installed no handler, both helpers return the host's auto-approval
 //! policy ([`ApprovalDecision::Allow`] / [`None`]) instead of blocking a turn on a prompt nobody can
 //! answer.
+//!
+//! The DSH driver uses neither helper: it answers every server-to-client request with a JSON-RPC
+//! "method not found" error, because the adapter exposes no client-side capability the runtime may
+//! call.
 
 use std::sync::Arc;
 

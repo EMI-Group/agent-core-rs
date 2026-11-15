@@ -1,11 +1,12 @@
 //! The sharing backend seam and its two offline implementations.
 //!
-//! Python's sharing backends speak to a remote hub; that client is deferred.
-//! The trait here is backend-neutral (ids are strings, not paths) so a future
-//! hub or database implementation can slot in beside the local-file store used
-//! for single-machine sharing and the in-memory store used for tests.
+//! Python's sharing backends speak to a remote hub. Here the trait stays
+//! backend-neutral (ids are strings, not paths): the local-file store is used for
+//! single-machine sharing, the in-memory store for tests, and
+//! [`RemoteHubSharingBackend`](crate::sharing::RemoteHubSharingBackend)
+//! (module `remote`) implements the same trait over HTTP.
 //!
-//! Both implementations share one ranking rule:
+//! The two local implementations share one ranking rule:
 //! `score = 0.7 * keyword_ratio + 0.3 * intent_ratio` — see [`score_bundle`].
 
 use std::collections::{BTreeMap, BTreeSet};

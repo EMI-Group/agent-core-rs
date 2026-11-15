@@ -7,12 +7,29 @@
 
 use std::any::TypeId;
 
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{ErrorKind, Result};
 use openjiuwen_harness_protocol::{HarnessProtocol, JsonObject};
 
 /// Asserts that `A` and `B` are the same type.
 fn same_type<A: 'static, B: 'static>() {
     assert_eq!(TypeId::of::<A>(), TypeId::of::<B>());
+}
+
+/// Drives an immediately-ready future to completion without a runtime.
+///
+/// The only async call driven this way (`WorkspaceWatcher::start`) answers on its first
+/// poll in both builds — the empty-plan checks run before any await, and the
+/// `notify`-free body is `async` only for signature parity — so a single poll suffices;
+/// a future that yields panics instead of silently returning nothing.
+fn poll_once<F: std::future::Future>(future: F) -> F::Output {
+    use std::task::{Context, Poll, Waker};
+
+    let mut context = Context::from_waker(Waker::noop());
+    let mut future = std::pin::pin!(future);
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(value) => value,
+        Poll::Pending => panic!("the future yielded; this helper drives one poll only"),
+    }
 }
 
 /// Asserts that each umbrella path is the same type as the concrete item after `=>`.
@@ -456,7 +473,8 @@ fn sqlite_feature_reaches_every_backend() {
 #[cfg(feature = "redis")]
 #[test]
 fn redis_feature_reaches_the_store_surface() {
-    // Construction returns `Error::Unsupported`; nothing here connects.
+    // The extensions' store connects lazily over `redis://`; `rediss://` TLS and cluster
+    // slot routing are typed `Unsupported`. Nothing here connects.
     same_paths! {
         openjiuwen::extensions::store::redis::RedisStore => openjiuwen_extensions::store::redis::RedisStore,
         openjiuwen::extensions::store::redis::RedisStoreConfig => openjiuwen_extensions::store::redis::RedisStoreConfig,
@@ -604,4 +622,31 @@ fn mobile_feature_reaches_the_reporting_preset() {
         message.contains("mobile_gui_agent") && message.contains("'mobile' cargo feature"),
         "unexpected message: {message}"
     );
+}
+
+#[test]
+fn notify_feature_gates_the_workspace_watcher_backend() {
+    // The umbrella's `notify` forward reaches `openjiuwen-harness/notify`, which is the one
+    // harness feature that gates real code (`watcher::backend::start`). An empty watch plan
+    // is rejected before any backend work, so one poll of `start()` covers both builds:
+    // with `notify` the plan validation answers `Config`, without it `start()` answers
+    // `Unsupported` before it looks at the plan at all. Nothing is watched, touched or
+    // spawned here.
+    let Err(error) = poll_once(openjiuwen::harness::watcher::WorkspaceWatcher::new().start())
+    else {
+        panic!("an empty watch plan is never accepted");
+    };
+    if cfg!(feature = "notify") {
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert!(
+            error.to_string().contains("at least one watch target"),
+            "unexpected message: {error}"
+        );
+    } else {
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            error.to_string().contains("notify"),
+            "unexpected message: {error}"
+        );
+    }
 }

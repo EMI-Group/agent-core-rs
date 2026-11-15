@@ -8,8 +8,9 @@
 //! non-negative one. Error messages use the Python wording (`"{key} must be a string"`,
 //! `"unknown Codex configuration fields: foo, zeta"`).
 
-// The factory and vendor configuration decoders added in a later phase consume these helpers; until
-// then they are exercised only by this module's tests.
+// These helpers are reached only through the feature-gated configuration decoders (`vendor` for the
+// Claude Code, Codex and DSH configurations, `native-v2` for the team provider), so a build with
+// those features compiled out leaves some of them unused.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;

@@ -84,7 +84,8 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool`, th
 - `MemoryToolBackend` trait: `search(MemorySearchRequest) -> Result<Value>`, `read(scope, path, offset, limit) -> Result<MemoryReadData>`, `write(scope, path, content, append) -> Result<MemoryWriteData>`, `edit(scope, path, old_text, new_text) -> Result<MemoryEditData>`.
 - Data types `MemorySearchRequest { query, max_results, min_score, session_key, scope }`, `MemoryReadData { path, text, total_lines, start_line, end_line }`, `MemoryWriteData { path, full_path, appended, file_existed }`, `MemoryEditData { path, replacements }`.
 - `MemoryTool { kind: MemoryToolKind, backend: Option<Arc<dyn MemoryToolBackend>> }` renders eight cards: `memory_search`, `memory_get`, `write_memory`, `read_memory`, `edit_memory` (scope `Memory`) and `coding_memory_read`, `coding_memory_write`, `coding_memory_edit` (scope `CodingMemory`).
-- No backend configured → `success=false` with `memory tool backend is not configured`.
+- `WorkspaceMemoryBackend::new(Workspace)` is the production backend: workspace path mapping, line windows, coding-memory front-matter rules and a deterministic offline keyword search (details in `memory/CONTEXT.md`).
+- No backend configured → `success=false` with `memory tool backend is not configured`. `ToolRegistry::new` leaves it unset by design; `with_workspace_memory` installs `WorkspaceMemoryBackend`, `with_memory` substitutes a host backend, and `DeepAgentBuilder::build` mounts the workspace backend by default.
 
 ### Web — `web/`
 
@@ -176,7 +177,7 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool`, th
 
 - Upper layers (`agent`, `rails`, `protocol`, `cli`) construct tools only through `ToolRegistry::build`; live seams are wired with `with_user_asker`, `with_memory`, `with_permissions` and the sys-operation setters.
 - A registry's `ReadStateRegistry` is per-instance, so build the tool set once per agent (or per session) rather than per call, otherwise the read-before-write gate resets.
-- `ask_user` reports `ask_user is not available: no user interaction handler is configured` until an asker is wired; the eight memory tools report `memory tool backend is not configured` until a backend is wired.
+- `ask_user` reports `ask_user is not available: no user interaction handler is configured` until an asker is wired; the eight memory tools report `memory tool backend is not configured` until a backend is wired, which `ToolRegistry::with_workspace_memory` (and `DeepAgentBuilder::build` by default) does.
 - The todo store defaults to `<workspace>/todo/<session>/todo.json`; the session id comes from `ToolContext::session_id` and falls back to `default`, so a session-less caller shares one list.
 - `grep` reports `success=true` with empty output on no matches (exit-code 1 lives in `data`), which is what makes it render `No matches found.`.
 - The extended tools are opt-in: `ToolRegistry::new(..).with_tools(BuiltinTool::EXTENDED)` mounts all thirty-five; wire `with_search_backend`, `with_mcp_resources`, `with_mcp_subscriptions`, `with_http_fetcher`, `with_goal_store`/`with_cron_scheduler`, `with_lsp_config` and `with_worktree_manager`/`with_worktree_root`/`with_worktree_session_store` only when a live seam is wanted.
@@ -191,7 +192,7 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool`, th
 - `bash`: `OPENJIUWEN_BASH_STRICT` injection detection, destructive-command warnings, rm-target history, sudo rewriting, `PowerShellTool`, and persisted oversized output.
 - `grep`: ripgrep binary invocation, `--type` filters, multiline search, Windows `Select-String`, and `.gitignore` awareness.
 - `todo`: `TodoLockManager` per-session process registry (replaced by `TodoStore` locks) and the Python code-numbered `build_error` envelope.
-- `memory`: SQLite/embedding hybrid retrieval lives in `openjiuwen_memory` behind `MemoryToolBackend`, but no production `MemoryToolBackend` implementation ships in this crate (only the `FakeBackend` in `memory/tests.rs`; `rails::memory::LongTermMemoryAdapter` implements `MemoryRecall`/`MemoryWriteBack` instead) — the host supplies one via `ToolRegistry::with_memory`; `coding_memory` front-matter validation is the backend's job.
+- `memory`: `memory/search` semantic retrieval is not ported — `WorkspaceMemoryBackend` (`memory/workspace_backend.rs`) is file-backed and answers with a deterministic offline keyword scan (`provider: "local"`, `search_mode: "keyword_only"`, `embedding_available: false`); the SQLite/embedding hybrid of Python's lite manager, its LLM conflict checker and the `MEMORY.md` index upsert stay deferred, and `rails::memory::LongTermMemoryAdapter` implements the separate `MemoryRecall`/`MemoryWriteBack` seam over `openjiuwen_memory::LongTermMemory`.
 - `ask_user`: the `AskUserRail` interrupt wiring lives in `crate::rails`.
 
 ## Routing Table
@@ -215,7 +216,7 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool`, th
 - `./mcp_resources.rs` → `McpResourceProvider` seam, `McpClientResourceProvider`, `list_mcp_resources`, `read_mcp_resource`, the fake provider
 - `./mcp_subscriptions.rs` → `McpResourceSubscriptions` registry, `McpResourceSubscriptionProvider`, sink/event/info types, the fake provider
 - `./mcp_subscription_tool.rs` → the `mcp_resource_subscription` tool and its four actions
-- `./memory/` → memory backend seam, tool kinds and the eight memory tools (`memory/CONTEXT.md`)
+- `./memory/` → memory backend seam, the file-backed `WorkspaceMemoryBackend`, tool kinds and the eight memory tools (`memory/CONTEXT.md`)
 - `./tests.rs` → cross-module parity suite: name order, card schemas/languages, `required` lists, `parallel_safe`, end-to-end registry calls over a temp workspace, `render_for_llm` strings, the `lsp`/`worktree`/`enter_worktree`/`exit_worktree` cards and registry wiring
 
 ## Test Strategy

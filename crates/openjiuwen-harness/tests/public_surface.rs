@@ -46,10 +46,10 @@ use openjiuwen_harness::{
     GoalStore, HarnessRail, HarnessRailContext, HeartbeatRail, HeartbeatRailConfig,
     HeartbeatReason, InteractionEvent, LogCapacity, ManualClock, MoaConfig, MoaRail, ModelUsage,
     PersistentAgentLayout, PersistentSessionRecord, PersonalContextStore, Range, Repl, ResumedTurn,
-    SessionBinding, SessionStateStore, SessionSummary, SparseConfig, WatchTargetKind,
-    WindowAssembler, Workspace, WorkspaceWatcher, WorktreeLock, WorktreeLockConfig,
-    GOAL_EVENT_EXTRA_KEY, LINKS_DIR, LOGS_DIR, PERSISTENT_AGENT_NODE, SESSIONS_DIR,
-    SESSION_STATE_KEY,
+    RuntimeSubAgentSpawner, SessionBinding, SessionStateStore, SessionSummary, SparseConfig,
+    SubAgentRuntime, WatchTargetKind, WindowAssembler, Workspace, WorkspaceWatcher, WorktreeLock,
+    WorktreeLockConfig, GOAL_EVENT_EXTRA_KEY, LINKS_DIR, LOGS_DIR, PERSISTENT_AGENT_NODE,
+    SESSIONS_DIR, SESSION_STATE_KEY,
 };
 use openjiuwen_session::{AgentSession, Session};
 use openjiuwen_test_support::ScriptedModel;
@@ -62,6 +62,28 @@ const NOW_MS: i64 = 1_700_000_000_000;
 /// Wraps a scripted model as an injected [`Model`] handle.
 fn model(text: &str) -> Arc<dyn Model> {
     Arc::new(ScriptedModel::text(text))
+}
+
+/// The production subagent seam resolves from the crate root and keeps its exact signature.
+///
+/// The seam is `crate::rails::SubAgentSpawner`; this pins that `RuntimeSubAgentSpawner`
+/// implements it (so it is usable as `Arc<dyn SubAgentSpawner>`) and that the flat
+/// constructors and accessors keep the documented shapes. Behaviour is covered end to end by
+/// `tests/subagent_spawner.rs`.
+#[test]
+fn runtime_subagent_spawner_resolves_from_the_crate_root() {
+    fn assert_spawner<T: openjiuwen_harness::rails::SubAgentSpawner>() {}
+    assert_spawner::<RuntimeSubAgentSpawner>();
+    let new: fn(Arc<SubAgentRuntime>) -> RuntimeSubAgentSpawner = RuntimeSubAgentSpawner::new;
+    let with_limit: fn(Arc<SubAgentRuntime>, usize) -> RuntimeSubAgentSpawner =
+        RuntimeSubAgentSpawner::with_limit;
+    let runtime: fn(&RuntimeSubAgentSpawner) -> &Arc<SubAgentRuntime> =
+        RuntimeSubAgentSpawner::runtime;
+    let limit: fn(&RuntimeSubAgentSpawner) -> usize = RuntimeSubAgentSpawner::limit;
+    let active: fn(&RuntimeSubAgentSpawner) -> usize = RuntimeSubAgentSpawner::active_permits;
+    let tracked: fn(&RuntimeSubAgentSpawner) -> usize = RuntimeSubAgentSpawner::tracked;
+    // Keep the pins alive so the signatures are part of the compiled test, not dead bindings.
+    std::hint::black_box((new, with_limit, runtime, limit, active, tracked));
 }
 
 /// The `MoA` configuration and rail resolve from the crate root and publish their section.

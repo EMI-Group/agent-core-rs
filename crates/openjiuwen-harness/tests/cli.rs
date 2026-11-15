@@ -545,8 +545,54 @@ async fn repl_mode_switch_and_unknown_commands() {
     assert_eq!(probe.call_count(), 0, "no conversational turn was typed");
 }
 
-// --- permission answers ---------------------------------------------------
+#[tokio::test]
+async fn repl_adopts_a_persisted_session_id_and_appends_to_its_record() {
+    let temp = TempDir::new().expect("temp dir");
+    let options = test_options(temp.path());
+    options.ensure_workspace().expect("workspace");
 
+    // The record a previous process left behind: one turn already on disk.
+    let store = options.sessions();
+    store
+        .new_session("existing-id", &options.model)
+        .expect("the persisted record is writable");
+    store
+        .append_message("existing-id", "user", "earlier question")
+        .expect("the earlier turn is persisted");
+
+    let (io, _buffer) = terminal(&[], true);
+    let (model, _probe) = scripted_model("later answer");
+    let agent = build_agent(model, &options, &io)
+        .await
+        .expect("agent builds");
+
+    let mut repl = Repl::with_io(agent, options.clone(), io).with_session_id("existing-id");
+    assert_eq!(repl.session_id(), "existing-id");
+
+    let outcome = tokio::time::timeout(REPL_TIMEOUT, repl.run_turn("later question"))
+        .await
+        .expect("the scripted turn terminates")
+        .expect("the turn answers");
+    assert_eq!(outcome.answer, "later answer");
+
+    // The turn appended to the existing record instead of minting (or truncating) one.
+    let record = store
+        .load("existing-id")
+        .expect("the record is readable")
+        .expect("the adopted record still exists");
+    let contents: Vec<&str> = record
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        ["earlier question", "later question", "later answer"],
+        "the adopted record must be continued, never truncated"
+    );
+}
+
+// --- permission answers ---------------------------------------------------
 #[test]
 fn permission_answers_approve_once() {
     for answer in [

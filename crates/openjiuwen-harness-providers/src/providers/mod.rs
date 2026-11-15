@@ -3,8 +3,8 @@
 //! [`builtin_provider`] is the resolution half of the registry: it maps a registry name onto the
 //! provider that implements it, or reports why this build cannot serve the name. Unknown names
 //! return [`None`] so the factory can fall back to in-process registrations; every declared name
-//! returns a result, so a known-but-deferred provider produces an `Unsupported` error instead of a
-//! "not found".
+//! returns a result, so a known provider whose feature is compiled out produces an `Unsupported`
+//! error instead of a "not found".
 //!
 //! Feature gating is expressed here, not in the provider modules: without the `native` feature the
 //! native entry point is compiled out, without `vendor` the three vendor providers stay

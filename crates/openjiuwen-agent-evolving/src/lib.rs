@@ -5,11 +5,12 @@
 //! checkpoint management, the bounded trainer loop, the research optimizers, the
 //! evolution subsystems (signals, rewards, attribution, trajectories, experience,
 //! sharing, TTSE), the Docker + git evaluation harness, the RL batching/training
-//! seams, evolution rails, and the RL service skeleton.
+//! seams, evolution rails, and the online RL HTTP service.
 //!
-//! Only the Python-only ML/vendor stack keeps typed stubs: GPU/distributed RL
-//! engines (`torch`/`verl`/`ray`), the Redis/vLLM online gateway, vendor reward and
-//! judge services, and the remote sharing hub. Those paths return
+//! Only the Python-only ML/vendor stack keeps typed stubs: the GPU/distributed RL
+//! engines (`torch`/`verl`/`ray`), the Redis/vLLM online gateway with its `LoRA`
+//! activation service, and the reward checks that need a container browser
+//! (`playwright`) or image decoding (`PIL`). Those paths return
 //! [`openjiuwen_common::error::Error::Unsupported`] with a reason and are listed in
 //! `docs/PARITY.md` and [`deferred`].
 //!
@@ -20,20 +21,24 @@
 //! - [`optimizer`] — candidates, grid-search baseline, research optimizers, checkpoints.
 //! - [`trainer`] — bounded train/evaluate loop, progress, callbacks, reports.
 //! - [`rails`] — pure evolution events, observer trait, harness rail adapter.
-//! - [`service`] — axum RL service skeleton (health/evaluate, RL endpoints).
+//! - [`service`] — axum RL service: health, offline evaluate, RL routes.
 //! - [`rl`] — RL config, batch/rollout bookkeeping and the pluggable trainer loop.
+//! - [`online`] — task/capture/turn/training-run state machines, sample ledger,
+//!   executor seam, `LoRA` repository, HTTP routes and the memory/Redis stores.
 //! - [`signal`] — the shared evolution-signal vocabulary and tracker.
 //! - [`reward`] — reward records, aggregation and normalisation.
 //! - [`attribution`] — dependency graph, credit assignment and keyword detection.
 //! - [`trajectory`] — run recording, grouping, windows and digests.
 //! - [`experience`] — experience records, archive, dedupe and extraction.
-//! - [`sharing`] — shared-experience packaging and the backend seam.
+//! - [`sharing`] — shared-experience packaging, keyword extraction, local/in-memory/remote-hub backends.
 //! - [`ttse`] — test-time skill experience: tip bank, induction, consultation.
 //! - [`evaluator_pipeline`] — Docker + git evaluation harness over a command seam.
 //! - [`deferred`] — deferred-feature table and `Error::Unsupported` helper.
 //!
-//! Everything except the stubs is offline and deterministic: no model calls, no
-//! environment reads, and no wall-clock dependence in tests.
+//! Everything except the stubs is offline and deterministic: tests exercise a
+//! model only through a scripted double or the loopback fake, reach no network or
+//! real service, and no report, checkpoint or record content depends on the wall
+//! clock.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
@@ -69,9 +74,9 @@ pub mod online;
 pub mod optimizer;
 /// Pure evolution events, observer trait, and harness rail adapter.
 pub mod rails;
-/// RL records and API-shaped ML stubs.
+/// RL config/records/batching, policy and rollout seams, checkpoints, and the trainer loop.
 pub mod rl;
-/// Axum RL service skeleton (health/evaluate, RL endpoints).
+/// Axum RL service: health, offline evaluate, and the online RL route table.
 pub mod service;
 /// Bounded train/evaluate loop, progress, callbacks, and reports.
 pub mod trainer;
@@ -82,7 +87,7 @@ pub mod attribution;
 pub mod experience;
 /// Reward records, aggregation and normalisation.
 pub mod reward;
-/// Shared-experience packaging and the backend seam.
+/// Shared-experience packaging and the local/in-memory/remote-hub backends.
 pub mod sharing;
 /// The shared evolution-signal vocabulary and tracker.
 pub mod signal;
@@ -160,11 +165,11 @@ pub use rl::{
     RlSample, RlStopReason, RlTask, RlTrainReport, RlTrainer, RlTrainerConfig, RlUpdate,
     RolloutEngine, RolloutLog,
 };
-/// Axum RL service skeleton (health/evaluate, 501 RL endpoints).
+/// Axum RL service: health, offline evaluate, and the online RL route table.
 pub use service::{
     build_router, serve, ApiError, EvaluateRequest, EvaluateResponse, RlServiceConfig,
 };
-/// Shared-experience packaging, keyword extraction, and the backend seam.
+/// Shared-experience packaging, keyword extraction, and the local/in-memory/remote-hub backends.
 pub use sharing::{
     KeywordExtractor, LocalFileSharingBackend, MemorySharingBackend, QueryKeywords,
     RemoteHubOptions, RemoteHubSharingBackend, ShareStager, SharedExperience, SharedSkillBundle,

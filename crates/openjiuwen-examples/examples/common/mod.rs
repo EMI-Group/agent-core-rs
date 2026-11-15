@@ -12,10 +12,11 @@
 //!
 //! # Unused helpers
 //!
-//! A shared module included by twelve binaries is always partially unused, so
-//! every item carries `#[allow(dead_code)]` with the reason: a given example
-//! uses the scripted model *or* the mock server, never both, and the helpers it
-//! does not call would otherwise produce a warning per binary.
+//! A shared module included by all twenty-six example binaries is always
+//! partially unused, so every item carries `#[allow(dead_code)]` with the
+//! reason: a given example uses the scripted model *or* the mock server, never
+//! both, and the helpers it does not call would otherwise produce a warning per
+//! binary.
 
 #![allow(
     // This module is compiled into a binary crate, which nothing can link

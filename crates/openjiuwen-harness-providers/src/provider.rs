@@ -16,7 +16,7 @@
 //!
 //! [`ProviderDescriptor`] is the introspection view of one registry entry: registry name, card
 //! name, implementation version, the built-in / implemented flags, whether it configures models,
-//! and the external requirement of a deferred provider.
+//! and the prerequisite an unavailable provider still needs.
 use std::sync::Arc;
 
 use openjiuwen_harness_protocol::{
@@ -34,11 +34,14 @@ pub mod provider_names {
     pub const NATIVE: &str = "native";
     /// Native v2 harness hosted by `openjiuwen-agent-teams`; needs the `native-v2` feature.
     pub const NATIVE_V2: &str = "native_v2";
-    /// Claude Code harness; deferred vendor stub.
+    /// Claude Code harness: a subprocess adapter for the `claude` CLI, compiled in by the `vendor`
+    /// feature.
     pub const CLAUDE_CODE: &str = "claudecode";
-    /// Codex harness; deferred vendor stub.
+    /// Codex harness: a subprocess adapter for `codex app-server`, compiled in by the `vendor`
+    /// feature.
     pub const CODEX: &str = "codex";
-    /// `DeepSeek` harness; deferred vendor stub.
+    /// `DeepSeek` Harness (DSH): a subprocess adapter for the `dsh` runtime, compiled in by the
+    /// `vendor` feature.
     pub const DSH: &str = "dsh";
 }
 
@@ -54,7 +57,7 @@ const BUILTIN_PROVIDER_NAMES: [&str; 5] = [
 /// Returns whether `name` is one of the provider names this crate declares.
 ///
 /// Declared is not the same as usable: a name whose feature is compiled out (`native-v2` for the
-/// agent-teams provider, `vendor` for the three vendor stubs) is known but cannot be resolved, so
+/// agent-teams provider, `vendor` for the three vendor adapters) is known but cannot be resolved, so
 /// resolution reports the missing feature.
 #[must_use]
 pub fn is_builtin_provider(name: &str) -> bool {
@@ -179,9 +182,12 @@ pub fn model_configuring_provider<P: HarnessProvider + ModelConfigProvider + 'st
 
 /// Introspection view of one registry entry.
 ///
-/// Serialized `snake_case` so a CLI can print the registry as JSON; `requires` names the external
-/// prerequisite of a deferred provider (an SDK, a CLI, or a sibling crate) and is [`None`] when the
-/// provider is implemented in this build.
+/// Serialized `snake_case` so a CLI can print the registry as JSON. `implemented` reports whether
+/// this build can construct harnesses through the provider, and `requires` names what a declared
+/// provider still lacks in this build — the sibling crate for `native_v2`, or the feature to
+/// rebuild with for the three vendor adapters — and is [`None`] once that feature is compiled in
+/// (and always [`None`] for `native`, whose descriptor is static metadata; see
+/// [`crate::factory::provider_descriptors`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProviderDescriptor {
     /// Registry name (the lookup key, e.g. `native`).
@@ -196,7 +202,7 @@ pub struct ProviderDescriptor {
     pub implemented: bool,
     /// Whether the provider implements the model-configuration hook.
     pub configures_models: bool,
-    /// External prerequisite of a deferred provider, if any.
+    /// Prerequisite a declared provider still lacks in this build, if any.
     pub requires: Option<String>,
 }
 

@@ -110,11 +110,12 @@ impl Default for DshSystemPromptMode {
 
 /// Configuration of the `DeepSeek` Harness adapter (Python `DshHarnessConfig`).
 ///
-/// Field names mirror `deepseek_harness.DeepSeekHarnessConfig`; `dsh_home` (or a non-empty
-/// `DSH_HOME` in `env`) is mandatory for the SDK runtime, which never falls back to `~/.dsh`
-/// implicitly. A custom Cordis composition must consume `system_prompt_env_var` when it is
-/// explicitly set; otherwise the adapter uses the bundled system-prompt plugin through a temporary
-/// launch overlay.
+/// Field names mirror `deepseek_harness.DeepSeekHarnessConfig`. `dsh_home` (or a non-empty
+/// `DSH_HOME` in `env`, or an inherited `DSH_HOME`) is mandatory, because the runtime never falls
+/// back to `~/.dsh` implicitly. The host system prompt reaches the runtime only through
+/// `system_prompt_env_var`, which a custom Cordis composition must consume: this adapter writes no
+/// composition overlay, so `append` mode — which rejects that variable — leaves the host prompt
+/// undelivered.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct DshHarnessConfig {
@@ -130,7 +131,10 @@ pub struct DshHarnessConfig {
     /// Maximum number of generated tokens per request.
     #[serde(default)]
     pub max_tokens: Option<u32>,
-    /// How the host system prompt combines with the DSH prompt.
+    /// How the host system prompt would combine with the DSH prompt.
+    ///
+    /// Only the cross-field rule is enforced: `append` rejects a `system_prompt_env_var`, and
+    /// `replace` (the default) allows one. No other combining behavior is implemented.
     #[serde(default)]
     pub system_prompt_mode: DshSystemPromptMode,
     /// Skill sources installed into the DSH project-local discovery directory.
@@ -145,7 +149,7 @@ pub struct DshHarnessConfig {
     /// Working directory of the DSH runtime itself.
     #[serde(default)]
     pub runtime_cwd: Option<PathBuf>,
-    /// Path of the DSH executable; `None` uses the SDK's lookup.
+    /// Path of the DSH executable; `None` looks the `dsh` runtime up on `PATH`.
     #[serde(default)]
     pub dsh_bin: Option<PathBuf>,
     /// DSH home directory; it never defaults to `~/.dsh`.
@@ -377,11 +381,13 @@ pub fn provider() -> DshHarnessProvider {
 
 /// Returns the capability card of the DSH adapter.
 ///
-/// The adapter keeps one reusable runtime session across turns, executes its own tools, consumes
-/// MCP server configurations and runs endpoint models. The pinned DSH protocol exposes no steering
-/// input, no abort of a running turn, no pause/resume and no portable checkpoint, so the card
-/// declares none of those: [`abort`](HarnessProtocol::abort),
-/// [`pause`](HarnessProtocol::pause) and
+/// The adapter keeps one reusable runtime session across turns, runs endpoint models and works with
+/// the tools the runtime itself configures. The card advertises `McpTools` and the optional
+/// `HostCapability::McpServers` like Python's, but the host's MCP servers are not transmitted: the
+/// `initialize` request carries no MCP configuration, so the runtime's own tool setup is
+/// authoritative (documented gap). The pinned DSH protocol exposes no steering input, no abort of a
+/// running turn, no pause/resume and no portable checkpoint, so the card declares none of those:
+/// [`abort`](HarnessProtocol::abort), [`pause`](HarnessProtocol::pause) and
 /// [`export_checkpoint`](HarnessProtocol::export_checkpoint) report
 /// [`HarnessError::UnsupportedCapability`](openjiuwen_harness_protocol::HarnessError) instead of
 /// pretending to work.
