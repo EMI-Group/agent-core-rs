@@ -73,8 +73,11 @@
 //! by the caller or read from the wall clock only at the documented entry point.
 //! The judge and harness paths touch a model only when the caller supplies one,
 //! and both keep the Python report field names and the `0.40/0.60` weighting.
-//! [`FunctionalReport::timestamp`] stays epoch milliseconds rather than Python's
-//! ISO-8601 string, so no date formatting or clock access lives in the library.
+//! [`FunctionalReport::timestamp`] stays the caller-supplied epoch milliseconds
+//! (the serialized artifact keeps an integer), and
+//! [`FunctionalReport::timestamp_iso`] renders Python's ISO-8601 UTC form from it
+//! through [`iso8601_utc`] — in-crate date arithmetic, so the library still never
+//! reads a clock.
 //!
 //! [`SkillDefinition`]: crate::skill_creator::SkillDefinition
 pub mod artifacts;
@@ -86,6 +89,7 @@ pub mod judge_scoring;
 pub mod report;
 pub mod runner;
 pub mod scoring;
+pub mod timestamp;
 
 pub use artifacts::{
     ArtifactPaths, DESIGN_ARTIFACT, FINAL_SCORE_ARTIFACT, FUNCTIONAL_ARTIFACT, SAFETY_ARTIFACT,
@@ -109,3 +113,4 @@ pub use report::{
 };
 pub use runner::{CaseRunner, ModelCaseRunner, ScriptedCaseRunner};
 pub use scoring::{aggregate, scan_safety, score_design, SafetyRule};
+pub use timestamp::iso8601_utc;
