@@ -15,7 +15,9 @@
 //! `ModelContext.get_messages()` / `add_messages()` as a session-backed store over the
 //! `__messages__` global lane, and [`crate::ComponentContext::with_history`] swaps in an
 //! embedder-provided store. See the [`crate::context::history`] module for the
-//! deviations (text-only, session-backed, non-failing).
+//! deviations (text-only, session-backed, non-failing: read and write problems are
+//! recorded through [`crate::context::history::MessageHistory::corruption`] instead of
+//! being raised).
 
 pub mod history;
 
@@ -35,7 +37,10 @@ use crate::interrupt::{interrupt_error, InteractionState, WorkflowInteraction};
 use crate::output::{self, FrameWriter};
 use crate::reference;
 
-pub use history::{MessageHistory, SessionMessageHistory, MESSAGES_STATE_KEY};
+pub use history::{
+    HistoryCorruption, HistoryCorruptionReason, MessageHistory, SessionMessageHistory,
+    MESSAGES_STATE_KEY,
+};
 
 /// Trace frame type used for workflow trace payloads.
 const TRACE_ITEM_TYPE: &str = "tracer_workflow";
@@ -53,6 +58,7 @@ pub struct ComponentContext {
     metadata: BTreeMap<String, Value>,
     depth: usize,
     frame_index: Arc<AtomicU64>,
+    default_history: SessionMessageHistory,
     history: Option<Arc<dyn MessageHistory>>,
 }
 
@@ -88,6 +94,7 @@ impl ComponentContext {
         let component_id = component_id.into();
         Self {
             writer: Arc::new(FrameWriter::new(None, Arc::clone(&session))),
+            default_history: SessionMessageHistory::new(Arc::clone(&session)),
             session,
             executable_id: component_id.clone(),
             component_id,
@@ -191,12 +198,14 @@ impl ComponentContext {
     /// (`get_messages()` / `add_messages()`): without an override it is a
     /// [`SessionMessageHistory`] over this context's session, so every component in one
     /// run shares the `__messages__` global lane. The handle is rebuilt per call on
-    /// purpose — it only clones the session `Arc`, and there is no cached mutable state.
+    /// purpose — it only clones the session `Arc` — but every session-backed handle of one
+    /// context shares the same corruption record, so
+    /// [`ComponentContext::history_corruption`] sees what a component's store observed.
     #[must_use]
     pub fn history(&self) -> Arc<dyn MessageHistory> {
         self.history
             .clone()
-            .unwrap_or_else(|| Arc::new(SessionMessageHistory::new(Arc::clone(&self.session))))
+            .unwrap_or_else(|| Arc::new(self.default_history.clone()))
     }
 
     /// Override the history store (tests / embedders that keep history outside the
@@ -205,6 +214,31 @@ impl ComponentContext {
     pub fn with_history(mut self, history: Arc<dyn MessageHistory>) -> Self {
         self.history = Some(history);
         self
+    }
+
+    /// The most recent conversation-history problem this context's store reported.
+    ///
+    /// This reads [`MessageHistory::corruption`] on [`ComponentContext::history`], so it
+    /// reports what the *last* [`messages`](MessageHistory::messages) /
+    /// [`append`](MessageHistory::append) / [`clear`](MessageHistory::clear) call observed:
+    /// `None` means that call was clean (or nothing has touched the store yet). A corrupt
+    /// lane degrades a run silently — the record makes it observable without making it
+    /// fatal; callers that want to fail hard use
+    /// [`ComponentContext::history_corrupt_error`].
+    #[must_use]
+    pub fn history_corruption(&self) -> Option<HistoryCorruption> {
+        self.history().corruption()
+    }
+
+    /// The conversation-history problem as a coded error, when there is one.
+    ///
+    /// The error is the `[100060]` [`Error::workflow`] built by
+    /// [`history::history_corrupt_error`], so a component can turn a corrupt lane into a
+    /// run failure with `ctx.history_corrupt_error().map_or(Ok(()), Err)`.
+    #[must_use]
+    pub fn history_corrupt_error(&self) -> Option<Error> {
+        self.history_corruption()
+            .map(|corruption| history::history_corrupt_error(&corruption))
     }
 
     /// Reads the workflow's global state lane.
