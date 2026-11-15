@@ -79,6 +79,11 @@ Ports `openjiuwen/harness/tools/web/` (`fetch_webpage.py`, `_http.py`, `_decode.
 - `test_support.rs` supplies the shared `StubFetcher` (canned response/failure, call count, last request), `fetch_response`, `http_response` and a loopback `TestServer` aborted on drop; all helpers are `#[cfg(test)]`.
 - Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --offline`, `cargo test -p openjiuwen-harness --no-default-features --offline`, `cargo clippy -p openjiuwen-harness --all-targets --offline -- -D warnings` clean.
 
+## Known Issues
+
+- The `card_for` doc comments on `FetchWebpageTool` (`fetch.rs:286`) and `WebSearchTool` (`search.rs:488`) still say the description "is empty until the table gains the `fetch_webpage`/`web_search` row", but both rows exist (`descriptions.rs:444`, `descriptions.rs:470`) and the descriptions are asserted non-empty in `descriptions.rs`'s own tests.
+- The `mod.rs` module header lists `_quality.py`/`_assessment.py`/`_budget.py` among the ported sources while the same header's deviations say those passes are not ported.
+
 ## Deferred Python behavior
 
 - `free_search.py`/`paid_search.py`: DuckDuckGo/Bing HTML scraping, vendor API clients, provider fallback, redirect unwrapping, domestic academic domain switching, relevance assessment and the search budget.

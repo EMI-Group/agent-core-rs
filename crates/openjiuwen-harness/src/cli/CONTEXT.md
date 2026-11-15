@@ -106,6 +106,7 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - **Colour resolution**: `paths::color_enabled(flag, env, stdout_is_tty())` gates `CliIo::with_color`; `NO_COLOR` and `--no-color` both opt out, non-terminals are always plain.
 - **History replay is opt-in**: `OPENJIUWEN_HISTORY_REPLAY` seeds `CliIo` with stored lines (the offline analogue of a pre-filled line editor); submitted lines are always appended best-effort and never fail a turn.
 - **`run_with_model`/`build_agent` signatures are frozen** (an out-of-crate e2e suite calls them); richer wiring goes through `build_agent_with` and the builder methods.
+- **Agent root vs workspace**: `build_agent_with` sets `DeepAgentConfig::cwd`/`project_root` to the process directory (`std::env::current_dir()`, falling back to `options.workspace`), while the tool `Workspace` tree is `Workspace::for_language(&options.workspace, "en")`.
 - **CLI tool set**: the CLI mounts `CLI_EXTENDED_TOOLS` (the fifteen `BuiltinTool::EXTENDED` entries beyond the default twenty, minus `lsp` and `mcp_resource_subscription`) through `ToolRegistry::with_tools`, so the builder baseline stays the default twenty for library users.
 - **Two extended tools stay unmounted**: `lsp` needs a per-workspace language-server configuration the CLI does not resolve, and `mcp_resource_subscription` needs a subscription registry the CLI does not wire; mounting either would only offer the model a tool that always answers "not configured".
 - **The three worktree tools are mounted together**: `worktree`, `enter_worktree` and `exit_worktree` share the registry's in-process `MemoryWorktreeSessionStore` and its manager rooted at the workspace, so they work inside a git repository and degrade to typed `success=false` payloads outside one (`exit_worktree` reports no active session without touching git).
@@ -118,6 +119,9 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - `ReplCommand`'s `Unknown skill:` branch is unreachable from `handle_input` (unknown names are rejected by `parse_skill_command` first and surface as `Unknown command: /name`).
 - `crates/openjiuwen-harness/tests/cli.rs` covers the pre-extension surface only; the new features are covered by `src/cli/tests/{commands,features,resume}.rs` instead (that file is outside this node).
 - A resumed REPL turn is not interruptible in a new way: `Repl::seed_history` seeds a built REPL only, so a host that resumes into `chat` must call it before the first turn and after any `agent.configure`.
+- `run_once_resumed` has no behavioural test: it resolves a real provider through `CliOptions::build_model`, so every offline suite drives `run_with_model_resumed` (which differs only by that call); `crates/openjiuwen-harness/tests/public_surface.rs` only signature-pins it.
+- `build_agent_with` installs `CliPermissionHost` with a freshly generated `run::session_id()`, not the caller's run/REPL session id, so `PermissionHost::session_id()` never matches the id in `<home>/sessions/<id>.json`.
+- The one-shot `run` path never emits colour, even on a terminal: `run_cli` resolves colour only in the `chat` branch and hands `run` a `CliIo::stdio_non_interactive()` whose colour flag stays off.
 
 ## Deferred Python areas
 

@@ -81,7 +81,11 @@ Everything except those paths is offline and deterministic: no GPU, no model cal
 - Online state layout is fixed and documented in `./src/online/CONTEXT.md`: task/capture/turn/training/sample keys live under `rl:v1:*`, and the Redis store prefixes them with `openjiuwen:rl` by default.
 - The Redis store issues single commands (no Lua, no `WATCH`/`MULTI`); single-flight paths are each one `SET … NX`, so one writable service process per database is the documented operational model.
 - No `unsafe`; no stdout logging (`tracing` only where an operation genuinely needs diagnostics, i.e. service serving).
-- Files stay under ~1000 lines; `src/trainer.rs` is the accepted exception (its inline unit-test module is larger than its implementation).
+- Files stay under ~1000 lines; `src/trainer.rs` (1419 lines, test module from line 707) and `src/reward/check.rs` (1142 lines, test module from line 716) both exceed it.
+- `RlServiceState` always constructs a `MemoryOnlineStore`: `RlServiceConfig` has no store/Redis field, so the Redis backend (feature `redis`) is library-only — reachable by building `TaskRegistry`/`SampleLedger`/`TrainingRunner` directly, never through `build_router`/`serve`.
+- No HTTP route currently answers `501`: `OnlineError::Unsupported` maps to `503` (`service::ApiError::from_online`), a `ppo` executor only fails `/health` with `503`, and `ApiError::from_error`'s `Error::Unsupported` → `501` mapping has no caller.
+- `POST /v1/evaluate` implements only `exact_match`; any other `metric` string (including a judge metric, although `evaluator::judge` exists) is `400 invalid_request`.
+- `POST /v1/rl/training/runs` runs the local executor inline and answers with the terminal record (`201` new / `200` reused active run), not a queued record.
 
 ## Design Decisions
 
@@ -129,6 +133,8 @@ Everything except those paths is offline and deterministic: no GPU, no model cal
 - `cargo clippy -p openjiuwen-agent-evolving --all-targets --all-features --offline -- -D warnings`
 - `cargo doc -p openjiuwen-agent-evolving --no-deps` and `--all-features` stay warning-free.
 - Surface at this revision: 543 inline unit tests (560 with `--all-features`, which adds the Redis-store suite), 22 integration binaries holding 490 tests, and 23 doctests — 1056 tests by default and 1073 with all features, all offline.
+- Not every unit test is an inline `mod tests`: `src/online/tests/` is a `#[cfg(test)]` subdirectory (its `redis` child is gated on `feature = "redis"` and drives the machines over `RedisOnlineStore` against the in-process fake `RESP2` server in `fake_redis.rs`), plus `src/reward/end_to_end.rs` and `src/experience/pipeline_tests.rs`.
+- The 17 Redis-gated tests come from `src/online/tests/redis.rs` (10) and `src/online/redis_store.rs` (7).
 
 ## Dependencies
 

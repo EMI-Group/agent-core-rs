@@ -77,11 +77,18 @@ The history file is capped at `MAX_RUNS_PER_JOB` (20) records per job and `MAX_R
 - Clocks are injected: `Utc::now()` appears only in `Tool::invoke` (one call at the call site, documented); the parser, scheduler, history and `invoke_at` never read the wall clock.
 - No panics on user input, no `unwrap`/`expect` outside tests, no `unsafe`, no `println!`/`eprintln!`; every public item is documented.
 - Files stay under 1000 lines; shared helpers live in the owning module (`stamp` in `actions.rs`, `write_atomic` in `store.rs`).
-- Test modules live in separate `*_tests.rs` files wired with `#[path = "..."] mod tests;` so no implementation file carries the suite.
+- Test modules live in separate `*_tests.rs` files wired with `#[path = "..."] mod tests;`, except `history.rs`, which carries its own inline `mod tests`.
+- No cron source declares `Error::Unsupported`: deferred Python surface is documented in doc comments only, and an unknown action is a `success=false` validation payload (`invalid action: "<x>" …`), not a typed unsupported error.
+
+## Known Issues
+
+- The `W` rejection is a substring test on the whole part (`upper.contains('W')`, `schedule.rs:346-348`), so the weekday name `WED` is rejected as `unsupported cron token: "WED": "W" (nearest weekday) is not supported` — in both forms and inside ranges/lists (`WED-FRI`, `MON,WED`), contradicting the doc claim that `SUN..SAT` are accepted case-insensitively (`schedule.rs:8-14`) and the card hint at `tool.rs:231`. No test exercises `WED`; `MON-FRI`, `SAT-SUN`, `FRI-MON`, `SUN`, `SAT#3` and `5L` all pass.
+- `CronAction::parse` compares the string exactly (`actions.rs:114-120`) although its doc says "accepting surrounding whitespace only"; `CronTool::invoke_at` trims first (`tool.rs:121`), so a direct caller must trim itself.
 
 ## Deferred Python Actions
 
-Python's tool also exposes `add`, `remove`, `run`, `runs`, `wake` and the legacy per-action tool set, plus `schedule.at`/`schedule.every` job forms, `payload`/`delivery` routing and `wake_offset_seconds`.
+Python's tool also exposes `add`, `remove`, `run`, `runs`, `wake` and the legacy per-action tool set, plus `schedule.at`/`schedule.every` job forms, `payload`/`delivery` routing, `wake_offset_seconds` and the `contextMessages` history window.
+A stored job carries a flat prompt/description instead of Python's structured `payload` object.
 Still deferred here: the `wake` action and `wake_offset_seconds`, the `schedule.at`/`schedule.every` job forms, `payload`/`delivery` routing, job tags/priority, and the legacy per-action tool set (one dispatching `cron` tool instead).
 Also deferred: the 7-field Quartz token `W` (nearest weekday, including `LW`), `?` inside a list, Quartz cron-expression `year` values outside `1970..=2099`, run output/exit-code capture (a run record is a receipt only), and any background scheduler loop or daemon.
 

@@ -35,6 +35,7 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 - `AutoHarnessCommand::{Run, Experience, VerifyExt, GapAnalyze, History}`.
 - `run`: flags `--task <TEXT>`, `--task-file <PATH>`, `--dry-run`, `--stage <assess|plan|implement|verify>`, `--no-push` (parity only, no effect), `--budget <SECS>`, `--goal <TEXT>`, `--pipeline <meta|extended|auto>` (absent means `meta`).
 - `run` loads `<data-dir>/config.yaml` via `AutoHarnessConfig::load_or_default`, applies the overrides, validates, resolves the tasks, and either writes/echoes the `--dry-run` list or returns `Error::Unsupported` naming the missing harness evaluation runner.
+- `--budget` also lowers `task_timeout_secs` to `min(current, budget * 0.95)`, `--pipeline`'s absence means `meta`, and `--no-push` reaches only a `tracing::debug!`.
 - `--dry-run` writes `<data-dir>/runs/tasks.json`, prints the same pretty JSON array on stdout, and prints `[dry-run] task list -> <path>` on stderr.
 - `--task` wins over `--task-file`; a task file may be a JSON array or a single object, needs `topic` per entry, defaults `description` to `""` and `files` to `[]`, and ignores unknown keys.
 - `experience search <QUERY>` searches a lowercased `topic`/`summary`/`details` blob (`outcome` is never searched), drops query words shorter than two characters, scores hits plus a 30-day linear recency bonus, and prints the best ten.
@@ -72,6 +73,7 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 - `TeamCommand::{Members, Member, Inbox, Send, Broadcast, CreateTask, Task, Claim, Complete, Update, Snapshot, Stop}`; `CreateTask { title, content, task_id (optional `--task-id`), dependencies (repeatable `--dep`) }`, `Update { task_id, title, content }`, and `Task { command: TeamTaskCommand::{List { status }, Claimable, Get { task_id } } }`.
 - `run` resolves the socket (`--socket`, else `OPENJIUWEN_TEAM_SOCKET` from `TEAM_SOCKET_ENV`, else `Error::validation` naming both sources), dials it with `AttachClient::connect`, and performs exactly one operation — no reconnect and no retry.
 - `AttachError::into_error` preserves the wire kind, so a remote `not_found` reaches the exit path as `error: not_found: …` instead of a transport failure.
+- `task get` on a host that answers with no task detail is this crate's own `Error::not_found` (`task not found: <id>`), not an attach error.
 - `--status` is parsed by `parse_status` into the schema `TaskStatus` after the connection but before any request; an unknown value is `Error::validation` naming the seven statuses.
 - Text rows: members/member are `<name>\t<role>\t<status>\t<execution>` plus a fifth display-name column when it differs (empty roster: `no team members`); inbox is the host text verbatim or `inbox is empty`; send/broadcast are `<message_id> from <from> to <to|*>`; create-task/update are `<task_id>\t<status>\t<title>`; task list/claimable are `<task_id>\t<status>\t<title>[\t<assignee>]` with `no tasks` / `no claimable tasks`; task get prints `task_id`, `title`, `status`, `assignee` (`-` when unowned) rows then the content; claim/complete print `claimed <id>` / `completed <id>`; snapshot prints `team <name> (<state>): N member(s), M task(s)` followed by the member and task rows; stop prints `stop requested`.
 - A payload with `ok: false` is `Error::tool` carrying the host's `reason` in both output modes — never a successful exit with JSON on stdout; a payload without `ok` (or without the fields a row needs) is printed as compact JSON.
@@ -113,6 +115,7 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 - No panics on user input — parsing is delegated to clap and command functions return `openjiuwen_common::error::Error`; `unwrap`/`expect`/indexing on input are forbidden in `src/`.
 - `println!`/`eprintln!` are allowed here (binary crate) for user-facing results and diagnostics only; libraries log through `tracing`.
 - No new crates.io dependencies: these surfaces need only `chrono` (the cron clock and timestamp rendering) and the `openjiuwen-harness` `notify` feature (the watcher), both already in the manifest; the crate builds offline with the workspace-pinned set, and `openjiuwen-test-support` is a dev-dependency only.
+- Declared dependencies: `openjiuwen` (the umbrella, for the `agent_teams` attach types), `openjiuwen-harness`, `openjiuwen-core` (`foundation::tool` in `lsp`), `openjiuwen-common`, `openjiuwen-rsi`, `clap`, `chrono`, `tokio`, `tracing`, `tracing-subscriber`, `dotenvy`, `serde` (only `auto_harness/experience.rs`) and `serde_json`; `anyhow` and `openjiuwen-harness-protocol` are declared but referenced by no source file.
 - Files stay around ≤1000 lines (`src/team/mod.rs` is the largest at ~702 lines); sibling binaries are not added here.
 - The `[[bin]]` target declares `doc = false` so rustdoc never collides with the `openjiuwen` umbrella crate's `target/doc/openjiuwen/`.
 - `team` is Unix-only at runtime: the grammar and wire types compile everywhere, but the attach transport answers `Error::Unsupported` ("cross-process attach requires Unix domain sockets") on non-Unix targets.
@@ -135,6 +138,7 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 - `chat --watch` reload notices are diagnostics only: the running REPL keeps the instructions, skills and MCP configuration it started with, and a restart applies the change.
 - The watcher needs the `openjiuwen-harness` `notify` feature, which this crate enables unconditionally, so `watch` and `chat --watch` are always compiled in.
 - The `auto-harness` dry run writes before it prints: a failed write is a `Config` error and nothing reaches stdout.
+- A non-dry `auto-harness run` with resolved tasks prints `using N manually specified task(s)` on stdout before the `unsupported` error on stderr (exit `1`).
 
 ## Known Issues
 
@@ -179,6 +183,8 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 
 ## Test Strategy
 
+- 78 process tests in 8 binaries (`auto_harness` 20, `cli_features` 3, `cli_run` 5, `cli_smoke` 13, `cron` 9, `lsp` 6, `team` 18, `watch` 4) plus 39 in-source unit tests (`cli.rs` 9, `team/mod.rs` 7, `auto_harness/run.rs` 10, `auto_harness/experience.rs` 10, `auto_harness/deferred.rs` 3).
+- `main.rs`, `extras.rs`, `cron.rs`, `lsp.rs` and `watch.rs` have no unit tests; only the process suites cover them.
 - `tests/cli_smoke.rs` (13 tests) covers the clap layer only — `--version`, the seven command rows, `auto-harness`'s five subcommands and its `run`/`experience` flags, `lsp`'s eleven actions, `cron`'s nine subcommands, `team`'s twelve, `watch`'s four flags, `run --worktree` and `chat --watch`/`--worktree` in their help, `--no-color` before and after a subcommand, and the unknown-subcommand usage error (exit `2`, diagnostic on stderr, empty stdout).
 - `tests/cli_run.rs` (5 tests) drives a real `run` through `MockLlmServer`: a reusable scripted fallback answers any number of agent-loop calls, the connection is passed as flags (`--provider openai --api-base <mock> --api-key … -m mock-model`), and the cases assert the `json` object keys (`answer`, `result_type`, `usage`, `session_id`), the `text` stream, one JSON object per `stream-json` line with a terminal `{"type":"result"}` line, escape-free stdout, `--no-color` through a real run, and `chat --help`.
 - `tests/auto_harness.rs` (20 tests) pins task resolution (`--task`, array/object task files, unknown keys, missing `topic`, `--task` precedence, the empty list), the dry run and its `runs/tasks.json`, the deferred non-dry run (exit exactly `1`, `unsupported` + `harness evaluation runner`), `--stage` in the message, `--pipeline bogus` as exit `2`, the seeded experience store (ordering, malformed line skipped, limit before type filter, search fields, short tokens, `--json`, empty-store messages), `history` (limit and JSON), and `gap-analyze` text/JSON.
