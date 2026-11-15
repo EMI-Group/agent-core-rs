@@ -167,6 +167,19 @@ pub trait Component: Send + Sync {
 
     /// The component type discriminator (`"start"`, `"end"`, `"llm"`, …).
     fn component_type(&self) -> &str;
+    /// Checks the component's static configuration before a workflow is compiled.
+    ///
+    /// The engine calls this for every registered component from
+    /// [`crate::engine::validate`], so a configuration problem is reported at build time
+    /// with the component's own status code instead of surfacing mid-run. The default
+    /// accepts any configuration; components with a checkable configuration override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the coded workflow error describing the problem.
+    fn validate_config(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Runs once with batch inputs and returns a batch output.
     ///
@@ -246,6 +259,9 @@ impl<T: Component + ?Sized> Component for Arc<T> {
 
     fn component_type(&self) -> &str {
         (**self).component_type()
+    }
+    fn validate_config(&self) -> Result<()> {
+        (**self).validate_config()
     }
 
     async fn invoke(&self, inputs: Value, ctx: &ComponentContext) -> Result<Value> {
