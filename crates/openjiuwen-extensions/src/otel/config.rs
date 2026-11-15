@@ -21,6 +21,10 @@ use super::env;
 const DEFAULT_TRACER_NAME: &str = "openjiuwen.tracer.otel";
 /// Default `service.name` resource attribute: `"openjiuwen"`.
 const DEFAULT_SERVICE_NAME: &str = "openjiuwen";
+/// Default `traces_dir` of the `file` exporter: `"./traces"`.
+const DEFAULT_TRACES_DIR: &str = "./traces";
+/// Default `file_retention_days` of the `file` exporter: `7` days.
+const DEFAULT_FILE_RETENTION_DAYS: u32 = 7;
 /// Lowest accepted sampling probability (inclusive).
 const MIN_SAMPLE_RATE: f64 = 0.0;
 /// Highest accepted sampling probability (inclusive).
@@ -39,6 +43,14 @@ pub enum ExporterType {
     Memory,
     /// Write one `tracing` line per finished span at `debug`.
     Console,
+    /// Append spans to one JSONL file per calendar day under
+    /// [`OtelTracerConfig::traces_dir`]; no collector is needed.
+    ///
+    /// Each line is a standalone single-span OTLP JSON
+    /// `ExportTraceServiceRequest` (`observability::file_exporter` with the
+    /// `otel` feature), which a Collector or Langfuse ingests directly; Python
+    /// spells the wire value `file`.
+    File,
     /// Ship spans to an OTLP collector over HTTP, as JSON or protobuf payloads.
     ///
     /// The endpoint, headers, and protocol resolve from the configuration,
@@ -149,6 +161,13 @@ pub struct OtelTracerConfig {
     pub max_attr_length: usize,
     /// Span attribute count limit.
     pub max_attributes: usize,
+    /// Root directory of the `file` exporter: one append-only
+    /// `traces-<YYYY-MM-DD>.jsonl` per calendar day, each line a standalone
+    /// single-span OTLP JSON request (Python default `"./traces"`).
+    pub traces_dir: String,
+    /// Days a trace file is kept before the `file` exporter prunes it by mtime;
+    /// `0` disables cleanup.
+    pub file_retention_days: u32,
     /// Process-wide HTTP instrumentation switch (traceparent propagation).
     ///
     /// [`global_instrument_enabled`] lets the
@@ -176,6 +195,8 @@ impl Default for OtelTracerConfig {
             redact_completions: None,
             max_attr_length: 4_096,
             max_attributes: 200,
+            traces_dir: DEFAULT_TRACES_DIR.to_owned(),
+            file_retention_days: DEFAULT_FILE_RETENTION_DAYS,
             global_instrument_enable: false,
         }
     }
@@ -339,7 +360,36 @@ mod tests {
         assert_eq!(config.redact_completions, None);
         assert_eq!(config.max_attr_length, 4_096);
         assert_eq!(config.max_attributes, 200);
+        assert_eq!(config.traces_dir, "./traces");
+        assert_eq!(config.file_retention_days, 7);
         assert!(!config.global_instrument_enable);
+    }
+
+    #[test]
+    fn file_exporter_type_uses_the_snake_case_wire_spelling() {
+        // Python's `exporter="file"` spelling; the variant exists in both builds.
+        assert_eq!(
+            serde_json::to_value(ExporterType::File).unwrap(),
+            json!("file")
+        );
+        let config: OtelTracerConfig =
+            serde_json::from_value(json!({"exporter_type": "file"})).unwrap();
+        assert_eq!(config.exporter_type, ExporterType::File);
+    }
+
+    #[test]
+    fn file_exporter_fields_round_trip_through_json() {
+        let config = OtelTracerConfig {
+            traces_dir: "/var/traces".to_owned(),
+            file_retention_days: 0,
+            ..OtelTracerConfig::default()
+        };
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value["traces_dir"], json!("/var/traces"));
+        assert_eq!(value["file_retention_days"], json!(0));
+        let parsed: OtelTracerConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.traces_dir, "/var/traces");
+        assert_eq!(parsed.file_retention_days, 0);
     }
 
     #[test]
@@ -366,6 +416,8 @@ mod tests {
             "redact_completions": false,
             "max_attr_length": 128,
             "max_attributes": 42,
+            "traces_dir": "/var/traces",
+            "file_retention_days": 3,
             "global_instrument_enable": true
         })
     }
@@ -381,6 +433,8 @@ mod tests {
         assert_eq!(config.redact_prompts, Some(true));
         assert_eq!(config.redact_completions, Some(false));
         assert_eq!(config.max_attributes, 42);
+        assert_eq!(config.traces_dir, "/var/traces");
+        assert_eq!(config.file_retention_days, 3);
         assert!(config.global_instrument_enable);
     }
 

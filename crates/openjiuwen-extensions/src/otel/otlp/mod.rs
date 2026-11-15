@@ -49,7 +49,9 @@
 //! [`SpanExporter::export`]: opentelemetry_sdk::trace::SpanExporter::export
 
 mod endpoint;
-mod json;
+// `pub(crate)` so the collector-free file exporter can reuse the same encoder
+// instead of carrying a second OTLP JSON implementation (no public API change).
+pub(crate) mod json;
 mod model;
 mod protobuf;
 #[cfg(test)]
