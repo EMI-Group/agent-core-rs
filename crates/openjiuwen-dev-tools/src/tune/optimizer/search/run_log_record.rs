@@ -28,6 +28,9 @@ pub(super) struct RoundRecord<'a> {
     pub(super) best_index: usize,
     /// The run's best reward after this round.
     pub(super) best_score: f64,
+    /// The run's best reward when this round started (`None` for round 1, which
+    /// has no elite yet).
+    pub(super) prior_best_score: Option<f64>,
     /// Whether this round changed the run's elite.
     pub(super) selected: bool,
     /// The convergence verdict of the round, when the detector fired.
@@ -50,7 +53,9 @@ impl RoundRecord<'_> {
     /// The winner supplies the candidate, the reward, its raw components, the
     /// notes, and the drift deviation; the other candidates of the round supply
     /// `candidate_prompts` (evaluation order) and every candidate contributes to
-    /// `scores`. `observations` is joined with `"; "` and left `None` when the
+    /// `scores`. `prior_best_score` is the elite score the round started from, so
+    /// the record can report whether the elite advanced, next to the post-round
+    /// `best_score`. `observations` is joined with `"; "` and left `None` when the
     /// winner had none, and `converged`/`convergence_reason` mirror the round's
     /// stopping verdict rather than the convergence state's own flags.
     pub(super) fn build(&self) -> RunLogRecord {
@@ -71,6 +76,7 @@ impl RoundRecord<'_> {
             .with_reward(reward.score)
             .with_reward_components(reward.raw_components.clone())
             .with_reward_notes(reward.notes.clone())
+            .with_prior_best_score(self.prior_best_score)
             .with_best_score(self.best_score)
             .with_drift(reward.drift)
             .with_selected(self.selected)

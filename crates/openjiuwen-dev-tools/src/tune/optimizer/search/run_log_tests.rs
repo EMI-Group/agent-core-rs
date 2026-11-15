@@ -71,6 +71,38 @@ impl CaseEvaluator for Fixed {
     }
 }
 
+/// Scores a prompt by how many deterministic mutation markers it carries, capped
+/// at two, so one round improves the elite and the next only matches it.
+struct MarkerCount;
+
+/// The marker phrases of the deterministic mutation bank.
+const MARKERS: &[&str] = &[
+    "think step by step",
+    "output format",
+    "never invent facts",
+    "before finishing, verify",
+    "follow the constraints",
+    "use the provided context only",
+];
+
+#[async_trait]
+impl CaseEvaluator for MarkerCount {
+    async fn evaluate(&self, prompt: &str, case: &Case) -> Result<EvaluatedCase> {
+        let lower = prompt.to_lowercase();
+        let markers = MARKERS
+            .iter()
+            .filter(|marker| lower.contains(**marker))
+            .count();
+        let score = 0.1 + 0.2 * markers.min(2) as f64;
+        let mut answer = BTreeMap::new();
+        answer.insert(
+            "output".to_owned(),
+            Value::String("complete answer".to_owned()),
+        );
+        EvaluatedCase::new(case.clone(), answer, score, "marker count")
+    }
+}
+
 /// A sink that rejects every record.
 struct Rejecting;
 
@@ -263,6 +295,67 @@ async fn a_policy_that_demands_a_gain_rejects_every_later_round() {
     }
     // The verdict is reporting only: the search itself is unchanged.
     assert_eq!(result, reference().await);
+}
+
+#[tokio::test]
+async fn is_improvement_marks_the_round_that_advances_the_elite() {
+    let (concrete, handle) = shared_log();
+    // No gate and no drift penalty, so the reward is a fixed monotone function of
+    // the evaluator's per-case score and a round's effect on the elite is
+    // exactly its winning score's effect.
+    let search = PromptSearchConfig::new()
+        .with_min_correctness(0.0)
+        .with_drift_penalty(0.0);
+    let result = PromptSearchOptimizer::new()
+        .with_evaluator(Arc::new(MarkerCount))
+        .with_search_config(search)
+        .with_run_log(handle)
+        .with_timestamp(NOW)
+        .optimize(SEED, &cases())
+        .await
+        .unwrap();
+
+    let logged = records(&concrete);
+    assert_eq!(logged.len(), result.iterations);
+    assert_eq!(logged.len(), 3, "the default budget is three rounds");
+
+    // Round 1 has no elite to advance: it establishes the first one, which is
+    // what `selected` reports.
+    assert_eq!(logged[0].prior_best_score, None);
+    assert!(!logged[0].is_improvement());
+    assert!(logged[0].selected);
+
+    // Every later round reports the elite it started from, so the predicate is
+    // exactly that comparison.
+    for pair in logged.windows(2) {
+        let (previous, next) = (&pair[0], &pair[1]);
+        assert_eq!(next.prior_best_score, Some(previous.best_score));
+        assert_eq!(
+            next.is_improvement(),
+            next.reward > previous.best_score,
+            "iteration {} disagrees with its own record",
+            next.iteration
+        );
+    }
+
+    // A mutation adds a marker, so round 2 beats round 1's elite ...
+    assert!(logged[1].is_improvement(), "{}", logged[1].best_score);
+    assert!(logged[1].selected);
+    // ... and the marker count is capped, so round 3 only matches it.
+    assert_eq!(logged[2].prior_best_score, Some(logged[1].best_score));
+    assert_eq!(logged[2].reward, logged[2].best_score);
+    assert!(!logged[2].is_improvement());
+    assert!(!logged[2].selected);
+}
+
+#[test]
+fn builders_and_readers_cover_the_pre_round_elite() {
+    let record = RunLogRecord::new(2, PromptCandidate::new("bare prompt", "carried over"));
+    assert_eq!(record.prior_best_score, None);
+    assert!(!record.is_improvement());
+    let record = record.with_prior_best_score(Some(0.25)).with_reward(0.5);
+    assert_eq!(record.prior_best_score, Some(0.25));
+    assert!(record.is_improvement());
 }
 
 #[test]

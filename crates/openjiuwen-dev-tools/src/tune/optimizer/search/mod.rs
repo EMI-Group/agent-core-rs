@@ -490,6 +490,9 @@ impl PromptSearchOptimizer {
             iteration: round.index,
             evaluations: round.evaluations,
             best_index: round.best_index,
+            // The elite score the round started from: round 1 starts from no
+            // elite at all (`-inf`), which the record reports as `None`.
+            prior_best_score: previous.is_finite().then_some(previous),
             best_score: tracker.finite_score(),
             selected,
             convergence: state.as_ref(),

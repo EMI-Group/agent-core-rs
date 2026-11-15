@@ -34,7 +34,8 @@ fn full_record(iteration: usize) -> RunLogRecord {
             ("completeness".to_owned(), 0.7),
         ]))
         .with_reward_notes(vec!["correctness gate passed".to_owned()])
-        .with_best_score(0.6)
+        .with_prior_best_score(Some(0.6))
+        .with_best_score(0.8)
         .with_drift(0.12)
         .with_convergence(convergence())
         .with_adopt(AdoptDecision::new(
@@ -90,6 +91,9 @@ fn full_round_trip_preserves_every_field() {
         read[0].reward_notes,
         vec!["correctness gate passed".to_owned()]
     );
+    // The pre-round elite survives too, and the winner beat it.
+    assert_eq!(read[0].prior_best_score, Some(0.6));
+    assert_eq!(read[0].best_score, 0.8);
     assert!((read[0].timestamp - 1_700_000_000.5).abs() < 1e-9);
     assert_eq!(read[0].run_id, "run-1");
     assert_eq!(read[0].observation.as_deref(), Some("first round"));
@@ -280,6 +284,7 @@ fn json_line_is_deterministic() {
         "reward",
         "reward_components",
         "reward_notes",
+        "prior_best_score",
         "best_score",
         "drift",
         "convergence",
@@ -317,6 +322,7 @@ fn serde_defaults_from_a_minimal_object() {
     assert_eq!(record.timestamp, 0.0);
     assert!(!record.converged);
     assert_eq!(record.adopt, None);
+    assert_eq!(record.prior_best_score, None);
     assert!(!record.is_improvement());
 
     // A line that shares no keys is an all-default record; anything that is
@@ -340,6 +346,95 @@ fn serde_defaults_from_a_minimal_object() {
         None
     );
     assert_eq!(RunLogRecord::from_json_line("{\"iteration\": -1}"), None);
+}
+
+#[test]
+fn is_improvement_reports_whether_the_elite_advanced() {
+    // The winner beat the elite it started from.
+    let advanced = bare_record(2)
+        .with_prior_best_score(Some(0.5))
+        .with_reward(0.75)
+        .with_best_score(0.75);
+    assert!(advanced.is_improvement());
+
+    // A round that only matched the elite did not move it.
+    let equal = bare_record(2)
+        .with_prior_best_score(Some(0.75))
+        .with_reward(0.75)
+        .with_best_score(0.75)
+        .with_selected(true);
+    assert!(!equal.is_improvement());
+
+    // A worse round leaves the elite where it was.
+    let worse = bare_record(3)
+        .with_prior_best_score(Some(0.75))
+        .with_reward(0.5)
+        .with_best_score(0.75);
+    assert!(!worse.is_improvement());
+
+    // Round 1 has no elite to advance: it establishes the first one, which is
+    // what `selected` reports.
+    let first = bare_record(1)
+        .with_prior_best_score(None)
+        .with_reward(0.9)
+        .with_best_score(0.9)
+        .with_selected(true);
+    assert!(!first.is_improvement());
+    assert!(first.selected);
+
+    // No reported pre-round elite (a hand-built record, a legacy line) makes no
+    // claim either way.
+    let unknown = RunLogRecord::default()
+        .with_reward(0.9)
+        .with_best_score(0.9)
+        .with_selected(true);
+    assert_eq!(unknown.prior_best_score, None);
+    assert!(!unknown.is_improvement());
+}
+
+#[test]
+fn the_wire_carries_the_pre_round_elite_and_loads_legacy_lines() {
+    let workspace = TempWorkspace::new().unwrap();
+    let path = log_path(&workspace);
+    let mut log = JsonlRunLog::new(&path).unwrap();
+
+    let first = bare_record(1).with_reward(0.4).with_best_score(0.4);
+    let second = bare_record(2)
+        .with_prior_best_score(Some(0.4))
+        .with_reward(0.6)
+        .with_best_score(0.6)
+        .with_selected(true);
+    log.record(&first).unwrap();
+    log.record(&second).unwrap();
+
+    let read = read_run_log(&path).unwrap();
+    assert_eq!(read, vec![first.clone(), second.clone()]);
+    assert_eq!(read[0].prior_best_score, None);
+    assert!(!read[0].is_improvement());
+    assert_eq!(read[1].prior_best_score, Some(0.4));
+    assert!(read[1].is_improvement());
+
+    // The field is on the wire, explicitly `null` for a round without an elite.
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.matches("\"prior_best_score\":").count(), 2);
+    assert!(text.contains("\"prior_best_score\":null"));
+
+    // A line written before the field existed still loads, and it claims no
+    // advance because it reports no pre-round elite.
+    let legacy = "{\"iteration\": 2, \"candidate\": {\"prompt\": \"P\", \
+                  \"candidate_id\": \"abc12345\", \"rationale\": \"why\"}, \
+                  \"reward\": 0.8, \"best_score\": 0.8, \"selected\": true, \
+                  \"timestamp\": 1700000000.5, \"run_id\": \"run-1\"}";
+    let record = RunLogRecord::from_json_line(legacy).expect("a legacy line loads");
+    assert_eq!(record.iteration, 2);
+    assert_eq!(record.reward, 0.8);
+    assert!(record.selected);
+    assert_eq!(record.prior_best_score, None);
+    assert!(!record.is_improvement());
+    // Re-serializing writes the field and the record still round trips.
+    let line = record.to_json_line().unwrap();
+    assert!(line.contains("\"prior_best_score\":null"));
+    assert_eq!(RunLogRecord::from_json_line(&line), Some(record));
 }
 
 #[test]

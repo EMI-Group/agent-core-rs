@@ -20,7 +20,10 @@
 //!   [`PromptCandidate`], the other `candidate_prompts` tried that round, the
 //!   per-candidate-id `scores`, the winner's `reward` with its raw
 //!   `reward_components` and `reward_notes`, the run's `best_score` after the
-//!   round, the `drift` deviation, the optional [`ConvergenceState`] with the
+//!   round together with the `prior_best_score` the round started from (so
+//!   [`RunLogRecord::is_improvement`] can report whether the elite was actually
+//!   advanced) — `None` when there was no elite to beat — the `drift` deviation,
+//!   the optional [`ConvergenceState`] with the
 //!   mirrored `converged`/`convergence_reason` flags, the optional
 //!   [`AdoptDecision`](crate::tune::AdoptDecision), whether it was `selected` as
 //!   the run's elite, the caller-supplied `timestamp` (seconds), the `run_id`,
@@ -70,14 +73,17 @@ use crate::tune::AdoptDecision;
 /// One iteration of a prompt-search run, as written to the run log.
 ///
 /// `best_score` is the run's best reward *after* the round, so a reader can
-/// compare a round against the run it belonged to; a caller with no history
-/// leaves it at `0.0`. `converged` and `convergence_reason` mirror the round's
-/// stopping verdict for readers that only need it, and `selected` says whether
-/// this candidate moved the run's elite.
+/// compare a round against the run it belonged to, and `prior_best_score` is the
+/// run's best reward *entering* the round — the two together say whether the
+/// round advanced the elite (see [`RunLogRecord::is_improvement`]); a caller with
+/// no history leaves them at `0.0` and `None`. `converged` and
+/// `convergence_reason` mirror the round's stopping verdict for readers that only
+/// need it, and `selected` says whether this candidate became the run's elite.
 ///
 /// Every field defaults on deserialization, so a legacy or hand-written line
 /// that carries only `iteration` and `candidate` still loads, and unknown keys
-/// are ignored.
+/// are ignored. `prior_best_score` is an added field: a line written before it
+/// existed still parses and leaves it `None`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct RunLogRecord {
@@ -95,6 +101,15 @@ pub struct RunLogRecord {
     pub reward_components: BTreeMap<String, f64>,
     /// The winner's reward-adjustment notes (gate, overfitting, drift).
     pub reward_notes: Vec<String>,
+    /// The run's best reward when this round started.
+    ///
+    /// `None` when the round had no elite to beat (round 1, which establishes
+    /// the first one), and for a line written before this field existed — the
+    /// reader leaves it `None` rather than inventing a history. A later round
+    /// carries the elite score it started from, so
+    /// [`RunLogRecord::is_improvement`] is a plain comparison against
+    /// [`RunLogRecord::reward`].
+    pub prior_best_score: Option<f64>,
     /// The run's best reward after this round.
     pub best_score: f64,
     /// The winner's semantic deviation from the task objective.
@@ -170,6 +185,15 @@ impl RunLogRecord {
     #[must_use]
     pub fn with_reward_notes(mut self, notes: Vec<String>) -> Self {
         self.reward_notes = notes;
+        self
+    }
+
+    /// Sets the run's best reward when the round started.
+    ///
+    /// Pass `None` for a round that had no elite to beat (round 1).
+    #[must_use]
+    pub fn with_prior_best_score(mut self, prior_best_score: Option<f64>) -> Self {
+        self.prior_best_score = prior_best_score;
         self
     }
 
@@ -267,17 +291,27 @@ impl RunLogRecord {
         self.reward
     }
 
-    /// Whether the round's winner's reward exceeds
-    /// [`RunLogRecord::best_score`].
+    /// Whether the round advanced the run's elite.
     ///
-    /// The comparison is strict, and it is a plain field comparison rather than
-    /// an elite report: the search writes the run's *post-round* best into
-    /// `best_score`, so a round that established the elite reports `reward ==
-    /// best_score` and [`RunLogRecord::selected`] is the flag that says the
-    /// elite moved.
+    /// The round's own best score is its winner's [`RunLogRecord::reward`], and
+    /// the elite it had to beat is [`RunLogRecord::prior_best_score`], so the
+    /// comparison is exactly "the round's best score strictly exceeded the score
+    /// of the elite entering the round": a round that matched the elite or fell
+    /// short reports `false`.
+    ///
+    /// A round with no pre-round elite reports `false`. That is round 1, which
+    /// *establishes* the first elite rather than advancing one — the
+    /// [`RunLogRecord::selected`] flag reports that establishment — and it is
+    /// also a hand-built record or a legacy line written before
+    /// `prior_best_score` existed, where no comparison is possible.
+    ///
+    /// [`RunLogRecord::best_score`] is the *post*-round best, so comparing
+    /// against it would only ever be able to report `false`; use it to read the
+    /// run's level, and this predicate to read the round's effect on it.
     #[must_use]
     pub fn is_improvement(&self) -> bool {
-        self.reward > self.best_score
+        self.prior_best_score
+            .is_some_and(|prior| self.reward > prior)
     }
 
     /// Whether an adoption decision was recorded and it adopted the candidate.
