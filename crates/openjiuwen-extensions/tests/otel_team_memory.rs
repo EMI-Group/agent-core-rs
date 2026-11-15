@@ -46,7 +46,8 @@
 //! Everything is offline and deterministic: the only peer is a loopback
 //! `wiremock` collector, ids are pure functions of the fixture events, the
 //! configured endpoint/headers/protocol/service name all beat the environment,
-//! and every await is bounded.
+//! and the only network await — inside `force_flush` — is bounded by the
+//! exporter's own request timeout.
 
 #![cfg(feature = "otel")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
