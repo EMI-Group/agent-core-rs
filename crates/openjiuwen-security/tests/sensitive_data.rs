@@ -424,3 +424,47 @@ fn config_round_trips_through_json() {
     let validator: SensitiveValidator = serde_json::from_value(json!("luhn")).unwrap();
     assert_eq!(validator, SensitiveValidator::Luhn);
 }
+
+// No Python equivalent: a payload the detector cannot project is a failure,
+// never a pass. The direct call reports the typed error; the pipeline resolves
+// it through the default fail-closed policy.
+#[tokio::test]
+async fn unscannable_payload_blocks_instead_of_passing() {
+    let guardrail = SensitiveDataGuardrail::new();
+    let ctx = GuardrailContext::raw("user_input", Value::Null);
+
+    let error = guardrail.check(&ctx).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.to_string().contains("unscannable content"), "{error}");
+
+    let mut pipeline = GuardrailPipeline::new();
+    pipeline.add(SensitiveDataGuardrail::new());
+    let outcome = pipeline.run(&ctx).await;
+    assert!(
+        outcome.is_blocked(),
+        "an unscannable payload must never read as safe"
+    );
+    assert_eq!(outcome.decision, SecurityDecision::Block);
+    assert_eq!(outcome.risk_level, RiskLevel::Critical);
+    assert_eq!(outcome.blocked_by.as_deref(), Some("context"));
+    let finding = &outcome.findings[0];
+    assert_eq!(finding.guardrail, "context");
+    assert_eq!(finding.risk_type, "unscannable_content");
+    assert_eq!(finding.risk_level, RiskLevel::Critical);
+    assert!(finding.blocking);
+    assert!(
+        finding.message.contains("unscannable_content"),
+        "{}",
+        finding.message
+    );
+    assert_eq!(outcome.errors.len(), 1);
+    assert!(
+        outcome.errors[0].contains("unscannable content"),
+        "{:?}",
+        outcome.errors
+    );
+
+    let error = outcome.enforce().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Security);
+    assert!(error.to_string().contains("unscannable content"), "{error}");
+}
