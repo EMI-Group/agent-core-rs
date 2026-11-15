@@ -177,14 +177,29 @@ fn unsupported_pipeline_nodes_warn_but_still_count() {
     let tokenizer = parse(
         r#"{
             "model": {"type": "BPE", "vocab": {"a": 0}, "merges": []},
-            "normalizer": {"type": "NFKC"},
-            "pre_tokenizer": {"type": "Split", "pattern": {"Regex": "\\w+"}, "behavior": "Isolated"}
+            "pre_tokenizer": {"type": "FancySplitter"}
         }"#,
     );
     assert_eq!(tokenizer.encode("a a"), vec![0, 0]);
-    assert_eq!(tokenizer.warnings().len(), 2);
-    assert!(tokenizer.warnings()[0].contains("NFKC"));
-    assert!(tokenizer.warnings()[1].contains("regex"));
+    assert_eq!(tokenizer.warnings().len(), 1);
+    assert!(tokenizer.warnings()[0].contains("FancySplitter"));
+}
+
+#[test]
+fn regex_splits_are_applied_without_a_warning() {
+    let tokenizer = parse(
+        r#"{
+            "model": {"type": "BPE", "vocab": {"a": 0, "b": 1, " ": 2}, "merges": []},
+            "pre_tokenizer": {"type": "Split", "pattern": {"Regex": "\\s+"}, "behavior": "Isolated"}
+        }"#,
+    );
+    assert!(
+        tokenizer.warnings().is_empty(),
+        "a regex split is supported: {:?}",
+        tokenizer.warnings()
+    );
+    // `Isolated` keeps the whitespace as its own piece, so it is encoded as id 2.
+    assert_eq!(tokenizer.encode("a a"), vec![0, 2, 0]);
 }
 
 #[test]
