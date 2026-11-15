@@ -5,7 +5,7 @@
 Owns the observability side of the compression pipeline: the `context.compression_state` record, the per-processor recorder that builds and fans it out, and the task-local request-purpose correlation scope for processor model calls.
 Ports `schema/context_state.py`, `context/processor_state_recorder.py` and `context/compression_scope.py`.
 Nothing here changes a history, calls a model, or blocks; `emit` is a side channel that can fail only into a log line.
-A later pass wires the recorder into `processor::ContextPipeline`; this node is the seam plus the recorder itself.
+`processor::ContextPipeline` owns an optional recorder and brackets every processor pass with it (`run_recorded`), passing `stats_before`/`stats_after` computed with the processor's own `cx.counter`.
 
 ## API Surface
 
@@ -45,6 +45,9 @@ A later pass wires the recorder into `processor::ContextPipeline`; this node is 
 - Sink, session, and token counter sit behind `RwLock<Option<Arc<…>>>` because the active model's counter and the session writer are usually known only after the context exists.
 - `emit` builds the record, records it, logs one `tracing::info!` line, calls the sink, then writes the stream frame, swallowing every failure with a `warn!` (and a `debug!` when no session writer is attached) — telemetry never fails a processor pass.
 - Token measurement uses the configured `TokenCounter` and falls back to Python's `ceil(characters / 3)`; statistics fall back to `compute_stats` with a 3-characters-per-token counter, so `statistic` always carries token counts (Python leaves them zero without a counter).
+- No field of the record carries token provenance: `ContextCompressionMetric` has only `time`/`messages`/`tokens`/`context_percent` and `ContextStats` has bare `total_tokens`/`*_tokens`, so a `ceil(characters / 3)` number, a `tiktoken` count and a native-artefact count are indistinguishable; `saved` inherits the same blindness, and the only hint is the `~` in the generated `summary` prose.
+- Nothing wires `ContextEngine`'s counter (nor a `SelectedTokenizer`) into the recorder, so an engine-built recorder measures `before`/`after` with `ceil(chars / 3)` while `statistic` in the same record uses the real `cx.counter`; the two token totals can disagree and neither is flagged.
+- `metric()` measures `message.content.to_plain_text()`, so a non-text payload (an image part) counts as zero characters there while the `statistic` counter may still frame it.
 - `saved` is signed (`before - after`), so a pass that grows the history reports negative savings; `percent` is `saved_tokens / before_tokens * 100` rounded to one decimal.
 - `context_percent` is `round(tokens / context_max * 100)` clamped to 0–100, and `None` when `context_max` is absent or zero.
 - `summary` is generated from Python's `_build_summary` ladder (`Compressing …` / `Compressed …` / `Context unchanged …` / `Context processor skipped: …` / paused / cancelled / failed) unless the input supplies one; counts are compacted (`1.5m`, `12.3k`).
