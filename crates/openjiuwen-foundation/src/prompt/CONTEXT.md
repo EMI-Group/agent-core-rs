@@ -41,6 +41,8 @@ The module is async-free and performs no I/O except `PromptTemplate::load_yaml`.
 
 - **Template rendering contract** (Python parity): only `{{name}}` / `{{a.b}}` with the configured delimiters are placeholders; the name is whitespace-stripped; names may not contain `{`/`}`; an empty name (`{{}}`) and single braces stay literal.
   Extra slots are ignored, and a missing simple slot keeps the placeholder text verbatim (Python back-fills `"{{key}}"`), so partially formatted templates stay usable.
+  That lenient path is not silent: `format` emits one `tracing::warn!` naming the template and the unresolved placeholder paths, `unresolved_keys`/`resolved_keys` expose the same split to code, and `try_format` turns it into an `Error::Validation` listing the missing placeholders — the variant to use wherever a rendered prompt is sent to a provider.
+  `to_messages` warns too, because it copies any remaining placeholder text straight into the messages a model reads.
   A dotted path resolves through JSON objects; a missing head/intermediate, a non-object intermediate, or `null` leaf keeps the placeholder verbatim and logs a `tracing::warn` (Python raises on a missing head — deliberately softened to avoid panics).
   A `null` slot value therefore never renders as `"null"`.
   The never-mutating `format` returns a new template and copies `name` and both delimiters; an empty value map is a clone.
@@ -55,6 +57,8 @@ The module is async-free and performs no I/O except `PromptTemplate::load_yaml`.
 - **YAML**: `from_yaml_str` also accepts a bare string document (→ `content` with defaults); `load_yaml` maps both I/O and parse failures to `Error::Validation` with the path as context.
 - **Tokens**: Python keeps real counters in `context_engine`; this module only offers a minimal counter for prompt construction so the feature flag `tiktoken` has a home. `context_engine` owns compression/trim policies.
   `ApproxTokenCounter::count_text` = `chars().count().div_ceil(chars_per_token)` (empty → 0, chars_per_token clamped to ≥1); the default `count_messages` charges `4 + text tokens` per message plus name/argument tokens per tool call.
+  The approximation is documented as an estimate, not a tokenizer (English prose within roughly ±20–30 % of a real BPE count; symbol-dense code and CJK under-counted), and `TokenCounter::is_exact` says which kind a counter is: `false` for the heuristic, `true` for `TiktokenCounter` only while its vocabulary is really loaded.
+  `truncate_messages` is the crate's one budget decision, so it logs one `tracing::warn!` per process (`std::sync::Once`) when the counter it was given is inexact.
   `truncate_messages` drops the oldest non-system messages until the budget fits, preserving system messages in order, and returns the dropped count.
   `TiktokenCounter` shares one `Lazy` cl100k_base BPE and falls back to the approx counter (one `tracing::warn`) if it cannot be loaded.
 
