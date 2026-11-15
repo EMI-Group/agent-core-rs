@@ -1,6 +1,7 @@
 //! Unit tests for the reward components and the composite reward.
 use super::*;
 use crate::tune::prompt_search::models::{PromptCandidate, PromptTaskCase};
+use crate::tune::tool::RunTelemetry;
 
 fn execution(candidate_id: &str, visible: &[f64], hidden: &[f64]) -> Execution {
     let candidate = PromptCandidate::new("prompt", "").with_id(candidate_id);
@@ -99,6 +100,103 @@ fn latency_token_and_cost_rewards_hit_their_half_lives() {
     assert!((TokenUsageReward::new(0.0).half_life_tokens() - 1.0).abs() < 1e-12);
     assert!((CostReward::new(-5.0, 0.0).price_per_mtok() - 0.0).abs() < 1e-12);
     assert!((CostReward::new(0.0, 0.0).half_life_cost() - 1e-9).abs() < 1e-12);
+}
+
+#[test]
+fn measured_telemetry_drives_latency_token_and_cost_rewards() {
+    let task = PromptTaskSpec::default();
+
+    let mut measured = Execution::new(PromptCandidate::new("p", ""));
+    measured.telemetry = RunTelemetry::default().with_latency_ms(1000.0);
+    assert!((LatencyReward::new(1.0).score(&measured, &task) - 0.5).abs() < 1e-12);
+
+    let mut measured = Execution::new(PromptCandidate::new("p", ""));
+    measured.telemetry = RunTelemetry::default()
+        .with_prompt_tokens(1000)
+        .with_completion_tokens(1000);
+    assert!((TokenUsageReward::new(2000.0).score(&measured, &task) - 0.5).abs() < 1e-12);
+
+    let mut measured = Execution::new(PromptCandidate::new("p", ""));
+    measured.telemetry = RunTelemetry::default().with_cost(1.0);
+    let cost = CostReward::new(1_000_000.0, 1.0);
+    assert!((cost.score(&measured, &task) - 0.5).abs() < 1e-12);
+}
+
+#[test]
+fn a_prompt_only_token_measurement_counts_the_missing_side_as_zero() {
+    let mut execution = Execution::new(PromptCandidate::new("p", ""));
+    execution.telemetry = RunTelemetry::default().with_prompt_tokens(2000);
+    let task = PromptTaskSpec::default();
+
+    // total = 2000 prompt + 0 unreported completion, the 2000 half-life.
+    assert!((TokenUsageReward::new(2000.0).score(&execution, &task) - 0.5).abs() < 1e-12);
+    // The derived cost also uses the measured total: 2000 tokens at 5/Mtok.
+    assert!((CostReward::new(5.0, 0.01).score(&execution, &task) - 0.5).abs() < 1e-12);
+
+    let mut completion_only = Execution::new(PromptCandidate::new("p", ""));
+    completion_only.telemetry = RunTelemetry::default().with_completion_tokens(500);
+    assert!((TokenUsageReward::new(500.0).score(&completion_only, &task) - 0.5).abs() < 1e-12);
+}
+
+#[test]
+fn telemetry_overrides_the_legacy_caller_supplied_fields() {
+    let task = PromptTaskSpec::default();
+    let mut execution = Execution::new(PromptCandidate::new("p", ""));
+    execution.latency_ms = 60_000.0;
+    execution.total_tokens = 1_000_000;
+
+    // Without telemetry the legacy caller-supplied fields still score as before.
+    assert!((LatencyReward::new(60.0).score(&execution, &task) - 0.5).abs() < 1e-12);
+    assert!((TokenUsageReward::new(1_000_000.0).score(&execution, &task) - 0.5).abs() < 1e-12);
+    assert!((CostReward::new(1.0, 1.0).score(&execution, &task) - 0.5).abs() < 1e-12);
+
+    execution.telemetry = RunTelemetry::default()
+        .with_latency_ms(1000.0)
+        .with_prompt_tokens(1000)
+        .with_completion_tokens(1000);
+    // The measured values now drive every component, not the legacy fields.
+    assert!((LatencyReward::new(1.0).score(&execution, &task) - 0.5).abs() < 1e-12);
+    assert!((TokenUsageReward::new(2000.0).score(&execution, &task) - 0.5).abs() < 1e-12);
+    // A token-derived cost uses the measured total: 2000 tokens at 500/Mtok.
+    assert!((CostReward::new(500.0, 1.0).score(&execution, &task) - 0.5).abs() < 1e-12);
+}
+
+#[test]
+fn absent_telemetry_keeps_the_run_cost_rewards_constant() {
+    let task = PromptTaskSpec::default();
+    let mut empty = Execution::new(PromptCandidate::new("p", ""));
+    empty.telemetry = RunTelemetry::default();
+    assert!(empty.telemetry.is_empty());
+
+    assert_eq!(LatencyReward::default().score(&empty, &task), 1.0);
+    assert_eq!(TokenUsageReward::default().score(&empty, &task), 1.0);
+    // The default price is 0.0, so an unreported run costs nothing.
+    assert_eq!(CostReward::default().score(&empty, &task), 1.0);
+    // A non-zero price with no measured tokens still derives a zero cost.
+    assert_eq!(CostReward::new(5.0, 0.01).score(&empty, &task), 1.0);
+}
+
+#[test]
+fn a_measured_zero_scores_like_an_absent_measurement() {
+    let task = PromptTaskSpec::default();
+    let mut zero = Execution::new(PromptCandidate::new("p", ""));
+    zero.telemetry = RunTelemetry::default()
+        .with_latency_ms(0.0)
+        .with_prompt_tokens(0)
+        .with_cost(0.0);
+    assert!(!zero.telemetry.is_empty());
+
+    // Zero and absent are indistinguishable here: both score the full 1.0.
+    assert_eq!(LatencyReward::new(1.0).score(&zero, &task), 1.0);
+    assert_eq!(TokenUsageReward::new(2000.0).score(&zero, &task), 1.0);
+    assert_eq!(CostReward::new(5.0, 0.01).score(&zero, &task), 1.0);
+
+    // An explicit zero cost wins over a token-derived cost.
+    let mut priced = Execution::new(PromptCandidate::new("p", ""));
+    priced.telemetry = RunTelemetry::default()
+        .with_prompt_tokens(1_000_000)
+        .with_cost(0.0);
+    assert_eq!(CostReward::new(0.01, 0.01).score(&priced, &task), 1.0);
 }
 
 #[test]

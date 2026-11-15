@@ -336,3 +336,92 @@ fn model_clock_and_debug_surface() {
     );
     assert!(rendered.contains("sessions: 0"), "{rendered}");
 }
+
+#[tokio::test]
+async fn legacy_build_records_model_provenance() {
+    let model = Arc::new(ScriptedModel::text(AGENT_FENCE));
+    let mut builder = AgentBuilder::new(dynamic(&model));
+
+    let result = builder
+        .build_agent("build me an agent", "s1", AgentType::LlmAgent)
+        .await
+        .expect("build succeeds");
+
+    assert_eq!(result.provenance.len(), 1);
+    let record = &result.provenance.stages[0];
+    assert_eq!(record.stage, ProgressStage::GeneratingConfig);
+    assert_eq!(record.source, GenerationSource::Model);
+    assert!(!result.provenance.has_deviation());
+    assert!(result.repair.is_empty());
+
+    // Nothing degraded, so the four Python keys are all the JSON carries.
+    let value = result.to_json().expect("serialize");
+    assert!(value.get("provenance").is_none());
+    assert!(value.get("repair").is_none());
+}
+
+#[tokio::test]
+async fn legacy_unparseable_answer_records_a_fallback() {
+    let model = Arc::new(ScriptedModel::text("I need more detail first."));
+    let mut builder = AgentBuilder::new(dynamic(&model));
+
+    let result = builder
+        .build_agent_at("build me a workflow", "s1", AgentType::Workflow, 7)
+        .await
+        .expect("build succeeds");
+
+    assert!(matches!(result.output, BuildOutput::Response(_)));
+    assert_eq!(result.status, "clarifying");
+    let record = &result.provenance.stages[0];
+    assert_eq!(record.stage, ProgressStage::GeneratingDl);
+    assert_eq!(record.source, GenerationSource::Fallback);
+    assert!(record.detail.contains("workflow document"));
+    assert!(result.provenance.has_fallback());
+    assert_eq!(result.provenance.fallback_count(), 1);
+
+    let value = result.to_json().expect("serialize");
+    assert_eq!(value["provenance"]["stages"][0]["source"], "fallback");
+}
+
+#[tokio::test]
+async fn record_result_appends_the_assistant_turn_in_pairs() {
+    let model = Arc::new(ScriptedModel::text(AGENT_FENCE));
+    let mut builder = AgentBuilder::new(dynamic(&model));
+
+    let result = builder
+        .build_agent_at("build me an agent", "s1", AgentType::LlmAgent, 7)
+        .await
+        .expect("build succeeds");
+    assert_eq!(
+        builder.status("s1").expect("session exists").resource_count,
+        2
+    );
+
+    builder
+        .record_result("s1", AgentType::LlmAgent, &result)
+        .expect("the result persists");
+    let history = builder.history("s1", None);
+    assert_eq!(history.len(), 3, "one assistant turn was appended");
+    assert_eq!(history[0].content, "build me an agent");
+    let reparsed =
+        LlmAgentDsl::from_json_str(&history[2].content).expect("the document round-trips");
+    assert_eq!(reparsed, *dsl_of(&result));
+
+    builder
+        .record_result("s1", AgentType::LlmAgent, &result)
+        .expect("the result persists again");
+    assert_eq!(
+        builder.status("s1").expect("session exists").resource_count,
+        4
+    );
+
+    // An unknown session is created on demand, so a streaming caller can
+    // persist a final result without a prior build.
+    assert!(builder.status("s2").is_none());
+    builder
+        .record_result("s2", AgentType::LlmAgent, &result)
+        .expect("the result persists into a new session");
+    let status = builder.status("s2").expect("the session now exists");
+    assert_eq!(status.state, BuildState::Completed);
+    assert_eq!(status.resource_count, 1);
+}

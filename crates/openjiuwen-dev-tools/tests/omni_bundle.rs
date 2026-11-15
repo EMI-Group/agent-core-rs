@@ -165,6 +165,7 @@ fn archives_are_detected_and_compressed_formats_unpack() {
         path: "guide.md".to_owned(),
         bytes: b"# Guide\n".to_vec(),
         is_dir: false,
+        ..ArchiveEntry::default()
     }])
     .expect("writes a zip");
     assert_eq!(detect(&zip), Some(ArchiveFormat::Zip));

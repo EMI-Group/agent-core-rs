@@ -1,5 +1,8 @@
 //! Tests for the evaluator seam.
 
+#[path = "telemetry_tests.rs"]
+mod telemetry_tests;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

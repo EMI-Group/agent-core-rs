@@ -1,11 +1,12 @@
 //! Agent specifications, build stages, and the bridge into `openjiuwen-agent`.
 //!
-//! Ports `openjiuwen/dev_tools/agent_builder/` across sixteen modules: the
+//! Ports `openjiuwen/dev_tools/agent_builder/` across seventeen modules: the
 //! programmatic specs, the serialized LLM-agent and workflow documents, the
-//! bounded dialogue history, the staged builder pipeline (requirement clarifier,
-//! workflow designer, DL generator, DL reflector, cycle checker, Mermaid
-//! rendering), the session-based builder, its result vocabulary, the stage
-//! progress weights, the deterministic helpers, and the kernel bridge.
+//! bounded dialogue history, the staged builder pipeline (intention detector,
+//! requirement clarifier, workflow designer, DL generator, DL reflector, cycle
+//! checker, Mermaid rendering), the session-based builder and its streaming
+//! form, the result vocabulary, the stage progress weights, the deterministic
+//! helpers, and the kernel bridge.
 //!
 //! Module layout:
 //!
@@ -27,6 +28,8 @@
 //! - `dsl` — the serialized LLM-agent DSL ([`LlmAgentDsl`]) and its model,
 //!   plugin, workflow, and dependency blocks.
 //! - `history` — the bounded builder dialogue history ([`HistoryManager`]).
+//! - `intention` — the build/refine intention detector ([`IntentionDetector`])
+//!   and its [`BuildIntent`] verdict.
 //! - `mermaid` — Mermaid rendering of designs and documents
 //!   ([`render_design`], [`render_mermaid`]).
 //! - `outcome` — the result and state vocabulary ([`BuildResult`],
@@ -46,10 +49,18 @@
 //! single-round-trip behavior: one fenced JSON answer completes the session, and
 //! any other answer becomes a plain-text clarification.
 //!
-//! [`AgentBuilder::build_with_pipeline`] runs clarification -> (workflow:
-//! designer -> generator -> reflector) or (llm agent: generation + deterministic
-//! repair), falls back to the deterministic stage implementations on any
-//! unusable model answer, and only errors on a blank query.
+//! [`AgentBuilder::build_with_pipeline`] runs intention detection, an optional
+//! refinement of the session's previous workflow, clarification, then either the
+//! three-pass workflow design -> DL generation -> bounded repair loop or the
+//! LLM-agent generation plus deterministic repair.
+//! Every stage falls back to its documented deterministic implementation on an
+//! unusable model answer, records its provenance in the result, and only a blank
+//! query is an error.
+//!
+//! [`AgentBuilder::build_with_pipeline_stream`] exposes the same pipeline as a
+//! [`PipelineEvent`] stream (stage start/completion, clarification rounds, repair
+//! attempts, and one final [`BuildResult`]); [`AgentBuilder::record_result`]
+//! persists a streamed result into a session.
 //!
 //! [`AgentCard`]: openjiuwen_agent::AgentCard
 //! [`LlmAgentConfig`]: openjiuwen_agent::LlmAgentConfig
@@ -65,6 +76,7 @@ pub mod dl_reflector;
 pub mod dl_transformer;
 pub mod dsl;
 pub mod history;
+pub mod intention;
 pub mod mermaid;
 pub mod outcome;
 pub mod progress;
@@ -72,11 +84,17 @@ pub mod spec;
 pub mod utils;
 pub mod workflow_dsl;
 
-pub use builder::{now_millis, AgentBuilder, AgentType};
-pub use clarifier::{Clarification, Clarifier};
+pub use builder::{now_millis, AgentBuilder, AgentType, PipelineEvent};
+pub use clarifier::{
+    Clarification, ClarificationDialogue, ClarificationRound, ClarificationTermination, Clarifier,
+    ClarifyConfig, ClarifyEvent, DEFAULT_MAX_CLARIFY_ROUNDS,
+};
 pub use cycle_checker::{find_cycle, has_cycle};
-pub use designer::{DesignEdge, DesignNode, DesignNodeKind, WorkflowDesign, WorkflowDesigner};
-pub use dl_generator::DlGenerator;
+pub use designer::{
+    DesignEdge, DesignEvent, DesignNode, DesignNodeKind, DesignOutcome, DesignPass, DesignPassKind,
+    ThreePassDesign, WorkflowDesign, WorkflowDesigner,
+};
+pub use dl_generator::{DlGenerator, Refinement};
 pub use dl_reflector::{
     DlReflector, DlValidation, Reflection, ReflectionIssue, ReflectionIssueKind,
     DEFAULT_MAX_RETRIES,
@@ -89,8 +107,12 @@ pub use dsl::{
     DslConfigs, DslDependencies, DslModel, DslModelInfo, LlmAgentDsl, PluginRef, WorkflowRef,
 };
 pub use history::{DialogueMessage, HistoryManager, DEFAULT_MAX_HISTORY_SIZE};
-pub use mermaid::{render_design, render_mermaid};
-pub use outcome::{map_state_to_status, BuildOutput, BuildResult, BuildState, BuildStatus};
+pub use intention::{BuildIntent, IntentionDetector, IntentionVerdict};
+pub use mermaid::{render_design, render_mermaid, when_condition_label};
+pub use outcome::{
+    map_state_to_status, BuildOutput, BuildResult, BuildState, BuildStatus, GenerationProvenance,
+    GenerationSource, RepairReport, StageProvenance,
+};
 pub use progress::{progress_for, ProgressStage, LLM_AGENT_STAGE_WEIGHTS, WORKFLOW_STAGE_WEIGHTS};
 pub use spec::{LlmAgentSpec, WorkflowSpec};
 pub use utils::{

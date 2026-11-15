@@ -79,6 +79,16 @@
 //! ([`ReflectionIssueKind::InvalidReference`]). Exactly one of `expression` and
 //! `expressions` must be present ([`ReflectionIssueKind::MissingConditionExpression`]).
 //!
+//! Every checked input or output list is also inspected variable by variable: a
+//! name repeated inside one list is [`ReflectionIssueKind::DuplicateVariable`],
+//! an input without a `value` and an output without a `description` are
+//! [`ReflectionIssueKind::MissingField`] issues naming the variable, an input
+//! `value` with more than one `${...}` placeholder is
+//! [`ReflectionIssueKind::MultiPlaceholderValue`], and an input `value` whose
+//! single placeholder names no output declared by an earlier or the current node
+//! is [`ReflectionIssueKind::UndeclaredReference`]. Python's variable-type set and
+//! its optional `check_type` flag are not ported.
+//!
 //! The helpers live in the private `dl_checks` module so this file stays the
 //! graph repair plus the public vocabulary.
 //!
@@ -158,6 +168,18 @@ pub enum ReflectionIssueKind {
     MissingConditionExpression,
     /// The node's `type` is not one of the nine DL node types.
     UnknownNodeType,
+    /// Two variables of one node's input or output list shared a name.
+    ///
+    /// Reported by [`DlReflector::validate_dl`], which never repairs.
+    DuplicateVariable,
+    /// An input `value` carried more than one `${...}` reference.
+    ///
+    /// Reported by [`DlReflector::validate_dl`], which never repairs.
+    MultiPlaceholderValue,
+    /// An input `value` referenced a variable no earlier or current node declared.
+    ///
+    /// Reported by [`DlReflector::validate_dl`], which never repairs.
+    UndeclaredReference,
 }
 
 /// One repair or rejection recorded while reflecting a document.
@@ -272,7 +294,9 @@ impl DlReflector {
     /// The check is deterministic, offline, and side-effect free: `document` is
     /// never mutated and no model is consulted, even on a reflector created with
     /// [`Self::with_model`]. Nodes are reported in document order and, inside a
-    /// node, in check order.
+    /// node, in check order. Declared inputs and outputs are checked name by name,
+    /// so duplicates, missing input values, multi-reference values, undeclared
+    /// references, and missing output descriptions are all reported here.
     ///
     /// Every issue names the offending node in its `node_id` and its message; a
     /// missing link target is reported as a [`ReflectionIssueKind::DanglingEdge`]

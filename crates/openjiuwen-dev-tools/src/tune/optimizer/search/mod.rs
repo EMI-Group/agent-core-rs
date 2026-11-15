@@ -21,12 +21,17 @@
 //!   so the result is never worse than the starting prompt.
 //! - The *environment* is the [`CaseEvaluator`]
 //!   ([`crate::tune::CaseEvaluator`]) seam, so the same loop runs offline
-//!   against the deterministic evaluator or through a model. That seam reports
-//!   neither latency nor token usage, so every
-//!   [`Execution`](crate::tune::Execution) carries `latency_ms = 0.0` and
-//!   `total_tokens = 0`; the latency, token-usage, and cost reward components
-//!   are therefore constant in this port (they never separate two candidates),
-//!   and [`OptimizationResult::token_usage`] stays empty.
+//!   against the deterministic evaluator or through a model. Each case runs
+//!   through [`CaseEvaluator::evaluate_run`], so the run's measured
+//!   [`RunTelemetry`](crate::tune::RunTelemetry) is kept per
+//!   [`CaseResult`](crate::tune::CaseResult) and merged into the
+//!   [`Execution`](crate::tune::Execution): the execution's latency and token
+//!   totals are the sum over its cases, and its legacy `latency_ms`/
+//!   `total_tokens` fields mirror them only when they were measured. An
+//!   evaluator that measures nothing leaves both at zero, so the latency,
+//!   token-usage, and cost reward components stay constant for it, while a
+//!   measuring evaluator feeds them. [`OptimizationResult::token_usage`] stays
+//!   empty either way because the result reports no run-level counters.
 //! - The round budget is the smaller of [`PromptSearchConfig::max_iterations`]
 //!   and the shared [`OptimizerConfig::iterations`], so the Python RLAF budget
 //!   is capped by the tuning budget; with the defaults that is
@@ -34,16 +39,26 @@
 //! - Ids, timestamps, and the run id are derived deterministically (see
 //!   [`PromptSearchOptimizer::run_id`]), never from a clock, a uuid, or the
 //!   environment.
+//! - Logging is optional and side-effect free: a [`RunLog`] attached with
+//!   [`PromptSearchOptimizer::with_run_log`] receives exactly one
+//!   [`RunLogRecord`](crate::tune::RunLogRecord) per completed round (after that
+//!   round's convergence check), an [`AdoptPolicy`] attached with
+//!   [`PromptSearchOptimizer::with_adopt_policy`] adds the round's adoption
+//!   verdict to it, and the caller's
+//!   [`with_timestamp`](PromptSearchOptimizer::with_timestamp) stamps every
+//!   record. Without a log nothing is built, a failed write never fails the run,
+//!   and the returned [`OptimizationResult`] is identical either way.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::Model;
 
 use crate::tune::base::Case;
 use crate::tune::evaluator::CaseEvaluator;
+use crate::tune::optimizer::adopt::{AdoptDecision, AdoptPolicy};
 use crate::tune::optimizer::config::OptimizerConfig;
 use crate::tune::optimizer::search_config::PromptSearchConfig;
 use crate::tune::optimizer::suggestion::{
@@ -51,10 +66,10 @@ use crate::tune::optimizer::suggestion::{
 };
 use crate::tune::optimizer::OptimizationResult;
 use crate::tune::prompt_search::{
-    candidate_id, CompositeReward, ConvergenceDetector, DriftJudge, Evaluation, HistoryCompressor,
-    HistoryEntry, IterationRecord, LexicalDriftJudge, NullDriftJudge, NullPromptMemory,
-    OptimizationHistory, PromptCandidate, PromptMemory, PromptRecord, PromptTaskCase,
-    PromptTaskSpec, RewardBreakdown,
+    candidate_id, CompositeReward, ConvergenceDetector, ConvergenceState, DriftJudge, Evaluation,
+    HistoryCompressor, HistoryEntry, IterationRecord, LexicalDriftJudge, NullDriftJudge,
+    NullPromptMemory, OptimizationHistory, PromptCandidate, PromptMemory, PromptRecord,
+    PromptTaskCase, PromptTaskSpec, RewardBreakdown, RunLog,
 };
 
 /// How many prior records a run warm-starts from (Python's `top_k=3`).
@@ -99,6 +114,12 @@ pub struct PromptSearchOptimizer {
     drift_judge: Option<Arc<dyn DriftJudge>>,
     /// The prompt memory, when the caller wants warm starts and persistence.
     memory: Option<Arc<dyn PromptMemory>>,
+    /// The run log, when the caller wants one record per round.
+    run_log: Option<Arc<Mutex<dyn RunLog>>>,
+    /// The timestamp stamped on every run-log record (never a clock read).
+    timestamp: f64,
+    /// The adoption policy, when the caller wants a per-round verdict.
+    adopt_policy: Option<AdoptPolicy>,
     /// The seed of the deterministic run identifier.
     run_id_seed: u64,
 }
@@ -122,6 +143,9 @@ impl PromptSearchOptimizer {
             reward: None,
             drift_judge: None,
             memory: None,
+            run_log: None,
+            timestamp: 0.0,
+            adopt_policy: None,
             run_id_seed: 0,
         }
     }
@@ -175,6 +199,41 @@ impl PromptSearchOptimizer {
         self
     }
 
+    /// Attaches a run log that receives one record per completed round.
+    ///
+    /// The log is shared through a [`Mutex`], so a caller keeps its own handle
+    /// and reads back what the run wrote (an
+    /// [`InMemoryRunLog`](crate::tune::InMemoryRunLog) is the offline choice).
+    /// A poisoned mutex or a sink error is logged and never fails the run, and
+    /// without a log nothing is built, so the search result is byte-identical
+    /// either way.
+    #[must_use]
+    pub fn with_run_log(mut self, log: Arc<Mutex<dyn RunLog>>) -> Self {
+        self.run_log = Some(log);
+        self
+    }
+
+    /// Sets the timestamp stamped on every run-log record.
+    ///
+    /// The caller supplies it (nothing here reads a clock); the default is
+    /// `0.0`.
+    #[must_use]
+    pub fn with_timestamp(mut self, timestamp: f64) -> Self {
+        self.timestamp = timestamp;
+        self
+    }
+
+    /// Attaches an adoption policy that judges every round's winner.
+    ///
+    /// The decision is recorded on that round's run-log record and never
+    /// influences the search itself: without a run log nothing is emitted,
+    /// and the elite is still chosen by reward alone.
+    #[must_use]
+    pub fn with_adopt_policy(mut self, policy: AdoptPolicy) -> Self {
+        self.adopt_policy = Some(policy);
+        self
+    }
+
     /// Replaces the seed of the deterministic run identifier.
     #[must_use]
     pub fn with_run_id_seed(mut self, run_id_seed: u64) -> Self {
@@ -198,6 +257,24 @@ impl PromptSearchOptimizer {
     #[must_use]
     pub fn has_model(&self) -> bool {
         self.model.is_some()
+    }
+
+    /// Whether a run log is attached.
+    #[must_use]
+    pub fn has_run_log(&self) -> bool {
+        self.run_log.is_some()
+    }
+
+    /// Whether an adoption policy is attached.
+    #[must_use]
+    pub fn has_adopt_policy(&self) -> bool {
+        self.adopt_policy.is_some()
+    }
+
+    /// The timestamp stamped on every run-log record (`0.0` by default).
+    #[must_use]
+    pub fn timestamp(&self) -> f64 {
+        self.timestamp
     }
 
     /// The deterministic run identifier a run of `task` reports with `seed`.
@@ -318,30 +395,28 @@ impl PromptSearchOptimizer {
             };
             let round_best = &evaluations[round_best_index];
             let round_observations = observations(round_best.candidate(), &round_best.reward);
-            record_round(
-                &mut records,
+            // The adoption history is the rounds before this one, so a round is
+            // never compared against itself.
+            let adopt = adopt_decision(self.adopt_policy.as_ref(), round_best, &round_best_scores);
+            let stop = self.close_round(
+                ScoredRound {
+                    index,
+                    first,
+                    round_seed: &round_seed,
+                    evaluations: &evaluations,
+                    best_index: round_best_index,
+                    scores: &scores,
+                    observations: &round_observations,
+                    adopt,
+                },
                 &mut history,
-                index,
-                &evaluations,
-                round_best,
-                &round_observations,
+                &mut records,
+                &mut round_best_scores,
+                &mut tracker,
+                &setup,
             );
             context = policy_context(&history.compressed, &setup.warm);
-            tracker.absorb(
-                first,
-                &round_seed,
-                &scores,
-                &evaluations,
-                round_best,
-                round_observations,
-            );
-            round_best_scores.push(round_best.score());
-            if let Some(reason) = stopping_reason(
-                &setup.detector,
-                &round_best_scores,
-                tracker.score,
-                self.config.early_stop_score,
-            ) {
+            if let Some(reason) = stop {
                 converged = true;
                 convergence_reason = Some(reason);
                 break;
@@ -367,7 +442,64 @@ impl PromptSearchOptimizer {
             token_usage: BTreeMap::new(),
             run_id: setup.run_id,
             records,
+            ..OptimizationResult::default()
         })
+    }
+
+    /// Absorbs one scored round into the run.
+    ///
+    /// The round is recorded in the iteration records and the compressed
+    /// history, its winner's adoption verdict (when a policy is attached) is
+    /// taken against the preceding rounds, the elite moves only on a strictly
+    /// better score, and the convergence detector plus the shared early-stop
+    /// score decide whether the run ends after this round. The run-log record is
+    /// written last, so it carries this round's stopping verdict. Returns why the
+    /// run should stop, if it should.
+    fn close_round(
+        &self,
+        round: ScoredRound<'_>,
+        history: &mut OptimizationHistory,
+        records: &mut Vec<IterationRecord>,
+        round_best_scores: &mut Vec<f64>,
+        tracker: &mut Tracker,
+        setup: &Setup,
+    ) -> Option<String> {
+        let round_best = &round.evaluations[round.best_index];
+        record_round(
+            records,
+            history,
+            round.index,
+            round.evaluations,
+            round_best,
+            round.observations,
+        );
+        let previous = tracker.score;
+        tracker.absorb(
+            round.first,
+            round.round_seed,
+            round.scores,
+            round.evaluations,
+            round_best,
+            round.observations.to_vec(),
+        );
+        let selected = tracker.score > previous;
+        round_best_scores.push(round_best.score());
+        let state = setup.detector.check(round_best_scores);
+        let stop = stopping_reason(state.as_ref(), tracker.score, self.config.early_stop_score);
+        self.log_round(RoundRecord {
+            iteration: round.index,
+            evaluations: round.evaluations,
+            best_index: round.best_index,
+            best_score: tracker.finite_score(),
+            selected,
+            convergence: state.as_ref(),
+            stop_reason: stop.as_deref(),
+            adopt: round.adopt,
+            timestamp: self.timestamp,
+            run_id: &setup.run_id,
+            observations: round.observations,
+        });
+        stop
     }
 
     /// Validates the run and builds the collaborators and derived inputs once.
@@ -538,6 +670,15 @@ impl PromptSearchOptimizer {
         }
         candidates
     }
+
+    /// Writes one round to the attached run log, or does nothing without one.
+    fn log_round(&self, round: RoundRecord<'_>) {
+        if self.run_log.is_none() {
+            return;
+        }
+        let record = round.build();
+        emit(self.run_log.as_deref(), &record);
+    }
 }
 
 impl fmt::Debug for PromptSearchOptimizer {
@@ -551,6 +692,9 @@ impl fmt::Debug for PromptSearchOptimizer {
             .field("custom_reward", &self.reward.is_some())
             .field("custom_drift_judge", &self.drift_judge.is_some())
             .field("has_memory", &self.memory.is_some())
+            .field("has_run_log", &self.run_log.is_some())
+            .field("has_adopt_policy", &self.adopt_policy.is_some())
+            .field("timestamp", &self.timestamp)
             .field("run_id_seed", &self.run_id_seed)
             .finish()
     }
@@ -566,6 +710,26 @@ struct Collaborators<'a> {
     drift_judge: &'a dyn DriftJudge,
     /// The deterministic bank plus the optional model rewrite.
     mutator: &'a Mutator,
+}
+
+/// One scored round, ready to be absorbed into the run.
+struct ScoredRound<'a> {
+    /// The 1-based round number.
+    index: usize,
+    /// Whether this is round 1 (which sets the elite's floor).
+    first: bool,
+    /// The prompt the round started from.
+    round_seed: &'a str,
+    /// Every evaluated candidate of the round, in evaluation order.
+    evaluations: &'a [Evaluation],
+    /// The index of the round's winning candidate.
+    best_index: usize,
+    /// The candidates' scores, in the same order as `evaluations`.
+    scores: &'a [f64],
+    /// The winner's observations.
+    observations: &'a [String],
+    /// The winner's adoption verdict, when a policy is attached.
+    adopt: Option<AdoptDecision>,
 }
 
 /// Everything one round needs from the run around it.
@@ -608,17 +772,16 @@ fn record_round(
     history.compressed = HistoryCompressor::default().compress(history);
 }
 
-/// Why the search should stop after a round, if it should: the convergence
-/// detector first (target reward, plateau, variance), then the shared
+/// Why the search should stop after a round, if it should: the already-computed
+/// convergence verdict first (target reward, plateau, variance), then the shared
 /// early-stop score.
 fn stopping_reason(
-    detector: &ConvergenceDetector,
-    round_best_scores: &[f64],
+    state: Option<&ConvergenceState>,
     best_score: f64,
     early_stop_score: f64,
 ) -> Option<String> {
-    if let Some(state) = detector.check(round_best_scores) {
-        return Some(state.reason);
+    if let Some(state) = state {
+        return Some(state.reason.clone());
     }
     if best_score >= early_stop_score {
         return Some(format!("early stop score {early_stop_score:.3} reached"));
@@ -750,11 +913,17 @@ impl Tracker {
 }
 
 mod execute;
+mod run_log_record;
 
 use execute::{
     base_prompt, best_index, drift_scores, execute_candidate, execute_candidates, metrics_of,
     observations, policy_context, record_metadata, warm_start,
 };
+use run_log_record::{adopt_decision, emit, RoundRecord};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "run_log_tests.rs"]
+mod run_log_tests;

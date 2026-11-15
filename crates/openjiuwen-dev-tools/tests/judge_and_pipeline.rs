@@ -308,6 +308,8 @@ async fn the_builder_pipeline_generates_a_mermaid_workflow() {
     let model = Arc::new(ScriptedModel::new([
         ScriptedTurn::text(CLARIFY_READY),
         ScriptedTurn::text(DESIGN_FENCE),
+        ScriptedTurn::text(DESIGN_FENCE),
+        ScriptedTurn::text(DESIGN_FENCE),
         ScriptedTurn::text(GENERATED_FENCE),
     ]));
     let mut builder = AgentBuilder::new(dynamic(&model));
@@ -346,7 +348,11 @@ async fn the_builder_pipeline_generates_a_mermaid_workflow() {
         ["  start --> llm_1", "  llm_1 --> end"],
         "a single-successor edge renders unlabelled as `  {{src}} --> {{dst}}`"
     );
-    assert_eq!(model.call_count(), 3, "clarify, design, and generate");
+    assert_eq!(
+        model.call_count(),
+        5,
+        "clarify, three designer passes, and generate"
+    );
     assert_eq!(
         builder
             .status("workflow-1")

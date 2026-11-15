@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use openjiuwen_common::error::ErrorKind;
+use openjiuwen_core::retrieval::loaders::fixtures;
 use openjiuwen_test_support::{ScriptedModel, ScriptedTurn, TempWorkspace};
 use serde_json::json;
 
@@ -95,11 +97,14 @@ async fn scraped_main() -> ScrapedPage {
         .expect("scrapes")
 }
 
-/// One `ustar` header for a regular file, with a valid checksum.
-fn tar_header(name: &str, size: usize, typeflag: u8) -> [u8; 512] {
+/// One `ustar` header, with a valid checksum, for `name`, `size`, and
+/// `typeflag`, carrying `link` in the linkname field.
+fn tar_header_fields(name: &str, size: usize, typeflag: u8, link: &str) -> [u8; 512] {
     assert!(name.len() < 100, "tar name field overflow: {name}");
+    assert!(link.len() < 100, "tar linkname field overflow: {link}");
     let mut header = [0_u8; 512];
     header[..name.len()].copy_from_slice(name.as_bytes());
+    header[157..157 + link.len()].copy_from_slice(link.as_bytes());
     let size_field = format!("{size:o}");
     let size_bytes = size_field.as_bytes();
     header[124..124 + size_bytes.len()].copy_from_slice(size_bytes);
@@ -114,24 +119,52 @@ fn tar_header(name: &str, size: usize, typeflag: u8) -> [u8; 512] {
     header
 }
 
+/// One `ustar` header for a regular file, with a valid checksum.
+fn tar_header(name: &str, size: usize, typeflag: u8) -> [u8; 512] {
+    tar_header_fields(name, size, typeflag, "")
+}
+
+/// One `ustar` header for a link entry: `typeflag` `1` (hard link) or `2`
+/// (symbolic link), its target in the linkname field, and a zero size.
+fn tar_link_header(name: &str, typeflag: u8, target: &str) -> [u8; 512] {
+    tar_header_fields(name, 0, typeflag, target)
+}
+
 /// The padding needed to align a payload of `size` bytes to the next block.
 fn padding(size: usize) -> usize {
     (512 - size % 512) % 512
 }
 
+/// The markdown payload every `tar` test archive carries.
+const TAR_GUIDE: &str = "# Install\n\nRun the installer.\n\n```sh\ncargo install widget\n```";
+
 /// A `tar` archive holding one markdown file and one binary file.
 fn tar_archive() -> Vec<u8> {
-    let guide = "# Install\n\nRun the installer.\n\n```sh\ncargo install widget\n```";
     let mut binary = b"logo payload".to_vec();
     binary.push(0);
     let mut archive = Vec::new();
-    let bytes = guide.as_bytes();
+    let bytes = TAR_GUIDE.as_bytes();
     archive.extend_from_slice(&tar_header("guide.md", bytes.len(), b'0'));
     archive.extend_from_slice(bytes);
     archive.resize(archive.len() + padding(bytes.len()), 0);
     archive.extend_from_slice(&tar_header("assets/logo.bin", binary.len(), b'0'));
     archive.extend_from_slice(&binary);
     archive.resize(archive.len() + padding(binary.len()), 0);
+    archive.extend_from_slice(&[0_u8; 1024]);
+    archive
+}
+
+/// A `tar` archive holding one markdown file, one directory entry, one symlink,
+/// and one hardlink, each link pointing at the markdown file.
+fn tar_archive_with_links() -> Vec<u8> {
+    let bytes = TAR_GUIDE.as_bytes();
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&tar_header("guide.md", bytes.len(), b'0'));
+    archive.extend_from_slice(bytes);
+    archive.resize(archive.len() + padding(bytes.len()), 0);
+    archive.extend_from_slice(&tar_link_header("assets/", b'5', ""));
+    archive.extend_from_slice(&tar_link_header("guide-link.md", b'2', "guide.md"));
+    archive.extend_from_slice(&tar_link_header("guide-hard.md", b'1', "guide.md"));
     archive.extend_from_slice(&[0_u8; 1024]);
     archive
 }
@@ -231,6 +264,70 @@ async fn tar_page_input_yields_markdown_entries() {
 }
 
 #[tokio::test]
+async fn tar_link_and_directory_entries_contribute_no_page_text() {
+    let url = "https://example.com/links.tar";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(url, "application/x-tar", tar_archive_with_links());
+    let page = OmniCreation::new(Arc::new(fetcher))
+        .scrape(url)
+        .await
+        .expect("scrapes the archive");
+
+    // The page holds the single file entry and nothing else: a directory,
+    // symlink, or hardlink entry is neither text nor a followed link target, so
+    // it can neither add an empty text block nor a copy of the file it points at.
+    assert_eq!(page.text, TAR_GUIDE);
+    assert_eq!(page.title, "Install");
+    assert_eq!(
+        page.headings,
+        vec![Heading {
+            level: 1,
+            text: "Install".to_owned(),
+        }]
+    );
+    assert_eq!(page.code_blocks, vec!["cargo install widget".to_owned()]);
+}
+
+#[tokio::test]
+async fn undecodable_container_suffixes_surface_unsupported_without_magic_bytes() {
+    let bzip2_url = "https://example.com/skill.tar.bz2";
+    let xz_url = "https://example.com/skill.txz";
+    let zstd_url = "https://example.com/skill.tar.zstd";
+    let fetcher = ScriptedFetcher::new();
+    // None of these bodies starts with a recognized signature, so only the URL
+    // suffix names the codec: the sniff falls back to the filename, and the
+    // archive route reports the missing decoder instead of the body being read
+    // as plain text.
+    fetcher.with_page(
+        bzip2_url,
+        "application/octet-stream",
+        b"opaque bzip2 payload".to_vec(),
+    );
+    fetcher.with_page(
+        xz_url,
+        "application/octet-stream",
+        b"opaque xz payload".to_vec(),
+    );
+    fetcher.with_page(
+        zstd_url,
+        "application/octet-stream",
+        b"opaque zstd payload".to_vec(),
+    );
+    let creation = OmniCreation::new(Arc::new(fetcher));
+
+    for (url, codec) in [(bzip2_url, "bzip2"), (xz_url, "xz"), (zstd_url, "zstd")] {
+        let error = creation
+            .scrape(url)
+            .await
+            .expect_err("no decoder is bundled for this codec");
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{url}: {error}");
+        let message = error.to_string();
+        assert!(message.contains(codec), "{url}: {message}");
+        assert!(message.contains("decoder"), "{url}: {message}");
+    }
+}
+
+#[tokio::test]
 async fn zip_and_gzip_page_inputs_unpack() {
     let zip_url = "https://example.com/skill.zip";
     let gzip_url = "https://example.com/skill.tar.gz";
@@ -238,6 +335,7 @@ async fn zip_and_gzip_page_inputs_unpack() {
         path: "guide.md".to_owned(),
         bytes: b"# Zip Guide\n\nbody text\n".to_vec(),
         is_dir: false,
+        ..ArchiveEntry::default()
     }])
     .expect("writes the zip");
 
@@ -279,6 +377,39 @@ async fn zip_and_gzip_page_inputs_unpack() {
             openjiuwen_common::error::ErrorKind::Validation,
             "{url}: {error}"
         );
+    }
+}
+
+#[tokio::test]
+async fn undecodable_containers_surface_unsupported_with_the_codec() {
+    let xz_url = "https://example.com/skill.tar.xz";
+    let zstd_url = "https://example.com/skill.tar.zst";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(
+        xz_url,
+        "application/x-xz",
+        b"\xFD7zXZ\x00xz-stream-body".to_vec(),
+    );
+    fetcher.with_page(
+        zstd_url,
+        "application/zstd",
+        vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00],
+    );
+    let creation = OmniCreation::new(Arc::new(fetcher));
+
+    for (url, codec) in [(xz_url, "xz"), (zstd_url, "zstd")] {
+        let error = creation
+            .scrape(url)
+            .await
+            .expect_err("no decoder is bundled for this codec");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Unsupported,
+            "{url}: {error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(codec), "{url}: {message}");
+        assert!(message.contains("decoder"), "{url}: {message}");
     }
 }
 
@@ -339,10 +470,12 @@ async fn model_assisted_generation_uses_the_fenced_json() {
     );
     let creation = OmniCreation::new(Arc::new(ScriptedFetcher::new()))
         .with_model(Arc::new(ScriptedModel::text(answer)));
-    let definition = creation
-        .generate_with_model(&page, &[])
+    let generated = creation
+        .generate_with_model_profiled(&page, &[])
         .await
         .expect("models the skill");
+    assert_eq!(generated.provenance, GenerationProvenance::Model);
+    let definition = generated.definition;
 
     assert_eq!(definition.name, "model-widget");
     assert_eq!(
@@ -376,28 +509,124 @@ async fn model_failures_fall_back_to_the_deterministic_skill() {
     let garbage = OmniCreation::new(Arc::new(ScriptedFetcher::new()))
         .with_model(Arc::new(ScriptedModel::text("Sure, here you go")));
     let fallback = garbage
-        .generate_with_model(&page, &[])
+        .generate_with_model_profiled(&page, &[])
         .await
         .expect("falls back without a fence");
-    assert_eq!(fallback, deterministic);
+    assert_eq!(fallback.provenance, GenerationProvenance::Deterministic);
+    assert_eq!(fallback.definition, deterministic);
 
     let malformed = OmniCreation::new(Arc::new(ScriptedFetcher::new())).with_model(Arc::new(
-        ScriptedModel::text("```json\n{\"name\": \"bad name\"}\n```"),
+        ScriptedModel::text("```json\n{\"name\": \"only a name\"}\n```"),
     ));
     let fallback = malformed
-        .generate_with_model(&page, &[])
+        .generate_with_model_profiled(&page, &[])
         .await
         .expect("falls back on an incomplete payload");
-    assert_eq!(fallback, deterministic);
+    assert_eq!(fallback.provenance, GenerationProvenance::Deterministic);
+    assert_eq!(fallback.definition, deterministic);
 
     let failing = OmniCreation::new(Arc::new(ScriptedFetcher::new())).with_model(Arc::new(
         ScriptedModel::new([ScriptedTurn::fail("provider down")]),
     ));
     let fallback = failing
-        .generate_with_model(&page, &[])
+        .generate_with_model_profiled(&page, &[])
         .await
         .expect("falls back on a model error");
-    assert_eq!(fallback, deterministic);
+    assert_eq!(fallback.provenance, GenerationProvenance::Deterministic);
+    assert_eq!(fallback.definition, deterministic);
+
+    // A complete payload whose name is not a valid skill name passes parsing
+    // but fails definition validation, which also falls back.
+    let invalid = OmniCreation::new(Arc::new(ScriptedFetcher::new())).with_model(Arc::new(
+        ScriptedModel::text(
+            "```json\n\
+             {\"name\": \"bad name\", \"description\": \"Desc\", \"instructions\": \"Body\"}\n\
+             ```",
+        ),
+    ));
+    let fallback = invalid
+        .generate_with_model_profiled(&page, &[])
+        .await
+        .expect("falls back on an invalid definition");
+    assert_eq!(fallback.provenance, GenerationProvenance::Deterministic);
+    assert_eq!(fallback.definition, deterministic);
+}
+
+#[tokio::test]
+async fn generate_profiled_reports_the_deterministic_generator() {
+    let page = scraped_main().await;
+    let creation = OmniCreation::new(Arc::new(ScriptedFetcher::new()));
+    let generated = creation.generate_profiled(&page, &[]).expect("generates");
+
+    assert_eq!(generated.provenance, GenerationProvenance::Deterministic);
+    assert_eq!(
+        generated.definition,
+        creation.generate(&page, &[]).expect("generates")
+    );
+    assert_eq!(
+        GenerationProvenance::default(),
+        GenerationProvenance::Deterministic
+    );
+    assert_eq!(
+        GenerationProvenance::Deterministic.as_str(),
+        "deterministic"
+    );
+    assert_eq!(GenerationProvenance::Model.as_str(), "model");
+    assert_eq!(GenerationProvenance::Model.to_string(), "model");
+}
+
+#[tokio::test]
+async fn run_records_the_generation_provenance() {
+    let deterministic = TempWorkspace::new().expect("temp workspace");
+    let outcome = OmniCreation::new(Arc::new(page_fetcher()))
+        .run(MAIN_URL, deterministic.root())
+        .await
+        .expect("runs without a model");
+    assert_eq!(outcome.provenance, GenerationProvenance::Deterministic);
+
+    let modelled = TempWorkspace::new().expect("temp workspace");
+    let answer = format!(
+        "```json\n{}\n```\n",
+        serde_json::to_string_pretty(&json!({
+            "name": "model-widget",
+            "description": "Install the widget with confidence.",
+            "instructions": "# Install\n\n1. Download the package."
+        }))
+        .expect("payload serializes")
+    );
+    let outcome = OmniCreation::new(Arc::new(page_fetcher()))
+        .with_model(Arc::new(ScriptedModel::text(answer)))
+        .run(MAIN_URL, modelled.root())
+        .await
+        .expect("runs with a model");
+    assert_eq!(outcome.provenance, GenerationProvenance::Model);
+    assert_eq!(outcome.definition.name, "model-widget");
+}
+
+#[test]
+fn outcome_json_round_trips_the_provenance() {
+    let outcome = OmniOutcome {
+        definition: crate::skill_creator::SkillDefinition::new("demo", "Desc", "Body"),
+        resources: vec![SOURCES_RESOURCE.to_owned()],
+        bundle_path: std::path::PathBuf::from("skills/demo"),
+        provenance: GenerationProvenance::Model,
+    };
+    let encoded = serde_json::to_value(&outcome).expect("serializes");
+    assert_eq!(encoded["provenance"], json!("model"));
+
+    let decoded: OmniOutcome = serde_json::from_value(encoded.clone()).expect("deserializes");
+    assert_eq!(decoded, outcome);
+
+    // JSON written before the field existed still deserializes: the serde
+    // default is the deterministic provenance.
+    let mut legacy = encoded;
+    legacy
+        .as_object_mut()
+        .expect("an object")
+        .remove("provenance");
+    let decoded: OmniOutcome =
+        serde_json::from_value(legacy).expect("deserializes the legacy JSON");
+    assert_eq!(decoded.provenance, GenerationProvenance::Deterministic);
 }
 
 #[tokio::test]
@@ -822,13 +1051,14 @@ async fn blank_instructions_after_stripping_fall_back_to_the_deterministic_skill
     let creation = OmniCreation::new(Arc::new(ScriptedFetcher::new())).with_model(Arc::new(
         instructions_model("![hallucinated](references/img_99.png)"),
     ));
-    let definition = creation
-        .generate_with_model(&page, &downloaded)
+    let generated = creation
+        .generate_with_model_profiled(&page, &downloaded)
         .await
         .expect("falls back to the deterministic generator");
 
-    assert_eq!(definition, deterministic);
-    definition.validate().expect("valid definition");
+    assert_eq!(generated.provenance, GenerationProvenance::Deterministic);
+    assert_eq!(generated.definition, deterministic);
+    generated.definition.validate().expect("valid definition");
 }
 
 #[tokio::test]
@@ -857,4 +1087,140 @@ async fn model_generation_without_images_has_no_image_references() {
         1,
         "{instructions}"
     );
+}
+
+/// The binary-document route of the scrape stage: a fetched `PDF` becomes a page
+/// even though its bytes carry no markdown.
+#[tokio::test]
+async fn pdf_page_input_is_extracted_by_the_loader() {
+    let url = "https://example.com/files/paper.pdf";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(
+        url,
+        "application/pdf",
+        fixtures::pdf_document(&fixtures::plain_stream("BT (Hello PDF) Tj ET")),
+    );
+    let page = OmniCreation::new(Arc::new(fetcher))
+        .scrape(url)
+        .await
+        .expect("scrapes the PDF");
+    assert_eq!(page.url, url);
+    assert!(page.text.contains("Hello PDF"), "{:?}", page.text);
+    assert_eq!(page.title, "paper");
+    assert_eq!(page.description, "");
+    assert_eq!(page.headings, Vec::new());
+    assert_eq!(page.links, Vec::new());
+    assert_eq!(page.images, Vec::new());
+}
+
+/// A `DOCX` is a `ZIP` container, so the document route has to win over the
+/// generic archive reader: the page holds the Word body, not the package parts.
+#[tokio::test]
+async fn docx_page_input_is_extracted_instead_of_being_unpacked_as_an_archive() {
+    let url = "https://example.com/files/notes.docx";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(
+        url,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        fixtures::docx_document(&["Intro", "Body"]).expect("builds a docx"),
+    );
+    let page = OmniCreation::new(Arc::new(fetcher))
+        .scrape(url)
+        .await
+        .expect("scrapes the DOCX");
+    assert_eq!(page.text, "Intro\nBody");
+    assert_eq!(page.title, "notes");
+    assert_eq!(page.headings, Vec::new());
+}
+
+/// A URL without a suffix still dispatches when the `content-type` names a
+/// document format.
+#[tokio::test]
+async fn a_document_without_a_suffix_dispatches_on_the_content_type() {
+    let url = "https://example.com/files/download";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(
+        url,
+        "application/pdf; charset=binary",
+        fixtures::pdf_document(&fixtures::plain_stream("BT (Typed PDF) Tj ET")),
+    );
+    let page = OmniCreation::new(Arc::new(fetcher))
+        .scrape(url)
+        .await
+        .expect("scrapes by content type");
+    assert!(page.text.contains("Typed PDF"), "{:?}", page.text);
+    assert_eq!(page.title, "download");
+}
+
+/// A failed loader is never fatal: the bytes are read as plain text instead.
+#[tokio::test]
+async fn a_corrupt_document_page_falls_back_to_plain_text() {
+    let url = "https://example.com/files/broken.pdf";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(url, "application/pdf", b"plain words, not a pdf".to_vec());
+    let page = OmniCreation::new(Arc::new(fetcher))
+        .scrape(url)
+        .await
+        .expect("a corrupt document still yields its text");
+    assert_eq!(page.text, "plain words, not a pdf");
+    assert_eq!(page.title, "");
+}
+
+/// A document that yields nothing, even as text, is unusable input whose error
+/// names the URL and the format.
+#[tokio::test]
+async fn a_document_page_with_no_text_names_the_url_and_format() {
+    let url = "https://example.com/files/empty.pdf";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(url, "application/pdf", b" \n\t\n".to_vec());
+    let error = OmniCreation::new(Arc::new(fetcher))
+        .scrape(url)
+        .await
+        .expect_err("a blank document");
+    assert_eq!(error.kind(), ErrorKind::Validation, "{error}");
+    let message = error.to_string();
+    assert!(message.contains("extracted no text"), "{message}");
+    assert!(message.contains(url), "{message}");
+    assert!(message.contains(".pdf"), "{message}");
+}
+
+/// The HTML and archive routes keep their precedence over the document route.
+#[tokio::test]
+async fn html_and_archive_routes_keep_their_precedence() {
+    let html_url = "https://example.com/files/page.pdf";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_html(html_url, main_html());
+    let page = OmniCreation::new(Arc::new(fetcher))
+        .scrape(html_url)
+        .await
+        .expect("scrapes the HTML page");
+    assert_eq!(page.title, "Install the Widget");
+    assert_eq!(page.description, "Learn to install the widget.");
+    assert_eq!(page.headings.len(), 2);
+    assert_eq!(page.links.len(), 1);
+    assert_eq!(page.images.len(), 1);
+    assert!(
+        page.text.contains("Download the package"),
+        "{:?}",
+        page.text
+    );
+
+    let tar_url = "https://example.com/skill.tar";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(tar_url, "application/x-tar", tar_archive());
+    let page = OmniCreation::new(Arc::new(fetcher))
+        .scrape(tar_url)
+        .await
+        .expect("scrapes the archive");
+    assert_eq!(page.title, "Install");
+    assert_eq!(
+        page.headings,
+        vec![Heading {
+            level: 1,
+            text: "Install".to_owned(),
+        }]
+    );
+    assert_eq!(page.code_blocks, vec!["cargo install widget".to_owned()]);
+    assert!(page.text.contains("Run the installer."));
+    assert!(!page.text.contains("logo"), "binary entry must be skipped");
 }

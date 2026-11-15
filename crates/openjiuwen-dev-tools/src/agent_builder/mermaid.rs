@@ -34,6 +34,14 @@
 //! condition. A single-successor source never gets an edge label, even when its
 //! edge carries a condition.
 //!
+//! A condition written as a `When condition met[...]` description is reduced to
+//! the label it carries by [`when_condition_label`], so the wrapper prefix and
+//! its brackets never reach the diagram; every other condition keeps rendering
+//! verbatim.
+//! Python derives that label with a regex that never produces a usable capture,
+//! so the port keeps the intent (the bracketed text, or the remainder after the
+//! prefix) instead of reproducing the one-character capture.
+//!
 //! Ids are sanitized (ASCII alphanumerics and `_` kept, every other character
 //! mapped to `_`, empty ids named `node_<index>`, digit-leading ids prefixed with
 //! `n_`, collisions resolved with `_2`, `_3`, ... in document order) so that a
@@ -48,6 +56,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::designer::WorkflowDesign;
 use super::workflow_dsl::WorkflowDsl;
+
+mod labels;
+
+use labels::{edge_label, escape_label, resolve_endpoint, sanitize_id, unique_id};
+
+pub use labels::when_condition_label;
 
 /// The Mermaid header line of every rendered diagram.
 const HEADER: &str = "graph TD";
@@ -164,57 +178,6 @@ fn render(nodes: &[RenderNode<'_>], edges: &[RenderEdge<'_>]) -> String {
     lines.join("\n")
 }
 
-/// Sanitizes a node id into a Mermaid-safe identifier.
-///
-/// ASCII alphanumerics and `_` are kept; every other character (CJK, `-`,
-/// spaces, punctuation) becomes `_` one by one, without collapsing. An empty
-/// result falls back to `node_<index>` (1-based document position), and a result
-/// starting with a digit is prefixed with `n_`.
-fn sanitize_id(raw: &str, index: usize) -> String {
-    let mut sanitized = String::with_capacity(raw.len().max(1));
-    for character in raw.chars() {
-        if character.is_ascii_alphanumeric() || character == '_' {
-            sanitized.push(character);
-        } else {
-            sanitized.push('_');
-        }
-    }
-
-    if sanitized.is_empty() {
-        return format!("node_{index}");
-    }
-    if sanitized.starts_with(|character: char| character.is_ascii_digit()) {
-        return format!("n_{sanitized}");
-    }
-    sanitized
-}
-
-/// Reserves `base` in `used`, appending `_2`, `_3`, ... until it is unique.
-fn unique_id(base: &str, used: &mut BTreeSet<String>) -> String {
-    if used.insert(base.to_string()) {
-        return base.to_string();
-    }
-
-    let mut suffix = 2_u32;
-    loop {
-        let candidate = format!("{base}_{suffix}");
-        if used.insert(candidate.clone()) {
-            return candidate;
-        }
-        suffix += 1;
-    }
-}
-
-/// Resolves an edge endpoint to the id it is rendered with.
-///
-/// Known endpoints use their deduplicated rendered id; a dangling endpoint keeps
-/// its sanitized form so the edge still points somewhere parseable.
-fn resolve_endpoint(ids: &BTreeMap<&str, String>, endpoint: &str) -> String {
-    ids.get(endpoint)
-        .cloned()
-        .unwrap_or_else(|| sanitize_id(endpoint, 0))
-}
-
 /// Whether `value` holds no non-whitespace character.
 fn is_blank(value: &str) -> bool {
     value.trim().is_empty()
@@ -236,29 +199,15 @@ fn node_label_source<'a>(node: &RenderNode<'a>, rendered_id: &'a str) -> &'a str
     }
 }
 
-/// Escapes free text into a label, exactly like Python's `to_mermaid`.
-///
-/// Backticks and double quotes become `'`; every other character is kept
-/// verbatim, so whitespace, brackets, pipes, and angle brackets survive.
-fn escape_label(raw: &str) -> String {
-    raw.chars()
-        .map(|character| {
-            if character == '`' || character == '"' {
-                '\''
-            } else {
-                character
-            }
-        })
-        .collect()
-}
-
 /// Formats one edge line.
 ///
-/// The edge is labelled `-- {condition} -->` only when `branching` (the source
-/// node has more than one outgoing edge) and the escaped condition is non-blank;
-/// otherwise it renders as `-->`.
+/// The edge is labelled `-- {label} -->` only when `branching` (the source node
+/// has more than one outgoing edge) and the label is non-blank; otherwise it
+/// renders as `-->`. The label is the extracted `When condition met` label when
+/// the condition is such a description, and the escaped whole condition
+/// otherwise.
 fn edge_line(source: &str, target: &str, condition: Option<&str>, branching: bool) -> String {
-    let label = condition.map(escape_label).unwrap_or_default();
+    let label = condition.map(edge_label).unwrap_or_default();
 
     if branching && !is_blank(&label) {
         format!("  {source} -- {label} --> {target}")
@@ -727,5 +676,133 @@ graph TD
         let dsl = design.to_workflow_dsl().expect("the design converts");
         assert_eq!(rendered, render_mermaid(&dsl));
         assert_eq!(rendered, render_design(&design));
+    }
+
+    #[test]
+    fn when_condition_labels_replace_the_whole_condition() {
+        let dsl = graph(
+            vec![
+                dsl_node("decide", "branch", "", "Decide"),
+                dsl_node("yes", "end", "", "Yes path"),
+                dsl_node("no", "end", "", "No path"),
+            ],
+            vec![
+                dsl_edge("decide", "yes", Some("When condition met[order valid]")),
+                dsl_edge("decide", "no", Some("otherwise")),
+            ],
+        );
+
+        assert_eq!(
+            render_mermaid(&dsl),
+            "\
+graph TD
+  decide[Nodedecide: Decide]
+  yes[Nodeyes: Yes path]
+  no[Nodeno: No path]
+  decide -- order valid --> yes
+  decide -- otherwise --> no"
+        );
+    }
+
+    #[test]
+    fn when_conditions_without_brackets_yield_the_remainder() {
+        let dsl = graph(
+            vec![
+                dsl_node("decide", "branch", "", "Decide"),
+                dsl_node("yes", "end", "", "Yes path"),
+                dsl_node("no", "end", "", "No path"),
+            ],
+            vec![
+                dsl_edge("decide", "yes", Some("When condition met: order valid")),
+                dsl_edge("decide", "no", Some("When condition met score > 0.5")),
+            ],
+        );
+
+        assert_eq!(
+            render_mermaid(&dsl),
+            "\
+graph TD
+  decide[Nodedecide: Decide]
+  yes[Nodeyes: Yes path]
+  no[Nodeno: No path]
+  decide -- order valid --> yes
+  decide -- score > 0.5 --> no"
+        );
+    }
+
+    #[test]
+    fn when_condition_on_a_single_successor_stays_unlabelled() {
+        let dsl = graph(
+            vec![
+                dsl_node("a", "start", "", "A"),
+                dsl_node("b", "end", "", "B"),
+            ],
+            vec![dsl_edge("a", "b", Some("When condition met[order valid]"))],
+        );
+
+        assert_eq!(
+            render_mermaid(&dsl),
+            "\
+graph TD
+  a[Nodea: A]
+  b[Nodeb: B]
+  a --> b"
+        );
+    }
+
+    #[test]
+    fn extracted_when_labels_escape_quotes_and_backticks() {
+        let dsl = graph(
+            vec![
+                dsl_node("decide", "branch", "", "Decide"),
+                dsl_node("yes", "end", "", "Yes path"),
+                dsl_node("no", "end", "", "No path"),
+            ],
+            vec![
+                dsl_edge(
+                    "decide",
+                    "yes",
+                    Some("When condition met[say \"hi\" and `bye`]"),
+                ),
+                dsl_edge("decide", "no", Some("otherwise")),
+            ],
+        );
+
+        assert_eq!(
+            render_mermaid(&dsl),
+            "\
+graph TD
+  decide[Nodedecide: Decide]
+  yes[Nodeyes: Yes path]
+  no[Nodeno: No path]
+  decide -- say 'hi' and 'bye' --> yes
+  decide -- otherwise --> no"
+        );
+    }
+
+    #[test]
+    fn bare_when_prefix_falls_back_to_the_escaped_condition() {
+        let dsl = graph(
+            vec![
+                dsl_node("decide", "branch", "", "Decide"),
+                dsl_node("yes", "end", "", "Yes path"),
+                dsl_node("no", "end", "", "No path"),
+            ],
+            vec![
+                dsl_edge("decide", "yes", Some("When condition met")),
+                dsl_edge("decide", "no", Some("otherwise")),
+            ],
+        );
+
+        assert_eq!(
+            render_mermaid(&dsl),
+            "\
+graph TD
+  decide[Nodedecide: Decide]
+  yes[Nodeyes: Yes path]
+  no[Nodeno: No path]
+  decide -- When condition met --> yes
+  decide -- otherwise --> no"
+        );
     }
 }

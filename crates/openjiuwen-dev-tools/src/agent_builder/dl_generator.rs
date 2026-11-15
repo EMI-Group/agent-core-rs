@@ -13,6 +13,16 @@
 //! [`WorkflowDsl::validate`] is logged and replaced by the deterministic
 //! baseline, so [`DlGenerator::generate_with_model`] never fails because of the
 //! model. Only an invalid *design* is a [`Error::Validation`].
+//!
+//! # Refine mode
+//!
+//! [`DlGenerator::refine`] ports Python's `DlGenerator.refine`: instead of a
+//! design it takes the requested change, the existing workflow document, and the
+//! document's Mermaid diagram, and asks the model for the complete modified
+//! document. The answer is accepted only when it parses and validates;
+//! otherwise — and when no model is configured at all — the existing document is
+//! returned unchanged. Every call reports where its result came from in a
+//! [`GenerationProvenance`] holding one `refining_dl` record.
 
 use std::fmt;
 use std::sync::Arc;
@@ -20,9 +30,13 @@ use std::sync::Arc;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::{Model, ModelRequestConfig};
 use openjiuwen_foundation::BaseMessage;
+use serde::{Deserialize, Serialize};
 
 use super::designer::WorkflowDesign;
+use super::outcome::GenerationProvenance;
+use super::progress::ProgressStage;
 use super::spec::WorkflowSpec;
+use super::utils::extract_json_from_text;
 use super::workflow_dsl::WorkflowDsl;
 use crate::util::extract_json_fence;
 
@@ -44,6 +58,54 @@ using these keys:
 The document needs at least one node, unique node ids, and every edge endpoint
 must resolve to a node id.
 Do not add other keys and do not wrap the document in prose."#;
+
+/// The instruction sent to the model by [`DlGenerator::refine`].
+///
+/// It is Python's refine system prompt: the same generator contract, applied to
+/// an existing document instead of a design.
+const DL_REFINE_SYSTEM_PROMPT: &str = r#"You are the openJiuwen workflow DL generator in refinement mode.
+Rewrite the existing workflow DSL document the user sends so that it satisfies
+the requested change and stays free of errors.
+
+Answer with exactly one ```json fenced code block holding the complete modified
+workflow document, using these keys:
+- `name`: the workflow name
+- `description`: one sentence describing the workflow
+- `nodes`: a list of {"id", "type", "title", "description", "inputs",
+  "outputs", "data"} objects, keeping the existing node ids where possible
+- `edges`: a list of {"source", "target", "condition"} objects naming node ids
+
+The document needs at least one node, unique node ids, and every edge endpoint
+must resolve to a node id.
+Do not add other keys and do not wrap the document in prose."#;
+
+/// The user template of Python's refine prompt, filled by
+/// [`refine_user_message`].
+///
+/// The markers are the three values Python's `DL_REFINE_USER_TEMPLATE` formats:
+/// the requested change, the existing Mermaid diagram, and the existing
+/// workflow document.
+const DL_REFINE_USER_PROMPT_TEMPLATE: &str = r"Refine the existing workflow according to the requested change.
+Make sure the result satisfies the request and is free of errors.
+
+## Requested change
+{feedback}
+
+## Existing Mermaid diagram
+{mermaid}
+
+## Existing workflow document
+{dsl}";
+
+/// One model-assisted refinement of an existing workflow document.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct Refinement {
+    /// The accepted revision, or the caller's document unchanged on a fallback.
+    pub workflow: WorkflowDsl,
+    /// One `refining_dl` record naming where `workflow` came from.
+    pub provenance: GenerationProvenance,
+}
 
 /// Generates a workflow DSL document from a workflow design.
 ///
@@ -131,6 +193,71 @@ impl DlGenerator {
             }
         }
     }
+
+    /// Rewrites `existing` according to `feedback`, using Python's refine prompt.
+    ///
+    /// The model receives the refine system contract, then one user message
+    /// carrying `feedback`, the `mermaid` diagram of the current document, and the
+    /// document itself as JSON. Its answer is accepted only when a fenced-or-bare
+    /// JSON document parses as a [`WorkflowDsl`] and
+    /// [`WorkflowDsl::validate`] passes.
+    ///
+    /// Without a model the existing document is returned unchanged with a
+    /// [`GenerationSource::Deterministic`] record. A model error, a choice-less
+    /// answer, an unparseable answer, or an invalid document is logged and also
+    /// keeps the existing document, recorded as [`GenerationSource::Fallback`] with
+    /// the reason as its detail. The returned provenance always holds exactly one
+    /// [`ProgressStage::RefiningDl`] record.
+    ///
+    /// [`GenerationSource::Deterministic`]: super::outcome::GenerationSource::Deterministic
+    /// [`GenerationSource::Fallback`]: super::outcome::GenerationSource::Fallback
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] when `feedback` is blank; the model is never
+    /// called in that case.
+    pub async fn refine(
+        &self,
+        feedback: &str,
+        existing: &WorkflowDsl,
+        mermaid: &str,
+    ) -> Result<Refinement> {
+        if feedback.trim().is_empty() {
+            return Err(Error::validation("refinement feedback must not be blank"));
+        }
+
+        let mut provenance = GenerationProvenance::new();
+        let Some(model) = self.model.as_deref() else {
+            provenance.record_deterministic(
+                ProgressStage::RefiningDl,
+                "no model configured; keeping the existing workflow",
+            );
+            provenance.warn_if_degraded();
+            return Ok(Refinement {
+                workflow: existing.clone(),
+                provenance,
+            });
+        };
+
+        match refine_with_model(model, feedback, existing, mermaid).await {
+            Ok(workflow) => {
+                provenance.record_model(ProgressStage::RefiningDl);
+                Ok(Refinement {
+                    workflow,
+                    provenance,
+                })
+            }
+            Err(reason) => {
+                tracing::debug!(%reason, "workflow DL refinement failed; keeping the existing document");
+                provenance.record_fallback(ProgressStage::RefiningDl, reason);
+                provenance.warn_if_degraded();
+                Ok(Refinement {
+                    workflow: existing.clone(),
+                    provenance,
+                })
+            }
+        }
+    }
 }
 
 impl Default for DlGenerator {
@@ -172,6 +299,58 @@ async fn generate_with_model(model: &dyn Model, design: &WorkflowDesign) -> Resu
     Ok(document)
 }
 
+/// Asks the model for one refined workflow document, or reports why it failed.
+///
+/// The failure is a short reason rather than an error, because every refine
+/// failure keeps the caller's document and is recorded as provenance detail.
+async fn refine_with_model(
+    model: &dyn Model,
+    feedback: &str,
+    existing: &WorkflowDsl,
+    mermaid: &str,
+) -> std::result::Result<WorkflowDsl, String> {
+    let document_json =
+        serde_json::to_string_pretty(existing).unwrap_or_else(|_| format!("{existing:?}"));
+    let messages = vec![
+        BaseMessage::system(DL_REFINE_SYSTEM_PROMPT),
+        BaseMessage::user(refine_user_message(feedback, mermaid, &document_json)),
+    ];
+    let request = ModelRequestConfig::new(model.model_name());
+    let response = model
+        .invoke(&messages, &request)
+        .await
+        .map_err(|error| format!("model call failed: {error}"))?;
+    let Some(choice) = response.choices.into_iter().next() else {
+        return Err("model returned no choices".to_string());
+    };
+
+    let text = choice.message.text().into_owned();
+    let json = extract_json_from_text(&text);
+    let document: WorkflowDsl = serde_json::from_str(json.trim())
+        .map_err(|error| format!("answer is not a workflow document: {error}"))?;
+    document
+        .validate()
+        .map_err(|error| format!("revised document is invalid: {error}"))?;
+    Ok(document)
+}
+
+/// Fills [`DL_REFINE_USER_PROMPT_TEMPLATE`] from its three markers.
+///
+/// The template is split on each marker once, in template order, so braces inside
+/// the inserted feedback, diagram, or document are never reinterpreted.
+fn refine_user_message(feedback: &str, mermaid: &str, dsl: &str) -> String {
+    let Some((head, rest)) = DL_REFINE_USER_PROMPT_TEMPLATE.split_once("{feedback}") else {
+        return DL_REFINE_USER_PROMPT_TEMPLATE.to_string();
+    };
+    let Some((after_feedback, rest)) = rest.split_once("{mermaid}") else {
+        return DL_REFINE_USER_PROMPT_TEMPLATE.to_string();
+    };
+    let Some((after_mermaid, tail)) = rest.split_once("{dsl}") else {
+        return DL_REFINE_USER_PROMPT_TEMPLATE.to_string();
+    };
+    format!("{head}{feedback}{after_feedback}{mermaid}{after_mermaid}{dsl}{tail}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -182,6 +361,7 @@ mod tests {
 
     use super::*;
     use crate::agent_builder::designer::WorkflowDesigner;
+    use crate::agent_builder::outcome::{GenerationSource, StageProvenance};
     use crate::agent_builder::workflow_dsl::{DslEdge, DslNode};
 
     /// The request the offline designer is fed in the deterministic tests.
@@ -408,5 +588,170 @@ mod tests {
             format!("{:?}", DlGenerator::with_model(dynamic(&model))),
             "DlGenerator { has_model: true }"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Refine mode
+    // -----------------------------------------------------------------------
+
+    /// The requested change the refine tests send.
+    const REFINE_FEEDBACK: &str = "Add a confirmation step after the order is collected.";
+
+    /// The Mermaid diagram of the document refine starts from.
+    const REFINE_MERMAID: &str =
+        "graph TD\n  start[Node start: Start]\n  end[Node end: End]\n  start --> end";
+
+    /// The document refine starts from.
+    fn existing() -> WorkflowDsl {
+        demo_spec().to_dsl()
+    }
+
+    /// The one provenance record of a refinement.
+    fn only_record(refinement: &Refinement) -> &StageProvenance {
+        assert_eq!(refinement.provenance.len(), 1);
+        &refinement.provenance.stages[0]
+    }
+
+    #[tokio::test]
+    async fn refine_rejects_blank_feedback_before_the_model() {
+        let model = Arc::new(ScriptedModel::text(MODEL_FENCE));
+        let generator = DlGenerator::with_model(dynamic(&model));
+        let current = existing();
+
+        for feedback in ["", "   ", "\n\t "] {
+            let error = generator
+                .refine(feedback, &current, REFINE_MERMAID)
+                .await
+                .expect_err("blank feedback is invalid");
+            assert_eq!(error.kind(), ErrorKind::Validation);
+        }
+        assert_eq!(model.call_count(), 0, "no model call for blank feedback");
+    }
+
+    #[tokio::test]
+    async fn refine_accepts_a_valid_model_document() {
+        let model = Arc::new(ScriptedModel::text(MODEL_FENCE));
+        let generator = DlGenerator::with_model(dynamic(&model));
+        let current = existing();
+
+        let refinement = generator
+            .refine(REFINE_FEEDBACK, &current, REFINE_MERMAID)
+            .await
+            .expect("the model path succeeds");
+
+        assert_eq!(refinement.workflow.name, "model-name");
+        refinement
+            .workflow
+            .validate()
+            .expect("the revision is valid");
+        let record = only_record(&refinement);
+        assert_eq!(record.stage, ProgressStage::RefiningDl);
+        assert_eq!(record.source, GenerationSource::Model);
+        assert_eq!(record.detail, "");
+        assert!(!refinement.provenance.has_fallback());
+
+        assert_eq!(model.call_count(), 1);
+        let call = model.last_call().expect("one call");
+        assert_eq!(call.messages.len(), 2);
+        assert_eq!(call.messages[0].text(), DL_REFINE_SYSTEM_PROMPT);
+        let user = call.messages[1].text();
+        assert!(
+            user.contains(REFINE_FEEDBACK),
+            "the user message carries the feedback"
+        );
+        assert!(
+            user.contains(REFINE_MERMAID),
+            "the user message carries the Mermaid diagram"
+        );
+        let document_json = serde_json::to_string_pretty(&current).expect("serialize");
+        assert!(
+            user.contains(&document_json),
+            "the user message carries the existing document"
+        );
+        assert!(user.contains("## Existing workflow document"));
+        assert_eq!(call.request.model_name, "scripted-model");
+    }
+
+    #[tokio::test]
+    async fn refine_keeps_the_existing_document_on_unusable_answers() {
+        let cases = [
+            (
+                Arc::new(ScriptedModel::text("there is no document here")),
+                "answer is not a workflow document",
+            ),
+            (
+                Arc::new(ScriptedModel::text(
+                    r#"```json
+{"name": "dangling", "description": "broken",
+ "nodes": [{"id": "start", "type": "start"}],
+ "edges": [{"source": "start", "target": "ghost"}]}
+```"#,
+                )),
+                "revised document is invalid",
+            ),
+            (
+                Arc::new(ScriptedModel::new([ScriptedTurn::fail("boom")])),
+                "model call failed",
+            ),
+        ];
+
+        let current = existing();
+        for (model, reason) in cases {
+            let generator = DlGenerator::with_model(dynamic(&model));
+
+            let refinement = generator
+                .refine(REFINE_FEEDBACK, &current, REFINE_MERMAID)
+                .await
+                .expect("refine problems never fail");
+
+            assert_eq!(
+                refinement.workflow, current,
+                "the existing document is kept"
+            );
+            let record = only_record(&refinement);
+            assert_eq!(record.stage, ProgressStage::RefiningDl);
+            assert_eq!(record.source, GenerationSource::Fallback);
+            assert!(
+                record.detail.contains(reason),
+                "detail {:?} lacks {reason:?}",
+                record.detail
+            );
+            assert_eq!(refinement.provenance.fallback_count(), 1);
+            assert_eq!(model.call_count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn refine_without_a_model_keeps_the_existing_document() {
+        let current = existing();
+        let refinement = DlGenerator::new()
+            .refine(REFINE_FEEDBACK, &current, REFINE_MERMAID)
+            .await
+            .expect("refine without a model succeeds");
+
+        assert_eq!(refinement.workflow, current);
+        let record = only_record(&refinement);
+        assert_eq!(record.stage, ProgressStage::RefiningDl);
+        assert_eq!(record.source, GenerationSource::Deterministic);
+        assert!(record.detail.contains("no model configured"));
+        assert!(!refinement.provenance.has_fallback());
+    }
+
+    #[test]
+    fn refinement_round_trips_as_json() {
+        let mut provenance = GenerationProvenance::new();
+        provenance.record_model(ProgressStage::RefiningDl);
+        let refinement = Refinement {
+            workflow: existing(),
+            provenance,
+        };
+
+        let value = serde_json::to_value(&refinement).expect("serialize");
+        assert_eq!(value["provenance"]["stages"][0]["stage"], "refining_dl");
+        let restored: Refinement = serde_json::from_value(value).expect("parse");
+        assert_eq!(restored, refinement);
+
+        let empty: Refinement = serde_json::from_value(json!({})).expect("parse an empty object");
+        assert_eq!(empty, Refinement::default());
     }
 }
