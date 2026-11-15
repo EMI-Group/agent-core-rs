@@ -3,7 +3,8 @@
 A real git-worktree helper for the DeepAgent harness, ported from `openjiuwen/harness/tools/worktree/`: create, list, lock, unlock, remove, prune and inspect worktrees through `git`, with a persisted registry and lifecycle events.
 It gives an agent (or a team member) an isolated checkout at `<repo-root>/.worktrees/<slug>` without cloning the repository.
 The model-facing entry points are the `worktree`, `enter_worktree` and `exit_worktree` tools; the `WorktreeRail` publishes the bounded worktree context section, and everything else is host API.
-`crate::tools::ToolRegistry` mounts all three tools (`BuiltinTool::Worktree`, `BuiltinTool::EnterWorktree`, `BuiltinTool::ExitWorktree`), builds them over one shared manager, and hands `enter_worktree`/`exit_worktree` one shared `WorktreeSessionStore`.
+`crate::tools::ToolRegistry` mounts all three tools (`BuiltinTool::Worktree`, `BuiltinTool::EnterWorktree`, `BuiltinTool::ExitWorktree`) and hands `enter_worktree`/`exit_worktree` one shared `WorktreeSessionStore` (`registry.rs:154`, default `MemoryWorktreeSessionStore::new()`).
+The manager is shared only when the host wires one with `ToolRegistry::with_worktree_manager`; otherwise `shared_worktree_manager` (`registry.rs:517-521`) builds a fresh `Arc<WorktreeManager>::new(repo_root)` per tool call — harmless because the manager is stateless (root, lock path and registry path are all derived from `repo_root`), but it means registry-default tools carry no owner, no sparse selection and the noop event sink.
 The registry's store is a `MemoryWorktreeSessionStore` unless the host calls `ToolRegistry::with_worktree_session_store`; each tool also accepts `with_sessions` directly.
 `WorktreeRail` is not registered by the registry or the builder: a host constructs and registers it, and it reads the same session store.
 ## API Surface
@@ -134,6 +135,7 @@ Everything else is module-path only (`find_git_root`, `GitOutput`, `WorktreeCrea
 A host outside the crate that fakes `GitRunner` must bring its own `async-trait` (workspace `0.1`); the crate does not re-export the attribute macro, and `openjiuwen-cli` currently has no `async-trait` dependency.
 `tools.rs` never changes the process cwd; a caller must apply the reported `worktree_path`/`original_cwd` in its own cwd stack.
 The session tools consult `crate::permission` path guards for the target path on mutating actions and block only on `PermissionLevel::Deny` (`ask`/`allow` pass, no engine fails open).
+The `worktree` tool guards `create`/`remove`/`lock`/`unlock` only (`tool.rs:186-260`); `list`, `prune` and `status` run unguarded because they inspect or reconcile state rather than write into a target.
 The tool is mounted by `crate::tools::ToolRegistry` as `BuiltinTool::Worktree`, the last of the extended tools, built from a `WorktreeManager` plus the registry language and permission engine.
 `WorktreeManager` acquires the repo lock itself for every mutating operation, so two managers over one workspace are coordinated; `repo_lock()` is exposed for a caller that needs the lock around its own critical section.
 The lock guard is an OS advisory lock on a `Send` descriptor, not a `parking_lot`/`std` mutex, so it may be held across the manager's git `.await` points; no `parking_lot`/`std` lock is ever held across `.await`.
