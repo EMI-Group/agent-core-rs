@@ -65,6 +65,7 @@ pub mod config;
 pub mod embedding;
 pub mod flow;
 pub mod lexical;
+pub mod render;
 pub mod truncation;
 
 pub use codebooks::{
@@ -82,6 +83,13 @@ pub use flow::{
 pub use lexical::{
     compile_matcher, tokenize, LexicalDocument, LexicalHit, LexicalIndex, QueryMatcher, BM25_B,
     BM25_K1, FIELD_WEIGHTS, IDENTITY_BONUS, PHRASE_FIELD_WEIGHTS,
+};
+pub use render::{
+    build_disclosure_messages, build_disclosure_prompt_parts, build_exposed_fragment,
+    disclosure_request_marker, disclosure_system_prompt, disclosure_user_prefix,
+    exposure_item_count, fragmentation_fingerprint, parse_selected_codes,
+    DefaultSubtreeRenderer, DisclosurePromptParts, SubtreeRenderer,
+    DISCLOSURE_PROMPT_VERSION,
 };
 pub use truncation::{
     take_budget, truncate_chars, truncate_chars_with_ellipsis, truncate_sorted_by_score,
