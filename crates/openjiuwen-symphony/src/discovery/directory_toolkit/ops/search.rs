@@ -1,142 +1,31 @@
-//! Operation execution for the `skill_index` tool: list, search, read, and pipelines.
-//!
-//! Ports the execution half of Python `openjiuwen.symphony.discovery.directory_toolkit`
-//! (`_list`, `_search`, `_search_categories`, `_search_content_one`, `_search_entry_one`,
-//! `_matched_snippets`, `_read_skills`, `_read`, and `_apply_pipeline`). Pagination
-//! cursors, output budgeting and the incremental notice live in the toolkit layer, which
-//! drives these functions.
-//!
-//! # Search assembly
-//!
-//! A search runs one query at a time and keeps, per query, the ranked matches bounded by
-//! the per-query limit. A batch (more than one query) on the advanced shape interleaves
-//! the per-query groups by rank so no single query floods the result; the simple shape
-//! concatenates them and lets the response page over the union. Identities are
-//! de-duplicated, and the query indexes that matched an identity are recorded so a row
-//! can render `matches: 1, 3`.
-//!
-//! When a content query on the simple shape finds nothing, the category tree answers
-//! instead ([`search_categories`]), so the model gets "try this group" hints rather than
-//! an empty answer.
-//!
-//! # Deviations from Python
-//!
-//! - **No regular expressions.** Python compiles the query with
-//!   `retrieval.search.runtime.lexical.compile_matcher`, which is a bounded regex unless
-//!   `fixed_strings` is set. This crate ships no regex engine, so a query matches either
-//!   as a case-(in)sensitive substring or, when it carries `*`, `?`, or `[`, as a glob
-//!   through [`glob_match`]; `fixed_strings` forces the substring reading. The evidence a
-//!   `matches` search reports is therefore line-oriented rather than pattern-oriented.
-//! - **Content ranking is BM25 plus a literal pass.** Python's lexical index scores
-//!   weighted fields, phrase hits, and identity tiers over the whole document. The port
-//!   ranks with the catalog's BM25 index ([`SkillFs::search`]) and then appends the
-//!   scoped records whose text contains the query verbatim, which keeps the ordering
-//!   deterministic and needs no model.
-//! - **A missing record is skipped, not raised.** Python indexes the view and raises
-//!   `KeyError`; a view built from the same catalog cannot be missing the record, so the
-//!   port degrades instead of panicking.
-//!
-//! Everything here is synchronous, offline, and deterministic: ties break on the path (or
-//! worker id), never on hash-map iteration order.
-//!
-//! [`glob_match`]: crate::discovery::directory_toolkit::matcher::glob_match
+//! The `search` operation: content and entry matching, snippet assembly, and the
+//! category-hint fallback.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::discovery::directory_toolkit::matcher::{
+    case_fold, glob_match, has_wildcard, literal_match_rank,
+};
+use crate::discovery::directory_toolkit::render::{
+    compact, directory_description, safe_match_snippet, sanitize_model_text, search_directory_row,
+    search_row, Row,
+};
+use crate::discovery::directory_toolkit::validate::{
+    SearchMatch, SearchResult, ValidatedRequest, MAX_QUERY_CHARS,
+};
+use crate::discovery::directory_toolkit::view::{
+    category_segments, DirectoryEntry, SkillDirectoryView,
+};
 use crate::discovery::models::SkillRecord;
 use crate::discovery::SkillFs;
 use crate::error::{validation, Result};
 use crate::model::CapabilityDescriptor;
 use crate::search::LexicalIndex;
 
-use super::matcher::{case_fold, glob_match, has_wildcard, literal_match_rank};
-use super::render::{
-    compact, directory_description, list_row, metadata_card, row_count, safe_match_snippet,
-    sanitize_model_text, search_directory_row, search_row, ListView, Row,
+use super::{
+    Execution, CATEGORY_CAPABILITY_TYPE, CATEGORY_HINT_CHARS, DEFAULT_MULTI_QUERY_LIMIT,
+    SNIPPET_CHARS,
 };
-use super::validate::{
-    validate, validate_identifiers, validate_paths, OutputMode, PipelineOperation, PipelineStage,
-    ReadMode, RequestIssue, SearchMatch, SearchResult, SkillIndexRequest, ValidatedRequest,
-    MAX_QUERY_CHARS,
-};
-use super::view::{category_segments, DirectoryEntry, SkillDirectoryView};
-
-/// The characters a `matches` search snippet is compacted to.
-pub const SNIPPET_CHARS: usize = 180;
-
-/// The characters of a category description a category hint shows.
-pub const CATEGORY_HINT_CHARS: usize = 300;
-
-/// The per-query hit limit a multi-query advanced search falls back to.
-pub const DEFAULT_MULTI_QUERY_LIMIT: usize = 5;
-
-/// The lines a `head` read returns when the request names none.
-pub const DEFAULT_READ_LINES: usize = 10;
-
-/// The capability type the category-hint index uses for its documents.
-pub const CATEGORY_CAPABILITY_TYPE: &str = "category";
-
-/// One operation's rows plus the counters a caller needs to page and summarize them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Execution {
-    /// The rendered rows, before any pipeline or paging.
-    pub rows: Vec<Row>,
-    /// How many entries the operation matched, before any pipeline or paging.
-    pub total_count: usize,
-    /// Whether the operation returned every match (false when a per-query limit bit).
-    pub complete: bool,
-}
-
-/// The result of applying a pipeline (and the output mode) to rendered rows.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PipelineOutcome {
-    /// The rows left after the stages.
-    pub rows: Vec<Row>,
-    /// Whether the stages removed nothing.
-    pub complete: bool,
-    /// The count a `count` stage (or `output_mode = count`) produced.
-    pub count_value: Option<usize>,
-    /// The row count after a stage that followed a `count` stage.
-    pub transformed_count: Option<usize>,
-}
-
-/// Runs the `list` operation.
-///
-/// The tree view ignores `recursive` and walks with
-/// [`SkillDirectoryView::tree_entries`]; every other view scopes with
-/// [`SkillDirectoryView::entries`]. Rows are rendered by
-/// [`list_row`].
-///
-/// # Errors
-///
-/// Returns [`Error::Validation`](crate::error::Error::Validation) for an unknown scope path.
-pub fn execute_list(
-    view: &SkillDirectoryView,
-    paths: &[String],
-    request: &ValidatedRequest,
-) -> Result<Execution> {
-    let entries = if request.view == ListView::Tree {
-        view.tree_entries(paths, request.max_depth, request.directories_only)?
-    } else {
-        view.entries(
-            paths,
-            request.recursive,
-            request.max_depth,
-            request.directories_only,
-            request.directory_entry,
-        )?
-    };
-    let total_count = entries.len();
-    let rows: Vec<Row> = entries
-        .into_iter()
-        .map(|entry| list_row(&entry, request.view, view))
-        .collect();
-    Ok(Execution {
-        rows,
-        total_count,
-        complete: true,
-    })
-}
 
 /// Runs the `search` operation.
 ///
@@ -312,164 +201,6 @@ pub fn execute_search(
         rows,
         total_count,
         complete,
-    })
-}
-
-/// Runs the `read` operation over resolved Skill ids.
-///
-/// One row per Skill: `full` renders the whole
-/// [`metadata_card`], `head`
-/// its first [`DEFAULT_READ_LINES`] lines (or `line_count`), and `range` the 1-based
-/// inclusive `start_line..=end_line` slice.
-///
-/// # Errors
-///
-/// Returns [`Error::Validation`](crate::error::Error::Validation) `Unknown Skill: <id>` for an unknown id, or naming
-/// `end_line` when a `range` read asks for an inverted range.
-pub fn execute_read(
-    view: &SkillDirectoryView,
-    skills: &[String],
-    request: &ValidatedRequest,
-) -> Result<Execution> {
-    let mut rows: Vec<Row> = Vec::with_capacity(skills.len());
-    for skill in skills {
-        let Some(record) = view.record(skill) else {
-            return Err(validation("skills", format!("Unknown Skill: {skill}")));
-        };
-        let card = metadata_card(record);
-        let mut lines: Vec<&str> = card.split('\n').collect();
-        match request.read_mode {
-            ReadMode::Full => {}
-            ReadMode::Head => {
-                lines.truncate(request.line_count.unwrap_or(DEFAULT_READ_LINES));
-            }
-            ReadMode::Range => {
-                let start = request.start_line.unwrap_or(1);
-                let end = request.end_line.unwrap_or(start);
-                if end < start {
-                    return Err(validation(
-                        "end_line",
-                        "must be greater than or equal to start_line",
-                    ));
-                }
-                let from = start.saturating_sub(1).min(lines.len());
-                let to = end.min(lines.len());
-                lines = if from < to {
-                    lines[from..to].to_vec()
-                } else {
-                    Vec::new()
-                };
-            }
-        }
-        rows.push(Row::new(lines.join("\n"), record.worker_id.clone()));
-    }
-    let total_count = rows.len();
-    Ok(Execution {
-        rows,
-        total_count,
-        complete: true,
-    })
-}
-
-/// Applies a pipeline and the output mode to rendered rows.
-///
-/// Every row is first flattened into one row per rendered line (Python does the same),
-/// then the stages run in order. A `count` stage replaces the rows with a single count
-/// row; the output mode `count` does the same after the stages.
-///
-/// `filter` matches a row's whole text with the same substitution the rest of the crate
-/// uses for Python's matcher: a case-(in)sensitive substring, or a `*`/`?` glob when the
-/// pattern carries a wildcard and `fixed_strings` is unset. `fixed_strings` is accepted
-/// for compatibility and only disables that glob reading; there is no regex engine.
-///
-/// # Errors
-///
-/// Returns [`Error::Validation`](crate::error::Error::Validation) for a malformed stage: a missing or non-positive line
-/// count, a blank filter query, an inverted slice, or an unknown operation.
-pub fn apply_pipeline(
-    rows: &[Row],
-    pipeline: &[PipelineStage],
-    output_mode: OutputMode,
-) -> Result<PipelineOutcome> {
-    let mut current: Vec<Row> = rows.to_vec();
-    let mut complete = true;
-    let mut count_value: Option<usize> = None;
-    let mut count_seen = false;
-    if !pipeline.is_empty() {
-        current = current
-            .iter()
-            .flat_map(|row| {
-                row.text
-                    .split('\n')
-                    .map(|line| Row::new(line, row.worker_id.clone()))
-                    .collect::<Vec<Row>>()
-            })
-            .collect();
-    }
-    for stage in pipeline {
-        let Some(operation) = PipelineOperation::parse(&stage.operation) else {
-            return Err(validation(
-                "pipeline.operation",
-                format!("must be one of: {}", PipelineOperation::names().join(", ")),
-            ));
-        };
-        match operation {
-            PipelineOperation::Limit => {
-                count_value = None;
-                let limit = positive(stage.lines, "lines")?;
-                complete = complete && current.len() <= limit;
-                current.truncate(limit);
-            }
-            PipelineOperation::Slice => {
-                count_value = None;
-                let start = positive(stage.start_line, "start_line")?;
-                let end = positive(stage.end_line, "end_line")?;
-                if end < start {
-                    return Err(validation(
-                        "pipeline.end_line",
-                        "must be greater than or equal to start_line",
-                    ));
-                }
-                complete = complete && start == 1 && end >= current.len();
-                let from = (start - 1).min(current.len());
-                let to = end.min(current.len());
-                current = if from < to {
-                    current[from..to].to_vec()
-                } else {
-                    Vec::new()
-                };
-            }
-            PipelineOperation::Filter => {
-                count_value = None;
-                let query = stage.query.as_deref().unwrap_or_default();
-                let matcher = TextMatcher::new(query, stage.case_insensitive, stage.fixed_strings)?;
-                let invert = stage.invert;
-                current.retain(|row| matcher.matches(&row.text) != invert);
-            }
-            PipelineOperation::Count => {
-                let count = row_count(&current);
-                count_value = Some(count);
-                count_seen = true;
-                current = vec![Row::text_only(count.to_string())];
-            }
-        }
-    }
-    if output_mode == OutputMode::Count {
-        let count = row_count(&current);
-        count_value = Some(count);
-        count_seen = true;
-        current = vec![Row::text_only(count.to_string())];
-    }
-    let transformed_count = if count_seen && count_value.is_none() {
-        Some(row_count(&current))
-    } else {
-        None
-    };
-    Ok(PipelineOutcome {
-        rows: current,
-        complete,
-        count_value,
-        transformed_count,
     })
 }
 
@@ -670,67 +401,6 @@ pub fn matched_snippets(
         case_insensitive,
         false,
     )
-}
-
-/// Resolves the Skill ids a `read` request names.
-///
-/// `skills` wins; the legacy `paths` form only resolves `META.md` paths that an earlier
-/// result observed (`observed_meta_paths`), which is how Python's `_observed_meta_paths`
-/// cross-call scope works.
-///
-/// # Errors
-///
-/// Returns [`Error::Validation`](crate::error::Error::Validation) when both forms are supplied, when neither is, when a
-/// path was never observed (`read accepts only Skills returned by an earlier skill_index
-/// result`), or when a listed value is malformed.
-pub fn resolve_read_skills(
-    view: &SkillDirectoryView,
-    request: &ValidatedRequest,
-    observed_meta_paths: &BTreeSet<String>,
-) -> Result<Vec<String>> {
-    let skills = request.request.skills.as_ref();
-    let legacy = request.request.paths.as_ref();
-    if skills.is_some() && legacy.is_some() {
-        return Err(validation(
-            "skills",
-            "skills and paths are mutually exclusive",
-        ));
-    }
-    if let Some(paths) = legacy {
-        let mut resolved: Vec<String> = Vec::new();
-        for path in validate_paths(&Some(paths.clone()), true)? {
-            let normalized = SkillDirectoryView::normalize_path(&path)?;
-            if !observed_meta_paths.contains(&normalized) {
-                return Err(validation(
-                    "paths",
-                    "read accepts only Skills returned by an earlier skill_index result",
-                ));
-            }
-            let record = view.resolve_metadata_path(&normalized)?;
-            if !resolved.contains(&record.worker_id) {
-                resolved.push(record.worker_id.clone());
-            }
-        }
-        return Ok(resolved);
-    }
-    validate_identifiers(&request.request.skills, "skills", true)
-}
-
-/// Validates one model-facing request into its typed projection.
-///
-/// Python's `_validate_request` together with the `_enum`/`_positive`/`_boolean` parsers
-/// it calls. In Rust the booleans and integers are already typed, so those failures are
-/// impossible; every remaining failure — an unknown enum value, an out-of-range number, a
-/// field the operation does not accept, a malformed pipeline — becomes a [`RequestIssue`]
-/// naming its field instead of a panic.
-///
-/// # Errors
-///
-/// Returns every issue found; a valid request yields `Ok`.
-pub fn validate_request(
-    request: &SkillIndexRequest,
-) -> std::result::Result<ValidatedRequest, Vec<RequestIssue>> {
-    validate(request)
 }
 
 /// One search hit: a content-ranked record or a matched directory entry.
@@ -938,7 +608,7 @@ fn category_text(
 /// expression; this crate ships no regex engine. `fixed_strings` therefore only disables
 /// the glob reading.
 #[derive(Debug, Clone)]
-struct TextMatcher {
+pub(super) struct TextMatcher {
     /// The (optionally folded) pattern.
     pattern: String,
     /// Whether the pattern carries a `*`/`?`/`[` wildcard.
@@ -954,7 +624,7 @@ impl TextMatcher {
     ///
     /// Returns [`Error::Validation`](crate::error::Error::Validation) for a blank query or one longer than
     /// [`MAX_QUERY_CHARS`].
-    fn new(query: &str, case_insensitive: bool, fixed_strings: bool) -> Result<Self> {
+    pub(super) fn new(query: &str, case_insensitive: bool, fixed_strings: bool) -> Result<Self> {
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return Err(validation("query", "must be a non-empty string"));
@@ -978,7 +648,7 @@ impl TextMatcher {
     }
 
     /// Whether `value` matches this pattern.
-    fn matches(&self, value: &str) -> bool {
+    pub(super) fn matches(&self, value: &str) -> bool {
         let candidate = if self.case_insensitive {
             case_fold(value)
         } else {
@@ -1005,22 +675,6 @@ fn matched_queries(queries: &[String], indexes: &[usize]) -> Vec<String> {
         .collect()
 }
 
-/// Reads one positive line number out of a pipeline stage.
-///
-/// # Errors
-///
-/// Returns [`Error::Validation`](crate::error::Error::Validation) naming `pipeline.<field>` when the stage does not carry a
-/// positive value.
-fn positive(value: Option<i64>, field: &str) -> Result<usize> {
-    match value.and_then(|value| usize::try_from(value).ok()) {
-        Some(value) if value >= 1 => Ok(value),
-        _ => {
-            let field = format!("pipeline.{field}");
-            Err(validation(&field, "must be a positive integer"))
-        }
-    }
-}
-
 /// The last non-empty segment of a virtual path.
 fn last_segment(path: &str) -> &str {
     path.rsplit('/')
@@ -1032,6 +686,10 @@ fn last_segment(path: &str) -> &str {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    use crate::discovery::directory_toolkit::validate::{OutputMode, PipelineStage};
+
+    use super::super::apply_pipeline;
 
     #[test]
     fn text_matcher_reads_substrings_globs_and_fixed_strings() {
