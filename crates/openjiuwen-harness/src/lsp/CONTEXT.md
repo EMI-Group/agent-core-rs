@@ -113,6 +113,8 @@ Python parity target: tool name `lsp`, 1-based model positions, `Defined in path
 - Files are synchronized before a request (`didOpen`, then full-text `didChange` with monotonic versions); notification handlers are safe to register before and after `initialize`, and a panicking handler cannot kill the I/O task.
 - No new dependencies beyond the crate manifest (tokio, serde/serde_json, schemars, async-trait, parking_lot, tracing, sysop path helpers).
 - Files stay around ≤1000 lines; `tool.rs` delegates action execution to `tool_ops.rs`.
+- The module is compiled unconditionally (`pub mod lsp;` in `lib.rs`); nothing inside `src/lsp` is behind a `#[cfg(feature = ...)]` gate.
+- No path here returns `Error::Unsupported`: the only "unsupported" notions are the internal `PullOutcome::Unsupported` branch in `tool_ops.rs` (server does not advertise `diagnosticProvider`, so the payload is `success=true` with `source: "none"`) and `tool::map_client_error`, which turns a JSON-RPC `-32601` into `Operation not supported by this language server: <method>`.
 
 ## Known Issues
 
