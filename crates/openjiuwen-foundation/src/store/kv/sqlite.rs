@@ -391,15 +391,27 @@ mod tests {
             .unwrap());
         assert_eq!(store.get("k").await.unwrap(), Some(KvValue::text("first")));
 
+        // A live TTL is refused and the stored value survives; five seconds is far
+        // longer than the two statements below can take, even under parallel load.
         assert!(store
-            .exclusive_set("ttl", KvValue::text("a"), Some(Duration::from_millis(20)))
+            .exclusive_set("ttl", KvValue::text("a"), Some(Duration::from_secs(5)))
             .await
             .unwrap());
         assert!(!store
             .exclusive_set("ttl", KvValue::text("b"), None)
             .await
             .unwrap());
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(store.get("ttl").await.unwrap(), Some(KvValue::text("a")));
+
+        // Expire the row by backdating its deadline rather than sleeping through a
+        // real TTL window: `pool()` is the documented companion-query hook and the
+        // elapsed-TTL path is identical once `expiry_ms` is in the past.
+        sqlx::query("UPDATE kv_store SET expiry_ms = ?1 WHERE k = ?2")
+            .bind(now_epoch_ms() - 1)
+            .bind("ttl")
+            .execute(store.pool())
+            .await
+            .unwrap();
         assert_eq!(store.get("ttl").await.unwrap(), None);
         assert!(!store.exists("ttl").await.unwrap());
         assert!(store
