@@ -43,6 +43,11 @@
 //! shutdown/kill/drop — is reported into a [`crate::monitor::RunMonitor`] as a
 //! [`crate::monitor::RunKind::Spawn`] run.
 //!
+//! Cancellation is correlated by a request id: [`crate::spawn::CancelRequest`] is
+//! the payload of a [`crate::spawn::SpawnMessageKind::Cancel`] frame, the process
+//! backends write it down the child's stdin, the in-process backend cancels the
+//! matching in-flight call, and the HTTP client posts it to its cancel endpoint.
+//!
 //! Deferred transports are typed, never silent: `RemoteProtocol::Mq`
 //! (Pulsar/ZeroMQ reply-topic routing) and `RemoteProtocol::A2a` (the A2A remote
 //! transport) fail with `Unsupported` from
@@ -69,7 +74,7 @@ pub use external::ExternalCommandSpawner;
 pub use frames::{frame_bytes, parse_frame_line, read_frame, DEFAULT_MAX_FRAME_BYTES};
 pub use in_process::{InProcessAgent, InProcessFactory, InProcessHandler, InProcessSpawner};
 pub use monitored::MonitoredSpawnedAgent;
-pub use protocol::{SpawnMessage, SpawnMessageKind};
+pub use protocol::{CancelRequest, SpawnMessage, SpawnMessageKind};
 pub use registry::{DeferredSpawner, SpawnerRegistry};
 pub use remote::{
     create_remote_client, RemoteAgent, RemoteAgentConfig, RemoteClient, RemoteProtocol,
@@ -340,9 +345,9 @@ impl SpawnSpec {
 /// Only the transport methods are required. [`Self::backend`],
 /// [`Self::is_healthy`], [`Self::health_snapshot`], [`Self::health`],
 /// [`Self::set_health_interval`], [`Self::cancel_task`],
-/// [`Self::send_with_timeout`] and [`Self::stream_with_timeout`] carry defaults
-/// so a minimal handle — and every backend that predates them — stays
-/// object-safe and compiles unchanged.
+/// [`Self::cancel_task_with_request_id`], [`Self::send_with_timeout`] and
+/// [`Self::stream_with_timeout`] carry defaults so a minimal handle — and every
+/// backend that predates them — stays object-safe and compiles unchanged.
 #[async_trait]
 pub trait SpawnedAgent: Send + Sync {
     /// The handle's stable id (not necessarily the OS process id).
@@ -489,16 +494,18 @@ pub trait SpawnedAgent: Send + Sync {
 
     /// Asks the backend to cancel the task identified by `task_id`.
     ///
-    /// The NDJSON protocol carries no request correlation id, so only a backend
-    /// that owns a real task handle (an HTTP endpoint, a broker) can honour this;
-    /// the default reports the seam instead of pretending to cancel.
+    /// The convenience form of [`Self::cancel_task_with_request_id`] with no
+    /// reason. A backend that owns no cancellation at all keeps the default and
+    /// reports the seam instead of pretending to cancel — an absence is typed, not
+    /// silent.
     ///
     /// # Errors
     ///
     /// [`openjiuwen_common::error::Error::Unsupported`] unless the backend
     /// implements task cancellation — the message names the backend — plus the
     /// backend's own failures: an unknown task
-    /// ([`openjiuwen_common::error::Error::NotFound`]), a deadline
+    /// ([`openjiuwen_common::error::Error::NotFound`]), a blank id
+    /// ([`openjiuwen_common::error::Error::Validation`]), a deadline
     /// ([`openjiuwen_common::error::Error::Timeout`]), or a transport failure
     /// ([`openjiuwen_common::error::Error::Transport`]).
     #[allow(clippy::unused_async_trait_impl)]
@@ -510,6 +517,36 @@ pub trait SpawnedAgent: Send + Sync {
                 self.backend()
             ),
         ))
+    }
+
+    /// Asks the backend to cancel the request identified by `request_id`,
+    /// carrying `reason` when the caller has one.
+    ///
+    /// `request_id` is the caller's correlation id for one in-flight request: the
+    /// value a request-id-aware invocation was started with
+    /// ([`crate::spawn::InProcessAgent`]'s own `send_with_request_id`), or an id the
+    /// caller and the child agreed on out of band (the process backends carry it in
+    /// the [`crate::spawn::CancelRequest`] frame). An id that matches no request is
+    /// conveyed faithfully — only the backend that owns the requests can report
+    /// that, as [`openjiuwen_common::error::Error::NotFound`] — while a blank id is
+    /// [`openjiuwen_common::error::Error::Validation`].
+    ///
+    /// Defaults to [`Self::cancel_task`] with the same id, because every backend
+    /// that can correlate by id at all can also correlate by id alone; a backend
+    /// with no cancellation propagates that method's
+    /// [`openjiuwen_common::error::Error::Unsupported`] instead of quietly
+    /// succeeding.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::cancel_task`] reports for this backend, or the backend's own
+    /// richer failure.
+    async fn cancel_task_with_request_id(
+        &self,
+        request_id: &str,
+        _reason: Option<&str>,
+    ) -> Result<()> {
+        self.cancel_task(request_id).await
     }
 }
 

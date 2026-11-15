@@ -62,6 +62,7 @@ impl SpawnSpec { pub fn class_agent(module, class) -> Self; pub fn team_agent(pa
     async fn health(&self) -> Result<bool>;                // Unsupported("agent health probe", <backend> hint)
     async fn set_health_interval(&self, interval: Duration) -> Result<()>;  // Unsupported("runtime health-interval re-tuning", <backend> hint)
     async fn cancel_task(&self, task_id: &str) -> Result<()>;  // Unsupported("spawned task cancellation", <backend> hint)
+    async fn cancel_task_with_request_id(&self, request_id: &str, reason: Option<&str>) -> Result<()>;  // default: cancel_task(request_id)
     async fn send_with_timeout(&self, inputs, timeout: Option<Duration>) -> Result<AgentOutput>;   // default: send(inputs)
     fn stream_with_timeout(&self, inputs, timeout: Option<Duration>) -> BoxStream<...>;            // default: stream(inputs)
 }
@@ -83,24 +84,34 @@ Its per-backend shapes are `{"backend": "subprocess", "program", "args", "cwd", 
 No secret is ever reported: the environment and the HTTP headers appear as **names only** (`env_names`, `header_names`), so a configured `Authorization: Bearer <token>` or `API_KEY=<value>` never reaches the summary.
 
 `SpawnSpec::backend` is a routing hint for `SpawnerRegistry`, not a wire change: it is additive metadata a Python child ignores (unknown fields are tolerated) and it never alters the frames.
-A minimal `SpawnedAgent` (only the required methods) reports `SpawnBackend::Unknown`, `is_healthy() == is_alive()`, an `Unsupported` `health`/`set_health_interval`/`cancel_task` whose message names its backend, and ignores the `send_with_timeout`/`stream_with_timeout` deadline hint (they call `send`/`stream`).
+A minimal `SpawnedAgent` (only the required methods) reports `SpawnBackend::Unknown`, `is_healthy() == is_alive()`, an `Unsupported` `health`/`set_health_interval`/`cancel_task`/`cancel_task_with_request_id` whose message names its backend, and ignores the `send_with_timeout`/`stream_with_timeout` deadline hint (they call `send`/`stream`).
+Cancellation has two seam methods: `cancel_task(task_id)` is the convenience form (no reason) and `cancel_task_with_request_id(request_id, reason)` is the correlated one, defaulted to `cancel_task(request_id)` — so a backend whose wire carries only an id still correlates by id, and a backend with no cancellation propagates that method's `Unsupported` instead of succeeding, while a blank id is `Validation` and an id that matches nothing in flight is `NotFound` from the backend that owns the requests.
 `set_health_interval` is the one seam method that re-configures a running backend instead of exchanging a message: only the process backends run a background health loop, so `InProcessAgent`, `RemoteAgent` and every host backend keep the default and report the gap by name — while a `MonitoredSpawnedAgent` over such a handle arms its own supervised loop, so the cadence is honoured where a host actually observes the spawn.
 The deadline on the bounded variants is advisory and never reaches the wire: `None` means "the backend's own default", `SpawnedProcess` and `RemoteAgent` honour a `Some(..)`, and `InProcessAgent` keeps the defaults.
 
 ### Wire — `protocol.rs`
 
 ```rust
-pub enum SpawnMessageKind { Input, Output, HealthCheck, HealthCheckResponse, Shutdown, ShutdownAck, Error, StreamChunk, Done }
+pub enum SpawnMessageKind { Input, Output, HealthCheck, HealthCheckResponse, Shutdown, ShutdownAck, Error, StreamChunk, Done, Cancel, CancelAck }
+impl SpawnMessageKind { pub const fn as_str(self) -> &'static str }   // "cancel_ack" …
 pub struct SpawnMessage { pub kind: SpawnMessageKind, pub payload: Value, pub timestamp: f64, pub message_id: String }
 impl SpawnMessage {
     pub fn new(kind, payload) -> Self;      // message_id = uuid v4, timestamp = unix secs
+    pub fn cancel(request_id: &str, reason: Option<&str>) -> Result<Self>;  // the Cancel frame
     pub fn to_line(&self) -> Result<String>;   // JSON + "\n"; Validation on unserializable or raw newline
     pub fn from_line(line: &str) -> Result<Self>;  // trims; Validation on blank / non-JSON / missing field / unknown kind
+}
+pub struct CancelRequest { pub request_id: String, pub reason: Option<String> }   // serde snake_case
+impl CancelRequest {
+    pub fn new(request_id, reason: Option<&str>) -> Result<Self>;  // Validation on a blank id
+    pub fn to_frame(&self) -> SpawnMessage;                        // {"request_id": …, "reason": … | null}
+    pub fn from_frame(frame: &SpawnMessage) -> Result<Self>;       // Validation on a non-cancel frame / malformed payload / blank id
 }
 ```
 
 `timestamp` is `f64` unix seconds; compare round-tripped frames with a tolerance (~1e-6) because `serde_json`'s float parser is not correctly rounded.
-Wire names are `snake_case` (`health_check_response`), not Python's upper-case `MessageType` values.
+Wire names are `snake_case` (`health_check_response`, `cancel_ack`), not Python's upper-case `MessageType` values, and `SpawnMessageKind::as_str` is the same table for messages.
+`cancel`/`cancel_ack` are the request-correlation pair: the parent names the in-flight request it wants cancelled (plus an optional reason) and the child echoes the same id back, so "received" is distinguishable from "never arrived". A blank id is `Validation` at both ends of the wire; an id that matches no request is conveyed faithfully (only the backend that owns the requests reports `NotFound`).
 
 ### Framing — `frames.rs`
 
@@ -141,7 +152,7 @@ pub struct SpawnedProcess;                                  // id, backend, pid,
 `SubprocessSpawner::new(config)` labels its children `SpawnBackend::Subprocess`, while `SubprocessSpawner::with_backend(config, backend)` is the wrapper form: a backend that is this protocol plus a step of its own labels its children with its own name, and both `Spawner::backend()` (the spawner's own `backend` field) and every child's handle report that label.
 `SpawnedProcess` implements `SpawnedAgent` directly, so both paths expose the same behaviour, including the trait's health accessors: `backend()` is the spawner's label (not always `subprocess`), `is_healthy()` reads the same atomic the background task updates, `health()` runs one probe, and `health_snapshot()` carries the same label and leaves `last_error` empty (a failed probe is an `Err` from `health`, not a fabricated snapshot field).
 The handle's `Debug` output shows that label beside its id, pid, liveness, and health.
-`cancel_task` keeps the unsupported default: the NDJSON protocol has no task handle to address, so a caller stops a child with `shutdown`/`force_kill`.
+`cancel_task`/`cancel_task_with_request_id` write one `cancel` frame carrying the id (and the reason) down the same serialized stdin writer — deliberately *without* taking the exchange lock, because a cancel has to reach a child that is mid-exchange — and the child answers with a `cancel_ack` the in-flight exchange ignores as a stray frame; a blank id is `Validation`, a desynchronized handle reports the same desync error an exchange would, and a child that already exited is a transport failure. A child that ignores the frame is not killed: stop it with `shutdown`/`force_kill`.
 `send_with_timeout(inputs, timeout)`/`stream_with_timeout(inputs, timeout)` bound one exchange: `Some(..)` is that exchange's deadline and `None` falls back to the configured `request_timeout_secs` (`send`/`stream` are the `None` form), so a host holding `Arc<dyn SpawnedAgent>` can bound a single invocation.
 `shutdown(timeout)` treats `Duration::ZERO` as "the configured `shutdown_timeout_secs`" (read through the clamped `SubprocessConfig::shutdown_timeout()`); a non-zero caller timeout wins over the configuration, and a child that does not exit within it is killed and reported `false`.
 `is_healthy` is the last observed probe result (fresh child = `true`); `health()` runs one probe synchronously.
@@ -178,12 +189,14 @@ A bare name that matches nothing is `Error::NotFound` naming the command and how
 #[async_trait] pub trait InProcessHandler: Send + Sync {
     fn is_alive(&self) -> bool;                            // true
     async fn send(&self, inputs: Value) -> Result<AgentOutput>;
+    async fn send_with_request_id(&self, request_id: &str, inputs: Value) -> Result<AgentOutput>;  // default: send(inputs)
+    fn cancel_request(&self, request_id: &str, reason: Option<&str>) -> bool;       // default: false
     fn stream(&self, inputs: Value) -> BoxStream<'static, Result<AgentChunk>>;
     async fn shutdown(&self) -> Result<()>;
 }
 pub type InProcessFactory = Arc<dyn Fn(&SpawnSpec) -> Result<Arc<dyn InProcessHandler>> + Send + Sync>;
 pub struct InProcessSpawner;                               // new(factory), from_handler(Arc<dyn InProcessHandler>)
-pub struct InProcessAgent;                                 // id, spec(), handler(), the trait methods
+pub struct InProcessAgent;                                 // id, spec(), handler(), send_with_request_id(id, inputs), the trait methods
 ```
 
 `new` calls the factory once per spawn, so a spec can select the bound agent; `from_handler` shares one already-built handler across every spawn.
@@ -192,6 +205,8 @@ Each spawn wraps its handler in a fresh `InProcessAgent` with the id `in-process
 `shutdown` calls `handler.shutdown()` then marks the handle dead and returns `Ok(true)`; `force_kill` does the same because an in-process handler is stopped, not signalled — there is no OS process — and both are idempotent because the handler's `shutdown` must be.
 A factory `Err` propagates from `spawn` and launches nothing.
 `describe()` is the marker `{"backend": "in_process", "hosted": true}`: a factory (or one shared handler) is not a transport configuration.
+Cancellation is correlated inside the hosted agent, because there is no child to send a frame to: `InProcessHandler::send_with_request_id` starts one invocation under a caller-known id and `InProcessHandler::cancel_request` cancels exactly that invocation (a `request_id`-keyed registry of `CancellationToken`s, typically), leaving the handler's other in-flight calls running; a handler that tracks nothing keeps the defaults (the id is accepted and ignored, `cancel_request` answers `false`).
+`InProcessAgent::send_with_request_id(request_id, inputs)` is the inherent entry point that pairs with the seam's cancels; `cancel_task(task_id)`/`cancel_task_with_request_id(request_id, reason)` forward to `cancel_request` — the id *is* the request id, so there is no cancel-all form — and answer `Error::NotFound` naming the id when nothing matches (including for a handler that cannot track requests), `Error::Validation` for a blank id.
 
 ### Registry — `registry.rs`
 
@@ -253,13 +268,14 @@ pub fn create_remote_client(protocol, config) -> Result<Arc<dyn RemoteClient>>;
     async fn invoke(&self, inputs: Value, timeout: Option<Duration>) -> Result<AgentOutput>;
     fn stream(&self, inputs: Value, timeout: Option<Duration>) -> BoxStream<'static, Result<AgentChunk>>;
     async fn cancel_task(&self, task_id: &str) -> Result<()>;
+    async fn cancel_task_with_request_id(&self, request_id: &str, reason: Option<&str>) -> Result<()>;  // default: cancel_task(request_id)
 }
 pub struct RemoteAgent;                                    // new(config), with_protocol(config, protocol), config(), agent_id(), protocol()
 pub struct RemoteSpawner;                                  // new(base_url), with_timeout, with_header, base_url(), config_for(agent_id)
 ```
 
 `RemoteAgent` implements both `RemoteClient` and `SpawnedAgent`.
-Through the seam it reports `backend() == RemoteHttp`, `pid() == None`, `is_healthy()` = the client's started state, `health()` = `Ok(is_started)` (the HTTP wire contract defines only invoke/stream/cancel, so there is no probe endpoint), and `cancel_task` forwards to `RemoteClient::cancel_task` (the one place a remote backend owns a real task handle).
+Through the seam it reports `backend() == RemoteHttp`, `pid() == None`, `is_healthy()` = the client's started state, `health()` = `Ok(is_started)` (the HTTP wire contract defines only invoke/stream/cancel, so there is no probe endpoint), and `cancel_task` forwards to `RemoteClient::cancel_task` (the one place a remote backend owns a real task handle) while `cancel_task_with_request_id` forwards to `RemoteClient::cancel_task_with_request_id`, which posts the id and the optional reason.
 `send_with_timeout`/`stream_with_timeout` forward the deadline to `RemoteClient::invoke`/`RemoteClient::stream`, so a bounded invocation is real on this backend while `send`/`stream` keep the configured `timeout_secs`.
 `RemoteAgent::new` stays lazy (the `reqwest` client is built on first `invoke`/`stream` or by `start`, so a directly constructed handle reports itself not alive until then), but `RemoteSpawner::spawn` calls `RemoteClient::start` before returning: a spawned remote child is started, so `is_alive()`/`is_healthy()`/`health()` are `true` immediately with no request sent (Python's `remote_agent.py` starts the child too), and a client that cannot be built fails the spawn.
 `RemoteSpawner::backend()` is `RemoteHttp`.
@@ -303,11 +319,13 @@ Frames travel one JSON object per line.
 | either | `error` | `{"message": …}` or a bare string (anything else is rendered as JSON) → `Error::Transport` naming the child |
 | parent → child | `health_check` | `null`; answered by `health_check_response`, whose payload counts as healthy for `null`/`true`/no `healthy` field |
 | parent → child | `shutdown` | `null`; answered by `shutdown_ack` (EOF before the ack is acceptable) |
+| parent → child | `cancel` | `{"request_id": …, "reason": … \| null}`; refused (`Validation`) when the id is blank |
+| child → parent | `cancel_ack` | echoes `{"request_id": …}` (plus whatever the child adds); the in-flight exchange reads it as a stray frame |
 
 Stdout/body handling, identical on both backends: blank and non-JSON lines are skipped at `trace` (a child's stray logging); a line that is JSON but not a frame, not valid UTF-8, or longer than `max_frame_bytes` is `Error::Validation`; an unterminated trailing line is still parsed.
 Any other frame arriving in the wrong direction is ignored at `trace` (Python's reader tolerates stray frames).
 
-HTTP: `POST {base_url}/{invoke_path}` and `POST {base_url}/{stream_path}` with body `{"session_id": <session_id|null>, "inputs": <inputs>}`; `POST {base_url}/{cancel_path}` with `{"task_id": <id>}`.
+HTTP: `POST {base_url}/{invoke_path}` and `POST {base_url}/{stream_path}` with body `{"session_id": <session_id|null>, "inputs": <inputs>}`; `POST {base_url}/{cancel_path}` with `{"task_id": <id>, "request_id": <id>, "reason": <reason|null>}` — the id under both its original key and its correlation name, so an endpoint written against the first layout keeps working while a reason-carrying cancel loses nothing on the way out.
 The stream endpoint answers one frame per line, parsed by the table above.
 Body lines that are not JSON are skipped; a `stream_chunk` that is not an `AgentChunk` is `Validation` and ends the stream; an `error` frame ends the stream after one `Err`.
 Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Transport` with the status and a whitespace-collapsed body snippet (≤ 256 chars), a `reqwest` timeout → `Error::Timeout`, a non-JSON success body or an invalid `AgentOutput` → `Error::Validation`, an invalid configured header → `Error::Config`.
@@ -322,7 +340,7 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 
 ## Design Decisions
 
-- **One exchange at a time per handle.** The protocol carries no request correlation id (`message_id` is generated per frame but nothing correlates on it), so a handle serialises exchanges with one fair `tokio::sync::Mutex` request guard; callers queue rather than interleave frames.
+- **One exchange at a time per handle.** The protocol correlates a *cancellation* (the `cancel` frame names the request id the caller and the child agreed on) but not an exchange (`message_id` is generated per frame but nothing correlates on it, and an `input` frame carries no id), so a handle serialises exchanges with one fair `tokio::sync::Mutex` request guard; callers queue rather than interleave frames. A `cancel` frame is written outside that guard on purpose: it must reach a child that is in the middle of an exchange, and the ordered stdin pipe is the only serialization it needs.
 - **The desync rule.** An exchange that ends without consuming its terminator — an abandoned stream, a request deadline, or a health probe that hits its deadline — leaves frames unread, so the handle is marked out of sync *before* the lock is released and every later `send`/`stream`/`health` fails with `Error::Validation` naming the child; the caller respawns.
 - **Kill on drop.** `tokio::process::Child::drop` does not kill and can leak a zombie, so dropping the last handle reference (its `Drop`) arms `start_kill` plus a detached reap, with `kill_on_drop(true)` as the final net when no runtime is available.
 - **stderr is always drained.** A child that fills its stderr pipe would block, so a task drains it into the debug log (first 512 chars per line) and is aborted with the handle.
@@ -338,7 +356,7 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - **No cancel endpoint, no cancel.** `cancel_task` without a configured `cancel_path` is `Error::Unsupported`, never a silent no-op.
 - **Health is a seam-level accessor, not a downcast.** `SpawnedAgent` carries `backend`, `is_healthy`, `health_snapshot` and `health` beside `is_alive`, so a caller holding `Arc<dyn SpawnedAgent>` needs no knowledge of `SpawnedProcess`; every one of them has a default (`Unknown`, `is_alive`, the composition, and an `Unsupported` probe naming the backend), which keeps the trait object-safe and every existing implementor compiling.
 - **Only liveness-backed health is promised by default.** "No probe ⇒ liveness is the answer" is the documented fallback; a backend that can probe (`SpawnedProcess`, `RemoteAgent`) overrides `health`/`is_healthy`, and one that cannot (`InProcessAgent` has nothing to ask) answers from its alive flag rather than inventing a probe.
-- **Cancellation is per-backend, never simulated.** The NDJSON protocol has no request correlation id, so a subprocess handle keeps the `Unsupported` default for `cancel_task` and stops its child with `shutdown`/`force_kill`; only the HTTP client, which owns a real `cancel_path`, forwards it.
+- **Cancellation is carried, never simulated.** A process backend writes a `cancel` frame with the caller's request id (and reason) and the child decides what to do; the in-process backend cancels the matching in-flight call through its handler; the HTTP client posts the id to its `cancel_path`. No backend fabricates a cancellation, and a backend with no cancellation keeps the trait's typed `Unsupported` (`cancel_task_with_request_id` defaults to `cancel_task`, so it reports the same absence). An id that matches nothing is conveyed faithfully by the wire and reported `NotFound` by whoever owns the in-flight requests.
 - **A deferred backend is a registered answer.** `SpawnerRegistry::with_deferred` stores `DeferredSpawner`s for `RemoteMq`/`RemoteA2a`, so routing is uniform: the missing transport is named in the `Unsupported` message (`Pulsar`/`a2a`) instead of surfacing as "nothing registered".
 - **Routing never falls back silently.** A `SpawnSpec::backend` that is not registered is a deferred failure naming that backend, `spawn_with` resolves exactly what it was asked for, and only an *unspecified* backend reaches the default / sole-spawner / ambiguity rules.
 - **A hint a runner cannot honour is a configuration error.** With only a single spawner installed, a `SpawnSpec::backend` that contradicts the spawner's own `backend()` is `Error::Config` naming both sides and both remedies (`Runner::set_spawner_registry`, `Runner::spawn_agent_with`); an unlabelled `Unknown` spawner cannot contradict the hint and keeps it as the run's label.
@@ -378,6 +396,7 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 ## Notes for Agents
 
 - Install a backend with `Runner::set_spawner`, or several with `Runner::set_spawner_registry`; `UnsupportedSpawner` stays the default, so an unconfigured runner fails a spawn with `Error::Unsupported`.
+- Cancelling through a handle from `Runner::spawn_agent` uses `cancel_task(task_id)` (no reason) or `cancel_task_with_request_id(request_id, reason)` (both); `MonitoredSpawnedAgent` forwards both unchanged — cancellation is not a lifecycle transition, so the run keeps its status until the cancelled request actually ends.
 - Every successful `Runner::spawn_agent`/`Runner::spawn_agent_with` is wrapped in `MonitoredSpawnedAgent::track`, so `Runner::active_spawns` lists the spawns not yet reported finished (a probe seeing a dead child, `shutdown`, `force_kill`, or `Drop`) and a failed spawn creates no monitor entry.
 - This module's own `pub use` group is the source of truth for names; `src/lib.rs` re-exports them flat (`SpawnBackend`, `SpawnHealth`, `SpawnerRegistry`, `DeferredSpawner`, the four backends, and `MonitoredSpawnedAgent`).
 - Integration suites: `tests/spawn_subprocess.rs` re-executes the test binary as the fake child (`FAKE_CHILD_MODE` selects echo/stream/crash/silent/malformed/oversized/health-failure/shutdown modes), and `tests/spawn_remote.rs` drives a loopback `wiremock` server.
@@ -388,7 +407,7 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - `SpawnedProcess::health_interval()` is the interval *this handle* currently supervises at: the configured `health_check_interval_secs` until `set_health_interval` changes it, and `Duration::ZERO` means "no background task". A re-tune is per handle, so two children of one spawner can probe at different rates; it is idempotent, and it is `Error::Validation` once the child has stopped (shutdown, kill, or an exit of its own) — respawn instead.
 - `set_health_interval` reaches a handle through the seam too, where `InProcessAgent`, `RemoteAgent` and any host backend keep the default and answer `Error::Unsupported` naming the backend and the missing background loop; through `MonitoredSpawnedAgent` (the handle `Runner::spawn_agent` returns) that answer is not a dead end: the decorator supervises the cadence itself and returns `Ok(())`, so a monitored in-process agent really does get background observations, and `Duration::ZERO` stops them.
 - `RemoteSpawner::spawn` returns a *started* `RemoteAgent` (readiness is `true` without a request); `RemoteAgent::new` is lazy, so a directly constructed handle reports not-alive until its first request or an explicit `RemoteClient::start`.
-- There is no child-side serve helper (no `serve_child_stdio`): a host's child program must read/write NDJSON itself — read one `input` bootstrap frame (`{"spawn_spec": …}`), then answer `input` (`{"inputs": …}`) frames with `output`/`stream_chunk`/`done`/`error` and reply to `health_check`/`shutdown`; `SpawnMessage::from_line`/`to_line` and `read_frame`/`frame_bytes` are reusable on that side.
+- There is no child-side serve helper (no `serve_child_stdio`): a host's child program must read/write NDJSON itself — read one `input` bootstrap frame (`{"spawn_spec": …}`), then answer `input` (`{"inputs": …}`) frames with `output`/`stream_chunk`/`done`/`error`, reply to `health_check`/`shutdown`, and answer a `cancel` frame with a `cancel_ack` echoing `{"request_id": …}` (the fake child's `cancel_echo` mode in `subprocess_tests.rs` is the worked example); `SpawnMessage::from_line`/`to_line` and `read_frame`/`frame_bytes` are reusable on that side.
 - The reference child implementation is `tests/spawn_subprocess.rs`'s `#[ignore]`d `fake_child` libtest case re-executed with `fake_child --exact --ignored --test-threads=1 --nocapture` (`--nocapture` is mandatory or libtest redirects the child's stdout and no frame reaches the pipe).
 - `SubprocessConfig::program` empty is `Error::Config` at spawn, not at construction, so a host can build a config incrementally.
 - `SubprocessSpawner::with_backend(config, backend)` is how a wrapper backend labels its children; a `SpawnedProcess` reports its spawner's label, so `backend() == Subprocess` only for a plain `SubprocessSpawner::new`/`default`.

@@ -16,8 +16,13 @@
 //! [`SpawnedProcess`] exposes the seam surface and hands every exchange to
 //! `subprocess_io`: one request frame down stdin followed by frames up stdout,
 //! with the wire in [`crate::spawn::protocol`] and the bounded line framing in
-//! [`crate::spawn::frames`]. A child implements no task cancellation (the protocol
-//! has no task handle to address): stop one with `shutdown` or `force_kill`.
+//! [`crate::spawn::frames`].
+//! Cancellation is a frame, not a signal:
+//! [`SpawnedAgent::cancel_task`](crate::spawn::SpawnedAgent::cancel_task) writes
+//! one `cancel` frame carrying the request id (and an optional reason) down the
+//! same serialized stdin writer, so a child that tracks its in-flight requests can
+//! cancel exactly the named one and echo the id in a `cancel_ack`; a child that
+//! ignores the frame is not killed — stop it with `shutdown` or `force_kill`.
 //!
 //! **No child outlives its handle.** Dropping the last reference kills and reaps
 //! the process, and the stderr drain and health tasks are aborted with it;
@@ -38,8 +43,9 @@ pub use subprocess_config::SubprocessConfig;
 // The exchange layer is a child module, so the helpers it owns are bound
 // explicitly; the rest of it is reached through them.
 use subprocess_io::{
-    force_kill_impl, health_impl, is_alive_impl, kill_child, send_impl, set_health_interval_impl,
-    shutdown_impl, spawn_health_task, spawn_stderr_task, stream_impl, write_frame,
+    cancel_impl, force_kill_impl, health_impl, is_alive_impl, kill_child, send_impl,
+    set_health_interval_impl, shutdown_impl, spawn_health_task, spawn_stderr_task, stream_impl,
+    write_frame,
 };
 
 use crate::error;
@@ -555,6 +561,30 @@ impl SpawnedAgent for SpawnedProcess {
         stream_impl(Arc::clone(&self.state), inputs, timeout)
     }
 
+    /// Writes one `cancel` frame for `task_id` with no reason.
+    ///
+    /// The child decides what a cancel means for the request it is running: this
+    /// backend only delivers the frame. See
+    /// [`SpawnedAgent::cancel_task_with_request_id`].
+    async fn cancel_task(&self, task_id: &str) -> Result<()> {
+        cancel_impl(&self.state, task_id, None).await
+    }
+
+    /// Writes one `cancel` frame carrying `request_id` and `reason`.
+    ///
+    /// Correlation is the child's: the id is what the caller and the child agreed
+    /// on, delivered verbatim, and the child echoes it in a `cancel_ack`. A blank
+    /// id is [`openjiuwen_common::error::Error::Validation`]; a handle that
+    /// abandoned a stream, or a child that already exited, fails exactly as an
+    /// exchange would.
+    async fn cancel_task_with_request_id(
+        &self,
+        request_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        cancel_impl(&self.state, request_id, reason).await
+    }
+
     async fn shutdown(&self, timeout: Duration) -> Result<bool> {
         shutdown_impl(&self.state, timeout).await
     }
@@ -583,7 +613,8 @@ struct ProcessState {
     stdin: Mutex<Option<ChildStdin>>,
     /// Read half of the protocol.
     stdout: Mutex<Option<BufReader<ChildStdout>>>,
-    /// Serialises exchanges (the protocol has no request correlation id).
+    /// Serialises exchanges (a cancel frame stays outside it: it must reach a
+    /// child that is mid-exchange).
     request: Mutex<()>,
     /// Set when an exchange ended without consuming its terminator.
     desynchronized: AtomicBool,

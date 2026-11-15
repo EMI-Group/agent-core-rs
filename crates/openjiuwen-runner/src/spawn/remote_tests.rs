@@ -805,7 +805,11 @@ async fn cancel_task_posts_the_task_id() {
     let requests = recorded(&server, |path| path == "/agents/a/cancel").await;
     assert_eq!(requests.len(), 1);
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(body, json!({"task_id": "task-1"}));
+    assert_eq!(
+        body,
+        json!({"task_id": "task-1", "request_id": "task-1", "reason": null}),
+        "the id travels under its original key and its correlation name"
+    );
 }
 
 #[tokio::test]
@@ -904,7 +908,47 @@ async fn cancel_task_through_the_seam_reaches_the_endpoint() {
     let requests = recorded(&server, |path| path == "/agents/a/cancel").await;
     assert_eq!(requests.len(), 1);
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(body, json!({"task_id": "task-9"}));
+    assert_eq!(
+        body,
+        json!({"task_id": "task-9", "request_id": "task-9", "reason": null})
+    );
+}
+
+#[tokio::test]
+async fn cancel_task_with_request_id_posts_the_id_and_the_reason() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/agents/a/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    let agent = server_agent(&server, "a");
+    RemoteClient::cancel_task_with_request_id(&agent, "req-42", Some("operator stop"))
+        .await
+        .unwrap();
+    let requests = recorded(&server, |path| path == "/agents/a/cancel").await;
+    assert_eq!(requests.len(), 1);
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body,
+        json!({"task_id": "req-42", "request_id": "req-42", "reason": "operator stop"})
+    );
+    // A blank id never reaches the endpoint.
+    let blank = RemoteClient::cancel_task(&agent, "  ")
+        .await
+        .expect_err("a blank id names nothing");
+    assert_eq!(blank.kind(), ErrorKind::Validation);
+    let error = RemoteClient::cancel_task_with_request_id(&agent, " ", Some("x"))
+        .await
+        .expect_err("a blank id names nothing");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert_eq!(
+        recorded(&server, |path| path == "/agents/a/cancel")
+            .await
+            .len(),
+        1,
+        "a refused cancel writes nothing"
+    );
 }
 
 #[test]

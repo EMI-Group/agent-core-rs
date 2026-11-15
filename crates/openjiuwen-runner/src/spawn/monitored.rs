@@ -643,11 +643,36 @@ impl SpawnedAgent for MonitoredSpawnedAgent {
 
     /// Forwards task cancellation to the inner handle.
     ///
+    /// Task cancellation is not a lifecycle transition: the run keeps its status
+    /// until the cancelled request actually ends (a terminal frame, a failed call,
+    /// a dead child, or a shutdown). A backend with no cancellation keeps the
+    /// trait's typed `Unsupported`, which is returned unchanged.
+    ///
     /// # Errors
     ///
     /// Whatever the inner handle reports.
     async fn cancel_task(&self, task_id: &str) -> Result<()> {
         self.inner.cancel_task(task_id).await
+    }
+
+    /// Forwards a reason-carrying, id-correlated cancel to the inner handle.
+    ///
+    /// Forwarded with the reason so a backend whose wire carries it (the process
+    /// backends' `cancel` frame, the HTTP client's `/cancel` body) delivers both;
+    /// a backend that only knows [`SpawnedAgent::cancel_task`] gets the trait's
+    /// default, which is that method with the same id.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the inner handle reports.
+    async fn cancel_task_with_request_id(
+        &self,
+        request_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.inner
+            .cancel_task_with_request_id(request_id, reason)
+            .await
     }
 }
 
