@@ -74,21 +74,12 @@ pub fn parse_selected_codes(fragment: &ExposedFragment, output: &str) -> Vec<Sel
         if line.is_empty() {
             continue;
         }
-        let entries = parse_line(fragment, line);
-        for (code, strategy) in entries {
-            match fragment.code_to_resolution.get(&code) {
-                Some(resolution) => {
-                    if seen.insert(resolution.canonical_id.clone()) {
-                        resolved.push(resolution.clone());
-                    }
-                }
-                None => tracing::debug!(
-                    %code,
-                    strategy,
-                    "the reply named a code that this exposure does not carry",
-                ),
-            }
-        }
+        push_entries(
+            fragment,
+            parse_line(fragment, line),
+            &mut resolved,
+            &mut seen,
+        );
     }
     if resolved.is_empty() && fragment.compact_codes_enabled {
         if let Some(entries) = parse_joined_codes(fragment, output.trim()) {
@@ -132,10 +123,7 @@ fn parse_code_handles(fragment: &ExposedFragment, line: &str) -> Vec<(String, &'
 }
 
 /// Strategy 1: JSON objects carrying `id`, `c` or `code`.
-fn parse_json_codes(
-    fragment: &ExposedFragment,
-    line: &str,
-) -> Option<Vec<(String, &'static str)>> {
+fn parse_json_codes(fragment: &ExposedFragment, line: &str) -> Option<Vec<(String, &'static str)>> {
     let trimmed = line.trim();
     if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
         return None;
@@ -196,10 +184,7 @@ fn parse_bracket_code(
 }
 
 /// Strategy 4: one or more `[id: XX]` handles.
-fn parse_id_handles(
-    fragment: &ExposedFragment,
-    line: &str,
-) -> Option<Vec<(String, &'static str)>> {
+fn parse_id_handles(fragment: &ExposedFragment, line: &str) -> Option<Vec<(String, &'static str)>> {
     let mut codes: Vec<(String, &'static str)> = Vec::new();
     let mut rest = line;
     while let Some(start) = rest.find("[id:") {
@@ -260,7 +245,7 @@ fn parse_prefixed_code(
         let rest = rest.strip_prefix([':', '=']).map_or(rest, str::trim_start);
         let code: String = rest
             .chars()
-            .take_while(|character| character.is_ascii_alphanumeric())
+            .take_while(char::is_ascii_alphanumeric)
             .collect();
         if !code.is_empty() && fragment.code_to_resolution.contains_key(&code) {
             return Some(vec![(code, "prefixed")]);
@@ -299,10 +284,7 @@ fn parse_code_prefix(
 }
 
 /// The names-mode fallbacks.
-fn parse_name_fallbacks(
-    fragment: &ExposedFragment,
-    line: &str,
-) -> Vec<(String, &'static str)> {
+fn parse_name_fallbacks(fragment: &ExposedFragment, line: &str) -> Vec<(String, &'static str)> {
     if let Some(code) = unique_case_insensitive_code(fragment, line) {
         return vec![(code, "case_insensitive")];
     }
@@ -319,10 +301,7 @@ fn parse_name_fallbacks(
 }
 
 /// A code that only differs from the line by case.
-fn unique_case_insensitive_code(
-    fragment: &ExposedFragment,
-    line: &str,
-) -> Option<String> {
+fn unique_case_insensitive_code(fragment: &ExposedFragment, line: &str) -> Option<String> {
     let lowered = line.to_lowercase();
     let matches: Vec<&String> = fragment
         .code_to_resolution
@@ -366,7 +345,8 @@ fn unique_token_code(fragment: &ExposedFragment, line: &str) -> Option<String> {
     }
     let mut matches: Vec<&String> = Vec::new();
     for (code, resolution) in &fragment.code_to_resolution {
-        let mut available: BTreeSet<String> = camel_tokens(&resolution.display_name).into_iter().collect();
+        let mut available: BTreeSet<String> =
+            camel_tokens(&resolution.display_name).into_iter().collect();
         available.extend(camel_tokens(&resolution.label));
         if wanted.is_subset(&available) {
             matches.push(code);
@@ -380,10 +360,7 @@ fn unique_token_code(fragment: &ExposedFragment, line: &str) -> Option<String> {
 }
 
 /// A plain digit string: a numeric code first, then a 1-based position.
-fn parse_digit_code(
-    fragment: &ExposedFragment,
-    line: &str,
-) -> Option<Vec<(String, &'static str)>> {
+fn parse_digit_code(fragment: &ExposedFragment, line: &str) -> Option<Vec<(String, &'static str)>> {
     if line.is_empty() || !line.chars().all(|character| character.is_ascii_digit()) {
         return None;
     }
@@ -437,17 +414,16 @@ fn push_entries(
     seen: &mut BTreeSet<String>,
 ) {
     for (code, strategy) in entries {
-        match fragment.code_to_resolution.get(&code) {
-            Some(resolution) => {
-                if seen.insert(resolution.canonical_id.clone()) {
-                    resolved.push(resolution.clone());
-                }
+        if let Some(resolution) = fragment.code_to_resolution.get(&code) {
+            if seen.insert(resolution.canonical_id.clone()) {
+                resolved.push(resolution.clone());
             }
-            None => tracing::debug!(
+        } else {
+            tracing::debug!(
                 %code,
                 strategy,
                 "the reply named a code that this exposure does not carry",
-            ),
+            );
         }
     }
 }
@@ -504,13 +480,10 @@ fn camel_tokens(text: &str) -> Vec<String> {
         if character.is_ascii_uppercase() {
             if characters
                 .get(index + 1)
-                .is_some_and(|next| next.is_ascii_lowercase())
+                .is_some_and(char::is_ascii_lowercase)
             {
                 let mut end = index + 1;
-                while characters
-                    .get(end)
-                    .is_some_and(|next| next.is_ascii_lowercase())
-                {
+                while characters.get(end).is_some_and(char::is_ascii_lowercase) {
                     end += 1;
                 }
                 tokens.push(characters[index..end].iter().collect());
@@ -518,17 +491,11 @@ fn camel_tokens(text: &str) -> Vec<String> {
                 continue;
             }
             let mut end = index;
-            while characters
-                .get(end)
-                .is_some_and(|next| next.is_ascii_uppercase())
-            {
+            while characters.get(end).is_some_and(char::is_ascii_uppercase) {
                 end += 1;
             }
             // A trailing uppercase that starts a new word belongs to the next token.
-            if end < characters.len()
-                && characters[end].is_ascii_lowercase()
-                && end - index > 1
-            {
+            if end < characters.len() && characters[end].is_ascii_lowercase() && end - index > 1 {
                 end -= 1;
             }
             tokens.push(characters[index..end].iter().collect());
@@ -556,7 +523,7 @@ fn camel_tokens(text: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 mod tests {
     use super::*;
     use crate::retrieval::search::flow::{ExposedFragment, SelectableResolution};
@@ -671,7 +638,10 @@ mod tests {
     fn json_codes_parse() {
         let fragment = compact_fragment();
         assert_eq!(codes(&fragment, r#"{"id": "AB"}"#), vec!["custom.AB"]);
-        assert_eq!(codes(&fragment, r#"{"c": "AC", "name": "x"}"#), vec!["custom.AC"]);
+        assert_eq!(
+            codes(&fragment, r#"{"c": "AC", "name": "x"}"#),
+            vec!["custom.AC"]
+        );
         assert_eq!(
             codes(&fragment, r#"{"code": "AA", "score": 1}"#),
             vec!["custom.AA"]
@@ -700,13 +670,11 @@ mod tests {
     fn code_lists_and_prefix_matches_parse() {
         let fragment = compact_fragment();
         assert_eq!(codes(&fragment, "AA, AB"), vec!["custom.AA", "custom.AB"]);
+        assert_eq!(codes(&fragment, "AA AC"), vec!["custom.AA", "custom.AC"]);
         assert_eq!(
-            codes(&fragment, "AA AC"),
-            vec!["custom.AA", "custom.AC"]
+            codes(&fragment, "AA; AB; AC"),
+            vec!["custom.AA", "custom.AB", "custom.AC"]
         );
-        assert_eq!(codes(&fragment, "AA; AB; AC"), vec![
-            "custom.AA", "custom.AB", "custom.AC"
-        ]);
         // A list with one unknown token is not a code list, but the prefix match still
         // recovers the leading code.
         assert_eq!(codes(&fragment, "AA nope"), vec!["custom.AA"]);

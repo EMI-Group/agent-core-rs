@@ -83,7 +83,8 @@ pub const ITEM_CANONICAL_PREFIX: &str = "item::";
 pub const TREE_INDENT: &str = "  ";
 
 /// The fixed field order of a flat compact candidate object.
-pub const FLAT_COMPACT_FIELD_ORDER: [&str; 5] = ["category", "name", "raw_name", "description", "id"];
+pub const FLAT_COMPACT_FIELD_ORDER: [&str; 5] =
+    ["category", "name", "raw_name", "description", "id"];
 
 /// The trailing remark a candidate description may carry and that is stripped.
 pub const REPRESENTATIVE_DESCENDANTS: &str = "Representative descendants:";
@@ -239,7 +240,7 @@ fn build_flat_fragment(
     config: &DisclosureConfig,
 ) -> Result<ExposedFragment> {
     let mut sorted: Vec<&SelectableEntry> = entries.iter().collect();
-    sorted.sort_by(|left, right| flat_sort_key(left).cmp(&flat_sort_key(right)));
+    sorted.sort_by_key(|entry| flat_sort_key(entry));
     let codes = build_codes_borrowed(&sorted, config)?;
     let display_names = build_boundary_names_borrowed(&sorted);
     let (code_to_resolution, canonical_to_code) =
@@ -292,7 +293,10 @@ fn build_resolutions(
     entries: &[SelectableEntry],
     codes: &[String],
     display_names: Vec<String>,
-) -> (BTreeMap<String, SelectableResolution>, BTreeMap<String, String>) {
+) -> (
+    BTreeMap<String, SelectableResolution>,
+    BTreeMap<String, String>,
+) {
     let borrowed: Vec<&SelectableEntry> = entries.iter().collect();
     build_resolutions_borrowed(&borrowed, codes, display_names)
 }
@@ -304,7 +308,10 @@ fn build_resolutions_borrowed(
     entries: &[&SelectableEntry],
     codes: &[String],
     display_names: Vec<String>,
-) -> (BTreeMap<String, SelectableResolution>, BTreeMap<String, String>) {
+) -> (
+    BTreeMap<String, SelectableResolution>,
+    BTreeMap<String, String>,
+) {
     let mut by_code: BTreeMap<String, SelectableResolution> = BTreeMap::new();
     let mut canonical_to_code: BTreeMap<String, String> = BTreeMap::new();
     for ((entry, code), display_name) in entries.iter().zip(codes.iter()).zip(display_names) {
@@ -1032,23 +1039,29 @@ mod tests {
     fn tree() -> RetrieverNode {
         RetrieverNode::new(ROOT_NODE_ID, "Root").with_children(vec![
             RetrieverNode::new("Skills", "Skills").with_children(vec![
-                RetrieverNode::new("Skills.alpha", "Alpha")
-                    .with_items(vec![item("alpha", "custom.alpha", "Alpha One")]),
-                RetrieverNode::new("Skills.beta", "Beta")
-                    .with_items(vec![item("beta", "custom.beta", "Beta One")]),
+                RetrieverNode::new("Skills.alpha", "Alpha").with_items(vec![item(
+                    "alpha",
+                    "custom.alpha",
+                    "Alpha One",
+                )]),
+                RetrieverNode::new("Skills.beta", "Beta").with_items(vec![item(
+                    "beta",
+                    "custom.beta",
+                    "Beta One",
+                )]),
             ]),
-            RetrieverNode::new("Tools", "Tools")
-                .with_items(vec![item("tool", "custom.tool", "Tool One")]),
+            RetrieverNode::new("Tools", "Tools").with_items(vec![item(
+                "tool",
+                "custom.tool",
+                "Tool One",
+            )]),
         ])
     }
 
     fn fragment(config: &DisclosureConfig) -> ExposedFragment {
-        build_exposed_fragment(
-            &tree(),
-            &[ROOT_NODE_ID.to_owned()],
-            config,
-            &|node| node.item_count(),
-        )
+        build_exposed_fragment(&tree(), &[ROOT_NODE_ID.to_owned()], config, &|node| {
+            node.item_count()
+        })
         .unwrap()
     }
 
@@ -1074,20 +1087,22 @@ mod tests {
         assert_eq!(alpha.canonical_id, "custom.alpha");
         assert!(alpha.is_terminal);
         assert_eq!(alpha.branch_path, vec!["ROOT", "Skills", "Skills.alpha"]);
-        assert_eq!(alpha.item.as_ref().map(|item| item.item_id.as_str()), Some("alpha"));
+        assert_eq!(
+            alpha.item.as_ref().map(|item| item.item_id.as_str()),
+            Some("alpha")
+        );
         assert!(exposed.root.children[0].children[0].children[0].is_selectable);
         assert!(!exposed.root.is_selectable);
     }
 
     #[test]
     fn a_unary_itemless_chain_is_spliced_away() {
-        let tree = RetrieverNode::new(ROOT_NODE_ID, "Root").with_children(vec![
-            RetrieverNode::new("Skills", "Skills").with_children(vec![RetrieverNode::new(
-                "Skills.only",
-                "Only",
+        let tree =
+            RetrieverNode::new(ROOT_NODE_ID, "Root").with_children(vec![RetrieverNode::new(
+                "Skills", "Skills",
             )
-            .with_items(vec![item("x", "custom.x", "X")])]),
-        ]);
+            .with_children(vec![RetrieverNode::new("Skills.only", "Only")
+                .with_items(vec![item("x", "custom.x", "X")])])]);
         let exposed = build_exposed_fragment(
             &tree,
             &[ROOT_NODE_ID.to_owned()],
@@ -1104,7 +1119,11 @@ mod tests {
         // segment is still recorded but `Skills.only` is not repeated.
         assert_eq!(
             exposed.resolution("X").unwrap().branch_path,
-            vec!["ROOT".to_owned(), "Skills".to_owned(), "Skills.only".to_owned()]
+            vec![
+                "ROOT".to_owned(),
+                "Skills".to_owned(),
+                "Skills.only".to_owned()
+            ]
         );
     }
 
@@ -1154,17 +1173,23 @@ mod tests {
 
     #[test]
     fn max_items_per_branch_hides_items_from_the_text_but_keeps_them_selectable() {
-        let tree = RetrieverNode::new(ROOT_NODE_ID, "Root").with_children(vec![
-            RetrieverNode::new("Skills", "Skills").with_items(vec![
+        let tree =
+            RetrieverNode::new(ROOT_NODE_ID, "Root").with_children(vec![RetrieverNode::new(
+                "Skills", "Skills",
+            )
+            .with_items(vec![
                 item("a", "custom.a", "A"),
                 item("b", "custom.b", "B"),
                 item("c", "custom.c", "C"),
-            ]),
-        ]);
+            ])]);
         let config = DisclosureConfig::default().with_max_items_per_branch(2);
-        let exposed =
-            build_exposed_fragment(&tree, &[ROOT_NODE_ID.to_owned()], &config, &exposure_item_count)
-                .unwrap();
+        let exposed = build_exposed_fragment(
+            &tree,
+            &[ROOT_NODE_ID.to_owned()],
+            &config,
+            &exposure_item_count,
+        )
+        .unwrap();
         assert_eq!(exposed.rendered_tree.matches("Candidate").count(), 2);
         assert!(exposed.rendered_tree.contains("Candidate A"));
         assert!(exposed.rendered_tree.contains("Candidate B"));
@@ -1183,7 +1208,10 @@ mod tests {
         let exposed = fragment(&DisclosureConfig::default().with_max_chars(20));
         assert!(exposed.truncated);
         assert!(exposed.rendered_chars <= 20, "{}", exposed.rendered_chars);
-        assert_eq!(exposed.rendered_chars, exposed.rendered_tree.chars().count());
+        assert_eq!(
+            exposed.rendered_chars,
+            exposed.rendered_tree.chars().count()
+        );
         assert!(exposed.rendered_tree.ends_with("..."));
 
         let full = fragment(&DisclosureConfig::default());
@@ -1201,17 +1229,29 @@ mod tests {
 
     #[test]
     fn names_mode_codes_are_pascal_boundary_names_with_duplicates_disambiguated() {
-        let tree = RetrieverNode::new(ROOT_NODE_ID, "Root").with_children(vec![
-            RetrieverNode::new("Skills", "Skills").with_children(vec![
-                RetrieverNode::new("Skills.alpha", "Alpha")
-                    .with_items(vec![item("shared", "custom.alpha.shared", "One")]),
-                RetrieverNode::new("Skills.beta", "Beta")
-                    .with_items(vec![item("shared", "custom.beta.shared", "Two")]),
-            ]),
-        ]);
-        let exposed =
-            build_exposed_fragment(&tree, &[ROOT_NODE_ID.to_owned()], &DisclosureConfig::default(), &exposure_item_count)
-                .unwrap();
+        let tree =
+            RetrieverNode::new(ROOT_NODE_ID, "Root").with_children(vec![RetrieverNode::new(
+                "Skills", "Skills",
+            )
+            .with_children(vec![
+                RetrieverNode::new("Skills.alpha", "Alpha").with_items(vec![item(
+                    "shared",
+                    "custom.alpha.shared",
+                    "One",
+                )]),
+                RetrieverNode::new("Skills.beta", "Beta").with_items(vec![item(
+                    "shared",
+                    "custom.beta.shared",
+                    "Two",
+                )]),
+            ])]);
+        let exposed = build_exposed_fragment(
+            &tree,
+            &[ROOT_NODE_ID.to_owned()],
+            &DisclosureConfig::default(),
+            &exposure_item_count,
+        )
+        .unwrap();
         assert_eq!(
             exposed.candidate_codes,
             vec![
@@ -1225,9 +1265,13 @@ mod tests {
             item("shared", "custom.shared", "One"),
             item("shared2", "custom.shared", "Two"),
         ]);
-        let exposed =
-            build_exposed_fragment(&tree, &[ROOT_NODE_ID.to_owned()], &DisclosureConfig::default(), &exposure_item_count)
-                .unwrap();
+        let exposed = build_exposed_fragment(
+            &tree,
+            &[ROOT_NODE_ID.to_owned()],
+            &DisclosureConfig::default(),
+            &exposure_item_count,
+        )
+        .unwrap();
         assert_eq!(
             exposed.candidate_codes,
             vec!["Shared__1".to_owned(), "Shared__2".to_owned()]
@@ -1248,7 +1292,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), crate::error::ErrorKind::Validation);
         assert!(
-            error.message().contains("provides 1 codes, but 3 selectable"),
+            error
+                .message()
+                .contains("provides 1 codes, but 3 selectable"),
             "{}",
             error.message()
         );
@@ -1263,7 +1309,9 @@ mod tests {
             vec!["AB".to_owned(), "AC".to_owned(), "AD".to_owned()]
         );
         assert_eq!(valid.code_width, 2);
-        assert!(valid.rendered_tree.contains("- Alpha [id: AB]: Alpha One description"));
+        assert!(valid
+            .rendered_tree
+            .contains("- Alpha [id: AB]: Alpha One description"));
     }
 
     #[test]
@@ -1274,7 +1322,9 @@ mod tests {
             vec!["1".to_owned(), "2".to_owned(), "3".to_owned()]
         );
         assert_eq!(exposed.code_width, 1);
-        assert!(exposed.rendered_tree.contains("- Alpha [id: 1]: Alpha One description"));
+        assert!(exposed
+            .rendered_tree
+            .contains("- Alpha [id: 1]: Alpha One description"));
     }
 
     #[test]
@@ -1355,7 +1405,11 @@ mod tests {
         assert!(clamp.ends_with("..."));
         assert_eq!(clamp.chars().count(), 13);
 
-        let sentence = format!("{}{}", "很长的描述".repeat(10), "。后面还有更多内容再来一段");
+        let sentence = format!(
+            "{}{}",
+            "很长的描述".repeat(10),
+            "。后面还有更多内容再来一段"
+        );
         let clamped = clamp_description(&sentence, 60);
         assert_eq!(clamped, format!("{}。", "很长的描述".repeat(10)));
 
@@ -1363,8 +1417,7 @@ mod tests {
         assert_eq!(clamp_description("short", 0), "short");
 
         let tree = RetrieverNode::new(ROOT_NODE_ID, "Root").with_items(vec![RetrieverItem::new(
-            "a",
-            "custom.a",
+            "a", "custom.a",
         )
         .with_label("A")
         .with_description("正文。 Representative descendants: x, y")]);
@@ -1375,7 +1428,10 @@ mod tests {
             &exposure_item_count,
         )
         .unwrap();
-        assert_eq!(exposed.rendered_tree, "- Category Root\n  - Candidate A: 正文。");
+        assert_eq!(
+            exposed.rendered_tree,
+            "- Category Root\n  - Candidate A: 正文。"
+        );
     }
 
     #[test]
@@ -1415,9 +1471,8 @@ mod tests {
         assert_eq!(exposed.root.children.len(), 3);
         assert!(exposed.root.children.iter().all(|node| node.is_selectable));
 
-        let names_mode = fragment(
-            &DisclosureConfig::default().with_flatten_full_tree_in_prompt(true),
-        );
+        let names_mode =
+            fragment(&DisclosureConfig::default().with_flatten_full_tree_in_prompt(true));
         assert!(!names_mode.compact_codes_enabled);
         assert_eq!(
             names_mode.rendered_tree,
@@ -1461,8 +1516,7 @@ mod tests {
     #[test]
     fn cjk_truncation_stays_on_character_boundaries() {
         let tree = RetrieverNode::new(ROOT_NODE_ID, "能力树").with_items(vec![RetrieverItem::new(
-            "a",
-            "custom.a",
+            "a", "custom.a",
         )
         .with_label("摘要")
         .with_description("把长文档总结成要点")]);
@@ -1478,7 +1532,10 @@ mod tests {
         // between `力` and `树`, so no half character can survive.
         assert_eq!(exposed.rendered_tree, "- Category 能力...");
         assert_eq!(exposed.rendered_chars, 16);
-        assert_eq!(exposed.rendered_chars, exposed.rendered_tree.chars().count());
+        assert_eq!(
+            exposed.rendered_chars,
+            exposed.rendered_tree.chars().count()
+        );
         assert!(!exposed.rendered_tree.contains('\u{FFFD}'));
 
         let whole = build_exposed_fragment(

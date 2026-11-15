@@ -97,7 +97,7 @@ pub const REQUEST_MARKER_HEX: usize = 16;
 pub const LEGACY_FLAT_TOP_K: usize = 5;
 
 /// The shared preamble of the nested and compact prompt variants.
-pub const SHARED: &str = r#"
+pub const SHARED: &str = r"
 /no_think
 
 # 背景与目标：
@@ -162,10 +162,10 @@ pub const SHARED: &str = r#"
 
 # 输出 id 说明：
 
-{output_block}"#;
+{output_block}";
 
 /// The shared preamble of the `top_k == 2` variant.
-pub const SHARED_TOP2: &str = r#"
+pub const SHARED_TOP2: &str = r"
 # 背景与目标：
 - 系统的最终目标是解决用户的问题。
 - 系统通过调用 Candidate skill 来执行任务。
@@ -253,19 +253,19 @@ pub const SHARED_TOP2: &str = r#"
 
 # 输出 id 说明：
 
-{output_block}"#;
+{output_block}";
 
 /// The candidate-format block of compact tree mode.
-pub const STRUCTURE_CODES: &str = r#"# 候选格式：
+pub const STRUCTURE_CODES: &str = r"# 候选格式：
 - <CANDIDATE_TREE> 中的 Category 表示分组，不可选择。
 - <CANDIDATE_TREE> 中的 NAME [id: X] 表示候选 skill，可选择，其中 X 是候选 id。
-- 缩进表示候选与分组之间的从属关系。"#;
+- 缩进表示候选与分组之间的从属关系。";
 
 /// The candidate-format block of names tree mode.
-pub const STRUCTURE_NAMES: &str = r#"# 候选格式：
+pub const STRUCTURE_NAMES: &str = r"# 候选格式：
 - <CANDIDATE_TREE> 中的 Category 表示分组，不可选择。
 - <CANDIDATE_TREE> 中的 Candidate NAME 表示候选 skill，可选择，其中 NAME 是 Candidate skill 节点 id。
-- 缩进表示候选与分组之间的从属关系。"#;
+- 缩进表示候选与分组之间的从属关系。";
 
 /// The candidate-format block of compact flat mode.
 pub const STRUCTURE_CODES_FLAT: &str = r#"# 候选格式：
@@ -275,10 +275,10 @@ pub const STRUCTURE_CODES_FLAT: &str = r#"# 候选格式：
 - 最终只能输出候选 JSON 对象 id 字段中的两个大写字母 ID。"#;
 
 /// The candidate-format block of names flat mode (empty in the reference).
-pub const STRUCTURE_NAMES_FLAT: &str = r#""#;
+pub const STRUCTURE_NAMES_FLAT: &str = "";
 
 /// The output block of compact tree mode.
-pub const OUTPUT_CODES: &str = r#"- 仅输出候选行 [id: ...] 方括号中的 id，不要附带任何其他内容。
+pub const OUTPUT_CODES: &str = r"- 仅输出候选行 [id: ...] 方括号中的 id，不要附带任何其他内容。
 - 每个非空行必须只包含一个候选 id；整行只能是 id 本身。
 - 禁止输出横线、候选名称、[id: ...]、冒号、描述或整行候选文本。
 - 任何以 - 开头的行都是错误输出。
@@ -295,7 +295,7 @@ pub const OUTPUT_CODES: &str = r#"- 仅输出候选行 [id: ...] 方括号中的
 - 不要输出候选名称、描述、整行候选文本、[id:] 前缀、列表、编号、后缀或解释。
 - 例如，候选行为 Summary [id: CC]: Summarize long documents 时，只能输出 CC。
 - 错误输出包括：以 - 开头、包含候选名称、包含 [id:]、包含冒号、包含描述或复制整行候选文本。
-- 正确输出示例：CC"#;
+- 正确输出示例：CC";
 
 /// The output block the reference keeps for compact flat mode but selects nowhere.
 pub const OUTPUT_CODES_FLAT: &str = r#"- 仅输出候选对象中的 id，不要附带任何其他内容。
@@ -316,14 +316,14 @@ pub const OUTPUT_CODES_FLAT: &str = r#"- 仅输出候选对象中的 id，不要
 - 正确输出示例：AB"#;
 
 /// The output block of names tree mode.
-pub const OUTPUT_NAMES_TREE: &str = r#"- 仅输出驼峰格式的节点 id, 不要附带任何其他内容
-- 只能输出 Candidate 行中的 NAME，不要输出 Category、描述、编号、解释或整行候选文本。"#;
+pub const OUTPUT_NAMES_TREE: &str = r"- 仅输出驼峰格式的节点 id, 不要附带任何其他内容
+- 只能输出 Candidate 行中的 NAME，不要输出 Category、描述、编号、解释或整行候选文本。";
 
 /// The output block of names flat mode.
-pub const OUTPUT_NAMES_FLAT: &str = r#"- 仅输出驼峰格式的节点 id, 不要附带任何其他内容"#;
+pub const OUTPUT_NAMES_FLAT: &str = r"- 仅输出驼峰格式的节点 id, 不要附带任何其他内容";
 
 /// The legacy flat, non-compact system prompt (used when `top_k != 2`).
-pub const LEGACY_FLAT_NON_COMPACT_SYSTEM_PROMPT: &str = r#"
+pub const LEGACY_FLAT_NON_COMPACT_SYSTEM_PROMPT: &str = r"
 # 背景与目标：
 - 系统的最终目标是解决用户的问题。
 - 系统通过调用 Candidate skill 来执行任务。
@@ -360,13 +360,13 @@ pub const LEGACY_FLAT_NON_COMPACT_SYSTEM_PROMPT: &str = r#"
 
 # 输出 id 说明：
 
-- 仅输出驼峰格式的节点 id, 不要附带任何其他内容"#;
+- 仅输出驼峰格式的节点 id, 不要附带任何其他内容";
 
 /// The output block of compact flat mode.
-pub const COMPACT_FLAT_OUTPUT_BLOCK: &str = r#"- 只输出候选 JSON 对象中的两个大写字母 id，每行一个 id。
+pub const COMPACT_FLAT_OUTPUT_BLOCK: &str = r"- 只输出候选 JSON 对象中的两个大写字母 id，每行一个 id。
 - 不要输出 JSON、字段名、候选名称、解释、编号、冒号、标点或整个候选对象。
 - 如果想复制某个候选 JSON 对象，必须改为只输出该对象的两个大写字母 id。
-- id 是无语义句柄，只能根据候选名称和能力说明判断相关性。"#;
+- id 是无语义句柄，只能根据候选名称和能力说明判断相关性。";
 
 /// Everything a prefix-cache-aware caller needs for one disclosure call.
 ///
@@ -499,7 +499,11 @@ fn build_system_prompt(
         (false, true) => (STRUCTURE_NAMES_FLAT, OUTPUT_NAMES_FLAT),
         (false, false) => (STRUCTURE_NAMES, OUTPUT_NAMES_TREE),
     };
-    let template = if resolved_top_k == 2 { SHARED_TOP2 } else { SHARED };
+    let template = if resolved_top_k == 2 {
+        SHARED_TOP2
+    } else {
+        SHARED
+    };
     expand_template(
         template,
         &[
@@ -537,9 +541,10 @@ fn expand_template(template: &str, substitutions: &[(&str, String)]) -> String {
 
 /// The prompt for `fragment`, resolving a `None` `top_k` to the candidate count.
 fn system_prompt_for(fragment: &ExposedFragment, top_k: Option<usize>) -> String {
-    let resolved_top_k = top_k
-        .map(|value| value.max(1))
-        .unwrap_or_else(|| fragment.candidate_codes.len().max(1));
+    let resolved_top_k = top_k.map_or_else(
+        || fragment.candidate_codes.len().max(1),
+        |value| value.max(1),
+    );
     build_system_prompt(
         fragment.compact_codes_enabled,
         fragment.flat_list_mode,
@@ -663,9 +668,7 @@ fn strip_prefix_ignore_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::retrieval::search::flow::{
-        ExposedFragment, ExposedNode, SelectableResolution,
-    };
+    use crate::retrieval::search::flow::{ExposedFragment, ExposedNode, SelectableResolution};
     use std::collections::BTreeMap;
 
     fn fragment(compact: bool, flat: bool, codes: &[&str]) -> ExposedFragment {
@@ -760,7 +763,8 @@ mod tests {
     #[test]
     fn the_candidate_block_appears_once_in_the_system_message() {
         let exposed = fragment(true, false, &["AB", "AC"]);
-        let messages = build_disclosure_messages(&exposed, &query("帮我把这份文档总结成要点"), Some(2));
+        let messages =
+            build_disclosure_messages(&exposed, &query("帮我把这份文档总结成要点"), Some(2));
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "user");
@@ -770,9 +774,7 @@ mod tests {
         assert_eq!(messages[0].content.matches("<CANDIDATE_TREE>\n").count(), 1);
         assert_eq!(messages[0].content.matches("candidate-body").count(), 1);
         assert!(!messages[1].content.contains("<CANDIDATE_TREE>"));
-        assert!(messages[1]
-            .content
-            .starts_with("<USER_REQUEST>\n[req:"));
+        assert!(messages[1].content.starts_with("<USER_REQUEST>\n[req:"));
         assert!(messages[1].content.ends_with("</USER_REQUEST>"));
         assert!(messages[1].content.contains("帮我把这份文档总结成要点"));
     }
@@ -790,10 +792,19 @@ mod tests {
         assert_eq!(parts.prefix_token_hash.len(), 64);
         assert_eq!(parts.cache_id.len(), 32);
 
-        let flat = build_disclosure_prompt_parts(&fragment(true, true, &["AB"]), &query("摘要"), Some(2));
+        let flat =
+            build_disclosure_prompt_parts(&fragment(true, true, &["AB"]), &query("摘要"), Some(2));
         assert_eq!(flat.prefix_messages[1].content, FLAT_USER_PREFIX);
-        assert_eq!(flat.suffix_text, format!("{}摘要", flat.suffix_text.split_once(']').unwrap().0.to_owned() + "]"));
-        assert!(flat.full_messages[1].content.starts_with("User request:\n[req:"));
+        assert_eq!(
+            flat.suffix_text,
+            format!(
+                "{}摘要",
+                flat.suffix_text.split_once(']').unwrap().0.to_owned() + "]"
+            )
+        );
+        assert!(flat.full_messages[1]
+            .content
+            .starts_with("User request:\n[req:"));
     }
 
     #[test]
@@ -828,9 +839,15 @@ mod tests {
             normalize_query_content("From user: 帮我总结\n\nFrom assistant: 好的\n第二行"),
             "帮我总结\n好的\n第二行"
         );
-        assert_eq!(normalize_query_content("From: no speaker"), "From: no speaker");
+        assert_eq!(
+            normalize_query_content("From: no speaker"),
+            "From: no speaker"
+        );
         assert_eq!(normalize_query_content("From me 总结"), "From me 总结");
-        assert_eq!(normalize_query_content("总结 From user: 后面"), "总结 From user: 后面");
+        assert_eq!(
+            normalize_query_content("总结 From user: 后面"),
+            "总结 From user: 后面"
+        );
 
         let joined = normalized_query(&[
             ChatMessage::user("From user: 第一段"),
@@ -864,9 +881,6 @@ mod tests {
             .starts_with("<USER_REQUEST>\n[req:"));
         assert!(!parts.suffix_text.contains("帮我"));
         // A query-less call is still deterministic.
-        assert_eq!(
-            build_disclosure_prompt_parts(&exposed, &[], Some(2)),
-            parts
-        );
+        assert_eq!(build_disclosure_prompt_parts(&exposed, &[], Some(2)), parts);
     }
 }

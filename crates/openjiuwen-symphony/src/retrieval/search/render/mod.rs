@@ -47,7 +47,9 @@ pub use prompt::{
 };
 
 use crate::error::Result;
-use crate::retrieval::search::flow::{ChatMessage, CurrentSubtree, PromptBundle, SelectionProtocol};
+use crate::retrieval::search::flow::{
+    ChatMessage, CurrentSubtree, PromptBundle, SelectionProtocol,
+};
 
 /// Renders one exposed subtree into the prompt a selection call sends.
 ///
@@ -146,7 +148,12 @@ impl SubtreeRenderer for DefaultSubtreeRenderer {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::assert_is_empty,
+    clippy::manual_assert_eq
+)]
 mod tests {
     use super::*;
     use crate::retrieval::search::config::DisclosureConfig;
@@ -154,10 +161,10 @@ mod tests {
     use crate::retrieval::types::{RetrieverItem, RetrieverNode, ROOT_NODE_ID};
 
     fn subtree() -> CurrentSubtree {
-        let tree = RetrieverNode::new(ROOT_NODE_ID, "Root").with_children(vec![
-            RetrieverNode::new("Skills", "Skills")
-                .with_items(vec![RetrieverItem::new("a", "custom.a").with_label("Alpha")]),
-        ]);
+        let tree = RetrieverNode::new(ROOT_NODE_ID, "Root")
+            .with_children(vec![RetrieverNode::new("Skills", "Skills").with_items(
+                vec![RetrieverItem::new("a", "custom.a").with_label("Alpha")],
+            )]);
         let fragment = build_exposed_fragment(
             &tree,
             &[ROOT_NODE_ID.to_owned()],
@@ -215,7 +222,9 @@ mod tests {
         assert!(!bundle.fragment.candidate_codes.is_empty());
         assert_eq!(bundle.fragment, subtree.fragment);
         assert!(renderer.with_messages(true).renders_messages());
-        assert!(!DefaultSubtreeRenderer::new().with_messages(false).renders_messages());
+        assert!(!DefaultSubtreeRenderer::new()
+            .with_messages(false)
+            .renders_messages());
     }
 
     #[test]
@@ -225,14 +234,20 @@ mod tests {
         let bundle = DefaultSubtreeRenderer::new()
             .render_subtree(&subtree, &[], &SelectionProtocol::default())
             .unwrap();
-        assert!(bundle.messages[0].content.contains("默认输出 2 个 Candidate skill 节点 id"));
+        assert!(bundle.messages[0]
+            .content
+            .contains("默认输出 2 个 Candidate skill 节点 id"));
     }
 
     #[test]
     fn the_renderer_never_parses() {
         let subtree = subtree();
         let bundle = DefaultSubtreeRenderer::new()
-            .render_subtree(&subtree, &[ChatMessage::user("摘要")], &SelectionProtocol::default())
+            .render_subtree(
+                &subtree,
+                &[ChatMessage::user("摘要")],
+                &SelectionProtocol::default(),
+            )
             .unwrap();
         assert_eq!(bundle.messages.len(), 2);
         assert!(parse_selected_codes(&subtree.fragment, "Alpha").len() == 1);
