@@ -56,6 +56,25 @@ fn header_value(request: &Request, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The requests `server` recorded whose path `keep` accepts, in arrival order.
+///
+/// `wiremock` hands its servers out of a process-wide pool, so a recording is
+/// not guaranteed to hold only this test's traffic: dropping a `MockServer`
+/// returns its listener to the pool (its recordings are reset for the next
+/// owner), and a request the previous owner left in flight can still be served —
+/// and therefore recorded — after that reset. Every assertion about what this
+/// client sent filters to the paths this test actually owns and never counts
+/// foreign entries.
+async fn recorded(server: &MockServer, keep: impl Fn(&str) -> bool) -> Vec<Request> {
+    server
+        .received_requests()
+        .await
+        .expect("a mock server records its requests")
+        .into_iter()
+        .filter(|request| keep(request.url.path()))
+        .collect()
+}
+
 /// Collects a whole stream under [`BOUND`], asserting it ends on its own.
 async fn collect_stream(stream: BoxStream<'static, Result<AgentChunk>>) -> Vec<Result<AgentChunk>> {
     tokio::time::timeout(BOUND, stream.collect::<Vec<_>>())
@@ -101,7 +120,7 @@ async fn invoke_returns_the_remote_output_and_sends_session_and_inputs() {
     let bound = RemoteAgent::new(config_for(&server, "echo").with_session_id("session-7"));
     bound.invoke(json!({"query": "again"}), None).await.unwrap();
 
-    let received = server.received_requests().await.unwrap();
+    let received = recorded(&server, |path| path == "/agents/echo/invoke").await;
     assert_eq!(received.len(), 2);
     assert_eq!(received[0].method.as_str(), "POST");
     assert_eq!(received[0].url.path(), "/agents/echo/invoke");
@@ -294,7 +313,8 @@ async fn remote_spawner_builds_a_working_spawned_agent() {
 
     let output = handle.send(json!({"query": "hi"})).await.unwrap();
     assert_eq!(output.output, "spawned");
-    let bodies = server.received_requests().await.unwrap();
+    let bodies = recorded(&server, |path| path == "/agents/echo/invoke").await;
+    assert_eq!(bodies.len(), 1, "only the invocation reached the server");
     assert_eq!(
         body_json(&bodies[0]),
         json!({"session_id": "sess-9", "inputs": {"query": "hi"}}),
@@ -342,7 +362,7 @@ async fn cancel_task_posts_the_task_id_and_needs_a_cancel_path() {
 
     let agent = RemoteAgent::new(config_for(&server, "echo"));
     agent.cancel_task("task-1").await.unwrap();
-    let received = server.received_requests().await.unwrap();
+    let received = recorded(&server, |path| path == "/agents/echo/cancel").await;
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].url.path(), "/agents/echo/cancel");
     assert_eq!(body_json(&received[0]), json!({"task_id": "task-1"}));
@@ -368,7 +388,8 @@ async fn configured_headers_reach_the_server() {
     );
     agent.invoke(json!({"query": "hi"}), None).await.unwrap();
 
-    let received = server.received_requests().await.unwrap();
+    let received = recorded(&server, |path| path == "/agents/echo/invoke").await;
+    assert_eq!(received.len(), 1, "only the invocation reached the server");
     assert_eq!(
         header_value(&received[0], "x-api-key").as_deref(),
         Some("secret")
@@ -420,10 +441,11 @@ async fn custom_paths_and_a_trailing_slash_base_url_hit_the_expected_routes() {
     assert_eq!(frames.len(), 1);
     agent.cancel_task("task-1").await.unwrap();
 
-    let paths: Vec<String> = server
-        .received_requests()
+    // The custom prefix is what this test owns, so keep only requests under it:
+    // the mock server's pool can hand a listener to us that still receives a
+    // request from a test that borrowed it before us (see [`recorded`]).
+    let paths: Vec<String> = recorded(&server, |path| path.starts_with("/v2/"))
         .await
-        .unwrap()
         .iter()
         .map(|request| request.url.path().to_owned())
         .collect();
@@ -439,13 +461,13 @@ async fn custom_paths_and_a_trailing_slash_base_url_hit_the_expected_routes() {
 
 #[tokio::test]
 async fn an_unreachable_endpoint_is_a_transport_error_not_a_panic() {
-    // Bind an ephemeral port and release it: nothing listens there afterwards.
-    let port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    };
+    // A deterministic unreachable endpoint: port 1 is privileged, so nothing in
+    // this process can listen there and `wiremock` never hands it out of its
+    // server pool. A bind-then-release ephemeral port would be racy — the freed
+    // port can be re-bound by another test's mock server before this connect,
+    // which turns the expected transport failure into a `404`.
     let agent = RemoteAgent::new(
-        RemoteAgentConfig::new("echo", format!("http://127.0.0.1:{port}"))
+        RemoteAgentConfig::new("echo", "http://127.0.0.1:1")
             .with_timeout(Duration::from_millis(500)),
     );
 

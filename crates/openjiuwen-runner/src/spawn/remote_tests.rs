@@ -4,7 +4,23 @@ use super::*;
 use openjiuwen_common::error::ErrorKind;
 use serde_json::json;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+/// The requests `server` recorded whose path `keep` accepts, in arrival order.
+///
+/// `wiremock` hands servers out of a process-wide pool, so a recording can hold
+/// a request another test left in flight when its server was returned to the
+/// pool and reset for us. Every assertion about what this client sent filters to
+/// the paths this test owns instead of counting the whole recording.
+async fn recorded(server: &MockServer, keep: impl Fn(&str) -> bool) -> Vec<Request> {
+    server
+        .received_requests()
+        .await
+        .expect("a mock server records its requests")
+        .into_iter()
+        .filter(|request| keep(request.url.path()))
+        .collect()
+}
 
 /// Serializes `frame` as one NDJSON line (without the trailing newline).
 fn frame_line(frame: &SpawnMessage) -> String {
@@ -526,7 +542,7 @@ async fn invoke_posts_the_session_body_and_parses_the_output() {
     let output = agent.invoke(json!({"query": "ping"}), None).await.unwrap();
     assert_eq!(output.output, "hi there");
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = recorded(&server, |path| path == "/agents/assistant/invoke").await;
     assert_eq!(requests.len(), 1);
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body["session_id"], json!("s-1"));
@@ -548,7 +564,8 @@ async fn invoke_sends_a_null_session_when_unset() {
         .await;
     let agent = server_agent(&server, "a");
     agent.invoke(json!({}), None).await.unwrap();
-    let requests = server.received_requests().await.unwrap();
+    let requests = recorded(&server, |path| path == "/agents/a/invoke").await;
+    assert_eq!(requests.len(), 1);
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body["session_id"], Value::Null);
 }
@@ -785,7 +802,8 @@ async fn cancel_task_posts_the_task_id() {
         .await;
     let agent = server_agent(&server, "a");
     RemoteClient::cancel_task(&agent, "task-1").await.unwrap();
-    let requests = server.received_requests().await.unwrap();
+    let requests = recorded(&server, |path| path == "/agents/a/cancel").await;
+    assert_eq!(requests.len(), 1);
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body, json!({"task_id": "task-1"}));
 }
@@ -883,7 +901,8 @@ async fn cancel_task_through_the_seam_reaches_the_endpoint() {
         .await;
     let agent: Arc<dyn SpawnedAgent> = Arc::new(server_agent(&server, "a"));
     agent.cancel_task("task-9").await.unwrap();
-    let requests = server.received_requests().await.unwrap();
+    let requests = recorded(&server, |path| path == "/agents/a/cancel").await;
+    assert_eq!(requests.len(), 1);
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body, json!({"task_id": "task-9"}));
 }

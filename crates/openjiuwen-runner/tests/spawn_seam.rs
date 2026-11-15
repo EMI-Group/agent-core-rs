@@ -34,7 +34,7 @@ use openjiuwen_runner::spawn::{
 };
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 /// Upper bound on any await in this suite, so a broken exchange fails the test
 /// instead of stalling the harness.
@@ -49,6 +49,22 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// the remote backend reads the agent id (`echo`) out of it.
 fn spec() -> SpawnSpec {
     SpawnSpec::class_agent("tests.spawn_seam", "echo")
+}
+
+/// The requests `server` recorded whose path `keep` accepts, in arrival order.
+///
+/// `wiremock` hands its servers out of a process-wide pool, so a recording can
+/// hold a request another test left in flight when its server was returned to
+/// the pool and reset for us. These assertions are about what this test sent, so
+/// they filter to the paths it owns instead of counting the whole recording.
+async fn recorded(server: &MockServer, keep: impl Fn(&str) -> bool) -> Vec<Request> {
+    server
+        .received_requests()
+        .await
+        .expect("the mock server recorded its requests")
+        .into_iter()
+        .filter(|request| keep(request.url.path()))
+        .collect()
 }
 
 /// Runs one health probe under [`BOUND`].
@@ -552,6 +568,15 @@ async fn the_in_process_factory_runs_once_per_spawn_with_the_spec() {
 
 // --- remote -----------------------------------------------------------------
 
+/// Whether `path` is one of the remote backend's routes for the `echo` spec, i.e.
+/// a request this test's own client could have sent.
+fn remote_routes(path: &str) -> bool {
+    matches!(
+        path,
+        "/agents/echo/invoke" | "/agents/echo/stream" | "/agents/echo/cancel"
+    )
+}
+
 #[tokio::test]
 async fn the_remote_backend_reports_health_and_cancels_through_the_seam() {
     let server = MockServer::start().await;
@@ -589,11 +614,7 @@ async fn the_remote_backend_reports_health_and_cancels_through_the_seam() {
         "a spawned remote handle is healthy before any request"
     );
     assert!(
-        server
-            .received_requests()
-            .await
-            .expect("the mock server recorded its requests")
-            .is_empty(),
+        recorded(&server, remote_routes).await.is_empty(),
         "the spawn itself makes no request"
     );
 
@@ -614,10 +635,7 @@ async fn the_remote_backend_reports_health_and_cancels_through_the_seam() {
         .cancel_task("t-1")
         .await
         .expect("the configured cancel path answers");
-    let received = server
-        .received_requests()
-        .await
-        .expect("the mock server recorded its requests");
+    let received = recorded(&server, remote_routes).await;
     assert_eq!(received.len(), 2, "one invoke, one cancel");
     assert_eq!(received[1].url.path(), "/agents/echo/cancel");
     assert_eq!(
@@ -675,11 +693,7 @@ async fn a_spawned_remote_handle_is_started_at_spawn_and_validates_its_url() {
     assert!(snapshot.alive && snapshot.healthy);
     assert_eq!(snapshot.backend, SpawnBackend::RemoteHttp);
     assert!(
-        server
-            .received_requests()
-            .await
-            .expect("the mock server recorded its requests")
-            .is_empty(),
+        recorded(&server, remote_routes).await.is_empty(),
         "no request is made just to become ready"
     );
 
