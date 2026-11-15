@@ -75,6 +75,7 @@ mod runner_dreaming;
 mod runner_seams;
 mod runner_spawn;
 pub mod spawn;
+pub mod stop;
 
 // ------------------------------------------------------- flat re-exports --
 
@@ -142,6 +143,8 @@ pub use run::{
     AgentRef, RunOptions, RunServices, TeamRef, WorkflowRef,
 };
 pub use runner::Runner;
+// --- shutdown report ---
+pub use stop::{ComponentStop, StopComponent, StopReport, StopStatus};
 // --- dreaming driver ---
 pub use dreaming::{DreamService, DreamServiceStatus, DEFAULT_DREAMING_STOP_TIMEOUT};
 /// The memory-crate dreaming types a host needs to build and inspect a

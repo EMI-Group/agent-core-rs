@@ -15,15 +15,18 @@
 //! and [`Runner::stop_dreaming`](crate::Runner::stop_dreaming); see the crate's
 //! `runner_dreaming` module for the facade. Dreaming has its own lifecycle:
 //! [`Runner::start`](crate::Runner::start) does **not** start it, and
-//! [`Runner::stop`](crate::Runner::stop) does stop it (bounded, and never failing
-//! the runner's own shutdown).
+//! [`Runner::stop`](crate::Runner::stop) does stop it — bounded by the configured
+//! shutdown grace period — and reports the outcome
+//! ([`ComponentStop`](crate::ComponentStop)) instead of swallowing it: a loop that
+//! could not be joined makes the runner's shutdown report name it.
 //!
 //! **Task ownership.** `start` spawns at most one task: a second call while the
 //! loop is live is a no-op that returns the current status, never a second loop.
-//! The loop is joined by `stop`, which cancels the token first — cancellation is
-//! the documented shutdown path, so the `Error::Cancelled` the loop reports is
-//! mapped to `Ok`. Any *other* loop outcome (a task panic, or a loop that ended
-//! early with an error) is recorded in [`DreamServiceStatus::last_stop_error`]
+//! The loop is joined by `stop` (or `stop_with_timeout`), which cancels the token
+//! first — cancellation is the documented shutdown path, so the
+//! `Error::Cancelled` the loop reports is mapped to `Ok`. Any *other* loop
+//! outcome (a task panic, or a loop that ignored its cancellation past the join
+//! bound and was aborted) is recorded in [`DreamServiceStatus::last_stop_error`]
 //! instead of being swallowed or panicking the caller.
 //!
 //! **A host with its own timer** calls [`DreamService::tick`], which delegates to
@@ -106,9 +109,11 @@ pub struct DreamServiceStatus {
     /// Why the last [`DreamService::stop`] did not join the loop cleanly;
     /// default `None`.
     ///
-    /// Only a task panic or a stop that hit [`DEFAULT_DREAMING_STOP_TIMEOUT`]
-    /// (the task is then aborted) sets this; a cancelled loop — the documented
-    /// shutdown path — does not. The next `start` clears it.
+    /// Only a task panic or a stop that hit its join bound
+    /// ([`DEFAULT_DREAMING_STOP_TIMEOUT`] for [`DreamService::stop`], the
+    /// caller's bound for [`DreamService::stop_with_timeout`]; the task is then
+    /// aborted) sets this; a cancelled loop — the documented shutdown path — does
+    /// not. The next [`DreamService::start`] clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_stop_error: Option<String>,
 }
@@ -294,12 +299,38 @@ impl DreamService {
     /// failure.
     ///
     /// Idempotent: a call when no loop is installed returns the current status.
+    /// Delegates to [`DreamService::stop_with_timeout`] with
+    /// [`DEFAULT_DREAMING_STOP_TIMEOUT`].
     ///
     /// # Errors
     ///
     /// Never today — a failed join is reported through the status rather than as
     /// an `Err` — but the `Result` is the crate's convention for lifecycle calls.
     pub async fn stop(&self) -> Result<DreamServiceStatus> {
+        self.stop_with_timeout(DEFAULT_DREAMING_STOP_TIMEOUT).await
+    }
+
+    /// Stops the background loop with an explicit join bound.
+    ///
+    /// Same contract as [`DreamService::stop`], with `timeout` as the bound
+    /// instead of [`DEFAULT_DREAMING_STOP_TIMEOUT`], so a host that is shutting
+    /// a whole process down — or a test proving the overrun path — does not have
+    /// to wait five seconds for a loop that ignores its cancellation. A
+    /// [`Duration::ZERO`] bound is read as [`DEFAULT_DREAMING_STOP_TIMEOUT`],
+    /// mirroring the runner's zero-means-default convention for a shutdown grace
+    /// period rather than aborting a healthy loop immediately.
+    ///
+    /// The reason an overrun leaves in
+    /// [`DreamServiceStatus::last_stop_error`] names the bound that expired, so
+    /// the caller of a short bound reads its own number back.
+    ///
+    /// Idempotent: a call when no loop is installed returns the current status.
+    ///
+    /// # Errors
+    ///
+    /// Never today — a failed join is reported through the status rather than as
+    /// an `Err` — but the `Result` is the crate's convention for lifecycle calls.
+    pub async fn stop_with_timeout(&self, timeout: Duration) -> Result<DreamServiceStatus> {
         let _lifecycle = self.lifecycle.lock().await;
         let Some(task) = self.take_loop_task() else {
             tracing::debug!(
@@ -308,7 +339,7 @@ impl DreamService {
             );
             return Ok(self.status());
         };
-        let failure = self.join_loop(task).await;
+        let failure = self.join_loop(task, timeout).await;
         if let Some(message) = &failure {
             tracing::warn!(
                 target: LOG_TARGET,
@@ -350,10 +381,18 @@ impl DreamService {
     ///
     /// `None` means the documented path: the loop observed the cancellation and
     /// returned `Error::Cancelled`, or it had already returned a summary.
-    async fn join_loop(&self, task: LoopTask) -> Option<String> {
+    /// `timeout` bounds the join (a zero bound means
+    /// [`DEFAULT_DREAMING_STOP_TIMEOUT`]); a task still running at the bound is
+    /// aborted and the overrun is reported against that same bound.
+    async fn join_loop(&self, task: LoopTask, timeout: Duration) -> Option<String> {
         let LoopTask { cancel, mut join } = task;
+        let bound = if timeout.is_zero() {
+            DEFAULT_DREAMING_STOP_TIMEOUT
+        } else {
+            timeout
+        };
         cancel.cancel();
-        match tokio::time::timeout(DEFAULT_DREAMING_STOP_TIMEOUT, &mut join).await {
+        match tokio::time::timeout(bound, &mut join).await {
             Ok(Ok(Ok(summary))) => {
                 tracing::debug!(
                     target: LOG_TARGET,
@@ -376,7 +415,7 @@ impl DreamService {
                 join.abort();
                 Some(format!(
                     "the dreaming loop did not stop within {}ms; the task was aborted",
-                    DEFAULT_DREAMING_STOP_TIMEOUT.as_millis()
+                    bound.as_millis()
                 ))
             }
         }

@@ -87,6 +87,31 @@ pub fn transport(message: impl Into<String>) -> Error {
     Error::Transport(message.into())
 }
 
+/// A shutdown that did not complete every component: `Error::Config`.
+///
+/// `details` is [`StopReport::failure_summary`](crate::StopReport::failure_summary),
+/// so the message names each failed component (`queue: …; dreaming: …`) with its
+/// own reason.
+///
+/// The kind is `Config` because a runner shutdown is a lifecycle step whose
+/// bounds and collaborators come from [`RunnerConfig`](crate::RunnerConfig) —
+/// the queue's `shutdown_timeout`, the pool's `TeamPoolConfig::stop_timeout`, and
+/// the dreaming stop bound — and the failure is "the configured shutdown could
+/// not be carried out": a grace period that expired, a backend that refused to
+/// stop, or a dream loop that ignored its cancellation. The original failure is
+/// not rewrapped into a new error kind, because the runner has no error enum of
+/// its own: the typed per-component reasons stay readable in the report
+/// ([`Runner::stop_with_report`](crate::Runner::stop_with_report)) and in this
+/// message. Inventing a `Timeout`/`Unsupported` kind here would misreport a
+/// mid-shutdown failure as a deadline or a missing capability.
+pub fn shutdown_incomplete(details: impl Into<String>) -> Error {
+    Error::Config(format!(
+        "runner shutdown did not complete every component: {}; call `Runner::stop_with_report` \
+         for the per-component report",
+        details.into()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

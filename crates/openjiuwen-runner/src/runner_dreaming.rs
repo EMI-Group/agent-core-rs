@@ -12,10 +12,11 @@
 //! **A lifecycle of its own.** [`Runner::start`] does not start dreaming and
 //! [`Runner::start_dreaming`] does not start the runner: the two are independent,
 //! so a host can run consolidation without a message queue and vice versa.
-//! [`Runner::stop`] *does* stop a running dreaming service (bounded and log-only on
-//! failure, so the runner's own shutdown never fails because of dreaming), and it
-//! leaves the service installed so a later [`Runner::start_dreaming`] can run it
-//! again.
+//! [`Runner::stop`] *does* stop a running dreaming service (bounded by the
+//! configured shutdown grace period) and reports the verdict as one
+//! [`ComponentStop`] of the shutdown report — an unjoinable loop is a reported
+//! failure, not a log line — and it leaves the service installed so a later
+//! [`Runner::start_dreaming`] can run it again.
 //!
 //! **Typed absence.** Without an installed service the three lifecycle/status
 //! entry points return [`Error::Config`](openjiuwen_common::error::Error) naming
@@ -27,12 +28,14 @@
 //! block in a private module keeps the facade file under the crate's size budget.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use openjiuwen_common::error::Result;
 
-use crate::dreaming::{DreamService, DreamServiceStatus};
+use crate::dreaming::{DreamService, DreamServiceStatus, DEFAULT_DREAMING_STOP_TIMEOUT};
 use crate::error;
 use crate::runner::Runner;
+use crate::stop::{ComponentStop, StopComponent};
 
 /// `tracing` target every dreaming facade log uses.
 const LOG_TARGET: &str = "openjiuwen_runner::runner";
@@ -112,28 +115,73 @@ impl Runner {
         Ok(self.require_dreaming_service()?.status())
     }
 
-    /// Stops the installed dreaming service as part of [`Runner::stop`].
+    /// Stops the installed dreaming service as part of [`Runner::stop`] and
+    /// reports the outcome as one [`ComponentStop`].
     ///
-    /// Best effort by design: the service reports a failed join through its own
-    /// status, and anything else is logged here, so the runner's shutdown result
-    /// stays the queue's. A runner without a service does nothing.
-    pub(crate) async fn stop_dreaming_quietly(&self) {
+    /// A runner without a service has nothing to stop, so the component is
+    /// [`StopStatus::Skipped`] — the typed absence, not a silent success. With a
+    /// service, the loop is joined with the runner's shutdown grace period
+    /// ([`crate::RunnerConfig::shutdown_timeout`], capped at
+    /// [`DEFAULT_DREAMING_STOP_TIMEOUT`]) and the verdict is reported:
+    /// [`StopStatus::Failed`] when the status carries a
+    /// [`DreamServiceStatus::last_stop_error`] (a loop that ignored its
+    /// cancellation and was aborted, or a task that failed), otherwise
+    /// [`StopStatus::Stopped`]. Nothing here is log-only: the runner's own stop
+    /// result aggregates this component.
+    pub(crate) async fn stop_dreaming_component(&self) -> ComponentStop {
         let Some(service) = self.dreaming_service() else {
-            return;
+            tracing::debug!(
+                target: LOG_TARGET,
+                runner_id = %self.runner_id(),
+                "no dreaming service is installed; the dreaming component is skipped",
+            );
+            return ComponentStop::skipped(StopComponent::Dreaming);
         };
-        match service.stop().await {
-            Ok(status) => tracing::debug!(
+        let bound = self.dreaming_stop_timeout();
+        let status = match service.stop_with_timeout(bound).await {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    runner_id = %self.runner_id(),
+                    %error,
+                    "stopping the dreaming service failed",
+                );
+                return ComponentStop::failed(StopComponent::Dreaming, error.to_string());
+            }
+        };
+        if let Some(message) = status.last_stop_error {
+            tracing::warn!(
+                target: LOG_TARGET,
+                runner_id = %self.runner_id(),
+                reason = %message,
+                "the dreaming service did not shut down cleanly",
+            );
+            ComponentStop::failed(StopComponent::Dreaming, message)
+        } else {
+            tracing::debug!(
                 target: LOG_TARGET,
                 runner_id = %self.runner_id(),
                 ticks = status.orchestrator.ticks,
                 "the dreaming service stopped with the runner",
-            ),
-            Err(error) => tracing::warn!(
-                target: LOG_TARGET,
-                runner_id = %self.runner_id(),
-                %error,
-                "stopping the dreaming service failed; the runner keeps stopping",
-            ),
+            );
+            ComponentStop::stopped(StopComponent::Dreaming)
+        }
+    }
+
+    /// The join bound [`Runner::stop`] gives the dreaming loop: the configured
+    /// shutdown grace period, capped at [`DEFAULT_DREAMING_STOP_TIMEOUT`].
+    ///
+    /// One configured number bounds the whole shutdown, so a host that sets a
+    /// short grace period for the queue gets the same bound for dreaming. A zero
+    /// grace period is read as "no configured bound", which for a dreaming loop
+    /// means [`DEFAULT_DREAMING_STOP_TIMEOUT`] rather than an instant abort.
+    fn dreaming_stop_timeout(&self) -> Duration {
+        let configured = self.config().shutdown_timeout();
+        if configured.is_zero() {
+            DEFAULT_DREAMING_STOP_TIMEOUT
+        } else {
+            configured.min(DEFAULT_DREAMING_STOP_TIMEOUT)
         }
     }
 

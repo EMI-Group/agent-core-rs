@@ -64,9 +64,10 @@
 //! - **Dreaming** — [`DreamService`] via [`Runner::set_dreaming_service`], driven by
 //!   [`Runner::start_dreaming`]/[`Runner::stop_dreaming`] and read through
 //!   [`Runner::dreaming_status`]; it has a lifecycle of its own, so [`Runner::start`]
-//!   never starts it, while [`Runner::stop`] does stop a running service (bounded and
-//!   log-only on failure, so the runner's shutdown result stays the queue's). The
-//!   accessors live in the crate's `runner_dreaming` module, beside this file.
+//!   never starts it, while [`Runner::stop`] does stop a running service (bounded by
+//!   the configured shutdown grace period) and reports it as one component of the
+//!   shutdown report. The accessors live in the crate's `runner_dreaming` module,
+//!   beside this file.
 //! - **Team transports** — `openjiuwen_multiagent::{TeamTransport, TransportKind,
 //!   build_transport}`, reached through the `Team` seam only: `Pulsar` is
 //!   `Error::Unsupported`, `RunnerConfig::distributed_mode` is refused by
@@ -78,13 +79,16 @@ use crate::error;
 use crate::hitl::{DeliverResult, InteractPayload, InteractionHub, RunTarget};
 use crate::monitor::{RunMonitor, RunStatus};
 use crate::mq::{self, MessageQueue};
-use crate::pool::{ActiveTeamInfo, PoolKey, PoolLease, PoolRequest, PoolRun, TeamPool};
+use crate::pool::{
+    ActiveTeamInfo, PoolKey, PoolLease, PoolRequest, PoolRun, PoolShutdown, TeamPool,
+};
 use crate::resources::ResourceMgr;
 use crate::run::{
     invoke_agent, invoke_team, invoke_workflow, stream_agent, stream_team, stream_workflow,
     AgentRef, RunOptions, RunServices, TeamRef, WorkflowRef,
 };
 use crate::spawn::{AgentSpawner, SpawnerRegistry, UnsupportedSpawner};
+use crate::stop::{ComponentStop, StopComponent, StopReport};
 use futures::stream::BoxStream;
 use openjiuwen_agent::output::{AgentChunk, AgentOutput};
 use openjiuwen_common::error::Result;
@@ -464,58 +468,91 @@ impl Runner {
         Ok(())
     }
 
+    /// Stops the runner and returns the per-component report.
+    ///
+    /// This is the whole truth of a shutdown: every component is attempted, and
+    /// each one's outcome is recorded in the returned [`StopReport`] —
+    ///
+    /// - **dreaming**: skipped when no [`DreamService`] is installed; otherwise
+    ///   joined with the configured shutdown grace period (capped at
+    ///   [`DEFAULT_DREAMING_STOP_TIMEOUT`](crate::DEFAULT_DREAMING_STOP_TIMEOUT)),
+    ///   and failed when the service reports a `last_stop_error` (a loop that
+    ///   ignored its cancellation and was aborted, or a task that failed);
+    /// - **pool**: every pooled team run is stopped ([`TeamPool::stop_all`]); a
+    ///   sweep failure is reported instead of only logged, and a fresh open pool
+    ///   built from the live configuration replaces the swept one **even when the
+    ///   sweep failed**, so a later [`Runner::start_agent_team`] can admit runs
+    ///   again;
+    /// - **queue**: stopped and bounded by [`RunnerConfig::shutdown_timeout`]; a
+    ///   backend error is failed with its own message, and a stop that exceeds the
+    ///   bound is failed with a message naming the bound (the queue is left to its
+    ///   own shutdown either way). A runner that was never started (or is already
+    ///   stopped) reports the queue as `skipped` and does not stop it.
+    ///
+    /// The pool is swept **before** the started check, so a runner that never
+    /// started (but admitted pooled runs, which do not require `start`) does not
+    /// leak them. When the runner was started, the checkpointer is dropped and
+    /// every registry entry released, which `registries_released` records.
+    ///
+    /// Idempotent: a second call stops nothing new, reports the queue as
+    /// `skipped`, and installs another fresh open pool. A recorded dreaming
+    /// failure is a fact about the *last* dreaming shutdown: it stays in the
+    /// service status — and therefore in the report — until the service's next
+    /// `start` clears it. See `crate::stop` for the wire shape.
+    pub async fn stop_with_report(&self) -> StopReport {
+        let _lifecycle = self.lifecycle.lock().await;
+        let dreaming = self.stop_dreaming_component().await;
+        let pool = self.sweep_team_pool().await;
+        let started = self.started.swap(false, Ordering::AcqRel);
+        let mut report = StopReport::new(started)
+            .with_pool(pool)
+            .with_dreaming(dreaming);
+        if !started {
+            tracing::debug!(target: LOG_TARGET, runner_id = %self.runner_id, "runner already stopped");
+            return report;
+        }
+        let queue = self.stop_queue_component().await;
+        *self.checkpointer.write() = None;
+        self.resources.release();
+        tracing::info!(target: LOG_TARGET, runner_id = %self.runner_id, "runner stopped");
+        report = report.with_queue(queue).with_registries_released(true);
+        report
+    }
+
     /// Stops the runner: stops every pooled team run, stops the queue (bounded by
     /// [`RunnerConfig::shutdown_timeout`]), drops the checkpointer, and releases
     /// every registry entry (Python `Runner.stop`).
     ///
+    /// Every component is attempted, and the result is the aggregate of all of
+    /// them: `Ok(())` only when the report
+    /// ([`Runner::stop_with_report`]) is clean. Nothing is swallowed — a queue that
+    /// fails or misses its grace period, a pool sweep that fails, and a dreaming
+    /// loop that could not be joined each make this an `Err`, and the message
+    /// names **every** failed component with its own reason.
+    ///
     /// The pool is swept **before** the started check, so a runner that never
     /// started (but admitted pooled runs, which do not require `start`) does not
-    /// leak them. A fresh open pool built from the live configuration replaces the
-    /// swept one, so a later [`Runner::start_agent_team`] — or a restart — can
-    /// admit runs again.
-    ///
-    /// Idempotent; stopping a runner that was never started is `Ok(())`. A queue
-    /// that does not stop within the grace period is logged and left to its own
-    /// shutdown rather than failing the whole stop; a pool sweep failure is
-    /// reported through `tracing` only, so the queue's result stays the return
-    /// value.
-    ///
-    /// The installed dreaming service is stopped too, before the pool sweep and
-    /// before the started early return — best effort, never affecting the result
-    /// — while [`Runner::start`] never starts one: consolidation has a lifecycle
-    /// of its own. The service stays installed, so a later
-    /// [`Runner::start_dreaming`] runs it again.
+    /// leak them, and the fresh open pool that replaces it lets a later
+    /// [`Runner::start_agent_team`] — or a restart — admit runs again, even when
+    /// the sweep itself failed. A running dreaming service is stopped too and
+    /// stays installed for a later [`Runner::start_dreaming`], while
+    /// [`Runner::start`] never starts one: consolidation has a lifecycle of its
+    /// own. Idempotent; stopping a never-started runner stops the pool and
+    /// dreaming as above and reports the queue as `skipped`.
     ///
     /// # Errors
     ///
-    /// Returns the queue's error when it fails to stop.
+    /// `Error::Config` — the closest existing kind, documented in
+    /// [`crate::error::shutdown_incomplete`] — with every failed component and its
+    /// message when the report is not clean. Call
+    /// [`Runner::stop_with_report`] instead to inspect the components without an
+    /// error.
     pub async fn stop(&self) -> Result<()> {
-        let _lifecycle = self.lifecycle.lock().await;
-        self.stop_dreaming_quietly().await;
-        self.sweep_team_pool().await;
-        if !self.started.swap(false, Ordering::AcqRel) {
-            tracing::debug!(target: LOG_TARGET, runner_id = %self.runner_id, "runner already stopped");
-            return Ok(());
+        let report = self.stop_with_report().await;
+        match report.failure_summary() {
+            Some(details) => Err(error::shutdown_incomplete(details)),
+            None => Ok(()),
         }
-        let queue = Arc::clone(&self.queue.read());
-        let timeout = self.config().shutdown_timeout();
-        let stopped = if timeout.is_zero() {
-            queue.stop().await
-        } else if let Ok(result) = tokio::time::timeout(timeout, queue.stop()).await {
-            result
-        } else {
-            tracing::warn!(
-                target: LOG_TARGET,
-                runner_id = %self.runner_id,
-                timeout_ms = timeout.as_millis(),
-                "message queue did not stop within the shutdown grace period"
-            );
-            Ok(())
-        };
-        *self.checkpointer.write() = None;
-        self.resources.release();
-        tracing::info!(target: LOG_TARGET, runner_id = %self.runner_id, "runner stopped");
-        stopped
     }
 
     /// Releases the state stored for `session_id` in the runner's checkpointer.
@@ -925,7 +962,10 @@ impl Runner {
             let mut slot = self.team_pool.write();
             std::mem::replace(&mut *slot, TeamPool::from_runner_config(config))
         };
-        sweep_pool(&previous, self.runner_id()).await;
+        // The sweep of the retired pool is a restart boundary, not a stop: its
+        // first failure is already logged by `sweep_pool`, and a `start` keeps
+        // reporting through its own `Result`.
+        let _retired = sweep_pool(&previous, self.runner_id()).await;
         tracing::debug!(
             target: LOG_TARGET,
             runner_id = %self.runner_id,
@@ -934,22 +974,65 @@ impl Runner {
         );
     }
 
-    /// Stops every pooled team run and installs a fresh open pool.
+    /// Stops every pooled team run, installs a fresh open pool, and reports the
+    /// sweep.
     ///
-    /// The logs are the only report: [`Runner::stop`]'s return value stays the
-    /// queue's, exactly as before the pool existed.
-    async fn sweep_team_pool(&self) {
+    /// The fresh pool is installed **before** the failure is judged, so a sweep
+    /// failure still leaves a usable pool behind (a restart or a later
+    /// [`Runner::start_agent_team`] must not be blocked by a member that refused
+    /// to stop). The first sweep failure becomes the component's message.
+    async fn sweep_team_pool(&self) -> ComponentStop {
         let previous = self.team_pool();
-        sweep_pool(&previous, self.runner_id()).await;
+        let shutdown = sweep_pool(&previous, self.runner_id()).await;
         *self.team_pool.write() = TeamPool::from_runner_config(&self.config());
+        match shutdown.into_result() {
+            Ok(_stopped) => ComponentStop::stopped(StopComponent::Pool),
+            Err(error) => ComponentStop::failed(StopComponent::Pool, error.to_string()),
+        }
+    }
+
+    /// Stops the installed message queue and reports the outcome.
+    ///
+    /// A zero [`RunnerConfig::shutdown_timeout`] waits without a bound (as
+    /// before); otherwise the stop is bounded and an expired bound is a failure
+    /// naming it — the queue is left to its own shutdown, but the Runner no
+    /// longer claims the stop succeeded.
+    async fn stop_queue_component(&self) -> ComponentStop {
+        let queue = Arc::clone(&self.queue.read());
+        let timeout = self.config().shutdown_timeout();
+        if timeout.is_zero() {
+            return match queue.stop().await {
+                Ok(()) => ComponentStop::stopped(StopComponent::Queue),
+                Err(error) => ComponentStop::failed(StopComponent::Queue, error.to_string()),
+            };
+        }
+        match tokio::time::timeout(timeout, queue.stop()).await {
+            Ok(Ok(())) => ComponentStop::stopped(StopComponent::Queue),
+            Ok(Err(error)) => ComponentStop::failed(StopComponent::Queue, error.to_string()),
+            Err(_elapsed) => {
+                let message = format!(
+                    "the message queue did not stop within the {}ms shutdown grace period \
+                     (`RunnerConfig::shutdown_timeout_secs`); it was left to its own shutdown",
+                    timeout.as_millis()
+                );
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    runner_id = %self.runner_id,
+                    timeout_ms = timeout.as_millis(),
+                    "message queue did not stop within the shutdown grace period"
+                );
+                ComponentStop::failed(StopComponent::Queue, message)
+            }
+        }
     }
 }
 
-/// Stops every run of `pool` (awaited outside any lock) and logs the sweep.
-async fn sweep_pool(pool: &TeamPool, runner_id: &str) {
+/// Stops every run of `pool` (awaited outside any lock) and logs the sweep,
+/// returning it so the caller can report a failure instead of only logging it.
+async fn sweep_pool(pool: &TeamPool, runner_id: &str) -> PoolShutdown {
     let shutdown = pool.stop_all().await;
     let stopped = shutdown.stopped;
-    if let Some(error) = shutdown.first_error {
+    if let Some(error) = &shutdown.first_error {
         tracing::warn!(
             target: LOG_TARGET,
             runner_id,
@@ -965,6 +1048,7 @@ async fn sweep_pool(pool: &TeamPool, runner_id: &str) {
             "stopped pooled team runs"
         );
     }
+    shutdown
 }
 
 #[cfg(test)]
