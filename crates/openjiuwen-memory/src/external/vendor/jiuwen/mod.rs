@@ -35,8 +35,8 @@ use serde_json::{json, Value};
 use super::super::provider::{MemoryProvider, ProviderCapabilities};
 use super::super::registry::{ProviderConfig, ProviderKind};
 use super::super::rest::{
-    body_value, field_f32, field_str, vendor_hit, vendor_record, AuthScheme, RestCall,
-    RestProvider, SpecContext, WireSpec,
+    body_value, field_f32, field_str, listing_record, rank_hits, vendor_record, AuthScheme,
+    RestCall, RestProvider, SpecContext, WireSpec,
 };
 use crate::external::rail;
 use crate::record::{
@@ -152,45 +152,40 @@ impl WireSpec for JiuwenSpec {
 
     /// Decodes the recall answer.
     ///
-    /// The server answers an object with an `items` array of `{unit_id, content, score}`;
-    /// a non-object body or a non-list `items` decodes as "no hits" instead of failing,
-    /// mirroring the Python backend.
+    /// The server answers an object with an `items` array of `{unit_id, content, score}`; a
+    /// missing or non-list `items` decodes as "no hits", mirroring the Python backend, and a
+    /// scored row keeps the caller's threshold. A row the server answered without a `score`
+    /// is a match it did not rank, so the threshold never drops it; a row with no content is
+    /// skipped with a warning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Transport`] naming the response URL when the body is not JSON. A
+    /// proxy error page or an HTML maintenance page is *not* an empty memory set, and
+    /// reading it as one would silently answer "nothing matched".
     fn search_result(
         &self,
         cx: &SpecContext<'_>,
         response: &HttpResponse,
         options: &SearchOptions,
     ) -> Result<Vec<RecallHit>> {
-        let value = match body_value(response) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    %error,
-                    "the Jiuwen recall answer was not JSON; treating it as no hits"
-                );
-                return Ok(Vec::new());
-            }
-        };
+        let value = body_value(response)?;
         let Some(items) = value.get("items").and_then(Value::as_array) else {
             return Ok(Vec::new());
         };
-        let mut scored: Vec<(MemoryRecord, f32)> = items
+        let candidates = items
             .iter()
             .filter(|item| item.is_object())
-            .map(|item| {
-                let record = vendor_record(item, cx.scope, MemoryType::SemanticMemory);
-                let score = field_f32(item, &["score"]).unwrap_or(0.0);
-                (record, score)
+            .filter_map(|item| {
+                let record = listing_record(item, cx.scope, MemoryType::SemanticMemory, "search")?;
+                Some((record, field_f32(item, &["score"])))
             })
-            .filter(|(_, score)| options.threshold <= 0.0 || *score >= options.threshold)
             .collect();
-        scored.sort_by(|left, right| right.1.total_cmp(&left.1));
-        scored.truncate(effective_top_k(options.top_k));
-        Ok(scored
-            .into_iter()
-            .map(|(record, score)| vendor_hit(record, score))
-            .collect())
+        Ok(rank_hits(
+            candidates,
+            options.threshold,
+            effective_top_k(options.top_k),
+        ))
     }
 
     /// Builds the write request: one memory per call, with the server's exact field
@@ -223,8 +218,18 @@ impl WireSpec for JiuwenSpec {
     /// The server answers a **top-level array** of serialized units; the first unit's
     /// `id` becomes the record id and its `segments` are joined with newlines into the
     /// content (a serialized unit carries no top-level content field). An empty array is
-    /// the legal "everything deduplicated" answer, and any other shape is treated the
-    /// same way: the input is reported as skipped, never as a failed write.
+    /// the legal "everything deduplicated" answer and is reported as a skip.
+    ///
+    /// Any other `2xx` answer is reported as **added**, because the write itself was
+    /// accepted: the request carried the content verbatim, so the memory is stored even
+    /// when the answer cannot be parsed. Reading an unparseable answer as "deduplicated"
+    /// would tell the caller its memory was already there and hide a vendor regression, so
+    /// the parse failure is logged and the submitted memory is reported instead (the same
+    /// rule mem0 follows for a body with no usable rows).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] when no memory is supplied.
     fn add_result(
         &self,
         cx: &SpecContext<'_>,
@@ -234,23 +239,23 @@ impl WireSpec for JiuwenSpec {
         let memory = memories.first().ok_or_else(|| {
             Error::validation("the Jiuwen memory server accepts exactly one memory per write")
         })?;
-        let value = match body_value(response) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    %error,
-                    "the Jiuwen write answer was not JSON; treating the memory as deduplicated"
-                );
-                return Ok(skipped_outcome(cx, memory));
-            }
-        };
-        let Value::Array(units) = value else {
-            tracing::debug!(
+        let value = body_value(response).unwrap_or_else(|error| {
+            tracing::warn!(
                 target: LOG_TARGET,
-                "the Jiuwen write answer was not a top-level array; treating the memory as deduplicated"
+                %error,
+                "the Jiuwen write answer was not JSON; the accepted write is reported as added"
             );
-            return Ok(skipped_outcome(cx, memory));
+            Value::Null
+        });
+        let Value::Array(units) = value else {
+            if !value.is_null() {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    "the Jiuwen write answer was not a top-level array; the accepted write is \
+                     reported as added"
+                );
+            }
+            return Ok(added_outcome(cx, memory));
         };
         let Some(unit) = units.first() else {
             return Ok(skipped_outcome(cx, memory));
@@ -592,6 +597,27 @@ fn segment_content(unit: &Value) -> String {
                 .join("\n")
         })
         .unwrap_or_default()
+}
+
+/// The outcome of an accepted write whose answer could not be decoded: the submitted
+/// memory is reported as added, under a client-generated id.
+///
+/// The request carried the content verbatim, so the server stored it; only the id the
+/// server assigned is unknown.
+fn added_outcome(cx: &SpecContext<'_>, memory: &NewMemory) -> AddOutcome {
+    let record = MemoryRecord::new(cx.scope.clone(), memory.content.clone(), memory.kind);
+    let mut record = record.with_id(crate::record::new_memory_id(
+        cx.user_id(),
+        chrono::Utc::now(),
+    ));
+    record.metadata.clone_from(&memory.metadata);
+    if let Some(source) = &memory.source {
+        record.source = Some(source.clone());
+    }
+    AddOutcome {
+        added: vec![record],
+        ..AddOutcome::default()
+    }
 }
 
 /// The outcome of a write the server deduplicated: nothing added, the input's generated

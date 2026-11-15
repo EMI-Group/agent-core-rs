@@ -58,8 +58,8 @@ use super::{
 use crate::external::provider::ProviderCapabilities;
 use crate::external::registry::ProviderConfig;
 use crate::external::rest::{
-    body_value, field_f32, field_str, results_array, vendor_hit, vendor_record, AuthScheme, Op,
-    RestCall, SpecContext, WireSpec,
+    body_value, field_f32, field_str, listing_record, rank_hits, results_array,
+    results_array_checked, vendor_record, AuthScheme, Op, RestCall, SpecContext, WireSpec,
 };
 use crate::record::{
     AddOptions, AddOutcome, MemoryFilter, MemoryRecord, MemoryScope, MemoryType, MemoryUpdate,
@@ -158,7 +158,10 @@ impl WireSpec for LakeBaseSpec {
     ///
     /// The returned id is stringified; the submitted content, kind, importance, and
     /// metadata are kept, and the vendor's type is recorded as `metadata["memory_type"]`
-    /// (the submitted type when the answer omits one).
+    /// (the submitted type when the answer omits one). `LakeBase` addresses a memory by its
+    /// integer id, so an answer without one is logged: the record is still reported as
+    /// added (the ingest was accepted) with the client-generated placeholder id, which
+    /// cannot be read, updated, or deleted afterwards.
     ///
     /// # Errors
     ///
@@ -177,8 +180,16 @@ impl WireSpec for LakeBaseSpec {
         }
         record.metadata = memory.metadata.clone();
         record.source.clone_from(&memory.source);
-        if let Some(id) = stringified_id(&value) {
-            record.id = id;
+        match stringified_id(&value) {
+            Some(id) => record.id = id,
+            None => {
+                tracing::warn!(
+                    target: super::LOG_TARGET,
+                    vendor = ID,
+                    "the LakeBase ingest answer carried no `memory_id`; the stored memory is \
+                     reported under a client-generated id and cannot be addressed"
+                );
+            }
         }
         let vendor_type = field_str(&value, &[TYPE_FIELD]).map_or_else(
             || vendor_type_for(memory.kind, &memory.metadata),
@@ -217,7 +228,10 @@ impl WireSpec for LakeBaseSpec {
     ///
     /// Hits are dropped when they are under a positive `options.threshold`, then sorted by
     /// score descending and truncated to `options.top_k`. A row carries no id, so the
-    /// record gets a generated one.
+    /// record gets a generated one. A row the vendor answered without a `score` is a match
+    /// the backend did not rank, so the threshold never drops it; a row that carries no
+    /// content at all is skipped with a warning instead of being reported as an empty
+    /// memory.
     ///
     /// # Errors
     ///
@@ -229,17 +243,14 @@ impl WireSpec for LakeBaseSpec {
         options: &SearchOptions,
     ) -> Result<Vec<RecallHit>> {
         let value = body_value(response)?;
-        let mut hits: Vec<RecallHit> = results_array(&value)
+        let candidates = results_array(&value)
             .iter()
-            .map(|row| {
-                let record = decode_row(row, cx.scope);
-                vendor_hit(record, field_f32(row, &["score"]).unwrap_or(0.0))
+            .filter_map(|row| {
+                let record = listing_row(row, cx.scope, "recall")?;
+                Some((record, field_f32(row, &["score"])))
             })
-            .filter(|hit| options.threshold <= 0.0 || hit.score >= options.threshold)
             .collect();
-        hits.sort_by(|left, right| right.score.total_cmp(&left.score));
-        hits.truncate(options.top_k);
-        Ok(hits)
+        Ok(rank_hits(candidates, options.threshold, options.top_k))
     }
 
     /// Reads one memory; the record id must be the vendor's integer id.
@@ -366,11 +377,13 @@ impl WireSpec for LakeBaseSpec {
     /// Decodes `{memories: [...], total: n}` into records.
     ///
     /// `total` is ignored: the record SPI has no page-count channel, and inventing one
-    /// would be a silent truncation.
+    /// would be a silent truncation. A row that carries no memory content is skipped with
+    /// a warning rather than reported as an empty record.
     ///
     /// # Errors
     ///
-    /// Returns a typed error when the body is not JSON.
+    /// Returns a typed error when the body is not JSON, or when a non-empty body carries no
+    /// recognised row array.
     fn list_result(
         &self,
         cx: &SpecContext<'_>,
@@ -378,9 +391,9 @@ impl WireSpec for LakeBaseSpec {
         _filter: &MemoryFilter,
     ) -> Result<Vec<MemoryRecord>> {
         let value = body_value(response)?;
-        Ok(results_array(&value)
+        Ok(results_array_checked(response, &value)?
             .iter()
-            .map(|row| decode_row(row, cx.scope))
+            .filter_map(|row| listing_row(row, cx.scope, "list"))
             .collect())
     }
 
@@ -525,6 +538,30 @@ fn decode_row(row: &Value, scope: &MemoryScope) -> MemoryRecord {
     let vendor_type = field_str(row, &[TYPE_FIELD]);
     let kind = vendor_type.map_or(MemoryType::SemanticMemory, kind_for_vendor_type);
     let mut record = vendor_record(row, scope, kind);
+    apply_row_identity(&mut record, row, vendor_type);
+    record
+}
+
+/// Maps one *listing* row onto a record, skipping a row the vendor answered without content.
+///
+/// `LakeBase`'s listing and recall rows are decoded by [`decode_row`], but a row that
+/// carries no `content` is not a memory the base stored: reporting it would put an empty
+/// record with an invented id in the caller's listing. `operation` names the request the
+/// row came from in the warning.
+fn listing_row(row: &Value, scope: &MemoryScope, operation: &str) -> Option<MemoryRecord> {
+    let vendor_type = field_str(row, &[TYPE_FIELD]);
+    let kind = vendor_type.map_or(MemoryType::SemanticMemory, kind_for_vendor_type);
+    let mut record = listing_record(row, scope, kind, operation)?;
+    apply_row_identity(&mut record, row, vendor_type);
+    Some(record)
+}
+
+/// Copies the vendor's integer id and own memory type onto a decoded record.
+///
+/// `vendor_record` only reads string ids, so `LakeBase`'s integer `memory_id` is
+/// stringified here; the vendor's type label is kept as `metadata["memory_type"]` when the
+/// row carried one.
+fn apply_row_identity(record: &mut MemoryRecord, row: &Value, vendor_type: Option<&str>) {
     if let Some(id) = stringified_id(row) {
         record.id = id;
     }
@@ -534,7 +571,6 @@ fn decode_row(row: &Value, scope: &MemoryScope) -> MemoryRecord {
             Value::String(vendor_type.to_owned()),
         );
     }
-    record
 }
 
 /// The vendor memory id of a response or row, stringified.
