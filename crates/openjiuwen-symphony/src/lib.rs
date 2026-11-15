@@ -43,9 +43,13 @@
 //! - [`runtime`] — [`runtime::SymphonyRuntime`], the composition root: configuration,
 //!   lifecycle (`start`/`stop`/`close`), graph build, plan, invoke, mutations, and
 //!   evolution feedback.
-//! - [`deferred`] — an API-shaped, documented `Error::Unsupported` stub for the only
-//!   remaining deferred backend, which needs a native GPU inference stack: `vLLM` logit
-//!   selection.
+//! - [`observation`] — the caller-supplied evidence log, content-hashed observation and
+//!   merged graph revisions, and the per-edge overlay weights the planner reads.
+//! - [`retrieval`] — capability-tree index construction and progressive retrieval: the
+//!   persisted index artifact set, field-weighted lexical scoring, bounded disclosure
+//!   rendering, and embedding-backed branch selection.
+//! - [`deferred`] — API-shaped, documented `Error::Unsupported` stubs for the backends
+//!   that need a native GPU inference stack: `vLLM` logit selection.
 //!
 //! # Contracts
 //!
@@ -85,12 +89,16 @@ pub mod llm;
 pub mod model;
 /// Object-store backed graph artifact persistence.
 pub mod object_artifact;
+/// Graph observation: the evidence log, derived graph revisions, and overlay weights.
+pub mod observation;
 /// Deterministic relation candidates, planning, and plan execution.
 pub mod orchestration;
 /// Credential and PII redaction for model-facing and packaged text.
 pub mod redaction;
 /// The in-memory capability registry with write-through persistence.
 pub mod registry;
+/// Capability-tree index build and progressive retrieval (lexical and embedding-backed).
+pub mod retrieval;
 /// The symphony composition root: configuration, lifecycle, graph build, plan, invoke.
 pub mod runtime;
 /// Keyword/metadata and semantic capability retrieval.

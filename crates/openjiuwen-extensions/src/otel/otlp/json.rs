@@ -28,7 +28,7 @@ use super::model::{scope_groups, ScopeGroup};
 /// `(name, version)` pair, in first-seen order, keeping the span order inside a
 /// scope. Without a resource the `resource` object is emitted empty instead of
 /// dropping the key, so the body shape never depends on the resource.
-pub(super) fn encode_body(resource: Option<&Resource>, spans: &[SpanData]) -> Value {
+pub(crate) fn encode_body(resource: Option<&Resource>, spans: &[SpanData]) -> Value {
     let mut root = Map::new();
     root.insert(
         "resourceSpans".to_owned(),

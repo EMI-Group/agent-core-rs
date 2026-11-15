@@ -43,6 +43,18 @@ fn assert_task_executor<T: openjiuwen_core::controller::TaskExecutor + ?Sized>()
 
 /// Asserts at compile time that `T` satisfies the umbrella's query-rewriter seam.
 fn assert_query_rewriter<T: openjiuwen_core::retrieval::rewrite::QueryRewriter + ?Sized>() {}
+/// Asserts at compile time that `T` satisfies the umbrella's compression-state sink
+/// seam.
+fn assert_compression_state_sink<
+    T: openjiuwen_core::context_engine::telemetry::CompressionStateSink + ?Sized,
+>() {
+}
+/// Asserts at compile time that `T` satisfies the umbrella's team-memory store seam.
+fn assert_team_memory_store<T: openjiuwen_core::memory::team::TeamMemoryStore + ?Sized>() {}
+/// Asserts at compile time that `T` satisfies the umbrella's external memory-provider
+/// seam. This is `openjiuwen_memory::external::MemoryProvider`, not the agent crate's
+/// `memory_provider` module of the same name.
+fn assert_memory_provider<T: openjiuwen_core::memory::external::MemoryProvider + ?Sized>() {}
 
 /// References (but never calls) an item whose fn-item type is unnameable.
 fn reference_item<T>(_item: T) {}
@@ -59,6 +71,14 @@ type DiffSnapshotsFn = fn(
     &openjiuwen_session::SessionSnapshot,
     &openjiuwen_session::SessionSnapshot,
 ) -> Vec<openjiuwen_session::JsonChange>;
+/// `memory_provider::provider_tools` as a fn pointer.
+type ProviderToolsFn = fn(
+    std::sync::Arc<dyn openjiuwen_memory::MemoryProvider>,
+) -> Vec<std::sync::Arc<dyn openjiuwen_foundation::Tool>>;
+/// `loaders::fixtures::build_zip` as a fn pointer.
+type BuildZipFn = fn(&[(&str, &str)]) -> openjiuwen_common::error::Result<Vec<u8>>;
+/// `loaders::fixtures::pptx_slides` as a fn pointer.
+type PptxSlidesFn = fn(&[(&str, &[&str])]) -> openjiuwen_common::error::Result<Vec<u8>>;
 
 #[test]
 fn common_paths_resolve() {
@@ -95,6 +115,105 @@ fn workflow_paths_resolve() {
 #[test]
 fn context_engine_paths_resolve() {
     assert_same_type::<ContextEngine, openjiuwen_context::ContextEngine>();
+}
+
+/// Proves the `context_engine` alias forwards the context crate's `usage`,
+/// `telemetry`, `policy`, `tokenizers`, and `processor::rule_compression` submodules
+/// unchanged.
+#[test]
+fn context_engine_modules_paths_resolve() {
+    use openjiuwen_core::context_engine::{
+        policy::{
+            lookup_model_default_window, ContextWindowPolicy, OpenRouterWindowCache,
+            ResolvedContextWindow,
+        },
+        processor::rule_compression::{
+            extract_query_terms, ContentRouter, RuleCompressionPipeline, RuleContentRouter,
+        },
+        telemetry::{CompressionStatePhase, RecordingSink},
+        tokenizers::{
+            artifacts::TokenizerArtifactManager, load_native_tokenizer, ModelEncoding,
+            ModelTokenCounter, TokenizerRegistry, TokenizerSpec,
+        },
+        usage::{ContextUsageAnalyzer, ContextUsageSnapshot, SessionKVCacheAggregator},
+    };
+
+    // Usage telemetry: the analyzer, its snapshot shape, and the KV-cache rollup.
+    assert_same_type::<ContextUsageAnalyzer, openjiuwen_context::usage::ContextUsageAnalyzer>();
+    assert_same_type::<ContextUsageSnapshot, openjiuwen_context::usage::ContextUsageSnapshot>();
+    assert_same_type::<SessionKVCacheAggregator, openjiuwen_context::usage::SessionKVCacheAggregator>(
+    );
+
+    // Compression-state telemetry. `CompressionStateSink` is a trait: prove the
+    // concrete trait object satisfies the umbrella trait's bound.
+    assert_same_type::<CompressionStatePhase, openjiuwen_context::telemetry::CompressionStatePhase>(
+    );
+    assert_same_type::<RecordingSink, openjiuwen_context::telemetry::RecordingSink>();
+    assert_compression_state_sink::<dyn openjiuwen_context::telemetry::CompressionStateSink>();
+
+    // Window resolution.
+    assert_same_type::<ContextWindowPolicy, openjiuwen_context::policy::ContextWindowPolicy>();
+    assert_same_type::<ResolvedContextWindow, openjiuwen_context::policy::ResolvedContextWindow>();
+    assert_same_type::<OpenRouterWindowCache, openjiuwen_context::policy::OpenRouterWindowCache>();
+    let core_lookup: fn(&str) -> Option<usize> = lookup_model_default_window;
+    let concrete_lookup: fn(&str) -> Option<usize> =
+        openjiuwen_context::policy::lookup_model_default_window;
+    assert!(std::ptr::eq(
+        core_lookup as *const (),
+        concrete_lookup as *const ()
+    ));
+
+    // Tokenizer selection and offline artefacts.
+    assert_same_type::<TokenizerRegistry, openjiuwen_context::tokenizers::TokenizerRegistry>();
+    assert_same_type::<TokenizerSpec, openjiuwen_context::tokenizers::TokenizerSpec>();
+    assert_same_type::<ModelTokenCounter, openjiuwen_context::tokenizers::ModelTokenCounter>();
+    assert_same_type::<ModelEncoding, openjiuwen_context::tokenizers::ModelEncoding>();
+    assert_same_type::<
+        TokenizerArtifactManager,
+        openjiuwen_context::tokenizers::artifacts::TokenizerArtifactManager,
+    >();
+
+    // The native-tokenizer loader takes `impl AsRef<Path>`, so its fn item is generic
+    // and cannot be coerced to a higher-ranked `fn(&Path)` pointer. Pin one concrete
+    // instantiation (`PathBuf`) through both paths and compare the addresses. Never
+    // called.
+    let core_load: fn(
+        std::path::PathBuf,
+    ) -> openjiuwen_common::error::Result<
+        openjiuwen_context::tokenizers::SelectedTokenizer,
+    > = load_native_tokenizer;
+    let concrete_load: fn(
+        std::path::PathBuf,
+    ) -> openjiuwen_common::error::Result<
+        openjiuwen_context::tokenizers::SelectedTokenizer,
+    > = openjiuwen_context::tokenizers::load_native_tokenizer;
+    assert!(std::ptr::eq(
+        core_load as *const (),
+        concrete_load as *const ()
+    ));
+
+    // Rule-based tool-result compression. `ContentRouter` is a type alias for
+    // `RuleContentRouter`, so it is compared by `TypeId`, not by a trait bound.
+    assert_same_type::<
+        RuleContentRouter,
+        openjiuwen_context::processor::rule_compression::RuleContentRouter,
+    >();
+    assert_same_type::<
+        RuleCompressionPipeline,
+        openjiuwen_context::processor::rule_compression::RuleCompressionPipeline,
+    >();
+    assert_same_type::<
+        ContentRouter,
+        openjiuwen_context::processor::rule_compression::RuleContentRouter,
+    >();
+    let core_terms: fn(&str, Option<&str>, Option<&str>) -> std::collections::BTreeSet<String> =
+        extract_query_terms;
+    let concrete_terms: fn(&str, Option<&str>, Option<&str>) -> std::collections::BTreeSet<String> =
+        openjiuwen_context::processor::rule_compression::extract_query_terms;
+    assert!(std::ptr::eq(
+        core_terms as *const (),
+        concrete_terms as *const ()
+    ));
 }
 
 #[test]
@@ -274,6 +393,69 @@ fn single_agent_extended_paths_resolve() {
     );
 }
 
+/// Proves the `single_agent` glob forwards the agent crate's `memory_provider`,
+/// `usage`, and `prompt_pack` submodules unchanged.
+#[test]
+fn single_agent_modules_paths_resolve() {
+    use openjiuwen_core::single_agent::{
+        memory_provider::{provider_tool_cards, provider_tools, ProviderMemoryRail, ProviderTool},
+        prompt_pack::{
+            directory::PromptDirectory, PromptPack, PromptPackContext, PromptSectionsRail,
+            RailSpec, PROMPT_SECTIONS_METADATA_KEY,
+        },
+        usage::{default_usage_analyzer, UsageTelemetry, MAIN_CONTEXT_ID},
+    };
+
+    // The external memory-provider bridge: the rail, the tool wrapper, and the two
+    // tool-schema builders.
+    assert_same_type::<ProviderMemoryRail, openjiuwen_agent::memory_provider::ProviderMemoryRail>();
+    assert_same_type::<ProviderTool, openjiuwen_agent::memory_provider::ProviderTool>();
+    let core_tools: ProviderToolsFn = provider_tools;
+    let agent_tools: ProviderToolsFn = openjiuwen_agent::memory_provider::provider_tools;
+    assert!(std::ptr::eq(
+        core_tools as *const (),
+        agent_tools as *const ()
+    ));
+    let core_cards: fn(
+        &std::sync::Arc<dyn openjiuwen_memory::MemoryProvider>,
+    ) -> Vec<openjiuwen_foundation::ToolCard> = provider_tool_cards;
+    let agent_cards: fn(
+        &std::sync::Arc<dyn openjiuwen_memory::MemoryProvider>,
+    ) -> Vec<openjiuwen_foundation::ToolCard> =
+        openjiuwen_agent::memory_provider::provider_tool_cards;
+    assert!(std::ptr::eq(
+        core_cards as *const (),
+        agent_cards as *const ()
+    ));
+
+    // Usage telemetry: the drained buffer, the fixed context id, and the default
+    // analyzer a host gets without configuring anything.
+    assert_same_type::<UsageTelemetry, openjiuwen_agent::usage::UsageTelemetry>();
+    assert_eq!(MAIN_CONTEXT_ID, openjiuwen_agent::usage::MAIN_CONTEXT_ID);
+    let core_analyzer: fn() -> openjiuwen_context::ContextUsageAnalyzer = default_usage_analyzer;
+    let agent_analyzer: fn() -> openjiuwen_context::ContextUsageAnalyzer =
+        openjiuwen_agent::usage::default_usage_analyzer;
+    assert!(std::ptr::eq(
+        core_analyzer as *const (),
+        agent_analyzer as *const ()
+    ));
+
+    // YAML prompt packs and the sections rail they install.
+    assert_same_type::<PromptPack, openjiuwen_agent::prompt_pack::PromptPack>();
+    assert_same_type::<PromptPackContext, openjiuwen_agent::prompt_pack::PromptPackContext>();
+    assert_same_type::<PromptSectionsRail, openjiuwen_agent::prompt_pack::PromptSectionsRail>();
+    assert_same_type::<RailSpec, openjiuwen_agent::prompt_pack::RailSpec>();
+    assert_eq!(
+        PROMPT_SECTIONS_METADATA_KEY,
+        openjiuwen_agent::prompt_pack::PROMPT_SECTIONS_METADATA_KEY
+    );
+
+    // Nested module paths.
+    assert_same_type::<PromptDirectory, openjiuwen_agent::prompt_pack::directory::PromptDirectory>(
+    );
+    assert_same_type::<PromptPack, openjiuwen_agent::prompt_pack::pack::PromptPack>();
+}
+
 #[test]
 fn session_extended_paths_resolve() {
     use openjiuwen_core::session::{
@@ -400,6 +582,93 @@ fn memory_extended_paths_resolve() {
     assert_same_type::<DreamJob, openjiuwen_memory::DreamJob>();
 }
 
+/// Proves the `memory` alias forwards the memory crate's `lite` extensions,
+/// `dreaming`, `team`, `external`, and `store::migration` submodules unchanged.
+#[test]
+fn memory_modules_paths_resolve() {
+    use openjiuwen_core::memory::{
+        dreaming::{DreamConfig, DreamOrchestrator, DreamState},
+        external::{ProviderRegistry, RestProvider},
+        lite::{
+            embed::{cosine_similarity, EmbeddingCache, EmbeddingIndex, MemChunk},
+            facts::{slug, FactDocument, FactFiles, MEMORY_FILE},
+            local::LocalCodingMemoryBuilder,
+            session::{sanitize_session_id, SessionStore},
+        },
+        store::migration::{standard_registry, MessageMigrator, SqlMigrator, VectorMigrator},
+        team::{TeamMemoryHooks, TeamMemoryRecord},
+    };
+
+    // Lite coding-memory extensions: per-fact files, the embedding index, session
+    // logs, and the local-store builder.
+    assert_same_type::<FactFiles, openjiuwen_memory::lite::facts::FactFiles>();
+    assert_same_type::<FactDocument, openjiuwen_memory::lite::facts::FactDocument>();
+    assert_eq!(MEMORY_FILE, openjiuwen_memory::lite::facts::MEMORY_FILE);
+    let core_slug: fn(&str) -> String = slug;
+    let concrete_slug: fn(&str) -> String = openjiuwen_memory::lite::facts::slug;
+    assert!(std::ptr::eq(
+        core_slug as *const (),
+        concrete_slug as *const ()
+    ));
+
+    assert_same_type::<EmbeddingCache, openjiuwen_memory::lite::embed::EmbeddingCache>();
+    assert_same_type::<MemChunk, openjiuwen_memory::lite::embed::MemChunk>();
+    assert_same_type::<EmbeddingIndex, openjiuwen_memory::lite::embed::EmbeddingIndex>();
+    let core_cosine: fn(&[f32], &[f32]) -> f32 = cosine_similarity;
+    let concrete_cosine: fn(&[f32], &[f32]) -> f32 =
+        openjiuwen_memory::lite::embed::cosine_similarity;
+    assert!(std::ptr::eq(
+        core_cosine as *const (),
+        concrete_cosine as *const ()
+    ));
+
+    assert_same_type::<SessionStore, openjiuwen_memory::lite::session::SessionStore>();
+    let core_sanitize: fn(&str) -> openjiuwen_common::error::Result<String> = sanitize_session_id;
+    let concrete_sanitize: fn(&str) -> openjiuwen_common::error::Result<String> =
+        openjiuwen_memory::lite::session::sanitize_session_id;
+    assert!(std::ptr::eq(
+        core_sanitize as *const (),
+        concrete_sanitize as *const ()
+    ));
+
+    assert_same_type::<
+        LocalCodingMemoryBuilder,
+        openjiuwen_memory::lite::local::LocalCodingMemoryBuilder,
+    >();
+
+    // The dream-job queue and its orchestrator.
+    assert_same_type::<DreamConfig, openjiuwen_memory::dreaming::DreamConfig>();
+    assert_same_type::<DreamState, openjiuwen_memory::dreaming::DreamState>();
+    assert_same_type::<DreamOrchestrator, openjiuwen_memory::dreaming::DreamOrchestrator>();
+
+    // Team-scoped memory: the record, the hooks, and the store seam. `TeamMemoryStore`
+    // is a trait, so the bound on the concrete trait object proves the alias.
+    assert_same_type::<TeamMemoryRecord, openjiuwen_memory::team::TeamMemoryRecord>();
+    assert_same_type::<TeamMemoryHooks, openjiuwen_memory::team::TeamMemoryHooks>();
+    assert_team_memory_store::<dyn openjiuwen_memory::team::TeamMemoryStore>();
+
+    // The external provider SPI: registry, REST transport, and the provider seam.
+    assert_same_type::<ProviderRegistry, openjiuwen_memory::external::ProviderRegistry>();
+    assert_same_type::<RestProvider, openjiuwen_memory::external::RestProvider>();
+    assert_memory_provider::<dyn openjiuwen_memory::external::MemoryProvider>();
+
+    // The forward-only migration runner. `store::migration::runner` is sqlite-gated, so
+    // only the always-compiled migrators and the standard registry are named here.
+    assert_same_type::<SqlMigrator, openjiuwen_memory::store::migration::SqlMigrator>();
+    assert_same_type::<VectorMigrator, openjiuwen_memory::store::migration::VectorMigrator>();
+    assert_same_type::<MessageMigrator, openjiuwen_memory::store::migration::MessageMigrator>();
+    let core_registry: fn() -> openjiuwen_common::error::Result<
+        openjiuwen_memory::store::migration::OperationRegistry,
+    > = standard_registry;
+    let concrete_registry: fn() -> openjiuwen_common::error::Result<
+        openjiuwen_memory::store::migration::OperationRegistry,
+    > = openjiuwen_memory::store::migration::standard_registry;
+    assert!(std::ptr::eq(
+        core_registry as *const (),
+        concrete_registry as *const ()
+    ));
+}
+
 #[test]
 fn retrieval_extended_paths_resolve() {
     use openjiuwen_core::retrieval::{
@@ -428,6 +697,69 @@ fn retrieval_extended_paths_resolve() {
     // `QueryRewriter` is a trait: prove the concrete trait object satisfies the
     // umbrella trait's bound.
     assert_query_rewriter::<dyn openjiuwen_retrieval::rewrite::QueryRewriter>();
+}
+
+/// Proves the `retrieval` alias forwards the loaders for the OOXML/ODF containers and
+/// the pure-Rust containers and readers beneath them (`parsing::zip`, `pptx`, `odt`).
+#[test]
+fn retrieval_modules_paths_resolve() {
+    use openjiuwen_core::retrieval::{
+        loaders::{
+            fixtures::{build_zip, odt_document, pptx_slides},
+            odt::OdtLoader,
+            pptx::PptxLoader,
+        },
+        parsing::{
+            odt::{OdtDocument, OdtParser},
+            pptx::{PptxDocument, PptxParser, PptxSlide},
+            zip::{ZipArchive, ZipEntry, ZipWriter},
+        },
+    };
+
+    // The two office loaders.
+    assert_same_type::<PptxLoader, openjiuwen_retrieval::loaders::pptx::PptxLoader>();
+    assert_same_type::<OdtLoader, openjiuwen_retrieval::loaders::odt::OdtLoader>();
+    assert_same_type::<PptxLoader, openjiuwen_retrieval::loaders::PptxLoader>();
+    assert_same_type::<OdtLoader, openjiuwen_retrieval::loaders::OdtLoader>();
+
+    // The in-memory document builders. Binding them is I/O-free; they are never called.
+    let core_build_zip: BuildZipFn = build_zip;
+    let concrete_build_zip: BuildZipFn = openjiuwen_retrieval::loaders::fixtures::build_zip;
+    assert!(std::ptr::eq(
+        core_build_zip as *const (),
+        concrete_build_zip as *const ()
+    ));
+
+    let core_pptx: PptxSlidesFn = pptx_slides;
+    let concrete_pptx: PptxSlidesFn = openjiuwen_retrieval::loaders::fixtures::pptx_slides;
+    assert!(std::ptr::eq(
+        core_pptx as *const (),
+        concrete_pptx as *const ()
+    ));
+
+    let core_odt: fn(&[&str]) -> openjiuwen_common::error::Result<Vec<u8>> = odt_document;
+    let concrete_odt: fn(&[&str]) -> openjiuwen_common::error::Result<Vec<u8>> =
+        openjiuwen_retrieval::loaders::fixtures::odt_document;
+    assert!(std::ptr::eq(
+        core_odt as *const (),
+        concrete_odt as *const ()
+    ));
+
+    // The containers under the parsers.
+    assert_same_type::<ZipWriter, openjiuwen_retrieval::parsing::zip::ZipWriter>();
+    assert_same_type::<ZipArchive, openjiuwen_retrieval::parsing::zip::ZipArchive>();
+    assert_same_type::<ZipEntry, openjiuwen_retrieval::parsing::zip::ZipEntry>();
+    assert_same_type::<PptxParser, openjiuwen_retrieval::parsing::pptx::PptxParser>();
+    assert_same_type::<PptxDocument, openjiuwen_retrieval::parsing::pptx::PptxDocument>();
+    assert_same_type::<PptxSlide, openjiuwen_retrieval::parsing::pptx::PptxSlide>();
+    assert_same_type::<OdtParser, openjiuwen_retrieval::parsing::odt::OdtParser>();
+    assert_same_type::<OdtDocument, openjiuwen_retrieval::parsing::odt::OdtDocument>();
+
+    // The flat `parsing` re-exports are the very same types.
+    assert_same_type::<ZipWriter, openjiuwen_retrieval::parsing::ZipWriter>();
+    assert_same_type::<ZipArchive, openjiuwen_retrieval::parsing::ZipArchive>();
+    assert_same_type::<PptxParser, openjiuwen_retrieval::parsing::PptxParser>();
+    assert_same_type::<OdtParser, openjiuwen_retrieval::parsing::OdtParser>();
 }
 
 #[test]
@@ -467,4 +799,56 @@ fn workflow_components_paths_resolve() {
         HttpRequestComponent,
         openjiuwen_workflow::components::http_request::HttpRequestComponent,
     >();
+}
+
+/// Proves the `workflow` alias forwards the single-component runner (`single`), its
+/// crate-root re-exports, and the thinner parts of the component configuration tree.
+#[test]
+fn workflow_single_component_paths_resolve() {
+    use openjiuwen_core::workflow::{
+        components::{
+            http_request::HttpComponentConfig as NestedHttpComponentConfig,
+            questioner::{
+                FieldInfo as NestedFieldInfo, QuestionerConfig as NestedQuestionerConfig,
+            },
+        },
+        single::{execute_single_component, execute_single_component_with, SingleComponentOptions},
+        FieldInfo, HttpComponentConfig, QuestionerConfig, SUB_WORKFLOW_COMPONENT,
+    };
+
+    // The single-component options type and its crate-root re-export.
+    assert_same_type::<SingleComponentOptions, openjiuwen_workflow::single::SingleComponentOptions>(
+    );
+    assert_same_type::<SingleComponentOptions, openjiuwen_workflow::SingleComponentOptions>();
+
+    // Both runners are `async fn`s, so their fn-item types are unnameable: reference
+    // them through each path instead of binding a fn pointer. Never called.
+    reference_item(execute_single_component);
+    reference_item(openjiuwen_workflow::single::execute_single_component);
+    reference_item(openjiuwen_workflow::execute_single_component);
+    reference_item(execute_single_component_with);
+    reference_item(openjiuwen_workflow::single::execute_single_component_with);
+    reference_item(openjiuwen_workflow::execute_single_component_with);
+
+    // Questioner configuration, through the umbrella root and its owning module.
+    assert_same_type::<
+        QuestionerConfig,
+        openjiuwen_workflow::components::questioner::QuestionerConfig,
+    >();
+    assert_same_type::<FieldInfo, openjiuwen_workflow::components::questioner::FieldInfo>();
+    assert_same_type::<NestedQuestionerConfig, openjiuwen_workflow::QuestionerConfig>();
+    assert_same_type::<NestedFieldInfo, openjiuwen_workflow::FieldInfo>();
+
+    // HTTP-request configuration, through the umbrella root and its owning module.
+    assert_same_type::<
+        HttpComponentConfig,
+        openjiuwen_workflow::components::http_request::HttpComponentConfig,
+    >();
+    assert_same_type::<NestedHttpComponentConfig, openjiuwen_workflow::HttpComponentConfig>();
+
+    // The sub-workflow component's registry key is the same constant at both paths.
+    assert_eq!(
+        SUB_WORKFLOW_COMPONENT,
+        openjiuwen_workflow::SUB_WORKFLOW_COMPONENT
+    );
 }

@@ -24,6 +24,7 @@
 pub mod checkpointer;
 pub mod context_evolver;
 pub mod message_queue;
+pub mod observability;
 pub mod otel;
 pub mod store;
 pub mod sys_operation;

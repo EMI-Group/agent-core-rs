@@ -31,6 +31,34 @@
 //! [`single_agent`] is a blanket glob of the same crate, those items are also
 //! exposed there as an alternative spelling.
 //!
+//! `context_engine`, `memory`, `retrieval`, `workflow`, `session`, `foundation`,
+//! `graph`, `sys_operation`, `security`, `common`, `multi_agent`, and `runner` are
+//! whole-crate aliases (and [`single_agent`] is a blanket glob of `openjiuwen-agent`),
+//! so *every* nested public module of those kernel crates is reachable under its
+//! Python-shaped path without being re-listed here. The deeper trees the kernel
+//! exposes today include:
+//!
+//! - `single_agent::{memory_provider, usage, prompt_pack, abilities, controller,
+//!   kv_cache, operator, policy, rails}` — the agent seam, ability manager, rails,
+//!   interrupts, and the controller/cache/operator stacks shared with the shims above.
+//! - `context_engine::{usage, telemetry, policy, tokenizers,
+//!   processor::rule_compression, recall, reload, offload, window}` — token
+//!   accounting, window policies, the compressor and offload processors, and recall
+//!   archives.
+//! - `memory::{lite::{facts, embed, session, local, markdown, fts}, dreaming, team,
+//!   external, store::migration, graph, analyzer}` — long-term, entity/graph, and team
+//!   memory plus the lite coding memory; `lite::fts` and the items of
+//!   `store::migration::runner` are gated on the `sqlite` feature.
+//! - `retrieval::{loaders::{pptx, odt, docx, xlsx, pdf, html, csv, json, url,
+//!   fixtures}, parsing::{zip, pptx, odt, docx, pdf, xlsx, inflate, xml}, chunking,
+//!   embedding, vector_store, retriever, reranker, rewrite}` — document loading and
+//!   parsing, chunking, embeddings, vector stores, retrievers, rerankers, and query
+//!   rewriting.
+//! - `workflow::{single, components, engine, render, registry, interrupt}` — the
+//!   builder and run engine, built-in components, rendering, and HITL interrupts.
+//! - `runner::{pool, resources, callback, hitl, monitor, spawn}` — resource managers,
+//!   the callback framework, the HITL hub, the monitor, and the spawners.
+//!
 //! # Usage
 //!
 //! The umbrella exists for consumers that want Python-shaped paths without depending
@@ -63,12 +91,25 @@
 //!   really install the supplied sink (without it the helper is a documented no-op).
 //! - `sqlite` → `openjiuwen-foundation/sqlite`, `openjiuwen-session/sqlite`, and
 //!   `openjiuwen-memory/sqlite`, which add the SQLite key-value and document stores,
-//!   the SQLite checkpointer, and memory's FTS5 coding index (`memory::lite::fts`).
+//!   the SQLite checkpointer, and memory's FTS5 coding index (`memory::lite::fts`) plus
+//!   its `store::migration::runner` migration items.
 //! - `sandbox` → `openjiuwen-sysop/sandbox`, which compiles the sandbox HTTP gateway
 //!   client in `sys_operation::sandbox::http`; its remote calls still report
 //!   `openjiuwen_common::error::Error::Unsupported`.
 //! - `live-tests` → `openjiuwen-foundation/live-tests`, the concrete crate's opt-in
 //!   network tests.
+//!
+//! These four forwarders cover the whole gated kernel surface, so the set is complete:
+//! the kernel crates declare exactly `mcp`, `tiktoken`, `sqlite`, and `live-tests`
+//! (`openjiuwen-foundation`), `sqlite` and `otel` (`openjiuwen-session`), `sqlite`
+//! (`openjiuwen-memory`), and `sandbox` (`openjiuwen-sysop`). Every other kernel crate
+//! this umbrella aliases — `openjiuwen-common`, `graph`, `workflow`, `context_engine`,
+//! `retrieval`, `security`, `single_agent` (the `openjiuwen-agent` crate), `multi_agent`,
+//! and `runner` — declares
+//! `default = []` with no other feature and no optional dependency, so there is nothing
+//! further to forward; `openjiuwen-runner` in particular declares no feature at all. Note
+//! that the `sqlite` forwarder also turns on `openjiuwen-foundation/sqlite` through
+//! `openjiuwen-memory/sqlite`.
 //!
 //! `mcp` and `tiktoken` are deliberately **not** exposed: they are
 //! `openjiuwen-foundation`'s default features and the dependency is taken with default

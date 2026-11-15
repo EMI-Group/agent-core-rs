@@ -14,8 +14,9 @@
 //!   [`ExporterType`]; nothing is built and nothing fails;
 //! - with `feature = "otel"`, every [`ExporterType`] builds a real private
 //!   provider: `Memory` keeps finished spans in memory, `Console` logs one
-//!   `tracing` line per span, `None` records nothing, and `Otlp` posts batches
-//!   to a collector over OTLP/HTTP as JSON or protobuf payloads.
+//!   `tracing` line per span, `File` appends single-span OTLP JSON lines to a
+//!   daily trace file (no collector), `None` records nothing, and `Otlp` posts
+//!   batches to a collector over OTLP/HTTP as JSON or protobuf payloads.
 //!
 //! # OTLP transport
 //!
@@ -62,6 +63,8 @@ use super::otlp::{OtlpEncoding, OtlpHttpExporter};
 use super::provider::{
     build_provider, build_provider_without_exporter, CaptureExporter, ConsoleExporter,
 };
+#[cfg(feature = "otel")]
+use crate::observability::file_exporter::TraceFileExporter;
 
 /// Reason reported when the configuration asks for OTLP/gRPC.
 #[cfg(feature = "otel")]
@@ -282,10 +285,13 @@ pub fn init_otel_tracer(config: OtelTracerConfig) -> Result<TracerHandle> {
 /// Initializes the tracer and returns its private provider handle.
 ///
 /// `Memory` attaches a [`CaptureExporter`], `Console` exports one `tracing`
-/// line per span at `debug`, `None` builds a provider whose spans are dropped,
-/// and `Otlp` builds an [`OtlpHttpExporter`] against the resolved collector
-/// endpoint, encoding its bodies as JSON ([`OtlpProtocol::Http`]) or protobuf
-/// ([`OtlpProtocol::HttpProtobuf`]); see [`super::env`] for the precedence.
+/// line per span at `debug`, `File` appends one OTLP JSON line per span to
+/// `<traces_dir>/traces-<YYYY-MM-DD>.jsonl` without a collector (see
+/// `crate::observability::file_exporter`), `None` builds a provider whose spans
+/// are dropped, and `Otlp` builds an [`OtlpHttpExporter`] against the resolved
+/// collector endpoint, encoding its bodies as JSON ([`OtlpProtocol::Http`]) or
+/// protobuf ([`OtlpProtocol::HttpProtobuf`]); see [`super::env`] for the
+/// precedence.
 ///
 /// # Errors
 ///
@@ -320,6 +326,11 @@ pub fn init_otel_tracer(config: OtelTracerConfig) -> Result<TracerHandle> {
         }
         ExporterType::Console => {
             let provider = build_provider(&config, ConsoleExporter)?;
+            let tracer = provider.tracer(config.tracer_name.clone());
+            Ok(TracerHandle::active(config, provider, tracer, None))
+        }
+        ExporterType::File => {
+            let provider = build_provider(&config, TraceFileExporter::from_config(&config))?;
             let tracer = provider.tracer(config.tracer_name.clone());
             Ok(TracerHandle::active(config, provider, tracer, None))
         }
@@ -444,6 +455,26 @@ mod tests {
             assert_eq!(handle.is_active(), cfg!(feature = "otel"));
             assert_eq!(handle.config().exporter_type, exporter_type);
         }
+    }
+
+    #[test]
+    fn file_exporter_initializes_in_both_builds() {
+        // `ExporterType::File` exists in both builds; only the feature build
+        // owns a provider, and it never needs a collector. The directory stays
+        // inside a temporary dir so the test never writes into the workspace.
+        let dir = tempfile::tempdir().unwrap();
+        let config = OtelTracerConfig {
+            traces_dir: dir.path().to_string_lossy().into_owned(),
+            file_retention_days: 0,
+            ..OtelTracerConfig::default()
+        }
+        .with_exporter_type(ExporterType::File);
+        let handle = init_otel_tracer(config).unwrap();
+        assert_eq!(handle.is_active(), cfg!(feature = "otel"));
+        assert_eq!(handle.config().exporter_type, ExporterType::File);
+        handle.force_flush();
+        handle.shutdown();
+        assert!(!handle.is_active());
     }
 
     #[cfg(not(feature = "otel"))]

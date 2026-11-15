@@ -6,8 +6,9 @@ SKILL.md discovery and the lexical skill catalog, mapping to Python `openjiuwen.
 A scan turns a directory of skill folders into ordinary `CapabilityDescriptor`s, so discovered skills flow straight into the registry, graph, and planner without a plugin protocol.
 The module ports both Python scan modes (immediate-child and bounded recursive), reports per-skill problems as diagnostics instead of failing the scan, and derives a stable, order-independent inventory fingerprint.
 Skill search reuses the crate's own BM25 `LexicalIndex` rather than duplicating retrieval semantics.
-The model-facing surface is completed by a deterministic prompt snapshot, the visible skill-name list, and an incremental skill-notice cursor with Python's reminder wording.
+The model-facing surface is completed by a deterministic prompt snapshot, the visible skill-name list, an incremental skill-notice cursor with Python's reminder wording, a session-level notice layer, and the `skill_index` tool (list/search/read over a virtual category tree).
 Everything here is offline, deterministic, and filesystem-only.
+The `skill_index` tool is Python's single read-only catalog tool: `list` a category's subcategories and skills, `search` names, aliases, descriptions and bodies, `read` a skill's metadata card; it is a virtual tree, never a filesystem tool.
 
 ## API Surface
 
@@ -197,6 +198,86 @@ pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 12_000;
 pub const DEFAULT_CANDIDATE_BUDGET_RATIO: f64 = 0.01;
 pub const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 200_000;
 ```
+### Notice session layer (`toolkit/`)
+```rust
+pub const MAX_SESSION_STATES: usize = 1_024;
+pub const TOOL_ID_DOMAIN: &str = "openjiuwen.skill-index.v1";
+pub struct SkillCard { pub name: Option<String>, pub description: Option<String> }
+pub type SkillCards = BTreeMap<String, SkillCard>;
+pub struct SkillCardSnapshot { pub worker_id: String, pub name: String, pub description: String }
+pub fn tool_id(session_scope: &str, tool_name: &str) -> Result<String>;    // "<name>__<sha256 hex>"
+pub fn normalize_cards(cards: &SkillCards) -> BTreeMap<String, SkillCardSnapshot>;
+pub fn cards_from_inventory(inventory: &SkillInventory) -> SkillCards;
+pub fn render_reminder(added: &[SkillCardSnapshot], max_chars: usize, tool_name: &str) -> Option<String>;
+pub struct IncrementalNoticeRegistry;   // new / with_capacity / len / is_empty / capacity / clear / initialize / consume / tool_ids
+pub struct IncrementalNoticeSession;    // new / tool_id / max_chars / seen / append(output, cards, output_budget)
+```
+`tool_id` is Python's domain-separated SHA-256 identity, so two scopes or two tool names never share a cursor.
+`normalize_cards` skips a card with a blank worker id, falls back `name` → worker id and `description` → name, collapses whitespace, escapes `<`/`>`, and shortens a description to `NOTICE_DESCRIPTION_CHARS` on a word boundary.
+`render_reminder` is Python's block for `(name, description)` rows sorted by name, with the compact `<N> new skills…` fallback when the full block exceeds `max_chars`.
+The registry is the owned substitute for Python's process-global `_STATES` map: a `Mutex` over a `BTreeMap` plus a monotonic recency counter, bounded at `capacity` (default `MAX_SESSION_STATES`) and evicting the least-recently-used cursor. A poisoned lock is recovered, never panics.
+`IncrementalNoticeSession::append` is Python's rollback protocol: a reminder that does not fit `output_budget` is not acknowledged, so the next call offers it again; a call with no additions still advances the cursor.
+### The `skill_index` tool (`directory_toolkit/`)
+```rust
+// view: the virtual category tree (see view/)
+pub struct SkillDirectoryView;   // from_catalog / from_records / normalize_path / node / node_paths / children /
+                                 // skill_count / record / record_ids / record_path / entries / tree_entries /
+                                 // searchable_entries / scoped_records / metadata_path / resolve_metadata_path /
+                                 // category_from_path / skill_category / category_text / category_path
+pub struct DirectoryEntry { pub path: String, pub kind: EntryKind, pub label: String, pub description: String, pub worker_id: String, pub depth: usize }
+pub enum EntryKind { Dir, Skill }
+pub const ROOT_PATH: &str = "/";   // label "ROOT", description "Installed Skills"
+// render: pinned rows and budgeting (see render.rs)
+pub struct Row { pub text: String, pub worker_id: String }
+pub enum ListView { Names, Details, Tree }
+pub fn list_row(entry: &DirectoryEntry, view: ListView, directory: &SkillDirectoryView) -> Row;
+pub fn search_row(record: &SkillRecord, directory: &SkillDirectoryView, indexes: &[usize], snippet: Option<&str>) -> Row;
+pub fn search_directory_row(entry: &DirectoryEntry, directory: &SkillDirectoryView, indexes: &[usize]) -> Row;
+pub fn fit_rows(rows: &[Row], summary: &ResponseSummary, budget: Option<usize>, count_value: Option<usize>, show_shortened_marker: bool) -> FittedRows;
+pub fn summary_line(summary: &ResponseSummary) -> String;   pub fn summary_line / bounded_summary_line / compact / append_note
+pub fn metadata_card(record: &SkillRecord) -> String;       pub fn empty_message(operation: &str, category: Option<&str>) -> String;
+pub fn sanitize_model_text(value: &str) -> String;          pub fn inline_text(value: &str) -> String;
+// validate: the typed request and the validation pass (see validate/)
+pub struct SkillIndexRequest;   // operation, category, skills, paths, query, view, recursive, directory_entry,
+                                // directories_only, match, result, case_insensitive, fixed_strings, max_depth,
+                                // read_mode, line_count, start_line, end_line, per_query_limit, pipeline,
+                                // output_mode, max_output_chars, disable_output_truncation, limit
+pub struct ValidatedRequest;    // the above, parsed into enums with validated scalars
+pub struct RequestIssue { pub field: String, pub message: String }
+pub fn validate(request: &SkillIndexRequest) -> std::result::Result<ValidatedRequest, Vec<RequestIssue>>;
+pub fn apply_simple_defaults(request: &SkillIndexRequest) -> std::result::Result<ValidatedRequest, Vec<RequestIssue>>;
+// ops: execution (see ops/)
+pub fn execute_list(view: &SkillDirectoryView, paths: &[String], request: &ValidatedRequest) -> Result<Execution>;
+pub fn execute_search(catalog: &SkillFs, view: &SkillDirectoryView, paths: &[String], request: &ValidatedRequest) -> Result<Execution>;
+pub fn execute_read(view: &SkillDirectoryView, skills: &[String], request: &ValidatedRequest) -> Result<Execution>;
+pub fn apply_pipeline(rows: &[Row], pipeline: &[PipelineStage], output_mode: OutputMode) -> Result<PipelineOutcome>;
+// toolkit: the model-facing tool (see toolkit.rs)
+pub struct SkillIndexConfig { pub session_scope: String, pub max_output_chars: usize, pub incremental_notice_max_chars: usize }
+pub struct SkillIndexToolkit { /* catalog, view, config, tool_id, notice, cursors, observed paths */ }
+impl SkillIndexToolkit {
+    pub fn new(catalog: SkillFs, config: SkillIndexConfig) -> Result<Self>;
+    pub fn tool_id(&self) -> &str;   pub fn catalog(&self) -> &SkillFs;   pub fn view(&self) -> &SkillDirectoryView;
+    pub fn card(&self) -> SkillIndexToolCard;
+    pub fn invoke(&mut self, arguments: &Value) -> Result<SkillIndexResult>;
+    pub fn execute(&mut self, request: &SkillIndexRequest) -> Result<SkillIndexResult>;
+    pub fn close(&mut self);   pub fn cursor_count(&self) -> usize;   pub fn reload(&mut self) -> Result<()>;
+}
+pub struct SkillIndexToolCard { pub id: String, pub name: String, pub description: String, pub input_schema: Value, pub parallel_safe: bool, pub stateless: bool }
+pub struct SkillIndexResult { /* content, model_content, operation, rows, observed_skill_ids, truncated,
+                                 truncation_reason, total_count, shown_count, result_complete, next_cursor,
+                                 effective_max_output_chars, skillfs_layout, index_state, candidate_count,
+                                 estimated_candidate_tokens, candidate_budget_tokens */ }
+pub const MAX_CURSORS: usize = 32;   pub const CURSOR_MAX_CHARS: usize = 128;
+```
+Categories are derived from each skill's `CapabilityDescriptor::classification` — split on `>` (else `/`), trimmed, blank segments dropped, depth capped at 32 — because Python's retriever-node taxonomy does not exist in this crate.
+Sibling segments that collide case-insensitively (or a label colliding with a skill id) get `~2`, `~3`, … in `(to_lowercase, exact)` order, so the tree is a pure function of the catalog.
+`invoke` is the model-facing shape and accepts only `operation`, `category`, `query` and `cursor`; `execute` takes the full typed request.
+Search reuses the crate's BM25 (`SkillFs::search`) for content mode and `LexicalIndex` for category hints; `match = name|path` uses `matcher::glob_match` (`*`, `?`) with `literal_match_rank` ordering.
+Pagination cursors are deterministic: the token is the unpadded URL-safe base64 of the first 16 SHA-256 bytes over a canonical JSON state (operation, category, queries, offset, page size, inventory fingerprint), so it is ≤ 24 characters; the state lives in a 32-entry LRU on the toolkit.
+A cursor is rejected when the token is unknown, the operation/category/query differ from the original request, or the catalog fingerprint changed.
+Rendering is pinned: `fit_rows` adds rows while `header + blank line + body` fits the char budget, then pops rows while the recomputed summary still overflows, then falls back to a compacted first row, then appends `SHORTENED_MARKER`.
+`output_mode = count` and the `limit`/`slice`/`filter`/`count` pipeline stages run over the rendered lines, after flattening multi-line rows.
+The notice reminder is appended last and never lets the response exceed its budget.
 
 ## Constraints
 
@@ -207,12 +288,19 @@ pub const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 200_000;
 - Descriptors produced here must round-trip through serde and remain valid `CapabilityDescriptor`s.
 - Front-matter keys outside the documented set are dropped, never leaked into metadata or retrieval text.
 - Prompt rendering never splits a code point and never renders an empty string; notice ordering is casefold-then-exact and clock-free.
+- **No process-global mutable state.** Python's per-session notice map and the tool's cursor map become owned values (`IncrementalNoticeRegistry`, `SkillIndexToolkit` cursors), so two toolkits never share state and tests need no reset hook.
+- **The `skill_index` tool never panics on bad arguments.** A rejected request is `Vec<RequestIssue>` (each naming its field, including `pipeline[i].field`) from the validation pass, or `Error::Validation` from the execution path; both are `tracing`-friendly and model-readable.
+- **No regex engine exists offline.** Content search is BM25 plus a case-(in)sensitive substring/glob matcher (`matcher::{glob_match, literal_match_rank}`); `fixed_strings` is accepted for schema compatibility and never changes the matcher.
+- **Every budget is counted in `chars().count()`**, never bytes, so CJK text truncates at the documented width.
+- **`ops.rs` is pure**: it reads a `SkillDirectoryView`/`SkillFs` and returns rows; only `toolkit.rs` owns cursors, observed paths and the notice cursor.
 
 ## Tests
 
 - `tests/discovery.rs` — scans, front matter, diagnostics, descriptors, inventory, catalog search, excerpts, settings.
 - `tests/skill_prompt.rs` — visible-name ordering and disabled-skill exclusion, exact pinned snapshot text (plain, category sections, empty), multi-byte `max_chars` truncation with `included`/`omitted`/`truncated` and fingerprint bookkeeping, `worker_id` filtering, fingerprint stability/content sensitivity, added/removed/changed notices with the exact Python reminder, reminder fallback and custom tool name, deterministic ordering, idempotent second consume, serde persistence, and `SkillFs::notice_state`.
-- Unit tests beside `catalog.rs` pin the plain/category/empty renderings; unit tests beside `notice.rs` pin the reminder wording, the `textwrap.shorten` behavior, and state round-tripping.
+- `tests/discovery_toolkit_notice.rs` — the notice session layer: the tool-id digest and its validation, card normalization (fallbacks, 300-char word-boundary shortening, escaping, ordering), pinned reminder text and its budget fallback, registry baseline/one-shot delta/LRU eviction/capacity clamp/clear, session rollback then later delivery, serde round-trip, byte-identical reruns.
+- `tests/discovery_toolkit.rs` — the tool: category-tree building (`~n` collisions, depth cap), path normalization, `children`/`skill_count`/`entries`/`tree_entries`/`searchable_entries`/`scoped_records`, metadata paths, category lookups (unknown and ambiguous), every pinned row/summary/message rendering, `fit_rows` truncation with multi-byte budgets, the full validation matrix, then end-to-end `invoke`/`execute` for list/search/read, multi-query interleaving, `result = matches` snippets, pagination without gaps or duplicates, cursor mismatch/stale/unknown errors and the 32-entry bound, pipelines with `output_mode = count`, output-budget shortening and `disable_output_truncation`, notice delivery, the pinned tool card, and byte-identical repeated calls.
+- Unit tests beside `catalog.rs` pin the plain/category/empty renderings; beside `notice.rs` the reminder wording, the `textwrap.shorten` behavior and state round-tripping; beside `ops/` the pipeline and search-assembly helpers.
 
 ## Routing Table
 
@@ -222,5 +310,44 @@ pub const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 200_000;
 - `./models.rs` → `SkillRecord`, `SkillInventory`, `sort_records`, inventory fingerprint, `DEFAULT_SOURCE`
 - `./catalog.rs` → `SkillFs`, `SkillHit`, `SelectionCard`, BM25 search, excerpts, `visible_skill_names`, `prompt_snapshot`
 - `./notice.rs` → `SkillNoticeState`, `SkillNotice`, incremental reminder rendering, notice constants
+- `./toolkit.rs` → `IncrementalNoticeRegistry`, `IncrementalNoticeSession`, `SkillCard` normalization, `tool_id`, reminder rendering
+- `./directory_toolkit/` → the model-facing `skill_index` tool; see [`directory_toolkit/mod.rs`](directory_toolkit/mod.rs)
+  - `./directory_toolkit/view/` → `SkillDirectoryView`, `DirectoryEntry`/`DirectoryNode`, category paths and skill counts
+    - `./directory_toolkit/view/mod.rs` → types, constants, root accessors
+    - `./directory_toolkit/view/tree.rs` → construction and the `~n` disambiguation index
+    - `./directory_toolkit/view/paths.rs` → path normalization, children, skill counts, metadata paths
+    - `./directory_toolkit/view/entries.rs` → `entries`/`tree_entries`/`searchable_entries`/`scoped_records`
+    - `./directory_toolkit/view/category.rs` → category names, chains and text
+  - `./directory_toolkit/render.rs` → pinned `list_row`/`search_row` rows, summary lines, `fit_rows`, `compact`, `metadata_card`
+  - `./directory_toolkit/validate/` → `SkillIndexRequest`, the six enums, `validate`/`apply_simple_defaults`, limits and `RequestIssue`
+    - `./directory_toolkit/validate/mod.rs` → module docs and re-exports
+    - `./directory_toolkit/validate/request.rs` → the request types and enums
+    - `./directory_toolkit/validate/rules.rs` → the per-operation field rules
+    - `./directory_toolkit/validate/pipeline.rs` → pipeline stage validation
+    - `./directory_toolkit/validate/limits.rs` → scalar limits, queries/paths/ids/category-path checks
+  - `./directory_toolkit/ops/` → `execute_list`/`execute_search`/`execute_read`, `apply_pipeline`, search assembly and snippets
+    - `./directory_toolkit/ops/mod.rs` → execution types, constants and re-exports
+    - `./directory_toolkit/ops/list.rs` / `read.rs` / `pipeline.rs` / `request.rs`
+    - `./directory_toolkit/ops/search.rs` → multi-query assembly, content/entry hits, snippets, category hints
+  - `./directory_toolkit/toolkit.rs` → `SkillIndexToolkit`, `SkillIndexConfig`, `SkillIndexToolCard`, `SkillIndexResult`, cursors
+  - `./directory_toolkit/matcher.rs` → `case_fold`, `glob_match`, `literal_match_rank`
 - `./settings.rs` → `DiscoverySettings`, token budget, settings defaults
+
+## Design Decisions
+
+- **The notice state is owned, not global.** Python keeps a process-wide `_STATES` `OrderedDict` keyed by a session-scoped tool id because its tool call path has no session object; the Rust port puts the same `Mutex`-guarded, LRU-bounded map in `IncrementalNoticeRegistry`, and `SkillIndexToolkit` holds its own `IncrementalNoticeSession`, so state travel with the value that owns it and tests need no reset hook.
+- **Categories come from the front-matter category, not a taxonomy index.** Python projects a prebuilt `RetrieverNode` tree; this crate has no taxonomy artifact, so the virtual tree is built from each skill's `CapabilityDescriptor::classification` and is therefore a pure function of the catalog.
+- **Cursors are deterministic and instance-local.** Python mints a random `token_urlsafe` and keeps a dict; here the token is a truncated SHA-256 of the canonical cursor state, so a repeated request yields the same token, and the state still lives in a 32-entry LRU because the token is a key, not a container.
+- **One matcher, no regex.** Both the search modes and the `filter` pipeline stage use case-folded substring matching with `*`/`?` globbing, so the offline build has no regex dependency and the same query text behaves identically everywhere.
+- **Search reuses the crate's own scorer.** Content mode delegates to `SkillFs`'s BM25 index (with the hit excerpt as the evidence snippet) and category hints use `LexicalIndex`, so discovery never grows a second scoring implementation.
+- **The escape replaces the untrusted-metadata prefix.** Python's `sanitize_model_text` prefixes `[untrusted Skill metadata] ` when it detects injection phrasing; here `<`/`>` are escaped and control characters dropped instead, which neutralizes the same vectors without leaking the prefix into legitimate descriptions and snippets.
+- **The summary header is the paged contract.** A paged result's `content` equals `model_content` (header included); an unpaged result's `content` is the row body only and the header travels in `model_content`, mirroring Python's `SkillDCICommandResult`/`.data["content"]` split.
+
+## Known Issues
+
+- `SkillIndexResult::skillfs_layout` is always `flat` and `index_state` always `flat`/`missing`: no taxonomy index is built, so Python's `tree`/`fresh`/`stale` states have no counterpart.
+- The category-hint fallback is mostly unreachable end-to-end: a label appears in its skills' own searchable text (the category is part of the view, not of the descriptor retrieval text, but the label usually matches the description), so a label query normally becomes a content hit first. `ops::search_categories` is implemented, exported and unit-tested directly.
+- Python's `DiscoverySettings.max_results` is still unused by the tool; the model-facing `limit` is the only result cap.
+- `read` resolves the legacy path form only for `META.md` paths an earlier result in the same toolkit instance returned; a fresh toolkit rejects them by design.
+- Drop-in filesystem caching (Python's per-inode parse cache, single-flight scans and `id()`-keyed inventory cache) is absent: `SkillFs` is an immutable snapshot and `SkillIndexToolkit::reload` rescans explicitly.
 

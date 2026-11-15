@@ -40,6 +40,20 @@ sandbox = ["openjiuwen-sysop/sandbox"]
 # concrete crate's network tests.
 live-tests = ["openjiuwen-foundation/live-tests"]
 # Deliberately not forwarded:
+# Kernel feature inventory, which the four forwarders above cover completely:
+# - `openjiuwen-foundation`: `default = ["mcp", "tiktoken"]`, plus `mcp`, `tiktoken`, `sqlite`,
+#   and `live-tests`.
+# - `openjiuwen-session`: `default = []`, plus `sqlite` and `otel`.
+# - `openjiuwen-memory`: `default = []`, plus `sqlite`, which itself enables
+#   `openjiuwen-foundation/sqlite`.
+# - `openjiuwen-sysop`: `default = []`, plus `sandbox`.
+# - `openjiuwen-runner`, `openjiuwen-graph`, `openjiuwen-workflow`, `openjiuwen-context`,
+#   `openjiuwen-retrieval`, `openjiuwen-security`, `openjiuwen-agent`, `openjiuwen-multiagent`,
+#   and `openjiuwen-common` declare no features at all (`default = []`, nothing else, no
+#   optional dependency), so they have nothing to forward.
+# - The `sqlite` feature above names foundation, session, and memory explicitly because memory's
+#   `sqlite` already pulls `openjiuwen-foundation/sqlite`; listing all three keeps the forwarded
+#   surface readable instead of relying on the transitive edge.
 # - `mcp` / `tiktoken` are foundation's *defaults*, and the dependency below is declared with
 #   default features. Cargo features are additive, so an umbrella feature could never turn them
 #   off; exposing them would imply otherwise.

@@ -12,6 +12,8 @@ fixed rules, and the LLM-guided stages live behind the `CompletionModel` seam in
 digest, the change-set check, and the durable idempotency journal.
 The mutation *service* (`mutation_service.py`, `artifacts.py`) is composed into
 `crate::runtime::SymphonyRuntime` instead of being a separate orchestrator type.
+`matcher/` ports `graph/matcher/protocol.py`: the compact request a matcher model is shown and the
+expansion/validation of its reply, without any model call.
 
 ## API Surface
 
@@ -29,6 +31,79 @@ Rules (deterministic, sorted by strategy rank, then confidence desc, then source
 `TextualCoercion` — `DataTypeVocabulary::can_feed(output.type, input.type)` with at least one shared name token: confidence `0.75`.
 Candidates below `min_confidence` are dropped; each source keeps at most `max_candidates_per_source` (highest confidence first).
 `CandidateConfig` defaults: `min_confidence 0.7`, `min_token_overlap 0.6`, `max_candidates_per_source 32`.
+
+### Match request/response protocol
+
+`matcher/` is the protocol between a matcher model and the deterministic candidates: it builds the
+compact document the model answers and it expands and validates the reply.
+It never calls a model — `crate::llm::OntologyMatcher` is the model-calling side.
+See [`matcher/CONTEXT.md`](matcher/CONTEXT.md) for the per-function rules.
+
+```rust
+pub const MAX_SKILL_DESCRIPTION_LENGTH: usize = 240;   pub const MAX_PORT_DESCRIPTION_LENGTH: usize = 160;
+pub const MAX_REASON_LENGTH: usize = 160;              pub const MAX_DERIVED_PORTS: usize = 8;
+pub const DEFAULT_CAN_FEED_THRESHOLD: f64 = 0.7;
+pub const DIRECTION_FORWARD: &str = "forward";         pub const DIRECTION_REVERSE: &str = "reverse";
+
+pub struct SkillBrief { pub name: String, pub description: String }
+pub struct IoBrief { pub name: String, pub io_type: String /* JSON "type" */, pub required: Option<bool>, pub description: String }
+pub struct PortBrief { pub output: String, pub output_type: String, pub input: String, pub input_type: String }
+pub struct DirectionEvidence { pub outputs: Vec<IoBrief>, pub inputs: Vec<IoBrief>, pub ports: Vec<PortBrief> }
+pub struct CandidateContext { pub id: String, pub candidate_key: String /* off the wire */,
+                              pub source: SkillBrief, pub target: SkillBrief,
+                              pub directions: BTreeMap<String, DirectionEvidence> }
+pub struct MatchRequest { pub candidates: Vec<CandidateContext> }
+impl MatchRequest {
+    pub fn new(candidates: Vec<CandidateContext>) -> Self;
+    pub fn candidates(&self) -> &[CandidateContext];
+    pub fn to_value(&self) -> Value;                 // {"candidates": […]} — total, pruned
+    pub fn evidence(&self) -> CandidateEvidence;     // (candidate key, direction) → evidence
+}
+pub struct CandidateEvidence;                        // new / insert / direction / is_empty / len
+pub fn candidate_key(candidate: &RelationCandidate) -> String;    // "{source}->{target}"
+pub fn build_match_request(capabilities: &[CapabilityDescriptor], candidates: &[RelationCandidate], reverse_skill_order: bool) -> MatchRequest;
+pub fn directional_evidence(source: &CapabilityDescriptor, target: &CapabilityDescriptor, candidate: &RelationCandidate, direction: &str) -> DirectionEvidence;
+pub fn truncate_chars(text: &str, limit: usize) -> String;        // char-boundary safe
+
+pub struct GraphDiagnostic { pub code: String, pub message: String, pub detail: Option<Value> }   // candidate_id() = detail["candidate_id"]
+pub struct PortMappingPair { pub source_output: String, pub target_input: String }
+pub struct SupportingFields { pub port_mappings: Vec<PortMappingPair>, pub source_outputs: Vec<String>, pub target_inputs: Vec<String> }
+pub struct ValidatedMatch { pub candidate_id: Option<String>, pub source_id: String, pub target_id: String,
+                            pub relation: String, pub confidence: f64, pub method: String, pub reasons: Vec<String>,
+                            pub supporting_fields: SupportingFields, pub accepted: bool, pub errors: Vec<String> }
+pub struct MatchOutcome { pub matches: Vec<ValidatedMatch>, pub diagnostics: Vec<GraphDiagnostic> }
+pub struct MatchThresholds { pub can_feed: f64 /*0.7*/ }
+
+pub fn parse_match_response(payload: &Value, candidates: &[RelationCandidate]) -> MatchOutcome;
+pub fn parse_match_response_with(payload: &Value, candidates: &[RelationCandidate], thresholds: &MatchThresholds) -> MatchOutcome;
+pub fn parse_match_response_with_evidence(payload: &Value, candidates: &[RelationCandidate], evidence: &CandidateEvidence, thresholds: &MatchThresholds) -> MatchOutcome;
+pub fn matches_by_candidate(matches: &[ValidatedMatch]) -> BTreeMap<String, Vec<&ValidatedMatch>>;
+pub fn diagnostics_by_candidate(diagnostics: &[GraphDiagnostic]) -> BTreeMap<String, Vec<&GraphDiagnostic>>;
+```
+
+Ids are `c1..cN` in input order; `reverse_skill_order` reverses the assignment, so the last input
+candidate becomes `c1`, and such a request is parsed against the reversed candidate order.
+Descriptions truncate on character boundaries (240 for a skill, 160 for a port), and empty fields
+are pruned from the document.
+The forward direction uses the candidate's matched output/input pair; the reverse direction is
+derived by scanning target outputs against source inputs for `can_feed` type compatibility,
+preferring an exact `normalize_name_key` match, then a shared name token, capped at
+`MAX_DERIVED_PORTS` — a Rust-only substitution for Python's generator-provided `evidence` dict.
+A direction without a pair is omitted, and a candidate naming an unknown capability is skipped with
+a `tracing` warning.
+
+`parse_match_response*` applies explicit rejections (`false`/`"0"`/`"no"` force the confidence to
+`0`), expands compact items (`direction: "reverse"` swaps the ids, the relation is always
+`can_feed`, the method is always `llm_ontology_match`, the reason is trimmed and truncated to 160),
+then validates endpoints, relation, confidence (unparseable → `0` plus an error, out of range →
+clamped plus an error) and `can_feed` supporting fields against the candidate evidence.
+`accepted` is "no errors *and* confidence ≥ the relation threshold"; rejected matches stay in
+`matches` with their `errors`.
+Diagnostics use the codes `invalid_match_item`, `unknown_candidate_id`, `duplicate_candidate_id`,
+`invalid_candidate_direction`, `unsupported_candidate_direction`, `invalid_matches_payload`,
+`rejected_llm_match` and `low_confidence_llm_match` — protocol diagnostics first, then validation
+diagnostics, each in payload order.
+`ValidatedMatch::to_ontology_match` projects a verdict onto `crate::llm::OntologyMatch`.
 
 ### Plans and planning
 
@@ -233,3 +308,4 @@ individual record is warned about and skipped.
 - `./planner.rs` → `Planner`, `PlanConfig`, `PlanMode`, `PlanRequest`, `SemanticScorer`, `LexicalSemanticScorer`, language helpers
 - `./executor.rs` → `PlanExecutor`, `ExecutorConfig`, `CapabilityRunner`, `RunnerContext`, `StepOutcome`, `PlanExecution`, `UnsupportedRunner`
 - `./mutation.rs` → `MutationOperation`, `MutationRequest`, `request_digest`, `validate_mutation_against_inventory`, `JournalRecord`, `MutationJournal`
+- `./matcher/` → the matcher request/response protocol: request building (`protocol.rs`) and reply expansion/validation (`validate.rs`); see [`matcher/CONTEXT.md`](matcher/CONTEXT.md)

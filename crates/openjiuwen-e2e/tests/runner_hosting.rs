@@ -1,13 +1,15 @@
 //! The runner as a *host*: several spawn backends side by side, the roster of the
-//! children it is currently keeping alive, their health, and a background driver
-//! sharing the runner's async context with a hosted spawn.
+//! children it is currently keeping alive, their health, and the memory-dreaming
+//! service the runner drives for itself.
 //!
 //! This scenario answers what the per-crate runner suites cannot answer from the
 //! outside: does a `SpawnerRegistry` installed on a *local* `Runner::new()` really
 //! route a `SpawnSpec` to the backend it names, does `Runner::active_spawns`
 //! report exactly the children that are still hosted, does a hosted spawn report
-//! health through the seam, and can the runner's async context drive an unrelated
-//! background loop (memory dreaming) without starving the spawn?
+//! health through the seam, and does the runner-owned dreaming driver
+//! ([`Runner::set_dreaming_service`] / `start_dreaming` / `dreaming_status` /
+//! `stop_dreaming`, i.e. [`DreamService`]) run a queued consolidation job beside a
+//! live spawn without starving it?
 //!
 //! Offline and deterministic throughout: the only backend that really launches
 //! anything is the in-process one, whose handler is a local echo double; the
@@ -16,14 +18,13 @@
 //! `Runner::global()`, no shared checkpointer, and every await is bounded by
 //! [`support::within`].
 //!
-//! **Known gap** — the runner exposes no dream (or generic background-driver)
-//! API: `openjiuwen-runner` has no `dream`/driver entry point at all, and
-//! `DreamOrchestrator` explicitly documents that "a caller that wants background
-//! consolidation owns the loop". The last scenario therefore composes the two
-//! halves at the test level — a `tokio::spawn`ed `DreamOrchestrator::tick` joined
-//! under the suite's deadline while the runner hosts a spawn — instead of driving
-//! a runner-owned driver. Closing that gap means adding such an API to the runner
-//! crate, which this suite must not do.
+//! Dreaming has two documented drivers and both are exercised here: the runner's
+//! own loop (a single-sweep schedule plus a bounded `eventually` poll over
+//! `Runner::dreaming_status`, never a sleep, and no task spawned by this scenario)
+//! and the host's own timer ([`DreamService::tick`] with an injected instant,
+//! which leaves the loop untouched). An empty slot is a typed absence rather than
+//! a silent no-op: the lifecycle calls fail with `ErrorKind::Config` naming
+//! `Runner::set_dreaming_service` until a service is installed.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;
@@ -40,14 +41,16 @@ use openjiuwen::core::common::error::{ErrorKind, Result};
 use openjiuwen::core::common::utils::id::now_utc;
 use openjiuwen::core::memory::dreaming::{
     DreamConfig, DreamJob, DreamKind, DreamOrchestrator, DreamOrchestratorConfig, DreamPlanner,
-    DreamRepository, DreamState, DreamTrigger, InMemoryDreamRepository, NoopConsolidator,
+    DreamRepository, DreamRunSummary, DreamState, DreamTrigger, InMemoryDreamRepository,
+    NoopConsolidator,
 };
 use openjiuwen::core::memory::MemoryScope;
 use openjiuwen::core::runner::{
-    DeferredSpawner, ExternalCommandSpawner, InProcessHandler, InProcessSpawner, RunKind, RunPhase,
-    Runner, SpawnBackend, SpawnSpec, SpawnerRegistry,
+    DeferredSpawner, DreamService, ExternalCommandSpawner, InProcessHandler, InProcessSpawner,
+    RunKind, RunPhase, Runner, SpawnBackend, SpawnSpec, SpawnerRegistry,
 };
 use openjiuwen::core::single_agent::{AgentChunk, AgentOutput};
+use openjiuwen_test_support::eventually;
 
 use support::{within, BOUND};
 
@@ -473,40 +476,91 @@ async fn a_hosted_spawn_reports_its_health_and_a_missing_command_fails_typed() {
     );
 }
 
-// --- a background driver beside the spawn -----------------------------------
+// --- the runner-owned dreaming driver ---------------------------------------
+//
+// The runner hosts a `DreamService` and decides when its loop runs; the loop's
+// schedule is the only thing that may tick it in the background, and a host with
+// its own timer calls `DreamService::tick` instead. Both shapes are covered below,
+// plus the typed absence of a runner with no service installed.
 
-#[tokio::test]
-async fn a_runner_hosts_a_dream_driver_beside_a_live_spawn() {
-    // The dream half: an in-memory queue, the documented no-op consolidator (it
-    // skips instead of failing), and the default orchestrator schedule. Nothing
-    // here talks to a model or a store.
-    let repository: Arc<dyn DreamRepository> = Arc::new(InMemoryDreamRepository::new());
-    let planner = Arc::new(
-        DreamPlanner::new(
-            Arc::clone(&repository),
-            Arc::new(NoopConsolidator),
-            DreamConfig::default(),
-        )
-        .expect("the default dream config is valid"),
-    );
-    let orchestrator = Arc::new(
-        DreamOrchestrator::new(
-            planner,
-            Arc::clone(&repository),
-            DreamOrchestratorConfig::default(),
-        )
-        .expect("the default orchestrator config is valid"),
-    );
-    let job = DreamJob::new(
+/// The id of the one job every dreaming scenario here queues.
+const JOB_ID: &str = "e2e-dream-tick";
+
+/// The schedule the hosted loop runs under: the first sweep is immediate and the
+/// next one is a minute out, so exactly one sweep happens inside a test and the
+/// summary it left behind can be read back without racing a second (empty) sweep.
+fn single_sweep() -> DreamOrchestratorConfig {
+    DreamOrchestratorConfig::default()
+        .with_initial_delay_ms(0)
+        .with_poll_interval_ms(60_000)
+        .with_max_interval_ms(60_000)
+}
+
+/// A manual consolidation job for [`JOB_ID`], stamped with the process clock.
+fn dream_job() -> DreamJob {
+    DreamJob::new(
         MemoryScope::new("alice", "workspace"),
         DreamKind::Consolidation,
         DreamTrigger::Manual,
         now_utc(),
     )
-    .with_id("e2e-dream-tick");
-    within("repository.enqueue", repository.enqueue(job))
+    .with_id(JOB_ID)
+}
+
+/// The queue behind `service`, shared with the test so jobs can be queued and read
+/// back through the same repository the loop sweeps.
+fn queue(service: &Arc<DreamService>) -> Arc<dyn DreamRepository> {
+    Arc::clone(service.orchestrator().planner().repository())
+}
+
+/// Polls the runner's hosted dreaming status until it reports `ticks` orchestrator
+/// ticks. A bounded poll, never a sleep used for ordering.
+async fn wait_for_ticks(runner: &Runner, ticks: u64) {
+    eventually(BOUND, || async {
+        runner
+            .dreaming_status()
+            .is_ok_and(|status| status.orchestrator.ticks >= ticks)
+    })
+    .await
+    .expect("the hosted dreaming loop reaches the requested tick count");
+}
+
+/// Asserts the single outcome `summary` recorded for [`JOB_ID`]: the documented
+/// `NoopConsolidator` skip, notes included.
+fn assert_noop_skip(summary: &DreamRunSummary) {
+    assert_eq!(summary.scanned, 1);
+    assert_eq!(
+        summary.skipped, 1,
+        "the default consolidator skips its job instead of failing it"
+    );
+    assert_eq!(summary.outcomes.len(), 1);
+    assert_eq!(summary.outcomes[0].job_id, JOB_ID);
+    assert_eq!(summary.outcomes[0].state, DreamState::Skipped);
+    assert!(
+        summary.outcomes[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("no consolidator configured")),
+        "unexpected notes: {:?}",
+        summary.outcomes[0].notes
+    );
+}
+
+#[tokio::test]
+async fn a_runner_drives_a_dreaming_service_beside_a_live_spawn() {
+    // The dream half: the runner's own service over an in-memory queue, the
+    // documented no-op consolidator, and a schedule whose first sweep is immediate.
+    let service = DreamService::with_in_memory(
+        Arc::new(NoopConsolidator),
+        DreamConfig::default(),
+        single_sweep(),
+    )
+    .expect("the single-sweep schedule is valid");
+    let repository = queue(&service);
+    within("repository.enqueue", repository.enqueue(dream_job()))
         .await
         .expect("the dream job is enqueued");
+    assert!(!service.is_running(), "a fresh service owns no loop");
 
     // The hosting half: a local runner with one live in-process spawn.
     let search = tempfile::tempdir().expect("a temp search directory");
@@ -519,55 +573,48 @@ async fn a_runner_hosts_a_dream_driver_beside_a_live_spawn() {
     .await
     .expect("the hosted child launches");
     let child_id = child.id().to_owned();
-    assert!(child.is_alive(), "the spawn is live before the driver runs");
+    assert!(child.is_alive(), "the spawn is live before the loop starts");
 
-    // No runner-owned dream driver exists, so the driver is composed here: the
-    // tick runs on its own task and is joined under the suite's deadline.
-    let tick_now = now_utc();
-    let driver = {
-        let orchestrator = Arc::clone(&orchestrator);
-        tokio::spawn(async move { orchestrator.tick(tick_now).await })
-    };
-    let summary = within("dream tick", driver)
-        .await
-        .expect("the driver task joins without panicking")
-        .expect("the tick succeeds");
-
-    assert_eq!(summary.scanned, 1);
-    assert_eq!(
-        summary.skipped, 1,
-        "the default consolidator skips its job instead of failing it"
-    );
-    assert_eq!(summary.outcomes.len(), 1);
-    assert_eq!(summary.outcomes[0].job_id, "e2e-dream-tick");
-    assert_eq!(summary.outcomes[0].state, DreamState::Skipped);
+    // The runner owns the loop from here on: this scenario spawns no task.
     assert!(
-        summary.outcomes[0]
-            .notes
-            .iter()
-            .any(|note| note.contains("no consolidator configured")),
-        "unexpected notes: {:?}",
-        summary.outcomes[0].notes
+        runner
+            .set_dreaming_service(Some(Arc::clone(&service)))
+            .is_none(),
+        "the slot starts empty"
     );
+    let started = runner.start_dreaming().await.expect("the service starts");
+    assert!(started.running, "the loop is live after start");
+    assert!(started.last_stop_error.is_none());
+    wait_for_ticks(&runner, 1).await;
 
-    let stored = within("repository.get", repository.get("e2e-dream-tick"))
+    // The sweep consumed exactly the queued job, and the no-op consolidator made
+    // that a documented skip rather than a failure.
+    let summary = runner
+        .dreaming_status()
+        .expect("the service is installed")
+        .orchestrator
+        .last_summary
+        .expect("the sweep left its summary");
+    assert_noop_skip(&summary);
+    let stored = within("repository.get", repository.get(JOB_ID))
         .await
         .expect("the queue is readable")
-        .expect("the tick left the job stored");
+        .expect("the sweep left the job stored");
     assert_eq!(
         stored.state,
         DreamState::Skipped,
-        "the tick persisted the terminal state"
+        "the sweep persisted the terminal state"
     );
-    let status = orchestrator.status();
-    assert_eq!(status.ticks, 1);
-    assert_eq!(status.last_tick_at, Some(tick_now));
-    assert!(status.last_error.is_none());
+    assert_eq!(stored.attempts, 1, "the job was claimed exactly once");
+    assert!(
+        stored.finished_at.is_some(),
+        "a skip is terminal, so it stamps the end"
+    );
 
-    // The hosted spawn survived the driver: the runner's context was not starved.
+    // The hosted spawn survived the loop: the runner's context was not starved.
     assert!(
         child.is_alive(),
-        "the hosted child is still alive after the tick"
+        "the hosted child is alive beside the loop"
     );
     assert!(
         within("child.health", child.health())
@@ -576,8 +623,23 @@ async fn a_runner_hosts_a_dream_driver_beside_a_live_spawn() {
         "the hosted child is still healthy"
     );
     let active = runner.active_spawns();
-    assert_eq!(active.len(), 1);
+    assert_eq!(active.len(), 1, "the dream loop is not an active spawn");
     assert_eq!(active[0].run_id, child_id);
+
+    // Stopping joins the loop and leaves the service installed for a later start.
+    let stopped = runner.stop_dreaming().await.expect("the service stops");
+    assert!(!stopped.running, "the loop is joined");
+    assert!(
+        stopped.last_stop_error.is_none(),
+        "cancellation is the documented shutdown path"
+    );
+    assert!(!service.is_running());
+    assert_eq!(
+        stopped.orchestrator.ticks, 1,
+        "the joined loop cannot tick a second time"
+    );
+    let again = runner.stop_dreaming().await.expect("a second stop is Ok");
+    assert!(!again.running, "a second stop is idempotent");
 
     assert!(within("child.shutdown", child.shutdown(BOUND))
         .await
@@ -585,6 +647,121 @@ async fn a_runner_hosts_a_dream_driver_beside_a_live_spawn() {
     assert_eq!(
         runner.active_spawns().len(),
         0,
-        "the hosted driver outlives no spawn"
+        "the stopped spawn leaves the roster"
     );
+}
+
+#[tokio::test]
+async fn the_dreaming_lifecycle_is_a_typed_absence_until_a_service_is_installed() {
+    let runner = Runner::new();
+    let errors = [
+        runner.start_dreaming().await.expect_err("nothing to start"),
+        runner.stop_dreaming().await.expect_err("nothing to stop"),
+        runner.dreaming_status().expect_err("nothing to report"),
+    ];
+    for error in errors {
+        assert_eq!(error.kind(), ErrorKind::Config, "got {error:?}");
+        assert!(
+            error.to_string().contains("Runner::set_dreaming_service"),
+            "`{error}` should name the fix"
+        );
+    }
+    assert!(runner.dreaming_service().is_none());
+
+    // An installed service makes the very same calls work; the empty queue means
+    // every tick it takes is a no-op sweep.
+    let service = DreamService::with_in_memory(
+        Arc::new(NoopConsolidator),
+        DreamConfig::default(),
+        single_sweep(),
+    )
+    .expect("the single-sweep schedule is valid");
+    assert!(runner
+        .set_dreaming_service(Some(Arc::clone(&service)))
+        .is_none());
+    assert!(runner
+        .dreaming_service()
+        .is_some_and(|installed| Arc::ptr_eq(&installed, &service)));
+    let started = runner.start_dreaming().await.expect("the service starts");
+    assert!(started.running);
+    assert!(
+        runner
+            .dreaming_status()
+            .expect("the service is installed")
+            .running
+    );
+    let stopped = runner.stop_dreaming().await.expect("the service stops");
+    assert!(!stopped.running);
+
+    // Clearing the slot hands the service back and restores the typed absence.
+    let previous = runner
+        .set_dreaming_service(None)
+        .expect("the installed service is returned");
+    assert!(Arc::ptr_eq(&previous, &service));
+    assert!(runner.dreaming_service().is_none());
+    let error = runner
+        .dreaming_status()
+        .expect_err("an empty slot is a typed absence");
+    assert_eq!(error.kind(), ErrorKind::Config);
+    assert!(
+        error.to_string().contains("Runner::set_dreaming_service"),
+        "`{error}` should name the fix"
+    );
+}
+
+#[tokio::test]
+async fn a_host_driven_tick_through_the_hosted_service_needs_no_loop() {
+    // The explicit composition: the host builds the orchestrator — its own queue,
+    // planner and schedule — and wraps it, the shape an application with a shared
+    // repository uses.
+    let repository: Arc<dyn DreamRepository> = Arc::new(InMemoryDreamRepository::new());
+    let planner = Arc::new(
+        DreamPlanner::new(
+            Arc::clone(&repository),
+            Arc::new(NoopConsolidator),
+            DreamConfig::default(),
+        )
+        .expect("the default dream config is valid"),
+    );
+    let orchestrator = Arc::new(
+        DreamOrchestrator::new(planner, Arc::clone(&repository), single_sweep())
+            .expect("the single-sweep schedule is valid"),
+    );
+    let service = DreamService::new(orchestrator);
+    within("repository.enqueue", repository.enqueue(dream_job()))
+        .await
+        .expect("the dream job is enqueued");
+
+    let runner = Runner::new();
+    runner.set_dreaming_service(Some(Arc::clone(&service)));
+    let hosted = runner.dreaming_service().expect("the service is installed");
+    assert!(
+        !hosted.is_running(),
+        "a host-driven tick spawns no loop task"
+    );
+
+    // The only clock-free assertion in this file: the injected instant is the
+    // instant the orchestrator records, and nothing reads the process clock.
+    let tick_now = now_utc();
+    let summary = within("service.tick", hosted.tick(tick_now))
+        .await
+        .expect("the tick succeeds");
+    assert_noop_skip(&summary);
+    let stored = within("repository.get", repository.get(JOB_ID))
+        .await
+        .expect("the queue is readable")
+        .expect("the tick left the job stored");
+    assert_eq!(
+        stored.state,
+        DreamState::Skipped,
+        "the tick persisted the terminal state"
+    );
+
+    let status = runner.dreaming_status().expect("the service is installed");
+    assert!(!status.running, "ticking does not start the loop");
+    assert_eq!(status.orchestrator.ticks, 1);
+    assert_eq!(status.orchestrator.last_tick_at, Some(tick_now));
+    assert!(status.orchestrator.last_error.is_none());
+    assert!(status.last_stop_error.is_none());
+    assert!(!service.is_running());
 }

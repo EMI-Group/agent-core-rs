@@ -208,7 +208,7 @@ impl TransportConfig { pub fn new() -> Self; pub const fn with_kind(self, kind: 
     fn agent_subscriptions(&self, agent_id: &str) -> Vec<String>;
     fn subscription_count(&self) -> usize;
 }
-pub fn build_transport(config: &TransportConfig, team_id: impl Into<String>, bus_config: MessageBusConfig,
+pub fn build_transport(config: &TransportConfig, team_id: &str, bus_config: MessageBusConfig,
                        handler: Arc<dyn MessageHandler>) -> Result<Arc<dyn TeamTransport>>;
 pub struct InProcessTransport { .. }
 impl InProcessTransport { pub fn new(team_id: impl Into<String>, bus_config: MessageBusConfig,
@@ -238,6 +238,8 @@ Each inbox kind has one consumer group — `{prefix}:{team}:p2p:cg` and `{prefix
 Subscriptions are write-through: `add_subscription`/`remove_subscription` update the local `SubscriptionManager` immediately and mirror the pair into the Redis registry on a detached best-effort task (`SADD`, then `SREM`/`SCARD` and an index `SREM` when a pattern set empties), so the synchronous calls never wait for the network. A refresher task started by `start` re-reads the registry every `registry_interval_ms` and replaces the local view with `remote ∪ owned` (owned = pairs this instance added itself), so a process publishes to subscribers registered elsewhere while a not-yet-flushed local pair can never be dropped; `refresh_subscriptions()` runs the same refresh on demand. A clean `stop` removes this instance's owned entries; a crashed process may leave some behind, which is harmless (a publisher `XADD`s into a stream no worker consumes).
 Reads are polled (`poll_interval_ms`, no `BLOCK`), so an idle inbox costs one round trip per interval and a reply one `XREAD` per interval until it arrives. Keys never collide with the message-bus in-process topic names, and a `send` deadline produces `"Message from '<sender>' to '<recipient>' timed out after <t>s"` (`Error::Timeout`).
 `TeamRuntime` owns one `Arc<dyn TeamTransport>` (in-process by default) and `send`/`publish`/`subscribe`/`start`/`stop` delegate to it; `set_transport` rejects a transport whose `team_id` differs from the runtime's (`Error::Validation`).
+The factory `build_transport` hands back a bare `Arc<dyn TeamTransport>`, so a caller that needs an inbox worker must build the concrete backend (`RedisTransport::new`/`try_new`, which return `Arc<Self>`): `watch_agent`, `refresh_subscriptions`, `is_started`, `consumer_name`, `config`, `key_prefix` and the `p2p_queue`/`reply_queue`/`pubsub_queue`/`p2p_consumer_group`/`pubsub_consumer_group` accessors are inherent, not on the trait.
+Nothing wires a transport's inbound workers to a `TeamRuntime`: `RuntimeHandler` is private, `TeamRuntime::dispatch_p2p`/`dispatch_pubsub` are private, and the only public handle is `set_transport`, which replaces the outbound backend alone — a Redis transport serving a team runtime therefore needs the caller to supply its own `MessageHandler`.
 
 ## Group routing (`routing.rs`)
 
