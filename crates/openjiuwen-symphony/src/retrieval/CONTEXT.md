@@ -1,11 +1,11 @@
-# retrieval — capability-tree index (build half)
+# retrieval — capability-tree index and query-time search runtime
 
 ## Intent
 
-Ports the index-BUILD half of Python `openjiuwen.symphony.retrieval` (v0.1.20): a set of capability assets becomes a persisted, browsable taxonomy index.
-One index is a directory of exactly three artifacts — `tree_index.yaml` (flat node list keyed by dot-joined cid), `catalog.jsonl` (one record per leaf item) and `manifest.json` (mode/count/membership) — consumed later by a query-time progressive retriever.
+Ports Python `openjiuwen.symphony.retrieval` (v0.1.20) in two halves: the index-BUILD half, where a set of capability assets becomes a persisted, browsable taxonomy index, and the query-time runtime in `search`.
+One index is a directory of exactly three artifacts — `tree_index.yaml` (flat node list keyed by dot-joined cid), `catalog.jsonl` (one record per leaf item) and `manifest.json` (mode/count/membership) — consumed by the query-time retriever in [`search`](src/retrieval/search/CONTEXT.md).
 Construction is fully offline and deterministic: the item tree, the cids, the catalog text and the byte layout of every artifact are reproducible bit for bit.
-The query-time search runtime (subtree selection, bounded disclosure rendering, embedding-backed branch selection) is NOT in this module yet; `pub mod search;` is the reserved slot and no stub module exists.
+The query-time half lives in [`./search/`](src/retrieval/search/CONTEXT.md): index loading, the progressive tree walk, lexical/embedding/model selection, disclosure rendering, expansion and reduction, the flat one-shot retriever and the public `Retriever` facade.
 
 ## API Surface
 
@@ -114,6 +114,32 @@ It does not check the tree's shape (that is `build::schema`), worker-id agreemen
 - `catalog`: `catalog_record(node, item) -> CatalogRecord`.
 - `workflows`: `BuildConfig`, `BuildReport`, `IncrementalReport`, `IndexBuilder::{new, build, open, add, delete, rebuild_subtree, manifest, write}`.
 
+### `search` (`src/retrieval/search/`)
+
+The query-time runtime over a loaded index, documented in full in [`search`](src/retrieval/search/CONTEXT.md).
+
+```rust
+pub struct Retriever;   // load(dir, config) / from_loaded_index(index, config) / with_model / with_embedding /
+                        // prepare / search / search_with / search_details / search_details_with / method
+pub struct RetrieverConfig { pub top_k, pub traversal, pub render, pub generation, pub embedding_weight, pub truncation }
+pub struct SearchRequest { pub top_k: Option<usize> }
+pub fn runtime_config_from_config(config: Option<&RetrieverConfig>) -> Result<ProgressiveSearchConfig>;
+pub struct RetrievalResult { pub method, item_ids, candidates: Vec<CandidateRecord>, summary_lines,
+                             selected_item_id, selected_rank, trace_events, steps }
+
+pub struct ProgressiveRetriever;   // new(root, config) / with_model / with_embedding / rebind / prepare_root /
+                                   // search / search_messages / begin / step / finish
+pub struct FlatRetriever;          // new(config) / with_embedding / retrieve / retrieve_choices
+pub struct RecursiveSearchEngine;  // new(five seams + config) / search / step over a resumable TraversalState
+pub struct ProgressiveSearchConfig;   // the engine's flat config; DisclosureConfig, EmbeddingScoringConfig, SelectionMode
+pub struct LexicalIndex;              // field-weighted BM25 over LexicalDocument
+pub fn build_exposed_fragment(..) -> Result<ExposedFragment>;   // disclosure exposure + code assignment
+pub fn parse_selected_codes(fragment: &ExposedFragment, output: &str) -> Vec<SelectableResolution>;
+```
+
+`search` owns index loading through `artifacts::load_index`, the five traversal seams (`CurrentSubtreeProvider`, `SubtreeRenderer`, `TopKSelector`, `TargetExpander`, `BranchReducer`), disclosure rendering and prompt text, the tolerant reply parser, the code book and truncation helpers, the lexical and embedding scorers, the flat retriever, and the publicization that turns internal leaf cids into public `worker_id`s.
+`types` is the hand-off surface it consumes; nothing in `search` writes an index.
+
 ## Artifact layout
 
 ```text
@@ -134,9 +160,9 @@ Hierarchy is implicit in the cid: `Skills.foo.bar`'s parent is `Skills.foo`; the
 - `serde_yaml_ng` is the only YAML parser; rendering is hand-rolled because Python's emitter shape is part of the on-disk contract.
 - Every public data type is `serde`-serializable (`snake_case`, tolerant of unknown fields, `BTreeMap`/`BTreeSet` only — never `HashMap`); `RootCategory` is the documented exception (it is a `const` table of `&'static str`, not a data record).
 - Determinism: no clock, no RNG, no hash-map iteration order; nodes sort by `(depth, cid)`, records by `cid`, items by `worker_id`, choices by walk order, ties by id.
-- Async: `tokio::fs` only; no `std::sync` guard is held across an `.await` (the module holds no locks at all).
+- Async: `tokio::fs` only; no `std::sync` guard is held across an `.await` (the build half holds no locks at all; `search` snapshots its cache and runtime under a lock before awaiting).
 - Errors: `crate::error::{validation, unsupported}` over `openjiuwen_common::error::Error`; no `unwrap`/`expect` outside tests; no panic on user input.
-- Dependencies: `openjiuwen-common` plus crate-internal `error`, `model`, `discovery`, `search::tokenize`; no new crate dependency and no `openjiuwen-retrieval` use yet (that arrives with the search half).
+- Dependencies: `openjiuwen-common` plus crate-internal `error`, `model`, `discovery`, `search::tokenize`; `search` additionally uses `openjiuwen-retrieval`'s `Embedding` trait and `async-trait`/`async` completions, and no new crate dependency was added for either half.
 
 ## Design Decisions
 
@@ -157,12 +183,12 @@ Hierarchy is implicit in the cid: `Skills.foo.bar`'s parent is `Skills.foo`; the
 
 ## Deferred Scope
 
-Implemented with deterministic offline substitutes: item scanning, grouping, node assembly, preset override, schema guard, catalog derivation, full/incremental/subtree workflows, and the three-artifact IO.
+Implemented with deterministic offline substitutes: item scanning, grouping, node assembly, preset override, schema guard, catalog derivation, full/incremental/subtree workflows, the three-artifact IO, and the query-time runtime (index loading, the progressive walk, disclosure rendering, lexical/embedding/model selection, the flat retriever and the publicizing facade).
 Absent or typed `Error::Unsupported`, listed here rather than stubbed:
 
 | Area | Status |
 |---|---|
-| `search/` — the whole query-time runtime (`runtime/{lexical,selector,disclosure,progressive}.py`, `service/retriever.py`, `runtime/render/*`) | not implemented; the reserved `pub mod search;` slot is empty and `types`/`artifacts` are its hand-off surface |
+| `search/` — `transformers`/vLLM logit-based branch selection | `Error::Unsupported` in [`deferred`](src/deferred.rs); the code-book/prefix-trie core, the LLM tree walk, the lexical and embedding selectors and the flat retriever are implemented (see [`search`](src/retrieval/search/CONTEXT.md)) |
 | `build/tree/{grouping,expansion,repair,equivalence,one_shot}.py` LLM paths | `GroupingStrategy::LlmGrouping` → `Error::Unsupported`; the deterministic grouping substitute is the default |
 | faiss / k-means clustering | `GroupingStrategy::{FaissKmeans, Kmeans}` → `Error::Unsupported` (native ML stack) |
 | LLM subtree repair (`workflows/subtree_rebuild.py`) | `IndexBuilder::rebuild_subtree` re-derives children deterministically from the catalog records |
@@ -176,6 +202,7 @@ Absent or typed `Error::Unsupported`, listed here rather than stubbed:
 
 - A `//!` doc block cannot link items defined in the same file module; write `[`X`](crate::retrieval::types::X)`.
 - `types.rs`, `artifacts.rs`, `build/scanner.rs` and `build/workflows.rs` sit just over the 1000-line soft cap because their `#[cfg(test)]` suites must stay in-file; their non-test halves are under it, so do not split them further on size alone.
+- The same holds for `search/lexical.rs` and `search/render/expose.rs`; do not split them on size alone.
 - The artifact bytes are a contract: changing `render_tree_yaml`/`render_catalog`/`render_manifest` breaks index compatibility with Python's loader, and `catalog_content_hash` covers the catalog only.
 - Never write a cid containing a dot, a blank segment, or a `.`/`..` segment; `parse_tree_yaml` and `build_tree_root` trust the prefix rule.
 - `tests/retrieval_build.rs` and `tests/retrieval_artifacts.rs` share a 1–10 coverage numbering; keep it ascending when adding cases.
@@ -185,11 +212,12 @@ Absent or typed `Error::Unsupported`, listed here rather than stubbed:
 - Unit tests live beside each module (`#[cfg(test)] mod tests`): naming/cid helpers, tree-text truncation, JSON/YAML render+parse round-trips, schema diagnostics, preset derivation, grouping determinism and bounds, tree assembly and pruning, catalog derivation, builder workflows.
 - `tests/retrieval_build.rs` — item sources (descriptor/inventory/JSONL/skill directory incl. a broken folder), grouping determinism and category derivation, preset override, schema validation failures, incremental `add`/`delete`/`rebuild_subtree`, a failed `add` leaving the builder unchanged, escalation, and the typed grouping deferrals.
 - `tests/retrieval_artifacts.rs` — the three-artifact set and their exact shapes, byte-identical rebuilds, no `*.tmp` leftovers, rejected publications leaving nothing behind, `load_index` round-trip, and the corrupt/tampered/missing-file errors (`NotFound`, `count`, `content_hash`, foreign catalog cid).
-- Everything is offline and deterministic: `tempfile::tempdir()`, no network, no clock, no map-order assertions.
+- `tests/retrieval_search.rs`, `tests/retrieval_search_lexical.rs` and `tests/retrieval_search_disclosure.rs` — the query-time runtime's service facade, foundation layer and render layer; see [`search`](src/retrieval/search/CONTEXT.md) for their coverage.
+- Everything is offline and deterministic: `tempfile::tempdir()`, `HashEmbedding`/`StaticCompletionModel` for the search suites, no network, no clock, no map-order assertions.
 
 ## Routing Table
 
-- `./mod.rs` → module docs, `pub mod artifacts/build/types`, the reserved `search` slot
+- `./mod.rs` → module docs, `pub mod artifacts/build/search/types`
 - `./types.rs` → value objects: items/nodes/choices/candidates/trace, `SearchCursor`, `IndexNode`, `IndexManifest`, `CatalogRecord`, `LoadedIndex`, retrieval-text helpers
 - `./artifacts.rs` → the three-artifact render/parse/write/load set, `catalog_content_hash`, `build_tree_root`, `compose_routing_description`
 - `./build/mod.rs` → the build pipeline overview and module list
@@ -201,3 +229,4 @@ Absent or typed `Error::Unsupported`, listed here rather than stubbed:
 - `./build/presets.rs` → `TreePreset`/`PresetNode`, nested-or-flat preset parsing and cid derivation
 - `./build/catalog.rs` → `catalog_record` derivation
 - `./build/workflows.rs` → `BuildConfig`, `IndexBuilder`, full/incremental/subtree workflows, publication
+- `./search/` → the query-time runtime: facade and config, engine and retrievers, the five seams and their defaults, lexical/embedding/model selectors, disclosure render and parse; see [`search/CONTEXT.md`](src/retrieval/search/CONTEXT.md)
