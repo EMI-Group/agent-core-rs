@@ -283,7 +283,11 @@ impl LongTermMemory {
             .take(config.extraction.max_facts)
             .collect();
         if !candidates.is_empty() {
-            let outcome = self.engine.add_many(scope, candidates, options).await?;
+            let overrides = self.resolve_scope_overrides(scope).await?;
+            let outcome = self
+                .engine
+                .add_many_with_embedding(scope, candidates, options, overrides.embedding())
+                .await?;
             record_outcome(outcome, result);
         }
         for (name, value) in variables {
@@ -380,7 +384,11 @@ impl LongTermMemory {
         if candidates.is_empty() {
             return Ok(());
         }
-        let outcome = self.engine.add_many(scope, candidates, options).await?;
+        let overrides = self.resolve_scope_overrides(scope).await?;
+        let outcome = self
+            .engine
+            .add_many_with_embedding(scope, candidates, options, overrides.embedding())
+            .await?;
         record_outcome(outcome, result);
         Ok(())
     }

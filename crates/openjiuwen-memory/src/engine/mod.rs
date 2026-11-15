@@ -56,8 +56,8 @@ pub struct MemoryEngine {
     token_counter: Arc<dyn TokenCounter + Send + Sync>,
     /// Per-scope write serialization.
     write_locks: WriteLocks,
-    /// Cached embedding dimension, initialized on first use.
-    dimensions: tokio::sync::OnceCell<usize>,
+    /// Cached embedding dimensions, keyed by embedding model name.
+    dimensions: parking_lot::Mutex<std::collections::HashMap<String, usize>>,
 }
 
 /// Builds a [`MemoryEngine`].
@@ -136,7 +136,7 @@ impl MemoryEngineBuilder {
             model: self.model,
             token_counter: self.token_counter,
             write_locks: WriteLocks::default(),
-            dimensions: tokio::sync::OnceCell::new(),
+            dimensions: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }))
     }
 }
@@ -170,6 +170,10 @@ impl MemoryEngine {
     }
 
     /// The embedding model, when one is attached.
+    ///
+    /// This is the engine's own model. A per-scope embedding resolved by the facade is
+    /// passed *per call* to the `*_with_embedding` variants of the write/recall methods,
+    /// so this handle is never replaced.
     #[must_use]
     pub fn embedding(&self) -> Option<&Arc<dyn Embedding>> {
         self.embedding.as_ref()

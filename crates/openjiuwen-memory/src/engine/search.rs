@@ -7,8 +7,11 @@
 //! Every score comes from [`crate::recall::rank`]; this module only chooses candidates,
 //! applies the caller's filters, and records access statistics.
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use openjiuwen_common::error::{Error, Result};
+use openjiuwen_retrieval::embedding::Embedding;
 
 use crate::recall::{rank, trim_to_token_budget, ScoredCandidate};
 use crate::record::{MemoryFilter, MemoryScope, MemoryType, RecallHit, SearchMode, SearchOptions};
@@ -32,7 +35,29 @@ impl super::MemoryEngine {
         query: &str,
         options: &SearchOptions,
     ) -> Result<Vec<RecallHit>> {
-        self.recall(scope, query, None, options, true).await
+        self.search_with_embedding(scope, query, options, None)
+            .await
+    }
+
+    /// Searches the stored memories with `embedding` as the query embedder of this call.
+    ///
+    /// `embedding` is the handle a per-scope override resolved to; `None` means "use the
+    /// engine's own model". A supplied handle is the *only* embedder the call uses, so a
+    /// scope whose vectors were written with its own embedder is recalled with that same
+    /// embedder rather than the engine's.
+    ///
+    /// # Errors
+    ///
+    /// See [`MemoryEngine::search`].
+    pub async fn search_with_embedding(
+        &self,
+        scope: &MemoryScope,
+        query: &str,
+        options: &SearchOptions,
+        embedding: Option<&Arc<dyn Embedding>>,
+    ) -> Result<Vec<RecallHit>> {
+        self.recall(scope, query, None, options, true, embedding)
+            .await
     }
 
     /// The shared recall pipeline behind [`MemoryEngine::search`] and the dedupe
@@ -48,6 +73,7 @@ impl super::MemoryEngine {
         vector: Option<&[f32]>,
         options: &SearchOptions,
         touch: bool,
+        embedder: Option<&Arc<dyn Embedding>>,
     ) -> Result<Vec<RecallHit>> {
         scope.validate()?;
         if query.trim().is_empty() {
@@ -55,7 +81,8 @@ impl super::MemoryEngine {
         }
         validate_search_options(options)?;
         options.call.check()?;
-        if options.mode == SearchMode::Semantic && !self.has_embedding() {
+        let has_embedding = self.has_embedding_with(embedder);
+        if options.mode == SearchMode::Semantic && !has_embedding {
             return Err(Error::unsupported(
                 "semantic search requires an embedding model",
             ));
@@ -66,10 +93,10 @@ impl super::MemoryEngine {
         let now = Utc::now();
         let mut candidates = Vec::new();
 
-        if options.mode != SearchMode::Keyword && self.has_embedding() {
+        if options.mode != SearchMode::Keyword && has_embedding {
             let query_vector = match vector {
                 Some(vector) => vector.to_vec(),
-                None => self.embed_text(query, &options.call).await?,
+                None => self.embed_text_with(embedder, query, &options.call).await?,
             };
             for kind in &kinds {
                 options.call.check()?;

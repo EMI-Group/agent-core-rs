@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{
     AnalyzerConfig, ConsolidationPlan, ExtractedFact, ExtractionInput, ExtractorKind,
-    MemoryAnalyzer, StagedAnalyzer,
+    MemoryAnalyzer, ScopeAnalyzerOverrides, StagedAnalyzer,
 };
 use crate::dreaming::{DreamConfig, DreamPlanner, NoopConsolidator};
 use crate::external::{EngineProvider, MemoryProvider};
@@ -111,10 +111,14 @@ impl LongTermMemory {
     ///
     /// `Error::Validation` for an invalid scope or input (and for a malformed stored
     /// override document), `Error::Unsupported` when a stored override names a
-    /// `model`/`embedding` this facade does not hold, `Error::Cancelled` when `options.call`
-    /// fires (including between facts — earlier writes stay stored), and the analyzer's or
-    /// engine's error otherwise. A failed write is never dropped silently: the error names
-    /// the fact index and content plus the engine's message.
+    /// `model`/`embedding` this facade has not registered, `Error::Cancelled` when
+    /// `options.call` fires (including between facts — earlier writes stay stored), and the
+    /// analyzer's or engine's error otherwise. A failed write is never dropped silently: the
+    /// error names the fact index and content plus the engine's message.
+    ///
+    /// The scope's resolved override model is the model the model-backed stages call and
+    /// its resolved override embedding is the embedder of every fact write, so one scope
+    /// can analyze and index with handles no other scope uses.
     pub async fn remember(
         &self,
         scope: &MemoryScope,
@@ -122,7 +126,7 @@ impl LongTermMemory {
         options: &AddOptions,
     ) -> Result<RememberReport> {
         scope.validate()?;
-        let (facts, mut report) = self.analyze_for_write(scope, input, options).await?;
+        let (facts, mut report, overrides) = self.analyze_for_write(scope, input, options).await?;
         if report.gated.is_some() {
             return Ok(report);
         }
@@ -130,7 +134,7 @@ impl LongTermMemory {
             options.call.check()?;
             let outcome = self
                 .engine
-                .add(scope, record_input(fact), options)
+                .add_with_embedding(scope, record_input(fact), options, overrides.embedding())
                 .await
                 .map_err(|error| {
                     error.with_context(format!("writing fact {index} (`{}`)", fact.content))
@@ -151,12 +155,16 @@ impl LongTermMemory {
     /// [`LongTermMemory::remember_with_assignments`]. A gated batch returns no facts at
     /// all, and a builder-injected analyzer keeps owning extraction while the scope
     /// carries no overrides (see the module docs).
+    ///
+    /// The resolved [`ScopeAnalyzerOverrides`] travel back with the facts, so the caller
+    /// writes them with the same per-scope embedding the analysis resolved instead of
+    /// resolving the document a second time.
     pub(super) async fn analyze_for_write(
         &self,
         scope: &MemoryScope,
         input: &ExtractionInput,
         options: &AddOptions,
-    ) -> Result<(Vec<ExtractedFact>, RememberReport)> {
+    ) -> Result<(Vec<ExtractedFact>, RememberReport, ScopeAnalyzerOverrides)> {
         let overrides = self.resolve_scope_overrides(scope).await?;
         if overrides.is_empty() && self.uses_injected_analyzer() {
             let extraction = self.analyzer.analyze(input, &options.call).await?;
@@ -166,7 +174,7 @@ impl LongTermMemory {
                 gated: None,
                 ..RememberReport::default()
             };
-            return Ok((extraction.facts, report));
+            return Ok((extraction.facts, report, overrides));
         }
         let staged = StagedAnalyzer::from_engine(self.config(), self.engine.model().cloned())
             .with_overrides(overrides.clone())
@@ -194,9 +202,9 @@ impl LongTermMemory {
                 "remember withheld the write under the scope override gate"
             );
             report.gated = Some(reason);
-            return Ok((Vec::new(), report));
+            return Ok((Vec::new(), report, overrides));
         };
-        Ok((facts, report))
+        Ok((facts, report, overrides))
     }
 
     /// Whether [`LongTermMemoryBuilder::analyzer`](super::LongTermMemoryBuilder::analyzer)
@@ -244,6 +252,7 @@ impl LongTermMemory {
         incoming.validate()?;
         options.check()?;
         let overrides = self.resolve_scope_overrides(scope).await?;
+        let embedding = overrides.embedding().cloned();
         let dedupe = self.config().dedupe.clone();
         let search = SearchOptions {
             top_k: dedupe.candidate_top_k,
@@ -257,7 +266,7 @@ impl LongTermMemory {
         };
         let hits = self
             .engine
-            .search(scope, &incoming.content, &search)
+            .search_with_embedding(scope, &incoming.content, &search, embedding.as_ref())
             .await?;
         let records: Vec<_> = hits.into_iter().map(|hit| hit.record).collect();
         let fact = ExtractedFact::from(incoming);

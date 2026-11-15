@@ -18,15 +18,23 @@ impl LongTermMemory {
     ///
     /// Returns [`openjiuwen_common::error::Error::Validation`] for an invalid scope or
     /// blank query, [`openjiuwen_common::error::Error::Unsupported`] when semantic mode
-    /// is requested without an embedding model, [`openjiuwen_common::error::Error::Cancelled`]
-    /// when the call is cancelled, and the storage/embedding error otherwise.
+    /// is requested without an embedding model or when the scope's override document
+    /// names an `embedding` this facade has not registered,
+    /// [`openjiuwen_common::error::Error::Cancelled`] when the call is cancelled, and the
+    /// storage/embedding error otherwise.
+    ///
+    /// The scope's resolved override embedding (when it names one) embeds the query, so a
+    /// recall searches its own scope's vectors with the same embedder that wrote them.
     pub async fn search(
         &self,
         scope: &MemoryScope,
         query: &str,
         options: &SearchOptions,
     ) -> Result<Vec<RecallHit>> {
-        self.engine.search(scope, query, options).await
+        let overrides = self.resolve_scope_overrides(scope).await?;
+        self.engine
+            .search_with_embedding(scope, query, options, overrides.embedding())
+            .await
     }
 
     /// Python `recall`: an alias of [`LongTermMemory::search`].

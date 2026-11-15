@@ -14,8 +14,10 @@
 //! [`MemoryType::Variable`]: crate::record::MemoryType::Variable
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
+use openjiuwen_retrieval::embedding::Embedding;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -138,8 +140,9 @@ impl LongTermMemory {
     ) -> Result<VariableWrite> {
         scope.validate()?;
         validate_variable_name(name)?;
+        let overrides = self.resolve_scope_overrides(scope).await?;
         self.engine
-            .write_variable(scope, name, value, options)
+            .write_variable_with_embedding(scope, name, value, options, overrides.embedding())
             .await
     }
 
@@ -179,9 +182,14 @@ impl LongTermMemory {
     ///
     /// Returns [`Error::Validation`] for an invalid scope, for a variable name the write
     /// path rejects (a forbidden name is named in the message), or for a fact the
-    /// analyzer/engine rejects; [`Error::Cancelled`] when `options.call` fires (earlier
-    /// writes stay stored); and the storage/embedding error when a write fails. A failed
-    /// write is never dropped silently: the error names the fact index and content.
+    /// analyzer/engine rejects; [`Error::Unsupported`] when the scope's override document
+    /// names a `model`/`embedding` this facade has not registered; [`Error::Cancelled`]
+    /// when `options.call` fires (earlier writes stay stored); and the storage/embedding
+    /// error when a write fails. A failed write is never dropped silently: the error names
+    /// the fact index and content.
+    ///
+    /// Every write (the variable projections and the ordinary records alike) embeds with
+    /// the scope's resolved override embedding when it names one.
     pub async fn remember_variables(
         &self,
         scope: &MemoryScope,
@@ -194,7 +202,8 @@ impl LongTermMemory {
             extracted: facts.len(),
             ..VariableAssignmentReport::default()
         };
-        self.write_assignment_facts(scope, facts, options, &mut report)
+        let overrides = self.resolve_scope_overrides(scope).await?;
+        self.write_assignment_facts(scope, facts, options, &mut report, overrides.embedding())
             .await?;
         Ok(report)
     }
@@ -223,7 +232,7 @@ impl LongTermMemory {
     /// Returns [`Error::Validation`] for an invalid scope or input, for a malformed
     /// stored override document, or for a variable name the write path rejects (a
     /// forbidden name is named in the message); [`Error::Unsupported`] when a stored
-    /// override names a `model`/`embedding` this facade does not hold;
+    /// override names a `model`/`embedding` this facade has not registered;
     /// [`Error::Cancelled`] when `options.call` fires (earlier writes stay stored); and
     /// the analyzer's, storage's, or embedding error otherwise. A failed write is never
     /// dropped silently: the error names the fact index and content.
@@ -235,7 +244,7 @@ impl LongTermMemory {
     ) -> Result<VariableAssignmentReport> {
         scope.validate()?;
         options.call.check()?;
-        let (facts, analysis) = self.analyze_for_write(scope, input, options).await?;
+        let (facts, analysis, overrides) = self.analyze_for_write(scope, input, options).await?;
         let mut report = VariableAssignmentReport {
             extracted: analysis.extracted,
             degraded: analysis.degraded,
@@ -245,7 +254,7 @@ impl LongTermMemory {
         if report.gated.is_some() {
             return Ok(report);
         }
-        self.write_assignment_facts(scope, &facts, options, &mut report)
+        self.write_assignment_facts(scope, &facts, options, &mut report, overrides.embedding())
             .await?;
         Ok(report)
     }
@@ -262,13 +271,14 @@ impl LongTermMemory {
         facts: &[ExtractedFact],
         options: &AddOptions,
         report: &mut VariableAssignmentReport,
+        embedding: Option<&Arc<dyn Embedding>>,
     ) -> Result<()> {
         for (index, fact) in facts.iter().enumerate() {
             options.call.check()?;
             let Some((name, value)) = variable_assignment(fact) else {
                 let outcome = self
                     .engine
-                    .add(scope, record_input(fact), options)
+                    .add_with_embedding(scope, record_input(fact), options, embedding)
                     .await
                     .map_err(|error| {
                         error.with_context(format!("writing fact {index} (`{}`)", fact.content))
@@ -278,7 +288,11 @@ impl LongTermMemory {
                 report.records_skipped += outcome.skipped.len();
                 continue;
             };
-            match self.assign_variable(scope, &name, &value, options).await {
+            match self
+                .engine
+                .write_variable_with_embedding(scope, &name, &value, options, embedding)
+                .await
+            {
                 Ok(_) => report.variables += 1,
                 // A forbidden or otherwise unacceptable *name* fails the call: the
                 // caller asked for a variable write, so a silent drop would lose data.

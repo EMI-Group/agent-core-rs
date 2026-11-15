@@ -20,15 +20,23 @@ impl LongTermMemory {
     /// # Errors
     ///
     /// Returns [`Error::Validation`] for an invalid scope or memory,
-    /// [`Error::Cancelled`] when the call is cancelled, and the storage/embedding error
-    /// when a write fails.
+    /// [`Error::Cancelled`] when the call is cancelled, [`Error::Unsupported`] when the
+    /// scope's override document names a `model`/`embedding` this facade has not
+    /// registered, and the storage/embedding error when a write fails.
+    ///
+    /// The scope's resolved override embedding (when it names one) is the embedder of
+    /// this write, so a scope with its own embedding model keeps its own vectors — and
+    /// its own vector collection dimension — beside other scopes.
     pub async fn add(
         &self,
         scope: &MemoryScope,
         memory: NewMemory,
         options: &AddOptions,
     ) -> Result<AddOutcome> {
-        self.engine.add(scope, memory, options).await
+        let overrides = self.resolve_scope_overrides(scope).await?;
+        self.engine
+            .add_with_embedding(scope, memory, options, overrides.embedding())
+            .await
     }
 
     /// Stores a batch of memories under one scope lock, deduping across the batch.
@@ -43,7 +51,10 @@ impl LongTermMemory {
         memories: Vec<NewMemory>,
         options: &AddOptions,
     ) -> Result<AddOutcome> {
-        self.engine.add_many(scope, memories, options).await
+        let overrides = self.resolve_scope_overrides(scope).await?;
+        self.engine
+            .add_many_with_embedding(scope, memories, options, overrides.embedding())
+            .await
     }
 
     /// Reads one record of `scope`, or `None` when it does not exist.
@@ -60,7 +71,10 @@ impl LongTermMemory {
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] when `id` does not exist, [`Error::Validation`] for
-    /// an invalid scope or patch, and the storage/embedding error when the write fails.
+    /// an invalid scope or patch, [`Error::Unsupported`] when the scope's override
+    /// document names a handle this facade has not registered, and the storage/embedding
+    /// error when the write fails. A re-embedding (content or kind change) uses the
+    /// scope's resolved override embedding, exactly like [`LongTermMemory::add`].
     pub async fn update(
         &self,
         scope: &MemoryScope,
@@ -68,7 +82,10 @@ impl LongTermMemory {
         patch: MemoryUpdate,
         options: &CallOptions,
     ) -> Result<MemoryRecord> {
-        self.engine.update(scope, id, patch, options).await
+        let overrides = self.resolve_scope_overrides(scope).await?;
+        self.engine
+            .update_with_embedding(scope, id, patch, options, overrides.embedding())
+            .await
     }
 
     /// Deletes one record and its embedding, returning whether it existed.
