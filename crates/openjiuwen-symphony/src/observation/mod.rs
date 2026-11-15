@@ -9,4 +9,5 @@
 
 pub mod contracts;
 pub mod identity;
+pub mod store;
 pub(crate) mod timestamp;
