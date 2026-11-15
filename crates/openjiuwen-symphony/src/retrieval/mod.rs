@@ -1,18 +1,23 @@
 //! Capability-tree index construction and progressive retrieval.
 //!
-//! Ports Python `openjiuwen.symphony.retrieval` (v0.1.20). This module currently
-//! implements the **index BUILD half**: the item sources, the deterministic grouping that
-//! places an item in the tree, the preset/schema guard that bounds a tree's shape, the full
-//! and incremental builder, and the IO of the three index artifacts (`tree_index.yaml`,
-//! `catalog.jsonl`, `manifest.json`).
+//! Ports Python `openjiuwen.symphony.retrieval` (v0.1.20). This module implements the
+//! **index BUILD half** — the item sources, the deterministic grouping that places an item
+//! in the tree, the preset/schema guard that bounds a tree's shape, the full and incremental
+//! builder, and the IO of the three index artifacts (`tree_index.yaml`, `catalog.jsonl`,
+//! `manifest.json`) — and the **foundation layer of the query-time search runtime**: the
+//! search value objects, the runtime configuration, the field-weighted lexical scorer, the
+//! optional embedding scorer, the compact codebook, and score/budget truncation.
 //!
-//! # The search runtime is the remaining half
+//! # The search runtime is being ported in waves
 //!
-//! The query-time **search runtime** — subtree selection, field-weighted lexical scoring,
-//! bounded disclosure rendering, and embedding-backed branch selection — has no module yet.
-//! The `pub mod search;` slot below is reserved for it, and it consumes only the types
-//! declared here (the tree, the choices, the catalog records and the cursor), so its surface
-//! is already fixed by them.
+//! [`search`](crate::retrieval::search) currently holds the runtime's foundation.
+//! Progressive disclosure rendering, the traversal protocols (subtree selection, expansion,
+//! reduction), the engine, the progressive and flat retrievers, and the service facade are
+//! not present yet; they are added by the following waves on top of
+//! [`search::flow`](crate::retrieval::search::flow),
+//! [`search::config`](crate::retrieval::search::config) and
+//! [`search::lexical`](crate::retrieval::search::lexical), and they consume only the types
+//! declared here (the tree, the choices, the catalog records and the cursor).
 //!
 //! # Layout
 //!
@@ -37,6 +42,13 @@
 //!   persisted nodes into an in-memory tree.
 //! - [`build`](crate::retrieval::build) — the index-build stages, from item sources through
 //!   grouping and node assembly to catalog derivation and publication.
+//! - [`search`](crate::retrieval::search) — the query-time runtime foundation: the flow
+//!   value objects ([`search::flow`](crate::retrieval::search::flow)), the runtime
+//!   configuration ([`search::config`](crate::retrieval::search::config)), the
+//!   field-weighted lexical scorer ([`search::lexical`](crate::retrieval::search::lexical)),
+//!   the embedding scorer ([`search::embedding`](crate::retrieval::search::embedding)), the
+//!   compact codebook ([`search::codebooks`](crate::retrieval::search::codebooks)) and
+//!   score/budget truncation ([`search::truncation`](crate::retrieval::search::truncation)).
 //!
 //! # Rust-only additions and gaps
 //!
@@ -58,8 +70,5 @@
 
 pub mod artifacts;
 pub mod build;
+pub mod search;
 pub mod types;
-
-// Reserved for the query-time search runtime (subtree selection, bounded disclosure
-// rendering, embedding-backed branch selection), which has no module yet. It will be
-// mounted here as `pub mod search;`.
