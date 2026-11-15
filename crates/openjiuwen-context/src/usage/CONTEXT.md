@@ -5,7 +5,7 @@
 Owns the accounting seam that explains where a request's prompt tokens went: four prompt categories (`system_prompt`, `tools`, `skills`, `messages`), the provider-total reconciliation, the provider's KV-cache `usage_metadata` normalization, and the session-to-date cache rollup.
 Ports the public behavior of Python's `openjiuwen/core/context_engine/usage/` (`models.py`, `analyzer.py`, `provider_usage.py`, `session_aggregator.py`, `context_tokens.py`) to serde value objects plus a pure analyzer.
 The analyzer only explains the window the processors already produced: it never decides compression, truncation, or routing, and it never calls a model.
-The engine does not call it yet; a later pass wires `ContextUsageAnalyzer`/`SessionKVCacheAggregator` into `ContextEngine`.
+`ContextEngine`/`ConversationContext` drive it: `prepare` fills `PreparedContext::usage` through `ConversationContext::usage_snapshot_for`, `usage_report`/`usage_snapshot` call the analyzer explicitly, and `record_provider_usage`/`kv_cache_usage` own the `SessionKVCacheAggregator`.
 
 ## API Surface
 
@@ -76,6 +76,10 @@ The engine does not call it yet; a later pass wires `ContextUsageAnalyzer`/`Sess
 - `weighted_hit_rate = read_total / input_total` (token weighted, not a mean of ratios); per-call averages divide by `calls_observed` only.
 - `cache_write_tokens_total` is only reported when every observed call reported a write (`cache_write_coverage = complete`); one missing write downgrades the coverage to `partial` and hides the total rather than reporting a misleading sum.
 - The session status ladder is `not_reported` (no observed call), `invalid` (only excluded calls), `miss` (no reads), `full_hit` (no misses), `partial_hit` otherwise.
+- `TokenMeasurement::estimated` / `ContextPartUsage::estimated` is derived from the *supplied* `CounterIdentity.source`, not from the counter that actually ran: `analyzer.rs`'s `measurement` sets `estimated: identity.source != NativeTokenizer`, so a caller may pair an approximate counter with a native identity and the snapshot reports `estimated = false` for a `len/4` number.
+- `ConversationContext::analyzer_with_limit` swaps the context's counter into a derived analyzer while keeping the caller's identity, so the mismatch above is reachable from engine configuration alone (an engine-level analyzer built with a native identity over a context whose `TokenCounterKind::Approx` counter is approximate).
+- `estimated` (any non-native source, including exact `tiktoken`) and `CounterIdentity::is_fallback` (a `_fallback` suffix only) are two different notions in the same wire record: a `tiktoken` part is `estimated = true` with `is_fallback() == false`.
+- `context_tokens.rs` returns bare `u64` counts (`count_context_window_tokens`, `count_messages_tokens`, `count_usage_tokens_with_tail`) that blend a provider-reported total with `len // 3` tails, so a compression-trigger decision made from them carries no provenance at all.
 
 ## Routing Table
 
