@@ -124,16 +124,20 @@ impl<T> OpResult<T> {
         }
     }
 
-    /// Converts into an idiomatic [`Result`], mapping any non-zero code to
-    /// [`openjiuwen_common::error::ErrorKind::SysOp`].
+    /// Converts into an idiomatic [`Result`], mapping any non-zero code to a typed error.
+    ///
+    /// [`SysOpStatus::Unsupported`] (`199012`) becomes
+    /// [`Error::unsupported`], so a caller can tell a capability gap from a real failure;
+    /// every other non-zero code becomes [`Error::sys_op`] exactly as before.
     ///
     /// # Errors
     ///
-    /// Returns the failure message as [`Error::sys_op`] when the code is non-zero, and
-    /// returns a `sys_op` error when the operation succeeded without a payload.
+    /// Returns the failure message as [`Error::sys_op`] (or [`Error::unsupported`] for
+    /// code `199012`) when the code is non-zero, and returns a `sys_op` error when the
+    /// operation succeeded without a payload.
     pub fn into_result(self) -> Result<T> {
         if self.is_failure() {
-            return Err(Error::sys_op(self.message));
+            return Err(failure_error(self.code, self.message));
         }
         self.data
             .ok_or_else(|| Error::sys_op("operation succeeded without a payload"))
@@ -143,12 +147,25 @@ impl<T> OpResult<T> {
     ///
     /// # Errors
     ///
-    /// Returns the failure message as [`Error::sys_op`] when the code is non-zero.
+    /// Returns the failure message as [`Error::sys_op`] (or [`Error::unsupported`] for
+    /// code `199012`) when the code is non-zero.
     pub fn into_optional_result(self) -> Result<Option<T>> {
         if self.is_failure() {
-            return Err(Error::sys_op(self.message));
+            return Err(failure_error(self.code, self.message));
         }
         Ok(self.data)
+    }
+}
+
+/// Maps a failure code and its message onto the shared error type.
+///
+/// [`SysOpStatus::Unsupported`] keeps its kind (`Unsupported`) so the capability gap
+/// survives the conversion; every other code stays a generic `sys_op` error.
+fn failure_error(code: i32, message: String) -> Error {
+    if code == SysOpStatus::Unsupported.code() {
+        Error::unsupported(message)
+    } else {
+        Error::sys_op(message)
     }
 }
 
@@ -196,6 +213,21 @@ pub fn code_failure<T>(execution: &str, reason: &str) -> OpResult<T> {
     OpResult::failure(
         SysOpStatus::CodeExecutionError,
         crate::status::code_execution_message(execution, reason),
+    )
+}
+
+/// Builds a "the sandbox backend does not support this capability" failure result.
+///
+/// The code is [`SysOpStatus::Unsupported`] (`199012`, a Rust-only addition) and the
+/// message is the Python sandbox-gateway envelope filled by
+/// [`crate::status::unsupported_message`], so `reason` reaches the caller verbatim and the
+/// text stays compatible. [`OpResult::into_result`] turns this variant into
+/// [`Error::unsupported`].
+#[must_use]
+pub fn unsupported_failure<T>(operation: &str, reason: &str) -> OpResult<T> {
+    OpResult::failure(
+        SysOpStatus::Unsupported,
+        crate::status::unsupported_message(operation, reason),
     )
 }
 
@@ -255,5 +287,64 @@ mod tests {
         let failure = fs_failure::<u8>("read_file", "boom").map(u16::from);
         assert_eq!(failure.code, 199_003);
         assert!(failure.data().is_none());
+    }
+
+    #[test]
+    fn unsupported_failure_keeps_the_python_envelope_and_a_new_code() {
+        let failure = unsupported_failure::<u8>("read_file", "gateway is deferred");
+        assert_eq!(failure.code, 199_012);
+        assert_eq!(
+            failure.message,
+            "sandbox gateway error, operation: read_file, reason: gateway is deferred"
+        );
+        assert_eq!(failure.status(), Some(SysOpStatus::Unsupported));
+        assert!(failure.data().is_none());
+        assert_eq!(
+            serde_json::to_value(&failure).unwrap(),
+            serde_json::json!({
+                "code": 199_012,
+                "message": "sandbox gateway error, operation: read_file, reason: gateway is deferred",
+            })
+        );
+    }
+
+    #[test]
+    fn into_result_maps_unsupported_code_to_unsupported_kind() {
+        let error = unsupported_failure::<u8>("read_file", "gateway is deferred")
+            .into_result()
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            error.message(),
+            "sandbox gateway error, operation: read_file, reason: gateway is deferred"
+        );
+
+        let error = unsupported_failure::<u8>("execute_cmd_stream", "deferred")
+            .into_optional_result()
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn other_codes_still_map_to_sys_op() {
+        // Every code but 199012 keeps the previous generic mapping.
+        for result in [
+            OpResult::<u8>::failure(SysOpStatus::SandboxGatewayError, "gateway down"),
+            OpResult::<u8>::failure(SysOpStatus::Error, "unspecified"),
+            OpResult::<u8>::failure(SysOpStatus::FileVersionConflict, "file version conflict"),
+        ] {
+            let code = result.code;
+            assert_eq!(
+                result.into_result().unwrap_err().kind(),
+                openjiuwen_common::error::ErrorKind::SysOp,
+                "code {code} must stay a sys_op failure"
+            );
+        }
     }
 }

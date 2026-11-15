@@ -4,13 +4,22 @@
 //! (`openjiuwen.core.common.exception.codes`, range `199000..=199999`) and the message
 //! built from the same template, so a caller porting from Python can match on either.
 //!
+//! [`SysOpStatus::Unsupported`] (`199012`) is the single **Rust-only** member: Python has
+//! no code for "this backend does not implement the capability", so the code is new while
+//! the message keeps the Python template it belongs to (see [`unsupported_message`]).
+//!
 //! ```
-//! use openjiuwen_sysop::status::{SysOpStatus, fs_execution_message};
+//! use openjiuwen_sysop::status::{SysOpStatus, fs_execution_message, unsupported_message};
 //!
 //! assert_eq!(SysOpStatus::FsExecutionError.code(), 199_003);
 //! assert_eq!(
 //!     fs_execution_message("resolve_path", "Access denied"),
 //!     "file system operation execution error, execution: resolve_path, reason: Access denied",
+//! );
+//! assert_eq!(SysOpStatus::Unsupported.code(), 199_012);
+//! assert_eq!(
+//!     unsupported_message("read_file", "gateway is deferred"),
+//!     "sandbox gateway error, operation: read_file, reason: gateway is deferred",
 //! );
 //! ```
 
@@ -51,6 +60,17 @@ pub enum SysOpStatus {
     SandboxIsolationKeyError,
     /// Optimistic-concurrency write rejection (`199011`).
     FileVersionConflict,
+    /// The backend does not implement the capability (`199012`, **Rust-only**).
+    ///
+    /// Python has no counterpart for this code: its sandbox providers raise a plain
+    /// operation error, so an unimplemented capability is indistinguishable from a real
+    /// failure. A Rust caller can therefore tell a capability gap (this variant, which
+    /// [`crate::result::OpResult::into_result`] turns into
+    /// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)) from a
+    /// genuine gateway failure ([`Self::SandboxGatewayError`]). The message keeps the
+    /// Python envelope of the path it was reported from, so text compatibility is
+    /// unchanged; only the numeric code differs.
+    Unsupported,
 }
 
 impl SysOpStatus {
@@ -71,6 +91,7 @@ impl SysOpStatus {
             Self::SandboxProviderError => 199_009,
             Self::SandboxIsolationKeyError => 199_010,
             Self::FileVersionConflict => 199_011,
+            Self::Unsupported => 199_012,
         }
     }
 
@@ -91,6 +112,7 @@ impl SysOpStatus {
             Self::SandboxProviderError => "sandbox_provider_error",
             Self::SandboxIsolationKeyError => "sandbox_isolation_key_error",
             Self::FileVersionConflict => "file_version_conflict",
+            Self::Unsupported => "unsupported",
         }
     }
 
@@ -117,6 +139,7 @@ impl SysOpStatus {
             199_009 => Self::SandboxProviderError,
             199_010 => Self::SandboxIsolationKeyError,
             199_011 => Self::FileVersionConflict,
+            199_012 => Self::Unsupported,
             _ => return None,
         })
     }
@@ -194,6 +217,21 @@ pub fn file_version_conflict_message() -> String {
     "file version conflict".to_string()
 }
 
+/// `sandbox gateway error, operation: {operation}, reason: {reason}` (**199012**, Rust-only).
+///
+/// Deliberately the same text as [`sandbox_gateway_message`]: the capability gap is
+/// reported inside the Python envelope of the path that hit it, so a caller that logs or
+/// forwards the message sees no new wording. Only the numeric code
+/// (`199012` for [`SysOpStatus::Unsupported`] instead of `199007` for
+/// [`SysOpStatus::SandboxGatewayError`]) marks "this backend cannot do it at all", and
+/// `reason` carries the underlying
+/// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported) message so
+/// the gap stays explainable.
+#[must_use]
+pub fn unsupported_message(operation: &str, reason: &str) -> String {
+    sandbox_gateway_message(operation, reason)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -232,10 +270,34 @@ mod tests {
             SysOpStatus::SandboxProviderError,
             SysOpStatus::SandboxIsolationKeyError,
             SysOpStatus::FileVersionConflict,
+            SysOpStatus::Unsupported,
         ] {
             assert_eq!(SysOpStatus::from_code(status.code()), Some(status));
         }
         assert_eq!(SysOpStatus::from_code(12_345), None);
+    }
+
+    #[test]
+    fn unsupported_is_a_rust_only_code() {
+        // Python stops at 199011: the capability-gap code is an addition, not a port.
+        assert_eq!(SysOpStatus::FileVersionConflict.code() + 1, 199_012);
+        assert_eq!(SysOpStatus::Unsupported.code(), 199_012);
+        assert_eq!(SysOpStatus::Unsupported.name(), "unsupported");
+        assert_eq!(SysOpStatus::Unsupported.to_string(), "unsupported");
+        assert!(!SysOpStatus::Unsupported.is_success());
+        assert_eq!(
+            serde_json::to_string(&SysOpStatus::Unsupported).unwrap(),
+            "\"unsupported\""
+        );
+        // The text keeps the Python sandbox-gateway envelope.
+        assert_eq!(
+            unsupported_message("read_file", "gateway is deferred"),
+            "sandbox gateway error, operation: read_file, reason: gateway is deferred"
+        );
+        assert_eq!(
+            unsupported_message("execute_cmd_stream", "deferred"),
+            sandbox_gateway_message("execute_cmd_stream", "deferred")
+        );
     }
 
     #[test]
