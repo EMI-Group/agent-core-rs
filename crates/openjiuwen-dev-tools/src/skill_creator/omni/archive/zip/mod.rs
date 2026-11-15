@@ -26,10 +26,23 @@
 //!   uncompressed size and the CRC-32 of the result.
 //!
 //! Supported compression methods are stored (`0`) and `DEFLATE` (`8`, decoded
-//! by [`inflate`](super::inflate)). Everything else is a typed
-//! [`Error::unsupported`]: encrypted entries (flag bit 0) and any other
-//! compression method (bzip2, `LZMA`, zstd, AES, ...). A 64-bit `ZIP64` size or
-//! offset wider than this platform's `usize` is the only `ZIP64` refusal left.
+//! by [`inflate`](super::inflate)).
+//!
+//! Traditional PKWARE encryption (`ZipCrypto`, general-purpose flag bit 0) is
+//! decrypted by the `zipcrypto` module when the caller supplies a password
+//! through [`UnpackOptions`](super::UnpackOptions): the 12-byte encryption
+//! header is decrypted and its password check byte verified first, then the
+//! decrypted remainder is decompressed, so the declared sizes, the CRC-32 check,
+//! and the [`CapTracker`] charge all apply to the real payload. An encrypted
+//! entry read without a password is a [`Error::validation`] naming the entry and
+//! asking for [`UnpackOptions::with_password`](super::UnpackOptions::with_password).
+//!
+//! Three other encryption schemes are typed [`Error::unsupported`], each naming
+//! itself: `WinZip` AES (compression method `99` or extra field `0x9901`), PKWARE
+//! strong encryption (flag bit 6), and an encrypted central directory (flag bit
+//! 13). Any other encryption marker and any other compression method (bzip2,
+//! `LZMA`, zstd, ...) is refused the same way. A 64-bit `ZIP64` size or offset
+//! wider than this platform's `usize` is the only `ZIP64` refusal left.
 //!
 //! Names are decoded as UTF-8 when the UTF-8 flag (bit 11) is set, and strictly
 //! so: invalid UTF-8 with that flag is a validation error. Without the flag a
@@ -59,17 +72,18 @@
 //! `0o040755` for a directory, `0o100644` otherwise), so a symlink entry round
 //! trips through [`unpack`] with its `kind` and `link_target` intact.
 
+mod payload;
 mod writer;
 mod zip64;
+mod zipcrypto;
 
 pub use writer::ArchiveWriter;
 
-use super::crc::crc32;
-use super::inflate::inflate;
 use super::{
     read_u16_le, read_u32_le, slice_at, validate_path, ArchiveEntry, ArchiveEntryKind, CapTracker,
 };
 use openjiuwen_common::error::{Error, Result};
+use payload::decode_payload;
 use zip64::{Zip64Escapes, ZIP64_MARKER};
 
 /// Signature of a local file header.
@@ -88,12 +102,22 @@ const LOCAL_FIXED: usize = 30;
 const MAX_COMMENT_LEN: usize = u16::MAX as usize;
 /// General-purpose flag bit 0: the entry is encrypted.
 const FLAG_ENCRYPTED: u16 = 0x0001;
+/// General-purpose flag bit 3: the entry's sizes and CRC-32 follow it as a data
+/// descriptor, so its local header declares none.
+const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
+/// General-purpose flag bit 6: the entry uses PKWARE strong encryption.
+const FLAG_STRONG_ENCRYPTION: u16 = 0x0040;
 /// General-purpose flag bit 11: the entry name is UTF-8.
 const FLAG_UTF8: u16 = 0x0800;
+/// General-purpose flag bit 13: the central directory is encrypted, so the local
+/// header's values are masked.
+const FLAG_MASKED_LOCAL_HEADERS: u16 = 0x2000;
 /// Compression method 0: stored.
 const METHOD_STORED: u16 = 0;
 /// Compression method 8: `DEFLATE`.
 const METHOD_DEFLATE: u16 = 8;
+/// Compression method 99: `WinZip` AES, whose payload this reader cannot decrypt.
+const METHOD_AES: u16 = 99;
 /// The DOS directory attribute, the low byte of the external attributes.
 const DOS_DIRECTORY_ATTRIBUTE: u32 = 0x10;
 /// The mask of the Unix file-type bits inside the external attributes' high half.
@@ -117,22 +141,45 @@ const UNIX_SYMLINK_MODE: u32 = 0o120_777;
 /// Upper bound on the records pre-allocated from the declared entry count.
 const MAX_PREALLOCATED_RECORDS: usize = 1024;
 
-/// Unpacks a `zip` archive into entries, in central-directory order.
+/// Unpacks a `zip` archive that carries no encrypted entries.
+///
+/// The no-password shorthand for [`unpack_with_password`].
 ///
 /// # Errors
 ///
 /// Returns [`Error::validation`] for malformed, truncated, unsafe, or oversized
 /// archives (including an escape value with no `ZIP64` structure behind it) and
-/// [`Error::unsupported`] for encrypted entries, compression methods other than
-/// stored and DEFLATE, and a 64-bit `ZIP64` value wider than this platform's
-/// `usize`.
+/// for a `ZipCrypto` entry, which needs a password, and
+/// [`Error::unsupported`] for a compression method other than stored and
+/// `DEFLATE`, a `ZIP64` value wider than this platform's `usize`, and the
+/// encryption schemes this reader does not implement (`WinZip` AES, PKWARE strong
+/// encryption, an encrypted central directory).
 pub(crate) fn unpack(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
+    unpack_with_password(bytes, None)
+}
+
+/// Unpacks a `zip` archive into entries, in central-directory order, decrypting
+/// traditional PKWARE (`ZipCrypto`) entries with `password`.
+///
+/// # Errors
+///
+/// Returns [`Error::validation`] for malformed, truncated, unsafe, or oversized
+/// archives, for a `ZipCrypto` entry when `password` is `None` or does not match
+/// the entry's check byte, and for a payload shorter than its encryption header;
+/// and [`Error::unsupported`] for a compression method other than stored and
+/// `DEFLATE`, a `ZIP64` value wider than this platform's `usize`, and the
+/// encryption schemes this reader does not implement (`WinZip` AES, PKWARE strong
+/// encryption, an encrypted central directory).
+pub(crate) fn unpack_with_password(
+    bytes: &[u8],
+    password: Option<&str>,
+) -> Result<Vec<ArchiveEntry>> {
     let eocd = find_eocd(bytes)?;
     let records = parse_central_directory(bytes, eocd)?;
     let mut caps = CapTracker::new();
     let mut entries = Vec::with_capacity(records.len());
     for record in &records {
-        entries.push(read_entry(bytes, record, &mut caps)?);
+        entries.push(read_entry(bytes, record, &mut caps, password)?);
     }
     Ok(entries)
 }
@@ -158,6 +205,9 @@ struct CentralRecord {
     flags: u16,
     /// Compression method.
     method: u16,
+    /// Whether the record's extra data carries the `WinZip` AES field (`0x9901`),
+    /// which marks an entry traditional `ZipCrypto` cannot decrypt.
+    aes_extra: bool,
     /// CRC-32 of the uncompressed payload.
     crc: u32,
     /// Size of the compressed payload in the archive.
@@ -377,6 +427,7 @@ fn parse_central_record(
         compressed: compressed == ZIP64_MARKER,
         local_offset: local_offset == ZIP64_MARKER,
     };
+    let aes_extra = zipcrypto::has_aes_extra(bytes, extra_start, extra_len);
     let extra = zip64::parse_extra(bytes, extra_start, extra_len, escapes, &name, offset)?;
     let compressed_size = zip64::resolve(
         compressed,
@@ -409,6 +460,7 @@ fn parse_central_record(
             name,
             flags,
             method,
+            aes_extra,
             crc,
             compressed_size,
             declared_size,
@@ -500,15 +552,35 @@ fn is_symlink(mode: u32) -> bool {
 /// # Errors
 ///
 /// Returns [`Error::validation`] for an unsafe path, a truncated local header or
-/// payload, a size mismatch, a CRC-32 mismatch, or an entry above the caps, and
-/// [`Error::unsupported`] for encrypted entries, unknown methods, and a `ZIP64`
-/// value this platform cannot address.
-fn read_entry(bytes: &[u8], record: &CentralRecord, caps: &mut CapTracker) -> Result<ArchiveEntry> {
+/// payload, an encrypted entry with no password or with a password that fails its
+/// check byte, a size mismatch, a CRC-32 mismatch, or an entry above the caps, and
+/// [`Error::unsupported`] for a compression method this reader cannot decode, an
+/// encryption scheme beyond traditional `ZipCrypto`, and a `ZIP64` value this
+/// platform cannot address.
+fn read_entry(
+    bytes: &[u8],
+    record: &CentralRecord,
+    caps: &mut CapTracker,
+    password: Option<&str>,
+) -> Result<ArchiveEntry> {
     let path = validate_path(&record.name)?;
     let mode = unix_mode(record.external_attributes);
-    if record.flags & FLAG_ENCRYPTED != 0 {
+    if record.flags & FLAG_STRONG_ENCRYPTION != 0 {
         return Err(Error::unsupported(format!(
-            "encrypted zip entry {path:?}: decrypting entries is not supported"
+            "zip entry {path:?} uses PKWARE strong encryption (general-purpose flag bit 6), which \
+             is not supported: only traditional ZipCrypto entries can be decrypted"
+        )));
+    }
+    if record.flags & FLAG_MASKED_LOCAL_HEADERS != 0 {
+        return Err(Error::unsupported(format!(
+            "zip entry {path:?} belongs to an encrypted central directory (general-purpose flag \
+             bit 13), which is not supported: only traditional ZipCrypto entries can be decrypted"
+        )));
+    }
+    if record.method == METHOD_AES || record.aes_extra {
+        return Err(Error::unsupported(format!(
+            "zip entry {path:?} uses WinZip AES encryption (compression method 99 or extra field \
+             0x9901), which is not supported: only traditional ZipCrypto entries can be decrypted"
         )));
     }
     if record.method != METHOD_STORED && record.method != METHOD_DEFLATE {
@@ -529,6 +601,13 @@ fn read_entry(bytes: &[u8], record: &CentralRecord, caps: &mut CapTracker) -> Re
             mode,
         });
     }
+    let encrypted = record.flags & FLAG_ENCRYPTED != 0;
+    if encrypted && password.is_none() {
+        return Err(Error::validation(format!(
+            "zip entry {path:?} is encrypted with traditional ZipCrypto: pass the password with \
+             UnpackOptions::with_password (or ArchiveUnpacker::unpack_with_options) to decrypt it"
+        )));
+    }
     if record.compressed_size == 0 && record.declared_size > 0 {
         return Err(Error::validation(format!(
             "zip entry {path:?} declares {} uncompressed bytes in a zero-byte payload",
@@ -538,7 +617,7 @@ fn read_entry(bytes: &[u8], record: &CentralRecord, caps: &mut CapTracker) -> Re
     // Charge the declared size before decompressing, so a declared zip bomb never
     // reaches an allocation.
     caps.charge(record.declared_size, &format!("zip entry {path:?}"))?;
-    let data = decode_payload(bytes, record, &path)?;
+    let data = decode_payload(bytes, record, &path, password)?;
 
     if mode.is_some_and(is_symlink) {
         // The stored payload of a symlink entry is its target. The lossy decode
@@ -568,87 +647,6 @@ fn read_entry(bytes: &[u8], record: &CentralRecord, caps: &mut CapTracker) -> Re
         link_target: None,
         mode,
     })
-}
-
-/// Decodes an entry's payload and verifies its declared size and CRC-32.
-///
-/// # Errors
-///
-/// Returns [`Error::validation`] for a truncated local header or payload, a
-/// malformed `DEFLATE` stream, a size mismatch, or a CRC-32 mismatch.
-fn decode_payload(bytes: &[u8], record: &CentralRecord, path: &str) -> Result<Vec<u8>> {
-    let payload = payload_slice(bytes, record)?;
-    let data = if record.method == METHOD_DEFLATE {
-        let data = inflate(payload, record.declared_size).map_err(|error| {
-            Error::validation(format!(
-                "invalid DEFLATE data for zip entry {path:?}: {error}"
-            ))
-        })?;
-        if data.len() != record.declared_size {
-            return Err(size_mismatch(path, data.len(), record.declared_size));
-        }
-        data
-    } else {
-        // Stored: the payload is the file, so a size mismatch is visible before
-        // the copy that would allocate it.
-        if payload.len() != record.declared_size {
-            return Err(size_mismatch(path, payload.len(), record.declared_size));
-        }
-        payload.to_vec()
-    };
-    let computed = crc32(&data);
-    if computed != record.crc {
-        return Err(Error::validation(format!(
-            "zip entry {path:?} fails its CRC-32 check: the central directory declares \
-             0x{declared:08x} but the payload hashes to 0x{computed:08x}",
-            declared = record.crc
-        )));
-    }
-    Ok(data)
-}
-
-/// Builds the validation error for a payload whose length contradicts the
-/// central directory.
-fn size_mismatch(path: &str, actual: usize, declared: usize) -> Error {
-    Error::validation(format!(
-        "zip entry {path:?} declares {declared} uncompressed bytes but its payload holds \
-         {actual} bytes"
-    ))
-}
-
-/// Returns the compressed payload slice named by the record's local header.
-///
-/// Only the local header's variable-field lengths are used: its sizes are
-/// ignored because a streamed entry keeps them zero and writes a data descriptor
-/// instead, so the central directory stays authoritative.
-///
-/// # Errors
-///
-/// Returns [`Error::validation`] naming the byte offset for a missing local
-/// header signature, a truncated header, or a truncated payload.
-fn payload_slice<'a>(bytes: &'a [u8], record: &CentralRecord) -> Result<&'a [u8]> {
-    let offset = record.local_offset;
-    let signature = slice_at(bytes, offset, 4)?;
-    if signature != LOCAL_SIGNATURE {
-        return Err(Error::validation(format!(
-            "invalid zip local header for entry {:?} at byte {offset}: expected the signature \
-             PK\x03\x04, found {signature:02x?}",
-            record.name
-        )));
-    }
-    let name_len = usize::from(read_u16_le(bytes, offset + 26)?);
-    let extra_len = usize::from(read_u16_le(bytes, offset + 28)?);
-    let data_start = offset
-        .checked_add(LOCAL_FIXED)
-        .and_then(|value| value.checked_add(name_len))
-        .and_then(|value| value.checked_add(extra_len))
-        .ok_or_else(|| {
-            Error::validation(format!(
-                "zip local header for entry {:?} at byte {offset} overflows the archive length",
-                record.name
-            ))
-        })?;
-    slice_at(bytes, data_start, record.compressed_size)
 }
 
 #[cfg(test)]

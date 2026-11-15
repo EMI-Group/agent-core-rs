@@ -11,8 +11,10 @@ use super::zip64::{
     ZIP64_LOCATOR_SIGNATURE, ZIP64_MARKER,
 };
 use super::*;
+use crate::skill_creator::omni::archive::crc::crc32;
 use crate::skill_creator::omni::archive::{
-    detect, ArchiveEntryKind, ArchiveFormat, ArchiveUnpacker, MAX_ENTRY_UNCOMPRESSED_BYTES,
+    detect, ArchiveEntryKind, ArchiveFormat, ArchiveUnpacker, UnpackOptions,
+    MAX_ENTRY_UNCOMPRESSED_BYTES,
 };
 use openjiuwen_common::error::ErrorKind;
 
@@ -32,6 +34,8 @@ struct Fields {
     declared: u32,
     /// External attributes.
     external: u32,
+    /// DOS modification time, written by both headers.
+    time: u16,
 }
 
 impl Fields {
@@ -44,6 +48,7 @@ impl Fields {
             packed: data.len() as u32,
             declared: data.len() as u32,
             external: 0,
+            time: DOS_TIME,
         }
     }
 }
@@ -56,7 +61,7 @@ fn local_header(name: &[u8], fields: Fields, extra: &[u8], sizes: Option<(u32, u
     put_u16(&mut out, VERSION);
     put_u16(&mut out, fields.flags);
     put_u16(&mut out, fields.method);
-    put_u16(&mut out, DOS_TIME);
+    put_u16(&mut out, fields.time);
     put_u16(&mut out, DOS_DATE);
     put_u32(&mut out, fields.crc);
     put_u32(&mut out, packed);
@@ -94,7 +99,7 @@ fn central_record_parts(
     put_u16(&mut out, VERSION);
     put_u16(&mut out, fields.flags);
     put_u16(&mut out, fields.method);
-    put_u16(&mut out, DOS_TIME);
+    put_u16(&mut out, fields.time);
     put_u16(&mut out, DOS_DATE);
     put_u32(&mut out, fields.crc);
     put_u32(&mut out, values.packed);
@@ -607,23 +612,405 @@ fn unknown_compression_method_is_unsupported() {
     assert!(message.contains("bzip2.txt"), "{message}");
 }
 
-#[test]
-fn encrypted_entries_are_unsupported() {
-    let fields = Fields {
+/// Fields of a `ZipCrypto` entry whose plaintext is `plain` and whose encrypted
+/// payload is `cipher` bytes long.
+fn encrypted_fields(plain: &[u8], cipher: &[u8], method: u16) -> Fields {
+    Fields {
         flags: FLAG_ENCRYPTED,
-        ..Fields::stored(b"secret")
-    };
+        method,
+        packed: cipher.len() as u32,
+        ..Fields::stored(plain)
+    }
+}
+
+#[test]
+fn zipcrypto_stored_entry_decrypts_with_the_password() {
+    let plain: &[u8] = b"top secret payload\n";
+    let cipher = zipcrypto::encrypt("hunter2", plain, zipcrypto::CheckByte::Crc32(crc32(plain)));
     let archive = single(Spec {
         name: b"secret.txt",
-        fields,
-        ..Spec::stored(b"secret.txt", b"secret")
+        fields: encrypted_fields(plain, &cipher, METHOD_STORED),
+        extra: b"",
+        local_sizes: None,
+        payload: &cipher,
     });
 
-    let error = ArchiveUnpacker::unpack(ArchiveFormat::Zip, &archive).expect_err("encrypted");
+    let options = UnpackOptions::new().with_password("hunter2");
+    let entries = ArchiveUnpacker::unpack_with_options(ArchiveFormat::Zip, &archive, &options)
+        .expect("the stored payload decrypts");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "secret.txt");
+    assert_eq!(entries[0].bytes, plain);
+    assert!(!entries[0].is_dir);
+
+    // Detection plus the options reaches exactly the same entry.
+    let auto = ArchiveUnpacker::unpack_auto_with_options(&archive, &options).expect("sniffs");
+    assert_eq!(auto, entries);
+}
+
+#[test]
+fn zipcrypto_deflate_entry_decrypts_before_inflating() {
+    // BFINAL = 1, BTYPE = 00 (stored block), LEN = 5, NLEN = !5, then "hello".
+    let deflated: &[u8] = &[0x01, 0x05, 0x00, 0xFA, 0xFF, b'h', b'e', b'l', b'l', b'o'];
+    let cipher = zipcrypto::encrypt(
+        "hunter2",
+        deflated,
+        zipcrypto::CheckByte::Crc32(crc32(b"hello")),
+    );
+    let archive = single(Spec {
+        name: b"deflated-secret.txt",
+        fields: encrypted_fields(b"hello", &cipher, METHOD_DEFLATE),
+        extra: b"",
+        local_sizes: None,
+        payload: &cipher,
+    });
+
+    let entries = ArchiveUnpacker::unpack_with_options(
+        ArchiveFormat::Zip,
+        &archive,
+        &UnpackOptions::new().with_password("hunter2"),
+    )
+    .expect("decrypts then inflates");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "deflated-secret.txt");
+    assert_eq!(entries[0].bytes, b"hello");
+}
+
+#[test]
+fn a_wrong_password_is_a_validation_error() {
+    let plain: &[u8] = b"guess me if you can\n";
+    let cipher = zipcrypto::encrypt("hunter2", plain, zipcrypto::CheckByte::Crc32(crc32(plain)));
+    let archive = single(Spec {
+        name: b"secret.txt",
+        fields: encrypted_fields(plain, &cipher, METHOD_STORED),
+        extra: b"",
+        local_sizes: None,
+        payload: &cipher,
+    });
+
+    let error = ArchiveUnpacker::unpack_with_options(
+        ArchiveFormat::Zip,
+        &archive,
+        &UnpackOptions::new().with_password("hunter3"),
+    )
+    .expect_err("a wrong password never yields data");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let message = error.to_string();
+    assert!(message.contains("secret.txt"), "{message}");
+    assert!(message.contains("password"), "{message}");
+    assert!(message.contains("does not decrypt"), "{message}");
+}
+
+#[test]
+fn an_encrypted_entry_needs_the_option_with_password() {
+    let plain: &[u8] = b"locked away\n";
+    let cipher = zipcrypto::encrypt("hunter2", plain, zipcrypto::CheckByte::Crc32(crc32(plain)));
+    let archive = single(Spec {
+        name: b"secret.txt",
+        fields: encrypted_fields(plain, &cipher, METHOD_STORED),
+        extra: b"",
+        local_sizes: None,
+        payload: &cipher,
+    });
+
+    let error = ArchiveUnpacker::unpack(ArchiveFormat::Zip, &archive).expect_err("no password");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let message = error.to_string();
+    assert!(message.contains("secret.txt"), "{message}");
+    assert!(message.contains("encrypted"), "{message}");
+    assert!(
+        message.contains("UnpackOptions::with_password"),
+        "the error tells the caller how to supply the password: {message}"
+    );
+
+    // `unpack_auto` reaches the same typed answer, and the options API reads it.
+    let error = ArchiveUnpacker::unpack_auto(&archive).expect_err("no password");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let entries = ArchiveUnpacker::unpack_with_options(
+        ArchiveFormat::Zip,
+        &archive,
+        &UnpackOptions::new().with_password("hunter2"),
+    )
+    .expect("the password decrypts the entry");
+    assert_eq!(entries[0].bytes, plain);
+
+    // An empty password is refused before decryption starts.
+    let error = ArchiveUnpacker::unpack_with_options(
+        ArchiveFormat::Zip,
+        &archive,
+        &UnpackOptions::new().with_password(""),
+    )
+    .expect_err("an empty password is a validation error");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.to_string().contains("empty"), "{error}");
+}
+
+#[test]
+fn a_data_descriptor_entry_checks_the_dos_time() {
+    /// A DOS time of 12:00:00, whose high byte is `0x18`.
+    const TIME: u16 = 0x180F;
+    let plain: &[u8] = b"streamed secret payload";
+    assert_ne!(
+        crc32(plain) >> 24,
+        u32::from(TIME >> 8),
+        "the fixture only proves the time is used when the two check bytes differ"
+    );
+    let cipher = zipcrypto::encrypt("hunter2", plain, zipcrypto::CheckByte::DosTime(TIME));
+    let fields = Fields {
+        flags: FLAG_ENCRYPTED | FLAG_DATA_DESCRIPTOR,
+        time: TIME,
+        ..encrypted_fields(plain, &cipher, METHOD_STORED)
+    };
+    let archive = single(Spec {
+        name: b"streamed-secret.txt",
+        fields,
+        extra: b"",
+        // A streamed entry keeps its local sizes zero and writes a data
+        // descriptor, so the central directory stays authoritative.
+        local_sizes: Some((0, 0)),
+        payload: &cipher,
+    });
+
+    let entries = ArchiveUnpacker::unpack_with_options(
+        ArchiveFormat::Zip,
+        &archive,
+        &UnpackOptions::new().with_password("hunter2"),
+    )
+    .expect("the DOS time is the check byte");
+    assert_eq!(entries[0].bytes, plain);
+
+    // Encrypting the same payload against the CRC-32 proves the flag decides the
+    // source: the DOS-time check rejects that header.
+    let wrong_source =
+        zipcrypto::encrypt("hunter2", plain, zipcrypto::CheckByte::Crc32(crc32(plain)));
+    let archive = single(Spec {
+        name: b"streamed-secret.txt",
+        fields: Fields {
+            flags: FLAG_ENCRYPTED | FLAG_DATA_DESCRIPTOR,
+            time: TIME,
+            ..encrypted_fields(plain, &wrong_source, METHOD_STORED)
+        },
+        extra: b"",
+        local_sizes: Some((0, 0)),
+        payload: &wrong_source,
+    });
+    let error = ArchiveUnpacker::unpack_with_options(
+        ArchiveFormat::Zip,
+        &archive,
+        &UnpackOptions::new().with_password("hunter2"),
+    )
+    .expect_err("a data-descriptor entry checks the DOS time, not the CRC-32");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+}
+
+#[test]
+fn a_truncated_encryption_header_is_rejected() {
+    let plain: &[u8] = b"eighteen bytes here";
+    let cipher = zipcrypto::encrypt("hunter2", plain, zipcrypto::CheckByte::Crc32(crc32(plain)));
+    let truncated = &cipher[..7];
+    let archive = single(Spec {
+        name: b"short-header.txt",
+        fields: encrypted_fields(plain, truncated, METHOD_STORED),
+        extra: b"",
+        local_sizes: None,
+        payload: truncated,
+    });
+
+    let error = ArchiveUnpacker::unpack_with_options(
+        ArchiveFormat::Zip,
+        &archive,
+        &UnpackOptions::new().with_password("hunter2"),
+    )
+    .expect_err("7 bytes cannot hold the 12-byte header");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.to_string().contains("encryption header"), "{error}");
+}
+
+#[test]
+fn a_mixed_archive_keeps_central_directory_order() {
+    let secret: &[u8] = b"encrypted second entry";
+    let cipher = zipcrypto::encrypt(
+        "hunter2",
+        secret,
+        zipcrypto::CheckByte::Crc32(crc32(secret)),
+    );
+    let archive = assemble(&[
+        Spec {
+            name: b"secret.txt",
+            fields: encrypted_fields(secret, &cipher, METHOD_STORED),
+            extra: b"",
+            local_sizes: None,
+            payload: &cipher,
+        },
+        Spec::stored(b"plain.txt", b"plain first entry"),
+    ]);
+
+    let entries = ArchiveUnpacker::unpack_with_options(
+        ArchiveFormat::Zip,
+        &archive,
+        &UnpackOptions::new().with_password("hunter2"),
+    )
+    .expect("both entries read");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].path, "secret.txt");
+    assert_eq!(entries[0].bytes, secret);
+    assert_eq!(entries[1].path, "plain.txt");
+    assert_eq!(entries[1].bytes, b"plain first entry");
+
+    // Without the password the encrypted entry fails even though the plain one
+    // would read, because the archive is unpacked as a unit.
+    let error =
+        ArchiveUnpacker::unpack(ArchiveFormat::Zip, &archive).expect_err("needs the password");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.to_string().contains("secret.txt"), "{error}");
+}
+
+#[test]
+fn winzip_aes_encryption_is_unsupported() {
+    let payload: &[u8] = b"0123456789abcdef";
+    let archive = single(Spec {
+        name: b"aes.txt",
+        fields: Fields {
+            flags: FLAG_ENCRYPTED,
+            method: METHOD_AES,
+            ..Fields::stored(payload)
+        },
+        extra: b"",
+        local_sizes: None,
+        payload,
+    });
+
+    for options in [
+        UnpackOptions::new(),
+        UnpackOptions::new().with_password("hunter2"),
+    ] {
+        let error = ArchiveUnpacker::unpack_with_options(ArchiveFormat::Zip, &archive, &options)
+            .expect_err("method 99");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.to_string();
+        assert!(message.contains("WinZip AES"), "{message}");
+        assert!(message.contains("aes.txt"), "{message}");
+    }
+}
+
+#[test]
+fn the_winzip_aes_extra_field_is_unsupported() {
+    // A `0x9901` extra field with the `WinZip` AES payload: version 2, vendor `AE`,
+    // AES-256, and the real method (stored, 0).
+    let mut extra = Vec::new();
+    put_u16(&mut extra, 0x9901);
+    put_u16(&mut extra, 7);
+    extra.extend_from_slice(&[0x02, 0x00, b'A', b'E', 0x03, 0x00, 0x00]);
+    let payload: &[u8] = b"0123456789abcdef";
+    let fields = Fields {
+        flags: FLAG_ENCRYPTED,
+        ..Fields::stored(payload)
+    };
+
+    let mut bytes = local_header(b"aes-extra.txt", fields, &extra, None);
+    bytes.extend_from_slice(payload);
+    let cd_offset = bytes.len();
+    let values = CentralValues {
+        packed: fields.packed,
+        declared: fields.declared,
+        offset: 0,
+    };
+    let record = central_record_parts(b"aes-extra.txt", fields, &extra, values);
+    let cd_size = record.len();
+    bytes.extend_from_slice(&record);
+    bytes.extend_from_slice(&eocd(1, cd_size as u32, cd_offset as u32));
+
+    let error = ArchiveUnpacker::unpack_with_options(
+        ArchiveFormat::Zip,
+        &bytes,
+        &UnpackOptions::new().with_password("hunter2"),
+    )
+    .expect_err("the AES extra field marks a scheme this reader cannot decrypt");
     assert_eq!(error.kind(), ErrorKind::Unsupported);
     let message = error.to_string();
-    assert!(message.contains("encrypt"), "{message}");
-    assert!(message.contains("secret.txt"), "{message}");
+    assert!(message.contains("WinZip AES"), "{message}");
+    assert!(message.contains("0x9901"), "{message}");
+    assert!(message.contains("aes-extra.txt"), "{message}");
+}
+
+#[test]
+fn other_encryption_schemes_are_unsupported() {
+    for (flag, needle) in [
+        (FLAG_STRONG_ENCRYPTION, "strong encryption"),
+        (FLAG_MASKED_LOCAL_HEADERS, "encrypted central directory"),
+    ] {
+        let payload: &[u8] = b"0123456789abcdef";
+        let archive = single(Spec {
+            name: b"strong.txt",
+            fields: Fields {
+                flags: FLAG_ENCRYPTED | flag,
+                ..Fields::stored(payload)
+            },
+            extra: b"",
+            local_sizes: None,
+            payload,
+        });
+        let error = ArchiveUnpacker::unpack_with_options(
+            ArchiveFormat::Zip,
+            &archive,
+            &UnpackOptions::new().with_password("hunter2"),
+        )
+        .expect_err(needle);
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{needle}");
+        let message = error.to_string();
+        assert!(message.contains(needle), "{message}");
+        assert!(message.contains("strong.txt"), "{message}");
+    }
+}
+
+/// A real Info-ZIP encrypted archive, produced by
+/// `zip -e -P hunter2 deflated.zip secret.txt` for a 640-byte `secret.txt`.
+///
+/// Its entry sets general-purpose flags `0x0009` (encrypted plus a data
+/// descriptor) and uses `DEFLATE` (method 8), so it pins interoperability with a
+/// writer this crate does not share code with: a real DOS-time password check
+/// byte and a real `DEFLATE` stream inside a real `ZipCrypto` layer.
+const INFO_ZIP_ENCRYPTED: &[u8] = &[
+    0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x09, 0x00, 0x08, 0x00, 0x17, 0x18, 0x70, 0x5d, 0x43, 0x1f,
+    0xac, 0xe4, 0x25, 0x00, 0x00, 0x00, 0x80, 0x02, 0x00, 0x00, 0x0a, 0x00, 0x1c, 0x00, 0x73, 0x65,
+    0x63, 0x72, 0x65, 0x74, 0x2e, 0x74, 0x78, 0x74, 0x55, 0x54, 0x09, 0x00, 0x03, 0x5d, 0x01, 0xfa,
+    0x6a, 0x5d, 0x01, 0xfa, 0x6a, 0x75, 0x78, 0x0b, 0x00, 0x01, 0x04, 0xe8, 0x03, 0x00, 0x00, 0x04,
+    0x64, 0x00, 0x00, 0x00, 0x7d, 0x0f, 0x91, 0xae, 0xbf, 0x96, 0xbf, 0xa0, 0x07, 0x96, 0x77, 0xe9,
+    0xdf, 0x1c, 0x8e, 0x3d, 0xdd, 0x65, 0xa0, 0xba, 0x34, 0x63, 0x59, 0x9d, 0x22, 0x08, 0xaf, 0x35,
+    0x41, 0xb2, 0x3c, 0x0d, 0x9c, 0xe3, 0xfc, 0x88, 0x5c, 0x50, 0x4b, 0x07, 0x08, 0x43, 0x1f, 0xac,
+    0xe4, 0x25, 0x00, 0x00, 0x00, 0x80, 0x02, 0x00, 0x00, 0x50, 0x4b, 0x01, 0x02, 0x1e, 0x03, 0x14,
+    0x00, 0x09, 0x00, 0x08, 0x00, 0x17, 0x18, 0x70, 0x5d, 0x43, 0x1f, 0xac, 0xe4, 0x25, 0x00, 0x00,
+    0x00, 0x80, 0x02, 0x00, 0x00, 0x0a, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0xa4, 0x81, 0x00, 0x00, 0x00, 0x00, 0x73, 0x65, 0x63, 0x72, 0x65, 0x74, 0x2e, 0x74, 0x78,
+    0x74, 0x55, 0x54, 0x05, 0x00, 0x03, 0x5d, 0x01, 0xfa, 0x6a, 0x75, 0x78, 0x0b, 0x00, 0x01, 0x04,
+    0xe8, 0x03, 0x00, 0x00, 0x04, 0x64, 0x00, 0x00, 0x00, 0x50, 0x4b, 0x05, 0x06, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x01, 0x00, 0x50, 0x00, 0x00, 0x00, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+#[test]
+fn reads_an_encrypted_archive_written_by_info_zip() {
+    let expected = "hello zipcrypto\n".repeat(40);
+    let entries = ArchiveUnpacker::unpack_with_options(
+        ArchiveFormat::Zip,
+        INFO_ZIP_ENCRYPTED,
+        &UnpackOptions::new().with_password("hunter2"),
+    )
+    .expect("the Info-ZIP fixture decrypts");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "secret.txt");
+    assert_eq!(entries[0].bytes, expected.as_bytes());
+
+    // Without a password the entry asks for one; a wrong one fails the check byte.
+    let error =
+        ArchiveUnpacker::unpack(ArchiveFormat::Zip, INFO_ZIP_ENCRYPTED).expect_err("no password");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let error = ArchiveUnpacker::unpack_with_options(
+        ArchiveFormat::Zip,
+        INFO_ZIP_ENCRYPTED,
+        &UnpackOptions::new().with_password("hunter3"),
+    )
+    .expect_err("wrong password");
+    assert_eq!(error.kind(), ErrorKind::Validation);
 }
 
 #[test]
