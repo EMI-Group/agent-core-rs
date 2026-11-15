@@ -15,7 +15,7 @@ The module spawns no task, starts no process, and keeps no global state; the que
 - `DreamKind { Consolidation (default), Dedupe, Summarize, Forget, GraphExtraction, Custom(String) }` with alias-tolerant `parse`, custom-string serde in both directions.
 - `DreamTrigger { Manual (default), Schedule, MessageThreshold, Idle }` with `as_str`, `parse`, `Display`.
 - `DreamMetrics { records_scanned, records_merged, records_deleted, records_created, tokens_saved, duration_ms }` with `is_empty`, saturating `accumulate`, `with_duration_ms`.
-- `DreamJob { id, scope, kind, state, trigger, priority, created_at, updated_at, started_at, finished_at, attempts, max_attempts, last_error, metrics, payload, metadata }` with `Default` (UUID v4, `DEFAULT_MAX_ATTEMPTS = 3`), `new`, `with_*` builders, `is_terminal`, and `validate`.
+- `DreamJob { id, scope, kind, state, trigger, priority, created_at, updated_at, started_at, finished_at, attempts, max_attempts, last_error, notes, metrics, payload, metadata }` with `Default` (UUID v4, `DEFAULT_MAX_ATTEMPTS = 3`), `new`, `with_*` builders (including `with_notes`), `is_terminal`, and `validate`.
 
 `outcome.rs`:
 - `DreamOutcome { job_id, state, metrics, notes }` with `new`, `succeeded`, `skipped`, `cancelled`, `failed`, `with_metrics`, `with_note`, `validate` (non-empty id, terminal state).
@@ -29,8 +29,8 @@ The module spawns no task, starts no process, and keeps no global state; the que
 - `#[async_trait] DreamRepository` with `enqueue`, `claim_next(now)`, `complete`, `fail`, `get`, `list`, `count_by_state`, `delete_finished`, `purge(now, retention)`, and the lease pair `claim_next_leased(now, &LeaseRequest)`, `renew_lease(job_id, owner, now, ttl)`, `release_lease(job_id, owner)`, `lease(job_id)`, plus `delete_job(job_id)`.
 - The five lease methods and `delete_job` default to typed `Error::Unsupported`, so a third-party repository compiles without leasing and says so instead of degrading.
 - `claim_next(now)` is the only place attempt counting happens: one atomic `Pending` → `Running` transition ordered `priority DESC, created_at ASC, id ASC`, setting `attempts += 1`, `started_at = now`, `updated_at = now`; eligibility is `Pending && attempts < max_attempts && (started_at.is_none() || started_at < now)`, so a job requeued at clock `now` is not re-claimable by the same run.
-- `complete` requires `Running` and `outcome.job_id == job_id`, stores state + metrics, sets `finished_at = updated_at = now`, clears `last_error`; unknown id is `NotFound`, any other state `Validation`.
-- `fail` requires `Running`, records `last_error`, keeps `started_at` as the retry marker, and lands in terminal `Failed` only when `attempts >= max_attempts`, otherwise `Pending`.
+- `complete` requires `Running` and `outcome.job_id == job_id`, stores state + metrics + `outcome.notes` into the job's `notes`, sets `finished_at = updated_at = now`, clears `last_error`; unknown id is `NotFound`, any other state `Validation`.
+- `fail` requires `Running`, records `last_error`, clears `notes` (a failed attempt has no completion notes), keeps `started_at` as the retry marker, and lands in terminal `Failed` only when `attempts >= max_attempts`, otherwise `Pending`.
 - `list` applies `DreamFilter::matches`, the shared `(priority DESC, created_at ASC, id ASC)` ordering, then `limit`; `count_by_state` reports all six states; `delete_finished(cutoff)` removes terminal rows whose finish time (falling back to `updated_at`) is strictly before the cutoff.
 - `InMemoryDreamRepository` (`BTreeMap` + `parking_lot::RwLock`, plus a `BTreeMap` of leases) is the default-build backend; it claims the pending head first and, failing that, takes over the earliest-queued `Running` job whose lease is expired.
 
@@ -77,6 +77,7 @@ The module spawns no task, starts no process, and keeps no global state; the que
 
 `pipeline.rs` + `pipeline/plan.rs` + `pipeline/tests.rs`:
 - Model-facing half: `DreamCandidate` (JSON `text`/`type` aliases), `DreamCandidateSource` (`StaticCandidateSource`, `PayloadCandidateSource` reading the job payload key `candidates`), `ConsolidationSink`/`RecordOnlySink`, `LlmConsolidatorConfig { enabled = true, model_retries = 1, max_candidates = 50, max_content_chars = 500, fallback_similarity = 0.75 }`, `LlmConsolidator` (`new(model: Option<Arc<dyn Model>>, source, config)`, `payload_driven`, `with_sink`, `config`, `plan`, `impl DreamConsolidator`).
+- `ConsolidationSink::applies_plans` (default `true`) tells the pipeline whether `apply` really mutates memory: `RecordOnlySink` answers `false`, reports only `records_scanned` from the plan, and the completion outcome then carries `RECORD_ONLY_NOTE`, so a stored job never looks like a pass that rewrote memory.
 - Pure decision half: `DreamConsolidationAction { Merge | Keep | Summarize | Forget }` (internally tagged `action`), `DreamConsolidationOrigin { Rules, Llm }`, `DreamConsolidationPlan { job_id, origin, actions, degraded, metrics }` (`is_degraded`, `is_empty`, `notes`), `parse_consolidation_response`, `deterministic_plan`.
 - `prompts.rs`: `CONSOLIDATION_SYSTEM_PROMPT`, `CONSOLIDATION_RESPONSE_SCHEMA`, `CONSOLIDATION_ACTION_NAMES`. There is no Python consolidation prompt; the request shape and schema are this crate's design (documented in the module header): a system message with the rules + schema, and a JSON user message `{job_id, kind, scope, max_actions, candidates:[{id, text, kind, importance, timestamp, access_count}]}`.
 - The model is attempted `model_retries + 1` times; provider errors, empty answers, unparseable JSON, invented-only ids, and non-terminal answers all count as failed attempts. Exhaustion yields `deterministic_plan` (token Jaccard ≥ `fallback_similarity` or equal normalized text → `Merge`, everything else `Keep`) with `degraded = Some(first failure)`. `{"actions":[]}` is a valid empty plan (`Skipped` outcome). Cancellation is propagated, never degraded.
@@ -85,15 +86,16 @@ The module spawns no task, starts no process, and keeps no global state; the que
 ## SQL Schema
 
 Table `dream_jobs` (this crate's table; it does not share a name with `kv_store`, `documents`, or the teams tables):
-`id TEXT PRIMARY KEY NOT NULL`, `user_id TEXT NOT NULL`, `scope_id TEXT NOT NULL`, `session_id TEXT`, `agent_id TEXT`, `kind TEXT NOT NULL`, `state TEXT NOT NULL`, `trigger TEXT NOT NULL`, `priority INTEGER NOT NULL DEFAULT 0`, `attempts INTEGER NOT NULL DEFAULT 0`, `max_attempts INTEGER NOT NULL DEFAULT 3`, `created_at TEXT NOT NULL`, `updated_at TEXT NOT NULL`, `started_at TEXT`, `finished_at TEXT`, `last_error TEXT`, `metrics_json TEXT NOT NULL DEFAULT '{}'`, `payload_json TEXT NOT NULL DEFAULT '{}'`, `metadata_json TEXT NOT NULL DEFAULT '{}'`.
+`id TEXT PRIMARY KEY NOT NULL`, `user_id TEXT NOT NULL`, `scope_id TEXT NOT NULL`, `session_id TEXT`, `agent_id TEXT`, `kind TEXT NOT NULL`, `state TEXT NOT NULL`, `trigger TEXT NOT NULL`, `priority INTEGER NOT NULL DEFAULT 0`, `attempts INTEGER NOT NULL DEFAULT 0`, `max_attempts INTEGER NOT NULL DEFAULT 3`, `created_at TEXT NOT NULL`, `updated_at TEXT NOT NULL`, `started_at TEXT`, `finished_at TEXT`, `last_error TEXT`, `notes_json TEXT NOT NULL DEFAULT '[]'`, `metrics_json TEXT NOT NULL DEFAULT '{}'`, `payload_json TEXT NOT NULL DEFAULT '{}'`, `metadata_json TEXT NOT NULL DEFAULT '{}'`.
 Indexes: `dream_jobs_claim_idx (state, priority DESC, created_at ASC, id ASC)` and `dream_jobs_scope_idx (user_id, scope_id)`.
+`notes_json` is additive: `from_pool` adds the column with the `'[]'` default to a table created before it existed, so an older worker's database keeps its rows with no recorded notes.
 
 Table `dream_job_leases` (one row per leased job; `job_id` is the job id and the row disappears on release or job deletion):
 `job_id TEXT PRIMARY KEY NOT NULL`, `owner TEXT NOT NULL`, `acquired_at TEXT NOT NULL`, `expires_at TEXT NOT NULL`, index `dream_job_leases_expiry_idx (expires_at)`.
 An unleased `Running` job is never stolen: takeover joins the lease table, so only a lease that exists and expired can be reclaimed.
 
 Timestamps are RFC 3339 UTC TEXT in one canonical format — `to_rfc3339_opts(SecondsFormat::Micros, true)` — so lexicographic ordering is chronological and cutoffs are plain string comparisons.
-Reads parse with `DateTime::parse_from_rfc3339(..).with_timezone(&Utc)` and map failures to `Error::External` naming the column; `kind`/`state`/`trigger` decode tolerantly; JSON columns round-trip through serde.
+Reads parse with `DateTime::parse_from_rfc3339(..).with_timezone(&Utc)` and map failures to `Error::External` naming the column; `kind` and `trigger` decode tolerantly, while an unknown `state` is `Error::External` naming the column on every read (`get`, `list`, `count_by_state`, the claim paths) instead of being guessed as `Pending`; JSON columns round-trip through serde.
 Every statement is parameter-bound with explicit `?N` placeholders; only module-level column/schema consts are interpolated.
 The unleased claim is one `UPDATE ... RETURNING` statement; completion and failure update `WHERE id = ?N AND state = 'running'` inside a transaction and re-read the row, so a zero-row update reports `NotFound` or the observed state.
 `list` narrows the four tenant ids and the two time bounds in SQL, then applies residual `DreamFilter` predicates and the limit in Rust so both backends rank and truncate identically.
@@ -107,6 +109,8 @@ A terminal `Ok(outcome)` is stored through `complete` with the job id forced to 
 Other errors go through `fail` and produce a `Failed` outcome whose note says whether the attempt was requeued (`attempt n/max`) or exhausted the budget.
 `DreamRunSummary::scanned` counts claimed jobs and `failed` counts failed attempts, including rescheduled ones; retry eligibility keys on `started_at`, so the same `now` never re-claims a requeued job.
 Repository errors from claim/complete/fail abort the sweep with `Err`; transitions already committed stay committed.
+A `complete`/`fail` write that fails after the claim committed is rescued: the planner sends the claimed job back through `fail` (`rescue_claimed`) so it lands `Pending` while the attempt budget lasts and terminally `Failed` once it is spent, and the original storage error is still what the sweep returns.
+The rescue is best effort — a repository that cannot write at all cannot be repaired from there — so both outcomes are logged and a job can only stay `Running` when every write to the repository fails.
 `run_leased` adds the lease arm: claim and lease atomically, renew before recording, release on every path, and stop without recording when the lease was lost.
 
 ## Orchestrator Schedule
@@ -146,13 +150,9 @@ Any other lock failure (`Validation`, `Cancelled`, `External`) still propagates 
 
 ## Known Issues
 
-- A claimed job whose transition write fails (`complete`/`fail` returning `Err`) stays `Running`: `planner` propagates the error, `run_leased` releases the lease first (so takeover cannot see it), and neither backend can re-claim a `Running` row without an expired lease row, so the job is orphaned and keeps counting under `Running`.
-- Neither backend persists `DreamOutcome::notes` (`complete` stores state + metrics only, in-memory `complete` and the `dream_jobs` table have no notes field), so a degraded LLM fallback, a partial model answer and `NoopConsolidator`'s "no consolidator configured" are indistinguishable from a clean success once the sweep summary is gone.
-- `RecordOnlySink` returns the plan's own counters, so a default-sink (dry-run) job persists `records_merged`/`records_deleted`/`tokens_saved` for actions nothing applied.
-- `sqlite::decode_state` maps an unparseable persisted `state` to `Pending` (warn only); `get`/`list` therefore report such a row as pending while the claim query, which matches `state = 'pending'` in SQL, never selects it.
-- `DreamJob::validate` does not constrain `state`, so `enqueue` accepts a `Running`/terminal job that no claim path (and, for `Running`, no lease takeover) can ever pick up.
-- `DreamMetrics::duration_ms` is never populated by the planner or the pipeline; only tests set it.
-- `DreamOrchestrator::tick_with` records neither `ticks` nor `last_error` when the sweep-lock acquisition returns `Err`, and `record_failed_tick` leaves a stale `last_summary` in place.
+- `DreamJob::validate` requires `started_at` for `Running` and `finished_at` for a terminal state, but `enqueue` still accepts such a job, and no claim path (nor, for `Running` without a lease row, any takeover) can pick it up.
+- `DreamMetrics::duration_ms` is never populated by the planner or the pipeline; only tests and a direct `with_duration_ms` call set it.
+- `DreamOrchestrator::tick_with` leaves `ticks` untouched when a non-skip sweep-lock acquisition fails, and `record_failed_tick` keeps the previous tick's `last_summary` beside the new error.
 
 ## Deferred
 
@@ -167,7 +167,8 @@ Any other lock failure (`Validation`, `Cancelled`, `External`) still propagates 
 
 `model`, `outcome`, `config`, `lease`, `retention`, and `salience` unit tests cover serde compatibility (including `DreamLeaseOptions` millisecond round-trip), defaults, builders, name parsing, metrics saturation, lease loss latching, expiry boundaries, weight validation, the formula components/ordering, idempotent purges, and every validation branch.
 `repository` tests cover the in-memory backend end to end: claim ordering, retry eligibility via `started_at`, requeue-then-terminal failure, complete/fail error kinds, filtering, counting, deletion, `purge`, lease claim/renew/release, takeover, and `delete_job`.
-`sqlite` tests (feature `sqlite`) use `tempfile::tempdir()` plus `sqlite:{path}` URLs and fixed `DateTime::from_timestamp(1_700_000_000, 0)` timestamps: cross-reopen durability, claim ordering, concurrent claims via `tokio::join!`, expiry-inclusive takeover, lease-row cleanup, retention cutoffs computed from `Utc::now()`, JSON column round-trips, all six state counts, and the complete/fail error contract.
+`sqlite` tests (feature `sqlite`) use `tempfile::tempdir()` plus `sqlite:{path}` URLs and fixed `DateTime::from_timestamp(1_700_000_000, 0)` timestamps: cross-reopen durability, claim ordering, concurrent claims via `tokio::join!`, expiry-inclusive takeover, lease-row cleanup, retention cutoffs computed from `Utc::now()`, JSON column round-trips including completion notes surviving a reopen and a failed attempt clearing them, the column upgrade of a pre-notes table, an unknown persisted state as a typed error, all six state counts, and the complete/fail error contract.
+Counts: the `dreaming` filter holds 177 unit tests without `sqlite` and 195 with `--features sqlite`.
 `planner` tests use a scripted consolidator (a `Step` queue behind `parking_lot::Mutex`, `tokio::sync::Notify` for blocking) to cover success with metrics, retry-until-`max_attempts` with an advancing clock, pre-cancelled and mid-consolidation cancellation, timeout as a failed attempt, non-terminal and mismatched outcome ids, skip semantics, disabled config, zero limit, ordering plus limit, and `run_due` batch size.
 `planner/lease.rs` adds leased-sweep coverage: completion releases the lease, racing sweeps claim one job once, an expired lease is taken over and the old owner records nothing, cancellation releases, terminal/requeued failures release, a non-leasing repository reports `Unsupported`, and invalid options are rejected before claiming.
 `pipeline/tests.rs` covers the LLM happy path, retry-then-fallback for prose and provider errors, no-model/disabled/no-candidate degradation, invented ids, the empty plan, sink success/failure, cancellation, config bounds, prompt truncation, both candidate sources, candidate serde, and the pure decision layer — all offline through `openjiuwen_test_support::ScriptedModel`.

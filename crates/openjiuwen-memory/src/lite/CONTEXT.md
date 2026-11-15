@@ -11,7 +11,7 @@ Python's per-fact `.md` files plus its `MEMORY.md` summary index are mapped onto
 
 ## API Surface
 
-### `CodingMemory` (engine-backed, unchanged)
+### `CodingMemory` (engine-backed)
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -395,7 +395,7 @@ impl MemUpdateChecker {
 
 ## On-disk layout
 
-Default single-document layout (unchanged):
+Default single-document layout:
 
 ```text
 <root>/
@@ -411,8 +411,8 @@ Per-fact layout (`LocalCodingMemoryBuilder::fact_files(true)`):
   facts/<slug>-<hash>.md   one fact per file, authoritative for content
   MEMORY.md                rendered index of the non-user facts
   USER.md                  rendered index of the `user`-level facts
-  .memory/index.db         derived index, unchanged
-  .memory/index.lock       advisory lock, unchanged
+  .memory/index.db         derived index
+  .memory/index.lock       advisory lock
 ```
 
 Independent of the layout, three further surfaces live under the same root:
@@ -599,8 +599,8 @@ Independent of the layout, three further surfaces live under the same root:
 - Coding facts are returned by `LongTermMemory::search` only when `MemoryType::Coding` is in the searched kinds (it is in the default `searchable_kinds`).
 - `CodingMemory::render_index`/`citation` write nothing; `LocalCodingMemory` owns the file and is the only writer of `MEMORY.md`, `USER.md`, `facts/`, `sessions/`, `daily_memory/`, and `.memory/`.
 - The derived indexes are never the source of truth: both may be dropped and rebuilt from the Markdown representation.
-- Default builds work without the `sqlite` feature: `LocalCodingMemory` then reloads and keyword-searches the Markdown document with no FTS index and keeps the embedding cache in memory only. Every new module compiles and is tested in both builds.
-- Every new feature is opt-in or additive: the default `open` keeps the single-document, keyword-only behaviour, and `tests/lite.rs`/`tests/lite_local.rs` are unchanged.
+- Default builds work without the `sqlite` feature: `LocalCodingMemory` then reloads and keyword-searches the Markdown document with no FTS index and keeps the embedding cache in memory only. Every module compiles and is tested in both builds.
+- Every capability beyond the default is opt-in or additive: the default `open` keeps the single-document, keyword-only behaviour, and `tests/lite.rs`/`tests/lite_local.rs` stay green in both feature configurations.
 - No new dependencies: the workspace has no `sha2`, `sqlite_vec`, or ANN crate, so content hashing is FNV-1a and vector search is a brute-force cosine scan.
 - Errors follow the crate strategy; no panics.
 - File sizes: `markdown/` and `local/` are directories; `embed/index.rs` (~895 lines) and `write.rs` (~845) sit above the ~800-line target because each carries its full in-file test module, with implementations of ~390 and ~490 lines.
@@ -644,8 +644,8 @@ Independent of the layout, three further surfaces live under the same root:
 - `session/`: `parse_line`/`to_json_line` round trip, malformed-line tolerance, timestamp string and epoch decoding, id sanitizing plus the folded-id discriminator, `path_for` layout, append accumulation and mid-line repair, recursive `files`, tolerant `load`, `chunks` numbering, keyword scoring.
 - `sync.rs`/`daily.rs`: scheduler due/not-due determinism from explicit `Instant`s, labels and report constructors; rollup shape, filters, ordering, truncation, and idempotent writes.
 - `write.rs`: serde/`FromStr` for every mode, policy validation, `backoff_for` capping, `plan` for every mode with and without an existing fact, and `run` first-attempt/retry/exhaustion/error-propagation behaviour.
-- `local/`: the original 13 store tests, plus the moved extras, plus the new suites — semantic vs keyword ordering, configured vs unconfigured `Semantic`, `RecallHit` components, cache hits across a refresh and a reopen, fact-file export/import, per-fact edits, the `USER.md` precedence rule, delete propagation, `sync_now` idempotency, trigger gating, the interval-task lifecycle, session recall in all three modes, rollup idempotency, and every write mode including retry exhaustion.
-- Integration binaries under `tests/`: `lite.rs` (10 tests, engine-backed `CodingMemory`) and `lite_local.rs` (8 tests, default `LocalCodingMemory`) are unchanged and must stay green.
+- `local/`: 13 store tests plus the mode-specific suites — semantic vs keyword ordering, configured vs unconfigured `Semantic`, `RecallHit` components, cache hits across a refresh and a reopen, fact-file export/import, per-fact edits, the `USER.md` precedence rule, delete propagation, `sync_now` idempotency, trigger gating, the interval-task lifecycle, session recall in all three modes, rollup idempotency, and every write mode including retry exhaustion.
+- Integration binaries under `tests/`: `lite.rs` (10 tests, engine-backed `CodingMemory`) and `lite_local.rs` (8 tests, default `LocalCodingMemory`) stay green in both feature configurations.
 - Offline and deterministic: `tempfile` directories, `HashEmbedding` plus counting wrappers, explicit `Instant`s, no network, no credentials, bounded awaits (≲5 s in `watch.rs`).
 - Gates (all must be green): `cargo fmt -p openjiuwen-memory`, `cargo test -p openjiuwen-memory --offline` (and the same with `--all-features`), `cargo clippy -p openjiuwen-memory --all-targets --all-features --offline -- -D warnings`, and `cargo doc -p openjiuwen-memory --no-deps` with and without the feature.
 - Module-level (`//!`) doc links in this directory must be absolute (`crate::lite::<module>::<Item>`): `//!` docs resolve in the parent module's scope.
