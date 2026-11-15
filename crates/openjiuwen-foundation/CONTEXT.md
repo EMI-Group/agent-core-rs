@@ -58,6 +58,7 @@ Storage (`store`):
 - No `unsafe`; workspace lints are `deny`, and `cargo clippy --all-targets -- -D warnings` must pass, so every public item needs a doc comment.
 - **Documented process-global registries**: `ModelProviderRegistry::global()`, `store::external::registry::global_registry()` and `llm::external_provider::ExternalProviderRegistry::global()` are this crate's only mutable globals; each is documented and has a local-instance alternative that tests prefer.
 - Files stay around ≤1000 lines; shared helpers live at the lowest common module (`prompt` types for the clients, `store::filter` for all backends). `store::external::{chroma,milvus,elasticsearch}` exceed the baseline on purpose: each is one complete wire mapping plus client-side validation and its tests are split into sibling `tests.rs` trees.
+- `tokio-rustls`/`rustls`/`webpki-roots`/`rustls-native-certs` and `sqlx-postgres 0.8.6` are already in `Cargo.lock` and the local registry cache (transitive through `reqwest`/`sqlx`), so a `rediss://` TLS stack and a PostgreSQL-backed store are buildable offline even though nothing depends on them directly today.
 - Default features (`mcp`, `tiktoken`) compile and test offline; no test may hit the network or need credentials. The network storage adapters need no feature gate because their dependencies are non-optional.
 
 ## Design Decisions
@@ -168,7 +169,7 @@ Storage (`store`):
 
 - `pgvector`/`postgres`/`gauss`/`gaussvector` vector backends and every external graph backend select through the registry but return typed `Error::Unsupported` (no PostgreSQL driver and no graph network contract offline).
 - Redis: no TLS (`rediss://`), no cluster, and commands serialize behind one connection mutex; the reconnect-retry is a single best-effort retry, not a backoff loop.
-- Milvus delegates duplicate-primary-key detection to the service; Chroma supports one embedding per record and scalar-only metadata; Elasticsearch document `query`/`delete` fall back to a bounded local scan (10 000 docs) for filters that do not translate to ES DSL.
+- Milvus delegates duplicate-primary-key detection to the service; Chroma supports one embedding per record and scalar-only metadata, and reads its schema only from `openjiuwen:schema` while Python writes `schema`/`fields`, so a Chroma collection is not readable across the two implementations; Elasticsearch document `query`/`delete` fall back to a bounded local scan (10 000 docs) for filters that do not translate to ES DSL.
 - MCP `Playwright` is a typed `Unsupported` (browser runtime absent); the OpenAPI transport resolves only local `$ref`, sends `application/json` bodies, and skips `in: cookie` parameters; the legacy SSE transport has no `Last-Event-ID` replay.
 - Anthropic: thinking blocks are still ignored in non-streaming responses; only the three automatic cache anchors exist (no per-message caller breakpoints or caching modes).
 - Reasoning: an OpenAI-compatible raw `reasoning` payload is forwarded verbatim while Anthropic rejects it with `Validation`; the Responses parser drops `reasoning.encrypted_content` items instead of replaying them on the next turn.
