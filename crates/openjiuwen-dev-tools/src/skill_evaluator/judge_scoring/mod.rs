@@ -37,7 +37,7 @@
 //! what lets `EvaluatorConfig::safety_gate_threshold` gate a judged run. The
 //! applied threshold gates the score, is stored in
 //! [`SafetyReport::gate_threshold`], and is handed to
-//! [`scan_safety`](crate::skill_evaluator::scoring::scan_safety), so the
+//! [`scan_safety`], so the
 //! deterministic scan and the model verdict agree.
 //!
 //! [`AutoFailCode`]: crate::skill_evaluator::report::AutoFailCode
