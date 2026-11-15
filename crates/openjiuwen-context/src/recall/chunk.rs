@@ -5,9 +5,15 @@
 //! initializing a tokenizer that may download assets), and overlapping windows
 //! step back at most `chunk_overlap_tokens * 4` bytes. Characters are never
 //! split, so multibyte CJK text survives chunking intact.
+//!
+//! Token sizes of chunks are estimates, so they use the crate's character-based
+//! `chars / 3` rule ([`estimate_tokens`]) rather than a byte count, and every
+//! chunk built from it is marked [`crate::recall::RecallChunk::estimated`].
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::prompt::{BaseMessage, Role};
 use serde::{Deserialize, Serialize};
+
+use crate::usage::context_tokens::CHARACTERS_PER_ESTIMATED_TOKEN;
 
 /// Leading-text markers that identify internal user messages.
 ///
@@ -166,10 +172,20 @@ pub fn render_turn(messages: &[BaseMessage], message_indices: &[usize]) -> Strin
     sections.join("\n\n").trim().to_owned()
 }
 
-/// Estimates tokens as `(utf8_bytes + 3) / 4`.
+/// Estimates tokens as `chars / 3`, with a floor of one token for non-empty text.
+///
+/// This is the crate's shared character-based rule
+/// ([`crate::usage::context_tokens::estimate_text_tokens`]): counting characters
+/// rather than UTF-8 bytes keeps CJK and emoji text from being over-counted
+/// several times over. The estimate is a fallback by construction, which is why
+/// [`crate::recall::RecallChunk::estimated`] is set beside it.
 #[must_use]
 pub fn estimate_tokens(text: &str) -> usize {
-    text.len().div_ceil(4)
+    let characters = text.chars().count();
+    if characters == 0 {
+        return 0;
+    }
+    (characters / CHARACTERS_PER_ESTIMATED_TOKEN).max(1)
 }
 
 /// Splits `text` into overlapping byte-window chunks.
@@ -326,8 +342,11 @@ mod tests {
     #[test]
     fn token_estimate_uses_the_documented_formula() {
         assert_eq!(estimate_tokens(""), 0);
+        // Characters, not bytes: three characters per token with a floor of one.
         assert_eq!(estimate_tokens("abc"), 1);
-        assert_eq!(estimate_tokens("abcde"), 2);
-        assert_eq!(estimate_tokens("你好"), 2);
+        assert_eq!(estimate_tokens("abcde"), 1);
+        assert_eq!(estimate_tokens("abcdef"), 2);
+        assert_eq!(estimate_tokens("你好世界"), 1);
+        assert_eq!(estimate_tokens("你好世界你好世界你好世"), 3);
     }
 }

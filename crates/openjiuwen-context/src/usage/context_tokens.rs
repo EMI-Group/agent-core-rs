@@ -12,8 +12,14 @@
 //! includes the system prompt and tools of that call, so a partial message span
 //! must never use it. Callers therefore pass `usage_aware = true` only for a
 //! full cumulative list.
+//!
+//! Every rung can be asked for its provenance through the `*_with_provenance`
+//! variants, which return a [`ContextTokenCount`] whose `estimated` flag and
+//! `note` survive into a compression decision; the plain `u64` functions are
+//! thin wrappers over them.
 
 use openjiuwen_foundation::prompt::{BaseMessage, MessageContent, Role, TokenCounter};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The message-metadata key holding a provider usage record.
@@ -25,6 +31,59 @@ pub const USAGE_STALE_METADATA_KEY: &str = "context_usage_stale";
 
 /// Characters per token of the last-resort estimate.
 pub const CHARACTERS_PER_ESTIMATED_TOKEN: usize = 3;
+
+/// The note of a count that mixed a provider baseline with an estimated tail.
+pub const USAGE_TAIL_NOTE: &str = "provider_usage_baseline_plus_estimated_tail";
+
+/// The note of a count produced by the string-length estimate.
+pub const STRING_LENGTH_NOTE: &str = "string_length_estimate";
+
+/// A token count together with what is known about its provenance.
+///
+/// `estimated` says whether this layer had to estimate, and `note` names why.
+/// A count produced by the supplied counter reports `estimated = false` because
+/// the counter's own provenance is not visible here: verification of the counter
+/// belongs to the analyzer, which knows the counter it executes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct ContextTokenCount {
+    /// The counted or estimated token total.
+    pub tokens: u64,
+    /// Whether any part of the count is an estimate rather than a counter count.
+    pub estimated: bool,
+    /// Why the count is an estimate, when it is one.
+    pub note: Option<String>,
+}
+
+impl ContextTokenCount {
+    /// A count produced by the supplied counter.
+    #[must_use]
+    pub fn counted(tokens: u64) -> Self {
+        Self {
+            tokens,
+            estimated: false,
+            note: None,
+        }
+    }
+
+    /// An estimate, with the named reason.
+    #[must_use]
+    pub fn estimated(tokens: u64, note: impl Into<String>) -> Self {
+        Self {
+            tokens,
+            estimated: true,
+            note: Some(note.into()),
+        }
+    }
+
+    /// Marks the count as an estimate produced by a counter known to estimate.
+    #[must_use]
+    pub fn with_estimated_counter(mut self, note: impl Into<String>) -> Self {
+        self.estimated = true;
+        self.note = Some(note.into());
+        self
+    }
+}
 
 /// Estimates tokens of sanitized text as `len // 3`, with a floor of one token.
 ///
@@ -88,6 +147,18 @@ pub fn has_valid_usage_metadata(message: &BaseMessage) -> bool {
 /// like Python: a message that contributes no text at all contributes no tokens.
 #[must_use]
 pub fn count_usage_tokens_with_tail(messages: &[BaseMessage]) -> Option<u64> {
+    count_usage_tokens_with_tail_provenance(messages).map(|counted| counted.tokens)
+}
+
+/// Returns the usage baseline plus its tail, with the provenance of the total.
+///
+/// A baseline with no appended messages is the provider's own count and reports
+/// itself as counted; a non-empty tail is an estimate named
+/// [`USAGE_TAIL_NOTE`], because the provider never saw those messages.
+#[must_use]
+pub fn count_usage_tokens_with_tail_provenance(
+    messages: &[BaseMessage],
+) -> Option<ContextTokenCount> {
     for (index, message) in messages.iter().enumerate().rev() {
         if !has_valid_usage_metadata(message) {
             continue;
@@ -100,7 +171,12 @@ pub fn count_usage_tokens_with_tail(messages: &[BaseMessage]) -> Option<u64> {
                     .unwrap_or(u64::MAX)
             })
             .fold(0u64, u64::saturating_add);
-        return Some(usage_tokens.saturating_add(tail_tokens));
+        let tokens = usage_tokens.saturating_add(tail_tokens);
+        return Some(if tail_tokens == 0 {
+            ContextTokenCount::counted(tokens)
+        } else {
+            ContextTokenCount::estimated(tokens, USAGE_TAIL_NOTE)
+        });
     }
     None
 }
@@ -115,21 +191,38 @@ pub fn count_messages_tokens(
     counter: Option<&dyn TokenCounter>,
     usage_aware: bool,
 ) -> u64 {
+    count_messages_tokens_with_provenance(messages, counter, usage_aware).tokens
+}
+
+/// Counts messages and reports whether the total is an estimate.
+///
+/// An empty list counts as zero without estimating; a usage baseline keeps the
+/// baseline's own provenance; without a counter the per-message
+/// [`estimate_text_tokens`] rule applies and the result names
+/// [`STRING_LENGTH_NOTE`].
+#[must_use]
+pub fn count_messages_tokens_with_provenance(
+    messages: &[BaseMessage],
+    counter: Option<&dyn TokenCounter>,
+    usage_aware: bool,
+) -> ContextTokenCount {
     if messages.is_empty() {
-        return 0;
+        return ContextTokenCount::counted(0);
     }
     if usage_aware {
-        if let Some(usage_tokens) = count_usage_tokens_with_tail(messages) {
-            return usage_tokens;
+        if let Some(counted) = count_usage_tokens_with_tail_provenance(messages) {
+            return counted;
         }
     }
     if let Some(counter) = counter {
-        return u64::try_from(counter.count_messages(messages)).unwrap_or(u64::MAX);
+        let tokens = u64::try_from(counter.count_messages(messages)).unwrap_or(u64::MAX);
+        return ContextTokenCount::counted(tokens);
     }
-    messages
+    let tokens = messages
         .iter()
         .map(estimate_message_tokens)
-        .fold(0u64, u64::saturating_add)
+        .fold(0u64, u64::saturating_add);
+    ContextTokenCount::estimated(tokens, STRING_LENGTH_NOTE)
 }
 
 /// Counts tool definitions with the context tokenizer or its estimate.
@@ -138,16 +231,33 @@ pub fn count_messages_tokens(
 /// sort-keys serialization Python measures.
 #[must_use]
 pub fn count_tools_tokens(tools: &[Value], counter: Option<&dyn TokenCounter>) -> u64 {
-    tools
+    count_tools_tokens_with_provenance(tools, counter).tokens
+}
+
+/// Counts tool definitions and reports whether the total is an estimate.
+#[must_use]
+pub fn count_tools_tokens_with_provenance(
+    tools: &[Value],
+    counter: Option<&dyn TokenCounter>,
+) -> ContextTokenCount {
+    let mut estimated = false;
+    let tokens = tools
         .iter()
         .map(|tool| {
             let text = canonical_json(tool);
-            match counter {
-                Some(counter) => u64::try_from(counter.count_text(&text)).unwrap_or(u64::MAX),
-                None => estimate_text_tokens(&text),
+            if let Some(counter) = counter {
+                u64::try_from(counter.count_text(&text)).unwrap_or(u64::MAX)
+            } else {
+                estimated = true;
+                estimate_text_tokens(&text)
             }
         })
-        .fold(0u64, u64::saturating_add)
+        .fold(0u64, u64::saturating_add);
+    if estimated {
+        ContextTokenCount::estimated(tokens, STRING_LENGTH_NOTE)
+    } else {
+        ContextTokenCount::counted(tokens)
+    }
 }
 
 /// The compressor's usage-baseline, tokenizer, and estimate policy.
@@ -161,11 +271,31 @@ pub fn count_context_window_tokens(
     tools: &[Value],
     counter: Option<&dyn TokenCounter>,
 ) -> u64 {
-    if let Some(usage_tokens) = count_usage_tokens_with_tail(messages) {
-        return usage_tokens;
+    count_context_window_tokens_with_provenance(messages, tools, counter).tokens
+}
+
+/// The compressor's window tokens, with the provenance a decision needs.
+///
+/// A compression trigger compares this total with a budget, so the estimate flag
+/// and its note travel with it: a baseline-plus-tail count and a string-length
+/// fallback both report themselves instead of looking like an exact counter
+/// count.
+#[must_use]
+pub fn count_context_window_tokens_with_provenance(
+    messages: &[BaseMessage],
+    tools: &[Value],
+    counter: Option<&dyn TokenCounter>,
+) -> ContextTokenCount {
+    if let Some(counted) = count_usage_tokens_with_tail_provenance(messages) {
+        return counted;
     }
-    count_messages_tokens(messages, counter, false)
-        .saturating_add(count_tools_tokens(tools, counter))
+    let messages_count = count_messages_tokens_with_provenance(messages, counter, false);
+    let tools_count = count_tools_tokens_with_provenance(tools, counter);
+    ContextTokenCount {
+        tokens: messages_count.tokens.saturating_add(tools_count.tokens),
+        estimated: messages_count.estimated || tools_count.estimated,
+        note: messages_count.note.or(tools_count.note),
+    }
 }
 
 /// Renders a JSON value with recursively sorted object keys.

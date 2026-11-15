@@ -95,7 +95,7 @@ pub fn parse_recall_marker(text: &str) -> Option<String> {
 }
 
 /// One chunk of archived transcript text.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct RecallChunk {
     /// Stable chunk identifier (`turn_0001_chunk_000`).
@@ -106,8 +106,54 @@ pub struct RecallChunk {
     pub chunk_index: usize,
     /// The chunk's rendered transcript text.
     pub text: String,
-    /// Estimated token count, `(utf8_bytes + 3) / 4`.
+    /// Estimated token count, `chars / 3` with a floor of one.
     pub tokens: usize,
+    /// Whether [`RecallChunk::tokens`] is an estimate rather than a measured count.
+    ///
+    /// Every chunk this crate archives is sized by [`chunk::estimate_tokens`], so
+    /// this is `true` for all of them; the field exists so a caller that skips
+    /// chunks on a token budget can see that the number it skipped on is an
+    /// estimate. Deserialized chunks without the field default to `true`,
+    /// because no tokenizer produced their `tokens` either.
+    pub estimated: bool,
+}
+
+impl Default for RecallChunk {
+    /// The defaults of an archived chunk: its size is an estimate.
+    fn default() -> Self {
+        Self {
+            chunk_id: String::new(),
+            turn_id: String::new(),
+            chunk_index: 0,
+            text: String::new(),
+            tokens: 0,
+            estimated: true,
+        }
+    }
+}
+
+impl RecallChunk {
+    /// Builds a chunk whose `tokens` is the character-based estimate.
+    ///
+    /// The estimate is marked with [`RecallChunk::estimated`], so a budget that
+    /// skips this chunk knows the number was never measured by a tokenizer.
+    #[must_use]
+    pub fn estimated(
+        chunk_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        chunk_index: usize,
+        text: impl Into<String>,
+    ) -> Self {
+        let text = text.into();
+        Self {
+            chunk_id: chunk_id.into(),
+            turn_id: turn_id.into(),
+            chunk_index,
+            tokens: chunk::estimate_tokens(&text),
+            text,
+            estimated: true,
+        }
+    }
 }
 
 /// One archived conversation turn and the chunks it produced.
@@ -551,13 +597,12 @@ pub fn try_archive_from_messages(
         for (chunk_index, text) in bodies.into_iter().enumerate() {
             let chunk_id = format!("{}_chunk_{:03}", turn.turn_id, chunk_index);
             chunk_ids.push(chunk_id.clone());
-            archive.chunks.push(RecallChunk {
+            archive.chunks.push(RecallChunk::estimated(
                 chunk_id,
-                turn_id: turn.turn_id.clone(),
+                turn.turn_id.clone(),
                 chunk_index,
-                tokens: chunk::estimate_tokens(&text),
                 text,
-            });
+            ));
         }
         archive.turns.push(RecallTurn {
             turn_id: turn.turn_id,

@@ -46,6 +46,7 @@ fn single_turn_archive(memory_id: &str, query: &str, text: &str) -> RecallArchiv
             chunk_index: 0,
             text: text.to_owned(),
             tokens: estimate_tokens(text),
+            estimated: true,
         }],
     }
 }
@@ -127,8 +128,11 @@ fn chunking_emits_one_chunk_per_wide_character() {
 fn chunk_tokens_use_the_documented_estimate() {
     assert_eq!(estimate_tokens("abc"), 1);
     assert_eq!(estimate_tokens("abcd"), 1);
-    assert_eq!(estimate_tokens("abcde"), 2);
-    assert_eq!(estimate_tokens("你好"), 2);
+    assert_eq!(estimate_tokens("abcde"), 1);
+    assert_eq!(estimate_tokens("abcdef"), 2);
+    // Characters, not UTF-8 bytes: `你好` is two characters and six bytes.
+    assert_eq!(estimate_tokens("你好"), 1);
+    assert_eq!(estimate_tokens("你好世界你好"), 2);
 }
 
 #[test]
@@ -353,6 +357,7 @@ async fn recall_returns_the_top_turn_and_chunks() {
                 chunk_index: 0,
                 text: "rust ownership and the borrow checker".to_owned(),
                 tokens: 10,
+                estimated: true,
             },
             RecallChunk {
                 chunk_id: "c2".to_owned(),
@@ -360,6 +365,7 @@ async fn recall_returns_the_top_turn_and_chunks() {
                 chunk_index: 1,
                 text: "unrelated appendix".to_owned(),
                 tokens: 10,
+                estimated: true,
             },
             RecallChunk {
                 chunk_id: "c3".to_owned(),
@@ -367,6 +373,7 @@ async fn recall_returns_the_top_turn_and_chunks() {
                 chunk_index: 0,
                 text: "python packaging wheels".to_owned(),
                 tokens: 10,
+                estimated: true,
             },
         ],
     };
@@ -421,6 +428,7 @@ async fn turn_ratio_cutoff_drops_weak_turns() {
                 chunk_index: 0,
                 text: "alpha alpha".to_owned(),
                 tokens: 5,
+                estimated: true,
             },
             RecallChunk {
                 chunk_id: "c2".to_owned(),
@@ -428,6 +436,7 @@ async fn turn_ratio_cutoff_drops_weak_turns() {
                 chunk_index: 0,
                 text: "alpha".to_owned(),
                 tokens: 5,
+                estimated: true,
             },
         ],
     };
@@ -472,6 +481,7 @@ async fn budget_skips_over_limit_chunks_and_sets_truncated() {
                 chunk_index: 0,
                 text: "alpha first".to_owned(),
                 tokens: 100,
+                estimated: true,
             },
             RecallChunk {
                 chunk_id: "c2".to_owned(),
@@ -479,6 +489,7 @@ async fn budget_skips_over_limit_chunks_and_sets_truncated() {
                 chunk_index: 1,
                 text: "alpha second".to_owned(),
                 tokens: 100,
+                estimated: true,
             },
         ],
     };

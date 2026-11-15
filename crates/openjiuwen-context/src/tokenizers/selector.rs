@@ -125,8 +125,37 @@ impl TokenizerSelector {
     }
 
     /// Selects the tokenizer for this provider and model.
+    ///
+    /// A selection that had to degrade below a native artifact emits exactly one
+    /// `tracing::warn!` naming the model and the reason, so a degraded count is
+    /// visible once per selection instead of once per count.
     #[must_use]
     pub fn select(&self) -> SelectedTokenizer {
+        let selected = self.resolve();
+        Self::warn_degradation(&selected);
+        selected
+    }
+
+    /// Emits the one warning of a degraded selection.
+    ///
+    /// A resolved `tiktoken` vocabulary reports `estimated() == true` without a
+    /// `fallback_reason`: nothing degraded, so nothing is logged.
+    fn warn_degradation(selected: &SelectedTokenizer) {
+        let Some(reason) = selected.fallback_reason() else {
+            return;
+        };
+        tracing::warn!(
+            target: "openjiuwen_context::tokenizers",
+            model = selected.model().unwrap_or_default(),
+            source = ?selected.source(),
+            reason,
+            note = selected.estimation_note().unwrap_or_default(),
+            "token counting degraded to an estimate"
+        );
+    }
+
+    /// Walks the selection ladder without logging.
+    fn resolve(&self) -> SelectedTokenizer {
         if let Some(spec) = &self.spec {
             if spec.engine == TokenizerEngine::Native {
                 return self
@@ -244,6 +273,10 @@ impl TokenizerSelector {
     }
 
     /// Builds the selection for an explicit (non-native) spec.
+    ///
+    /// A spec that declares a fallback source keeps that source even when the
+    /// model resolves cleanly, so the reason is filled from the declared source
+    /// when encoding resolution found none: an estimate always names why.
     fn spec_selection(&self, spec: &TokenizerSpec) -> SelectedTokenizer {
         let model = self.effective_model(spec);
         let resolved = resolve_encoding(&model);
@@ -261,7 +294,9 @@ impl TokenizerSelector {
             source,
             non_empty(model),
             tokenizer,
-            resolved.fallback_reason,
+            resolved
+                .fallback_reason
+                .or_else(|| declared_fallback_reason(source)),
         )
     }
 
@@ -334,6 +369,20 @@ impl TokenizerSelector {
         } else {
             "model_not_registered"
         }
+    }
+}
+
+/// The reason a declared fallback source carries when nothing else explains it.
+///
+/// An exact `tiktoken` or native source needs none; the three fallback sources
+/// do, so a measurement never reports an estimate without a named cause.
+fn declared_fallback_reason(source: TokenizerSource) -> Option<String> {
+    match source {
+        TokenizerSource::TiktokenFallback => Some("tiktoken_unavailable".to_owned()),
+        TokenizerSource::StringLengthFallback => Some("model_not_registered".to_owned()),
+        TokenizerSource::NativeTokenizer
+        | TokenizerSource::Tiktoken
+        | TokenizerSource::FamilyTokenizerFallback => None,
     }
 }
 

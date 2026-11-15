@@ -3,6 +3,11 @@
 //! The snapshot describes one logical request, so it is derived from the
 //! assembled window and its per-role statistics rather than from the stored
 //! history; an analyzer without a window limit is copied with the resolved one.
+//!
+//! The copy keeps the analyzer's own counter and identity: those are the only
+//! pairing whose provenance the analyzer can vouch for, and substituting the
+//! context's counter would republish an approximate count under the analyzer's
+//! native identity.
 use std::sync::Arc;
 
 use crate::policy::ContextWindowSnapshot;
@@ -21,19 +26,17 @@ impl ConversationContext {
     }
 
     /// Wraps `analyzer` with the resolved window limit when it has none.
+    ///
+    /// Only the limit is substituted: the analyzer keeps counting with its own
+    /// counter, so the published identity always describes the counter that ran.
+    /// A per-context `token_counter` override therefore affects the processors
+    /// and the window, not the provenance of the usage snapshot.
     fn analyzer_with_limit(&self, analyzer: &ContextUsageAnalyzer) -> Option<ContextUsageAnalyzer> {
         if analyzer.context_window_limit().is_some() {
             return None;
         }
         let limit = u64::try_from(self.resolved_window().tokens).unwrap_or(u64::MAX);
-        Some(
-            ContextUsageAnalyzer::new(
-                Arc::clone(&self.counter),
-                analyzer.counter_identity().clone(),
-            )
-            .with_model(analyzer.model())
-            .with_context_window_limit(Some(limit)),
-        )
+        Some(analyzer.with_derived_limit(limit))
     }
 
     /// Measures `input` and reconciles it with the provider total.
