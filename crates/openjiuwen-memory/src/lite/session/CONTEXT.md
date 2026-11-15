@@ -46,6 +46,17 @@ The module owns append-only writes, recursive discovery, tolerant decoding, chun
 - A tolerated decode emits one `debug` event; no warning is emitted per line, so a plain-text log does not flood the log.
 - The index is derived state: it may be dropped and rebuilt from the JSONL files at any time.
 
+## Known Issues
+
+- `append` does not check that an existing log ends with `\n`, so appending to a hand-edited or crash-truncated file concatenates the last old line and the first new record into one line (which then decodes as a raw-text fallback, losing the new record as a distinct entry).
+- `sanitize_session_id` folds every non-portable character to `-` and adds no disambiguating hash (unlike `lite::facts::file_name_for`), so distinct ids such as `café`, `caf-` and `日本` share one log file: their appends mix and recall cites the folded path.
+- `parse_line`'s raw-text fallback discards a decodable `role` and `timestamp` whenever the content field is missing or non-string, and nothing marks the record as undecoded, so a corrupted structured line is indistinguishable from a genuine plain-text turn.
+- `decode_timestamp` drops an unparsable or out-of-range timestamp silently (`None`, no event); a record without a timestamp is permanently ineligible for a `lite::daily` rollup, which filters on `DailySessionLine::date == Some(date)`.
+- `files` matches the extension case-sensitively, so a log named `ABC.JSONL` is invisible to `files`/`chunks`/`stamp` and therefore to recall.
+- `stamp` maps a `modified()` or pre-epoch `duration_since` failure to `newest_ms = 0`, so such a file never bumps the staleness stamp.
+- `index::TOKENS` degrades to `None` when the static regex fails to compile, which makes `keyword_score` `0.0` for every query (one `warn!`, no error on the public path).
+- `SessionStore::relative` falls back to `strip_prefix(..).unwrap_or(path)` and `to_string_lossy`, so a path outside the root or a non-UTF-8 name yields a plausible-looking but wrong citation path.
+
 ## Routing Table
 
 - `./mod.rs` → module docs, `SESSIONS_DIR`, `SessionStore`, `sanitize_session_id`, `DirStamp`, line decoding
