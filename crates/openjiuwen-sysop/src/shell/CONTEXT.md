@@ -28,7 +28,9 @@ The parent `../CONTEXT.md` "Behavior contract" section is the authoritative Pyth
 - `RunOptions::timeout_secs == 0` means no deadline.
 - A timeout or any of the cancellation tokens kills the child exactly once, keeps partial output, and sets `timed_out`/`cancelled`.
 - `stream_child` emits exactly one terminal event (`Exit`, `TimedOut`, or `Cancelled`) and joins its pipe readers with a grace period.
-- Reader failures end the affected pipe and never panic.
+- Reader failures end the affected pipe and never panic; anything other than clean EOF / `EIO` / `BrokenPipe` is logged at `warn!` with the path or stream name, so truncated output is never silent.
+- Best-effort steps log their outcome instead of discarding it: a failed `start_kill`, a failed reap, a failed group termination, a session-map poison, and the PTY→pipe fallback each emit `warn!`/`debug!` with the pid or stream and the underlying error.
+- A child that was signalled (or whose status could not be read) still reports exit code `-1` (Python parity), with a `debug!`/`warn!` naming the case.
 - Cancellation tokens come from `shell::registry` (per session) plus the optional per-instance token.
 - Every child is spawned into a fresh process group (`Command::process_group(0)`, pgid = child pid). A timeout, a cancellation, or a session teardown kills **the group** with `killpg(SIGKILL)` before `Child::wait`, and `ProcessGroup` guarantees at most one kill and never a kill after the reap (pid reuse).
 - `setsid()` is deliberately not used: it needs an `unsafe` `pre_exec` hook, which the crate forbids. `process_group(0)` gives the same killpg-able group without detaching a controlling terminal.
