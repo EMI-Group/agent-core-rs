@@ -328,6 +328,16 @@ Sandbox lifecycle (`sandbox/gateway/gateway.py`, `sandbox/launchers/`):
   files above 8 MiB.
 - Writes are always UTF-8 (or UTF-16 when explicitly requested); Python can write arbitrary
   codecs.
+- `PreDeploymentLauncher` inherits the trait defaults for `pause`/`resume`/`delete` and
+  `check_status` (which reports `Running`), so `SandboxLifecycle::release(Delete)` returns
+  `Ok` and drops the record without tearing anything down; Python's `pre_deployment_launcher.delete`
+  deletes `jiuwenbox`/`yuanrong` containers through the extension providers.
+- `SandboxLifecycle::evict_idle` drops a record and reports the key as evicted even when the
+  launcher delete fails or the launcher type is no longer registered (the container is leaked,
+  logged at `warn`); a duplicate launch whose cleanup delete fails is leaked the same way.
+- The HTTP gateway backends flatten `HttpSandboxGateway::invoke`'s `Error::Unsupported` into a
+  code 199007 `OpResult` failure (`sandbox/http.rs` `invoke_value`), so fs/shell/code callers
+  never see the `Unsupported` kind; only a direct `invoke` call does.
 - Hard links to one inode map to different sidecar lock files (Python's SQLite lock manager
   shares that limitation), and stale lock files are never swept (they are empty and reused).
 - POSIX streaming does not reproduce the macOS `script -q /dev/null` wrapper; macOS runs
