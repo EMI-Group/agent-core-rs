@@ -21,7 +21,7 @@ use openjiuwen_common::error::{ErrorKind, Result};
 use openjiuwen_retrieval::loaders::{fixtures, DocxLoader};
 use openjiuwen_retrieval::{
     extract_title, html_to_text, AutoLoader, CsvLoader, Document, DocumentLoader, HtmlLoader,
-    JsonLoader, LoaderRegistry, MarkdownLoader, TextLoader, UrlLoader,
+    JsonLoader, LoadOptions, LoaderRegistry, MarkdownLoader, TextLoader, UrlLoader,
 };
 use serde_json::Value;
 use wiremock::matchers::{method, path};
@@ -704,5 +704,167 @@ async fn auto_loader_rejects_scanned_pdfs() {
     assert!(
         error.to_string().contains("PDF has no extractable text"),
         "unexpected message: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Office loader completeness metadata (PPTX placeholders, ODT dropped elements)
+// ---------------------------------------------------------------------------
+/// `ppt/presentation.xml` declaring two slides, the second one unmapped.
+const PPTX_LOSSY_PRESENTATION: &str = concat!(
+    r#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main""#,
+    r#" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#,
+    r#"<p:sldIdLst><p:sldId id="256" r:id="rId1"/>"#,
+    r#"<p:sldId id="257" r:id="rId7"/></p:sldIdLst></p:presentation>"#,
+);
+/// `ppt/_rels/presentation.xml.rels`: only `rId1` is mapped, so `rId7` dangles.
+const PPTX_LOSSY_RELS: &str = concat!(
+    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+    r#"<Relationship Id="rId1" Type="slide" Target="slides/slide1.xml"/></Relationships>"#,
+);
+/// The one slide part the lossy deck actually ships.
+const PPTX_LOSSY_SLIDE: &str = concat!(
+    r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main""#,
+    r#" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">"#,
+    r#"<p:cSld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>"#,
+    r#"<p:txBody><a:bodyPr/><a:p><a:r><a:t>Overview</a:t></a:r></a:p></p:txBody></p:sp>"#,
+    r#"</p:spTree></p:cSld></p:sld>"#,
+);
+/// `content.xml` with a drawing and a footnote between two rendered paragraphs.
+const ODT_LOSSY_CONTENT: &str = concat!(
+    r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0""#,
+    r#" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0""#,
+    r#" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0">"#,
+    r#"<office:body><office:text>"#,
+    r#"<text:p>Before</text:p>"#,
+    r#"<text:p><draw:frame><draw:image href="Pictures/a.png"/></draw:frame></text:p>"#,
+    r#"<text:p><text:note><text:note-citation>1</text:note-citation>"#,
+    r#"<text:note-body><text:p>footnote</text:p></text:note-body></text:note></text:p>"#,
+    r#"<text:p>After</text:p>"#,
+    r#"</office:text></office:body></office:document-content>"#,
+);
+/// Builds the deck whose second slide cannot be resolved.
+fn pptx_lossy_deck() -> Vec<u8> {
+    fixtures::build_zip(&[
+        ("ppt/presentation.xml", PPTX_LOSSY_PRESENTATION),
+        ("ppt/_rels/presentation.xml.rels", PPTX_LOSSY_RELS),
+        ("ppt/slides/slide1.xml", PPTX_LOSSY_SLIDE),
+    ])
+    .unwrap()
+}
+#[tokio::test]
+async fn pptx_loader_flags_a_deck_with_a_placeholder_slide() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = pptx_lossy_deck();
+    let path = write_bytes(&dir, "deck.pptx", &bytes);
+    let documents = AutoLoader::new().load(&path).await.unwrap();
+    assert_eq!(documents.len(), 1);
+    let document = &documents[0];
+    let metadata = &document.metadata;
+    // The placeholder counts: two declared slides, two loaded slides.
+    assert_eq!(metadata.get("slide_count"), Some(&Value::from(2)));
+    assert_eq!(metadata.get("pptx_incomplete"), Some(&Value::from(true)));
+    let problems = metadata
+        .get("pptx_problems")
+        .expect("pptx_problems is always present")
+        .as_array()
+        .expect("pptx_problems is a JSON array");
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].as_str().unwrap().contains("rId7"),
+        "{problems:?}"
+    );
+    assert!(
+        document
+            .text
+            .contains("## Slide 2\n! missing slide part: rId7"),
+        "{}",
+        document.text
+    );
+    // The in-memory path reports exactly the same completeness metadata.
+    let from_bytes = AutoLoader::new()
+        .load_bytes("deck.pptx", bytes, &LoadOptions::new())
+        .await
+        .unwrap();
+    for key in ["slide_count", "pptx_incomplete", "pptx_problems"] {
+        assert_eq!(
+            from_bytes[0].metadata.get(key),
+            metadata.get(key),
+            "{key} differs between the path and byte entry points"
+        );
+    }
+}
+#[tokio::test]
+async fn pptx_loader_reports_a_complete_deck_as_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_bytes(
+        &dir,
+        "clean.pptx",
+        &fixtures::pptx_slides(&[("Intro", &["first body"])]).unwrap(),
+    );
+    let documents = AutoLoader::new().load(&path).await.unwrap();
+    let metadata = &documents[0].metadata;
+    assert_eq!(metadata.get("slide_count"), Some(&Value::from(1)));
+    assert_eq!(metadata.get("has_notes"), Some(&Value::from(false)));
+    assert_eq!(metadata.get("source_type"), Some(&Value::from("document")));
+    assert_eq!(metadata.get("pptx_incomplete"), Some(&Value::from(false)));
+    assert_eq!(
+        metadata.get("pptx_problems"),
+        Some(&Value::Array(Vec::new()))
+    );
+    assert_eq!(documents[0].text, "## Slide 1\nIntro\nfirst body");
+}
+#[tokio::test]
+async fn odt_loader_flags_elements_that_contribute_no_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_bytes(
+        &dir,
+        "lossy.odt",
+        &fixtures::build_zip(&[("content.xml", ODT_LOSSY_CONTENT)]).unwrap(),
+    );
+    let documents = AutoLoader::new().load(&path).await.unwrap();
+    assert_eq!(documents.len(), 1);
+    let document = &documents[0];
+    assert_eq!(document.text, "Before\nAfter");
+    let metadata = &document.metadata;
+    assert_eq!(metadata.get("paragraph_count"), Some(&Value::from(2)));
+    assert_eq!(metadata.get("table_count"), Some(&Value::from(0)));
+    assert_eq!(metadata.get("source_type"), Some(&Value::from("document")));
+    assert_eq!(metadata.get("file_ext"), Some(&Value::from(".odt")));
+    assert_eq!(metadata.get("odt_incomplete"), Some(&Value::from(true)));
+    let unsupported = metadata
+        .get("odt_unsupported_elements")
+        .expect("odt_unsupported_elements is always present")
+        .as_array()
+        .expect("odt_unsupported_elements is a JSON array");
+    assert_eq!(
+        unsupported,
+        &vec![
+            Value::from("draw:frame (×1)"),
+            Value::from("draw:image (×1)"),
+            Value::from("text:note (×1)"),
+        ]
+    );
+}
+#[tokio::test]
+async fn odt_loader_reports_a_clean_document_as_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_bytes(
+        &dir,
+        "memo.odt",
+        &fixtures::odt_document(&["First", "Second"]).unwrap(),
+    );
+    let documents = AutoLoader::new().load(&path).await.unwrap();
+    let document = &documents[0];
+    assert_eq!(document.text, "First\nSecond");
+    let metadata = &document.metadata;
+    assert_eq!(metadata.get("title"), Some(&Value::from("memo")));
+    assert_eq!(metadata.get("paragraph_count"), Some(&Value::from(2)));
+    assert_eq!(metadata.get("table_count"), Some(&Value::from(0)));
+    assert_eq!(metadata.get("source_type"), Some(&Value::from("document")));
+    assert_eq!(metadata.get("odt_incomplete"), Some(&Value::from(false)));
+    assert_eq!(
+        metadata.get("odt_unsupported_elements"),
+        Some(&Value::Array(Vec::new()))
     );
 }
