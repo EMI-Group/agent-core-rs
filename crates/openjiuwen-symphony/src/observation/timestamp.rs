@@ -15,6 +15,8 @@
 //! `GraphEvolutionInput::normalized`, which rewrites `observed_at` to the canonical `...Z`
 //! form and reports an `Error::Validation` naming the field when the text is unusable.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crate::error::{validation, Result};
 
 /// Parses an RFC 3339 timestamp into epoch seconds plus the fractional digits as written.
@@ -53,6 +55,21 @@ pub(crate) fn format_epoch(epoch_seconds: i64, fraction: Option<&str>) -> String
     }
     rendered.push('Z');
     rendered
+}
+
+/// Returns the current UTC instant as RFC 3339 text with second precision.
+///
+/// Used for `generated_at` metadata only: the observation layer never orders or compares
+/// anything by a clock, and revision ids deliberately exclude the timestamp. A system clock
+/// before the Unix epoch renders as `1970-01-01T00:00:00Z` instead of panicking.
+#[must_use]
+pub(crate) fn utc_now() -> String {
+    let epoch_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        });
+    format_epoch(epoch_seconds, None)
 }
 
 /// Normalises an RFC 3339 timestamp to UTC (`...Z`) text.
