@@ -372,6 +372,7 @@ impl PromptSearchOptimizer {
             token_usage: BTreeMap::new(),
             run_id: setup.run_id,
             records,
+            ..OptimizationResult::default()
         })
     }
 
