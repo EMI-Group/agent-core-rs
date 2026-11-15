@@ -435,6 +435,8 @@ Independent of the layout, three further surfaces live under the same root:
 - Staleness in the per-fact layout compares `MEMORY.md`/`USER.md` stamps and the `facts/` `DirStamp`; index-document changes trigger an import, fact-file changes trigger a re-render, and when both changed the index wins with a `tracing::warn!`.
 - Mutations are additionally serialized inside the process by an async mutex; the file lock alone would work but is a blocking system call.
 - A read path that observes a changed file without holding the file lock updates the cache and marks the projections dirty; every locked path flushes them, which preserves the file-lock-then-state-guard order.
+- That read-path reload rebuilds only the document and the FTS index (`store::ensure_fresh`); the chunk index is refreshed solely by mutations, `reindex`, `sync_now`, `export_index`/`import_index` and `open`, so a `search` after an external edit scores changed facts against stale vectors.
+- A failed `EmbeddingIndex::reindex` keeps the previously committed chunk list, but the first refresh after open inserts the empty index into its slot before reindexing, so a failure there leaves an empty index that later `search` calls read as `similarity = 0.0` with no error.
 - `start_watching` reloads (and reindexes) on every debounced `.md` change; `reload_count` is the observable reload counter.
 - `write`/`edit`/`delete`/`reindex` refresh the chunk index after the state guard is dropped, so no guard is ever held across an embedding call.
 

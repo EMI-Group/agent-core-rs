@@ -34,6 +34,10 @@ Everything runs offline: the cache has an in-memory backend, `SQLite` is an opti
 - No `unsafe`, no `println!`/`eprintln!`; diagnostics use `tracing` with target `openjiuwen_memory::lite::embed`; no `unwrap`/`expect` outside tests.
 - A `parking_lot` mutex only guards the in-memory map and is never held across an `.await`; the `SqlitePool` is cheaply cloned.
 - `index.rs` is 895 lines because its 21 tests live in-file (the implementation half is about 390 lines); `cache.rs` stays under 700 and `chunk.rs` under 450.
+## Known Issues
+- `EmbeddingIndex::reindex` validates only the *count* of vectors returned by `embed_documents`, so an empty or off-dimension vector is written to the cache and kept on the chunk, then scored `0.0` for the life of the persistent cache row; `EmbeddingStats::dimension` reports the first non-empty vector's length because it is inferred, never enforced.
+- Cache hits are reused without comparing the stored vector to `embedding.dimension_hint()`, so a model re-pointed under the same name silently yields `0.0` similarity for every cached chunk while `EmbeddingStats::cached` counts the hit as success.
+- `chunk_markdown` does not call `ChunkingConfig::validate`: a direct caller with `target_tokens = 0` gets one chunk per line, and with `overlap >= target_tokens` gets chunks that repeat the whole preceding prefix; every in-crate caller validates first (`EmbeddingIndex::reindex`, the `LocalCodingMemory` builder).
 ## Routing Table
 - `./mod.rs` → module documentation, submodule declarations, public re-exports, the tracing `TARGET`
 - `./chunk.rs` → `ChunkingConfig`, `MemChunk`, `estimate_tokens`, `chunk_markdown`, the chunking algorithm and its 15 unit tests
