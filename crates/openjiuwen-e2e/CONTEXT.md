@@ -11,8 +11,8 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 
 - `src/lib.rs` — marker module (`crate_name()`); the crate has no runtime API.
 - `tests/support/mod.rs` — the cross-scenario helper contract: `BOUND` (10 s per-await deadline), `within(what, future)`, `collect_bounded(stream, max)`. Scenario-specific fixtures stay in `openjiuwen-test-support` or beside the scenario.
-- Test binaries (each `tests/*.rs` is its own binary; no `[[test]]` entries), 24 of them:
-  `kernel_flow`, `workflow_components`, `context_engine`, `context_tokenizers`, `retrieval_pipeline`, `memory_recall`, `memory_dreaming`, `team_memory`, `deep_agent`, `harness_cli_tools`, `provider_native`, `team_flow`, `team_backend`, `runner_subprocess`, `runner_hosting`, `federation_transports`, `a2a_roundtrip`, `symphony_plan`, `symphony_artifacts`, `self_improvement`, `evaluation_ledger`, `plugin_observability`, `cli_binary`.
+- Test binaries (each `tests/*.rs` is its own binary; no `[[test]]` entries), 25 of them:
+  `kernel_flow`, `workflow_components`, `context_engine`, `context_tokenizers`, `retrieval_pipeline`, `memory_recall`, `memory_dreaming`, `team_memory`, `deep_agent`, `harness_cli_tools`, `provider_native`, `team_flow`, `team_backend`, `runner_subprocess`, `runner_hosting`, `federation_transports`, `a2a_roundtrip`, `symphony_plan`, `symphony_artifacts`, `self_improvement`, `evaluation_ledger`, `plugin_observability`, `watcher_reload`, `cli_binary`.
 - Features: `default = []`;
   `a2a` (enables `openjiuwen/a2a` + `openjiuwen-extensions/a2a`, gates `a2a_roundtrip.rs`);
   `otel` (enables `openjiuwen/otel` + `openjiuwen-extensions/otel` + `openjiuwen-agent-teams/otlp`, gates `plugin_observability.rs`);
@@ -206,6 +206,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 - `axum`/`tower` are intentionally absent: the A2A scenario uses a real loopback socket (`A2aServer::serve_in_background` + `A2aClient`) instead of an in-process `tower::ServiceExt::oneshot` harness, so the transport, the JSON-RPC envelope and the SSE framing are all exercised.
 - Non-LLM HTTP fakes use `openjiuwen_test_support::wiremock`; set bodies with `set_body_raw(body, mime)` because `set_body_string` forces `text/plain`.
 - `reqwest` is a direct dependency for the agent-card endpoint (the A2A client itself lives in `openjiuwen-extensions`).
+- `watcher_reload.rs` never starts `WorkspaceWatcher` and never enables the `notify` feature: the hub/handler/dispatch path is always compiled, so the scenario builds its own `WatchEvent` literals and calls `ReloadHub::dispatch` directly.
 
 ## Known Behaviours
 
