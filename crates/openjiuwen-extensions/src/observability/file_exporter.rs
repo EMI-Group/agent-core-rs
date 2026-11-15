@@ -8,7 +8,7 @@
 //! Collector (or Langfuse) ingests directly via `POST /v1/traces`. Spans from
 //! different traces interleave in one file: the collector rebuilds each trace
 //! from the ids carried on every span, so physical ordering and per-trace files
-//! are irrelevant, and replaying is just POSTing each line in turn.
+//! are irrelevant, and replaying means posting every line with `POST` in turn.
 //!
 //! # Semantics kept from Python
 //!
@@ -265,7 +265,8 @@ impl TraceFileExporter {
             }
             match fs::remove_file(&path) {
                 Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                // Removed by another process between listing and now.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
                     warn!(target: LOG_TARGET, path = %path.display(), %error, "cannot prune a trace file");
                 }

@@ -40,6 +40,10 @@ fn config(dir: &Path, retention_days: u32) -> OtelTracerConfig {
 }
 
 /// Every `traces-*.jsonl` file under `dir`, sorted.
+///
+/// The suffix comparison is case-sensitive on purpose: Python's sweep filters
+/// with `entry.endswith(".jsonl")`, so `TRACES.JSONL` is not a trace file.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn trace_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
         .unwrap()
