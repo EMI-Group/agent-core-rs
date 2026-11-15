@@ -13,6 +13,16 @@ Ports `openjiuwen/core/foundation/llm/model_clients/anthropic_model_client.py`.
 - `build_messages_body_with_endpoint(&[BaseMessage], &ModelRequestConfig, stream, provider, endpoint_profile: Option<&str>, api_base: Option<&str>) -> Result<Value>` — the same projection with the client's `endpoint_profile` as well; the client calls this one, and `_with_provider` delegates with no profile.
 - `normalize_api_base(&str) -> String` — strips a pasted `/v1/messages` or `/v1` suffix.
 - `parse_messages_response`, `parse_anthropic_usage`, `AnthropicStreamState` — response and stream conversion.
+- `THINKING_BLOCKS_METADATA_KEY` (`"anthropic_thinking_blocks"`) — the `BaseMessage::metadata` key holding the raw `thinking`/`redacted_thinking` blocks preserved from a response.
+
+## Extended Thinking (`response.rs`, `convert.rs`)
+
+A non-streaming `thinking` block appends its `thinking` text to the assistant message's `reasoning_content` (adjacent blocks concatenate in order); `reasoning_content` stays `None` when no thinking block carried text.
+Every replayable block — a `thinking` block with a non-empty `signature`, a `redacted_thinking` block with non-empty `data` — is preserved verbatim, in response order, as a JSON array under `BaseMessage::metadata[THINKING_BLOCKS_METADATA_KEY]`.
+A block without that provider proof is dropped with a `tracing::warn!` and never stored: the client never invents a signature.
+The assistant projection reads the same key and emits those blocks first, verbatim and in order, ahead of the text and `tool_use` blocks, because the Messages API requires the original signed blocks on a follow-up `tool_use` turn.
+A turn without survivable blocks keeps the plain string `content` it always had; a turn with them always sends a block array.
+The key is caller-writable, so the projection re-validates every entry (`type` plus `signature`/`data`) and silently drops anything else instead of forwarding a block the API would reject.
 
 ## Request Projection (`request.rs`)
 
