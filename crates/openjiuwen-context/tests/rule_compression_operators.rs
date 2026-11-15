@@ -16,12 +16,13 @@
 //!
 //! Everything is offline and deterministic: no model, no clock, no filesystem
 //! and no network.
-use openjiuwen_context::processor::rule_compression::router::{
-    is_timestamp_line, repair_json, repair_json_array, repair_json_array_checked, sniff_bytes,
-    sniff_content, JsonRepairFailure, SniffKind,
-};
+// Everything is reached through the module root, so the re-exports a caller
+// depends on are the imports this suite exercises.
 use openjiuwen_context::processor::rule_compression::{
-    ContentType, RuleContentRouter, RuleContext,
+    is_timestamp_line, repair_json, repair_json_array, repair_json_array_checked, sniff_bytes,
+    sniff_content, ContentType, JsonRepairFailure, RuleContentRouter, RuleContext, SniffKind,
+    BINARY_SNIFF_BYTES, MAX_CONTROL_RATIO_PERCENT, REPLACEMENT_CHAR_MIN,
+    REPLACEMENT_CHAR_RATIO_PERCENT,
 };
 
 /// A rule-compression context with room for every fixture.
@@ -349,6 +350,46 @@ fn tabs_and_newlines_stay_text() {
     assert_eq!(sniffed.kind, SniffKind::Utf8);
     assert_eq!(sniffed.text, "a\tb\nc\r\nd");
     assert!(sniffed.details().is_none(), "UTF-8 reports no details");
+}
+
+#[test]
+fn the_sniff_thresholds_are_public_and_pinned() {
+    // A caller budgets against these limits, so they are part of the surface.
+    assert_eq!(BINARY_SNIFF_BYTES, 8 * 1024);
+    assert_eq!(MAX_CONTROL_RATIO_PERCENT, 5);
+    assert_eq!(REPLACEMENT_CHAR_MIN, 8);
+    assert_eq!(REPLACEMENT_CHAR_RATIO_PERCENT, 5);
+
+    // The control ratio is strict: exactly the limit is text, one over is binary.
+    let controls = "\u{1}".repeat(MAX_CONTROL_RATIO_PERCENT);
+    let at_limit = format!("{controls}{}", "a".repeat(100 - MAX_CONTROL_RATIO_PERCENT));
+    assert_eq!(sniff_content(&at_limit).kind, SniffKind::Utf8);
+    let over = format!(
+        "{}{}",
+        "\u{1}".repeat(MAX_CONTROL_RATIO_PERCENT + 1),
+        "a".repeat(100 - MAX_CONTROL_RATIO_PERCENT - 1)
+    );
+    assert_eq!(sniff_content(&over).kind, SniffKind::Binary);
+
+    // The replacement gate needs the count and the ratio, so the count alone
+    // keeps a body as text.
+    let few = format!(
+        "{}{}",
+        "\u{fffd}".repeat(REPLACEMENT_CHAR_MIN - 1),
+        "a".repeat(100 - REPLACEMENT_CHAR_MIN + 1)
+    );
+    assert_eq!(sniff_content(&few).kind, SniffKind::Utf8);
+    let many = format!(
+        "{}{}",
+        "\u{fffd}".repeat(REPLACEMENT_CHAR_MIN),
+        "a".repeat(100 - REPLACEMENT_CHAR_MIN)
+    );
+    assert_eq!(sniff_content(&many).kind, SniffKind::ReplacementHeavy);
+
+    // The binary scan stops at its limit, so a clean prefix hides a dirty tail.
+    let mut long = "a".repeat(BINARY_SNIFF_BYTES);
+    long.push_str(&"\u{1}".repeat(200));
+    assert_eq!(sniff_content(&long).kind, SniffKind::Utf8);
 }
 
 // ---------------------------------------------------------------------------

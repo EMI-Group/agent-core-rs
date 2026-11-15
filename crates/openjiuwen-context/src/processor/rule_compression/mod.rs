@@ -20,13 +20,20 @@
 //!
 //! Intentional differences from Python, all documented per module:
 //!
-//! - matching is ASCII and hand-rolled (no `regex` crate), so log-line and
-//!   timestamp sniffing ignore non-ASCII case folding;
-//! - `json_repair` is replaced by a bounded repair (fence, trailing text,
-//!   trailing commas, single quotes);
-//! - the HTML extractor is a small tokenizer/renderer instead of `BeautifulSoup`
-//!   plus `trafilatura`, and `source_file` keeps Python's shape but adds the
-//!   structure digest Python's no-op compressor never had;
+//! - matching is regex-free and hand-rolled (no `regex` crate) but stays
+//!   Unicode-aware: log lines fold with full Unicode lowercasing, and
+//!   [`is_timestamp_line`] folds `unicode-normalization` `NFKC` plus the
+//!   Arabic-Indic decimal blocks, so full-width and localized timestamp spellings
+//!   are recognised instead of only ASCII ones;
+//! - `json_repair` is replaced by the documented repair ladder in
+//!   `router::repair` (fence, span, smart quotes, single quotes, Python
+//!   literals, unquoted keys, trailing commas, close truncated, drop incomplete
+//!   tail, wrap sequence/bare members) and a body it cannot repair is a typed
+//!   [`JsonRepairFailure`], never a silent truncation;
+//! - HTML readability is the deterministic scoring ladder in
+//!   `compressors::html::ladder` over the built-in renderer instead of
+//!   `BeautifulSoup` plus `trafilatura`, and `source_file` keeps Python's shape
+//!   but adds the structure digest Python's no-op compressor never had;
 //! - the dump directory has no workspace handle, so it falls back to the
 //!   documented relative [`dump::DEFAULT_DUMP_DIR`] instead of
 //!   `<workspace>/context/<session>_context/rule_compression_logs`.
@@ -61,7 +68,12 @@ pub use pipeline::{
     RULE_COMPRESSION_PASS_KEY, RULE_COMPRESSION_TYPE_KEY, TTL_PASS,
 };
 pub use query_terms::extract_query_terms;
-pub use router::{repair_json_array, ContentRouter, RuleContentRouter};
+pub use router::{
+    is_timestamp_line, repair_json, repair_json_array, repair_json_array_checked, sniff_bytes,
+    sniff_content, ContentRouter, JsonRepairFailure, RuleContentRouter, SniffKind, SniffedContent,
+    BINARY_SNIFF_BYTES, MAX_CONTROL_RATIO_PERCENT, REPLACEMENT_CHAR_MIN,
+    REPLACEMENT_CHAR_RATIO_PERCENT,
+};
 pub use types::{
     ContentType, RuleCompressionResult, RuleCompressionStrategy, RuleContext, TokenCountPolicy,
     CHARACTERS_PER_TOKEN,
