@@ -3,24 +3,39 @@
 //! Port of the Python `openjiuwen/core/retrieval/indexing/processor/chunker/`
 //! package: the [`Chunker`] trait with its chunk-stamping contract, fixed-size
 //! character windows ([`CharChunker`]), recursive character splitting
-//! ([`RecursiveCharChunker`]), token approximation ([`TokenChunker`]), and a
+//! ([`RecursiveCharChunker`]), token approximation ([`TokenChunker`]), the
+//! table-unit-aware [`HybridChunker`], the [`TextPreprocessor`] family with
+//! [`PreprocessingPipeline`], the preprocessing facade [`TextChunker`], and a
 //! name-based factory registry ([`ChunkerRegistry`]).
 //!
 //! Chunking is pure CPU work: every method is synchronous and deterministic
 //! except for the generated chunk identifiers.
+//! Preprocessing runs only through [`TextChunker`] (or directly through a
+//! [`PreprocessingPipeline`]): [`CharChunker`], [`RecursiveCharChunker`],
+//! [`TokenChunker`], and [`HybridChunker`] never alter the text they receive.
 mod char;
+mod hybrid;
+mod preprocess;
 mod recursive;
 mod registry;
+mod text_chunker;
 mod token;
 
 use openjiuwen_common::error::{Error, Result};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::common::{Document, TextChunk};
 
 pub use char::CharChunker;
+pub use hybrid::{default_no_split, HybridChunker, NoSplitPredicate};
+pub use preprocess::{
+    PreprocessingPipeline, SpecialCharacterNormalizer, TextPreprocessor, URLEmailRemover,
+    WhitespaceNormalizer, REDUNDANT_RUN_PATTERN,
+};
 pub use recursive::RecursiveCharChunker;
 pub use registry::{ChunkerFactory, ChunkerRegistry};
+pub use text_chunker::{ChunkUnit, TextChunker};
 pub use token::{TokenChunker, TokenCounter, WhitespaceTokenCounter};
 
 pub use crate::common::{DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE};
@@ -46,25 +61,9 @@ pub trait Chunker: Send + Sync {
     /// uuid as `id`).
     fn chunk_documents(&self, documents: &[Document]) -> Result<Vec<TextChunk>> {
         let mut chunks = Vec::new();
-        for doc in documents {
-            let texts = self.chunk_text(&doc.text)?;
-            let total_chunks = texts.len();
-            for (chunk_index, text) in texts.into_iter().enumerate() {
-                let id = Uuid::new_v4().to_string();
-                let mut metadata = doc.metadata.clone();
-                metadata.insert(
-                    "chunk_index".to_owned(),
-                    serde_json::Value::from(chunk_index),
-                );
-                metadata.insert(
-                    "total_chunks".to_owned(),
-                    serde_json::Value::from(total_chunks),
-                );
-                metadata.insert("chunk_id".to_owned(), serde_json::Value::from(id.clone()));
-                let mut chunk = TextChunk::from_document(doc, text, Some(id));
-                chunk.metadata = metadata;
-                chunks.push(chunk);
-            }
+        for document in documents {
+            let texts = self.chunk_text(&document.text)?;
+            chunks.extend(stamp_chunks(document, texts));
         }
         Ok(chunks)
     }
@@ -74,6 +73,32 @@ pub trait Chunker: Send + Sync {
 
     /// Configured overlap, in the same unit as [`Chunker::chunk_size`].
     fn chunk_overlap(&self) -> usize;
+}
+
+/// Stamps chunk texts with the ids and metadata the [`Chunker`] contract requires.
+///
+/// Every chunk gets a fresh `uuid4` id, a copy of the document metadata, and the
+/// keys `chunk_index` (0-based within the document), `total_chunks` (this call's
+/// chunk count) and `chunk_id` (the same uuid as `id`); those three keys override
+/// any pre-existing values in the document metadata.
+/// `texts` is expected to come from one document, so the indices stay
+/// document-relative.
+pub(crate) fn stamp_chunks(doc: &Document, texts: Vec<String>) -> Vec<TextChunk> {
+    let total_chunks = texts.len();
+    texts
+        .into_iter()
+        .enumerate()
+        .map(|(chunk_index, text)| {
+            let id = Uuid::new_v4().to_string();
+            let mut metadata = doc.metadata.clone();
+            metadata.insert("chunk_index".to_owned(), Value::from(chunk_index));
+            metadata.insert("total_chunks".to_owned(), Value::from(total_chunks));
+            metadata.insert("chunk_id".to_owned(), Value::from(id.clone()));
+            let mut chunk = TextChunk::from_document(doc, text, Some(id));
+            chunk.metadata = metadata;
+            chunk
+        })
+        .collect()
 }
 
 /// Validates chunk window parameters shared by every chunker.
