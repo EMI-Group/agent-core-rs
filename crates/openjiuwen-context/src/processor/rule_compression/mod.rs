@@ -27,8 +27,9 @@
 //! - the HTML extractor is a small tokenizer/renderer instead of `BeautifulSoup`
 //!   plus `trafilatura`, and `source_file` keeps Python's shape but adds the
 //!   structure digest Python's no-op compressor never had;
-//! - the dump directory has no workspace fallback, because the pipeline has no
-//!   `ModelContext`.
+//! - the dump directory has no workspace handle, so it falls back to the
+//!   documented relative [`dump::DEFAULT_DUMP_DIR`] instead of
+//!   `<workspace>/context/<session>_context/rule_compression_logs`.
 pub mod common;
 pub mod compressors;
 pub mod dump;
@@ -48,16 +49,20 @@ pub use compressors::{
     SourceFileCompressor,
 };
 pub use dump::{
-    dump_file_name, resolve_dump_dir, safe_filename_part, write_dump, DumpRecord,
-    RULE_COMPRESSION_DUMP_DIR_ENV,
+    append_jsonl, dump_file_name, expand_dump_dir_template, jsonl_file_name, read_dump_dir,
+    read_dump_file, read_dump_text, resolve_dump_dir, safe_filename_part, safe_filename_part_or,
+    utc_date_stamp, write_dump, write_record, DumpRecord, DumpTemplateVars,
+    RuleCompressionDumpFormat, RuleCompressionDumpRecord, DEFAULT_DUMP_DIR,
+    RULE_COMPRESSION_DUMP_DIR_ENV, UNKNOWN_CONTEXT_ID, UNKNOWN_SESSION_ID,
 };
 pub use pipeline::{
     RuleClock, RuleCompressionPipeline, ADD_PASS, RULE_COMPRESSED_AT_KEY,
-    RULE_COMPRESSION_DETAILS_KEY, RULE_COMPRESSION_DUMP_PATH_KEY, RULE_COMPRESSION_PASS_KEY,
-    RULE_COMPRESSION_TYPE_KEY, TTL_PASS,
+    RULE_COMPRESSION_DETAILS_KEY, RULE_COMPRESSION_DUMP_PATH_KEY, RULE_COMPRESSION_LOSSY_KEY,
+    RULE_COMPRESSION_PASS_KEY, RULE_COMPRESSION_TYPE_KEY, TTL_PASS,
 };
 pub use query_terms::extract_query_terms;
 pub use router::{repair_json_array, ContentRouter, RuleContentRouter};
 pub use types::{
-    ContentType, RuleCompressionResult, RuleContext, TokenCountPolicy, CHARACTERS_PER_TOKEN,
+    ContentType, RuleCompressionResult, RuleCompressionStrategy, RuleContext, TokenCountPolicy,
+    CHARACTERS_PER_TOKEN,
 };

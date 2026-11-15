@@ -16,6 +16,11 @@
 //! character budget is kept as is, and a larger one is summarised and offloaded
 //! exactly like before.
 //!
+//! [`RuleCompressionTierConfig`] selects between Python's three offload
+//! strategies (see [`RuleCompressionStrategy`]) and the dump format, through
+//! [`MessageSummaryOffloader::with_rule_compression_tier`]; the default,
+//! `rule_then_truncate`, is the behaviour described above.
+//!
 //! The summary comes from the configured [`Model`] when one is available — the
 //! processor's own model first, then the engine's — and from a deterministic
 //! head/tail truncation ([`summarize_text_offline`]) otherwise. A failed model
@@ -33,6 +38,7 @@ use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::Model;
 use openjiuwen_foundation::prompt::{BaseMessage, MessageContent, Role};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::events::ContextEvent;
 use crate::offload::OffloadStore;
@@ -43,7 +49,8 @@ use crate::processor::offloader::{
     role_allowed, MessageOffloadRole,
 };
 use crate::processor::rule_compression::{
-    RuleCompressionPipeline, ADD_PASS, RULE_COMPRESSED_AT_KEY,
+    RuleCompressionDumpFormat, RuleCompressionPipeline, RuleCompressionStrategy, ADD_PASS,
+    RULE_COMPRESSED_AT_KEY,
 };
 use crate::processor::summarize;
 use crate::processor::{ContextProcessor, ProcessorContext, ProcessorState};
@@ -96,6 +103,75 @@ impl Default for MessageSummaryOffloaderConfig {
             enable_rule_compression_dump: false,
             rule_compression_dump_dir: None,
         }
+    }
+}
+
+/// Whether, and in what shape, the rule-compression tier participates.
+///
+/// This is Python's `OffloadStrategy` promoted from a module constant to a serde
+/// configuration, plus the dump format the tier writes:
+///
+/// - `rule_then_truncate` (the default) compresses deterministically and, when the
+///   result still exceeds [`MessageSummaryOffloaderConfig::rule_compression_max_chars`],
+///   falls through to the summary/offload tier,
+/// - `rule_only` keeps the rule-compressed body even when it still exceeds that
+///   budget and never summarises or offloads; a candidate the rule tier declined
+///   is left untouched,
+/// - `truncate_only` skips rule compression entirely and goes straight to the
+///   summary/offload tier.
+///
+/// An unknown strategy spelling is refused: `serde` fails to deserialize it
+/// instead of falling back to the default, and
+/// [`RuleCompressionTierConfig::from_json_value`] maps that failure to
+/// [`Error::Config`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct RuleCompressionTierConfig {
+    /// Which tiers may rewrite a candidate.
+    pub strategy: RuleCompressionStrategy,
+    /// How a rule-compression application is dumped.
+    pub dump_format: RuleCompressionDumpFormat,
+}
+
+impl RuleCompressionTierConfig {
+    /// A tier that runs rule compression first and dumps pretty JSON.
+    #[must_use]
+    pub fn new(strategy: RuleCompressionStrategy) -> Self {
+        Self {
+            strategy,
+            dump_format: RuleCompressionDumpFormat::default(),
+        }
+    }
+
+    /// Parses the tier out of a JSON object, refusing unknown values.
+    ///
+    /// The typed twin of `serde_json::from_value`: an unknown `strategy` or
+    /// `dump_format` becomes [`Error::Config`] naming the problem, never a silent
+    /// default.
+    pub fn from_json_value(value: &Value) -> Result<Self> {
+        serde_json::from_value(value.clone()).map_err(|error| {
+            Error::config(format!(
+                "invalid rule-compression tier configuration {value}: {error}"
+            ))
+        })
+    }
+
+    /// Whether the rule tier runs.
+    #[must_use]
+    pub fn runs_rule_compression(&self) -> bool {
+        self.strategy.runs_rule_compression()
+    }
+
+    /// Whether the summary/offload tier runs.
+    #[must_use]
+    pub fn runs_fallback_offload(&self) -> bool {
+        self.strategy.runs_fallback_offload()
+    }
+
+    /// Whether a rule-compressed body that still exceeds the budget is summarised.
+    #[must_use]
+    pub fn truncates_rule_preview(&self) -> bool {
+        self.strategy.truncates_rule_preview()
     }
 }
 
@@ -179,18 +255,51 @@ impl MessageSummaryOffloader {
         message.metadata.contains_key(RULE_COMPRESSED_AT_KEY)
     }
 
-    /// Runs the tier-1 rule compressor on the message at `index`.
+    /// The tier configuration this processor runs with.
+    #[must_use]
+    pub fn rule_compression_tier(&self) -> RuleCompressionTierConfig {
+        RuleCompressionTierConfig {
+            strategy: self.pipeline.strategy(),
+            dump_format: self.pipeline.dump_format(),
+        }
+    }
+
+    /// Selects Python's offload strategy and the dump format of the rule tier.
+    ///
+    /// The two knobs live on the tier configuration rather than on
+    /// [`MessageSummaryOffloaderConfig`] so the processor configuration stays
+    /// exhaustively constructible.
+    #[must_use]
+    pub fn with_rule_compression_tier(mut self, tier: RuleCompressionTierConfig) -> Self {
+        self.pipeline = self
+            .pipeline
+            .clone()
+            .with_strategy(tier.strategy)
+            .with_dump_format(tier.dump_format);
+        self
+    }
+
+    /// Runs the tier-1 rule compressor on the message at `index`, under `cx`'s scope.
     ///
     /// Returns the indices entry replaced in `messages` and whether tier 2 may
-    /// keep the result as is (it fits the character budget).
-    fn rule_compress(&self, messages: &mut [BaseMessage], index: usize) -> (bool, bool) {
-        if !self.config.enable_rule_compression || Self::is_rule_compressed(&messages[index]) {
+    /// keep the result as is (it fits the character budget). The scope is what
+    /// makes a dump carry the real session and context ids.
+    fn rule_compress(
+        &self,
+        messages: &mut [BaseMessage],
+        index: usize,
+        cx: &ProcessorContext<'_>,
+    ) -> (bool, bool) {
+        if !self.config.enable_rule_compression
+            || !self.pipeline.strategy().runs_rule_compression()
+            || Self::is_rule_compressed(&messages[index])
+        {
             return (false, false);
         }
         let max_chars = self.config.rule_compression_max_chars.max(1);
         let replaced = match self
             .pipeline
-            .compress_in_messages(messages, index, ADD_PASS, max_chars, false)
+            .compress_in_messages_with_scope(messages, index, ADD_PASS, max_chars, false, cx.scope)
         {
             Ok(replaced) => replaced,
             Err(error) => {
@@ -268,6 +377,7 @@ impl ContextProcessor for MessageSummaryOffloader {
         }
 
         let tokens_before = count_messages(cx.counter, messages);
+        let tier = self.rule_compression_tier();
         let mut changed: Vec<usize> = Vec::new();
         let mut last_handle: Option<String> = None;
         let mut rule_compressed = 0_usize;
@@ -276,13 +386,19 @@ impl ContextProcessor for MessageSummaryOffloader {
             if cx.cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let (tier1, fits) = self.rule_compress(messages, index);
+            let (tier1, fits) = self.rule_compress(messages, index, cx);
             if tier1 {
                 rule_compressed += 1;
-                if fits {
+                if fits || !tier.truncates_rule_preview() {
+                    // `rule_only` keeps the compressed body even when it still
+                    // exceeds the budget; `rule_then_truncate` keeps it when it fits.
                     changed.push(index);
                     continue;
                 }
+            } else if !tier.runs_fallback_offload() {
+                // `rule_only` never summarises or offloads: a candidate the rule
+                // tier declined stays exactly as it was.
+                continue;
             }
             let original = messages[index].clone();
             let text = original.content.as_text().unwrap_or_default();
@@ -304,6 +420,9 @@ impl ContextProcessor for MessageSummaryOffloader {
         self.state
             .record_tokens("last_tokens_before", tokens_before);
         self.state.record_tokens("last_tokens_after", tokens_after);
+        if changed.is_empty() {
+            return Ok(None);
+        }
         Ok(Some(offloaded_event(
             self.name(),
             &mut changed,
