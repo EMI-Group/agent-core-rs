@@ -908,20 +908,31 @@ async fn stream_first_frame_timeout_cancels_and_ends_the_stream() {
     let (executor, started, finished) = StallingExecutor::new("agent", Duration::from_millis(200));
     controller.add_executor("agent", Arc::new(executor));
 
-    let stream = Controller::stream(&controller, json!({"query": "slow"}), Some(test_session()));
-    let items = bounded(stream.collect::<Vec<_>>()).await;
-    assert_eq!(items.len(), 2, "the processing frame and one timeout error");
-    assert_eq!(
-        items[0].as_ref().unwrap().payload.as_ref().unwrap().kind,
-        OutputKind::Processing
-    );
-    let error = items[1]
-        .as_ref()
+    let mut stream =
+        Controller::stream(&controller, json!({"query": "slow"}), Some(test_session()));
+
+    // Poll 1: the local acknowledgment, which never consumes the deadline.
+    let first = bounded(stream.next())
+        .await
+        .expect("the stream opens with the processing acknowledgment")
+        .expect("the processing acknowledgment is not an error");
+    assert_eq!(first.payload.as_ref().unwrap().kind, OutputKind::Processing);
+
+    // Poll 2: exactly one timeout error.
+    let error = bounded(stream.next())
+        .await
+        .expect("one timeout error follows the acknowledgment")
         .expect_err("the first-frame deadline expired");
     assert_eq!(error.kind(), ErrorKind::Timeout);
     assert!(error
         .message()
         .contains("controller stream first frame timed out after 20 ms"));
+
+    // Poll 3: nothing follows the error frame; the next poll is `None`.
+    assert!(
+        bounded(stream.next()).await.is_none(),
+        "no frame follows the timeout error and the stream ends"
+    );
     assert_eq!(started.load(Ordering::SeqCst), 1);
 
     tokio::time::sleep(Duration::from_millis(400)).await;
