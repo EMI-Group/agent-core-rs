@@ -112,6 +112,8 @@ Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path ins
 - `WatcherConfig` derives `Debug, Clone, PartialEq, Eq` only — no `Serialize`/`Deserialize`; a host that persists watcher settings maps them itself, and a host that carries them in a flag or env var uses `str::parse::<WatcherConfig>()` (`FromStr`) and `to_string()` (`Display`).
 - `Subscription::recv().await` is an inherent method, so consuming updates needs no `futures` import; only `StreamExt`/`BoxStream` usage does (the `futures::Stream` impl at `handle.rs:121` is public).
 - `pub mod watcher` is not feature-gated (`lib.rs:45`), so every type compiles without `notify`; enabling the backend is the single feature line `notify = ["dep:notify"]` (`Cargo.toml:63`) and pulls only already-locked, already-cached crates.
+- The only consumer in the workspace is the `openjiuwen-cli` binary crate (`crates/openjiuwen-cli/src/watch.rs`), which takes `openjiuwen-harness = { workspace = true, features = ["notify"] }` and exposes `openjiuwen watch [--json|--list|--max-events N|--debounce-ms N]` plus `chat --watch` (report on stderr) through `WatchPlan::existing_only`, the three reload handlers and one `Subscription` select loop with `ctrl_c`.
+- `openjiuwen` (umbrella) forwards the feature as `notify = ["openjiuwen-harness/notify"]` (`crates/openjiuwen/Cargo.toml:46`); `openjiuwen-e2e` and `openjiuwen-test-support` do not enable it.
 
 ## Constraints
 
