@@ -521,6 +521,16 @@ These three are the only places the crate constructs `Error::Unsupported` (`rg U
 | Process-global state (`program_opt/state._DIRECTORIES`, `_MODEL_ENV_LOCK`, logging/checkpointer singletons) | not ported by design | Replaced by explicit per-session state + injected stores. |
 | `live-tests` (network/LLM) | never enabled by default | `docs/ARCHITECTURE.md` §5. |
 
+## Known Issues
+
+- `src/harness_rsi/single_harness/iterative.rs:247` resumes with `.ok()` on the persisted `best_case_scores`, so malformed metadata silently yields an empty incumbent map and the stage-one gate then treats every case as newly improved.
+- `src/harness_rsi/single_harness/iterative.rs:282` only warns when the incumbent case scores fail to serialize, saving a state without them (same weakened resume gate).
+- `src/runtime/git.rs:588` returns an empty commit list when `git rev-list` fails, so `GitCherryPick.commits` cannot distinguish "no commits" from "git failed"; `has_commits_against_base` (`git.rs:390`) likewise folds a git failure into `false`, and the `diff_stat`/`status_porcelain`/`show_last_commit_stat` helpers return stdout without checking success.
+- `src/runtime/ci.rs:343`/`:348` return `None` from `diff_ranges`, which `gate_outcome` (`ci.rs:806`) treats as "no scoping": changed-line filtering is silently disabled and every finding is reported.
+- `src/runtime/python.rs:398`/`:405` return `None` for an unreadable or unparsable pytest report, so `PytestOutcome` reports pass/fail with no parsed counts.
+- `src/harness_rsi/auto_harness/config.rs:219` swallows an unreadable/invalid config at `debug!` level (Python bootstrap semantics) — a typo'd YAML silently runs the built-in defaults.
+- Provenance-only degradations: `src/artifact_rsi/paper_opt/orchestrator.rs:489` stores `Some("")` as a ranking node's parent when no frontier is adopted, and `src/harness_rsi/member_optimizer/verify.rs:530` buckets checks under an empty role for an unknown action id.
+
 ## Routing Table
 
 - `./src/lib.rs` → crate docs, module declarations, flat re-exports, lint header

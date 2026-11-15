@@ -144,6 +144,17 @@ Cards: `claudecode` declares Steer, GracefulAbort, PersistentSession, Checkpoint
 - Manifest/agent-template loading and `HarnessContext` persona rendering — deferred with the agent-template spec.
 - Installed entry-point discovery (`importlib.metadata`) has no Rust analogue; providers are registered in-process or compiled in.
 
+## Known Issues
+
+Silent degradations — the capability is advertised or accepted but does nothing, so the host cannot tell "off" from "broken":
+- `request_observation_wait_s` is decoded, defaulted, validated and `Debug`-printed in both vendor configs (`src/providers/claudecode/mod.rs:275`, `src/providers/codex/mod.rs:320`) but nothing reads it on the turn path, while the card advertises `HostCapability::ModelRequestObservation`.
+- `CodexHarnessConfig::experimental_raw_events` defaults to `true` and is never read; `rawResponseItem/completed` and `rawResponse/completed` are dropped at `src/providers/codex/frames.rs:177` with no event and no log.
+- The `dsh` card advertises `HostCapability::McpServers` (`src/providers/dsh/mod.rs:404`) but `initialize` carries no MCP configuration, so host servers are invisible to the runtime.
+- `HarnessIOAdapter`'s pump ends with `tracing::warn!` + `break` on a cursor error (`src/io_adapter/mod.rs:326`), so `outputs` ends exactly like a normal completion instead of surfacing the failure.
+- A `TurnResult` that fails `validate()` is only logged (`src/vendor_cli/harness.rs:745`; also the event side, `src/vendor_cli/driver.rs:160,171`) and is still published as the terminal result.
+- `VendorDriver::export_checkpoint` defaults to `Ok(None)` (`src/vendor_cli/driver.rs:439`), which is indistinguishable from "the vendor keeps no portable state"; only DSH documents that meaning.
+- `vendor_cli::EventBus` drops the oldest event once full (`src/vendor_cli/events.rs:85-93`, one warning per overflow episode), so a slow observer loses events silently afterwards.
+
 ## Test Strategy
 
 - `tests/registry.rs` — name resolution for every declared name, unknown-provider message, duplicate/overwrite semantics, built-in-name rejection, unregister, `available_providers` ordering/dedup, `provider_model_config` gates and fragments, `build_harness_context` defaults and capability injection, `create_harness` returns an unstarted harness, the built-in descriptors and their feature-dependent `implemented`/`requires`.

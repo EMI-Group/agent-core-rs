@@ -125,6 +125,9 @@ Public data types are `#[serde(rename_all = "snake_case", default)]`, tolerate u
 - Vendor CLI harness translation: `claudecode`/`codex`/`dsh` stay `Unsupported` in `openjiuwen-harness-providers`; this crate ships the generic stdio child and a scriptable external-CLI adapter.
 - Cross-process organisation/team federation: shared-store resume, leader-turn queues, summary teams and the org transport handshake.
 - LLM-driven context compaction (fork/compact emits the deterministic template summary) and `IntelliRouter`/builtin-model selection (four router strategies and two pool strategies are the full surface).
+- Platform-gated typed refusals: on non-Unix targets `mcp::stdio::serve_impl`, `skill::serve::process_streams`, `attach::AttachServer::serve` and `attach::AttachClient::call` return `Error::Unsupported`, and `runtime::attach_host` refuses the `invoke_tool` attach op with an `AttachError` of kind `Unsupported`.
+- `ModelPoolStrategy` has no `intelli_router` variant and `runtime::allocator::ModelAllocator::from_state_dict` restores an unknown strategy as `RoundRobin`, so an IntelliRouter spec fails to deserialize and an IntelliRouter state dict mis-restores.
+- Round/pause-boundary memory extraction is unwired: `TeamMemoryWiring::on_turn` has no runtime caller, so memory is only written by lifecycle hooks and flushed/exported on `stop`/`snapshot`.
 
 ## Routing Table
 

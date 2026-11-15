@@ -125,6 +125,29 @@ Everything except those paths is offline and deterministic: no GPU, no model cal
 | Full Python agent_evolving unit suite | Representative offline tests only | not ported wholesale |
 
 `src/deferred.rs` carries these five entries as `DEFERRED_FEATURES`; `deferred::unsupported(area)` builds the corresponding error.
+`deferred::unsupported` has no caller in `src/`: only the module doctest and its own unit test invoke it, so the table is documentation, not a dispatch path.
+
+## Unported Python Areas (absent, not stubbed)
+
+These Python areas have no Rust module at all — no typed `Unsupported` seam, no compiling surface — and are absent from both `DEFERRED_FEATURES` and the Deferred Scope table above.
+Most are offline-implementable and are the cheapest parity wins in the crate.
+
+- `agent_rl/online/judge/` (judge server, judge scorer, evaluator, scoring; ~615 LOC) and `agent_rl/online/gateway/trajectory/judge_dispatcher.py` + `pending_judge_store.py`: the LLM-as-judge trajectory scoring service. Its only runtime dependency is an OpenAI-compatible endpoint, so the "vendor gateway" reason in the deferred table overstates it.
+- `agent_rl/online/verification_gateway.py` (dev/test OpenAI adapter over the capture pipeline) and `agent_rl/online/backends/rollouter/` + `core/task_rollouter.py` (SFT task rollout; container/CLI automation, 813 LOC).
+- `agent_rl/offline/` (~2961 LOC): collector, parallel/runtime executor, agent factory, training coordinator, batch builder, task queue, metrics tracker and file/null stores — the offline PPO data path around `rl::RlTrainer`.
+- `evaluator/evaluator_pipeline/adapters/` (agent + benchmark adapters) and `pipeline._run_evolution` + `skill_manager.py`; `pipeline.rs` documents all four as dropped.
+- `tools/` (`BaseEvolutionTool`, `review.py` 837 LOC, `skill.py` 434 LOC): the restricted harness tools the skill-review subagent drives.
+- `updater/` (`single_dim.rs`-equivalent, `multi_dim`, `update_execution.py`, 217 LOC): uniform application of optimizer updates; `TrainableTarget::apply` covers only part of it.
+- `agent_rl/config/*.yaml` + `VerlHydraOverlay` (deferred table entry 3): no YAML crate is in `Cargo.lock`, so this is blocked on a dependency as well as on scope.
+
+## Known Issues
+
+- `service::ApiError::unsupported` (`501 unsupported`) and `ApiError::from_error` have no callers, so no route can answer `501`; `/v1/evaluate` reports a non-`exact_match` metric as `400 invalid_request` (`service.rs:358`) even though `evaluator::judge` exists offline — a capability gap typed as a client error.
+- `UnsupportedLoraActivator` is exported but never wired: `RlServiceState::new` always installs `NoopLoraActivator` (`online/routes.rs:166`), so `auto_activate_lora = true` (the default) records an activation for a switch that never happened.
+- `RlServiceState::new` hardcodes `MemoryOnlineStore` (`online/routes.rs:159`), so the `redis` feature is unreachable through `build_router`/`serve`.
+- `DefaultEvaluator::new` maps an unknown metric name to `ExactMatchMetric` (`evaluator/metrics.rs:289`), so a typo silently scores by exact match instead of failing.
+- `reward::CheckRunner::run_read` feeds a page (`.html/.htm/.js/.mjs/.css`) to the model as source text (`reward/check.rs:459`); Python refuses to judge a page without a browser (`reward/checks.py:301-307`), so a page criterion can be scored against unexecuted source.
+- `TrainableTarget::snapshot`/`restore` default to `Value::Null`/no-op (`trainer.rs:99`, `trainer.rs:107`), so a target that does not override them resumes from nothing without an error.
 
 ## Verification
 

@@ -129,6 +129,12 @@ Every public item is also re-exported flat from the crate root.
 - The `lsp` tool is read-only and never sends `textDocument/formatting`, `rename`, `codeAction` or `workspace/applyEdit`, and has no `Error::Unsupported` seam at all; missing servers and `-32601` answers are typed `success=false` payloads.
 - `LspArgs::from_str` splits on whitespace, so a path containing spaces must go through `with_path`; a path whose last `:` segment is numeric is read as a position.
 
+- Several `DeepAgentConfig` knobs are deserialized but never read, so a spec that sets them silently gets no behaviour: `enable_async_subagent`, `enable_subagent_runtime` (`src/schema/config/agent.rs:95,99`), `enable_tool_resilience_rail` (:138), `enable_task_planning` (:140), `invocation_log_dir` (:156) and `project_root` (:115, set by `cli/run.rs:297`).
+- `read_file` accepts `pages` and `caption` and drops both (`src/tools/read.rs:34-56`, schema order at :303), so a PDF range or image-caption request silently returns the plain text window; `DeepAgent::configure` logs an invalid config and installs it anyway (`src/agent/mod.rs:239`).
+- `permission::rules::OS_CONTROL_TOOLS` names twelve cua tools that `BuiltinTool` never mounts, so that policy list is inert.
+- MCP resource subscriptions stay unsupported because `openjiuwen_foundation::tool::mcp::McpClient` exposes only `list_resources`/`read_resource`; rmcp 0.8.5 itself carries `resources/subscribe`, so the gap is in the foundation trait, not the transport.
+- The crate has no `#[ignore]`d test and no `todo!`/`unimplemented!`; the single panic path is the internal `memory_kind` `unreachable!` (`src/tools/registry.rs:45`).
+
 ## Deferred Python areas
 
 - `subagents/{browser,cua,mobile_gui}_agent.py`, `tools/{browser_move,cua,mobile_gui,cua}` — feature-gated stubs (`browser`, `cua`, `mobile`), return `Error::Unsupported`.

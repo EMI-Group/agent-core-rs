@@ -198,6 +198,9 @@ Absent or typed `Error::Unsupported`, listed here rather than stubbed:
 | `build/io/config_loader.py`, `load_tree_root_categories` file loading, S3/OBS/HTTP ZIP item sources, `tree_sketch` rendering | absent; item sources are local directories, inventories, descriptors and JSONL text |
 | Python's lexical incremental placement (`tree_ops.py` confidence/margin gates) | replaced by re-running the deterministic grouping rule per item |
 
+## Known Issues
+- `GroupingStrategy::parse` maps an unknown strategy name to `Deterministic`, so a config naming a strategy this build does not implement (e.g. Python's `one_shot`) groups deterministically with no warning instead of failing the build.
+
 ## Notes for Agents
 
 - A `//!` doc block cannot link items defined in the same file module; write `[`X`](crate::retrieval::types::X)`.

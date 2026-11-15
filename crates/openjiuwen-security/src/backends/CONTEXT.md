@@ -92,6 +92,8 @@ Judge errors propagate unchanged, so the pipeline's failure policy decides.
 `http` / `with_http_defaults` derive `HttpModerationConfig { url: api_url, auth: api_key => Bearer else None, timeout, max_retries: 2, retry_initial_backoff: 0.2, text_field: "text" }` and reject a blank `api_url` with `Error::Validation`.
 An injected transport always wins, in either call order; the parser (default `BertBinaryParser`) is independent of the transport choice.
 `analyze` builds `ModerationRequest { url: api_url, api_key, text, timeout }` (configured timeout, or 30 s for unusable values) and grades the reply.
+Because `ModelOutputParser::parse` is total, a 2xx reply in a dialect the parser does not recognize grades as `Safe` (no finding) rather than as an error, so a mis-pointed endpoint reads as clean; use a validating parser or `FailurePolicy::FailClosed` when that must not happen.
+The same total-parse rule means the default `BertBinaryParser` grades `{}` (or any payload it cannot read) as predicted class `0`.
 
 **HTTP moderation transport**: posts `{"<text_field>": "<text>"}` with the static headers and one credential.
 The per-call `ModerationRequest::url` wins when non-blank (else the configured URL; both blank is `Error::Validation`) and a non-zero per-call `timeout` wins over the configured one.
