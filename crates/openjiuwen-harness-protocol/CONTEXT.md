@@ -14,6 +14,8 @@ Mirrors the Python `openjiuwen.harness_protocol` package (v0.1.20): the vocabula
 - Constants: `PROTOCOL_VERSION` (`"1.0"`), `EVENT_WIRE_SCHEMA_VERSION` (`"1"`), `MAX_CHECKPOINT_BYTES`, `AUTH_FALLBACK_REQUEST_TYPE`, `AUTH_FALLBACK_EVENT_TYPE`, `TERMINAL_TURN_EVENT_KINDS`.
 - Functions: `harness_event_to_dict`/`harness_event_from_dict` (+ JSON string forms), `event_retention`, `validate_interaction_response`, `event_cursor_stream`, JSON helpers.
 - Aliases: `JsonValue`/`JsonObject`, `HarnessResult`, `HarnessEventStream`, `DynHarness`, `DynHarnessProvider`, `DynModelControl`.
+- Handles/adapters: `McpInstance` (opaque in-process MCP server handle), `EventCursorStream` (cursor→`Stream` adapter), `VecEventCursor` (in-memory cursor), `crate_name()`.
+- Error helpers: `HarnessError::{protocol, state, unsupported_capability, checkpoint_conflict, validation}`, `kind()`, `message()`, `From<serde_json::Error>` → `Protocol`.
 - Everything is re-exported flat from the crate root (Python's eager `__init__.__all__`); modules stay public for qualified paths.
 
 ## Constraints
