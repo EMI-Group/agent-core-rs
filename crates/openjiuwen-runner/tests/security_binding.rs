@@ -22,8 +22,8 @@ use openjiuwen_runner::callback::{
     GUARDRAIL_PRIORITY, GUARDRAIL_STAGES, GUARDRAIL_TAG,
 };
 use openjiuwen_security::{
-    Guardrail, GuardrailContext, GuardrailPipeline, GuardrailResult, PromptInjectionGuardrail,
-    RiskLevel, ScanStage, SecurityPolicy,
+    FailurePolicy, Guardrail, GuardrailContext, GuardrailPipeline, GuardrailResult,
+    PromptInjectionGuardrail, RiskLevel, ScanStage, SecurityPolicy,
 };
 use serde_json::json;
 
@@ -306,24 +306,30 @@ async fn each_guarded_event_scans_its_own_payload() {
     }
 }
 
-#[tokio::test]
-async fn a_failing_guardrail_is_fail_open_by_default() {
-    struct BrokenGuardrail;
+/// A guardrail whose detector is unavailable: every check is a transport error.
+struct BrokenGuardrail;
 
-    #[async_trait]
-    impl Guardrail for BrokenGuardrail {
-        fn name(&self) -> &str {
-            "broken"
-        }
-
-        async fn check(&self, _ctx: &GuardrailContext) -> Result<GuardrailResult> {
-            Err(openjiuwen_common::error::Error::Transport(
-                "detector unavailable".to_owned(),
-            ))
-        }
+#[async_trait]
+impl Guardrail for BrokenGuardrail {
+    fn name(&self) -> &str {
+        "broken"
     }
 
-    let mut pipeline = GuardrailPipeline::new();
+    async fn check(&self, _ctx: &GuardrailContext) -> Result<GuardrailResult> {
+        Err(openjiuwen_common::error::Error::Transport(
+            "detector unavailable".to_owned(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn a_failing_guardrail_is_fail_open_under_an_explicit_policy() {
+    // Python parity is an opt-in, never the default: the caller must ask for it.
+    let policy = SecurityPolicy {
+        failure_policy: FailurePolicy::FailOpen,
+        ..SecurityPolicy::default()
+    };
+    let mut pipeline = GuardrailPipeline::new().with_policy(policy);
     pipeline.add(BrokenGuardrail);
     let framework = CallbackFramework::new();
     bind_guardrails(&framework, Arc::new(pipeline));
@@ -337,4 +343,28 @@ async fn a_failing_guardrail_is_fail_open_by_default() {
         .unwrap();
     assert_eq!(report.fired, 1);
     assert!(report.is_clean());
+}
+
+#[tokio::test]
+async fn a_failing_guardrail_blocks_under_the_default_policy() {
+    // The default is fail-closed: an unusable detector must never read as "safe".
+    let mut pipeline = GuardrailPipeline::new();
+    assert_eq!(
+        pipeline.policy().failure_policy,
+        FailurePolicy::FailClosed,
+        "the default policy must fail closed"
+    );
+    pipeline.add(BrokenGuardrail);
+    let framework = CallbackFramework::new();
+    bind_guardrails(&framework, Arc::new(pipeline));
+
+    let error = framework
+        .trigger(
+            CallbackEvent::LlmInvokeInput,
+            &CallbackContext::new(CallbackEvent::LlmInvokeInput).with_input(json!("hello")),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Security, "{error}");
+    assert!(error.to_string().contains("guardrail_error"), "{error}");
 }
