@@ -75,6 +75,9 @@ sandbox = ["openjiuwen-sysop/sandbox"]
 # opt-in network/vendor test gates
 live-tests = [
     "openjiuwen-foundation/live-tests",
+    # Only re-forwards the foundation gate; listed so every declared dependency feature is
+    # accounted for.
+    "openjiuwen-core/live-tests",
     "openjiuwen-harness/live-tests",
     "openjiuwen-harness-providers/live-tests",
     "openjiuwen-agent-teams/live-tests",
