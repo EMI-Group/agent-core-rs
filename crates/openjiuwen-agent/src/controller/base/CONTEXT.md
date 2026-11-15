@@ -39,7 +39,7 @@ Four `ControllerConfig` fields change the loop; the remaining fields keep their 
 ## Constraints
 
 - `invoke` resolves the session through `crate::run::resolve_session` (borrowed when supplied, otherwise a fresh `AgentSession` finished at the end), calls `start()`, binds the session, loads state when `enable_task_persistence`, pushes the inbound event, drains every queued event, runs the turn, saves state, checks the completion sentinel, unbinds the session, and finishes an owned session.
-- A turn never returns `Err` for a missing executor, a failing executor, a timeout, or an unknown task target: those become `Failed`/`InputRequired` outputs and task statuses.
+- A turn never returns `Err` for a missing executor, a failing executor, a per-task timeout, or an unknown task target: those become `Failed`/`InputRequired` outputs and task statuses. The event deadline is the exception: it returns `Error::timeout` for the whole turn.
 - `stream` emits a `processing` chunk first, the turn frames with `last_chunk` cleared and re-indexed, then exactly one terminal `last_chunk` chunk (unless `suppress_completion_signal`); a failed turn emits one `Err` item after the `processing` chunk and no terminal chunk.
 - `Inner`/`TurnState` fields stay `pub(super)`; nothing leaks outside `base`.
 - `save_state` writes per session and overwrites the snapshot's `next_seq` with `Planner::next_seq()`; `load_state` treats missing, unreadable, or unrestorable state as `None` (warn, clear that session's slice, sequence back to 1).
@@ -98,5 +98,5 @@ Four `ControllerConfig` fields change the loop; the remaining fields keep their 
 - `./mod.rs` → `Controller`, `BaseController`, `EventHandler`, accessors, lifecycle, queue tests
 - `./turn.rs` → `impl Controller`, event processing, intent routing, dispatch, aggregation, streaming, sentinel call
 - `./state.rs` → `save_state`/`load_state`/`tasks`, the `__controller_tasks__` codec
-- `./tests.rs` → routing, persistence, streaming, handler, lifecycle, control, reasoner, group, sentinel tests
+- `./tests.rs` → routing, persistence, streaming, handler, lifecycle, control, reasoner, group, sentinel, and history/reasoning/deadline enforcement tests
 - `./fixtures.rs` → shared test doubles
