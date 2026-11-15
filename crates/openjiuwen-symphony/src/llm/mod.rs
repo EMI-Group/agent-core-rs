@@ -94,6 +94,7 @@ pub mod identity;
 pub mod judge;
 /// LLM-validated `can_feed` ontology matching.
 pub mod ontology;
+mod ontology_request;
 /// LLM-scored semantic relevance for the planner.
 pub mod scoring;
 /// LLM-guided progressive capability-tree retrieval.

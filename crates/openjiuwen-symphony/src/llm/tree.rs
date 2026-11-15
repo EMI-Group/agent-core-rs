@@ -11,6 +11,9 @@
 //! [`RetrieverItem`]s; an item's [`payload`](RetrieverItem::payload) is the retrieved
 //! text. [`TreeRetriever::search`] answers a [`TreeSearchResult`] holding the payloads in
 //! rank order, the `method` that produced them, and an informational `elapsed_ms`.
+//! [`TreeRetriever::search_detailed`] returns that same result inside a
+//! `TreeSearchOutcome`, which also says where the selection came from, so
+//! `TreeSearchResult` stays layout-compatible for callers that only want payloads.
 //!
 //! # The LLM path
 //!
@@ -32,6 +35,29 @@
 //! A soft failure deeper in the tree falls back
 //! for that subtree only.
 //!
+//! # Provenance and logging
+//!
+//! The `method` alone cannot tell a model walk from an offline one, so
+//! [`TreeRetriever::search_detailed`] also reports a [`StageProvenance`] and how many
+//! branches had to be ranked lexically:
+//!
+//! | Case | `provenance` | `fallback_branches` | Records |
+//! | --- | --- | --- | --- |
+//! | no model configured | `NoModel` | `0` | one `debug!` (the crate-internal `note_no_model` helper) |
+//! | a configured model's selection was unusable, so that branch was ranked lexically | `DeterministicFallback` | the number of such branches | one `warn!` naming the stage and the rule |
+//! | a configured model answered every selection it was asked | `Model` | `0` | none |
+//! | a configured model was never asked (the root has no children and no items) | `NoModel` | `0` | none |
+//!
+//! A usable reply is never a fallback — including the abstaining `"0"` reply and the
+//! empty selection a node without options produces. `NoModel` therefore means "no model
+//! produced any part of the answer: none is configured, or the request needed none".
+//!
+//! Each call emits at most one aggregate record: the per-node diagnostics stay `debug!`
+//! records, and the fallback decision is recorded once per
+//! [`TreeRetriever::search_detailed`] call, at `warn!` only for
+//! `DeterministicFallback`. Running with no model is the documented offline default, so
+//! it is not a warning.
+//!
 //! # Bounds
 //!
 //! [`TreeRetrieverConfig::max_depth`] caps how many branch levels are entered (level `0`
@@ -49,12 +75,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::search::lexical::tokenize;
 
-use super::{render_prompt, CompletionModel};
+use super::{note_no_model, render_prompt, CompletionModel, StageProvenance};
 
 /// The `method` reported when the walk asked a model at every visited node.
 pub const METHOD_LLM: &str = "llm";
 /// The `method` reported when the walk used the lexical ranking.
 pub const METHOD_LEXICAL_FALLBACK: &str = "lexical_fallback";
+/// The stage name carried by this stage's single provenance log record.
+const STAGE: &str = "tree retriever";
+/// The fallback rule named by this stage's single provenance log record.
+const FALLBACK_RULE: &str = "the lexical query-term ranking";
 /// The reply token that abstains from the current node.
 const ABSTAIN: &str = "0";
 /// The default number of payloads a search returns.
@@ -264,6 +294,53 @@ pub struct TreeSearchResult {
     pub elapsed_ms: u64,
 }
 
+/// One tree search plus where the selection came from.
+///
+/// [`TreeRetriever::search_detailed`] answers this instead of a bare
+/// [`TreeSearchResult`], so a caller can tell a model walk from the lexical one. The
+/// result itself is unchanged and stays layout-compatible for consumers that only want
+/// payloads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", default)]
+pub struct TreeSearchOutcome {
+    /// The payloads, the reported method, and the informational duration.
+    pub result: TreeSearchResult,
+    /// Where the selection came from.
+    pub provenance: StageProvenance,
+    /// How many branches the walk had to rank lexically because a model selection was
+    /// unusable (`0` when every visited branch was answered by the model, or when no
+    /// model is configured).
+    pub fallback_branches: usize,
+}
+
+impl TreeSearchOutcome {
+    /// Builds an outcome.
+    #[must_use]
+    pub fn new(
+        result: TreeSearchResult,
+        provenance: StageProvenance,
+        fallback_branches: usize,
+    ) -> Self {
+        Self {
+            result,
+            provenance,
+            fallback_branches,
+        }
+    }
+
+    /// The selected payloads, deduplicated and in rank order.
+    #[must_use]
+    pub fn payloads(&self) -> &[String] {
+        &self.result.payloads
+    }
+
+    /// Whether a model produced the whole selection.
+    #[must_use]
+    pub fn is_model_backed(&self) -> bool {
+        self.provenance.is_model()
+    }
+}
+
 /// A progressive capability-tree walker.
 ///
 /// The retriever is cheap to clone (`Arc`-shared model behind the configuration) and
@@ -310,6 +387,10 @@ impl TreeRetriever {
 
     /// Retrieves the payloads most relevant to `query`.
     ///
+    /// This is the layout-compatible facade: it answers only the result. Use
+    /// [`search_detailed`](Self::search_detailed) to learn whether a model produced the
+    /// selection.
+    ///
     /// # Errors
     ///
     /// Model failures are not errors: they fall back to the lexical ranking. The
@@ -320,23 +401,83 @@ impl TreeRetriever {
         query: &str,
         request: &TreeSearchRequest,
     ) -> Result<TreeSearchResult> {
+        Ok(self.search_detailed(query, request).await?.result)
+    }
+
+    /// Retrieves the payloads most relevant to `query`, plus where they came from.
+    ///
+    /// Answers a [`TreeSearchOutcome`]: the same [`TreeSearchResult`] plus a marker for
+    /// the selection. The [`provenance`](TreeSearchOutcome::provenance) is
+    /// [`StageProvenance::Model`] when a configured model answered every selection it was
+    /// asked,
+    /// [`StageProvenance::DeterministicFallback`] when a selection was unusable so that
+    /// branch was ranked lexically, and [`StageProvenance::NoModel`] when no model
+    /// produced any part of the answer — none is configured, or the tree asked for none.
+    /// Exactly one log record accompanies the decision (see the module docs).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`search`](Self::search): model failures degrade to the lexical ranking
+    /// rather than becoming errors.
+    pub async fn search_detailed(
+        &self,
+        query: &str,
+        request: &TreeSearchRequest,
+    ) -> Result<TreeSearchOutcome> {
         let started = Instant::now();
         let limit = request.top_k.unwrap_or(self.config.top_k);
         let mut payloads = Vec::new();
-        let method = self.walk(query, limit, &mut payloads).await;
-        Ok(TreeSearchResult {
+        let mut tally = WalkTally::default();
+        let method = self.walk(query, limit, &mut payloads, &mut tally).await;
+        let result = TreeSearchResult {
             payloads,
             method: method.to_string(),
             elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        };
+        let provenance = self.classify(&tally);
+        Ok(TreeSearchOutcome {
+            result,
+            provenance,
+            fallback_branches: tally.fallbacks,
         })
     }
 
+    /// Classifies one walk and emits its single provenance record.
+    fn classify(&self, tally: &WalkTally) -> StageProvenance {
+        if self.config.model.is_none() {
+            note_no_model(STAGE, FALLBACK_RULE);
+            return StageProvenance::NoModel;
+        }
+        if tally.fallbacks > 0 {
+            // The aggregation point for the whole search: the per-node soft failures are
+            // `debug!` records, so this is the only warning a search emits.
+            tracing::warn!(
+                stage = STAGE,
+                fallback = FALLBACK_RULE,
+                branches = tally.fallbacks,
+                "tree retriever: a model selection was unusable; ranking those branches lexically"
+            );
+            return StageProvenance::DeterministicFallback;
+        }
+        if tally.calls > 0 {
+            StageProvenance::Model
+        } else {
+            StageProvenance::NoModel
+        }
+    }
+
     /// Walks the tree, collecting payloads, and reports which method produced them.
-    async fn walk(&self, query: &str, limit: usize, payloads: &mut Vec<String>) -> &'static str {
+    async fn walk(
+        &self,
+        query: &str,
+        limit: usize,
+        payloads: &mut Vec<String>,
+        tally: &mut WalkTally,
+    ) -> &'static str {
         let mut actions: Vec<Walk<'_>> = Vec::new();
         let method = if let Some(model) = self.config.model.as_deref() {
             if let Some(selected) = self
-                .request_selection(model, &self.root, query, limit)
+                .request_selection(model, &self.root, query, limit, tally)
                 .await
             {
                 let mut planned = selected_actions(&self.root, &selected, 0, self.config.max_depth);
@@ -345,6 +486,7 @@ impl TreeRetriever {
                 METHOD_LLM
             } else {
                 actions.push(Walk::Rank(&self.root, 0));
+                tally.fallbacks += 1;
                 METHOD_LEXICAL_FALLBACK
             }
         } else {
@@ -363,10 +505,18 @@ impl TreeRetriever {
                     actions.extend(planned);
                 }
                 Walk::Select(node, depth) => {
-                    let mut selection = None;
-                    if let Some(model) = self.config.model.as_deref() {
-                        selection = self.request_selection(model, node, query, limit).await;
-                    }
+                    let selection = match self.config.model.as_deref() {
+                        Some(model) => {
+                            let selected = self
+                                .request_selection(model, node, query, limit, tally)
+                                .await;
+                            if selected.is_none() {
+                                tally.fallbacks += 1;
+                            }
+                            selected
+                        }
+                        None => None,
+                    };
                     if let Some(selected) = selection {
                         let mut planned =
                             selected_actions(node, &selected, depth, self.config.max_depth);
@@ -385,31 +535,45 @@ impl TreeRetriever {
     ///
     /// `Some(ids)` is a usable reply (possibly empty, which ends the branch);
     /// `None` is a soft failure, so the caller falls back to the lexical ranking.
+    /// Every actual model call is counted in `tally`; the resulting diagnostics stay at
+    /// `debug` because the fallback decision is aggregated once in
+    /// [`search_detailed`](Self::search_detailed).
     async fn request_selection(
         &self,
         model: &dyn CompletionModel,
         node: &RetrieverNode,
         query: &str,
         limit: usize,
+        tally: &mut WalkTally,
     ) -> Option<Vec<String>> {
         if node.children.is_empty() && node.items.is_empty() {
             return Some(Vec::new());
         }
         let prompt = render_prompt(SYSTEM_PROMPT, &selection_prompt(node, query, limit));
+        tally.calls += 1;
         match model.complete(&prompt).await {
             Ok(reply) if reply.trim().is_empty() => {
-                tracing::warn!(
+                tracing::debug!(
                     "tree retriever: model returned an empty selection; using the lexical ranking"
                 );
                 None
             }
             Ok(reply) => Some(parse_selection(&reply, node)),
             Err(error) => {
-                tracing::warn!(%error, "tree retriever: model call failed; using the lexical ranking");
+                tracing::debug!(%error, "tree retriever: model call failed; using the lexical ranking");
                 None
             }
         }
     }
+}
+
+/// How one walk used the model, for the provenance decision.
+#[derive(Debug, Clone, Copy, Default)]
+struct WalkTally {
+    /// Selections that actually awaited `CompletionModel::complete`.
+    calls: usize,
+    /// Selections that were unusable, so the branch was ranked lexically.
+    fallbacks: usize,
 }
 
 /// One pending step of a walk, resolved by the loop in [`TreeRetriever::walk`].
@@ -614,6 +778,7 @@ fn reached(limit: usize, len: usize) -> bool {
 #[allow(clippy::assert_is_empty)]
 mod tests {
     use super::*;
+    use crate::llm::StaticCompletionModel;
 
     fn node() -> RetrieverNode {
         RetrieverNode::new("root")
@@ -680,5 +845,139 @@ mod tests {
         assert!(!reached(0, 100));
         assert!(!reached(3, 2));
         assert!(reached(3, 3));
+    }
+
+    /// A two-level tree whose only translating branch holds one leaf.
+    fn provenance_tree() -> RetrieverNode {
+        RetrieverNode::new("root")
+            .with_items(vec![
+                RetrieverItem::new("i_root", "root_payload").with_label("weather forecast")
+            ])
+            .with_children(vec![RetrieverNode::new("c1")
+                .with_label("translate")
+                .with_description("translate text between languages")
+                .with_items(vec![
+                    RetrieverItem::new("i_child", "child_payload").with_label("translate text")
+                ])])
+    }
+
+    #[tokio::test]
+    async fn search_detailed_without_a_model_reports_no_model() {
+        let retriever =
+            TreeRetriever::new(TreeRetrieverConfig::default()).with_root(provenance_tree());
+        let outcome = retriever
+            .search_detailed("translate", &TreeSearchRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.payloads(),
+            ["child_payload".to_string(), "root_payload".to_string()]
+        );
+        assert_eq!(outcome.result.method, METHOD_LEXICAL_FALLBACK);
+        assert_eq!(outcome.provenance, StageProvenance::NoModel);
+        assert_eq!(outcome.fallback_branches, 0);
+        assert!(!outcome.is_model_backed());
+        assert!(!outcome.provenance.is_warning());
+    }
+
+    #[tokio::test]
+    async fn search_detailed_with_a_walking_model_reports_the_model() {
+        let model = Arc::new(StaticCompletionModel::new(vec![
+            "c1".to_string(),
+            "i_child".to_string(),
+        ]));
+        let retriever =
+            TreeRetriever::new(TreeRetrieverConfig::default().with_model(model.clone()))
+                .with_root(provenance_tree());
+        let outcome = retriever
+            .search_detailed("translate text", &TreeSearchRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(outcome.payloads(), ["child_payload".to_string()]);
+        assert_eq!(outcome.result.method, METHOD_LLM);
+        assert_eq!(outcome.provenance, StageProvenance::Model);
+        assert_eq!(outcome.fallback_branches, 0);
+        assert!(outcome.is_model_backed());
+        assert_eq!(model.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn search_detailed_with_a_blank_reply_reports_the_fallback() {
+        let model = Arc::new(StaticCompletionModel::single("   "));
+        let retriever =
+            TreeRetriever::new(TreeRetrieverConfig::default().with_model(model.clone()))
+                .with_root(provenance_tree());
+        let outcome = retriever
+            .search_detailed("translate", &TreeSearchRequest::default())
+            .await
+            .unwrap();
+        // The lexical ranking still answers, but the marker admits the model was unusable.
+        assert_eq!(outcome.result.method, METHOD_LEXICAL_FALLBACK);
+        assert_eq!(
+            outcome.payloads(),
+            ["child_payload".to_string(), "root_payload".to_string()]
+        );
+        assert_eq!(outcome.provenance, StageProvenance::DeterministicFallback);
+        assert!(outcome.fallback_branches >= 1);
+        assert!(outcome.provenance.is_warning());
+        assert!(!outcome.is_model_backed());
+        assert_eq!(model.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_detailed_does_not_charge_an_unasked_model() {
+        let model = Arc::new(StaticCompletionModel::single("c1"));
+        let retriever =
+            TreeRetriever::new(TreeRetrieverConfig::default().with_model(model.clone()))
+                .with_root(RetrieverNode::new("root"));
+        let outcome = retriever
+            .search_detailed("anything", &TreeSearchRequest::default())
+            .await
+            .unwrap();
+        // An optionless root needs no selection, so the configured model is never asked
+        // and cannot be reported as a failure.
+        assert_eq!(model.call_count(), 0);
+        assert!(outcome.payloads().is_empty());
+        assert_eq!(outcome.provenance, StageProvenance::NoModel);
+        assert_eq!(outcome.fallback_branches, 0);
+    }
+
+    #[test]
+    fn tree_search_outcome_round_trips_and_defaults_legacy_payloads() {
+        let outcome = TreeSearchOutcome::new(
+            TreeSearchResult {
+                payloads: vec!["p1".to_string()],
+                method: METHOD_LLM.to_string(),
+                elapsed_ms: 3,
+            },
+            StageProvenance::DeterministicFallback,
+            2,
+        );
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "result": {"payloads": ["p1"], "method": "llm", "elapsed_ms": 3},
+                "provenance": "deterministic_fallback",
+                "fallback_branches": 2,
+            })
+        );
+        let decoded: TreeSearchOutcome = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, outcome);
+        assert_eq!(decoded.payloads(), ["p1".to_string()]);
+
+        // A payload written before the marker existed still decodes: `serde(default)`
+        // supplies `NoModel` and a zero branch count.
+        let legacy: TreeSearchOutcome = serde_json::from_value(serde_json::json!({
+            "result": {"payloads": ["p1"], "method": "lexical_fallback", "elapsed_ms": 0},
+        }))
+        .unwrap();
+        assert_eq!(legacy.provenance, StageProvenance::NoModel);
+        assert_eq!(legacy.fallback_branches, 0);
+        assert_eq!(legacy.result.method, METHOD_LEXICAL_FALLBACK);
+        assert_eq!(
+            TreeSearchOutcome::default(),
+            TreeSearchOutcome::new(TreeSearchResult::default(), StageProvenance::NoModel, 0)
+        );
     }
 }
