@@ -14,6 +14,8 @@
 //! - [`validate`] expands a compact reply into full matches, validates every endpoint,
 //!   confidence, relation and supporting field against the candidate evidence, and applies
 //!   the per-relation thresholds.
+//! - [`support`] holds the payload types the reply pipeline reads and reports — the
+//!   diagnostics, the requested port wiring and the supporting fields.
 //!
 //! ```no_run
 //! use openjiuwen_symphony::llm::ontology::OntologyMatcher;
@@ -57,6 +59,7 @@
 //! evidence that was shown).
 
 pub mod protocol;
+pub mod support;
 pub mod validate;
 
 pub use protocol::{
@@ -65,12 +68,13 @@ pub use protocol::{
     DIRECTION_FORWARD, DIRECTION_REVERSE, MAX_DERIVED_PORTS, MAX_PORT_DESCRIPTION_LENGTH,
     MAX_REASON_LENGTH, MAX_SKILL_DESCRIPTION_LENGTH,
 };
+pub use support::{GraphDiagnostic, PortMappingPair, SupportingFields};
 pub use validate::{
     diagnostics_by_candidate, matches_by_candidate, parse_match_response,
-    parse_match_response_with, parse_match_response_with_evidence, GraphDiagnostic, MatchOutcome,
-    MatchThresholds, PortMappingPair, SupportingFields, ValidatedMatch, DEFAULT_CAN_FEED_THRESHOLD,
-    DIAGNOSTIC_DUPLICATE_CANDIDATE_ID, DIAGNOSTIC_INVALID_CANDIDATE_DIRECTION,
-    DIAGNOSTIC_INVALID_MATCHES_PAYLOAD, DIAGNOSTIC_INVALID_MATCH_ITEM,
-    DIAGNOSTIC_LOW_CONFIDENCE_LLM_MATCH, DIAGNOSTIC_REJECTED_LLM_MATCH,
-    DIAGNOSTIC_UNKNOWN_CANDIDATE_ID, DIAGNOSTIC_UNSUPPORTED_CANDIDATE_DIRECTION,
+    parse_match_response_with, parse_match_response_with_evidence, MatchOutcome, MatchThresholds,
+    ValidatedMatch, DEFAULT_CAN_FEED_THRESHOLD, DIAGNOSTIC_DUPLICATE_CANDIDATE_ID,
+    DIAGNOSTIC_INVALID_CANDIDATE_DIRECTION, DIAGNOSTIC_INVALID_MATCHES_PAYLOAD,
+    DIAGNOSTIC_INVALID_MATCH_ITEM, DIAGNOSTIC_LOW_CONFIDENCE_LLM_MATCH,
+    DIAGNOSTIC_REJECTED_LLM_MATCH, DIAGNOSTIC_UNKNOWN_CANDIDATE_ID,
+    DIAGNOSTIC_UNSUPPORTED_CANDIDATE_DIRECTION,
 };
