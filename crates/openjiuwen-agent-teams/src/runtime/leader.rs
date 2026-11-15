@@ -700,6 +700,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_settled_run_with_a_blank_answer_still_extracts_the_mailbox_turn() {
+        let factory = ScriptedFactory::new();
+        let workspace = RecordingWorkspaceProvider::new();
+        // A leader that answers nothing: there is no answer turn to append, but the run still
+        // settles and the mailbox turn it buffered must not wait for `stop`.
+        factory.answering("boss", "");
+        let dir = tempfile::tempdir().unwrap();
+        let wiring = TeamMemoryWiring::open("alpha", MemoryConfig::default(), dir.path())
+            .await
+            .unwrap();
+        let agent = blueprint("alpha", "boss", &["dev-1"])
+            .build_with(deps(&factory, &workspace).with_memory(Arc::clone(&wiring)))
+            .await
+            .unwrap();
+        agent.start().await.unwrap();
+        agent
+            .backend()
+            .send_message("dev-1", Some("boss"), "We decided to migrate off Postgres.")
+            .await
+            .unwrap();
+
+        let output = agent.invoke(json!("hello"), None).await.unwrap();
+        assert!(
+            output.output.is_empty(),
+            "the scripted leader answer is blank: {output:?}"
+        );
+
+        let stored = records(&wiring).await;
+        assert!(
+            stored
+                .iter()
+                .any(|record| record.content.contains("migrate off Postgres")),
+            "the mailbox turn was extracted at the settled-run boundary: {stored:?}"
+        );
+        assert_eq!(
+            wiring.hooks().pending_turns(),
+            0,
+            "the settled-run flush drained the buffer even without an answer turn"
+        );
+    }
+
+    #[tokio::test]
     async fn a_failing_memory_store_does_not_fail_the_settled_run() {
         let factory = ScriptedFactory::new();
         let workspace = RecordingWorkspaceProvider::new();

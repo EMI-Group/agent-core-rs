@@ -32,7 +32,8 @@
 //! resolve: injected wiring -> metadata["memory"] -> no wiring (disabled or unconfigured)
 //! start   -> on_session_start   (warn! on failure)
 //! spawn   -> on_member_join     (warn! on failure)
-//! settled run -> on_turn(leader answer) then flush() (warn! on failure; never on cancellation)
+//! settled run -> flush() every time, with the leader answer appended as a turn when non-blank
+//!                 (warn! on failure; never on cancellation)
 //! shutdown/stop -> on_member_leave for every live row, then flush() + export() (warn! on failure)
 //! ```
 use std::path::Path;
@@ -246,9 +247,11 @@ pub(crate) async fn export_document(memory: Option<&Arc<TeamMemoryWiring>>, team
 /// This is the runtime's `_finalize_round` equivalent: Python's
 /// `TeamMemoryManager.extract_after_round`, called from `_finalize_round` in
 /// `openjiuwen/agent_teams/memory/manager.py`. It runs once per settled run, after the
-/// `team.completed` marker and its bus event and before the run returns to the caller, so the
-/// leader's answer becomes the run's last turn and everything the mailbox buffered during the run
-/// is extracted and written in the same pass.
+/// `team.completed` marker and its bus event and before the run returns to the caller, so
+/// everything the mailbox buffered during the run is extracted and written in a single flush.
+/// The leader's answer is appended to that batch as one more turn — the one turn no mailbox row
+/// carries — but only when it is non-blank; a settled run whose leader produced no answer still
+/// flushes, so the mailbox turns never have to wait for `stop`.
 ///
 /// Both steps are advisory: a broken memory store can never fail a run that otherwise succeeded,
 /// so an `on_turn` or `flush` failure is logged and the run still returns its answer. It never runs
@@ -264,31 +267,31 @@ pub(crate) async fn record_settled_run(
         return;
     };
     let trimmed = answer.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-    // A leader answer may legitimately exceed the engine's per-turn limit, and dropping the whole
-    // turn would lose the run's conclusions: truncating keeps a valid turn the engine accepts.
-    let content: String = trimmed
-        .chars()
-        .take(openjiuwen_memory::team::MAX_TURN_CONTENT_CHARS)
-        .collect();
-    if let Err(error) = wiring
-        .on_turn(openjiuwen_memory::team::TeamTurn::new(
-            from,
-            content,
-            chrono::Utc::now(),
-        ))
-        .await
-    {
-        warn!(
-            target: LOG_TARGET,
-            team,
-            member = from,
-            %error,
-            "failed to buffer the settled run's leader answer in team memory; extracting the \
-             mailbox turns only"
-        );
+    if !trimmed.is_empty() {
+        // A leader answer may legitimately exceed the engine's per-turn limit, and dropping the
+        // whole turn would lose the run's conclusions: truncating keeps a valid turn the engine
+        // accepts.
+        let content: String = trimmed
+            .chars()
+            .take(openjiuwen_memory::team::MAX_TURN_CONTENT_CHARS)
+            .collect();
+        if let Err(error) = wiring
+            .on_turn(openjiuwen_memory::team::TeamTurn::new(
+                from,
+                content,
+                chrono::Utc::now(),
+            ))
+            .await
+        {
+            warn!(
+                target: LOG_TARGET,
+                team,
+                member = from,
+                %error,
+                "failed to buffer the settled run's leader answer in team memory; extracting the \
+                 mailbox turns only"
+            );
+        }
     }
     match wiring.flush().await {
         Ok(flush) => debug!(
