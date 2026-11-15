@@ -505,15 +505,16 @@ built-in default**, blank values skipped at every level.
 | Code | Meaning |
 | --- | --- |
 | `0` | Success, including `--help` and `--version`, and a `watch` that stopped at `--max-events`. |
-| `1` | A runtime failure from `run`, `chat`, `auto-harness`, `lsp`, `cron`, `team` or `watch`. Reported as `error: <kind>: <cause>` on stderr (for example `error: unsupported: …`, `error: not_found: cron job not found: …`, `error: validation: team socket is required: …`). |
+| `1` | A runtime failure from `run`, `chat`, `auto-harness`, `lsp`, `cron`, `team`, `watch` or `sessions`. Reported as `error: <kind>: <cause>` on stderr (for example `error: unsupported: …`, `error: not_found: cron job not found: …`, `error: validation: team socket is required: …`). |
 | `2` | A usage error, decided by clap before any command runs: unknown subcommand or flag, missing value, invalid enum value (`--pipeline bogus`, `--stage bogus`, `--output-format bogus`, `lsp definitely-not-an-action`). |
 
 ## Streams: logs on stderr, results on stdout
 
 - **stdout is the result stream.** `run -f json` prints exactly one JSON object;
   `run -f stream-json` prints one JSON object per line; `auto-harness --json`,
-  `lsp --json`, `cron --json`, `team --json` and `watch --list --json` print one
-  JSON document; `watch --json` prints one JSON object per reported update. A
+  `lsp --json`, `cron --json`, `team --json`, `sessions --json` and
+  `watch --list --json` print one JSON document; `watch --json` prints one JSON
+  object per reported update. A
   `watch --list` text plan and every text-mode command print their lines here
   too. `auto-harness run --dry-run` prints only the task array.
 - **stderr carries everything else**: the `tracing` log stream (always installed
