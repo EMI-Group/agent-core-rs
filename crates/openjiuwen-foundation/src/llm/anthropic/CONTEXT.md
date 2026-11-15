@@ -95,5 +95,5 @@ No test needs a network or a credential.
 ## Known Gaps
 
 - No `cache_control` breakpoints beyond the three automatic anchors (no per-message caller control, no `clear`/`auto` caching modes).
-- `thinking` blocks are ignored in non-streaming responses; only streaming maps `thinking_delta` onto `reasoning`.
+- The streaming path maps `thinking_delta` onto `reasoning` but does not preserve the streamed signatures, so a thinking block from a streamed turn is not replayed on the next request (only the non-streaming parser preserves blocks).
 - Mid-conversation system turns are text-only, and the supported-family list is a fixed substring match (no capability query).

@@ -21,6 +21,12 @@
 //!   single braces stay literal.
 //! - Extra values are ignored; an unresolvable placeholder is kept verbatim, so
 //!   a partially formatted template stays usable and can be formatted again.
+//!   That is a silent degradation if the text then goes to a model, so
+//!   [`PromptTemplate::format`] warns (naming the template and the unresolved
+//!   keys), [`PromptTemplate::unresolved_keys`] reports them to code, and
+//!   [`PromptTemplate::try_format`] is the strict variant that returns an
+//!   [`Error::Validation`] instead of text still carrying placeholders. Use the
+//!   strict variant wherever a rendered prompt is sent to a provider.
 //! - A dotted name (`{{user.name}}`) resolves through nested JSON objects; a
 //!   missing head, a missing intermediate, or a `null` leaf keeps the
 //!   placeholder verbatim (and a `null` never renders as `"null"`).
@@ -39,6 +45,9 @@ use serde_json::Value;
 use super::assembler;
 use super::content::{ContentPart, MessageContent};
 use super::message::BaseMessage;
+
+/// The `tracing` target of every event emitted by this module.
+const LOG_TARGET: &str = "openjiuwen_foundation::prompt::template";
 
 /// The content of a [`PromptTemplate`].
 ///
@@ -210,8 +219,17 @@ impl PromptTemplate {
     /// For a message list only the text content is rendered; image, audio, file,
     /// and unknown parts plus `role`, `name`, `tool_calls`, `tool_call_id`,
     /// `reasoning_content`, and `metadata` are preserved exactly.
+    ///
+    /// A placeholder that `values` cannot resolve stays in the rendered text
+    /// (that is the documented, non-failing behaviour), and the render emits one
+    /// `tracing::warn!` naming the template and the unresolved placeholder
+    /// names. Text meant for a model should therefore be rendered with
+    /// [`PromptTemplate::try_format`], which turns the same condition into an
+    /// [`Error::Validation`]; [`PromptTemplate::unresolved_keys`] exposes the
+    /// same information to code that wants to report it itself.
     #[must_use]
     pub fn format(&self, values: &BTreeMap<String, Value>) -> Self {
+        self.warn_unresolved(values);
         if values.is_empty() {
             return self.clone();
         }
@@ -238,6 +256,60 @@ impl PromptTemplate {
         }
     }
 
+    /// Renders the template strictly, rejecting every unresolved placeholder.
+    ///
+    /// Behaves exactly like [`PromptTemplate::format`] when `values` resolves
+    /// every placeholder, and returns [`Error::Validation`] naming the template
+    /// and the missing placeholder paths otherwise, instead of producing text
+    /// that still carries `{{…}}` for the model to read. This is the variant a
+    /// caller should use at the boundary where a prompt is sent to a provider;
+    /// `format` remains the lenient one for multi-pass rendering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] listing every unresolved placeholder name,
+    /// in first-seen order.
+    pub fn try_format(&self, values: &BTreeMap<String, Value>) -> Result<Self> {
+        let unresolved = self.unresolved_keys(values);
+        if !unresolved.is_empty() {
+            return Err(Error::validation(format!(
+                "prompt template `{}` left {} placeholder(s) unresolved: {}",
+                self.name,
+                unresolved.len(),
+                unresolved.join(", ")
+            )));
+        }
+        Ok(self.format(values))
+    }
+
+    /// The placeholder names of this template that `values` cannot resolve.
+    ///
+    /// Names are the full dotted paths as written (`"user.name"`), in first-seen
+    /// order. A name is unresolved exactly when the renderer keeps it verbatim:
+    /// the head key is missing, an intermediate is missing or not an object, or
+    /// the leaf is `null`. This is the accessor for callers that collect their
+    /// own diagnostics instead of relying on the `tracing::warn!` in
+    /// [`PromptTemplate::format`].
+    #[must_use]
+    pub fn unresolved_keys(&self, values: &BTreeMap<String, Value>) -> Vec<String> {
+        self.placeholders()
+            .into_iter()
+            .filter(|name| assembler::resolve(values, name).is_none())
+            .collect()
+    }
+
+    /// The placeholder names of this template that `values` resolves.
+    ///
+    /// The complement of [`PromptTemplate::unresolved_keys`] over
+    /// [`PromptTemplate::placeholders`], in the same order.
+    #[must_use]
+    pub fn resolved_keys(&self, values: &BTreeMap<String, Value>) -> Vec<String> {
+        self.placeholders()
+            .into_iter()
+            .filter(|name| assembler::resolve(values, name).is_some())
+            .collect()
+    }
+
     /// Renders the template with a single `key`/`value` pair.
     ///
     /// Convenience wrapper over [`PromptTemplate::format`] for the common
@@ -251,8 +323,14 @@ impl PromptTemplate {
     ///
     /// Empty text yields no messages (Python returns `[]`), non-empty text yields
     /// one user message, and a message list is returned as a deep copy.
+    ///
+    /// Any placeholder still present is copied verbatim into the messages that
+    /// are about to be sent to a model, so this emits a `tracing::warn!` naming
+    /// the template and those placeholders; render with
+    /// [`PromptTemplate::try_format`] first to make that an error instead.
     #[must_use]
     pub fn to_messages(&self) -> Vec<BaseMessage> {
+        self.warn_remaining_placeholders();
         match &self.content {
             TemplateContent::Text(text) if text.is_empty() => Vec::new(),
             TemplateContent::Text(text) => vec![BaseMessage::user(text.clone())],
@@ -314,6 +392,40 @@ impl PromptTemplate {
             self.placeholder_prefix.as_str(),
             self.placeholder_suffix.as_str(),
         )
+    }
+
+    /// Warns about the placeholders one render could not resolve.
+    ///
+    /// The template stays renderable (that is the documented contract), so the
+    /// degradation is made visible instead of silent: the event names the
+    /// template and the unresolved placeholder paths, never their values.
+    fn warn_unresolved(&self, values: &BTreeMap<String, Value>) {
+        let unresolved = self.unresolved_keys(values);
+        if unresolved.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            target: LOG_TARGET,
+            template = self.name.as_str(),
+            unresolved = ?unresolved,
+            "prompt template placeholders were left unresolved; the rendered text still \
+             carries them. Use `try_format` to fail instead of rendering them literally"
+        );
+    }
+
+    /// Warns when messages are converted while placeholders are still present.
+    fn warn_remaining_placeholders(&self) {
+        let placeholders = self.placeholders();
+        if placeholders.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            target: LOG_TARGET,
+            template = self.name.as_str(),
+            unresolved = ?placeholders,
+            "converting a prompt template whose placeholders are unresolved; the placeholder \
+             text is sent to the model verbatim"
+        );
     }
 }
 
@@ -704,5 +816,69 @@ mod tests {
                 .content,
             TemplateContent::Text(r#"{"name":"bob"}"#.to_owned())
         );
+    }
+
+    #[test]
+    fn unresolved_keys_report_what_format_kept_verbatim() {
+        let template = PromptTemplate::named("greet", "hi {{name}}, {{user.city}} / {{age}}");
+        let values = map(&[("name", json!("bob")), ("user", json!({"age": 3}))]);
+
+        assert_eq!(template.placeholders(), vec!["name", "user.city", "age"]);
+        assert_eq!(template.resolved_keys(&values), vec!["name"]);
+        assert_eq!(
+            template.unresolved_keys(&values),
+            vec!["user.city", "age"],
+            "a missing nested leaf and a missing head are both unresolved"
+        );
+
+        // The lenient path keeps rendering, so the placeholder text survives.
+        let formatted = template.format(&values);
+        assert_eq!(
+            formatted.content,
+            TemplateContent::Text("hi bob, {{user.city}} / {{age}}".to_owned())
+        );
+        assert_eq!(
+            formatted.placeholders(),
+            vec!["user.city", "age"],
+            "the unresolved keys are still readable off the result"
+        );
+        assert_eq!(
+            formatted.unresolved_keys(&BTreeMap::new()),
+            vec!["user.city", "age"]
+        );
+    }
+
+    #[test]
+    fn try_format_is_strict_and_names_every_missing_placeholder() {
+        let template = PromptTemplate::named("greet", "hi {{name}} from {{user.city}}");
+        let error = template
+            .try_format(&map(&[("name", json!("bob"))]))
+            .expect_err("an unresolved placeholder is an error");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        let message = error.to_string();
+        assert!(message.contains("greet"), "template name: {message}");
+        assert!(message.contains("user.city"), "missing key: {message}");
+        assert!(
+            message.contains("1 placeholder(s)"),
+            "only the missing key is counted: {message}"
+        );
+    }
+
+    #[test]
+    fn a_fully_resolved_template_has_nothing_to_report() {
+        let template = PromptTemplate::named("greet", "hi {{name}}!");
+        let values = map(&[("name", json!("bob"))]);
+
+        assert_eq!(template.unresolved_keys(&values), Vec::<String>::new());
+        assert_eq!(template.resolved_keys(&values), vec!["name"]);
+
+        let formatted = template.try_format(&values).expect("everything resolves");
+        assert_eq!(formatted, PromptTemplate::named("greet", "hi bob!"));
+        assert_eq!(
+            formatted.placeholders(),
+            Vec::<String>::new(),
+            "nothing is left for the model to read literally"
+        );
+        assert_eq!(formatted.to_messages()[0].text(), "hi bob!");
     }
 }

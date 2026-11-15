@@ -9,6 +9,8 @@
 //!   *and* the position is one the API allows (see
 //!   [`convert_messages`]);
 //! - assistant `tool_calls` become `tool_use` blocks with a parsed JSON `input`;
+//! - assistant thinking blocks preserved by the response parser are re-emitted
+//!   first, verbatim, so a follow-up `tool_use` turn stays replayable;
 //! - consecutive `tool` turns become one `user` message of `tool_result` blocks;
 //! - `OpenAI` `image_url` parts become Anthropic `image` blocks (base64 or URL);
 //! - `OpenAI` function schemas become `{name, description, input_schema}` tools.
@@ -21,6 +23,8 @@ use openjiuwen_common::error::{Error, Result};
 use serde_json::{json, Value};
 
 use crate::prompt::{BaseMessage, ContentPart, ImageUrl, MessageContent, Role, ToolCall};
+
+use super::response::preserved_thinking_blocks;
 
 /// Model families that accept `role: "system"` inside `messages`, GA and with
 /// no beta header. Every other model answers 400 ("role 'system' is not
@@ -197,16 +201,25 @@ fn tool_result_block(message: &BaseMessage) -> Result<Value> {
     }))
 }
 
-/// Converts an assistant turn, including its `tool_use` blocks.
+/// Converts an assistant turn, including its `tool_use` and thinking blocks.
+///
+/// Preserved `thinking`/`redacted_thinking` blocks (see
+/// [`THINKING_BLOCKS_METADATA_KEY`](super::response::THINKING_BLOCKS_METADATA_KEY))
+/// are emitted first, verbatim and in their original order, because the Messages
+/// API requires the original signed blocks ahead of the text and `tool_use`
+/// blocks of the turn they belong to. A turn without them keeps the plain
+/// string content it always had; a turn with them always sends a block array.
 fn assistant_message(message: &BaseMessage) -> Result<Value> {
-    if message.tool_calls.is_empty() {
+    let thinking = preserved_thinking_blocks(message);
+    if message.tool_calls.is_empty() && thinking.is_empty() {
         return Ok(json!({
             "role": "assistant",
             "content": content_value(&message.content)?,
         }));
     }
 
-    let mut blocks = message_blocks(&message.content)?;
+    let mut blocks = thinking;
+    blocks.extend(message_blocks(&message.content)?);
     for call in &message.tool_calls {
         blocks.push(tool_use_block(call)?);
     }

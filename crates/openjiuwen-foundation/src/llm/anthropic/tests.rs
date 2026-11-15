@@ -521,3 +521,178 @@ fn a_non_object_extra_leaves_the_body_unchanged() {
         assert_eq!(pure_body(&request), plain, "extra {extra} is ignored");
     }
 }
+
+/// A canned Messages response carrying extended-thinking blocks.
+fn thinking_response() -> serde_json::Value {
+    json!({
+        "id": "msg_think",
+        "type": "message",
+        "role": "assistant",
+        "model": MODEL,
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": "Paris is in France.",
+                "signature": "sig-thinking",
+            },
+            {"type": "redacted_thinking", "data": "opaque-blob"},
+            {"type": "text", "text": "checking"},
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "get_weather",
+                "input": {"city": "Paris"},
+            },
+        ],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 10, "output_tokens": 4},
+    })
+}
+
+#[tokio::test]
+async fn invoke_decodes_and_preserves_thinking_blocks() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(thinking_response()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = build_client(&server, ModelRequestConfig::new(MODEL));
+    let response = client
+        .invoke(
+            &[BaseMessage::user("weather in Paris?")],
+            &ModelRequestConfig::new(MODEL),
+        )
+        .await
+        .expect("the response parses");
+    let message = response.message().expect("one choice");
+
+    assert_eq!(
+        message.reasoning_content.as_deref(),
+        Some("Paris is in France."),
+        "the thinking text becomes the reasoning content"
+    );
+    assert_eq!(message.text(), "checking");
+    assert_eq!(message.tool_calls.len(), 1);
+    assert_eq!(
+        message.metadata.get(THINKING_BLOCKS_METADATA_KEY).cloned(),
+        Some(json!([
+            {
+                "type": "thinking",
+                "thinking": "Paris is in France.",
+                "signature": "sig-thinking",
+            },
+            {"type": "redacted_thinking", "data": "opaque-blob"},
+        ])),
+        "the raw blocks are preserved in their original order"
+    );
+}
+
+#[test]
+fn preserved_thinking_blocks_are_replayed_first_in_the_next_request() {
+    let answer = parse_messages_response(&thinking_response()).expect("valid response");
+    let assistant = answer.message().expect("one choice").clone();
+    let call_id = assistant.tool_calls[0]
+        .id
+        .clone()
+        .expect("the tool call carries an id");
+
+    let body = build_messages_body(
+        &[
+            BaseMessage::user("weather in Paris?"),
+            assistant,
+            BaseMessage::tool(call_id, "sunny"),
+        ],
+        &ModelRequestConfig::new(MODEL),
+        false,
+    )
+    .expect("the body builds");
+
+    assert_eq!(
+        body["messages"][1]["content"],
+        json!([
+            {
+                "type": "thinking",
+                "thinking": "Paris is in France.",
+                "signature": "sig-thinking",
+            },
+            {"type": "redacted_thinking", "data": "opaque-blob"},
+            {"type": "text", "text": "checking"},
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "get_weather",
+                "input": {"city": "Paris"},
+            },
+        ]),
+        "thinking blocks come first, in order, with their signatures"
+    );
+}
+
+#[test]
+fn a_thinking_block_without_a_signature_is_never_replayed() {
+    let answer = parse_messages_response(&json!({
+        "content": [
+            {"type": "thinking", "thinking": "unsigned"},
+            {"type": "redacted_thinking"},
+            {"type": "text", "text": "done"},
+        ],
+        "stop_reason": "end_turn",
+    }))
+    .expect("valid response");
+    let assistant = answer.message().expect("one choice").clone();
+
+    assert_eq!(
+        assistant.reasoning_content.as_deref(),
+        Some("unsigned"),
+        "the reasoning text is still reported"
+    );
+    assert!(
+        !assistant
+            .metadata
+            .contains_key(THINKING_BLOCKS_METADATA_KEY),
+        "an unreplayable block is not preserved"
+    );
+
+    let body = build_messages_body(
+        &[
+            BaseMessage::user("hi"),
+            assistant,
+            BaseMessage::user("and?"),
+        ],
+        &ModelRequestConfig::new(MODEL),
+        false,
+    )
+    .expect("the body builds");
+    assert_eq!(
+        body["messages"][1]["content"],
+        json!("done"),
+        "a turn with nothing to replay keeps its plain string content"
+    );
+}
+
+#[test]
+fn caller_supplied_metadata_cannot_smuggle_an_unreplayable_block() {
+    let assistant = BaseMessage::assistant("done").with_metadata(
+        THINKING_BLOCKS_METADATA_KEY,
+        json!([
+            {"type": "thinking", "thinking": "unsigned"},
+            {"type": "text", "text": "not a thinking block"},
+            {"type": "redacted_thinking", "data": ""},
+        ]),
+    );
+
+    let body = build_messages_body(
+        &[
+            BaseMessage::user("hi"),
+            assistant,
+            BaseMessage::user("and?"),
+        ],
+        &ModelRequestConfig::new(MODEL),
+        false,
+    )
+    .expect("the body builds");
+    assert_eq!(body["messages"][1]["content"], json!("done"));
+}

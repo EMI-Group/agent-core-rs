@@ -12,6 +12,24 @@
 //! `[DONE]` sentinel is transport-specific, so it is surfaced as ordinary data;
 //! clients can test it with [`SseEvent::is_done`].
 //!
+//! # Malformed frames are skipped, never silent
+//!
+//! A frame is malformed when its bytes are not valid UTF-8 — the one way an
+//! event-stream payload can be undecodable at this layer, since JSON decoding
+//! belongs to the provider clients. Such a frame cannot be handed to a model as
+//! faithfully decoded text, so the decoder **drops the whole frame**, emits one
+//! `tracing::warn!` naming the transport (`event-stream`), the frame's ordinal,
+//! its `event:` name when it had one, and the payload's byte length — never the
+//! payload itself, which may carry model or user text — and counts it.
+//! [`SseDecoder::skipped_frames`] exposes that count, so a caller can treat a
+//! lossy stream as a diagnostic instead of guessing.
+//!
+//! Everything else the grammar allows keeps flowing: unknown fields (`id`,
+//! `retry`), `:` comment lines, and keep-alive frames that carry no `data:` and
+//! no `event:` are consumed by the format, not skipped as malformed, and they do
+//! not count. A single bad frame never aborts the stream, and the valid frames
+//! around it are still returned.
+//!
 //! ```
 //! use openjiuwen_foundation::llm::sse::SseDecoder;
 //!
@@ -20,8 +38,12 @@
 //! assert_eq!(events.len(), 1);
 //! assert_eq!(events[0].event.as_deref(), Some("delta"));
 //! assert_eq!(events[0].data, "{\"text\":\"hi\"}");
+//! assert_eq!(decoder.skipped_frames(), 0);
 //! assert!(decoder.finish().is_none());
 //! ```
+
+/// The `tracing` target of every event emitted by this module.
+const LOG_TARGET: &str = "openjiuwen_foundation::llm::sse";
 
 /// One Server-Sent-Events event.
 ///
@@ -50,7 +72,9 @@ impl SseEvent {
 /// Incremental decoder for a `text/event-stream` body.
 ///
 /// Bytes are buffered until a line is complete, so callers can feed network
-/// chunks of any size. Each decoded event is returned exactly once.
+/// chunks of any size. Each decoded event is returned exactly once; a frame
+/// whose payload is not valid UTF-8 is dropped and counted (see
+/// [`SseDecoder::skipped_frames`]).
 #[derive(Debug, Clone, Default)]
 pub struct SseDecoder {
     /// Raw bytes received but not yet terminated by a `\n`.
@@ -61,6 +85,11 @@ pub struct SseDecoder {
     data_seen: bool,
     /// `event:` name of the event being assembled.
     event: Option<String>,
+    /// Whether a line of the frame being assembled was not valid UTF-8; a
+    /// malformed frame is dropped at dispatch.
+    malformed: bool,
+    /// Frames dropped because they could not be decoded.
+    skipped_frames: usize,
 }
 
 impl SseDecoder {
@@ -68,6 +97,18 @@ impl SseDecoder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How many undecodable frames this decoder has dropped.
+    ///
+    /// A malformed frame is consumed silently by the event-stream grammar here
+    /// only in the sense that no event is emitted for it: every one of them was
+    /// logged with a `tracing::warn!` and is counted here, so a caller that cares
+    /// about a lossy stream can check this instead of guessing from the chunk
+    /// count.
+    #[must_use]
+    pub fn skipped_frames(&self) -> usize {
+        self.skipped_frames
     }
 
     /// Feeds one network chunk and returns every event completed by it.
@@ -85,8 +126,8 @@ impl SseDecoder {
             .position(|&byte| byte == b'\n')
         {
             let line_end = consumed + offset;
-            let line = decode_line(&self.buffer[consumed..line_end]);
-            self.process_line(&line, &mut events);
+            let (line, malformed) = decode_line(&self.buffer[consumed..line_end]);
+            self.process_line(&line, malformed, &mut events);
             consumed = line_end + 1;
         }
         if consumed > 0 {
@@ -102,8 +143,8 @@ impl SseDecoder {
     pub fn finish(&mut self) -> Option<SseEvent> {
         let mut events = Vec::new();
         if !self.buffer.is_empty() {
-            let line = decode_line(&std::mem::take(&mut self.buffer));
-            self.process_line(&line, &mut events);
+            let (line, malformed) = decode_line(&std::mem::take(&mut self.buffer));
+            self.process_line(&line, malformed, &mut events);
         }
         if let Some(event) = self.dispatch() {
             events.push(event);
@@ -112,7 +153,12 @@ impl SseDecoder {
     }
 
     /// Applies one line of the event-stream grammar.
-    fn process_line(&mut self, line: &str, events: &mut Vec<SseEvent>) {
+    ///
+    /// `malformed` reports that the line's bytes were not valid UTF-8; the frame
+    /// is flagged so [`SseDecoder::dispatch`] can drop it with a warning instead
+    /// of forwarding lossily decoded text.
+    fn process_line(&mut self, line: &str, malformed: bool, events: &mut Vec<SseEvent>) {
+        self.malformed |= malformed;
         if line.is_empty() {
             if let Some(event) = self.dispatch() {
                 events.push(event);
@@ -146,10 +192,30 @@ impl SseDecoder {
     }
 
     /// Emits the pending event, if it has data or an explicit event name.
+    ///
+    /// A pending frame whose payload was not valid UTF-8 is dropped instead: one
+    /// `tracing::warn!` records the transport, the frame's ordinal, its
+    /// `event:` name, and the payload's byte length (never the payload), and
+    /// [`SseDecoder::skipped_frames`] counts it.
     fn dispatch(&mut self) -> Option<SseEvent> {
         let data = std::mem::take(&mut self.data);
         self.data_seen = false;
         let event = self.event.take();
+        let malformed = std::mem::take(&mut self.malformed);
+
+        if malformed {
+            self.skipped_frames += 1;
+            tracing::warn!(
+                target: LOG_TARGET,
+                transport = "event-stream",
+                frame = self.skipped_frames,
+                event = event.as_deref().unwrap_or("<default>"),
+                data_bytes = data.len(),
+                "skipping a malformed event-stream frame: its payload is not valid UTF-8"
+            );
+            return None;
+        }
+
         if data.is_empty() && event.is_none() {
             return None;
         }
@@ -159,11 +225,17 @@ impl SseDecoder {
 
 /// Decodes line bytes, dropping a trailing `\r` from a CRLF ending.
 ///
-/// Invalid UTF-8 is replaced lossily rather than rejecting the stream, so a
-/// malformed provider frame can never panic the client.
-fn decode_line(line: &[u8]) -> String {
+/// Returns the decoded line together with whether its bytes were valid UTF-8.
+/// The lossy decode is only kept so the caller can describe the frame it is
+/// about to drop: forwarding replacement characters would hand corrupted text
+/// to a model, so [`SseDecoder::dispatch`] discards the frame whenever the flag
+/// is set.
+fn decode_line(line: &[u8]) -> (String, bool) {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
-    String::from_utf8_lossy(line).into_owned()
+    match std::str::from_utf8(line) {
+        Ok(text) => (text.to_owned(), false),
+        Err(_) => (String::from_utf8_lossy(line).into_owned(), true),
+    }
 }
 
 #[cfg(test)]
@@ -375,11 +447,49 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_is_replaced_without_panicking() {
+    fn an_undecodable_frame_is_skipped_and_counted() {
         let mut decoder = SseDecoder::new();
-        let events = decoder.push(b"data: \xff\xfe\n\n");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data, "\u{fffd}\u{fffd}");
+        assert_no_events(decoder.push(b"data: \xff\xfe\n\n"));
+        assert_eq!(decoder.skipped_frames(), 1);
+        assert!(decoder.finish().is_none());
+        assert_eq!(decoder.skipped_frames(), 1, "the count is stable");
+    }
+
+    #[test]
+    fn a_malformed_frame_between_valid_ones_keeps_the_valid_chunks() {
+        let mut decoder = SseDecoder::new();
+        let mut body = Vec::new();
+        body.extend_from_slice(b"data: {\"text\":\"first\"}\n\n");
+        body.extend_from_slice(b"event: broken\ndata: \xff\xfe\n\n");
+        body.extend_from_slice(b"data: {\"text\":\"second\"}\n\n");
+        let events = decoder.push(&body);
+        assert_eq!(
+            events,
+            vec![
+                event("{\"text\":\"first\"}"),
+                event("{\"text\":\"second\"}")
+            ],
+            "only the malformed frame is dropped"
+        );
+        assert_eq!(decoder.skipped_frames(), 1);
+        assert!(decoder.finish().is_none());
+    }
+
+    #[test]
+    fn a_malformed_trailing_frame_is_skipped_by_finish() {
+        let mut decoder = SseDecoder::new();
+        assert_no_events(decoder.push(b"data: \xff"));
+        assert_eq!(decoder.finish(), None);
+        assert_eq!(decoder.skipped_frames(), 1);
+    }
+
+    #[test]
+    fn keep_alive_and_empty_frames_are_not_counted_as_skipped() {
+        let mut decoder = SseDecoder::new();
+        assert_no_events(decoder.push(b": ping\n\n"));
+        assert_no_events(decoder.push(b"\n\r\n\n"));
+        assert_no_events(decoder.push(b"retry: 1000\n\n"));
+        assert_eq!(decoder.skipped_frames(), 0);
     }
 
     #[test]
