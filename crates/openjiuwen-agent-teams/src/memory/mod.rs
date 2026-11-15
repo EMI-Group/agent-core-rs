@@ -55,6 +55,10 @@ pub mod tools;
 pub mod trace;
 pub mod wiring;
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+pub(crate) mod test_support;
+
 pub use config::{
     memory_config, MemoryConfig, MemoryExtractorKind, MemoryStoreConfig, MEMORY_METADATA_KEY,
 };
