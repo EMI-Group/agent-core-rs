@@ -67,6 +67,7 @@ pub mod contracts;
 pub mod embedding;
 pub mod engine;
 pub mod expand;
+pub mod flat;
 pub mod flow;
 pub mod lexical;
 pub mod reduce;
@@ -88,6 +89,9 @@ pub use contracts::{
 };
 pub use embedding::{blend_scores, cosine_similarity, EmbeddingScorer};
 pub use expand::DefaultTargetExpander;
+pub use flat::{
+    FlatRetriever, FlatSearchResult, FLAT_ROOT_NODE_ID, METHOD_FLAT, METHOD_FLAT_LEXICAL,
+};
 pub use flow::{
     ChatMessage, ChildSearchCursor, CurrentSubtree, ExpansionPlan, ExposedFragment, ExposedNode,
     NodeSearchResult, PromptBundle, SearchCursor, SelectableResolution, SelectableTarget,
