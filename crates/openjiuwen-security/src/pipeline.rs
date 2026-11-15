@@ -642,8 +642,8 @@ mod tests {
             .run(&GuardrailContext::raw("user_input", Value::Null))
             .await;
         assert!(outcome.is_safe());
-        assert!(outcome.errors.is_empty());
-        assert!(outcome.evaluations.is_empty());
+        assert_eq!(outcome.errors, Vec::<String>::new());
+        assert_eq!(outcome.evaluations, Vec::<GuardrailEvaluation>::new());
     }
 
     #[tokio::test]
