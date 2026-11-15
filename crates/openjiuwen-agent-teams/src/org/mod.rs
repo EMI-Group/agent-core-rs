@@ -31,9 +31,11 @@
 //! | [`mailbox`] | `OrgMailbox`: leader-to-leader messages, receipts, system notifications |
 //! | [`swarmflow`] | `SwarmflowPlan`, `SwarmLane`, `SwarmflowRunner`, `SwarmflowOutcome` |
 //! | [`fork_compact`] | `fork_member_context` (member fork) and `compact_transcript` (context compaction) |
+//! | [`compact_template`] | `CompactTemplate` and `compact_with_template` (split/direction compaction) |
 
 use openjiuwen_common::error::{Error, Result};
 
+pub mod compact_template;
 pub mod delegation;
 pub mod fork_compact;
 pub mod mailbox;
@@ -43,6 +45,7 @@ pub mod task_pool;
 
 // Flat re-exports so a host reaches the whole layer as
 // `openjiuwen_agent_teams::org::OrgChart`, mirroring the other modules of the crate.
+pub use compact_template::*;
 pub use delegation::*;
 pub use fork_compact::*;
 pub use mailbox::*;

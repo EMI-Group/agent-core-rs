@@ -88,10 +88,31 @@ pub struct CompactPolicy { keep_system, keep_last_messages, max_tool_result_byte
 pub struct CompactedTranscript { messages, summary, dropped_messages, truncated_tool_results,
                                  original_bytes, compacted_bytes }              // is_lossless/text
 pub fn compact_transcript(messages: &[TranscriptMessage], policy: &CompactPolicy) -> CompactedTranscript;
+
+// compact_template.rs — Python's split/direction compaction with a total byte budget
+pub const DEFAULT_TEMPLATE_MAX_FACTS: usize = 4;
+pub const DEFAULT_EXCERPT_CHARS: usize = 48;
+pub const DEFAULT_BUDGET_PRIORITY: [BudgetTier; 3] = [Summary, KeptSide, ToolResults];
+pub enum CompactDirection { Before, After }        // default Before; as_str/parse/compresses
+pub enum CompactionSide { Head, Tail }             // default Head; as_str
+pub enum BudgetTier { Summary, KeptSide, ToolResults }   // as_str
+pub enum SummaryOmission { Regressive, Budget }    // as_str
+pub enum SummaryFact { Paths, Decisions, Errors, Feedback }   // as_str
+pub struct SummaryRetention { facts, max_facts, max_excerpt_chars }   // new/with_facts/without/with_max_facts/with_excerpt_chars/retains
+pub struct CompactTemplate { split_at, direction, keep_system, total_budget_bytes: Option<usize>,
+                             budget_priority, max_tool_result_bytes, truncated_suffix,
+                             extend_through_tool_results, retention }   // new + builders + validate
+pub struct TemplateCompaction { messages, summary, summary_omitted, direction, compressed_side,
+                                split_at, requested_split_at, compressed_messages,
+                                stripped_system_messages, kept_messages, squeezed_messages,
+                                truncated_tool_results, original_bytes, compacted_bytes }  // is_lossless/text
+pub fn compact_with_template(messages: &[TranscriptMessage], template: &CompactTemplate)
+    -> Result<TemplateCompaction>;
 ```
 
 `mod.rs` re-exports every submodule flat, so the whole layer reads as `crate::org::OrgChart`, `crate::org::OrgTaskPool`, `crate::org::SwarmflowPlan`, `crate::org::fork_member_context`, …
 `task_pool::task_pool_types` stays reachable as a submodule as well as through the glob.
+`fork_compact` re-exports every `compact_template` item, so `crate::org::fork_compact::CompactTemplate` and `crate::org::CompactTemplate` are the same type.
 
 ## Invariants
 
@@ -158,6 +179,19 @@ First refusal wins, in this order (the module docs carry the same table):
 - `compact_transcript` keeps system messages at the front (unless `keep_system` is false), keeps the last `keep_last_messages` non-system messages verbatim, replaces everything older with exactly one deterministic summary line (`"[compacted] <n> earlier messages dropped (<u> user, <a> assistant, <t> tool)"`), and truncates only `Tool` content beyond `max_tool_result_bytes` on a UTF-8 char boundary with `truncated_suffix`.
 - Compaction never grows the transcript (`compacted_bytes <= original_bytes`), is stable when applied twice, and `is_lossless()` means nothing was dropped and nothing truncated.
 
+### Template-driven compaction (`compact_with_template`)
+
+- `CompactDirection::Before` compresses `stripped[..split_at]` and keeps the tail verbatim; `After` keeps `stripped[..head_end]` and compresses the rest, where `head_end` starts at `split_at` and advances through trailing `Tool` messages when `extend_through_tool_results` (Python's dangling-tool-call guard).
+- Every `System` message is stripped *before* the split is computed and counted in `stripped_system_messages`; it is re-emitted at the front only when `keep_system` (default false, matching Python, which never puts them back).
+- The split is validated against the stripped transcript (`1 <= split_at < non-system messages`) and a bad split, an empty `budget_priority` or a repeated tier is a typed `Error::validation`; Python silently skips instead.
+- The summary line is `"<SUMMARY_PREFIX><side>@<split>/<total>: <n> message(s) compressed (<role counts>)"` followed by `paths`, `decisions`, `errors` and `feedback` segments in that fixed order; an empty or disabled category costs no byte.
+- Facts are extracted deterministically from the compressed side: path-like tokens (first-seen order, deduped), lines containing an error marker, lines containing a decision marker, and every non-empty line of a `User` message; `max_facts == 0` reports counts, `max_excerpt_chars` cuts an excerpt on a char boundary with `…`.
+- Python's retention priorities are the template contract: `SummaryRetention::facts` selects the categories and the default enables all four (paths, decisions, errors, feedback).
+- Budget tiers are reduced lowest-priority first until the result fits `min(budget, original_bytes)`; within a tier the messages farthest from the split go first, so the side nearest the split survives longest.
+- Default `budget_priority` is `[Summary, KeptSide, ToolResults]`: the summary is protected first, then the verbatim non-tool messages, then their tool results; a template that lists `Summary` last makes the summary the first thing the budget removes.
+- A summary that would cost more than the messages it replaces is omitted with `SummaryOmission::Regressive`; a summary the budget removed is `SummaryOmission::Budget`; `squeezed_messages` counts kept-side and system messages only.
+- Kept system messages are the budget's last resort, so `compacted_bytes <= min(budget, original_bytes)` always holds; `compacted_bytes` is the summed `byte_len` of `messages`, and compaction is monotone by construction.
+
 ## Constraints
 
 - Only `src/org/**` is edited; `src/runtime/`, `src/schema/`, `src/taskboard/`, `src/storage/`, `src/lib.rs`, `Cargo.toml`, `tests/`, the crate-root `CONTEXT.md` and `docs/` are read-only here.
@@ -165,7 +199,7 @@ First refusal wins, in this order (the module docs carry the same table):
 - Async-first tokio with `#[async_trait]`; the router and chart are `Arc`-shared and immutable, so no lock is needed; the pools hold no interior mutable state (the mailbox's timestamp guard is the only one, and it is a single short `parking_lot`/atomic section, never held across an `.await`).
 - `tracing` only (a `debug!` on task-pool mutations), no `println!`/`eprintln!`; no `unsafe`; no undocumented global state, and none in this module at all.
 - Every public item documented; fallible methods carry `# Errors`; pure accessors are `#[must_use]`; every data type is `serde` with `rename_all = "snake_case"`, `default` and unknown-field tolerance; event enums are internally tagged (`type`).
-- Files ≤ 1000 lines; `task_pool.rs` is the sanctioned long file (1140 lines: one policy object whose lifecycle rules only read as a whole) with a top-of-file note, and its value objects live in `task_pool_types.rs`.
+- Files ≤ 1000 lines; `task_pool.rs` (1140 lines) and `compact_template.rs` (1056 lines) are the sanctioned long files, each carrying a top-of-file note, because a lifecycle policy and a split/budget/retention pipeline only read as a whole; `task_pool`'s value objects live in `task_pool_types.rs`.
 - `--no-default-features` must build: this module has no feature gates and no `mcp`/`sqlite` reference.
 
 ## Deferred (documented, not implemented)
@@ -176,8 +210,8 @@ First refusal wins, in this order (the module docs carry the same table):
 - The organisation workspace manager and write policy (`teams/<id>/`, `shared/`, `summary/`, git init/commit lock, conflict strategy) plus `workspace_rail.py` enforcement.
 - `TransportAPI` negotiation/handshake and the organisation event bus beyond the in-process `OrgTaskEvent`/`OrgMessage` values.
 - The LLM-facing organisation tool wrappers (`tools.py`: control, task-pool, summary and inbox tools) and their prompt packs.
-- LLM-generated compaction: Python asks the model to summarise; `compact_transcript` emits the deterministic template summary line instead.
-- Harness-side compaction and a runtime swarmflow lane: `compact_transcript` and `SwarmflowRunner` are pure seams of this module, and `src/harness/`/`src/runtime/` do not call them yet.
+- LLM-generated compaction: Python asks the model to summarise; `compact_transcript` and `compact_with_template` emit the deterministic template summary line instead.
+- Harness-side compaction and a runtime swarmflow lane: `compact_transcript`, `compact_with_template` and `SwarmflowRunner` are pure seams of this module, and `src/harness/`/`src/runtime/` do not call them yet.
 - Swarmflow's external host/bridge (`external_swarmflow_host.py`), worktree lanes and in-runner review gate (`tool_swarmflow.py`).
 - Org-level task lease/expiry: `TaskRecord` carries no lease column, so staleness stays the board's `updated_at` policy.
 
@@ -190,12 +224,13 @@ First refusal wins, in this order (the module docs carry the same table):
 - `./task_pool_types.rs` → the pool's value objects (`OrgTaskSpec`, `OrgTask`, `OrgTaskFilter`, `OrgTaskOpResult`, `OrgTaskEvent`, `OrgTaskMutation`, `OrgTaskFailure`, `OrgTaskSidecar`, `OrgTaskEventSink`)
 - `./mailbox.rs` → `OrgMailbox`, `OrgMessage`, `OrgMessageKind`, mailbox constants
 - `./swarmflow.rs` → `LaneSpec`, `SwarmflowPlan`, `SwarmLane`, `LaneClosure`, `SwarmflowRunner`, `SwarmflowOutcome`
-- `./fork_compact.rs` → `ForkSource`/`ForkToolPolicy`/`ForkedMemberSpec`/`fork_member_context` and `TranscriptMessage`/`CompactPolicy`/`CompactedTranscript`/`compact_transcript`
-- `./roles_tests.rs`, `./delegation_tests.rs`, `./task_pool_tests.rs`, `./mailbox_tests.rs`, `./swarmflow_tests.rs`, `./fork_compact_tests.rs` → the crate-internal suites, included with `#[cfg(test)] #[path = "…"] mod …;`
+- `./fork_compact.rs` → `ForkSource`/`ForkToolPolicy`/`ForkedMemberSpec`/`fork_member_context` and `TranscriptMessage`/`CompactPolicy`/`CompactedTranscript`/`compact_transcript`, plus the re-export of every `compact_template` item
+- `./compact_template.rs` → `CompactTemplate`, `CompactDirection`, `CompactionSide`, `BudgetTier`, `SummaryRetention`/`SummaryFact`, `SummaryOmission`, `TemplateCompaction`, `compact_with_template`, the internal `BudgetState` and the deterministic fact extractor
+- `./roles_tests.rs`, `./delegation_tests.rs`, `./task_pool_tests.rs`, `./mailbox_tests.rs`, `./swarmflow_tests.rs`, `./fork_compact_tests.rs`, `./compact_template_tests.rs` → the crate-internal suites, included with `#[cfg(test)] #[path = "…"] mod …;`
 
 ## Test Strategy
 
-133 unit tests live beside the modules and run offline against `InMemoryTeamStore` plus small in-memory fixtures; no `#[ignore]`, no network, no sleeps beyond short bounded waits.
+153 unit tests live beside the modules and run offline against `InMemoryTeamStore` plus small in-memory fixtures; no `#[ignore]`, no network, no sleeps beyond short bounded waits.
 
 - `roles_tests.rs` (18): org-id grammar and message, duplicate/malformed team names, duplicate members, undeclared team, unknown/self `reports_to`, team and member reporting cycles with exact path text, leader membership and the `team_leader` default, owner checks, `summary_team` role check, sorted listings, a full 5-deep hierarchy walk, unknown-node `NotFound`, serde and `to_value` round-trips.
 - `delegation_tests.rs` (18): the allow/refuse matrix (intra-team, descendant team, owner bypass, upward, lateral, self, unknown delegator/team/member, depth cap incl. `depth == 0` and unlimited, role matrix, budget boundary and per-team override), `check()`'s validation error, `code()` strings, rules/request serde.
@@ -203,6 +238,7 @@ First refusal wins, in this order (the module docs carry the same table):
 - `mailbox_tests.rs` (15): stamped send and round-trip, receiver-only visibility, self-send and name validation, oversize subject/body, broadcast visibility and watermark advance/non-regression, direct ack idempotence, `acknowledge_all`, system `notify`/`announce`, ordering, namespace isolation, foreign-protocol and corrupt rows skipped, serde, `preview`.
 - `swarmflow_tests.rs` (12): measured peak concurrency ≤ limit and reaching it, retry-then-success, retries exhausted, continue-on-failure vs fail-fast skipping, plan-order results under out-of-order completion, payload/attempt delivery, validation errors, outcome lookups, serde, `LaneClosure` as `Arc<dyn SwarmLane>`.
 - `fork_compact_tests.rs` (25): inheritance of session/workspace/cwd/project_root/model, identity clearing, tool deny/allow/additive ordering, invalid/reserved/self fork, two-level lineage, serde shape, exact summary lines, system front-keeping and `keep_system = false`, `keeping_last(0)`, multibyte truncation on a char boundary, tool-only truncation, losslessness, monotonicity, idempotence, empty transcript.
+- `compact_template_tests.rs` (20): both directions and the head-widening tool extension, an empty compressed side, system stripping before the split, `keep_system`, split at 0 / at the end / out of range as typed errors, direction parsing and side/tier/reason names, the exact summary line with `head@3/6`-style side and split, excerpt caps and counts-only mode, retention selection, the regressive-summary guard, budget-first summary omission, tool-results-before-kept-messages squeezing under the default priority, nearest-the-split survival in both directions, a custom priority order inverting the squeeze, `budget_priority` validation, tool truncation, the never-grow/never-exceed-budget matrix, and the template/result serde round-trip.
 - Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --offline org::`, `cargo test -p openjiuwen-agent-teams --offline --no-default-features org::`, `cargo clippy -p openjiuwen-agent-teams --all-targets --offline -- -D warnings`, `cargo doc -p openjiuwen-agent-teams --no-deps --offline`.
 
 ## Runtime integration (owned by the sibling nodes)
@@ -223,4 +259,6 @@ The leader loop in `src/runtime/leader.rs` reads `OrgBinding::unread(team)` (ove
 - The pool and the mailbox share one namespace and therefore one store instance; they touch different tables, so a task id and a message id can never collide and a real team's `TaskBoard` rows stay invisible to both.
 - `swarmflow` deliberately does not depend on `crate::runtime`; keeping the lane seam injectable is what makes the runner testable with fakes and keeps the fan-out policy independent of how a member is spawned.
 - `fork_compact` is pure and reusable outside the team runtime: it has no store, no clock and no session dependency, so the harness can call the compaction step on any transcript.
-- `task_pool.rs` is the sanctioned long file; `task_pool_tests.rs` (1368 lines) and `fork_compact_tests.rs` (809 lines) are comprehensive suites rather than policy code.
+- `task_pool.rs` and `compact_template.rs` are the sanctioned long files; `task_pool_tests.rs` (1368 lines), `compact_template_tests.rs` (691 lines) and `fork_compact_tests.rs` (809 lines) are comprehensive suites rather than policy code.
+- `compact_transcript` keeps its "last N non-system messages" heuristic and its callers are unchanged; only `compact_with_template` models Python's `split_at` + `direction` contract, so a new fork path should adopt the template entry point rather than grow the old heuristic.
+- The template path never re-emits stripped system messages by default and never truncates the compressed side, so a summary can only disappear through the monotonicity guard or the budget — both are reported on `TemplateCompaction` (`summary_omitted`).
