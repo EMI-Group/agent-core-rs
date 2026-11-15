@@ -80,19 +80,27 @@ WeChat articles, article-extraction services, and LLM/OCR document understanding
 ### `xlsx.rs`
 - `XlsxLoader` (`.xlsx`) parses with `XlsxParser::parse_path` / `parse_bytes` and returns `XlsxWorkbook::to_documents(file_stem(source))`.
 - Ids are `{stem}_s{sheet}_r{row}` (1-based, header included) and `{stem}_s{sheet}_c{column}` (0-based); metadata keeps `{sheet_name, row_index?, column_name?, source_type}`.
-- An empty workbook (no sheets) returns `Ok(vec![])`; missing file → `Error::NotFound`; missing `xl/workbook.xml` → `Error::Retrieval`.
+- An empty workbook (no sheets) returns `Ok(vec![])`; missing file → `Error::NotFound`; missing `xl/workbook.xml` → `Error::Retrieval`; an unresolvable `t="s"` cell propagates the parser's `Error::Retrieval`, naming the worksheet part, the cell and the shared-string table size instead of indexing empty text.
 
 ### `pptx.rs`
 - `PptxLoader` (`.pptx`) parses with `PptxParser::parse_path` / `parse_bytes` and returns exactly one `Document`.
-- `text` is `PptxDocument::text` — one `## Slide N` heading block per slide (plus `### Notes` when a slide has speaker notes).
-- Metadata: `title` (only when `docProps/core.xml` carries a non-empty `dc:title`), `slide_count`, `has_notes` (any slide has a notes part), `source_type: "document"`.
-- A deck with no reachable slide part propagates `PptxParser`'s `Error::Validation`.
+- `text` is `PptxDocument::text` — one `## Slide N` heading block per slide (plus `### Notes` when a slide has speaker notes); a slide whose part could not be resolved keeps its heading with a `! missing slide part: …` body line.
+- Metadata: `title` (only when `docProps/core.xml` carries a non-empty `dc:title`), `slide_count` (placeholder slides included), `has_notes` (any slide has a notes part), `source_type: "document"`, `pptx_problems` (array of the parser's unresolved-slide messages, always present and empty for a clean deck), `pptx_incomplete` (bool, always present, `true` iff `pptx_problems` is non-empty).
+- The two `pptx_*` keys are the loader's completeness markers: a deck that lost slides to dangling relationships is still indexed, but says so, mirroring `pdf_incomplete`/`pdf_skipped_filters`.
+- A deck with no slide at all propagates `PptxParser`'s `Error::Validation`.
 
 ### `odt.rs`
 - `OdtLoader` (`.odt`) parses with `OdtParser::parse_path` / `parse_bytes` and returns exactly one `Document`.
 - `text` is `OdtDocument::text()` — headings as `#`-prefixed lines, body paragraphs, Markdown tables.
-- Metadata: `title` (only when `meta.xml` carries a non-empty `dc:title`), `paragraph_count`, `table_count`, `source_type: "document"`.
+- Metadata: `title` (only when `meta.xml` carries a non-empty `dc:title`), `paragraph_count`, `table_count`, `source_type: "document"`, `odt_unsupported_elements` (array of the parser's `<name> (×<count>)` entries, sorted, always present and empty for a clean document), `odt_incomplete` (bool, always present, `true` iff the list is non-empty).
+- The two `odt_*` keys name what contributed no text (drawings, footnotes, tables of contents, tracked changes, annotations, unknown blocks) instead of dropping it silently.
 - An archive without `content.xml` → `Error::Validation`.
+
+### `pdf.rs`
+- `PdfLoader` (`.pdf`) parses with `PdfParser::parse_path` / `parse_bytes` and returns exactly one `Document`.
+- `text` is the decoded page text, and `page_count` / `has_text` / `source_type: "document"` carry the document shape.
+- Metadata also carries the parser's completeness markers: `pdf_incomplete` (bool, `true` when at least one stream was skipped, so `text` is partial) and `pdf_skipped_filters` (array of the display names of the filters on skipped streams, deduplicated in first-seen order); both are always present.
+- An image-only document is not an error (`has_text == false`); encrypted PDFs and object streams propagate the parser's `Error::Unsupported`.
 
 ### `auto.rs`
 - `LoaderRegistry`: normalized extension map (with leading dot); `with_defaults()` registers the 19 extensions above; `register(extensions, loader)` first registration wins (Python parity); `get_for_path(path) -> Option<Arc<dyn DocumentLoader>>`; `extensions()` returns the sorted list.
@@ -123,9 +131,9 @@ WeChat articles, article-extraction services, and LLM/OCR document understanding
 
 ## Test Strategy
 
-- Unit tests live inline (`#[cfg(test)] mod tests`) beside each loader, and cover both paths with the same fixtures: path `load` and `load_bytes` parity, metadata keys, `LoadOptions` stamping (`doc_id` verbatim, base-prefix for CSV/XLSX, `title` override, `metadata["doc_id"]`), typed errors per format (missing → `NotFound`, corrupt bytes → `Validation`, scanned/encrypted PDF and `UrlLoader::load_bytes` → `Unsupported`), `supports` case-insensitivity, and `AutoLoader` byte dispatch for text/CSV/DOCX/XLSX/PDF/PPTX/ODT plus unknown/extension-less names.
+- Unit tests live inline (`#[cfg(test)] mod tests`) beside each loader, and cover both paths with the same fixtures: path `load` and `load_bytes` parity, metadata keys, `LoadOptions` stamping (`doc_id` verbatim, base-prefix for CSV/XLSX, `title` override, `metadata["doc_id"]`), typed errors per format (missing → `NotFound`, corrupt bytes → `Validation`, scanned/encrypted PDF and `UrlLoader::load_bytes` → `Unsupported`), `supports` case-insensitivity, `AutoLoader` byte dispatch for text/CSV/DOCX/XLSX/PDF/PPTX/ODT plus unknown/extension-less names, and the completeness markers on both the clean and the lossy path (`pptx_problems`/`pptx_incomplete`, `odt_unsupported_elements`/`odt_incomplete`, `pdf_incomplete`/`pdf_skipped_filters`).
 - `fixtures.rs` unit tests parse each builder back through the matching parser, assert the ZIP entries are stored, and check shared strings, gapped cells, 28-column sheets, slide ordering/titles, and XML escaping.
-- Path-level coverage of every loader and of `AutoLoader` dispatch/provenance lives in `tests/loaders.rs`, which belongs to the parent node.
+- Path-level coverage of every loader and of `AutoLoader` dispatch/provenance lives in `tests/loaders.rs`, which belongs to the parent node; it also asserts the `pptx_*` and `odt_*` completeness markers through `AutoLoader` and the bare loaders.
 
 ## Notes for Agents
 

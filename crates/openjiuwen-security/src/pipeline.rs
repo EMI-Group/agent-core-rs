@@ -9,6 +9,14 @@
 //! [`GuardrailOutcome::errors`](crate::GuardrailOutcome::errors) and logged),
 //! never an early return, so the caller decides whether to continue by calling
 //! [`GuardrailOutcome::enforce`](crate::GuardrailOutcome::enforce).
+//!
+//! Failures are **fail-closed by default**
+//! (`FailurePolicy::FailClosed`): a guardrail
+//! that errors, and a payload [`GuardrailContext::text_view_checked`] cannot
+//! project, both become a blocking [`RiskLevel::Critical`] finding whose message
+//! carries the reason, so an unusable detector can never read as "safe".
+//! `FailurePolicy::FailOpen` is the explicit
+//! opt-in that records the failure and lets the call continue.
 
 use std::sync::Arc;
 
@@ -20,6 +28,15 @@ use crate::{
     FailurePolicy, Finding, Guardrail, GuardrailContext, GuardrailEvaluation, GuardrailOutcome,
     RiskLevel, ScanStage, SecurityDecision, SecurityPolicy,
 };
+
+/// `risk_type` of a finding derived from a guardrail failure.
+pub const GUARDRAIL_ERROR_RISK_TYPE: &str = "guardrail_error";
+
+/// `risk_type` of a finding derived from a payload no detector can read.
+pub const UNSCANNABLE_RISK_TYPE: &str = "unscannable_content";
+
+/// Name reported for the payload pre-check in `evaluations` and `findings`.
+pub const CONTEXT_GUARDRAIL: &str = "context";
 
 /// Guardrails plus the policy that decides which findings block.
 ///
@@ -79,7 +96,10 @@ impl GuardrailPipeline {
     /// Runs every guardrail that handles the context's stage and aggregates the
     /// verdicts.
     ///
-    /// Never fails: guardrail errors are recorded and resolved by the policy.
+    /// Never fails: guardrail errors and an unscannable context are recorded and
+    /// resolved by the policy — blocking under the default
+    /// `FailurePolicy::FailClosed`, recorded
+    /// only under the opt-in `FailurePolicy::FailOpen`.
     pub async fn run(&self, ctx: &GuardrailContext) -> GuardrailOutcome {
         let stage = ctx.stage();
         let mut selected: Vec<&Arc<dyn Guardrail>> = self
@@ -91,6 +111,27 @@ impl GuardrailPipeline {
         selected.sort_by_key(|guardrail| std::cmp::Reverse(guardrail.priority()));
 
         let mut outcome = GuardrailOutcome::allowed(stage);
+        if selected.is_empty() {
+            return outcome;
+        }
+
+        // A payload no detector can read is a scan failure, never a pass: the
+        // checked projection reports the reason and the policy decides.
+        if let Err(err) = ctx.text_view_checked() {
+            tracing::warn!(
+                target: "openjiuwen_security::pipeline",
+                stage = %ctx.event,
+                content_type = ?ctx.content_type,
+                error = %err,
+                "guardrail context cannot be scanned"
+            );
+            let blocked =
+                self.record_failure(&mut outcome, CONTEXT_GUARDRAIL, UNSCANNABLE_RISK_TYPE, &err);
+            if blocked && self.policy.stop_on_block {
+                return outcome;
+            }
+        }
+
         for guardrail in selected {
             let name = guardrail.name().to_owned();
             match guardrail.check(ctx).await {
@@ -125,51 +166,69 @@ impl GuardrailPipeline {
                     }
                 }
                 Err(err) => {
-                    // The message never carries scanned content: only the
-                    // guardrail name and the error text.
-                    tracing::warn!(
-                        target: "openjiuwen_security::pipeline",
-                        stage = %ctx.event,
-                        guardrail = %name,
-                        error = %err,
-                        "guardrail evaluation failed"
-                    );
-                    let entry = format!("{name}: {err}");
-                    outcome.errors.push(entry.clone());
-                    outcome.evaluations.push(GuardrailEvaluation {
-                        guardrail: name.clone(),
-                        result: None,
-                        error: Some(entry),
-                    });
-                    if self.policy.failure_policy == FailurePolicy::FailClosed {
-                        let result = crate::GuardrailResult::block(
-                            RiskLevel::Critical,
-                            "guardrail_error",
-                            None,
-                            None,
-                        );
-                        outcome.risk_level = RiskLevel::Critical;
-                        outcome.findings.push(Finding {
-                            guardrail: name.clone(),
-                            risk_level: RiskLevel::Critical,
-                            risk_type: "guardrail_error".to_owned(),
-                            message: finding_message("guardrail_error", RiskLevel::Critical, true),
-                            blocking: true,
-                            details: result.details.clone(),
-                            modified_data: None,
-                        });
-                        outcome.decision = SecurityDecision::Block;
-                        if outcome.blocked_by.is_none() {
-                            outcome.blocked_by = Some(name);
-                        }
-                        if self.policy.stop_on_block {
-                            break;
-                        }
+                    let blocked =
+                        self.record_failure(&mut outcome, &name, GUARDRAIL_ERROR_RISK_TYPE, &err);
+                    if blocked && self.policy.stop_on_block {
+                        break;
                     }
                 }
             }
         }
         outcome
+    }
+
+    /// Records one scan failure and applies the [`FailurePolicy`].
+    ///
+    /// The entry is `"<guardrail>: <error>"` (the message never carries scanned
+    /// content: only the guardrail name and the error text), and the evaluation
+    /// keeps `result: None` so the failure can never be mistaken for a verdict.
+    /// Under [`FailurePolicy::FailClosed`] the failure also becomes a blocking
+    /// [`RiskLevel::Critical`] finding whose message and `details.error` carry
+    /// the reason; under [`FailurePolicy::FailOpen`] it is only recorded.
+    ///
+    /// Returns whether the failure blocked the call.
+    fn record_failure(
+        &self,
+        outcome: &mut GuardrailOutcome,
+        guardrail: &str,
+        risk_type: &str,
+        err: &openjiuwen_common::error::Error,
+    ) -> bool {
+        tracing::warn!(
+            target: "openjiuwen_security::pipeline",
+            stage = %outcome.stage,
+            guardrail = %guardrail,
+            failure_policy = ?self.policy.failure_policy,
+            error = %err,
+            "guardrail evaluation failed"
+        );
+        let entry = format!("{guardrail}: {err}");
+        outcome.errors.push(entry.clone());
+        outcome.evaluations.push(GuardrailEvaluation {
+            guardrail: guardrail.to_owned(),
+            result: None,
+            error: Some(entry),
+        });
+        if self.policy.failure_policy != FailurePolicy::FailClosed {
+            return false;
+        }
+
+        let reason = err.to_string();
+        outcome.risk_level = RiskLevel::Critical;
+        outcome.findings.push(Finding {
+            guardrail: guardrail.to_owned(),
+            risk_level: RiskLevel::Critical,
+            risk_type: risk_type.to_owned(),
+            message: format!("Guardrail blocked: {risk_type} risk detected ({reason})"),
+            blocking: true,
+            details: Some(serde_json::json!({ "error": reason })),
+            modified_data: None,
+        });
+        outcome.decision = SecurityDecision::Block;
+        if outcome.blocked_by.is_none() {
+            outcome.blocked_by = Some(guardrail.to_owned());
+        }
+        true
     }
 
     /// Scans `text` at `stage`.
@@ -480,8 +539,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fail_open_records_the_error_and_allows() {
-        let mut pipeline = GuardrailPipeline::new();
+    async fn fail_open_opt_in_records_the_error_and_allows() {
+        let mut pipeline = GuardrailPipeline::new().with_policy(SecurityPolicy {
+            failure_policy: FailurePolicy::FailOpen,
+            ..SecurityPolicy::default()
+        });
         pipeline.add(Recording::new("broken", Script::Fail("backend exploded")));
         pipeline.add(Recording::new("fine", Script::Pass));
 
@@ -499,11 +561,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fail_closed_turns_the_error_into_a_critical_finding() {
-        let mut pipeline = GuardrailPipeline::new().with_policy(SecurityPolicy {
-            failure_policy: FailurePolicy::FailClosed,
-            ..SecurityPolicy::default()
-        });
+    async fn a_guardrail_error_blocks_by_default() {
+        // The default policy is fail-closed: an unusable guardrail never reads
+        // as "safe".
+        let mut pipeline = GuardrailPipeline::new();
+        assert_eq!(
+            pipeline.policy().failure_policy,
+            FailurePolicy::FailClosed,
+            "the default policy must fail closed"
+        );
         pipeline.add(Recording::new("broken", Script::Fail("backend exploded")));
 
         let outcome = pipeline.scan_user_input("x").await;
@@ -511,14 +577,73 @@ mod tests {
         assert_eq!(outcome.risk_level, RiskLevel::Critical);
         assert_eq!(outcome.blocked_by.as_deref(), Some("broken"));
         assert_eq!(outcome.findings.len(), 1);
-        assert_eq!(outcome.findings[0].risk_type, "guardrail_error");
+        assert_eq!(outcome.findings[0].guardrail, "broken");
+        assert_eq!(outcome.findings[0].risk_type, GUARDRAIL_ERROR_RISK_TYPE);
         assert_eq!(outcome.findings[0].risk_level, RiskLevel::Critical);
         assert!(outcome.findings[0].blocking);
         assert_eq!(
             outcome.findings[0].message,
-            "Critical security risk detected: guardrail_error"
+            "Guardrail blocked: guardrail_error risk detected (security: backend exploded)"
+        );
+        assert_eq!(
+            outcome.findings[0].details,
+            Some(json!({"error": "security: backend exploded"}))
         );
         assert_eq!(outcome.errors.len(), 1);
+        assert_eq!(outcome.errors[0], "broken: security: backend exploded");
+        assert_eq!(
+            outcome.violation().unwrap().risk_type,
+            GUARDRAIL_ERROR_RISK_TYPE
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unscannable_context_blocks_by_default() {
+        let mut pipeline = GuardrailPipeline::new();
+        pipeline.add(Recording::new("recorder", Script::Pass));
+
+        let outcome = pipeline
+            .run(&GuardrailContext::raw("user_input", Value::Null))
+            .await;
+        assert!(outcome.is_blocked());
+        assert_eq!(outcome.blocked_by.as_deref(), Some(CONTEXT_GUARDRAIL));
+        assert_eq!(outcome.findings.len(), 1);
+        assert_eq!(outcome.findings[0].risk_type, UNSCANNABLE_RISK_TYPE);
+        assert!(outcome.findings[0].message.contains("unscannable content"));
+        assert_eq!(outcome.evaluations.len(), 1);
+        assert_eq!(outcome.evaluations[0].guardrail, CONTEXT_GUARDRAIL);
+        assert!(outcome.evaluations[0].error.is_some());
+        assert!(outcome.enforce().is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unscannable_context_is_only_recorded_under_fail_open() {
+        let mut pipeline = GuardrailPipeline::new().with_policy(SecurityPolicy {
+            failure_policy: FailurePolicy::FailOpen,
+            ..SecurityPolicy::default()
+        });
+        pipeline.add(Recording::new("recorder", Script::Pass));
+
+        let outcome = pipeline
+            .run(&GuardrailContext::raw("user_input", Value::Null))
+            .await;
+        assert!(outcome.is_safe());
+        assert_eq!(outcome.errors.len(), 1);
+        assert_eq!(outcome.evaluations.len(), 2, "the guardrail still ran");
+        assert_eq!(outcome.findings.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_pipeline_does_not_scan_and_does_not_fail() {
+        // Without a registered guardrail there is no detector whose failure
+        // could be hidden, so the pre-check stays silent.
+        let pipeline = GuardrailPipeline::default();
+        let outcome = pipeline
+            .run(&GuardrailContext::raw("user_input", Value::Null))
+            .await;
+        assert!(outcome.is_safe());
+        assert_eq!(outcome.errors, Vec::<String>::new());
+        assert_eq!(outcome.evaluations, Vec::<GuardrailEvaluation>::new());
     }
 
     #[tokio::test]

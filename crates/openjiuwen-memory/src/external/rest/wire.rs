@@ -350,6 +350,8 @@ pub trait WireSpec: Send + Sync {
 
     /// Decodes the listing response.
     ///
+    /// Called once per page, in page order, with the caller's filter.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Unsupported`] when
@@ -361,6 +363,29 @@ pub trait WireSpec: Send + Sync {
         _filter: &MemoryFilter,
     ) -> Result<Vec<MemoryRecord>> {
         Err(self.unsupported(Op::List))
+    }
+    /// Builds the listing request for the page after `page`, when the vendor pages.
+    ///
+    /// `page` is the 1-based index of the answer just decoded, so a vendor that pages by
+    /// number asks for `page + 1`. Returning `None` — the default — means "the collection
+    /// is exhausted", and is also the right answer for a vendor whose single answer is the
+    /// whole collection.
+    ///
+    /// [`list`](super::super::provider::MemoryProvider::list) keeps calling this until it
+    /// answers `None`, so an implementation must be able to say "no more" from the answer
+    /// it was given (a short page, a `next` cursor of `null`, an exhausted `total`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the answer cannot be inspected (a non-JSON body).
+    fn next_list_call(
+        &self,
+        _cx: &SpecContext<'_>,
+        _filter: &MemoryFilter,
+        _response: &HttpResponse,
+        _page: usize,
+    ) -> Result<Option<RestCall>> {
+        Ok(None)
     }
 
     /// Builds the bulk-delete request for `filter`.

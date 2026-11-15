@@ -53,6 +53,9 @@
 //! - [`schema`] — the data model: payload frames, events, intents, tasks,
 //!   statuses, and the batch/streaming controller output.
 //! - [`config`] — [`ControllerConfig`] and [`DefaultResponse`].
+//! - [`history`] — the per-conversation conversation history ([`HistoryEntry`],
+//!   [`HistoryRole`]) with its append-time and read-time trims ([`trim_history`],
+//!   [`window`]).
 //! - [`intent`] — [`IntentRecognizer`] (rule-based [`RuleIntentRecognizer`],
 //!   model-backed [`LlmIntentRecognizer`]) and the [`Planner`].
 //! - [`task_manager`] — the shared, indexed task store ([`TaskManager`],
@@ -95,6 +98,7 @@ pub mod base;
 pub mod config;
 pub mod executors;
 pub mod group;
+pub mod history;
 pub mod intent;
 pub mod legacy;
 pub mod queue;
@@ -112,6 +116,7 @@ pub use executors::{
     WorkflowController, AGENT_TASK_TYPE, LLM_TASK_TYPE, WORKFLOW_TASK_TYPE,
 };
 pub use group::{GroupMethod, GroupRouter};
+pub use history::{trim_history, window, HistoryEntry, HistoryRole};
 pub use intent::{
     IntentRecognizer, IntentRule, LlmIntentRecognizer, Planner, RuleIntentRecognizer,
     LLM_INTENT_PROMPT,

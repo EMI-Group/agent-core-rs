@@ -5,6 +5,12 @@
 //! Metadata follows the other office loaders (`source_type = "document"`) and
 //! adds the slide count, whether any slide has a speaker-notes part, and the
 //! `dc:title` the core-properties part carries, when it is present.
+//!
+//! A deck whose slide parts do not all resolve still loads, and says so:
+//! `pptx_incomplete` (`false`/`true`) and `pptx_problems` (the unresolved slide
+//! entries, in presentation order) are added to the document metadata, always
+//! present, so an ingestion pipeline can reject or flag a lossy deck instead of
+//! indexing it as if every slide had been read.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -35,12 +41,17 @@ impl PptxLoader {
 /// when speaker notes exist), and the metadata keeps `slide_count`, `has_notes`
 /// (true when any slide has a notes part, even an empty one), `source_type =
 /// "document"`, and `title` only when the core properties carry one.
+///
+/// `pptx_incomplete` (`true` iff any slide part failed to resolve) and
+/// `pptx_problems` (those unresolved entries, in presentation order; an empty
+/// array for a complete deck) are always inserted.
 fn presentation_document(presentation: PptxDocument) -> Document {
     let PptxDocument {
         text,
         slides,
         slide_count,
         title,
+        problems,
     } = presentation;
     let mut metadata = Metadata::new();
     if let Some(title) = title {
@@ -52,6 +63,14 @@ fn presentation_document(presentation: PptxDocument) -> Document {
     metadata.insert(
         "source_type".to_owned(),
         Value::String("document".to_owned()),
+    );
+    metadata.insert(
+        "pptx_incomplete".to_owned(),
+        Value::Bool(!problems.is_empty()),
+    );
+    metadata.insert(
+        "pptx_problems".to_owned(),
+        Value::Array(problems.into_iter().map(Value::String).collect()),
     );
     Document::new(text).with_metadata(metadata)
 }
@@ -67,6 +86,7 @@ impl DocumentLoader for PptxLoader {
         debug!(
             file = source,
             slides = presentation.slide_count,
+            problems = presentation.problems.len(),
             "loaded PPTX presentation"
         );
         Ok(vec![presentation_document(presentation)])
@@ -91,6 +111,8 @@ impl DocumentLoader for PptxLoader {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
     use openjiuwen_common::error::ErrorKind;
 
@@ -121,6 +143,44 @@ mod tests {
         pptx_slides(&[
             ("Rust rewrite", &["Agenda", "Offline"]),
             ("Closing & <thanks>", &[]),
+        ])
+        .unwrap()
+    }
+
+    /// A presentation part listing `ids` in order.
+    fn presentation(ids: &[&str]) -> String {
+        let mut entries = String::new();
+        for id in ids {
+            write!(entries, r#"<p:sldId id="256" r:id="{id}"/>"#).unwrap();
+        }
+        format!(
+            r#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst>{entries}</p:sldIdLst></p:presentation>"#
+        )
+    }
+
+    /// A relationships part mapping `(id, target)` pairs.
+    fn relationships(entries: &[(&str, &str)]) -> String {
+        let mut items = String::new();
+        for (id, target) in entries {
+            write!(
+                items,
+                r#"<Relationship Id="{id}" Type="slide" Target="{target}"/>"#
+            )
+            .unwrap();
+        }
+        format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{items}</Relationships>"#
+        )
+    }
+
+    /// A two-slide deck whose second `<p:sldId>` (`rId2`) is never mapped.
+    fn dangling_deck_bytes() -> Vec<u8> {
+        let presentation = presentation(&["rId1", "rId2"]);
+        let relationships = relationships(&[("rId1", "slides/slide1.xml")]);
+        build_zip(&[
+            ("ppt/presentation.xml", presentation.as_str()),
+            ("ppt/_rels/presentation.xml.rels", relationships.as_str()),
+            ("ppt/slides/slide1.xml", SLIDE_XML),
         ])
         .unwrap()
     }
@@ -183,6 +243,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dangling_slide_relationships_are_reported_in_the_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dangling.pptx");
+        std::fs::write(&path, dangling_deck_bytes()).unwrap();
+
+        let documents = PptxLoader::new()
+            .load(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(documents.len(), 1);
+        let document = &documents[0];
+        assert_eq!(document.metadata.get("slide_count"), Some(&Value::from(2)));
+        assert_eq!(
+            document.metadata.get("pptx_incomplete"),
+            Some(&Value::Bool(true))
+        );
+        let problems = document
+            .metadata
+            .get("pptx_problems")
+            .and_then(Value::as_array)
+            .expect("pptx_problems is an array");
+        assert_eq!(problems.len(), 1);
+        assert_eq!(
+            problems[0],
+            Value::String(
+                "slide 2: rId2 is not mapped by ppt/_rels/presentation.xml.rels".to_owned()
+            )
+        );
+        assert!(document.text.contains("! missing slide part: rId2"));
+        assert!(document.text.contains("## Slide 2"));
+    }
+
+    #[tokio::test]
+    async fn clean_decks_report_no_pptx_problems() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clean.pptx");
+        std::fs::write(&path, deck_bytes()).unwrap();
+
+        let documents = PptxLoader::new()
+            .load(path.to_str().unwrap())
+            .await
+            .unwrap();
+        let document = &documents[0];
+        assert_eq!(
+            document.metadata.get("pptx_incomplete"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            document.metadata.get("pptx_problems"),
+            Some(&Value::Array(Vec::new()))
+        );
+        assert!(!document.text.contains("! missing slide part:"));
+    }
+
+    #[tokio::test]
     async fn load_bytes_matches_the_path_documents() {
         let bytes = deck_bytes();
         let dir = tempfile::tempdir().unwrap();
@@ -211,7 +326,47 @@ mod tests {
             from_bytes[0].metadata.get("source_type"),
             from_path[0].metadata.get("source_type")
         );
+        assert_eq!(
+            from_bytes[0].metadata.get("pptx_incomplete"),
+            from_path[0].metadata.get("pptx_incomplete")
+        );
+        assert_eq!(
+            from_bytes[0].metadata.get("pptx_problems"),
+            from_path[0].metadata.get("pptx_problems")
+        );
         assert_eq!(from_bytes[0].id.len(), 36);
+    }
+
+    #[tokio::test]
+    async fn load_bytes_matches_the_path_problems_of_a_lossy_deck() {
+        let bytes = dangling_deck_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dangling.pptx");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let from_path = PptxLoader::new()
+            .load(path.to_str().unwrap())
+            .await
+            .unwrap();
+        let from_bytes = PptxLoader::new()
+            .load_bytes(
+                &DocumentBytes::new("dangling.pptx", bytes),
+                &LoadOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(from_bytes[0].text, from_path[0].text);
+        for key in ["pptx_incomplete", "pptx_problems", "slide_count"] {
+            assert_eq!(
+                from_bytes[0].metadata.get(key),
+                from_path[0].metadata.get(key),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            from_bytes[0].metadata.get("pptx_incomplete"),
+            Some(&Value::Bool(true))
+        );
     }
 
     #[tokio::test]

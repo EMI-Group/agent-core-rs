@@ -457,6 +457,43 @@ pub(super) async fn write_frame(state: &ProcessState, frame: &SpawnMessage) -> R
     })
 }
 
+/// Writes one `cancel` frame for `request_id`, carrying `reason` when known.
+///
+/// Cancellation deliberately does **not** take the exchange lock
+/// (`ProcessState::request`): the point of a cancel is to reach a child that is in
+/// the middle of an exchange, so only the serialized stdin writer is contended.
+/// The frame is the [`crate::spawn::CancelRequest`] payload
+/// (`{"request_id": …, "reason": … }`), and the child answers with
+/// [`SpawnMessageKind::CancelAck`] echoing the id — the exchange that owns the
+/// request reads that ack as one more frame it does not recognize, so the id
+/// correlates at the child, not in this handle.
+///
+/// A blank id is [`Error::Validation`] before anything is written; a handle that
+/// abandoned a stream is out of sync ([`Error::Validation`]), and a child that has
+/// already exited is a transport failure — both are the errors the exchanges
+/// already report, never a silent success.
+pub(super) async fn cancel_impl(
+    state: &ProcessState,
+    request_id: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    let frame = SpawnMessage::cancel(request_id, reason)?;
+    if state.desynchronized.load(Ordering::SeqCst) {
+        return Err(out_of_sync(state));
+    }
+    if !is_alive_impl(state) {
+        return Err(gone(state, "before the cancel frame could be written"));
+    }
+    write_frame(state, &frame).await?;
+    debug!(
+        target: TARGET,
+        pid = ?state.pid,
+        request_id,
+        "wrote a cancel frame to the child"
+    );
+    Ok(())
+}
+
 /// Reads one frame from the child's stdout.
 pub(super) async fn read_frame(state: &ProcessState) -> Result<Option<SpawnMessage>> {
     let mut stdout = state.stdout.lock().await;

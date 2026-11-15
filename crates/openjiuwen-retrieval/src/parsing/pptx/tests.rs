@@ -81,6 +81,13 @@ fn presentation(ids: &[&str]) -> String {
     )
 }
 
+/// A presentation part wrapping already-rendered `<p:sldId>` entries.
+fn presentation_raw(entries: &str) -> String {
+    format!(
+        r#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst>{entries}</p:sldIdLst></p:presentation>"#
+    )
+}
+
 /// A relationships part mapping `(id, target)` pairs.
 fn relationships(entries: &[(&str, &str)]) -> String {
     let mut items = String::new();
@@ -299,4 +306,215 @@ async fn parse_path_reads_files_and_reports_missing_ones() {
         .await
         .unwrap_err();
     assert_eq!(missing.kind(), ErrorKind::NotFound);
+}
+
+#[test]
+fn unresolved_slide_parts_keep_their_deck_position() {
+    let bytes = archive(&[
+        (
+            "ppt/presentation.xml",
+            presentation(&["rId1", "rId7", "rId8"]),
+        ),
+        (
+            "ppt/_rels/presentation.xml.rels",
+            relationships(&[("rId1", "slides/slide1.xml"), ("rId8", "slides/slide3.xml")]),
+        ),
+        (
+            "ppt/slides/slide1.xml",
+            slide_part(&shape(&paragraph(&run("real one")))),
+        ),
+    ]);
+    let document = PptxParser::new().parse_bytes(&bytes).unwrap();
+
+    assert_eq!(document.slide_count, 3);
+    assert_eq!(document.slides.len(), 3);
+    assert_eq!(
+        document
+            .slides
+            .iter()
+            .map(|slide| slide.index)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+
+    let resolved = document.slide(1).unwrap();
+    assert_eq!(resolved.text, "real one");
+    assert_eq!(resolved.missing_part, None);
+
+    let unmapped = document.slide(2).unwrap();
+    assert_eq!(unmapped.missing_part.as_deref(), Some("rId7"));
+    assert_eq!(unmapped.text, "! missing slide part: rId7");
+    assert_eq!(unmapped.title, None);
+    assert_eq!(unmapped.notes, None);
+    assert!(!unmapped.has_notes);
+
+    let absent = document.slide(3).unwrap();
+    assert_eq!(absent.missing_part.as_deref(), Some("rId8"));
+    assert_eq!(absent.text, "! missing slide part: rId8");
+    assert_eq!(absent.title, None);
+
+    assert_eq!(
+        document.problems,
+        vec![
+            "slide 2: rId7 is not mapped by ppt/_rels/presentation.xml.rels".to_owned(),
+            "slide 3: rId8 target slides/slide3.xml is missing from the archive".to_owned(),
+        ]
+    );
+    assert!(
+        document
+            .text
+            .starts_with("## Slide 1\nreal one\n## Slide 2\n"),
+        "{}",
+        document.text
+    );
+    assert!(
+        document
+            .text
+            .contains("## Slide 2\n! missing slide part: rId7"),
+        "{}",
+        document.text
+    );
+    assert!(
+        document
+            .text
+            .contains("## Slide 3\n! missing slide part: rId8"),
+        "{}",
+        document.text
+    );
+}
+
+#[test]
+fn sld_id_without_relationship_id_is_a_placeholder() {
+    let bytes = archive(&[
+        (
+            "ppt/presentation.xml",
+            presentation_raw(r#"<p:sldId id="256"/>"#),
+        ),
+        ("ppt/_rels/presentation.xml.rels", relationships(&[])),
+        (
+            "ppt/slides/slide1.xml",
+            slide_part(&shape(&paragraph(&run("unreachable")))),
+        ),
+    ]);
+    let document = PptxParser::new().parse_bytes(&bytes).unwrap();
+
+    // Declared entries exist, so the numeric fallback must not resurrect the
+    // part the presentation part failed to reference.
+    assert_eq!(document.slide_count, 1);
+    let slide = document.slide(1).unwrap();
+    assert_eq!(slide.missing_part.as_deref(), Some("<no r:id>"));
+    assert_eq!(slide.text, "! missing slide part: <no r:id>");
+    assert_eq!(
+        document.problems,
+        vec!["slide 1: <p:sldId> has no r:id".to_owned()]
+    );
+    assert_eq!(document.text, "## Slide 1\n! missing slide part: <no r:id>");
+}
+
+#[test]
+fn relationship_target_that_is_not_a_slide_is_a_placeholder() {
+    let bytes = archive(&[
+        ("ppt/presentation.xml", presentation(&["rId2"])),
+        (
+            "ppt/_rels/presentation.xml.rels",
+            relationships(&[("rId2", "media/image1.png")]),
+        ),
+        ("ppt/media/image1.png", "not a slide part".to_owned()),
+    ]);
+    let document = PptxParser::new().parse_bytes(&bytes).unwrap();
+
+    assert_eq!(document.slide_count, 1);
+    let slide = document.slide(1).unwrap();
+    assert_eq!(slide.missing_part.as_deref(), Some("rId2"));
+    assert_eq!(
+        document.problems,
+        vec!["slide 1: rId2 target media/image1.png is not a slide part".to_owned()]
+    );
+    assert!(document.text.contains("! missing slide part: rId2"));
+}
+
+#[test]
+fn complete_decks_report_no_problems() {
+    let bytes = archive(&[
+        ("ppt/presentation.xml", presentation(&["rId1", "rId2"])),
+        (
+            "ppt/_rels/presentation.xml.rels",
+            relationships(&[("rId1", "slides/slide1.xml"), ("rId2", "slides/slide2.xml")]),
+        ),
+        (
+            "ppt/slides/slide1.xml",
+            slide_part(&shape(&paragraph(&run("one")))),
+        ),
+        (
+            "ppt/slides/slide2.xml",
+            slide_part(&shape(&paragraph(&run("two")))),
+        ),
+    ]);
+    let document = PptxParser::new().parse_bytes(&bytes).unwrap();
+
+    assert_eq!(document.problems, Vec::<String>::new());
+    assert!(document
+        .slides
+        .iter()
+        .all(|slide| slide.missing_part.is_none()));
+    assert_eq!(document.slide_count, 2);
+    assert_eq!(document.text, "## Slide 1\none\n## Slide 2\ntwo");
+}
+
+#[test]
+fn empty_slide_list_still_falls_back_to_numeric_order() {
+    let bytes = archive(&[
+        ("ppt/presentation.xml", presentation(&[])),
+        ("ppt/_rels/presentation.xml.rels", relationships(&[])),
+        (
+            "ppt/slides/slide10.xml",
+            slide_part(&shape(&paragraph(&run("ten")))),
+        ),
+        (
+            "ppt/slides/slide2.xml",
+            slide_part(&shape(&paragraph(&run("two")))),
+        ),
+    ]);
+    let document = PptxParser::new().parse_bytes(&bytes).unwrap();
+
+    assert_eq!(document.slide_count, 2);
+    assert_eq!(document.slide(1).unwrap().text, "two");
+    assert_eq!(document.slide(2).unwrap().text, "ten");
+    assert_eq!(document.problems, Vec::<String>::new());
+    assert!(document
+        .slides
+        .iter()
+        .all(|slide| slide.missing_part.is_none()));
+}
+
+#[test]
+fn placeholder_fields_serialise_and_older_payloads_still_load() {
+    let placeholder = PptxSlide {
+        index: 2,
+        text: "! missing slide part: rId7".to_owned(),
+        missing_part: Some("rId7".to_owned()),
+        ..PptxSlide::default()
+    };
+    let json = serde_json::to_value(&placeholder).unwrap();
+    assert_eq!(json["missing_part"], serde_json::json!("rId7"));
+    assert_eq!(json["index"], serde_json::json!(2));
+
+    let without_field = serde_json::json!({
+        "index": 1,
+        "text": "body",
+        "title": null,
+        "notes": null,
+        "has_notes": false
+    });
+    let parsed: PptxSlide = serde_json::from_value(without_field).unwrap();
+    assert_eq!(parsed.missing_part, None);
+
+    let document_without_problems = serde_json::json!({
+        "text": "## Slide 1\nbody",
+        "slides": [],
+        "slide_count": 0,
+        "title": null
+    });
+    let parsed: PptxDocument = serde_json::from_value(document_without_problems).unwrap();
+    assert_eq!(parsed.problems, Vec::<String>::new());
 }

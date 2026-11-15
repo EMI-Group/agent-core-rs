@@ -27,7 +27,7 @@ use openjiuwen_security::{
     LlmPromptInjectionBackend, LlmPromptInjectionBackendConfig, LocalModelBackend,
     LocalModelBackendConfig, ModelOutputParser, ModerationRequest, ModerationTransport,
     PromptInjectionGuardrail, PromptInjectionGuardrailConfig, QwenGuardParser, RiskLevel,
-    RuleBasedPromptInjectionBackend, ScanStage, SecurityPolicy, Thresholds,
+    RuleBasedPromptInjectionBackend, ScanStage, SecurityDecision, SecurityPolicy, Thresholds,
 };
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
@@ -399,7 +399,7 @@ mod parsers {
     /// Asserts `output` grades to `expected`, with `risk_type` set exactly when
     /// the level is risky.
     fn assert_bert_level(parser: &BertBinaryParser, output: &Value, expected: RiskLevel) {
-        let assessment = parser.parse(output);
+        let assessment = parser.parse(output).expect("a recognized dialect");
         assert_eq!(assessment.risk_level, expected, "{output}");
         assert_eq!(assessment.has_risk, expected != RiskLevel::Safe, "{output}");
         if expected == RiskLevel::Safe {
@@ -418,6 +418,30 @@ mod parsers {
         assessment.details.as_ref().unwrap()["predicted_class"]
             .as_i64()
             .unwrap()
+    }
+
+    /// Asserts `parser` rejects `output` as an unrecognized dialect.
+    ///
+    /// The error must be a validation error naming the parser and its expected
+    /// dialects, and it must never echo the payload it refused to grade.
+    fn assert_unrecognized(parser: &dyn ModelOutputParser, output: &Value) {
+        let error = parser
+            .parse(output)
+            .expect_err("an unrecognized output must fail, never grade safe");
+        assert_eq!(error.kind(), ErrorKind::Validation, "{output}: {error}");
+        let message = error.to_string();
+        assert!(
+            message.contains(parser.name()),
+            "{output}: the message names the parser: {message}"
+        );
+        assert!(
+            message.contains("unrecognized"),
+            "{output}: the message says the dialect is unrecognized: {message}"
+        );
+        assert!(
+            !message.contains(&output.to_string()),
+            "{output}: the message must not echo the payload: {message}"
+        );
     }
 
     // ports tests/unit_tests/core/security/guardrail/test_parsers_and_backends.py
@@ -484,35 +508,39 @@ mod parsers {
         let parser = BertBinaryParser::new();
 
         // `label`/`score`.
-        let labelled = parser.parse(&json!({"label": 1, "score": 0.97}));
+        let labelled = parser
+            .parse(&json!({"label": 1, "score": 0.97}))
+            .expect("a recognized dialect");
         assert!(labelled.has_risk);
         assert_eq!(labelled.risk_level, RiskLevel::High);
         assert_eq!(predicted_class(&labelled), 1);
 
         // Probabilities: argmax picks the class, the maximum is the confidence.
-        let probable = parser.parse(&json!({"probabilities": [0.1, 0.9]}));
+        let probable = parser
+            .parse(&json!({"probabilities": [0.1, 0.9]}))
+            .expect("a recognized dialect");
         assert!(probable.has_risk);
         assert_eq!(probable.risk_level, RiskLevel::Medium);
         assert!((probable.confidence - 0.9).abs() < 1e-9);
 
         // Logits are softmaxed before the argmax rule.
-        let logits = parser.parse(&json!({"logits": [0.0, 2.0]}));
+        let logits = parser
+            .parse(&json!({"logits": [0.0, 2.0]}))
+            .expect("a recognized dialect");
         assert!(logits.has_risk);
         assert_eq!(predicted_class(&logits), 1);
 
         // A bare array is interpreted with the same argmax/max rule.
-        let listed = parser.parse(&json!([0.2, 0.8]));
+        let listed = parser
+            .parse(&json!([0.2, 0.8]))
+            .expect("a recognized dialect");
         assert!(listed.has_risk);
         assert!((listed.confidence - 0.8).abs() < 1e-9);
 
         // A bare number above 0.5 is an attack.
-        let bare = parser.parse(&json!(0.9));
+        let bare = parser.parse(&json!(0.9)).expect("a recognized dialect");
         assert!(bare.has_risk);
         assert_eq!(bare.risk_level, RiskLevel::Medium);
-
-        // Anything unrecognized degrades to safe instead of failing.
-        assert_bert_level(&parser, &json!({}), RiskLevel::Safe);
-        assert_bert_level(&parser, &json!("not a model reply"), RiskLevel::Safe);
     }
 
     // ports tests/unit_tests/core/security/guardrail/test_parsers_and_backends.py
@@ -522,7 +550,9 @@ mod parsers {
         let parser = BertBinaryParser::new().with_attack_class_id(0);
         assert_eq!(parser.attack_class_id, 0);
 
-        let flipped = parser.parse(&json!({"predicted_class": 0, "confidence": 0.97}));
+        let flipped = parser
+            .parse(&json!({"predicted_class": 0, "confidence": 0.97}))
+            .expect("a recognized dialect");
         assert!(flipped.has_risk);
         assert_eq!(flipped.risk_level, RiskLevel::High);
         assert!(
@@ -549,7 +579,9 @@ mod parsers {
         assert_eq!(parser.name(), "qwen_guard");
 
         // Standard `safety`/`categories` object.
-        let standard = parser.parse(&json!({"safety": "unsafe", "categories": ["violence"]}));
+        let standard = parser
+            .parse(&json!({"safety": "unsafe", "categories": ["violence"]}))
+            .expect("a recognized dialect");
         assert!(standard.has_risk);
         assert_eq!(standard.risk_level, RiskLevel::High);
         assert_eq!(standard.risk_type.as_deref(), Some("violence"));
@@ -558,39 +590,58 @@ mod parsers {
             json!("unsafe")
         );
 
-        let safe = parser.parse(&json!({"safety": "safe"}));
+        let safe = parser
+            .parse(&json!({"safety": "safe"}))
+            .expect("a recognized dialect");
         assert!(!safe.has_risk);
         assert_eq!(safe.risk_level, RiskLevel::Safe);
         assert_eq!(safe.risk_type, None);
 
         // Rich `analysis` dialect.
-        let analysis = parser.parse(&json!({
-            "analysis": {"risk_level": "controversial", "risk_categories": ["hate"]},
-            "decision": "review",
-        }));
+        let analysis = parser
+            .parse(&json!({
+                "analysis": {"risk_level": "controversial", "risk_categories": ["hate"]},
+                "decision": "review",
+            }))
+            .expect("a recognized dialect");
         assert!(analysis.has_risk);
         assert_eq!(analysis.risk_level, RiskLevel::Medium);
         assert_eq!(analysis.risk_type.as_deref(), Some("hate"));
 
         // Legacy `judgment` dialect reports the parser's configured risk type.
-        let judgment = parser.parse(&json!({"judgment": "Unsafe", "reason": "policy"}));
+        let judgment = parser
+            .parse(&json!({"judgment": "Unsafe", "reason": "policy"}))
+            .expect("a recognized dialect");
         assert!(judgment.has_risk);
         assert_eq!(judgment.risk_level, RiskLevel::High);
         assert_eq!(judgment.risk_type.as_deref(), Some("content_risk"));
 
         // Legacy API dialect: `unsafe` is the verdict Python's map knows.
-        let api = parser.parse(&json!({"severity_level": "unsafe", "reason": "policy"}));
+        let api = parser
+            .parse(&json!({"severity_level": "unsafe", "reason": "policy"}))
+            .expect("a recognized dialect");
         assert!(api.has_risk);
         assert_eq!(api.risk_level, RiskLevel::High);
 
-        // `HIGH` is not one of the three model verdicts, so it degrades to the
-        // parser default (`Safe`), exactly like Python's `_map_risk_level`.
-        let unrelated = parser.parse(&json!({"severity_level": "HIGH"}));
-        assert!(!unrelated.has_risk);
-        assert_eq!(unrelated.risk_level, RiskLevel::Safe);
+        // `HIGH` is a recognized severity word, so it maps exactly. An unknown
+        // *level value* inside a recognized shape is never a parse error: it
+        // errs upward at the parser's `Critical` default.
+        let unrelated = parser
+            .parse(&json!({"severity_level": "HIGH"}))
+            .expect("a recognized dialect");
+        assert!(unrelated.has_risk);
+        assert_eq!(unrelated.risk_level, RiskLevel::High);
+
+        let unmappable = parser
+            .parse(&json!({"severity_level": "totally-unheard-of"}))
+            .expect("a recognized dialect");
+        assert!(unmappable.has_risk);
+        assert_eq!(unmappable.risk_level, RiskLevel::Critical);
 
         // Generic `risk_level` fallback.
-        let generic = parser.parse(&json!({"risk_level": "unsafe"}));
+        let generic = parser
+            .parse(&json!({"risk_level": "unsafe"}))
+            .expect("a recognized dialect");
         assert!(generic.has_risk);
         assert_eq!(generic.risk_level, RiskLevel::High);
         assert_eq!(generic.risk_type.as_deref(), Some("content_risk"));
@@ -608,25 +659,52 @@ mod parsers {
             "categories": ["violence"],
         }))
         .unwrap();
-        let from_json_string = parser.parse(&json!(wrapped));
+        let from_json_string = parser.parse(&json!(wrapped)).expect("a recognized dialect");
         assert!(from_json_string.has_risk);
         assert_eq!(from_json_string.risk_level, RiskLevel::High);
         assert_eq!(from_json_string.risk_type.as_deref(), Some("violence"));
 
-        let text = parser.parse(&json!("safety: unsafe"));
+        let text = parser
+            .parse(&json!("safety: unsafe"))
+            .expect("a recognized dialect");
         assert!(text.has_risk);
         assert_eq!(text.risk_level, RiskLevel::High);
 
-        let text_with_categories =
-            parser.parse(&json!("Safety: Controversial\nCategories: Political"));
+        let text_with_categories = parser
+            .parse(&json!("Safety: Controversial\nCategories: Political"))
+            .expect("a recognized dialect");
         assert!(text_with_categories.has_risk);
         assert_eq!(text_with_categories.risk_level, RiskLevel::Medium);
         assert_eq!(text_with_categories.risk_type.as_deref(), Some("Political"));
+    }
 
-        // Text without a verdict keyword falls back to safe.
-        let fallback = parser.parse(&json!("this reply mentions no verdict"));
-        assert!(!fallback.has_risk);
-        assert_eq!(fallback.risk_level, RiskLevel::Safe);
+    // ports tests/unit_tests/core/security/guardrail/test_parsers_and_backends.py
+    // (TestBertBinaryParser / TestQwenGuardParser): an output outside every
+    // documented dialect is a typed failure. It must never degrade to `Safe`,
+    // and the message must never echo the payload.
+    #[test]
+    fn unrecognized_replies_are_validation_errors_never_safe_grades() {
+        let bert = BertBinaryParser::new();
+        let qwen = QwenGuardParser::new();
+        let unrecognized = [
+            json!({}),
+            json!({"unrelated": 1}),
+            Value::Null,
+            json!(true),
+            json!("this reply mentions no verdict"),
+            json!([0.5]),
+        ];
+
+        for output in &unrecognized {
+            assert_unrecognized(&bert, output);
+            assert_unrecognized(&qwen, output);
+        }
+
+        // A recognized bert shape whose *level value* is unusable still grades
+        // (class 0 is always safe); only an unrecognized shape is an error.
+        assert_bert_level(&bert, &json!({"predicted_class": 0}), RiskLevel::Safe);
+        assert_unrecognized(&bert, &json!({"probabilities": [0.9]}));
+        assert_unrecognized(&bert, &json!({"logits": [1.0]}));
     }
 }
 
@@ -821,8 +899,7 @@ mod api_backend {
 
     // ports tests/unit_tests/core/security/guardrail/test_guardrail_base.py
     #[tokio::test]
-    async fn the_pipeline_records_findings_and_failures_per_its_policy() {
-        // A detection is a non-blocking HIGH finding.
+    async fn the_pipeline_records_a_detection_as_a_finding() {
         let finding_fake =
             FakeTransport::returning(json!({"predicted_class": 1, "confidence": 0.99}));
         let finding_backend = ApiModelBackend::new(api_config())
@@ -840,11 +917,72 @@ mod api_backend {
         assert!(!outcome.findings[0].blocking);
         assert_eq!(outcome.errors.len(), 0);
         assert_eq!(finding_fake.calls().len(), 1);
+    }
 
-        // A transport failure is fail-open by default: recorded, never thrown.
+    // ports tests/unit_tests/core/security/guardrail/test_guardrail_base.py:
+    // Python's callback framework swallowed a guardrail error and execution
+    // continued. Here that behavior is the explicit `FailOpen` opt-in; the
+    // default policy fails closed.
+    #[tokio::test]
+    async fn a_transport_failure_blocks_by_default_and_is_recorded_under_fail_open() {
         let failure_fake = FakeTransport::failing("moderation service unavailable");
+
+        // The default policy is fail-closed: a transport failure blocks the call
+        // with a `guardrail_error` finding instead of reading as "allowed".
+        let closed_backend =
+            ApiModelBackend::new(api_config()).with_transport(failure_fake.clone());
+        let outcome = pipeline_with(BackendGuardrail::new("api", Arc::new(closed_backend)))
+            .scan_user_input("hello")
+            .await;
+        assert!(outcome.is_blocked(), "the default policy fails closed");
+        assert_eq!(outcome.decision, SecurityDecision::Block);
+        assert_eq!(outcome.risk_level, RiskLevel::Critical);
+        assert_eq!(outcome.blocked_by.as_deref(), Some("api"));
+        assert_eq!(outcome.findings.len(), 1, "one finding per failure");
+        let finding = &outcome.findings[0];
+        assert_eq!(finding.risk_type, "guardrail_error");
+        assert_eq!(finding.risk_level, RiskLevel::Critical);
+        assert!(finding.blocking);
+        assert!(
+            finding
+                .message
+                .contains("Guardrail blocked: guardrail_error risk detected"),
+            "{}",
+            finding.message
+        );
+        assert!(
+            finding.message.contains("unavailable"),
+            "the message carries the reason: {}",
+            finding.message
+        );
+        assert_eq!(
+            finding.details.as_ref().unwrap()["error"],
+            json!("security: moderation service unavailable")
+        );
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(outcome.errors[0].contains("api:"), "{:?}", outcome.errors);
+        assert!(
+            outcome.errors[0].contains("unavailable"),
+            "{:?}",
+            outcome.errors
+        );
+        assert_eq!(outcome.evaluations.len(), 1);
+        assert!(outcome.evaluations[0].result.is_none());
+        assert!(outcome.evaluations[0].error.is_some());
+        assert_eq!(
+            outcome.enforce().unwrap_err().kind(),
+            ErrorKind::Security,
+            "a failure blocks instead of passing the guarded call"
+        );
+
+        // Fail-open is the explicit opt-in: the same failure is recorded only.
         let open_backend = ApiModelBackend::new(api_config()).with_transport(failure_fake.clone());
-        let open = pipeline_with(BackendGuardrail::new("api", Arc::new(open_backend)));
+        let open = pipeline_with(BackendGuardrail::new("api", Arc::new(open_backend))).with_policy(
+            SecurityPolicy {
+                failure_policy: FailurePolicy::FailOpen,
+                ..SecurityPolicy::default()
+            },
+        );
         let outcome = open.scan_user_input("hello").await;
         assert!(outcome.is_safe());
         assert_eq!(outcome.findings.len(), 0);
@@ -859,22 +997,53 @@ mod api_backend {
         assert!(outcome.evaluations[0].result.is_none());
         assert!(outcome.evaluations[0].error.is_some());
         assert!(outcome.enforce().is_ok());
-
-        // Fail-closed turns the same failure into a blocking `guardrail_error`.
-        let closed_backend =
-            ApiModelBackend::new(api_config()).with_transport(failure_fake.clone());
-        let mut closed = GuardrailPipeline::new().with_policy(SecurityPolicy {
-            failure_policy: FailurePolicy::FailClosed,
-            ..SecurityPolicy::default()
-        });
-        closed.add(BackendGuardrail::new("api", Arc::new(closed_backend)));
-        let outcome = closed.scan_user_input("hello").await;
-        assert!(outcome.is_blocked());
-        assert_eq!(outcome.risk_level, RiskLevel::Critical);
-        assert_eq!(outcome.findings.len(), 1);
-        assert_eq!(outcome.findings[0].risk_type, "guardrail_error");
-        assert_eq!(outcome.enforce().unwrap_err().kind(), ErrorKind::Security);
         assert_eq!(failure_fake.calls().len(), 2);
+    }
+
+    // No Python equivalent: Python's `APIModelBackend` degraded a reply its
+    // parser could not read to a safe grade. It is a parse failure here.
+    #[tokio::test]
+    async fn an_unrecognized_reply_is_a_parse_failure_not_a_pass() {
+        let garbage_fake = FakeTransport::returning(json!({}));
+        let garbage_backend =
+            ApiModelBackend::new(api_config()).with_transport(garbage_fake.clone());
+        let outcome = pipeline_with(BackendGuardrail::new("api", Arc::new(garbage_backend)))
+            .scan_user_input("hello")
+            .await;
+        assert!(outcome.is_blocked(), "an unrecognized reply is not a pass");
+        assert_eq!(outcome.findings[0].risk_type, "guardrail_error");
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            outcome.errors[0].contains("unrecognized"),
+            "the failure names the unrecognized dialect: {:?}",
+            outcome.errors
+        );
+        assert!(
+            outcome.errors[0].contains("bert_binary"),
+            "the failure names the parser: {:?}",
+            outcome.errors
+        );
+        assert_eq!(outcome.enforce().unwrap_err().kind(), ErrorKind::Security);
+        assert_eq!(garbage_fake.calls().len(), 1, "grading never retries");
+    }
+
+    #[tokio::test]
+    async fn an_unscannable_context_is_a_validation_error_from_check() {
+        let guardrail = PromptInjectionGuardrail::new();
+        let non_string_text = GuardrailContext {
+            content_type: openjiuwen_security::GuardrailContentType::Text,
+            content: json!(5),
+            event: ScanStage::LlmInvokeInput.event().to_owned(),
+            metadata: std::collections::BTreeMap::new(),
+        };
+        for ctx in [
+            GuardrailContext::raw("llm_invoke_input", Value::Null),
+            non_string_text,
+        ] {
+            let error = guardrail.check(&ctx).await.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Validation, "{ctx:?}");
+            assert!(error.to_string().contains("unscannable content"), "{error}");
+        }
     }
 }
 
@@ -906,6 +1075,93 @@ mod local_backend {
         let error = backend.analyze(&non_empty).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
         assert!(error.to_string().contains("inference runtime"), "{error}");
+    }
+}
+
+mod local_mode {
+    use super::*;
+
+    /// A complete `local`-mode configuration: the mode validates, but the
+    /// in-process inference runtime it needs is not linked.
+    fn local_guardrail() -> PromptInjectionGuardrail {
+        PromptInjectionGuardrail::with_config(PromptInjectionGuardrailConfig {
+            mode: "local".to_owned(),
+            model_type: Some("qwen".to_owned()),
+            model_path: Some("/models/qwen-guard".to_owned()),
+            ..PromptInjectionGuardrailConfig::default()
+        })
+        .expect("a complete local configuration")
+    }
+
+    // ports tests/unit_tests/core/security/guardrail/test_parsers_and_backends.py
+    // (TestPromptInjectionGuardrail::test_local_mode): a valid local
+    // configuration whose runtime is missing is a *detection failure*, so the
+    // default fail-closed policy blocks every non-empty scan.
+    #[tokio::test]
+    async fn a_complete_local_config_blocks_by_default_and_is_allowed_only_when_fail_open() {
+        let guardrail = local_guardrail();
+        assert_eq!(guardrail.backend_name(), "local_model");
+
+        let outcome = pipeline_with(guardrail)
+            .scan_text(ScanStage::LlmInvokeInput, "hello there")
+            .await;
+        assert!(
+            outcome.is_blocked(),
+            "a missing runtime must never read as a pass"
+        );
+        assert_eq!(outcome.decision, SecurityDecision::Block);
+        assert_eq!(outcome.risk_level, RiskLevel::Critical);
+        assert_eq!(outcome.blocked_by.as_deref(), Some("prompt_injection"));
+        assert_eq!(outcome.findings.len(), 1);
+        let finding = &outcome.findings[0];
+        assert_eq!(finding.risk_type, "guardrail_error");
+        assert_eq!(finding.risk_level, RiskLevel::Critical);
+        assert!(finding.blocking);
+        assert!(
+            finding
+                .message
+                .contains("Guardrail blocked: guardrail_error risk detected"),
+            "{}",
+            finding.message
+        );
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            outcome.errors[0].contains("prompt_injection:"),
+            "{:?}",
+            outcome.errors
+        );
+        assert!(
+            outcome.errors[0].contains("inference runtime"),
+            "{:?}",
+            outcome.errors
+        );
+        assert_eq!(outcome.enforce().unwrap_err().kind(), ErrorKind::Security);
+
+        // An empty payload carries nothing to detect, so it is not a failure.
+        let empty = pipeline_with(local_guardrail())
+            .scan_text(ScanStage::LlmInvokeInput, "   ")
+            .await;
+        assert!(empty.is_safe());
+        assert_eq!(empty.findings.len(), 0);
+        assert_eq!(empty.errors.len(), 0);
+
+        // `FailOpen` is the explicit opt-in that lets the same scan through.
+        let open = pipeline_with(local_guardrail()).with_policy(SecurityPolicy {
+            failure_policy: FailurePolicy::FailOpen,
+            ..SecurityPolicy::default()
+        });
+        let outcome = open
+            .scan_text(ScanStage::LlmInvokeInput, "hello there")
+            .await;
+        assert!(outcome.is_safe());
+        assert_eq!(outcome.findings.len(), 0);
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            outcome.errors[0].contains("inference runtime"),
+            "{:?}",
+            outcome.errors
+        );
+        assert!(outcome.enforce().is_ok());
     }
 }
 
@@ -1053,5 +1309,86 @@ mod api_mode {
                 "the configured api_key is sent as a bearer token"
             );
         }
+    }
+
+    /// An `api`-mode guardrail pointed at `server`, parsing with `bert`.
+    fn http_guardrail(server: &MockServer) -> PromptInjectionGuardrail {
+        PromptInjectionGuardrail::with_config(PromptInjectionGuardrailConfig {
+            mode: "api".to_owned(),
+            api_url: Some(format!("{}/detect", server.uri())),
+            model_type: Some("bert".to_owned()),
+            ..PromptInjectionGuardrailConfig::default()
+        })
+        .expect("a complete api configuration")
+    }
+
+    // No Python equivalent: Python's `APIModelBackend` degraded an unparsable
+    // reply to a safe grade. A reply the parser cannot recognize is a detection
+    // failure, so the default fail-closed policy blocks the scan.
+    #[tokio::test]
+    async fn an_unrecognized_http_reply_blocks_instead_of_reading_as_safe() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guardrail = http_guardrail(&server);
+        let mut pipeline = GuardrailPipeline::new();
+        pipeline.add(BackendGuardrail::new(
+            guardrail.backend_name().to_owned(),
+            Arc::clone(guardrail.backend()),
+        ));
+
+        let outcome = pipeline
+            .scan_text(ScanStage::LlmInvokeInput, "hello there")
+            .await;
+        assert!(
+            outcome.is_blocked(),
+            "an unrecognized reply is not a safe verdict"
+        );
+        assert_eq!(outcome.decision, SecurityDecision::Block);
+        assert_eq!(outcome.risk_level, RiskLevel::Critical);
+        assert_eq!(outcome.findings.len(), 1);
+        let finding = &outcome.findings[0];
+        assert_eq!(finding.risk_type, "guardrail_error");
+        assert_eq!(finding.risk_level, RiskLevel::Critical);
+        assert!(finding.blocking);
+        assert!(
+            finding.details.as_ref().unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("unrecognized"),
+            "the finding details name the unrecognized dialect: {:?}",
+            finding.details
+        );
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            outcome.errors[0].contains("api_model:"),
+            "{:?}",
+            outcome.errors
+        );
+        assert!(
+            outcome.errors[0].contains("bert_binary"),
+            "{:?}",
+            outcome.errors
+        );
+        assert!(
+            outcome.errors[0].contains("unrecognized"),
+            "{:?}",
+            outcome.errors
+        );
+        assert_eq!(
+            outcome.enforce().unwrap_err().kind(),
+            ErrorKind::Security,
+            "the blocked outcome enforces as a security error"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "a reply that fails to parse is not retried"
+        );
     }
 }

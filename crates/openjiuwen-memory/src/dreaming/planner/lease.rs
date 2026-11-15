@@ -65,7 +65,10 @@ impl DreamPlanner {
     /// - Afterwards — including after a lost lease — the lease is released with
     ///   [`DreamLeaseGuard::release`]. `false` is not an error: it only means the lease was
     ///   already gone (released, expired and taken over, or deleted), so it is logged at
-    ///   debug level.
+    ///   debug level. A failed transition write has already requeued the job (the shared
+    ///   recording path does that before the error escapes), so releasing the lease cannot
+    ///   strand it; when both the attempt and the release fail, the attempt's error
+    ///   propagates and the release failure is logged instead of being dropped.
     ///
     /// A terminally completed, skipped, cancelled, requeued, or terminally failed job all
     /// leave the job's lease released. A cancelled consolidator still completes the job as
@@ -127,7 +130,6 @@ impl DreamPlanner {
                 .leased_attempt(&job, &guard, now, ctx, options, &mut summary)
                 .await;
             let released = guard.release().await;
-            let stop = attempt?;
             match released {
                 Ok(true) => tracing::debug!(
                     target: "openjiuwen_memory::dreaming::planner::lease",
@@ -139,8 +141,19 @@ impl DreamPlanner {
                     job_id = %job.id,
                     "the dream lease was already gone at release time"
                 ),
+                // The attempt's own error is what the caller must see; a release failure
+                // alongside it is reported here instead of being dropped silently. The
+                // planner has already requeued the job before returning its error, so a
+                // stale lease row cannot strand it.
+                Err(error) if attempt.is_err() => tracing::error!(
+                    target: "openjiuwen_memory::dreaming::planner::lease",
+                    job_id = %job.id,
+                    %error,
+                    "could not release the dream lease after a failed attempt"
+                ),
                 Err(error) => return Err(error),
             }
+            let stop = attempt?;
             if stop {
                 break;
             }

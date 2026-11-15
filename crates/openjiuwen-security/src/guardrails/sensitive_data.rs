@@ -453,7 +453,9 @@ impl Guardrail for SensitiveDataGuardrail {
     }
 
     async fn check(&self, ctx: &GuardrailContext) -> Result<GuardrailResult> {
-        let text = ctx.text_view();
+        // An unscannable payload is a typed failure, not a pass: the pipeline's
+        // failure policy decides whether it blocks.
+        let text = ctx.text_view_checked()?;
         if text.trim().is_empty() {
             return Ok(GuardrailResult::pass());
         }
@@ -693,6 +695,26 @@ mod tests {
             assert_eq!(result.modified_data, None);
         }
         assert_eq!(guardrail.redact_text("").matches.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn unscannable_payload_is_a_validation_error() {
+        let guardrail = SensitiveDataGuardrail::new();
+        let error = guardrail
+            .check(&GuardrailContext::raw(
+                "user_input",
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.to_string().contains("unscannable content"), "{error}");
+
+        // A scannable empty text still passes: nothing to find is not a
+        // failure.
+        let empty = guardrail.check(&text_ctx("")).await.unwrap();
+        assert!(empty.is_safe());
+        assert_eq!(empty.risk_level, RiskLevel::Safe);
     }
 
     #[test]

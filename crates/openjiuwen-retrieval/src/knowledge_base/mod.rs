@@ -46,7 +46,11 @@ use crate::rewrite::QueryRewriter;
 use crate::sparse::Bm25Index;
 use crate::vector_store::{VectorRecord, VectorStore, DOC_ID_FIELD};
 
-pub use multi::{retrieve_multi_kb, retrieve_multi_kb_with_source};
+pub use multi::{
+    retrieve_multi_kb, retrieve_multi_kb_reporting, retrieve_multi_kb_strict,
+    retrieve_multi_kb_with_source, retrieve_multi_kb_with_source_reporting,
+    retrieve_multi_kb_with_source_strict, MultiKbFailure, MultiKbReport, MultiKbSourceReport,
+};
 
 /// Default iteration budget of the agentic retrieval loop ([`DEFAULT_MAX_ITER`]).
 pub const DEFAULT_AGENTIC_ITERATIONS: usize = DEFAULT_MAX_ITER;

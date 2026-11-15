@@ -6,7 +6,7 @@
 //! configuration and builds the ordered [`GuardrailPipeline`].
 #![allow(clippy::module_name_repetitions)]
 
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::guardrails::content_rules::{ContentRuleGuardrail, ContentRuleGuardrailConfig};
@@ -18,14 +18,27 @@ use crate::guardrails::tool_arguments::{ToolArgumentGuardrail, ToolArgumentGuard
 use crate::{GuardrailPipeline, RiskLevel, ScanStage};
 
 /// How guardrail failures (errors, not findings) are treated.
+///
+/// A *failure* is a detector that could not reach a verdict: a backend error, an
+/// unusable reply, an unrecognized model-output dialect, or a payload that
+/// cannot be projected to text. Failures are distinct from findings, which are
+/// successful verdicts of unsafe content.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailurePolicy {
-    /// Record the failure and continue; the default, and Python's behavior.
+    /// Treat the failure as a blocking [`crate::RiskLevel::Critical`] finding
+    /// (`risk_type = "guardrail_error"`, or `"unscannable_content"` for a
+    /// payload no detector can read) whose message names the reason; the
+    /// default, because an unusable detector must never read as "safe".
     #[default]
-    FailOpen,
-    /// Treat the failure as a blocking [`crate::RiskLevel::Critical`] finding.
     FailClosed,
+    /// Record the failure in [`crate::GuardrailOutcome::errors`] and log it, but
+    /// leave the decision unchanged.
+    ///
+    /// This is Python's behavior (the callback framework swallows guardrail
+    /// errors) and is only appropriate when availability outweighs detection:
+    /// opt in explicitly, never by omission.
+    FailOpen,
 }
 
 /// Thresholds and switches of the content-safety pipeline.
@@ -42,11 +55,11 @@ pub struct SecurityPolicy {
 }
 
 impl Default for SecurityPolicy {
-    /// Python's effective policy: block at `CRITICAL`, fail open, stop on block.
+    /// Block at `CRITICAL` and fail closed: a failing detector blocks the call.
     fn default() -> Self {
         Self {
             block_level: default_block_level(),
-            failure_policy: FailurePolicy::FailOpen,
+            failure_policy: FailurePolicy::FailClosed,
             stop_on_block: true,
         }
     }
@@ -124,6 +137,12 @@ impl ScanTargets {
 /// The detector configs `prompt_injection`, `sensitive_data`, `content_rules`,
 /// and `tool_arguments` are only consulted when [`Self::enabled`] is `true`;
 /// with security disabled they still round-trip through JSON unchanged.
+///
+/// An *enabled* config must produce at least one guardrail: a config that scans
+/// nothing is a configuration error unless [`Self::allow_all`] is set, so a
+/// misspelled or empty detector table can never silently protect nothing.
+/// `enabled = false` is itself an explicit off switch and keeps building the
+/// empty pipeline it documents.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct SecurityConfig {
@@ -133,6 +152,13 @@ pub struct SecurityConfig {
     /// [`SecurityConfig::pipeline`], but no guardrail is registered, so the
     /// resulting pipeline never produces a finding.
     pub enabled: bool,
+    /// Explicit opt-in for an enabled config that registers no guardrail.
+    ///
+    /// Set this only when "scan nothing" is the intended policy (for example a
+    /// host that installs its own pipeline later); without it, an enabled
+    /// config whose targets and detector tables are empty fails
+    /// [`SecurityConfig::pipeline`] with [`openjiuwen_common::error::ErrorKind::Config`].
+    pub allow_all: bool,
     /// Thresholds and failure handling applied to every scan.
     pub policy: SecurityPolicy,
     /// The call stages that are scanned.
@@ -161,6 +187,7 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            allow_all: false,
             policy: SecurityPolicy::default(),
             targets: ScanTargets::default(),
             prompt_injection: PromptInjectionGuardrailConfig::default(),
@@ -194,9 +221,10 @@ impl SecurityConfig {
     ///
     /// Detector selection:
     ///
-    /// - disabled config: no guardrails, policy preserved;
+    /// - disabled config: no guardrails, policy preserved (`enabled` is the
+    ///   explicit off switch);
     /// - no enabled [`ScanTargets`]: no guardrails (an empty stage list would
-    ///   otherwise mean "every stage");
+    ///   otherwise mean "every stage"), and [`Self::allow_all`] is required;
     /// - prompt injection only at the configured intersection of
     ///   [`PromptInjectionGuardrail::DEFAULT_STAGES`] and the enabled stages;
     /// - sensitive data only when its own `enabled` flag is set, at every
@@ -206,12 +234,21 @@ impl SecurityConfig {
     /// - tool arguments only when tool inputs are scanned and the config has a
     ///   rule to apply, at [`ScanStage::ToolInvokeInput`].
     ///
+    /// An enabled config that ends up registering nothing is an error unless
+    /// [`Self::allow_all`] is set: a guardrail pipeline that scans nothing must
+    /// be an explicit decision, never the result of an empty detector table.
+    ///
     /// # Errors
     ///
     /// Propagates a [`openjiuwen_common::error::ErrorKind::Validation`] error
     /// unchanged when a detector rejects its configuration: an unknown
     /// prompt-injection mode, a missing endpoint for `api` mode, or an invalid
     /// regular expression.
+    ///
+    /// Returns [`openjiuwen_common::error::ErrorKind::Config`] when the config
+    /// enables security but registers no detector and [`Self::allow_all`] is
+    /// not set; the message names the reason (no enabled scan target, or no
+    /// enabled detector).
     pub fn pipeline(&self) -> Result<GuardrailPipeline> {
         let mut pipeline = GuardrailPipeline::new().with_policy(self.policy);
         if !self.enabled {
@@ -219,7 +256,15 @@ impl SecurityConfig {
         }
         let stages = self.targets.stages();
         if stages.is_empty() {
-            return Ok(pipeline);
+            return if self.allow_all {
+                Ok(pipeline)
+            } else {
+                Err(Error::config(
+                    "security config enables no scan target: enable one of prompts, user_input, \
+                     model_outputs, tool_inputs, tool_outputs, or set allow_all = true to build a \
+                     pipeline that scans nothing",
+                ))
+            };
         }
 
         let prompt_stages = intersect_stages(PromptInjectionGuardrail::DEFAULT_STAGES, &stages);
@@ -248,6 +293,15 @@ impl SecurityConfig {
                 ToolArgumentGuardrail::with_config(self.tool_arguments.clone())?
                     .with_stages([ScanStage::ToolInvokeInput]),
             );
+        }
+
+        if pipeline.guardrails().is_empty() && !self.allow_all {
+            return Err(Error::config(
+                "security config enables no detector: prompt injection is off for every enabled \
+                 stage, sensitive data is disabled, no content rule is configured, and no \
+                 tool-argument rule is set; add a detector or set allow_all = true to build a \
+                 pipeline that scans nothing",
+            ));
         }
 
         Ok(pipeline)
@@ -285,19 +339,24 @@ mod tests {
     use crate::guardrails::content_rules::ContentRule;
 
     #[test]
-    fn policy_defaults_match_python() {
+    fn the_default_policy_fails_closed() {
         let policy = SecurityPolicy::default();
         assert_eq!(policy.block_level, RiskLevel::Critical);
-        assert_eq!(policy.failure_policy, FailurePolicy::FailOpen);
+        assert_eq!(policy.failure_policy, FailurePolicy::FailClosed);
         assert!(policy.stop_on_block);
-        assert_eq!(FailurePolicy::default(), FailurePolicy::FailOpen);
+        assert_eq!(FailurePolicy::default(), FailurePolicy::FailClosed);
     }
 
     #[test]
-    fn policy_deserializes_missing_fields_to_defaults() {
+    fn policy_deserializes_missing_fields_to_fail_closed() {
         let policy: SecurityPolicy = serde_json::from_value(json!({})).unwrap();
         assert_eq!(policy, SecurityPolicy::default());
         assert_eq!(policy.block_level, RiskLevel::Critical);
+        assert_eq!(policy.failure_policy, FailurePolicy::FailClosed);
+
+        let open: SecurityPolicy =
+            serde_json::from_value(json!({"failure_policy": "fail_open"})).unwrap();
+        assert_eq!(open.failure_policy, FailurePolicy::FailOpen);
 
         let lowered: SecurityPolicy = serde_json::from_value(json!({
             "block_level": "high",
@@ -421,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_targets_register_no_guardrails() {
+    fn disabled_targets_are_a_config_error_unless_allow_all() {
         let config = SecurityConfig {
             targets: ScanTargets {
                 prompts: false,
@@ -433,9 +492,72 @@ mod tests {
             ..SecurityConfig::protected()
         };
         assert_eq!(config.targets.stages(), Vec::<ScanStage>::new());
-        let pipeline = config.pipeline().unwrap();
+        let Err(error) = config.pipeline() else {
+            panic!("an enabled config with no scan target must fail");
+        };
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert!(
+            error.to_string().contains("enables no scan target"),
+            "{error}"
+        );
+
+        let allowed = SecurityConfig {
+            allow_all: true,
+            ..config
+        };
+        let pipeline = allowed.pipeline().unwrap();
         assert!(pipeline.guardrails().is_empty());
         assert_eq!(pipeline.policy(), &SecurityPolicy::default());
+    }
+
+    #[test]
+    fn an_enabled_config_without_a_detector_is_a_config_error() {
+        // Only tool inputs are scanned, and no tool-argument rule is set: the
+        // config registers nothing even though security is on.
+        let config = SecurityConfig {
+            targets: ScanTargets {
+                prompts: false,
+                user_input: false,
+                model_outputs: false,
+                tool_inputs: true,
+                tool_outputs: false,
+            },
+            sensitive_data: SensitiveDataGuardrailConfig {
+                enabled: false,
+                ..SensitiveDataGuardrailConfig::default()
+            },
+            // An empty rule table, so the tool-input target adds no guardrail.
+            tool_arguments: ToolArgumentGuardrailConfig {
+                deny_patterns: Vec::new(),
+                sensitive_data: None,
+                ..ToolArgumentGuardrailConfig::default()
+            },
+            ..SecurityConfig::protected()
+        };
+        let Err(error) = config.pipeline() else {
+            panic!("an enabled config with no detector must fail");
+        };
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert!(error.to_string().contains("enables no detector"), "{error}");
+
+        let allowed = SecurityConfig {
+            allow_all: true,
+            ..config
+        };
+        assert!(allowed.pipeline().unwrap().guardrails().is_empty());
+    }
+
+    #[test]
+    fn a_disabled_config_is_the_explicit_off_switch() {
+        // `enabled = false` is an explicit opt-out and keeps building the empty
+        // pipeline it documents; `allow_all` covers the enabled-but-empty case.
+        let pipeline = SecurityConfig::default().pipeline().unwrap();
+        assert!(pipeline.guardrails().is_empty());
+        let value = serde_json::to_value(SecurityConfig::default()).unwrap();
+        assert_eq!(value["allow_all"], json!(false));
+        let back: SecurityConfig = serde_json::from_value(json!({"enabled": true})).unwrap();
+        assert!(back.enabled);
+        assert!(!back.allow_all);
     }
 
     #[test]

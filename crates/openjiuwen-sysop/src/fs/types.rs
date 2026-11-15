@@ -387,6 +387,15 @@ impl WriteFileParams {
         self.append = true;
         self
     }
+    /// Returns these parameters with an explicit write encoding.
+    ///
+    /// Text content is encoded with it (see [`crate::encoding::encode_text`]); byte content
+    /// ignores it.
+    #[must_use]
+    pub fn with_encoding(mut self, encoding: impl Into<String>) -> Self {
+        self.encoding = encoding.into();
+        self
+    }
 
     /// Returns these parameters with an expected-content digest.
     #[must_use]

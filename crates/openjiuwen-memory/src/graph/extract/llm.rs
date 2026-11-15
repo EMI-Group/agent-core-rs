@@ -3,6 +3,11 @@
 //! [`LlmExtractor`] asks a [`Model`] for JSON in the shape pinned by
 //! [`EXTRACTION_SYSTEM_PROMPT`] and parses the answer tolerantly, falling back to the
 //! heuristic extractor when the model output stays unusable.
+//!
+//! The fallback is caller-visible: the returned [`Extraction`] carries a reason on
+//! [`Extraction::degraded`] naming the exhausted attempt count, so a caller can tell a
+//! heuristic answer apart from a model answer without reading logs. Retries, the
+//! cancellation check, and the fallback itself are unchanged; only the silence is gone.
 
 use std::sync::Arc;
 
@@ -37,7 +42,8 @@ pub const EXTRACTION_SYSTEM_PROMPT: &str = concat!(
 /// One [`Model::invoke`] call per attempt with [`EXTRACTION_SYSTEM_PROMPT`]; the answer
 /// is parsed tolerantly by `parse_extraction`. Failed calls and unusable answers are
 /// retried, and once the retry budget is spent the extractor falls back to
-/// [`HeuristicExtractor`] so graph memory keeps working without a healthy model.
+/// [`HeuristicExtractor`] so graph memory keeps working without a healthy model, with
+/// the fallback reported on [`Extraction::degraded`].
 pub struct LlmExtractor {
     /// Model used for extraction.
     model: Arc<dyn Model>,
@@ -119,9 +125,15 @@ impl EntityExtractor for LlmExtractor {
             attempts,
             "LLM entity extraction exhausted its retries; falling back to heuristics"
         );
-        HeuristicExtractor::new(&self.config)
+        let mut extraction = HeuristicExtractor::new(&self.config)
             .extract(text, scope, options)
-            .await
+            .await?;
+        // The fallback keeps graph memory working but is a real quality change, so it is
+        // reported on the result instead of staying in the logs (see `Extraction::degraded`).
+        extraction.degraded = Some(format!(
+            "LLM entity extraction failed after {attempts} attempt(s); fell back to the heuristic extractor"
+        ));
+        Ok(extraction)
     }
 }
 
@@ -154,6 +166,7 @@ fn parse_extraction(raw: &str) -> Option<Extraction> {
         Some(Extraction {
             entities,
             relations,
+            degraded: None,
         })
     }
 }
@@ -475,8 +488,70 @@ mod tests {
             .extract(text, &scope(), &CallOptions::new())
             .await
             .unwrap();
-        assert_eq!(extraction, expected);
+        assert!(
+            !expected.is_degraded(),
+            "a plain heuristic pass is not degraded"
+        );
+        assert_eq!(extraction.entities, expected.entities);
+        assert_eq!(extraction.relations, expected.relations);
+        assert!(extraction.is_degraded(), "the fallback must be reported");
+        let reason = extraction
+            .degraded_reason()
+            .expect("the fallback carries a reason");
+        assert!(
+            reason.contains("4 attempt(s)"),
+            "the reason must name the exhausted attempt count: {reason}"
+        );
+        assert!(
+            reason.contains("heuristic"),
+            "the reason must name the fallback: {reason}"
+        );
         assert_eq!(handle.call_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn llm_extractor_does_not_report_a_successful_answer_as_degraded() {
+        let model = ScriptedModel::builder()
+            .respond_text(r#"{"entities":[{"name":"Alice","type":"Person"}]}"#)
+            .build();
+        let extractor = LlmExtractor::new(Arc::new(model), &GraphMemoryConfig::default());
+        let extraction = extractor
+            .extract("Alice", &scope(), &CallOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(extraction.degraded, None);
+        assert!(!extraction.is_degraded());
+        assert_eq!(extraction.degraded_reason(), None);
+    }
+
+    #[test]
+    fn extraction_degraded_is_optional_on_the_wire() {
+        let extraction = Extraction {
+            entities: Vec::new(),
+            relations: Vec::new(),
+            degraded: None,
+        };
+        let value = serde_json::to_value(&extraction).expect("extraction json");
+        assert_eq!(value, serde_json::json!({"entities": [], "relations": []}));
+
+        let degraded = Extraction {
+            degraded: Some("fell back to heuristics".to_owned()),
+            ..Extraction::default()
+        };
+        let value = serde_json::to_value(&degraded).expect("degraded json");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "entities": [],
+                "relations": [],
+                "degraded": "fell back to heuristics",
+            })
+        );
+        // An absent field decodes to `None`, so older payloads stay readable.
+        let restored: Extraction =
+            serde_json::from_value(serde_json::json!({"entities": [], "relations": []}))
+                .expect("tolerant decode");
+        assert_eq!(restored.degraded, None);
     }
 
     #[tokio::test]

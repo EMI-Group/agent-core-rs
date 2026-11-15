@@ -135,6 +135,16 @@ pub struct RailContext {
     pub interrupts: Vec<InterruptRequest>,
     /// Model a rail wants the loop to use instead of the configured one.
     pub model_override: Option<Arc<dyn Model>>,
+    /// Steering messages queued for the drain being fired.
+    ///
+    /// Populated only while [`AgentRail::before_steering_drain`] fires; it stays
+    /// `0` for every [`RailEvent`] firing point.
+    pub steering_pending: usize,
+    /// Cap on how many steering messages this drain may take.
+    ///
+    /// Populated only while [`AgentRail::before_steering_drain`] fires; it stays
+    /// `None` for every [`RailEvent`] firing point.
+    pub steering_limit: Option<usize>,
 }
 
 impl RailContext {
@@ -160,6 +170,8 @@ impl RailContext {
             skip_tool: None,
             interrupts: Vec::new(),
             model_override: None,
+            steering_pending: 0,
+            steering_limit: None,
         }
     }
 
@@ -264,6 +276,14 @@ impl RailContext {
     pub fn set_model_override(&mut self, model: Arc<dyn Model>) {
         self.model_override = Some(model);
     }
+
+    /// Seeds the steering backlog size for a
+    /// [`AgentRail::before_steering_drain`] firing.
+    #[must_use]
+    pub fn with_steering_pending(mut self, pending: usize) -> Self {
+        self.steering_pending = pending;
+        self
+    }
 }
 
 // Trait objects (`Arc<dyn Session>`, `Arc<dyn Model>`) are not `Debug`, so the
@@ -283,6 +303,8 @@ impl fmt::Debug for RailContext {
             .field("output", &self.output.is_some())
             .field("is_interrupted", &self.is_interrupted())
             .field("model_override", &self.model_override.is_some())
+            .field("steering_pending", &self.steering_pending)
+            .field("steering_limit", &self.steering_limit)
             .finish()
     }
 }
@@ -348,6 +370,29 @@ pub trait AgentRail: Send + Sync {
     async fn after_react_iteration(&self, _ctx: &mut RailContext) -> Result<()> {
         Ok(())
     }
+
+    /// About to drain the queued steering messages into the model window.
+    ///
+    /// The loop fires this at its steering-drain point, before the drained
+    /// messages are observed, and only when the backlog is non-empty: an empty
+    /// queue skips the hook entirely.
+    ///
+    /// [`RailContext::steering_pending`] reports how many messages are queued;
+    /// [`RailContext::steering_limit`] caps how many this drain may take (`None`
+    /// takes everything, `Some(n)` takes at most `n`, and `n == 0`/`n < 1` still
+    /// takes exactly one, so a non-empty queue always makes progress). Rails run
+    /// in priority order and each sees what the previous left, so the final
+    /// value applies.
+    ///
+    /// This is a method-dispatched hook, not a [`RailEvent`] variant (the
+    /// read-only `openjiuwen-harness` crate matches that enum exhaustively).
+    /// While it runs [`RailContext::event`] still reports the *previous* firing
+    /// point, so a rail must not branch on `ctx.event` inside this hook.
+    ///
+    /// `Err` aborts the run: later rails do not run and the error propagates.
+    async fn before_steering_drain(&self, _ctx: &mut RailContext) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The priority-ordered set of rails a loop fires.
@@ -409,6 +454,10 @@ impl RailRegistry {
     /// Dispatch stops at the first rail returning `Err`: later rails do not
     /// run and the error propagates to the caller, which aborts the run.
     ///
+    /// This is the event dispatcher only: it never calls
+    /// [`AgentRail::before_steering_drain`], which has its own dispatcher,
+    /// [`RailRegistry::fire_steering_drain`].
+    ///
     /// # Errors
     ///
     /// Returns the first error a rail raises.
@@ -425,6 +474,22 @@ impl RailRegistry {
                 RailEvent::OnToolException => rail.on_tool_exception(ctx).await?,
                 RailEvent::AfterReactIteration => rail.after_react_iteration(ctx).await?,
             }
+        }
+        Ok(())
+    }
+
+    /// Fires [`AgentRail::before_steering_drain`] on each rail, in stored order
+    /// (stable descending priority, ties in insertion order).
+    ///
+    /// A method-dispatched hook, not an event: [`RailRegistry::fire`] stays the
+    /// event dispatcher and never calls this hook.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error a rail raises; later rails do not run.
+    pub async fn fire_steering_drain(&self, ctx: &mut RailContext) -> Result<()> {
+        for rail in &self.rails {
+            rail.before_steering_drain(ctx).await?;
         }
         Ok(())
     }
@@ -541,6 +606,10 @@ mod tests {
 
         async fn after_react_iteration(&self, _ctx: &mut RailContext) -> Result<()> {
             self.record("after_react_iteration")
+        }
+
+        async fn before_steering_drain(&self, _ctx: &mut RailContext) -> Result<()> {
+            self.record("before_steering_drain")
         }
     }
 
@@ -749,6 +818,150 @@ mod tests {
         let mut ctx = RailContext::new(RailEvent::BeforeInvoke);
         registry.fire(&mut ctx).await.unwrap();
         assert_eq!(entries(&log), Vec::<String>::new());
+    }
+
+    /// `(steering_pending, steering_limit)` observations collected by the
+    /// steering-drain test rails.
+    type SteeringSeen = Arc<Mutex<Vec<(usize, Option<usize>)>>>;
+
+    /// A rail that observes and optionally caps the steering drain.
+    ///
+    /// It records every `(steering_pending, steering_limit)` it saw and, when
+    /// `limit` is set, replaces `ctx.steering_limit` with it.
+    struct SteeringLimitRail {
+        name: &'static str,
+        priority: i32,
+        limit: Option<usize>,
+        seen: SteeringSeen,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRail for SteeringLimitRail {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn priority(&self) -> i32 {
+            self.priority
+        }
+
+        async fn before_steering_drain(&self, ctx: &mut RailContext) -> Result<()> {
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push((ctx.steering_pending, ctx.steering_limit));
+            }
+            if self.limit.is_some() {
+                ctx.steering_limit = self.limit;
+            }
+            Ok(())
+        }
+    }
+
+    fn limit_rail(
+        name: &'static str,
+        priority: i32,
+        limit: Option<usize>,
+        seen: &SteeringSeen,
+    ) -> Arc<dyn AgentRail> {
+        Arc::new(SteeringLimitRail {
+            name,
+            priority,
+            limit,
+            seen: Arc::clone(seen),
+        })
+    }
+
+    #[tokio::test]
+    async fn fire_steering_drain_dispatches_in_priority_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = RailRegistry::new();
+        registry.register(recorder("low", 10, &log));
+        registry.register(recorder("high", 90, &log));
+        registry.register(recorder("tie_a", 50, &log));
+        registry.register(recorder("tie_b", 50, &log));
+
+        let mut ctx = RailContext::new(RailEvent::AfterReactIteration).with_steering_pending(3);
+        registry.fire_steering_drain(&mut ctx).await.unwrap();
+        assert_eq!(
+            entries(&log),
+            vec![
+                "high:before_steering_drain",
+                "tie_a:before_steering_drain",
+                "tie_b:before_steering_drain",
+                "low:before_steering_drain",
+            ]
+        );
+        // The hook is not an event: `event` still reports the previous point.
+        assert_eq!(ctx.event, RailEvent::AfterReactIteration);
+    }
+
+    #[tokio::test]
+    async fn fire_steering_drain_stops_at_the_first_error() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = RailRegistry::new();
+        registry.register(failing_recorder("boom", 90, &log));
+        registry.register(recorder("later", 10, &log));
+
+        let mut ctx = RailContext::new(RailEvent::BeforeModelCall).with_steering_pending(1);
+        let err = registry.fire_steering_drain(&mut ctx).await.unwrap_err();
+        assert!(
+            matches!(err, openjiuwen_common::error::Error::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(entries(&log), vec!["boom:before_steering_drain"]);
+    }
+
+    #[tokio::test]
+    async fn before_steering_drain_default_is_inert() {
+        let mut registry = RailRegistry::new();
+        // `TestRail` does not override the hook, so the default method runs.
+        registry.register(rail("plain", 10));
+
+        let mut ctx = RailContext::new(RailEvent::AfterReactIteration).with_steering_pending(4);
+        registry.fire_steering_drain(&mut ctx).await.unwrap();
+        assert_eq!(ctx.steering_pending, 4);
+        assert!(ctx.steering_limit.is_none());
+    }
+
+    #[tokio::test]
+    async fn fire_steering_drain_preserves_a_rail_limit() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = RailRegistry::new();
+        registry.register(limit_rail("high_limit", 90, Some(1), &seen));
+        // A lower-priority rail sees what the previous one left.
+        registry.register(limit_rail("low_limit", 10, Some(2), &seen));
+
+        let mut ctx = RailContext::new(RailEvent::BeforeInvoke).with_steering_pending(7);
+        registry.fire_steering_drain(&mut ctx).await.unwrap();
+        assert_eq!(
+            seen.lock().map(|seen| seen.clone()).unwrap_or_default(),
+            vec![(7, None), (7, Some(1))]
+        );
+        assert_eq!(ctx.steering_limit, Some(2));
+        assert_eq!(ctx.steering_pending, 7);
+    }
+
+    #[tokio::test]
+    async fn fire_never_calls_before_steering_drain() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = RailRegistry::new();
+        registry.register(recorder("rec", 10, &log));
+
+        let mut ctx = RailContext::new(RailEvent::BeforeModelCall).with_steering_pending(2);
+        registry.fire(&mut ctx).await.unwrap();
+        assert_eq!(entries(&log), vec!["rec:before_model_call"]);
+        assert_eq!(ctx.steering_pending, 2);
+    }
+
+    #[test]
+    fn steering_fields_default_and_build() {
+        let ctx = RailContext::new(RailEvent::BeforeInvoke);
+        assert_eq!(ctx.steering_pending, 0);
+        assert!(ctx.steering_limit.is_none());
+
+        let ctx = ctx.with_steering_pending(5);
+        assert_eq!(ctx.steering_pending, 5);
+        assert!(ctx.steering_limit.is_none());
+        assert!(format!("{ctx:?}").contains("steering_pending"));
     }
 
     #[test]

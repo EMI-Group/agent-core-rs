@@ -228,9 +228,24 @@ async fn malformed_model_output_falls_back_to_heuristics() {
     assert!(handle.call_count() > 1, "the extractor retried the model");
 
     let expected = heuristic_extraction(ltm.config()).await;
+    assert!(!expected.is_degraded(), "a plain heuristic pass is clean");
     assert_eq!(
-        extraction, expected,
-        "the failed LLM pass must yield the heuristic extraction"
+        extraction.entities, expected.entities,
+        "the failed LLM pass must yield the heuristic entities"
+    );
+    assert_eq!(
+        extraction.relations, expected.relations,
+        "the failed LLM pass must yield the heuristic relations"
+    );
+    assert!(
+        extraction.is_degraded(),
+        "the fallback must be visible on the returned extraction"
+    );
+    assert!(
+        extraction
+            .degraded_reason()
+            .is_some_and(|reason| reason.contains("attempt(s)")),
+        "the reason must name the exhausted attempt count: {extraction:?}"
     );
     assert_ne!(extraction.entities.len(), 0);
     assert_ne!(extraction.relations.len(), 0);
@@ -442,6 +457,7 @@ async fn search_all_merges_memory_hits_and_graph_entities() {
             importance: None,
         }],
         relations: Vec::new(),
+        degraded: None,
     };
     ltm.graph()
         .expect("graph enabled")
@@ -491,9 +507,15 @@ async fn search_all_degrades_without_failing() {
         .expect("search all");
     assert_eq!(combined.memories.len(), 1);
     assert_eq!(combined.entities.len(), 0);
+    assert_eq!(
+        combined.graph_error, None,
+        "no graph store is not a graph failure"
+    );
+    assert!(!combined.is_partial());
 
     // (b) Graph wired and populated, but a narrow threshold excludes the graph entity
-    // while memory recall still succeeds: graph recall degrades to empty, not an error.
+    // while memory recall still succeeds: graph recall returns no entities and reports
+    // no failure, so "no match" stays distinguishable from "could not ask".
     let ltm = facade(graph_config()).await;
     ltm.add(
         &scope(),
@@ -509,6 +531,7 @@ async fn search_all_degrades_without_failing() {
             importance: None,
         }],
         relations: Vec::new(),
+        degraded: None,
     };
     ltm.graph()
         .expect("graph enabled")
@@ -527,6 +550,10 @@ async fn search_all_degrades_without_failing() {
     assert!(
         combined.entities.is_empty(),
         "graph recall must degrade to empty, not fail"
+    );
+    assert_eq!(
+        combined.graph_error, None,
+        "a threshold miss is not a graph failure"
     );
 
     // Defaults propagate as documented: graph knobs defer to the config and expand
@@ -548,4 +575,77 @@ async fn search_all_degrades_without_failing() {
     assert_eq!(search_defaults.mode, SearchMode::Hybrid);
     assert_eq!(search_defaults.kinds.len(), 0);
     assert!(search_defaults.token_budget.is_none());
+}
+
+#[tokio::test]
+async fn search_all_reports_a_graph_failure_instead_of_an_empty_entity_list() {
+    /// Indexes documents normally but cannot embed a query, so graph writes succeed and
+    /// only graph recall fails.
+    struct QuerylessEmbedding;
+
+    #[async_trait::async_trait]
+    impl openjiuwen_retrieval::embedding::Embedding for QuerylessEmbedding {
+        fn model_name(&self) -> &'static str {
+            "queryless"
+        }
+
+        async fn embed_query(&self, _text: &str) -> openjiuwen_common::error::Result<Vec<f32>> {
+            Err(openjiuwen_common::error::Error::retrieval(
+                "query embedding backend unavailable",
+            ))
+        }
+
+        async fn embed_documents(
+            &self,
+            texts: &[String],
+            _batch_size: Option<usize>,
+        ) -> openjiuwen_common::error::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.5_f32, 0.5]).collect())
+        }
+    }
+
+    let ltm = LongTermMemory::builder(graph_config())
+        .stores(MemoryStores::in_memory())
+        .embedding(Arc::new(QuerylessEmbedding))
+        .build()
+        .expect("facade");
+    ltm.add(
+        &scope(),
+        NewMemory::semantic("alice prefers dark mode"),
+        &AddOptions::default().skip_embedding(),
+    )
+    .await
+    .expect("memory add");
+    // Graph writes embed documents (which this provider serves), so the graph is
+    // populated and only recall fails.
+    ltm.graph()
+        .expect("graph enabled")
+        .add(&scope(), RELATION_TEXT, &GraphAddOptions::default())
+        .await
+        .expect("graph add");
+
+    // Memory recall is keyword-only here, so the graph's query embedding is the only
+    // failing step.
+    let options = SearchOptions::default()
+        .with_threshold(0.0)
+        .with_mode(SearchMode::Keyword);
+    let combined = ltm
+        .search_all(&scope(), "dark mode", &options)
+        .await
+        .expect("a graph failure must not fail the recall");
+    assert_eq!(
+        combined.memories.len(),
+        1,
+        "memory hits survive a graph failure"
+    );
+    assert_eq!(combined.entities.len(), 0);
+    let reason = combined
+        .graph_error
+        .as_deref()
+        .expect("the graph failure must be reported, not hidden behind an empty list");
+    assert!(
+        reason.contains("query embedding backend unavailable"),
+        "the reason must carry the provider error: {reason}"
+    );
+    assert!(combined.is_partial());
 }

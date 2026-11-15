@@ -20,10 +20,15 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use openjiuwen_common::error::{ErrorKind, Result};
+use openjiuwen_common::error::{Error, ErrorKind, Result};
 use openjiuwen_retrieval::embedding::{Embedding, HashEmbedding};
-use openjiuwen_retrieval::graph::{GraphStore, InMemoryGraphStore, Triple};
+use openjiuwen_retrieval::graph::{
+    GraphStatistics, GraphStore, InMemoryGraphStore, Triple, TripleQuery,
+};
 use openjiuwen_retrieval::model::StaticCompletionModel;
+use openjiuwen_retrieval::retriever::graph::{
+    GraphDegradation, GraphExpansionReport, GraphStage, GRAPH_DEGRADED_FIELD,
+};
 use openjiuwen_retrieval::retriever::{
     AgenticConfig, AgenticRetriever, AgenticStopReason, GraphRetriever, HybridRetriever,
     RetrieveMode, Retriever, SparseRetriever, VectorRetriever,
@@ -33,7 +38,7 @@ use openjiuwen_retrieval::rewrite::{
 };
 use openjiuwen_retrieval::sparse::{Bm25Config, Bm25Index};
 use openjiuwen_retrieval::vector_store::{InMemoryVectorStore, VectorRecord, VectorStore};
-use openjiuwen_retrieval::{Document, Metadata};
+use openjiuwen_retrieval::{Document, Metadata, MetadataFilter};
 
 /// Embedding dimension used by every dense channel in this file.
 const DIMENSION: usize = 64;
@@ -529,4 +534,296 @@ async fn agentic_retriever_falls_back_when_the_model_reply_is_malformed() {
     assert_eq!(rewriter.calls(), 1);
     assert_eq!(model.call_count(), 2);
     assert_eq!(results.len(), 1);
+}
+
+// --- graph expansion report -----------------------------------------------
+
+/// The message every [`OfflineGraphStore`] method fails with.
+const GRAPH_OFFLINE: &str = "graph offline";
+
+/// Graph store whose every operation fails, as if the backend were unreachable.
+///
+/// Only `neighbors` is exercised by the retriever, but every method is
+/// implemented so the double stays a complete [`GraphStore`].
+#[derive(Debug)]
+struct OfflineGraphStore;
+
+#[async_trait]
+impl GraphStore for OfflineGraphStore {
+    async fn add_triples(&self, _triples: Vec<Triple>) -> Result<usize> {
+        Err(Error::retrieval(GRAPH_OFFLINE))
+    }
+
+    async fn triples_for_entity(&self, _entity: &str) -> Result<Vec<Triple>> {
+        Err(Error::retrieval(GRAPH_OFFLINE))
+    }
+
+    async fn neighbors(&self, _entity: &str, _hops: usize) -> Result<Vec<Triple>> {
+        Err(Error::retrieval(GRAPH_OFFLINE))
+    }
+
+    async fn search(&self, _query: &TripleQuery) -> Result<Vec<Triple>> {
+        Err(Error::retrieval(GRAPH_OFFLINE))
+    }
+
+    async fn all_triples(&self) -> Result<Vec<Triple>> {
+        Err(Error::retrieval(GRAPH_OFFLINE))
+    }
+
+    async fn len(&self) -> Result<usize> {
+        Err(Error::retrieval(GRAPH_OFFLINE))
+    }
+
+    async fn is_empty(&self) -> Result<bool> {
+        Err(Error::retrieval(GRAPH_OFFLINE))
+    }
+
+    async fn clear(&self) -> Result<()> {
+        Err(Error::retrieval(GRAPH_OFFLINE))
+    }
+
+    async fn statistics(&self) -> Result<GraphStatistics> {
+        Err(Error::retrieval(GRAPH_OFFLINE))
+    }
+}
+
+/// Chunk channel that answers the main query but fails on a triple's text.
+#[derive(Debug)]
+struct FlakyChannel {
+    hits: Vec<openjiuwen_retrieval::SearchResult>,
+    /// Query substrings that make the channel fail.
+    failures: Vec<&'static str>,
+}
+
+impl FlakyChannel {
+    /// A channel serving `chunk-a` for every non-failing query.
+    fn new(failures: &[&'static str]) -> Self {
+        Self {
+            hits: vec![openjiuwen_retrieval::SearchResult {
+                id: "chunk-a".to_owned(),
+                text: "the ownership model prevents data races".to_owned(),
+                score: 1.0,
+                metadata: Metadata::new(),
+            }],
+            failures: failures.to_vec(),
+        }
+    }
+}
+
+#[async_trait]
+impl Retriever for FlakyChannel {
+    async fn retrieve(
+        &self,
+        query: &str,
+        top_k: usize,
+        _score_threshold: Option<f32>,
+        mode: RetrieveMode,
+        filters: Option<&MetadataFilter>,
+    ) -> Result<Vec<openjiuwen_retrieval::RetrievalResult>> {
+        Ok(self
+            .retrieve_search_results(query, top_k, mode, filters)
+            .await?
+            .into_iter()
+            .map(|hit| openjiuwen_retrieval::RetrievalResult {
+                text: hit.text,
+                score: hit.score,
+                metadata: hit.metadata,
+                doc_id: None,
+                chunk_id: Some(hit.id),
+            })
+            .collect())
+    }
+
+    async fn retrieve_search_results(
+        &self,
+        query: &str,
+        top_k: usize,
+        _mode: RetrieveMode,
+        _filters: Option<&MetadataFilter>,
+    ) -> Result<Vec<openjiuwen_retrieval::SearchResult>> {
+        if self.failures.iter().any(|needle| query.contains(needle)) {
+            return Err(Error::retrieval("expansion channel offline"));
+        }
+        Ok(self.hits.iter().take(top_k).cloned().collect())
+    }
+}
+
+/// The single-triple store the clean-expansion tests reuse.
+fn one_triple_store() -> Arc<dyn GraphStore> {
+    Arc::new(
+        InMemoryGraphStore::with_triples(vec![Triple::new("Rust", "has", "Borrow Checker")])
+            .unwrap(),
+    )
+}
+
+/// `graph_degraded` is set on exactly the hits of a degraded call.
+fn is_marked(result: &openjiuwen_retrieval::SearchResult) -> bool {
+    result.metadata.get(GRAPH_DEGRADED_FIELD) == Some(&serde_json::json!(true))
+}
+
+#[tokio::test]
+async fn graph_report_records_a_failing_neighbor_lookup() {
+    let retriever = GraphRetriever::new(
+        Arc::new(SparseRetriever::new(graph_corpus())),
+        Arc::new(OfflineGraphStore),
+    );
+    let (results, report) = retriever
+        .retrieve_with_report("Rust ownership", 2, None, RetrieveMode::Sparse, None)
+        .await
+        .unwrap();
+
+    // The plain chunk hit survives, marked as produced by a degraded expansion.
+    assert_eq!(
+        texts_of(&results),
+        vec!["the ownership model prevents data races"]
+    );
+    assert!(results.iter().all(|result| {
+        result.metadata.get(GRAPH_DEGRADED_FIELD) == Some(&serde_json::json!(true))
+    }));
+
+    assert!(report.is_degraded());
+    assert_eq!(report.degradations.len(), 1);
+    let degradation = &report.degradations[0];
+    assert_eq!(degradation.stage, GraphStage::NeighborExpansion);
+    assert_eq!(degradation.subject.as_deref(), Some("Rust"));
+    assert!(degradation.error.contains(GRAPH_OFFLINE));
+    assert!(!report.entities.is_empty());
+    assert_eq!(report.triple_count, 0);
+    assert_eq!(report.expanded_queries, 0);
+
+    // The bare trait path still returns the chunk hits (the report is dropped).
+    let plain = retriever
+        .retrieve("Rust ownership", 2, None, RetrieveMode::Sparse, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        texts_of(&plain),
+        vec!["the ownership model prevents data races"]
+    );
+}
+
+#[tokio::test]
+async fn graph_report_describes_a_clean_expansion() {
+    let retriever = GraphRetriever::new(
+        Arc::new(SparseRetriever::new(graph_corpus())),
+        one_triple_store(),
+    );
+    let (results, report) = retriever
+        .retrieve_search_results_with_report("Rust ownership", 2, RetrieveMode::Sparse, None)
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].text, "the borrow checker guide");
+    assert!(!report.entities.is_empty());
+    assert_eq!(report.triple_count, 1);
+    assert_eq!(report.expanded_queries, 1);
+    assert!(report.degradations.is_empty());
+    assert!(!report.is_degraded());
+    assert!(results.iter().all(|result| !is_marked(result)));
+}
+
+#[tokio::test]
+async fn graph_report_treats_an_empty_graph_as_a_clean_no_op() {
+    let plain = SparseRetriever::new(graph_corpus())
+        .retrieve_search_results("Rust ownership", 2, RetrieveMode::Sparse, None)
+        .await
+        .unwrap();
+    let retriever = GraphRetriever::new(
+        Arc::new(SparseRetriever::new(graph_corpus())),
+        Arc::new(InMemoryGraphStore::new()),
+    );
+    let (results, report) = retriever
+        .retrieve_search_results_with_report("Rust ownership", 2, RetrieveMode::Sparse, None)
+        .await
+        .unwrap();
+
+    assert!(report.degradations.is_empty());
+    assert!(!report.is_degraded());
+    // The candidates were looked up, the store simply held nothing for them.
+    assert!(!report.entities.is_empty());
+    assert_eq!(report.triple_count, 0);
+    assert_eq!(report.expanded_queries, 0);
+    assert_eq!(
+        results
+            .iter()
+            .map(|hit| hit.text.clone())
+            .collect::<Vec<_>>(),
+        plain.iter().map(|hit| hit.text.clone()).collect::<Vec<_>>()
+    );
+    assert!(results.iter().all(|result| !is_marked(result)));
+}
+
+#[tokio::test]
+async fn graph_report_records_a_failing_chunk_query() {
+    let retriever = GraphRetriever::new(
+        Arc::new(FlakyChannel::new(&["Borrow Checker"])),
+        one_triple_store(),
+    );
+    let (results, report) = retriever
+        .retrieve_with_report("Rust ownership", 2, None, RetrieveMode::Sparse, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        texts_of(&results),
+        vec!["the ownership model prevents data races"]
+    );
+    assert!(results.iter().all(|result| {
+        result.metadata.get(GRAPH_DEGRADED_FIELD) == Some(&serde_json::json!(true))
+    }));
+    assert_eq!(report.triple_count, 1);
+    assert_eq!(report.expanded_queries, 1);
+    assert_eq!(report.degradations.len(), 1);
+    let degradation = &report.degradations[0];
+    assert_eq!(degradation.stage, GraphStage::ChunkQuery);
+    assert_eq!(degradation.subject.as_deref(), Some("Rust"));
+    assert!(degradation.error.contains("expansion channel offline"));
+    assert!(report.is_degraded());
+}
+
+#[test]
+fn graph_expansion_report_round_trips_through_json() {
+    let report = GraphExpansionReport {
+        entities: vec!["Rust".to_owned(), "Borrow Checker".to_owned()],
+        triple_count: 1,
+        expanded_queries: 1,
+        degradations: vec![GraphDegradation {
+            stage: GraphStage::ChunkQuery,
+            subject: Some("Rust".to_owned()),
+            error: "graph offline".to_owned(),
+        }],
+    };
+    let encoded = serde_json::to_string(&report).unwrap();
+    let decoded: GraphExpansionReport = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, report);
+    assert!(decoded.is_degraded());
+
+    let value = serde_json::to_value(&report).unwrap();
+    assert_eq!(
+        value["degradations"][0]["stage"],
+        serde_json::json!("chunk_query")
+    );
+    assert_eq!(
+        value["degradations"][0]["subject"],
+        serde_json::json!("Rust")
+    );
+    assert_eq!(value["entities"][0], serde_json::json!("Rust"));
+
+    assert_eq!(
+        serde_json::to_value(GraphStage::EntityLookup).unwrap(),
+        serde_json::json!("entity_lookup")
+    );
+    assert_eq!(
+        serde_json::to_value(GraphStage::NeighborExpansion).unwrap(),
+        serde_json::json!("neighbor_expansion")
+    );
+
+    let clean = GraphExpansionReport::default();
+    assert!(!clean.is_degraded());
+    assert!(clean.entities.is_empty());
+    assert_eq!(
+        serde_json::from_str::<GraphExpansionReport>("{}").unwrap(),
+        clean
+    );
 }

@@ -344,6 +344,14 @@ pub struct DreamJob {
     pub last_error: Option<String>,
     /// Counters reported by the last completion.
     pub metrics: DreamMetrics,
+    /// Notes the last completion recorded, e.g. why the pass degraded to rules.
+    ///
+    /// [`DreamRepository::complete`](crate::dreaming::DreamRepository::complete) stores
+    /// the completing outcome's notes here, so a degraded or partial pass stays
+    /// distinguishable from a clean success after the sweep summary is gone;
+    /// [`DreamRepository::fail`](crate::dreaming::DreamRepository::fail) clears them, the
+    /// same way a completion clears [`DreamJob::last_error`]. Default: empty.
+    pub notes: Vec<String>,
     /// Free-form job parameters.
     pub payload: serde_json::Map<String, serde_json::Value>,
     /// Free-form caller annotations.
@@ -369,6 +377,7 @@ impl Default for DreamJob {
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             last_error: None,
             metrics: DreamMetrics::default(),
+            notes: Vec::new(),
             payload: serde_json::Map::new(),
             metadata: serde_json::Map::new(),
         }
@@ -447,6 +456,16 @@ impl DreamJob {
     #[must_use]
     pub const fn with_state(mut self, state: DreamState) -> Self {
         self.state = state;
+        self
+    }
+
+    /// Returns the job carrying `notes` as its recorded completion notes.
+    ///
+    /// A completion replaces them with its own outcome's notes and a failed attempt clears
+    /// them, so setting them here is only meaningful for a job imported with a history.
+    #[must_use]
+    pub fn with_notes(mut self, notes: Vec<String>) -> Self {
+        self.notes = notes;
         self
     }
 
@@ -825,17 +844,33 @@ mod tests {
         assert_eq!(restored.priority, -2);
         assert_eq!(restored.payload.get("a"), Some(&json!([1, 2])));
         assert_eq!(restored.metadata.get("b"), Some(&json!(true)));
+        assert!(
+            restored.notes.is_empty(),
+            "a job without notes deserializes to none"
+        );
         assert!(restored.validate().is_ok());
 
-        let job = running_job().with_metadata(serde_json::Map::from_iter([(
-            "note".to_owned(),
-            json!("hello"),
-        )]));
+        let noted: DreamJob =
+            serde_json::from_value(json!({"id": "job-notes", "notes": ["degraded: rules"]}))
+                .unwrap();
+        assert_eq!(noted.notes, vec!["degraded: rules".to_owned()]);
+        assert_eq!(noted.id, "job-notes");
+        assert_eq!(
+            job().with_notes(vec!["kept".to_owned()]).notes,
+            vec!["kept".to_owned()]
+        );
+        let job = running_job()
+            .with_notes(vec!["merged 2 records".to_owned()])
+            .with_metadata(serde_json::Map::from_iter([(
+                "note".to_owned(),
+                json!("hello"),
+            )]));
         let value = serde_json::to_value(&job).unwrap();
         assert_eq!(value["state"], json!("running"));
         assert_eq!(value["kind"], json!("consolidation"));
         assert_eq!(value["trigger"], json!("manual"));
         assert_eq!(value["payload"], json!({}));
+        assert_eq!(value["notes"], json!(["merged 2 records"]));
         assert_eq!(value["metadata"], json!({"note": "hello"}));
         assert_eq!(value["scope"]["user_id"], json!("alice"));
         assert_eq!(serde_json::from_value::<DreamJob>(value).unwrap(), job);

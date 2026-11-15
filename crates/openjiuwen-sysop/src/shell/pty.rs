@@ -48,8 +48,10 @@ pub(crate) struct PtyChild {
 /// Returns `None` — never an error — when the host cannot provide a PTY (`openpty` fails,
 /// for example because `/dev/ptmx` is unavailable), when a descriptor cannot be
 /// duplicated, or when the spawn itself fails; the caller then spawns the same command
-/// with pipes. The command is consumed either way, so it must be fully configured before
-/// the call.
+/// with pipes, which loses the terminal's line buffering (`stdbuf` is the fallback). Every
+/// such fallback is logged at `warn!` (a missing PTY is expected on some hosts and only
+/// `debug!`), so a run that silently behaves differently is never unexplained. The command
+/// is consumed either way, so it must be fully configured before the call.
 pub(crate) fn try_spawn(mut command: Command) -> Option<PtyChild> {
     let OpenptyResult { master, slave } = match openpty(
         None::<&nix::pty::Winsize>,
@@ -64,9 +66,23 @@ pub(crate) fn try_spawn(mut command: Command) -> Option<PtyChild> {
     configure_terminal(&slave);
     // A terminal merges the three standard streams, so the child gets the slave on all of
     // them; each stdio slot needs its own descriptor.
-    let stdin = dup(&slave).ok()?;
-    let stdout = dup(&slave).ok()?;
-    let stderr = dup(&slave).ok()?;
+    let duplicate = |stream: &'static str| match dup(&slave) {
+        Ok(descriptor) => Some(descriptor),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                stream,
+                "cannot duplicate the pseudo-terminal descriptor; falling back to pipes \
+                 without terminal line buffering"
+            );
+            None
+        }
+    };
+    let (Some(stdin), Some(stdout), Some(stderr)) =
+        (duplicate("stdin"), duplicate("stdout"), duplicate("stderr"))
+    else {
+        return None;
+    };
     command
         .kill_on_drop(true)
         .stdin(Stdio::from(stdin))
@@ -76,7 +92,10 @@ pub(crate) fn try_spawn(mut command: Command) -> Option<PtyChild> {
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            tracing::debug!(%error, "failed to spawn a PTY command");
+            tracing::warn!(
+                %error,
+                "failed to spawn a command on the pseudo-terminal; falling back to pipes"
+            );
             return None;
         }
     };
@@ -138,9 +157,18 @@ async fn pty_reader(
     let mut buffer = vec![0_u8; constants::DEFAULT_TEXT_CHUNK_SIZE];
     loop {
         let read = match master.read(&mut buffer).await {
-            // EOF and a read failure both end the capture; on Linux the master reports
-            // `EIO` once the last slave descriptor closes, which is the normal end.
-            Ok(0) | Err(_) => break,
+            // `Ok(0)` is the end of the capture.
+            Ok(0) => break,
+            // On Linux the master reports `EIO` once the last slave descriptor closes,
+            // which is the normal end of the run rather than a failure.
+            Err(error) if error.raw_os_error() == Some(nix::errno::Errno::EIO as i32) => break,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "reading the pseudo-terminal failed; the streamed output is incomplete"
+                );
+                break;
+            }
             Ok(read) => read,
         };
         if marked {
@@ -271,5 +299,25 @@ mod tests {
         }
         assert_eq!(text, "pty-output\n");
         assert!(matches!(terminal, Some(EngineEvent::Exit { code: 0 })));
+    }
+    /// A spawn the terminal cannot host still falls back to pipes (and reports nothing).
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_pty_spawn_falls_back_instead_of_erroring() {
+        if openpty(
+            None::<&nix::pty::Winsize>,
+            None::<&nix::sys::termios::Termios>,
+        )
+        .is_err()
+        {
+            eprintln!("skipping PTY test: no pseudo-terminal available");
+            return;
+        }
+        let mut command = Command::new("/nonexistent/openjiuwen-pty-probe");
+        command.arg("--version");
+        assert!(
+            try_spawn(command).is_none(),
+            "a command that cannot be spawned must fall back to the pipe path"
+        );
     }
 }

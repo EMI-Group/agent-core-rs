@@ -528,7 +528,7 @@ async fn run_inner(
         used = iteration;
         // Steering pushed before the run lands in the first request; one pushed
         // mid-run lands in the next iteration's window.
-        hooks::drain_steering(runtime, &context).await?;
+        hooks::drain_steering(runtime, ctx, &context).await?;
         let system = system_message(runtime, input, ctx);
         let prepared = runtime
             .engine

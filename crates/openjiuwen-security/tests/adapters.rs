@@ -67,10 +67,14 @@ fn only_stage(backend: Arc<dyn GuardrailBackend>, stage: ScanStage) -> Guardrail
     pipeline
 }
 
-/// The same pipeline with the `FailClosed` failure policy.
-fn fail_closed(backend: Arc<dyn GuardrailBackend>) -> GuardrailPipeline {
+/// The same pipeline with the explicit `FailOpen` opt-in.
+///
+/// The default policy already fails closed, so a failure path is paired: one
+/// pipeline built with `FailOpen` records the failure and allows the call, the
+/// default pipeline blocks it.
+fn fail_open(backend: Arc<dyn GuardrailBackend>) -> GuardrailPipeline {
     pipeline_with(backend).with_policy(SecurityPolicy {
-        failure_policy: FailurePolicy::FailClosed,
+        failure_policy: FailurePolicy::FailOpen,
         ..SecurityPolicy::default()
     })
 }
@@ -108,6 +112,19 @@ async fn failing_server(path_match: &str, calls: u64) -> MockServer {
     Mock::given(method("POST"))
         .and(path(path_match))
         .respond_with(ResponseTemplate::new(500).set_body_string("upstream unavailable"))
+        .expect(calls)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// A server answering `calls` `POST`s to `path_match` with a raw `HTTP 200`
+/// body, for replies that are not JSON at all.
+async fn server_with_raw(path_match: &str, body: &str, calls: u64) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(path_match))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
         .expect(calls)
         .mount(&server)
         .await;
@@ -319,7 +336,7 @@ fn assert_blocked(outcome: &GuardrailOutcome, guardrail: &str, risk_type: &str, 
     assert_eq!(error.message(), expected.as_str());
 }
 
-/// Asserts the default fail-open handling of a backend failure.
+/// Asserts the fail-open handling of a backend failure: recorded, allowed.
 fn assert_fail_open(outcome: &GuardrailOutcome, guardrail: &str) {
     assert_eq!(outcome.decision, SecurityDecision::Allow);
     assert!(outcome.findings.is_empty());
@@ -342,10 +359,59 @@ fn assert_fail_open(outcome: &GuardrailOutcome, guardrail: &str) {
 }
 
 /// Asserts the fail-closed handling of a backend failure: a blocking
-/// `guardrail_error` finding at `CRITICAL`.
-fn assert_fail_closed(outcome: &GuardrailOutcome, guardrail: &str) {
+/// `guardrail_error` finding at `CRITICAL` whose message and details carry
+/// `reason`.
+///
+/// The failure finding is *not* a detection: the pipeline builds it with the
+/// `Guardrail blocked: guardrail_error risk detected (<reason>)` wording, so a
+/// failure can never be mistaken for a graded verdict.
+fn assert_fail_closed(outcome: &GuardrailOutcome, guardrail: &str, reason: &str) {
     assert!(!outcome.errors.is_empty(), "the failure is still recorded");
-    assert_blocked(outcome, guardrail, "guardrail_error", RiskLevel::Critical);
+    assert_eq!(outcome.decision, SecurityDecision::Block);
+    assert!(outcome.is_blocked());
+    assert_eq!(outcome.risk_level, RiskLevel::Critical);
+    assert_eq!(outcome.blocked_by.as_deref(), Some(guardrail));
+    assert_eq!(outcome.findings.len(), 1);
+    let finding = &outcome.findings[0];
+    assert_eq!(finding.guardrail, guardrail);
+    assert_eq!(finding.risk_type, "guardrail_error");
+    assert_eq!(finding.risk_level, RiskLevel::Critical);
+    assert!(finding.blocking);
+    let expected = "Guardrail blocked: guardrail_error risk detected";
+    assert!(finding.message.starts_with(expected), "{}", finding.message);
+    assert!(
+        finding.message.contains(reason),
+        "the message carries the reason: {}",
+        finding.message
+    );
+    let details = finding.details.as_ref().expect("a failure carries details");
+    assert!(
+        details["error"].as_str().unwrap().contains(reason),
+        "{details}"
+    );
+    assert_eq!(outcome.evaluations.len(), 1);
+    assert!(
+        outcome.evaluations[0].result.is_none(),
+        "a failure is not a verdict"
+    );
+    assert!(
+        outcome.evaluations[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains(reason)),
+        "{:?}",
+        outcome.evaluations
+    );
+    assert!(
+        outcome.errors.iter().any(|error| error.contains(reason)),
+        "{:?}",
+        outcome.errors
+    );
+    let error = outcome
+        .enforce()
+        .expect_err("a failure under fail-closed must enforce");
+    assert_eq!(error.kind(), ErrorKind::Security);
+    assert_eq!(error.message(), finding.message.as_str());
 }
 
 /// Asserts the serialized outcome carries neither the scanned text nor a
@@ -404,12 +470,14 @@ async fn openai_medium_reply_blocks_only_when_the_policy_lowers_the_bar() {
 async fn openai_transport_failure_follows_the_failure_policy() {
     let server = failing_server("/v1/moderations", 2).await;
     let backend = openai_backend(&server);
-    let open = pipeline_with(Arc::clone(&backend))
+    // `FailOpen` is the explicit opt-in: the failure is recorded only.
+    let open = fail_open(Arc::clone(&backend))
         .scan_user_input(SCANNED)
         .await;
     assert_fail_open(&open, OPENAI);
-    let closed = fail_closed(backend).scan_user_input(SCANNED).await;
-    assert_fail_closed(&closed, OPENAI);
+    // The default policy fails closed: the same failure blocks the call.
+    let closed = pipeline_with(backend).scan_user_input(SCANNED).await;
+    assert_fail_closed(&closed, OPENAI, "500");
 }
 
 #[tokio::test]
@@ -478,12 +546,14 @@ async fn azure_medium_reply_blocks_only_when_the_policy_lowers_the_bar() {
 async fn azure_transport_failure_follows_the_failure_policy() {
     let server = failing_server("/contentsafety/text:analyze", 2).await;
     let backend = azure_backend(&server);
-    let open = pipeline_with(Arc::clone(&backend))
+    // `FailOpen` is the explicit opt-in: the failure is recorded only.
+    let open = fail_open(Arc::clone(&backend))
         .scan_user_input(SCANNED)
         .await;
     assert_fail_open(&open, AZURE);
-    let closed = fail_closed(backend).scan_user_input(SCANNED).await;
-    assert_fail_closed(&closed, AZURE);
+    // The default policy fails closed: the same failure blocks the call.
+    let closed = pipeline_with(backend).scan_user_input(SCANNED).await;
+    assert_fail_closed(&closed, AZURE, "500");
 }
 
 #[tokio::test]
@@ -548,12 +618,14 @@ async fn aliyun_medium_reply_blocks_only_when_the_policy_lowers_the_bar() {
 async fn aliyun_transport_failure_follows_the_failure_policy() {
     let server = failing_server("/", 2).await;
     let backend = aliyun_backend(&server);
-    let open = pipeline_with(Arc::clone(&backend))
+    // `FailOpen` is the explicit opt-in: the failure is recorded only.
+    let open = fail_open(Arc::clone(&backend))
         .scan_user_input(SCANNED)
         .await;
     assert_fail_open(&open, ALIYUN);
-    let closed = fail_closed(backend).scan_user_input(SCANNED).await;
-    assert_fail_closed(&closed, ALIYUN);
+    // The default policy fails closed: the same failure blocks the call.
+    let closed = pipeline_with(backend).scan_user_input(SCANNED).await;
+    assert_fail_closed(&closed, ALIYUN, "500");
 }
 
 #[tokio::test]
@@ -621,10 +693,94 @@ async fn generic_medium_reply_blocks_only_when_the_policy_lowers_the_bar() {
 async fn generic_transport_failure_follows_the_failure_policy() {
     let server = failing_server("/detect", 2).await;
     let backend: Arc<dyn GuardrailBackend> = Arc::new(api_model_backend(&server));
-    let open = pipeline_with(Arc::clone(&backend))
+    let open = fail_open(Arc::clone(&backend))
         .scan_user_input(SCANNED)
         .await;
     assert_fail_open(&open, API_MODEL);
-    let closed = fail_closed(backend).scan_user_input(SCANNED).await;
-    assert_fail_closed(&closed, API_MODEL);
+    let closed = pipeline_with(backend).scan_user_input(SCANNED).await;
+    assert_fail_closed(&closed, API_MODEL, "500");
+}
+
+// --- unrecognized 2xx replies ----------------------------------------------
+
+/// Asserts an unrecognized `2xx` reply blocks as a `guardrail_error` failure
+/// whose recorded reason contains `reason`, without echoing the payload.
+async fn assert_unrecognized_reply_blocks(backend: Arc<dyn GuardrailBackend>, reason: &str) {
+    let name = backend.name().to_owned();
+    let outcome = pipeline_with(backend).scan_user_input(SCANNED).await;
+    assert_eq!(outcome.errors.len(), 1, "one failure per scan");
+    assert_fail_closed(&outcome, &name, reason);
+    assert_no_leak(&outcome);
+}
+
+// No Python equivalent: Python's vendor adapters graded an unparsable reply as
+// safe. A `2xx` reply outside the documented schema is a validation failure, so
+// the default fail-closed policy blocks the scan.
+#[tokio::test]
+async fn openai_unrecognized_reply_blocks_instead_of_reading_as_safe() {
+    let server = server_with("/v1/moderations", json!({}), 1).await;
+    assert_unrecognized_reply_blocks(openai_backend(&server), "openai moderation reply").await;
+}
+
+#[tokio::test]
+async fn azure_unrecognized_reply_blocks_instead_of_reading_as_safe() {
+    let server = server_with("/contentsafety/text:analyze", json!({}), 1).await;
+    assert_unrecognized_reply_blocks(azure_backend(&server), "azure content safety reply").await;
+}
+
+#[tokio::test]
+async fn aliyun_unrecognized_reply_blocks_instead_of_reading_as_safe() {
+    let server = server_with("/", json!({}), 1).await;
+    assert_unrecognized_reply_blocks(aliyun_backend(&server), "aliyun green reply").await;
+}
+
+#[tokio::test]
+async fn generic_unrecognized_json_reply_blocks_instead_of_reading_as_safe() {
+    let server = server_with("/detect", json!({}), 1).await;
+    let backend: Arc<dyn GuardrailBackend> = Arc::new(api_model_backend(&server));
+    assert_unrecognized_reply_blocks(backend, "bert_binary parser: unrecognized model output")
+        .await;
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "a reply that fails to parse is not retried"
+    );
+}
+
+#[tokio::test]
+async fn generic_non_json_reply_blocks_instead_of_reading_as_safe() {
+    let server = server_with_raw("/detect", "garbage", 1).await;
+    let backend: Arc<dyn GuardrailBackend> = Arc::new(api_model_backend(&server));
+    let name = backend.name().to_owned();
+    let outcome = pipeline_with(backend).scan_user_input(SCANNED).await;
+    assert_fail_closed(&outcome, &name, "non-JSON body");
+    assert_no_leak(&outcome);
+    assert!(
+        !serde_json::to_string(&outcome).unwrap().contains("garbage"),
+        "the payload of a rejected reply is never recorded"
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "a bad 2xx body is never retried"
+    );
+}
+
+#[tokio::test]
+async fn generic_json_non_object_reply_blocks_instead_of_reading_as_safe() {
+    let server = server_with("/detect", json!("garbage"), 1).await;
+    let backend: Arc<dyn GuardrailBackend> = Arc::new(api_model_backend(&server));
+    let name = backend.name().to_owned();
+    let outcome = pipeline_with(backend).scan_user_input(SCANNED).await;
+    assert_fail_closed(&outcome, &name, "JSON string body");
+    assert_no_leak(&outcome);
+    assert!(
+        !serde_json::to_string(&outcome).unwrap().contains("garbage"),
+        "the payload of a rejected reply is never recorded"
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "a bad 2xx body is never retried"
+    );
 }

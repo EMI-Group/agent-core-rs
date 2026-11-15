@@ -23,7 +23,8 @@
 //! ```
 //!
 //! Planning never touches a data store except through the read-only helpers below
-//! (`vector_field`, `scan_collection`); a dry run ([`MigrationContext::with_dry_run`]
+//! (`vector_field`, `scan_vector_field`, `scan_collection`); a dry run
+//! ([`MigrationContext::with_dry_run`]
 //! or [`MigrationPlan::with_dry_run`]) records `Skipped` journal entries without invoking
 //! any handler, so it always reports the work a real run would do.
 
@@ -578,13 +579,56 @@ impl MigrationPlanner {
 
 /// The collection's vector field: (field name, dimensions).
 ///
-/// The first `FLOAT_VECTOR` field with a dimension wins, mirroring the store's own
-/// default-vector-field rule. `None` means the collection cannot be scanned.
+/// The first `FLOAT_VECTOR` field with a positive dimension wins, mirroring the store's own
+/// default-vector-field rule, so a schema declaring `[embedding: None, dense: Some(4)]`
+/// scans through `dense`. `None` means no field carries the dimension a scan has to size its
+/// query vector with; [`scan_vector_field`] turns that into the typed error naming the cause.
 pub(crate) fn vector_field(schema: &CollectionSchema) -> Option<(&str, usize)> {
-    schema
-        .vector_fields()
-        .into_iter()
-        .find_map(|field| field.dim.map(|dim| (field.name.as_str(), dim)))
+    schema.vector_fields().into_iter().find_map(|field| {
+        field
+            .dim
+            .filter(|dim| *dim > 0)
+            .map(|dim| (field.name.as_str(), dim))
+    })
+}
+
+/// Why a schema that [`vector_field`] answers `None` for cannot be searched, in one sentence.
+///
+/// Two shapes are unsearchable, and `CollectionSchema::validate` rejects both: a schema with
+/// no `FLOAT_VECTOR` field at all, and one whose `FLOAT_VECTOR` fields declare no positive
+/// dimension. Neither can be worked around locally: a search sizes its query vector from the
+/// dimension, and the vector store exposes no document listing that could stand in for one,
+/// so the reason names the collection, the offending fields, and what the caller can do.
+pub(crate) fn unsearchable_reason(collection: &str, schema: &CollectionSchema) -> String {
+    let vectors = schema.vector_fields();
+    if vectors.is_empty() {
+        return format!(
+            "vector collection {collection:?} declares no FLOAT_VECTOR field, so it holds nothing to search; \
+             a valid collection schema requires one (recreate the collection)"
+        );
+    }
+    let names: Vec<&str> = vectors.iter().map(|field| field.name.as_str()).collect();
+    format!(
+        "vector collection {collection:?} declares its FLOAT_VECTOR field(s) {names:?} without a positive \
+         dimension, and a search sizes its query vector from that dimension; recreate the collection with \
+         a dimensional schema"
+    )
+}
+
+/// The vector field a scan of `collection` ranks against, or the reason it cannot be scanned.
+///
+/// # Errors
+///
+/// `Error::Validation` carrying [`unsearchable_reason`] when the schema declares no
+/// `FLOAT_VECTOR` field with a positive dimension, because such a schema cannot be searched.
+pub(crate) fn scan_vector_field<'a>(
+    collection: &str,
+    schema: &'a CollectionSchema,
+) -> Result<(&'a str, usize)> {
+    let Some((field, dim)) = vector_field(schema) else {
+        return Err(Error::validation(unsearchable_reason(collection, schema)));
+    };
+    Ok((field, dim))
 }
 
 /// Upper bound passed to the snapshot scan; the store truncates results to `top_k`.
@@ -597,23 +641,43 @@ pub(crate) const SCAN_TOP_K: usize = usize::MAX;
 /// [`SCAN_TOP_K`], which returns a snapshot of every document (the scores are
 /// meaningless and discarded). Each map includes the primary key.
 ///
+/// The query length is the one number a scan needs from the schema, so
+/// [`scan_vector_field`] supplies it: the first `FLOAT_VECTOR` field with a positive `dim`,
+/// which is also the field the store searches itself when a query names none.
+///
 /// # Errors
 ///
-/// A missing collection yields an empty vector. A collection whose schema declares no
-/// `FLOAT_VECTOR` field is `Error::Unsupported` naming the collection, because such a
-/// collection cannot be searched and therefore cannot be scanned.
+/// A missing collection scans empty. Everything else this build cannot decide by itself is a
+/// typed error naming the collection, never a guess:
+///
+/// - `Error::Validation` when the schema the store returns is not a searchable collection
+///   schema: no `FLOAT_VECTOR` field at all, or none with a positive dimension.
+///   [`CollectionSchema::validate`] rejects both, so no conforming store can create such a
+///   collection, and no store can search it either — the collection has to be recreated, not
+///   scanned again. A dimensionless vector field cannot stand in for the missing number
+///   either: the store sizes the query against that same `dim`, so an empty query would only
+///   suit a backend that reads a missing dimension as zero, which the [`VectorStore`] contract
+///   does not promise.
+/// - `Error::Unsupported` when the store reports the collection exists but returns no schema:
+///   without a dimension there is no query length, and [`VectorStore`] offers no document
+///   listing or get-by-id call to read the documents without one. This is the one case the
+///   store seam genuinely blocks, and it means the store cannot describe what it holds.
+/// - A store error from `search` propagates unchanged, so a backend that cannot answer an
+///   unfiltered top-k keeps its own kind and message.
 pub(crate) async fn scan_collection(
     store: &dyn VectorStore,
     collection: &str,
 ) -> Result<Vec<Map<String, Value>>> {
     let Some(schema) = store.get_schema(collection).await? else {
+        if store.collection_exists(collection).await? {
+            return Err(Error::unsupported(format!(
+                "cannot scan vector collection {collection:?}: it exists but the store returns no schema, so \
+                 there is no dimension to size the scan query with and the vector store exposes no document listing"
+            )));
+        }
         return Ok(Vec::new());
     };
-    let Some((field, dim)) = vector_field(&schema) else {
-        return Err(Error::unsupported(format!(
-            "cannot scan vector collection {collection:?}: its schema declares no FLOAT_VECTOR field"
-        )));
-    };
+    let (field, dim) = scan_vector_field(collection, &schema)?;
     let query = VectorQuery::new(vec![0.0; dim])
         .with_vector_field(field)
         .with_top_k(SCAN_TOP_K)
@@ -628,6 +692,7 @@ mod tests {
 
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use openjiuwen_foundation::store::{
         FieldSchema, InMemoryVectorStore, VectorDataType, VectorSearchResult,
@@ -1037,13 +1102,51 @@ mod tests {
 
     // --- scan_collection ---------------------------------------------------
 
-    /// A store whose single collection declares no vector field.
-    struct SchemaOnlyStore {
-        schema: CollectionSchema,
+    /// A store with one fixed schema that records the query every search receives.
+    ///
+    /// It exists because the in-memory store rejects the schemas a *foreign* or hand-edited
+    /// backend can hand back (`CollectionSchema::validate` forbids a dimension-less vector
+    /// field), so the scan's own schema classification is only reachable through a fake.
+    struct ScriptedVectorStore {
+        /// What `collection_exists` answers.
+        exists: bool,
+        /// What `get_schema` answers.
+        schema: Option<CollectionSchema>,
+        /// The fields every search hit carries.
+        hits: Vec<Map<String, Value>>,
+        /// The queries `search` was called with, in order.
+        queries: Mutex<Vec<VectorQuery>>,
+    }
+
+    impl ScriptedVectorStore {
+        /// A store that answers `schema` and returns one hit per entry in `hits`.
+        fn new(schema: CollectionSchema, hits: Vec<Map<String, Value>>) -> Self {
+            Self {
+                exists: true,
+                schema: Some(schema),
+                hits,
+                queries: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A store whose collection exists but has no schema at all.
+        fn hidden() -> Self {
+            Self {
+                exists: true,
+                schema: None,
+                hits: Vec::new(),
+                queries: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The last query `search` received, when it was called at all.
+        fn last_query(&self) -> Option<VectorQuery> {
+            self.queries.lock().expect("queries").last().cloned()
+        }
     }
 
     #[async_trait]
-    impl VectorStore for SchemaOnlyStore {
+    impl VectorStore for ScriptedVectorStore {
         async fn create_collection(
             &self,
             _collection: &str,
@@ -1057,11 +1160,11 @@ mod tests {
         }
 
         async fn collection_exists(&self, _collection: &str) -> Result<bool> {
-            Ok(true)
+            Ok(self.exists)
         }
 
         async fn get_schema(&self, _collection: &str) -> Result<Option<CollectionSchema>> {
-            Ok(Some(self.schema.clone()))
+            Ok(self.schema.clone())
         }
 
         async fn add_docs(
@@ -1075,9 +1178,14 @@ mod tests {
         async fn search(
             &self,
             _collection: &str,
-            _query: &VectorQuery,
+            query: &VectorQuery,
         ) -> Result<Vec<VectorSearchResult>> {
-            Err(Error::unsupported("unused in this test"))
+            self.queries.lock().expect("queries").push(query.clone());
+            Ok(self
+                .hits
+                .iter()
+                .map(|fields| VectorSearchResult::new(0.0, fields.clone()))
+                .collect())
         }
 
         async fn delete_docs_by_ids(&self, _collection: &str, _ids: &[String]) -> Result<usize> {
@@ -1170,21 +1278,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_collection_without_a_vector_field_is_unsupported() {
-        let store = SchemaOnlyStore {
-            schema: CollectionSchema::new(vec![FieldSchema {
+    async fn scan_collection_of_an_existing_collection_without_a_schema_is_unsupported() {
+        let store = ScriptedVectorStore::hidden();
+        let error = scan_collection(&store, "ghost")
+            .await
+            .expect_err("unsupported");
+        assert!(matches!(error, Error::Unsupported(_)), "{error}");
+        assert!(error.to_string().contains("ghost"), "{error}");
+        assert!(error.to_string().contains("no schema"), "{error}");
+        assert!(
+            store.last_query().is_none(),
+            "a schema-less collection is never searched: there is no dimension to size the query"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_collection_without_a_vector_field_is_validation() {
+        let store = ScriptedVectorStore::new(
+            CollectionSchema::new(vec![FieldSchema {
                 name: "id".to_owned(),
                 dtype: VectorDataType::Varchar,
                 is_primary: true,
                 ..FieldSchema::default()
             }]),
-        };
+            Vec::new(),
+        );
         let error = scan_collection(&store, "odd")
             .await
-            .expect_err("unsupported");
-        assert!(matches!(error, Error::Unsupported(_)), "{error}");
+            .expect_err("validation");
+        assert!(matches!(error, Error::Validation(_)), "{error}");
         assert!(error.to_string().contains("odd"), "{error}");
-        assert_eq!(vector_field(&store.schema), None);
+        assert!(
+            error.to_string().contains("no FLOAT_VECTOR field"),
+            "{error}"
+        );
+        assert!(
+            store.last_query().is_none(),
+            "an unsearchable collection is reported, never searched"
+        );
+        assert_eq!(vector_field(store.schema.as_ref().expect("schema")), None);
+    }
+
+    #[tokio::test]
+    async fn scan_collection_of_a_dimensionless_vector_field_is_validation() {
+        for dim in [None, Some(0)] {
+            let store = ScriptedVectorStore::new(
+                CollectionSchema::new(vec![
+                    FieldSchema {
+                        name: "id".to_owned(),
+                        dtype: VectorDataType::Varchar,
+                        is_primary: true,
+                        ..FieldSchema::default()
+                    },
+                    FieldSchema {
+                        name: "embedding".to_owned(),
+                        dtype: VectorDataType::FloatVector,
+                        dim,
+                        ..FieldSchema::default()
+                    },
+                ]),
+                Vec::new(),
+            );
+            let error = scan_collection(&store, "uid_a_gid_b_mtype_coding")
+                .await
+                .expect_err("validation");
+            assert!(matches!(error, Error::Validation(_)), "{error}");
+            let message = error.to_string();
+            assert!(message.contains("uid_a_gid_b_mtype_coding"), "{message}");
+            assert!(message.contains(r#"["embedding"]"#), "{message}");
+            assert!(message.contains("positive"), "{message}");
+            assert!(
+                store.last_query().is_none(),
+                "a dimensionless field cannot size a query, so nothing is searched"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_collection_scans_through_the_first_dimensional_field() {
+        let store = ScriptedVectorStore::new(
+            CollectionSchema::new(vec![
+                FieldSchema {
+                    name: "id".to_owned(),
+                    dtype: VectorDataType::Varchar,
+                    is_primary: true,
+                    ..FieldSchema::default()
+                },
+                FieldSchema {
+                    name: "embedding".to_owned(),
+                    dtype: VectorDataType::FloatVector,
+                    dim: None,
+                    ..FieldSchema::default()
+                },
+                FieldSchema {
+                    name: "dense".to_owned(),
+                    dtype: VectorDataType::FloatVector,
+                    dim: Some(2),
+                    ..FieldSchema::default()
+                },
+            ]),
+            vec![embedding_doc("a", [1.0, 0.0, 0.0])],
+        );
+        let docs = scan_collection(&store, "uid_a_gid_b_mtype_coding")
+            .await
+            .expect("scan");
+        assert_eq!(docs.len(), 1);
+        let query = store.last_query().expect("one query");
+        assert_eq!(query.vector_field.as_deref(), Some("dense"));
+        assert_eq!(query.query_vector, vec![0.0, 0.0]);
+        assert_eq!(query.top_k, SCAN_TOP_K);
+        assert_eq!(query.filters, Value::Null);
     }
 
     #[test]
@@ -1205,6 +1408,59 @@ mod tests {
             },
         ]);
         assert_eq!(vector_field(&dimensionless), None);
+
+        let zero_dimension = CollectionSchema::new(vec![
+            FieldSchema {
+                name: "id".to_owned(),
+                dtype: VectorDataType::Varchar,
+                is_primary: true,
+                ..FieldSchema::default()
+            },
+            FieldSchema {
+                name: "embedding".to_owned(),
+                dtype: VectorDataType::FloatVector,
+                dim: Some(0),
+                ..FieldSchema::default()
+            },
+        ]);
+        assert_eq!(
+            vector_field(&zero_dimension),
+            None,
+            "a zero dimension sizes a zero-length query and is rejected"
+        );
+
+        let mixed = CollectionSchema::new(vec![
+            FieldSchema {
+                name: "id".to_owned(),
+                dtype: VectorDataType::Varchar,
+                is_primary: true,
+                ..FieldSchema::default()
+            },
+            FieldSchema {
+                name: "embedding".to_owned(),
+                dtype: VectorDataType::FloatVector,
+                dim: None,
+                ..FieldSchema::default()
+            },
+            FieldSchema {
+                name: "dense".to_owned(),
+                dtype: VectorDataType::FloatVector,
+                dim: Some(2),
+                ..FieldSchema::default()
+            },
+        ]);
+        assert_eq!(vector_field(&mixed), Some(("dense", 2)));
+        assert_eq!(
+            scan_vector_field("mixed", &mixed).expect("searchable"),
+            ("dense", 2)
+        );
+        let reason = unsearchable_reason("mixed", &dimensionless);
+        assert!(reason.contains("mixed"), "{reason}");
+        assert!(reason.contains("recreate the collection"), "{reason}");
+        assert!(matches!(
+            scan_vector_field("mixed", &dimensionless),
+            Err(Error::Validation(_))
+        ));
     }
 
     // Keep the journal types exercised from this module too, so a change to the

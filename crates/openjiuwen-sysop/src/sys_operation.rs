@@ -188,6 +188,13 @@ impl SysOperation {
         })?;
         let isolation_key_template =
             crate::sandbox::config::isolation_key_template_from_config(gateway)?;
+        let isolation_key = endpoint.isolation_key.clone().ok_or_else(|| {
+            // Releasing a container addressed by an empty key would be a silent no-op, so
+            // an endpoint without one is refused here instead of defaulting to `""`.
+            crate::sandbox::launcher::isolation_key_error(
+                "the resolved sandbox endpoint carries no isolation key",
+            )
+        })?;
         Ok(Self {
             card,
             mode: OperationMode::Sandbox,
@@ -195,7 +202,7 @@ impl SysOperation {
             isolation_key_template: Some(isolation_key_template),
             sandbox: Some(SandboxBinding {
                 lifecycle: lifecycle.clone(),
-                isolation_key: endpoint.isolation_key.clone().unwrap_or_default(),
+                isolation_key,
                 endpoint,
             }),
         })
@@ -254,8 +261,14 @@ impl SysOperation {
     ///
     /// # Errors
     ///
-    /// See [`SandboxLifecycle::release`]: 199008 when the launcher fails and
-    /// `ErrorKind::Unsupported` when the recorded launcher type is no longer registered.
+    /// See [`SandboxLifecycle::release`]: 199008 when the launcher fails, and
+    /// `ErrorKind::Unsupported` when the recorded launcher type is no longer registered
+    /// **or when the launcher cannot perform the requested teardown at all**. The second
+    /// case is the important one: a launcher that has no way to `delete`/`pause` a container
+    /// (the built-in `pre_deploy` launcher, for instance) reports `Unsupported` instead of
+    /// returning `Ok(())`, because a silent success would leave the container running while
+    /// the caller believed it was gone. The record stays in the lifecycle, so the call can
+    /// be retried or swept later.
     pub async fn release_sandbox(&self) -> Result<()> {
         let Some(binding) = self.sandbox.as_ref() else {
             tracing::debug!(

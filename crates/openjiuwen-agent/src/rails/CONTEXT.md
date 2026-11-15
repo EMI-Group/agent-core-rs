@@ -3,11 +3,15 @@
 ## Intent
 
 Agent rails: the hook trait, per-event context, priority-ordered registry, and the built-in rails that need no upper layer.
-Ports the hook model of Python `core/single_agent/rail/base.py` (`AgentRail`, `AgentCallbackContext`, event firing, force-finish/retry control) and the rails the kernel can host on its own.
+Ports the hook model of Python `core/single_agent/rail/base.py` (`AgentRail`, `AgentCallbackContext`, event firing, force-finish/retry control, the opt-in `before_steering_drain` hook of `AgentCallbackEvent.BEFORE_STEERING_DRAIN`) and the rails the kernel can host on its own.
 
 ## API Surface
 
-- `mod.rs` — `RailEvent`, `RailContext` (per-event data + control flags: `force_finish`, `model_continue`, `retry`, `skip_tool`, `interrupts`, `model_override`), `AgentRail` (name, priority=50, async hooks `before_invoke`, `after_invoke`, `before_model_call`, `after_model_call`, `on_model_exception`, `before_tool_call`, `after_tool_call`, `on_tool_exception`, `after_react_iteration`), `RailRegistry` (`register`, `unregister`, `rails`, `fire`), `RetryRequest`, `DEFAULT_RAIL_PRIORITY`.
+- `mod.rs` — `RailEvent`, `RailContext` (per-event data + control flags: `force_finish`, `model_continue`, `retry`, `skip_tool`, `interrupts`, `model_override`, plus the steering-drain fields `steering_pending`/`steering_limit`), `AgentRail` (name, priority=50, async hooks `before_invoke`, `after_invoke`, `before_model_call`, `after_model_call`, `on_model_exception`, `before_tool_call`, `after_tool_call`, `on_tool_exception`, `after_react_iteration`, and the method-dispatched `before_steering_drain`), `RailRegistry` (`register`, `unregister`, `rails`, `fire`, `fire_steering_drain`), `RetryRequest`, `DEFAULT_RAIL_PRIORITY`.
+- `before_steering_drain` is an opt-in *trait-method* hook, not a `RailEvent` variant, because the read-only `openjiuwen-harness` crate matches `RailEvent` exhaustively; `RailRegistry::fire` stays event-only and `RailRegistry::fire_steering_drain` is its separate dispatcher.
+- The hook fires at the loop's steering-drain point, before the drained messages are observed, and only when the backlog is non-empty (an empty queue skips it entirely).
+- `RailContext::steering_pending` reports the queued message count and `RailContext::steering_limit` caps how many this drain may take: `None` takes everything, `Some(n)` takes at most `n`, and `n == 0`/`n < 1` still takes exactly one (`max(1, ·)`), so a non-empty queue always makes progress.
+- Rails run in priority order and each sees what the previous left, so the final `steering_limit` applies; while the hook runs `ctx.event` still reports the *previous* firing point, so a rail must not branch on `ctx.event` inside it.
 - `guardrail.rs` — `GuardrailRail` over `openjiuwen_security::GuardrailPipeline`: user input on `BeforeInvoke`, model output on `AfterModelCall`, tool input/output on `BeforeToolCall`/`AfterToolCall`, gated by `ScanTargets` flags; blocking returns `Error::Security` naming the stage, risk type, and level (from `GuardrailOutcome::enforce` + `violation`).
 - `guardrail.rs` keeps the `prompts` flag for `ScanTargets` parity but never scans the prepared window; user and tool content are scanned at their own stages.
 - `memory.rs` — `MemoryRail` over `openjiuwen_memory::LongTermMemory`: prompt variables on `BeforeInvoke`, recall injected as a system message after the leading system messages before the model call (at most once per invoke, flagged in `ctx.extra`), message write on `AfterInvoke`; `with_top_k`/`top_k` control recall size (default 5); failures are logged only.
@@ -23,6 +27,7 @@ Ports the hook model of Python `core/single_agent/rail/base.py` (`AgentRail`, `A
 ## Constraints
 
 - Hook dispatch is by `ctx.event` with a stable descending-priority order; `fire` stops at the first `Err`, which aborts the run.
+- `fire_steering_drain` uses the same stable descending-priority order and likewise stops at the first `Err`, which aborts the run; no out-of-crate code constructs `RailContext` literally, so the steering fields are additive.
 - A rail never mutates the agent directly; control flows through `RailContext`.
 - `RailContext.extra` persists for the whole invoke (Python `ctx.extra`) and is where resume answers/auto-confirm flags are seeded by the loop.
 - Built-in rails must be constructible without a `Runner` and must not depend on harness crates.
@@ -30,6 +35,7 @@ Ports the hook model of Python `core/single_agent/rail/base.py` (`AgentRail`, `A
 ## Test Strategy
 
 - Unit tests beside each module: registry dispatch order, first-error stop, per-event hook targeting, guardrail stage blocking, memory prompt-variable filtering/absence/labels, memory recall injection/write-back, model-backup ordering and exhaustion, interrupt pause/approve/reject/ask-user/auto-confirm.
+- `before_steering_drain` coverage: `fire_steering_drain_dispatches_in_priority_order` (descending priority, stable ties, `event` left at the previous firing point), `fire_steering_drain_stops_at_the_first_error` (highest-priority failure stops later rails and propagates), `before_steering_drain_default_is_inert` (a rail without the override leaves both steering fields untouched), `fire_steering_drain_preserves_a_rail_limit` (each rail sees the previous value and the final `steering_limit` survives dispatch), `fire_never_calls_before_steering_drain` (`fire` stays event-only), and `steering_fields_default_and_build` (`new` yields `0`/`None`, `with_steering_pending` seeds the count).
 - `../../tests/rails.rs` proves the hooks are wired into the running loop: priority ordering for every event, force-finish before the model and before a tool, `ModelBackupRail` failover, `GuardrailRail` blocking (`ErrorKind::Security`), `MemoryRail` recall reaching the model plus write-back, and `skip_tool` replacing a result.
 
 ## Routing Table

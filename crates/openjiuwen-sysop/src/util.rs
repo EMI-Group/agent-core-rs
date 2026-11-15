@@ -15,16 +15,69 @@ use sha2::{Digest, Sha256};
 /// example `"2024-01-02 03:04:05.123456"`. That string is what
 /// `FileSystemItem.modified_time` carries, and it is also the sort key of
 /// `sort_by="modified_time"`.
+///
+/// A pre-epoch timestamp (a file modified before 1970) is formatted as the real date rather
+/// than being clamped to the epoch. The only case that still has no rendering is a timestamp
+/// outside the representable local range; it yields the empty string, which is logged so it
+/// cannot be mistaken for a silently wrong date.
 #[must_use]
 pub fn format_modified_time(time: SystemTime) -> String {
-    let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let secs = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
-    let micros = i64::from(duration.subsec_micros());
     Local
-        .timestamp_opt(secs, u32::try_from(micros * 1000).unwrap_or(0))
+        .timestamp_micros(epoch_micros(time))
         .single()
-        .map(|stamp| stamp.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
-        .unwrap_or_default()
+        .map_or_else(
+            || {
+                tracing::debug!(
+                    ?time,
+                    "timestamp is outside the representable local range; reporting it as unset"
+                );
+                String::new()
+            },
+            |stamp| stamp.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+        )
+}
+
+/// Microseconds since the Unix epoch, negative for a pre-epoch clock.
+///
+/// Saturates at the `i64` bounds (a timestamp some 292 000 years from the epoch) and names
+/// the saturation in the log instead of silently claiming the epoch.
+fn epoch_micros(time: SystemTime) -> i64 {
+    let (duration, before_epoch) = match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (duration, false),
+        Err(error) => (error.duration(), true),
+    };
+    let magnitude = i64::try_from(duration.as_micros()).unwrap_or_else(|_| {
+        tracing::debug!(
+            ?time,
+            "timestamp is outside the representable range; clamping it"
+        );
+        i64::MAX
+    });
+    if before_epoch {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+/// Formats `metadata`'s modification time, naming `path` when the OS reports none.
+///
+/// A filesystem that does not report a modification time falls back to the Unix epoch (the
+/// `st_mtime == 0` rendering Python produces), which is indistinguishable from a genuinely
+/// epoch-stamped file, so the fallback is logged with the path.
+#[must_use]
+pub fn modified_time_of(metadata: &Metadata, path: &Path) -> String {
+    match metadata.modified() {
+        Ok(time) => format_modified_time(time),
+        Err(error) => {
+            tracing::debug!(
+                path = %format_path(path),
+                %error,
+                "the filesystem reports no modification time; using the Unix epoch"
+            );
+            format_modified_time(UNIX_EPOCH)
+        }
+    }
 }
 
 /// Formats a path as a lossy UTF-8 string (diagnostics and tool output).
@@ -139,5 +192,28 @@ mod tests {
             let metadata = std::fs::metadata(&file).unwrap();
             assert_eq!(octal_permissions(&metadata).as_deref(), Some("640"));
         }
+    }
+    #[test]
+    fn pre_epoch_timestamps_are_not_clamped_to_the_epoch() {
+        // One and a half seconds before 1970 is a real date, not `1970-01-01 00:00:00`.
+        let before = UNIX_EPOCH - Duration::from_millis(1_500);
+        assert_eq!(epoch_micros(before), -1_500_000);
+        assert_eq!(epoch_micros(UNIX_EPOCH), 0);
+        let rendered = format_modified_time(before);
+        assert_eq!(rendered.len(), 26, "unexpected format: {rendered}");
+        assert_ne!(
+            rendered,
+            format_modified_time(UNIX_EPOCH),
+            "a pre-epoch timestamp must not render as the epoch"
+        );
+    }
+
+    #[test]
+    fn a_metadata_without_a_modification_time_is_reported_as_the_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(modified_time_of(&metadata, &path).len(), 26);
     }
 }

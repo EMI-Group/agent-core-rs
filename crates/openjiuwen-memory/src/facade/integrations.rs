@@ -29,6 +29,10 @@
 //! writes the variable-assignment facts as real
 //! [`MemoryType::Variable`](crate::record::MemoryType::Variable) projections. Both go
 //! through the facade's single [`record_input`] conversion, which keeps a fact's tags.
+//! Both also fold the write path's [`AddOutcome`](crate::record::AddOutcome) diagnostics
+//! into [`RememberReport::degraded`] (`note_write_degraded`), so a fact stored without a
+//! duplicate check is reported beside a model-to-rules fallback instead of hiding behind
+//! it.
 use std::path::Path;
 use std::sync::Arc;
 
@@ -37,7 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{
     AnalyzerConfig, ConsolidationPlan, ExtractedFact, ExtractionInput, ExtractorKind,
-    MemoryAnalyzer, StagedAnalyzer,
+    MemoryAnalyzer, ScopeAnalyzerOverrides, StagedAnalyzer,
 };
 use crate::dreaming::{DreamConfig, DreamPlanner, NoopConsolidator};
 use crate::external::{EngineProvider, MemoryProvider};
@@ -72,7 +76,16 @@ pub struct RememberReport {
     pub merged: usize,
     /// Number of facts dropped by the dedupe policy.
     pub skipped: usize,
-    /// Why a deterministic fallback ran instead of the model, when one did.
+    /// Why this call was not fully analysed or fully checked, when it was not.
+    ///
+    /// Two independent failures land here, because either one makes the call's result
+    /// less trustworthy than a clean report: the analysis pass degrading to the
+    /// deterministic rules (the model call or its payload failed) and a fact write whose
+    /// duplicate candidate scan failed, so the fact was stored without a duplicate check
+    /// ([`AddOutcome::degraded`](crate::record::AddOutcome::degraded)). When both
+    /// happened both are named: the analysis reason keeps its place and the first write
+    /// reason follows it, since the two explain different halves of the call. Only the
+    /// first write failure is reported — later facts share its cause.
     pub degraded: Option<String>,
     /// Why the proactive stage withheld the write, when it did.
     ///
@@ -80,6 +93,29 @@ pub struct RememberReport {
     /// advisory proactive decision into a gate: the report then names the decision's
     /// reason and nothing is written.
     pub gated: Option<String>,
+}
+
+/// Folds a write path's degradation into a report's `degraded` reason.
+///
+/// `write` is the first
+/// [`AddOutcome::degraded`](crate::record::AddOutcome::degraded) a write loop saw, so a
+/// batch reports the failure that explains the rest. An analysis-pass reason (a model
+/// stage that fell back to the rules) keeps its place and the write reason is appended,
+/// because the two describe different halves of the call — how the facts were produced
+/// and whether the store could check them. With no analysis reason the write reason
+/// becomes the whole answer.
+pub(super) fn note_write_degraded(degraded: &mut Option<String>, write: Option<String>) {
+    let Some(write) = write else {
+        return;
+    };
+    match degraded {
+        None => *degraded = Some(write),
+        Some(analysis) if analysis.contains(&write) => {}
+        Some(analysis) => {
+            analysis.push_str(" The write path also degraded: ");
+            analysis.push_str(&write);
+        }
+    }
 }
 
 impl LongTermMemory {
@@ -111,10 +147,18 @@ impl LongTermMemory {
     ///
     /// `Error::Validation` for an invalid scope or input (and for a malformed stored
     /// override document), `Error::Unsupported` when a stored override names a
-    /// `model`/`embedding` this facade does not hold, `Error::Cancelled` when `options.call`
-    /// fires (including between facts — earlier writes stay stored), and the analyzer's or
-    /// engine's error otherwise. A failed write is never dropped silently: the error names
-    /// the fact index and content plus the engine's message.
+    /// `model`/`embedding` this facade has not registered, `Error::Cancelled` when
+    /// `options.call` fires (including between facts — earlier writes stay stored), and the
+    /// analyzer's or engine's error otherwise. A failed write is never dropped silently: the
+    /// error names the fact index and content plus the engine's message.
+    ///
+    /// The scope's resolved override model is the model the model-backed stages call and
+    /// its resolved override embedding is the embedder of every fact write, so one scope
+    /// can analyze and index with handles no other scope uses.
+    ///
+    /// A write that stored a fact without a duplicate check (its candidate scan failed)
+    /// is reported too: the first such reason reaches `RememberReport::degraded`, which
+    /// keeps the analysis-pass reason when one is already there and names both.
     pub async fn remember(
         &self,
         scope: &MemoryScope,
@@ -122,15 +166,16 @@ impl LongTermMemory {
         options: &AddOptions,
     ) -> Result<RememberReport> {
         scope.validate()?;
-        let (facts, mut report) = self.analyze_for_write(scope, input, options).await?;
+        let (facts, mut report, overrides) = self.analyze_for_write(scope, input, options).await?;
         if report.gated.is_some() {
             return Ok(report);
         }
+        let mut write_degraded = None;
         for (index, fact) in facts.iter().enumerate() {
             options.call.check()?;
             let outcome = self
                 .engine
-                .add(scope, record_input(fact), options)
+                .add_with_embedding(scope, record_input(fact), options, overrides.embedding())
                 .await
                 .map_err(|error| {
                     error.with_context(format!("writing fact {index} (`{}`)", fact.content))
@@ -138,7 +183,11 @@ impl LongTermMemory {
             report.added += outcome.added.len();
             report.merged += outcome.merged.len();
             report.skipped += outcome.skipped.len();
+            if write_degraded.is_none() {
+                write_degraded = outcome.degraded;
+            }
         }
+        note_write_degraded(&mut report.degraded, write_degraded);
         Ok(report)
     }
 
@@ -148,15 +197,22 @@ impl LongTermMemory {
     /// write counters stay at zero for the caller to fill from each
     /// [`AddOutcome`](crate::record::AddOutcome), so the same analysis feeds both
     /// [`LongTermMemory::remember`] and
-    /// [`LongTermMemory::remember_with_assignments`]. A gated batch returns no facts at
+    /// [`LongTermMemory::remember_with_assignments`]. `degraded` here is only the analysis
+    /// pass's own reason; the caller folds each write's
+    /// [`AddOutcome::degraded`](crate::record::AddOutcome::degraded) into it with
+    /// `note_write_degraded`. A gated batch returns no facts at
     /// all, and a builder-injected analyzer keeps owning extraction while the scope
     /// carries no overrides (see the module docs).
+    ///
+    /// The resolved [`ScopeAnalyzerOverrides`] travel back with the facts, so the caller
+    /// writes them with the same per-scope embedding the analysis resolved instead of
+    /// resolving the document a second time.
     pub(super) async fn analyze_for_write(
         &self,
         scope: &MemoryScope,
         input: &ExtractionInput,
         options: &AddOptions,
-    ) -> Result<(Vec<ExtractedFact>, RememberReport)> {
+    ) -> Result<(Vec<ExtractedFact>, RememberReport, ScopeAnalyzerOverrides)> {
         let overrides = self.resolve_scope_overrides(scope).await?;
         if overrides.is_empty() && self.uses_injected_analyzer() {
             let extraction = self.analyzer.analyze(input, &options.call).await?;
@@ -166,9 +222,9 @@ impl LongTermMemory {
                 gated: None,
                 ..RememberReport::default()
             };
-            return Ok((extraction.facts, report));
+            return Ok((extraction.facts, report, overrides));
         }
-        let staged = StagedAnalyzer::from_engine(self.config(), self.engine.model().cloned())
+        let staged = StagedAnalyzer::from_engine(self.config(), self.engine.model().cloned())?
             .with_overrides(overrides.clone())
             .with_dedupe(self.config().dedupe.clone());
         let result = staged.analyze(input, &options.call).await?;
@@ -194,9 +250,9 @@ impl LongTermMemory {
                 "remember withheld the write under the scope override gate"
             );
             report.gated = Some(reason);
-            return Ok((Vec::new(), report));
+            return Ok((Vec::new(), report, overrides));
         };
-        Ok((facts, report))
+        Ok((facts, report, overrides))
     }
 
     /// Whether [`LongTermMemoryBuilder::analyzer`](super::LongTermMemoryBuilder::analyzer)
@@ -232,8 +288,9 @@ impl LongTermMemory {
     ///
     /// `Error::Validation` for an invalid scope or a blank/unsupported content (and for a
     /// malformed stored override document), `Error::Unsupported` when a stored override
-    /// names a handle this facade does not hold, `Error::Cancelled` when `options` fires,
-    /// and the engine's recall error otherwise.
+    /// names a handle this facade does not hold or when an extracted override asks for the
+    /// model-backed extractor/classifier while the facade holds no model,
+    /// `Error::Cancelled` when `options` fires, and the engine's recall error otherwise.
     pub async fn consolidate(
         &self,
         scope: &MemoryScope,
@@ -244,6 +301,7 @@ impl LongTermMemory {
         incoming.validate()?;
         options.check()?;
         let overrides = self.resolve_scope_overrides(scope).await?;
+        let embedding = overrides.embedding().cloned();
         let dedupe = self.config().dedupe.clone();
         let search = SearchOptions {
             top_k: dedupe.candidate_top_k,
@@ -257,11 +315,11 @@ impl LongTermMemory {
         };
         let hits = self
             .engine
-            .search(scope, &incoming.content, &search)
+            .search_with_embedding(scope, &incoming.content, &search, embedding.as_ref())
             .await?;
         let records: Vec<_> = hits.into_iter().map(|hit| hit.record).collect();
         let fact = ExtractedFact::from(incoming);
-        let staged = StagedAnalyzer::from_engine(self.config(), self.engine.model().cloned())
+        let staged = StagedAnalyzer::from_engine(self.config(), self.engine.model().cloned())?
             .with_overrides(overrides)
             .with_dedupe(dedupe.clone());
         Ok(staged.consolidate(&[fact], &records, &dedupe))
@@ -455,6 +513,40 @@ mod tests {
             .get(TAGS_KEY)
             .and_then(|tags| tags.as_array())
             .is_some_and(|tags| !tags.is_empty())));
+    }
+
+    #[test]
+    fn write_degradation_keeps_the_analysis_reason_and_names_both() {
+        // Only the write path degraded: its reason is the whole answer.
+        let mut degraded = None;
+        note_write_degraded(
+            &mut degraded,
+            Some("duplicate candidate scan failed".to_owned()),
+        );
+        assert_eq!(degraded.as_deref(), Some("duplicate candidate scan failed"));
+        // Only the analysis pass degraded: a clean write never touches the reason.
+        let mut analysis_only = Some("the model fell back to rules".to_owned());
+        note_write_degraded(&mut analysis_only, None);
+        assert_eq!(
+            analysis_only.as_deref(),
+            Some("the model fell back to rules")
+        );
+        // Both degraded: the analysis reason keeps its place and the write reason follows
+        // it, because the two explain different halves of the call.
+        let mut both = Some("the model fell back to rules".to_owned());
+        note_write_degraded(
+            &mut both,
+            Some("duplicate candidate scan failed".to_owned()),
+        );
+        let reason = both.expect("a degraded reason");
+        assert!(
+            reason.starts_with("the model fell back to rules"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("duplicate candidate scan failed"),
+            "{reason}"
+        );
     }
 
     #[tokio::test]

@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use openjiuwen_common::error::{Error, ErrorKind, Result};
+use openjiuwen_retrieval::knowledge_base::{
+    retrieve_multi_kb_reporting, retrieve_multi_kb_strict, retrieve_multi_kb_with_source_reporting,
+    retrieve_multi_kb_with_source_strict,
+};
 use openjiuwen_retrieval::{
     retrieve_multi_kb, retrieve_multi_kb_with_source, Document, Embedding, HashEmbedding,
     InMemoryVectorStore, IndexConfig, KnowledgeBaseConfig, KnowledgeBaseStatistics, Metadata,
@@ -95,6 +99,16 @@ impl Embedding for FailingEmbedding {
     ) -> Result<Vec<Vec<f32>>> {
         Err(Error::retrieval("boom"))
     }
+}
+
+/// Builds a knowledge base whose embedder always fails, so every retrieval errors.
+fn failing_kb(kb_id: &str) -> Arc<SimpleKnowledgeBase> {
+    let embedder: Arc<dyn Embedding> = Arc::new(FailingEmbedding);
+    let vector_store: Arc<dyn VectorStore> = store();
+    Arc::new(
+        SimpleKnowledgeBase::from_config(KnowledgeBaseConfig::new(kb_id), vector_store, embedder)
+            .unwrap(),
+    )
 }
 
 /// Extracts result texts in order.
@@ -656,4 +670,129 @@ async fn from_index_config_rejects_a_blank_name_and_unknown_type() {
         .err()
         .expect("an unknown index type must be rejected");
     assert_eq!(error.kind(), ErrorKind::Config);
+}
+
+#[tokio::test]
+async fn multi_kb_reporting_lists_every_failed_knowledge_base() {
+    let healthy = kb(KnowledgeBaseConfig::new("kb-healthy"));
+    healthy
+        .add_documents(vec![Document::with_id("doc-a", "shared text")])
+        .await
+        .unwrap();
+    let kbs = vec![failing_kb("kb-fail-1"), healthy, failing_kb("kb-fail-2")];
+
+    let report = retrieve_multi_kb_reporting(&kbs, "shared text", None).await;
+    assert_eq!(texts(&report.results), vec!["shared text".to_owned()]);
+    assert_eq!(
+        report
+            .failures
+            .iter()
+            .map(|failure| failure.kb_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["kb-fail-1", "kb-fail-2"]
+    );
+    for failure in &report.failures {
+        assert!(!failure.error.is_empty(), "{failure:?}");
+        assert!(failure.error.contains("boom"), "{failure:?}");
+    }
+
+    // The compatible function keeps returning only the surviving results.
+    let compatible = retrieve_multi_kb(&kbs, "shared text", None).await;
+    assert_eq!(compatible, report.results);
+}
+
+#[tokio::test]
+async fn multi_kb_with_source_reporting_lists_every_failed_knowledge_base() {
+    let healthy = kb(KnowledgeBaseConfig::new("kb-healthy"));
+    healthy
+        .add_documents(vec![Document::with_id("doc-a", "shared text")])
+        .await
+        .unwrap();
+    let kbs = vec![failing_kb("kb-fail-1"), healthy, failing_kb("kb-fail-2")];
+
+    let report = retrieve_multi_kb_with_source_reporting(&kbs, "shared text", None).await;
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].text, "shared text");
+    assert_eq!(report.results[0].kb_ids, vec!["kb-healthy".to_owned()]);
+    assert_eq!(
+        report
+            .failures
+            .iter()
+            .map(|failure| failure.kb_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["kb-fail-1", "kb-fail-2"]
+    );
+    for failure in &report.failures {
+        assert!(failure.error.contains("boom"), "{failure:?}");
+    }
+
+    let compatible = retrieve_multi_kb_with_source(&kbs, "shared text", None).await;
+    assert_eq!(compatible, report.results);
+}
+
+#[tokio::test]
+async fn multi_kb_strict_keeps_partial_results() {
+    let healthy = kb(KnowledgeBaseConfig::new("kb-healthy"));
+    healthy
+        .add_documents(vec![Document::with_id("doc-a", "shared text")])
+        .await
+        .unwrap();
+    let kbs = vec![failing_kb("kb-fail-1"), healthy, failing_kb("kb-fail-2")];
+
+    let plain = retrieve_multi_kb_strict(&kbs, "shared text", None)
+        .await
+        .expect("a partial failure is not an error");
+    assert_eq!(plain, retrieve_multi_kb(&kbs, "shared text", None).await);
+
+    let with_source = retrieve_multi_kb_with_source_strict(&kbs, "shared text", None)
+        .await
+        .expect("a partial failure is not an error");
+    assert_eq!(
+        with_source,
+        retrieve_multi_kb_with_source(&kbs, "shared text", None).await
+    );
+    assert_eq!(with_source.len(), 1);
+    assert_eq!(with_source[0].kb_ids, vec!["kb-healthy".to_owned()]);
+}
+
+#[tokio::test]
+async fn multi_kb_strict_fails_when_every_knowledge_base_fails() {
+    let kbs = vec![failing_kb("kb-fail-1"), failing_kb("kb-fail-2")];
+
+    let error = retrieve_multi_kb_strict(&kbs, "shared text", None)
+        .await
+        .expect_err("every knowledge base failed");
+    assert_eq!(error.kind(), ErrorKind::Retrieval);
+    let message = error.to_string();
+    assert!(message.contains("kb-fail-1"), "{message}");
+    assert!(message.contains("kb-fail-2"), "{message}");
+
+    let error = retrieve_multi_kb_with_source_strict(&kbs, "shared text", None)
+        .await
+        .expect_err("every knowledge base failed");
+    assert_eq!(error.kind(), ErrorKind::Retrieval);
+    let message = error.to_string();
+    assert!(message.contains("kb-fail-1"), "{message}");
+    assert!(message.contains("kb-fail-2"), "{message}");
+}
+
+#[tokio::test]
+async fn multi_kb_without_knowledge_bases_reports_nothing() {
+    // An empty slice is a successful no-op for both strict variants.
+    let plain = retrieve_multi_kb_strict(&[], "query", None)
+        .await
+        .expect("an empty slice is a successful no-op");
+    assert!(plain.is_empty(), "{plain:?}");
+    let with_source = retrieve_multi_kb_with_source_strict(&[], "query", None)
+        .await
+        .expect("an empty slice is a successful no-op");
+    assert!(with_source.is_empty(), "{with_source:?}");
+
+    let report = retrieve_multi_kb_reporting(&[], "query", None).await;
+    assert_eq!(report.results, Vec::new());
+    assert_eq!(report.failures, Vec::new());
+
+    let report = retrieve_multi_kb_with_source_reporting(&[], "query", None).await;
+    assert_eq!(report.results, Vec::new());
+    assert_eq!(report.failures, Vec::new());
 }

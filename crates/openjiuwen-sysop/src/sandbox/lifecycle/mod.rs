@@ -6,7 +6,9 @@
 //! `delete_sandbox`) and `sandbox/gateway/sandbox_store.py` (`SandboxRecord`,
 //! `AbstractSandboxStore`, `InMemorySandboxStore`). The provider cache of Python's gateway
 //! is not ported: providers are rebuilt from the resolved endpoint per
-//! [`crate::SysOperation`], so only the container bookkeeping lives here.
+//! [`crate::SysOperation`], so only the container bookkeeping lives here — including the
+//! `container_config_hash` and `metadata` fields that key that cache in Python (see
+//! [`refresh_container_config`]).
 //!
 //! # State machine
 //!
@@ -34,6 +36,16 @@
 //! [`SandboxStatus::Stopped`]) is dropped and relaunched, mirroring Python's
 //! `SandboxGateway._get_endpoint`.
 //!
+//! # Failures
+//!
+//! A launcher that fails while doing its job is code 199008 ([`ErrorKind::SysOp`]). A
+//! launcher that cannot perform the operation *at all* keeps its own
+//! [`ErrorKind::Unsupported`] — the defaulted `pause`/`resume`/`delete` of
+//! [`crate::sandbox::launcher::SandboxLauncher`] — and a launcher that rejects the request as
+//! invalid keeps its [`ErrorKind::Validation`]/[`ErrorKind::Config`]; see
+//! `map_launcher_failure`. Teardown is never reported as a success the launcher did not
+//! perform, and the record is restored on failure so the call is retryable.
+//!
 //! # Time
 //!
 //! Every decision takes `now_epoch_secs` as an argument (or the injected [`Clock`]), so
@@ -50,8 +62,8 @@
 //!
 //! # Layout
 //!
-//! `record` holds the bookkeeping struct, `clock` the injected time sources, and this module
-//! the [`SandboxLifecycle`] manager plus [`global`].
+//! `record` holds the bookkeeping struct plus the config hash/metadata helpers, `clock` the
+//! injected time sources, and this module the [`SandboxLifecycle`] manager plus [`global`].
 //!
 //! ```
 //! use std::sync::Arc;
@@ -73,6 +85,12 @@
 //!     ) -> openjiuwen_common::error::Result<LaunchedSandbox> {
 //!         Ok(LaunchedSandbox::new("http://127.0.0.1:9000").with_sandbox_id("c-1"))
 //!     }
+//!
+//!     // A launcher that can destroy its container must say so, or `release(Delete)`
+//!     // reports the inherited `Unsupported` refusal instead of pretending success.
+//!     async fn delete(&self, _sandbox_id: &str) -> openjiuwen_common::error::Result<()> {
+//!         Ok(())
+//!     }
 //! }
 //!
 //! let launchers = LauncherRegistry::new();
@@ -90,6 +108,16 @@
 //! assert_eq!(endpoint.base_url, "http://127.0.0.1:9000");
 //! assert_eq!(endpoint.sandbox_id.as_deref(), Some("c-1"));
 //!
+//! // The record carries the hash and labels of the launcher configuration it was made with.
+//! let record = lifecycle.record("session_key").await.unwrap();
+//! assert_eq!(
+//!     record.container_config_hash,
+//!     openjiuwen_sysop::sandbox::lifecycle::container_config_hash(
+//!         config.launcher_config.as_ref().unwrap()
+//!     )
+//! );
+//! assert_eq!(record.metadata["launcher_type"], "fake");
+//!
 //! // Reused, not relaunched, on the next call.
 //! let again = lifecycle.ensure_endpoint(&config, "session_key", 1_010).await?;
 //! assert_eq!(again, endpoint);
@@ -104,7 +132,9 @@ mod clock;
 mod record;
 
 pub use clock::{now_epoch_secs, Clock, FixedClock, SystemClock};
-pub use record::SandboxRecord;
+pub use record::{
+    container_config_hash, container_metadata, refresh_container_config, SandboxRecord,
+};
 
 use std::{
     collections::BTreeMap,
@@ -112,7 +142,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, ErrorKind, Result};
 use tokio::sync::Mutex;
 
 use crate::sandbox::config::{
@@ -121,6 +151,23 @@ use crate::sandbox::config::{
 use crate::sandbox::launcher::{
     isolation_key_error, launcher_error, LauncherRegistry, SandboxLauncher, SandboxStatus,
 };
+
+/// Maps a launcher failure onto the lifecycle's error codes.
+///
+/// A launcher that exists and fails while doing its job is code 199008
+/// ([`launcher_error`], [`ErrorKind::SysOp`]). Kinds that describe what the launcher *is*
+/// rather than how a call went are passed through unchanged: [`ErrorKind::Unsupported`] (the
+/// launcher cannot do this at all, for example destroying a pre-deployed container),
+/// [`ErrorKind::Validation`] and [`ErrorKind::Config`] (the launcher rejects the request as
+/// invalid). Flattening those into 199008 is what made a refused teardown look like a
+/// transient failure; keeping them typed lets a caller tell "this runtime cannot do that"
+/// from "the call failed, retry may help".
+fn map_launcher_failure(process: &str, error: Error) -> Error {
+    match error.kind() {
+        ErrorKind::Unsupported | ErrorKind::Validation | ErrorKind::Config => error,
+        _ => launcher_error(process, error.message().as_ref()),
+    }
+}
 
 /// The lifecycle manager: resolves, reuses, pauses, resumes, and evicts sandbox containers.
 ///
@@ -138,21 +185,20 @@ pub struct SandboxLifecycle {
 impl fmt::Debug for SandboxLifecycle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Records carry endpoints, which may embed credentials: only keys and states show.
+        // A map that cannot be read at all is rendered as an explicit marker, because an
+        // empty list would claim that no container is tracked.
+        let records = match self.records.try_lock() {
+            Ok(records) => records
+                .iter()
+                .map(|(key, record)| (key.clone(), record.status))
+                .collect::<Vec<_>>(),
+            // `tokio::sync::Mutex::try_lock` has a single failure mode (the lock is held),
+            // so the marker says the view is unavailable rather than "no containers".
+            Err(_) => vec![("<locked>".to_string(), SandboxStatus::Unknown)],
+        };
         f.debug_struct("SandboxLifecycle")
             .field("launchers", &self.launchers.launcher_types())
-            .field(
-                "records",
-                &self
-                    .records
-                    .try_lock()
-                    .map(|records| {
-                        records
-                            .iter()
-                            .map(|(key, record)| (key.clone(), record.status))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default(),
-            )
+            .field("records", &records)
             .finish_non_exhaustive()
     }
 }
@@ -239,7 +285,7 @@ impl SandboxLifecycle {
         let launcher = self.launchers.create(&launcher_config.launcher_type)?;
 
         if let Some(endpoint) = self
-            .revive(&launcher, isolation_key, now_epoch_secs)
+            .revive(&launcher, launcher_config, isolation_key, now_epoch_secs)
             .await?
         {
             return Ok(endpoint);
@@ -258,20 +304,29 @@ impl SandboxLifecycle {
     /// recorded one.
     ///
     /// A paused container is resumed; one that is gone is forgotten so the caller launches a
-    /// fresh sandbox.
+    /// fresh sandbox. Both reuse paths merge `launcher_config`'s derived bookkeeping into the
+    /// record once the launcher call has succeeded (see [`refresh_container_config`]), so a
+    /// failure never loses metadata.
     ///
     /// # Errors
     ///
     /// Returns `ErrorKind::SysOp` (199008) when the launcher fails to resume the container
-    /// or cannot report its status.
+    /// or cannot report its status, and passes a launcher's own
+    /// [`ErrorKind::Unsupported`]/[`ErrorKind::Validation`]/[`ErrorKind::Config`] through
+    /// unchanged (see [`map_launcher_failure`]) — a launcher that cannot resume surfaces its
+    /// typed refusal instead of a 199008.
     async fn revive(
         &self,
         launcher: &Arc<dyn SandboxLauncher>,
+        launcher_config: &SandboxLauncherConfig,
         isolation_key: &str,
         now_epoch_secs: u64,
     ) -> Result<Option<SandboxEndpoint>> {
         // 1. Reuse a running container.
-        if let Some(endpoint) = self.touch_running(isolation_key, now_epoch_secs).await {
+        if let Some(endpoint) = self
+            .touch_running(isolation_key, launcher_config, now_epoch_secs)
+            .await
+        {
             return Ok(Some(endpoint));
         }
         // 2. A stored record that is not running: ask the launcher what the container is.
@@ -288,7 +343,7 @@ impl SandboxLifecycle {
         };
         match launcher.check_status(&sandbox_id).await {
             Ok(SandboxStatus::Running) => Ok(self
-                .mark_running(isolation_key, &sandbox_id, now_epoch_secs)
+                .mark_running(isolation_key, &sandbox_id, launcher_config, now_epoch_secs)
                 .await),
             // Python only knows running/paused/killed; a launcher that cannot tell is
             // treated as paused, because it may hold a suspended container that a resume
@@ -297,9 +352,9 @@ impl SandboxLifecycle {
                 launcher
                     .resume(&sandbox_id)
                     .await
-                    .map_err(|error| launcher_error("resume", error.message().as_ref()))?;
+                    .map_err(|error| map_launcher_failure("resume", error))?;
                 Ok(self
-                    .mark_running(isolation_key, &sandbox_id, now_epoch_secs)
+                    .mark_running(isolation_key, &sandbox_id, launcher_config, now_epoch_secs)
                     .await)
             }
             Ok(SandboxStatus::Stopped) => {
@@ -311,12 +366,16 @@ impl SandboxLifecycle {
                 self.drop_record(isolation_key, &sandbox_id).await;
                 Ok(None)
             }
-            Err(error) => Err(launcher_error("check_status", error.message().as_ref())),
+            Err(error) => Err(map_launcher_failure("check_status", error)),
         }
     }
 
     /// Steps 3 and 4 of [`Self::ensure_endpoint`]: evict the idle containers, launch a new
     /// sandbox, and store its record.
+    ///
+    /// The stored record carries the configuration hash and the labels derived from
+    /// `launcher_config` (see [`container_config_hash`] / [`container_metadata`]), so a reuse
+    /// can tell whether the running container still matches the configured launcher.
     ///
     /// # Errors
     ///
@@ -339,7 +398,7 @@ impl SandboxLifecycle {
         let descriptor = launcher
             .launch(launcher_config, config.timeout_seconds, Some(isolation_key))
             .await
-            .map_err(|error| launcher_error("launch", error.message().as_ref()))?;
+            .map_err(|error| map_launcher_failure("launch", error))?;
 
         // 4. Store the record. The lock is never held across a launcher await.
         let record = SandboxRecord {
@@ -354,6 +413,8 @@ impl SandboxLifecycle {
             launcher_type: launcher_config.launcher_type.clone(),
             created_epoch_secs: now_epoch_secs,
             last_used_epoch_secs: now_epoch_secs,
+            container_config_hash: container_config_hash(launcher_config),
+            metadata: container_metadata(launcher_config),
         };
         let winner = {
             let mut records = self.records.lock().await;
@@ -382,11 +443,22 @@ impl SandboxLifecycle {
                     "duplicate launch reused the same sandbox id; nothing to delete"
                 );
             } else if let Err(error) = launcher.delete(sandbox_id).await {
-                tracing::warn!(
-                    sandbox_id,
-                    error = %error,
-                    "failed to delete a duplicate sandbox launched for the same isolation key"
-                );
+                if error.kind() == ErrorKind::Unsupported {
+                    tracing::warn!(
+                        isolation_key,
+                        sandbox_id,
+                        launcher_type = %launcher_config.launcher_type,
+                        error = %error,
+                        "the duplicate sandbox launched for this isolation key was left behind \
+                         (leaked): its launcher cannot delete containers"
+                    );
+                } else {
+                    tracing::warn!(
+                        sandbox_id,
+                        error = %error,
+                        "failed to delete a duplicate sandbox launched for the same isolation key"
+                    );
+                }
             }
         } else {
             tracing::debug!(
@@ -424,9 +496,15 @@ impl SandboxLifecycle {
     ///
     /// # Errors
     ///
-    /// Returns `ErrorKind::SysOp` (199008) when the launcher fails, and
-    /// `ErrorKind::Unsupported` when the recorded `launcher_type` is no longer registered.
-    /// The record is restored on failure, so the call can be retried.
+    /// - `ErrorKind::SysOp` (199008) when the launcher fails the `delete`/`pause` call;
+    /// - the launcher's own [`ErrorKind::Unsupported`] when it cannot destroy or suspend the
+    ///   container at all: teardown is *not* reported as a success, because the container
+    ///   would be left running (see `map_launcher_failure`). A `pre_deploy` container is
+    ///   the built-in example;
+    /// - `ErrorKind::Unsupported` when the recorded `launcher_type` is no longer registered.
+    ///
+    /// The record is restored on every failure, so the call can be retried without losing
+    /// its bookkeeping (`container_config_hash`, `metadata`).
     pub async fn release(&self, isolation_key: &str, on_stop: OnStop) -> Result<()> {
         if on_stop == OnStop::Keep {
             let mut records = self.records.lock().await;
@@ -447,7 +525,16 @@ impl SandboxLifecycle {
                 return Err(error);
             }
         };
-        let sandbox_id = record.sandbox_id.clone().unwrap_or_default();
+        let sandbox_id = record.sandbox_id.clone().unwrap_or_else(|| {
+            // The launcher has no container identity to act on; the call still goes out
+            // (Python does the same) but the caller can see why it may not resolve.
+            tracing::warn!(
+                isolation_key,
+                launcher_type = %record.launcher_type,
+                "the released record carries no sandbox id; the launcher receives an empty id"
+            );
+            String::new()
+        });
         let outcome = if on_stop == OnStop::Pause {
             launcher.pause(&sandbox_id).await
         } else {
@@ -471,7 +558,18 @@ impl SandboxLifecycle {
                 } else {
                     "delete"
                 };
-                let mapped = launcher_error(process, error.message().as_ref());
+                if error.kind() == ErrorKind::Unsupported {
+                    tracing::warn!(
+                        isolation_key,
+                        sandbox_id,
+                        launcher_type = %record.launcher_type,
+                        process,
+                        error = %error,
+                        "sandbox teardown was refused by its launcher; the container is left \
+                         in place and the record is kept"
+                    );
+                }
+                let mapped = map_launcher_failure(process, error);
                 self.restore(record).await;
                 Err(mapped)
             }
@@ -506,16 +604,40 @@ impl SandboxLifecycle {
 
         let mut evicted = Vec::with_capacity(expired.len());
         for record in expired {
-            let sandbox_id = record.sandbox_id.clone().unwrap_or_default();
+            let sandbox_id = record.sandbox_id.clone().unwrap_or_else(|| {
+                tracing::warn!(
+                    isolation_key = %record.isolation_key,
+                    launcher_type = %record.launcher_type,
+                    "the evicted record carries no sandbox id; the launcher receives an empty id"
+                );
+                String::new()
+            });
             match self.launchers.create(&record.launcher_type) {
                 Ok(launcher) => {
                     if let Err(error) = launcher.delete(&sandbox_id).await {
-                        tracing::warn!(
-                            isolation_key = %record.isolation_key,
-                            sandbox_id,
-                            error = %error,
-                            "idle sandbox deletion failed"
-                        );
+                        if error.kind() == ErrorKind::Unsupported {
+                            // The sweep keeps Python's drop-and-continue semantics, so the
+                            // record is gone either way; saying so explicitly is the only
+                            // honest outcome for a container the launcher cannot destroy.
+                            tracing::warn!(
+                                isolation_key = %record.isolation_key,
+                                launcher_type = %record.launcher_type,
+                                sandbox_id,
+                                error = %error,
+                                "idle sandbox was left behind (leaked): its launcher cannot \
+                                 delete containers; the record was dropped and the sweep \
+                                 continues"
+                            );
+                        } else {
+                            tracing::warn!(
+                                isolation_key = %record.isolation_key,
+                                launcher_type = %record.launcher_type,
+                                sandbox_id,
+                                error = %error,
+                                "idle sandbox deletion failed; the record was dropped and the \
+                                 sweep continues"
+                            );
+                        }
                     }
                 }
                 Err(error) => tracing::warn!(
@@ -561,9 +683,13 @@ impl SandboxLifecycle {
     }
 
     /// Refreshes a running record and returns its endpoint.
+    ///
+    /// The record absorbs `launcher_config`'s hash and labels on the way out, so a container
+    /// that is reused under a changed configuration is recorded as such.
     async fn touch_running(
         &self,
         isolation_key: &str,
+        launcher_config: &SandboxLauncherConfig,
         now_epoch_secs: u64,
     ) -> Option<SandboxEndpoint> {
         let mut records = self.records.lock().await;
@@ -571,15 +697,20 @@ impl SandboxLifecycle {
         if !record.status.is_running() {
             return None;
         }
+        refresh_container_config(record, launcher_config);
         record.last_used_epoch_secs = now_epoch_secs;
         Some(record.endpoint.clone())
     }
 
     /// Marks the resumed record running, when it is still the one that was resumed.
+    ///
+    /// Called only after the launcher reported the container running or resumed it, so the
+    /// configuration merge never runs on a failed launcher call.
     async fn mark_running(
         &self,
         isolation_key: &str,
         sandbox_id: &str,
+        launcher_config: &SandboxLauncherConfig,
         now_epoch_secs: u64,
     ) -> Option<SandboxEndpoint> {
         let mut records = self.records.lock().await;
@@ -588,6 +719,7 @@ impl SandboxLifecycle {
             return None;
         }
         record.status = SandboxStatus::Running;
+        refresh_container_config(record, launcher_config);
         record.last_used_epoch_secs = now_epoch_secs;
         Some(record.endpoint.clone())
     }

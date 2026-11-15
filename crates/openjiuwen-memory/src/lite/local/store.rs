@@ -47,6 +47,7 @@ impl LocalCodingMemory {
         let (guard, mut state) = self.lock_for_write().await?;
         self.ensure_fresh_locked(&mut state).await?;
         let _replaced = state.document.upsert_fact(&fact);
+        state.touch();
         self.persist(&mut state).await?;
         #[cfg(feature = "sqlite")]
         self.fts.upsert(&fact).await?;
@@ -93,6 +94,7 @@ impl LocalCodingMemory {
         fact.content = content;
         fact.updated_at = Utc::now();
         let _replaced = state.document.upsert_fact(&fact);
+        state.touch();
         self.persist(&mut state).await?;
         #[cfg(feature = "sqlite")]
         self.fts.upsert(&fact).await?;
@@ -113,6 +115,7 @@ impl LocalCodingMemory {
         if !state.document.remove(name) {
             return Ok(false);
         }
+        state.touch();
         self.persist(&mut state).await?;
         #[cfg(feature = "sqlite")]
         self.fts.remove(name).await?;
@@ -207,6 +210,7 @@ impl LocalCodingMemory {
         let (document, stamp) = load_document(&self.inner.memory_path, &self.inner.scope).await?;
         state.document = document;
         state.stamp = stamp;
+        state.touch();
         let _bumped = self.inner.reloads.fetch_add(1, Ordering::Relaxed);
         let facts = state.document.facts();
         self.rebuild_index_from(&facts).await?;

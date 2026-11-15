@@ -8,7 +8,10 @@
 //! history summary.
 //!
 //! A model failure never fails `add_messages`: it degrades to the heuristic path with a
-//! warning. Only cancellation is propagated, and already-appended history stays.
+//! warning and an [`AddMemResult::degraded`] reason. A payload that parses but reports
+//! neither a fact nor a variable counts as a failure too — an empty object must not
+//! suppress the heuristics. Only cancellation is propagated, and already-appended history
+//! stays.
 //!
 //! [`LongTermMemory::get_recent_messages`] reads the history back as foundation
 //! [`BaseMessage`]s in chronological order, and [`LongTermMemory::get_message_page`]
@@ -56,6 +59,32 @@ struct ExtractionPayload {
     variables: BTreeMap<String, String>,
 }
 
+impl ExtractionPayload {
+    /// Returns `true` when the payload carries neither a fact nor a variable.
+    ///
+    /// A syntactically valid but empty answer (`{}`, `{"facts":[]}`) is not a usable
+    /// extraction: accepting it would suppress the heuristic fallback and store nothing
+    /// for a batch that has extractable turns, so the caller treats it as a failure.
+    fn is_empty(&self) -> bool {
+        self.facts.is_empty() && self.variables.is_empty()
+    }
+}
+
+/// What one model-assisted extraction attempt produced.
+enum ExtractionAttempt {
+    /// No model is attached, so only the deterministic heuristics are available.
+    ///
+    /// This is the documented no-model path, not a degradation.
+    NoModel,
+    /// The model answered with a usable payload that has not been applied yet.
+    Payload(ExtractionPayload),
+    /// Every attempt failed (transport, parse, or an empty payload); the heuristics ran.
+    ///
+    /// The error is carried so the caller can name the reason in
+    /// [`AddMemResult::degraded`].
+    Failed(Error),
+}
+
 impl LongTermMemory {
     /// Appends conversation messages to the history and extracts memory from them.
     ///
@@ -70,7 +99,8 @@ impl LongTermMemory {
     ///
     /// Returns [`Error::Validation`] for an invalid scope, [`Error::Cancelled`] when the
     /// call is cancelled, and the storage/embedding error when a write fails. A model
-    /// failure never fails the call: it degrades to the heuristic path.
+    /// failure never fails the call: it degrades to the heuristic path and the reason is
+    /// reported in [`AddMemResult::degraded`].
     pub async fn add_messages(
         &self,
         scope: &MemoryScope,
@@ -107,11 +137,23 @@ impl LongTermMemory {
             .extract_with_model(scope, &sanitized, agent_config, options)
             .await?
         {
-            Some(payload) => {
+            ExtractionAttempt::Payload(payload) => {
                 self.apply_extraction(scope, agent_config, options, payload, &mut result)
                     .await?;
             }
-            None => {
+            ExtractionAttempt::NoModel => {
+                self.apply_heuristics(scope, agent_config, options, &sanitized, &mut result)
+                    .await?;
+            }
+            ExtractionAttempt::Failed(error) => {
+                tracing::warn!(
+                    target: TARGET,
+                    %error,
+                    "memory extraction failed; falling back to heuristics"
+                );
+                result.degraded = Some(format!(
+                    "model memory extraction failed ({error}); heuristic extraction ran instead"
+                ));
                 self.apply_heuristics(scope, agent_config, options, &sanitized, &mut result)
                     .await?;
             }
@@ -213,18 +255,21 @@ impl LongTermMemory {
 
     /// Runs one extraction prompt, retrying on model or parse failures.
     ///
-    /// Returns `Ok(None)` when there is no model or every attempt failed (the caller
-    /// falls back to heuristics), and [`Error::Cancelled`] as soon as the call is
-    /// cancelled — a cancelled extraction is never retried.
+    /// Returns [`ExtractionAttempt::NoModel`] when there is no model to ask,
+    /// [`ExtractionAttempt::Payload`] for a usable payload, and
+    /// [`ExtractionAttempt::Failed`] when every attempt failed (the caller falls back to
+    /// heuristics and records the reason). A syntactically valid but empty payload counts
+    /// as a failure so it cannot suppress the heuristics. [`Error::Cancelled`] is returned
+    /// as soon as the call is cancelled — a cancelled extraction is never retried.
     async fn extract_with_model(
         &self,
         scope: &MemoryScope,
         messages: &[BaseMessage],
         agent_config: &AgentMemoryConfig,
         options: &AddOptions,
-    ) -> Result<Option<ExtractionPayload>> {
+    ) -> Result<ExtractionAttempt> {
         let Some(model) = self.engine.model() else {
-            return Ok(None);
+            return Ok(ExtractionAttempt::NoModel);
         };
         let config = self.config();
         let history = self
@@ -252,18 +297,18 @@ impl LongTermMemory {
                 }
             };
             match parse_extraction(&response) {
-                Ok(payload) => return Ok(Some(payload)),
+                Ok(payload) if payload.is_empty() => {
+                    last_error = Some(Error::memory(
+                        "memory extraction payload carried neither a fact nor a variable",
+                    ));
+                }
+                Ok(payload) => return Ok(ExtractionAttempt::Payload(payload)),
                 Err(error) => last_error = Some(error),
             }
         }
-        if let Some(error) = last_error {
-            tracing::warn!(
-                target: TARGET,
-                %error,
-                "memory extraction failed; falling back to heuristics"
-            );
-        }
-        Ok(None)
+        Ok(ExtractionAttempt::Failed(last_error.unwrap_or_else(|| {
+            Error::memory("memory extraction ran no attempt")
+        })))
     }
 
     /// Applies a parsed extraction: facts through the engine, variables through storage.
@@ -283,7 +328,11 @@ impl LongTermMemory {
             .take(config.extraction.max_facts)
             .collect();
         if !candidates.is_empty() {
-            let outcome = self.engine.add_many(scope, candidates, options).await?;
+            let overrides = self.resolve_scope_overrides(scope).await?;
+            let outcome = self
+                .engine
+                .add_many_with_embedding(scope, candidates, options, overrides.embedding())
+                .await?;
             record_outcome(outcome, result);
         }
         for (name, value) in variables {
@@ -380,7 +429,11 @@ impl LongTermMemory {
         if candidates.is_empty() {
             return Ok(());
         }
-        let outcome = self.engine.add_many(scope, candidates, options).await?;
+        let overrides = self.resolve_scope_overrides(scope).await?;
+        let outcome = self
+            .engine
+            .add_many_with_embedding(scope, candidates, options, overrides.embedding())
+            .await?;
         record_outcome(outcome, result);
         Ok(())
     }
@@ -456,7 +509,13 @@ fn build_extraction_prompt(
          \"importance\":0.5}],\"variables\":{\"name\":\"value\"}}\n",
     );
     if agent_config.mem_variables.is_empty() {
-        prompt.push_str("The agent exposes no variables: answer with an empty object.\n");
+        // Naming the key keeps the answer non-empty: a payload with neither facts nor
+        // variables is rejected and retried, so an ambiguous "empty object" instruction
+        // would only burn the retry budget.
+        prompt.push_str(
+            "The agent exposes no variables: omit `variables` (or leave it empty) and \
+             still report the facts you find.\n",
+        );
     } else {
         let _ = writeln!(
             prompt,
@@ -503,6 +562,11 @@ fn extract_json_object(text: &str) -> Option<&str> {
 }
 
 /// Parses the `facts` array; unusable entries are skipped, never fatal.
+///
+/// A fact without a `type` is a semantic memory (the documented default). A fact with a
+/// `type` the crate does not know is kept as a semantic memory with a warning naming the
+/// value: [`MemoryType::Unknown`] is not an enabled kind, so keeping it would silently
+/// drop a model-extracted fact (Python parity: an unknown type is tolerated, not fatal).
 fn parse_facts(object: &Map<String, Value>) -> Vec<NewMemory> {
     let Some(Value::Array(items)) = object.get("facts") else {
         return Vec::new();
@@ -519,7 +583,21 @@ fn parse_facts(object: &Map<String, Value>) -> Vec<NewMemory> {
             continue;
         }
         let kind = match fact.get("type").and_then(Value::as_str) {
-            Some(raw) => MemoryType::from_str(raw).unwrap_or(MemoryType::Unknown),
+            Some(raw) => match MemoryType::from_str(raw).unwrap_or_default() {
+                // `Variable` is a projection-only kind and `Unknown` is not a kind at
+                // all: neither is ever an enabled fact kind, so both would be dropped
+                // by the agent's kind filter.
+                kind @ (MemoryType::Unknown | MemoryType::Variable) => {
+                    tracing::warn!(
+                        target: TARGET,
+                        kind = %raw,
+                        parsed = %kind,
+                        "unrecognized extracted fact type; treating the fact as semantic memory"
+                    );
+                    MemoryType::SemanticMemory
+                }
+                kind => kind,
+            },
             None => MemoryType::SemanticMemory,
         };
         let mut memory = NewMemory::new(content.trim(), kind);
@@ -581,7 +659,13 @@ fn truncate_to_tokens(
 }
 
 /// Groups the records an engine write produced into an [`AddMemResult`] by kind.
+///
+/// The skipped and deleted ids the engine reported are preserved as counts, so a batch
+/// whose inputs were all already stored (or whose rows a replace-style write removed) is
+/// visible in the result instead of looking like an empty extraction.
 fn record_outcome(outcome: AddOutcome, result: &mut AddMemResult) {
+    result.skipped += outcome.skipped.len();
+    result.deleted += outcome.deleted.len();
     for record in outcome.added.into_iter().chain(outcome.merged) {
         push_record(result, record);
     }
@@ -612,10 +696,11 @@ mod tests {
 
     use chrono::DateTime;
     use openjiuwen_common::error::Error as CommonError;
-    use openjiuwen_test_support::ScriptedModel;
+    use openjiuwen_test_support::{ScriptedModel, ScriptedTurn};
     use tokio_util::sync::CancellationToken;
 
     use crate::config::MemoryEngineConfig;
+    use crate::record::DedupePolicy;
 
     fn scope() -> MemoryScope {
         MemoryScope::new("alice", "ws")
@@ -896,6 +981,191 @@ mod tests {
         assert!(scripted.call_count() >= 1);
         assert_eq!(result.episodic_memory.len(), 2);
         assert_eq!(result.summary.len(), 1);
+        let degraded = result.degraded.expect("degradation reason");
+        assert!(degraded.contains("heuristic"), "{degraded}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_model_reports_why_it_degraded_and_still_stores_facts() {
+        // Every retry fails the same way, so the reported reason is the provider error.
+        let scripted = Arc::new(ScriptedModel::new([
+            ScriptedTurn::fail("provider exploded"),
+            ScriptedTurn::fail("provider exploded"),
+            ScriptedTurn::fail("provider exploded"),
+        ]));
+        let ltm = LongTermMemory::builder(MemoryEngineConfig::default())
+            .model(scripted.clone())
+            .build()
+            .expect("facade");
+        let result = ltm
+            .add_messages(
+                &scope(),
+                &long_messages(),
+                &AgentMemoryConfig::default(),
+                &AddOptions::default(),
+            )
+            .await
+            .expect("add messages");
+        let degraded = result.degraded.clone().expect("degradation reason");
+        assert!(degraded.contains("provider exploded"), "{degraded}");
+        // The heuristic records are real: they are returned and persisted.
+        assert_eq!(result.episodic_memory.len(), 2);
+        assert_eq!(result.summary.len(), 1);
+        let stored = ltm.list(&scope(), &[]).await.expect("list");
+        assert_eq!(stored.len(), 3);
+        assert_eq!(scripted.call_count(), 3, "every attempt failed");
+    }
+
+    #[tokio::test]
+    async fn an_applied_payload_is_not_reported_as_degraded() {
+        let scripted = Arc::new(ScriptedModel::text(
+            r#"{"facts":[{"content":"Alice prefers tea","type":"user_profile"}]}"#,
+        ));
+        let ltm = LongTermMemory::builder(MemoryEngineConfig::default())
+            .model(scripted)
+            .build()
+            .expect("facade");
+        let result = ltm
+            .add_messages(
+                &scope(),
+                &long_messages(),
+                &AgentMemoryConfig::default(),
+                &AddOptions::default(),
+            )
+            .await
+            .expect("add messages");
+        assert_eq!(result.user_profile.len(), 1);
+        assert_eq!(result.degraded, None, "no fallback ran");
+        assert_eq!(result.skipped, 0);
+        assert_eq!(result.deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unrecognized_fact_type_is_kept_as_semantic_memory() {
+        let payload = r#"{"facts":[
+            {"content":"Alice prefers tea over coffee","type":"preference"},
+            {"content":"Alice works in Berlin","type":"variable"},
+            {"content":"Alice ships Rust","type":"semantic_memory"}]}"#;
+        let scripted = Arc::new(ScriptedModel::text(payload));
+        let ltm = LongTermMemory::builder(MemoryEngineConfig::default())
+            .model(scripted)
+            .build()
+            .expect("facade");
+        let result = ltm
+            .add_messages(
+                &scope(),
+                &long_messages(),
+                &AgentMemoryConfig::default(),
+                &AddOptions::default(),
+            )
+            .await
+            .expect("add messages");
+        // Nothing is dropped: the unrecognized types fall back to semantic memory.
+        assert_eq!(result.semantic_memory.len(), 3);
+        assert_eq!(result.episodic_memory.len(), 0);
+        assert_eq!(result.degraded, None);
+        assert!(result
+            .semantic_memory
+            .iter()
+            .all(|record| record.kind == MemoryType::SemanticMemory));
+        let stored = ltm.list(&scope(), &[]).await.expect("list");
+        assert_eq!(stored.len(), 3);
+        assert!(stored
+            .iter()
+            .any(|record| record.content == "Alice prefers tea over coffee"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_model_payload_does_not_suppress_the_heuristics() {
+        for payload in ["{}", r#"{"facts":[]}"#] {
+            let scripted = Arc::new(ScriptedModel::text(payload));
+            let ltm = LongTermMemory::builder(MemoryEngineConfig::default())
+                .model(scripted.clone())
+                .build()
+                .expect("facade");
+            let result = ltm
+                .add_messages(
+                    &scope(),
+                    &long_messages(),
+                    &AgentMemoryConfig::default(),
+                    &AddOptions::default(),
+                )
+                .await
+                .expect("add messages");
+            assert!(
+                scripted.call_count() >= 1,
+                "{payload} came from a real model call"
+            );
+            assert_eq!(result.episodic_memory.len(), 2, "{payload}");
+            assert_eq!(result.summary.len(), 1, "{payload}");
+            assert!(result.degraded.is_some(), "{payload}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_truly_unextractable_batch_stays_empty_without_a_model() {
+        // The no-model path is the documented heuristic route, not a degradation, and a
+        // batch with nothing worth storing still yields an empty result.
+        let ltm = facade(MemoryEngineConfig::default()).await;
+        let short = vec![BaseMessage::user("hi"), BaseMessage::assistant("hello")];
+        let agent = AgentMemoryConfig {
+            enable_summary_memory: false,
+            ..Default::default()
+        };
+        let result = ltm
+            .add_messages(&scope(), &short, &agent, &AddOptions::default())
+            .await
+            .expect("add messages");
+        assert!(result.is_empty());
+        assert_eq!(result.degraded, None);
+    }
+
+    #[tokio::test]
+    async fn a_skipped_duplicate_is_counted_in_the_result() {
+        let scripted = Arc::new(ScriptedModel::text(
+            r#"{"facts":[{"content":"Alice keeps every editor in dark mode",
+                           "type":"semantic_memory"}]}"#,
+        ));
+        let ltm = LongTermMemory::builder(MemoryEngineConfig::default())
+            .model(scripted)
+            .build()
+            .expect("facade");
+        ltm.add(
+            &scope(),
+            NewMemory::semantic("Alice keeps every editor in dark mode"),
+            &AddOptions::default(),
+        )
+        .await
+        .expect("seed record");
+        let options = AddOptions::default().with_dedupe(DedupePolicy::Skip);
+        let result = ltm
+            .add_messages(
+                &scope(),
+                &long_messages(),
+                &AgentMemoryConfig::default(),
+                &options,
+            )
+            .await
+            .expect("add messages");
+        assert_eq!(result.skipped, 1, "the duplicate is reported, not hidden");
+        assert_eq!(result.semantic_memory.len(), 0);
+        assert_eq!(result.degraded, None);
+    }
+
+    #[test]
+    fn record_outcome_keeps_the_skipped_and_deleted_counts() {
+        let mut result = AddMemResult::default();
+        record_outcome(
+            AddOutcome {
+                skipped: vec!["skipped-1".to_owned(), "skipped-2".to_owned()],
+                deleted: vec!["deleted-1".to_owned()],
+                ..Default::default()
+            },
+            &mut result,
+        );
+        assert_eq!(result.skipped, 2);
+        assert_eq!(result.deleted, 1);
+        assert!(result.is_empty(), "counts are not records");
     }
 
     #[tokio::test]

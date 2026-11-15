@@ -5,7 +5,16 @@
 //! class `0` is safe and the configurable attack class (default `1`) is an
 //! attack. The predicted class is the primary signal and the confidence only
 //! escalates it when the model is sure, which keeps false positives down.
+//! A predicted *attack* whose reply carries no usable confidence (the field is
+//! missing, non-numeric or non-finite) is [`RiskLevel::High`] — the same level a
+//! confident attack gets — because a missing field must never make an attack
+//! look clean.
+//!
+//! Parsing is fallible: a reply in none of the accepted dialects is
+//! [`Error::validation`] rather than a silent `Safe` grade, so a mis-pointed
+//! endpoint cannot make a payload look clean.
 
+use openjiuwen_common::error::{Error, Result};
 use serde_json::{json, Value};
 
 use super::{ModelOutputParser, Thresholds};
@@ -68,15 +77,19 @@ impl BertBinaryParser {
         self
     }
 
-    /// Maps a predicted class and confidence to a risk level.
-    fn determine_risk_level(&self, predicted_class: i64, confidence: f64) -> RiskLevel {
+    /// Maps a predicted class and an optional confidence to a risk level.
+    ///
+    /// A class other than [`Self::attack_class_id`] is the model's own safe
+    /// verdict, whatever the confidence. For a predicted attack a present,
+    /// finite confidence keeps the threshold bands; a missing or non-finite
+    /// confidence errs upward to [`RiskLevel::High`] instead of reading as
+    /// `Safe`.
+    fn determine_risk_level(&self, predicted_class: i64, confidence: Option<f64>) -> RiskLevel {
         if predicted_class != self.attack_class_id {
             return RiskLevel::Safe;
         }
-        let confidence = if confidence.is_finite() {
-            confidence
-        } else {
-            0.0
+        let Some(confidence) = confidence.filter(|value| value.is_finite()) else {
+            return RiskLevel::High;
         };
         let thresholds = self.confidence_thresholds;
         if confidence < thresholds.low {
@@ -91,9 +104,14 @@ impl BertBinaryParser {
     }
 
     /// Builds the assessment Python's `BertBinaryParser.parse` returns.
-    fn assess(&self, predicted_class: i64, confidence: f64) -> RiskAssessment {
+    ///
+    /// The `details` shape is unchanged: an absent confidence is reported as
+    /// `0.0` there and only the level reflects the upward error, so existing
+    /// consumers of `predicted_class`/`attack_confidence` keep working.
+    fn assess(&self, predicted_class: i64, confidence: Option<f64>) -> RiskAssessment {
         let risk_level = self.determine_risk_level(predicted_class, confidence);
         let has_risk = risk_level != RiskLevel::Safe;
+        let confidence = confidence.filter(|value| value.is_finite()).unwrap_or(0.0);
         let attack_confidence = if predicted_class == self.attack_class_id {
             confidence
         } else {
@@ -119,35 +137,55 @@ impl ModelOutputParser for BertBinaryParser {
         "bert_binary"
     }
 
-    fn parse(&self, output: &Value) -> RiskAssessment {
-        let (predicted_class, confidence) = extract_prediction(output, self.attack_class_id);
-        self.assess(predicted_class, confidence)
+    fn parse(&self, output: &Value) -> Result<RiskAssessment> {
+        let (predicted_class, confidence) =
+            extract_prediction(output, self.attack_class_id).ok_or_else(unrecognized_output)?;
+        Ok(self.assess(predicted_class, confidence))
     }
+}
+
+/// The error an output outside every accepted dialect reports.
+///
+/// The message names the parser and the dialects it accepts and never echoes
+/// the payload, so it is safe to log and to surface in a violation.
+fn unrecognized_output() -> Error {
+    Error::validation(
+        "bert_binary parser: unrecognized model output (expected predicted_class/confidence, \
+         label/score, probabilities or logits with at least two values, a two-element score \
+         array, or a bare numeric score)",
+    )
 }
 
 /// Extracts `(predicted_class, confidence)` from the first matching shape.
 ///
 /// The order mirrors the Python `if` chain exactly, so a payload that carries
-/// several keys is interpreted the same way.
-fn extract_prediction(output: &Value, attack_class_id: i64) -> (i64, f64) {
+/// several keys is interpreted the same way. The outer `None` means that no
+/// dialect matched, which is deliberately distinguishable from a real
+/// `(0, 0.0)` prediction. The inner `None` means the dialect matched but carried
+/// no usable confidence (the field is absent, non-numeric or non-finite), which
+/// [`BertBinaryParser::determine_risk_level`] resolves upward for a predicted
+/// attack.
+fn extract_prediction(output: &Value, attack_class_id: i64) -> Option<(i64, Option<f64>)> {
     if let Value::Object(map) = output {
         if let Some(value) = map.get("predicted_class") {
-            return (integer_of(value), float_or_zero(map.get("confidence")));
+            return Some((integer_of(value), confidence_of(map.get("confidence"))));
         }
         if let Some(value) = map.get("label") {
-            let confidence = float_or_zero(map.get("score").or_else(|| map.get("confidence")));
-            return (integer_of(value), confidence);
+            let confidence = confidence_of(map.get("score").or_else(|| map.get("confidence")));
+            return Some((integer_of(value), confidence));
         }
         if let Some(Value::Array(probabilities)) = map.get("probabilities") {
             if probabilities.len() >= 2 {
                 let values: Vec<f64> = probabilities.iter().map(float_of).collect();
-                return argmax(&values);
+                let (predicted_class, confidence) = argmax(&values);
+                return Some((predicted_class, Some(confidence)));
             }
         }
         if let Some(Value::Array(logits)) = map.get("logits") {
             if logits.len() >= 2 {
                 let values: Vec<f64> = logits.iter().map(float_of).collect();
-                return argmax(&softmax(&values));
+                let (predicted_class, confidence) = argmax(&softmax(&values));
+                return Some((predicted_class, Some(confidence)));
             }
         }
     }
@@ -155,7 +193,8 @@ fn extract_prediction(output: &Value, attack_class_id: i64) -> (i64, f64) {
     if let Value::Array(values) = output {
         if values.len() >= 2 {
             let numbers: Vec<f64> = values.iter().map(float_of).collect();
-            return argmax(&numbers);
+            let (predicted_class, confidence) = argmax(&numbers);
+            return Some((predicted_class, Some(confidence)));
         }
     }
 
@@ -165,10 +204,10 @@ fn extract_prediction(output: &Value, attack_class_id: i64) -> (i64, f64) {
             .filter(|value| value.is_finite())
             .unwrap_or(0.0);
         let predicted_class = if confidence > 0.5 { attack_class_id } else { 0 };
-        return (predicted_class, confidence);
+        return Some((predicted_class, Some(confidence)));
     }
 
-    (0, 0.0)
+    None
 }
 
 /// The Python rule: class `1` when the second score beats the first, and the
@@ -222,29 +261,40 @@ fn integer_of(value: &Value) -> i64 {
 
 /// Reads a JSON number, or a numeric string, as a finite `f64`.
 ///
-/// Missing, non-numeric, and non-finite values degrade to `0.0`.
-fn float_of(value: &Value) -> f64 {
+/// A missing, non-numeric, or non-finite value is `None`.
+fn parse_float(value: &Value) -> Option<f64> {
     let parsed = match value {
         Value::Number(number) => number.as_f64(),
         Value::String(text) => text.trim().parse::<f64>().ok(),
         _ => None,
     };
-    parsed.filter(|number| number.is_finite()).unwrap_or(0.0)
+    parsed.filter(|number| number.is_finite())
 }
 
-/// [`float_of`] for an optional value, defaulting to `0.0`.
-fn float_or_zero(value: Option<&Value>) -> f64 {
-    value.map_or(0.0, float_of)
+/// Reads a JSON number, or a numeric string, as a finite `f64`.
+///
+/// Missing, non-numeric, and non-finite values degrade to `0.0`.
+fn float_of(value: &Value) -> f64 {
+    parse_float(value).unwrap_or(0.0)
+}
+
+/// Reads an optional confidence, reporting whether a usable value was present.
+///
+/// `None` covers an absent field, a non-numeric value, and a non-finite number:
+/// the reply carries no confidence to grade with.
+fn confidence_of(value: Option<&Value>) -> Option<f64> {
+    value.and_then(parse_float)
 }
 
 #[cfg(test)]
 mod tests {
+    use openjiuwen_common::error::ErrorKind;
     use serde_json::json;
 
     use super::*;
 
     #[allow(clippy::needless_pass_by_value)]
-    fn parse(parser: &BertBinaryParser, output: Value) -> RiskAssessment {
+    fn parse(parser: &BertBinaryParser, output: Value) -> Result<RiskAssessment> {
         parser.parse(&output)
     }
 
@@ -264,21 +314,21 @@ mod tests {
     fn predicted_class_and_confidence_bands() {
         let parser = BertBinaryParser::new();
 
-        let safe = parse(&parser, json!({"predicted_class": 1, "confidence": 0.6}));
+        let safe = parse(&parser, json!({"predicted_class": 1, "confidence": 0.6})).unwrap();
         assert!(!safe.has_risk);
         assert_eq!(safe.risk_level, RiskLevel::Safe);
         assert_eq!(safe.risk_type, None);
 
-        let low = parse(&parser, json!({"predicted_class": 1, "confidence": 0.75}));
+        let low = parse(&parser, json!({"predicted_class": 1, "confidence": 0.75})).unwrap();
         assert!(low.has_risk);
         assert_eq!(low.risk_level, RiskLevel::Low);
         assert_eq!(low.risk_type.as_deref(), Some("attack_detected"));
 
-        let medium = parse(&parser, json!({"predicted_class": 1, "confidence": 0.9}));
+        let medium = parse(&parser, json!({"predicted_class": 1, "confidence": 0.9})).unwrap();
         assert!(medium.has_risk);
         assert_eq!(medium.risk_level, RiskLevel::Medium);
 
-        let high = parse(&parser, json!({"predicted_class": 1, "confidence": 0.97}));
+        let high = parse(&parser, json!({"predicted_class": 1, "confidence": 0.97})).unwrap();
         assert!(high.has_risk);
         assert_eq!(high.risk_level, RiskLevel::High);
         assert!((high.confidence - 0.97).abs() < f64::EPSILON);
@@ -287,7 +337,7 @@ mod tests {
     #[test]
     fn predicted_class_safe_is_always_safe() {
         let parser = BertBinaryParser::new();
-        let assessment = parse(&parser, json!({"predicted_class": 0, "confidence": 0.99}));
+        let assessment = parse(&parser, json!({"predicted_class": 0, "confidence": 0.99})).unwrap();
         assert!(!assessment.has_risk);
         assert_eq!(assessment.risk_level, RiskLevel::Safe);
         assert_eq!(assessment.risk_type, None);
@@ -309,7 +359,8 @@ mod tests {
             let assessment = parse(
                 &parser,
                 json!({"predicted_class": 1, "confidence": confidence}),
-            );
+            )
+            .unwrap();
             assert_eq!(assessment.risk_level, expected, "confidence {confidence}");
         }
     }
@@ -321,10 +372,10 @@ mod tests {
             medium: 0.9,
             high: 0.98,
         });
-        let assessment = parse(&parser, json!({"predicted_class": 1, "confidence": 0.85}));
+        let assessment = parse(&parser, json!({"predicted_class": 1, "confidence": 0.85})).unwrap();
         assert_eq!(assessment.risk_level, RiskLevel::Low);
 
-        let below = parse(&parser, json!({"predicted_class": 1, "confidence": 0.75}));
+        let below = parse(&parser, json!({"predicted_class": 1, "confidence": 0.75})).unwrap();
         assert_eq!(below.risk_level, RiskLevel::Safe);
     }
 
@@ -332,12 +383,12 @@ mod tests {
     fn attack_class_id_zero_flips_the_positive_class() {
         // ports tests/unit_tests/core/security/guardrail/test_parsers_and_backends.py
         let parser = BertBinaryParser::new().with_attack_class_id(0);
-        let assessment = parse(&parser, json!({"predicted_class": 0, "confidence": 0.95}));
+        let assessment = parse(&parser, json!({"predicted_class": 0, "confidence": 0.95})).unwrap();
         assert!(assessment.has_risk);
         assert_eq!(assessment.risk_level, RiskLevel::High);
         assert!((attack_confidence(&assessment) - 0.95).abs() < f64::EPSILON);
 
-        let flipped = parse(&parser, json!({"predicted_class": 1, "confidence": 0.99}));
+        let flipped = parse(&parser, json!({"predicted_class": 1, "confidence": 0.99})).unwrap();
         assert!(!flipped.has_risk);
         assert_eq!(flipped.risk_level, RiskLevel::Safe);
     }
@@ -346,57 +397,92 @@ mod tests {
     fn label_and_score_shape() {
         // ports ...::test_parse_with_label_attack
         let parser = BertBinaryParser::new();
-        let assessment = parse(&parser, json!({"label": 1, "score": 0.97}));
+        let assessment = parse(&parser, json!({"label": 1, "score": 0.97})).unwrap();
         assert!(assessment.has_risk);
         assert_eq!(assessment.risk_level, RiskLevel::High);
         assert_eq!(predicted_class(&assessment), 1);
 
-        let falls_back_to_confidence = parse(&parser, json!({"label": 1, "confidence": 0.9}));
+        let falls_back_to_confidence =
+            parse(&parser, json!({"label": 1, "confidence": 0.9})).unwrap();
         assert_eq!(falls_back_to_confidence.risk_level, RiskLevel::Medium);
+    }
 
-        let missing_score = parse(&parser, json!({"label": 1}));
-        assert_eq!(missing_score.risk_level, RiskLevel::Safe);
+    #[test]
+    fn a_predicted_attack_without_confidence_errs_upward() {
+        let parser = BertBinaryParser::new();
+
+        // No score at all: the class still says "attack", so the level errs
+        // upward instead of reading as safe.
+        let missing_score = parse(&parser, json!({"label": 1})).unwrap();
+        assert!(missing_score.has_risk);
+        assert_eq!(missing_score.risk_level, RiskLevel::High);
+        assert_eq!(missing_score.risk_type.as_deref(), Some("attack_detected"));
         assert!(missing_score.confidence.abs() < f64::EPSILON);
+        assert_eq!(
+            missing_score.details.as_ref().unwrap(),
+            &json!({"predicted_class": 1, "attack_confidence": 0.0}),
+            "the details key set and values stay stable"
+        );
+
+        // The same for `predicted_class`, a null confidence and a non-numeric
+        // confidence.
+        for output in [
+            json!({"predicted_class": 1}),
+            json!({"label": 1, "confidence": null}),
+            json!({"label": 1, "confidence": "not-a-number"}),
+            json!({"label": 1, "score": "not-a-number"}),
+        ] {
+            let assessment = parse(&parser, output.clone()).unwrap();
+            assert!(assessment.has_risk, "{output} must not grade safe");
+            assert_eq!(assessment.risk_level, RiskLevel::High, "{output}");
+        }
+
+        // The model's own safe class stays safe without a score.
+        let safe = parse(&parser, json!({"label": 0})).unwrap();
+        assert!(!safe.has_risk);
+        assert_eq!(safe.risk_level, RiskLevel::Safe);
+        assert_eq!(safe.risk_type, None);
     }
 
     #[test]
     fn probabilities_shape() {
         let parser = BertBinaryParser::new();
 
-        let attack = parse(&parser, json!({"probabilities": [0.02, 0.98]}));
+        let attack = parse(&parser, json!({"probabilities": [0.02, 0.98]})).unwrap();
         assert!(attack.has_risk);
         assert_eq!(attack.risk_level, RiskLevel::High);
         assert_eq!(predicted_class(&attack), 1);
         assert!((attack.confidence - 0.98).abs() < f64::EPSILON);
 
-        let safe = parse(&parser, json!({"probabilities": [0.9, 0.1]}));
+        let safe = parse(&parser, json!({"probabilities": [0.9, 0.1]})).unwrap();
         assert!(!safe.has_risk);
         assert_eq!(safe.risk_level, RiskLevel::Safe);
         assert_eq!(predicted_class(&safe), 0);
         assert!((attack_confidence(&safe) - 0.1).abs() < f64::EPSILON);
 
         let too_short = parse(&parser, json!({"probabilities": [0.9]}));
-        assert!(!too_short.has_risk);
-        assert!(too_short.confidence.abs() < f64::EPSILON);
+        let error = too_short.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.to_string().contains("unrecognized"), "{error}");
     }
 
     #[test]
     fn logits_shape_uses_softmax() {
         let parser = BertBinaryParser::new();
 
-        let attack = parse(&parser, json!({"logits": [-2.0, 5.0]}));
+        let attack = parse(&parser, json!({"logits": [-2.0, 5.0]})).unwrap();
         assert!(attack.has_risk);
         assert_eq!(attack.risk_level, RiskLevel::High);
         assert_eq!(predicted_class(&attack), 1);
 
-        let safe = parse(&parser, json!({"logits": [2.0, 0.5]}));
+        let safe = parse(&parser, json!({"logits": [2.0, 0.5]})).unwrap();
         assert!(!safe.has_risk);
         assert_eq!(safe.risk_level, RiskLevel::Safe);
         assert_eq!(predicted_class(&safe), 0);
 
         // Equal logits give a `[0.5, 0.5]` distribution: no attack, 0.5
         // confidence.
-        let tied = parse(&parser, json!({"logits": [1.0, 1.0]}));
+        let tied = parse(&parser, json!({"logits": [1.0, 1.0]})).unwrap();
         assert!(!tied.has_risk);
         assert!((tied.confidence - 0.5).abs() < 1e-9);
     }
@@ -416,30 +502,32 @@ mod tests {
         // ports ...::test_parse_with_list_attack
         let parser = BertBinaryParser::new();
 
-        let attack = parse(&parser, json!([0.2, 0.8]));
+        let attack = parse(&parser, json!([0.2, 0.8])).unwrap();
         assert!(attack.has_risk);
         assert_eq!(attack.risk_level, RiskLevel::Low);
         assert!((attack.confidence - 0.8).abs() < f64::EPSILON);
 
-        let safe = parse(&parser, json!([0.8, 0.2]));
+        let safe = parse(&parser, json!([0.8, 0.2])).unwrap();
         assert!(!safe.has_risk);
         assert_eq!(safe.risk_level, RiskLevel::Safe);
 
+        // A shortened score array is not a dialect: it must not grade as safe.
         let short = parse(&parser, json!([0.9]));
-        assert!(!short.has_risk);
-        assert!(short.confidence.abs() < f64::EPSILON);
+        let error = short.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.to_string().contains("unrecognized"), "{error}");
     }
 
     #[test]
     fn bare_number_shape_uses_strict_greater_than() {
         let parser = BertBinaryParser::new();
 
-        let at_half = parse(&parser, json!(0.5));
+        let at_half = parse(&parser, json!(0.5)).unwrap();
         assert!(!at_half.has_risk);
         assert_eq!(predicted_class(&at_half), 0);
         assert!((at_half.confidence - 0.5).abs() < f64::EPSILON);
 
-        let above_half = parse(&parser, json!(0.6));
+        let above_half = parse(&parser, json!(0.6)).unwrap();
         assert_eq!(
             predicted_class(&above_half),
             1,
@@ -451,13 +539,13 @@ mod tests {
         );
         assert_eq!(above_half.risk_level, RiskLevel::Safe);
 
-        let confident = parse(&parser, json!(0.97));
+        let confident = parse(&parser, json!(0.97)).unwrap();
         assert!(confident.has_risk);
         assert_eq!(confident.risk_level, RiskLevel::High);
     }
 
     #[test]
-    fn unrecognized_inputs_are_safe() {
+    fn unrecognized_inputs_are_errors() {
         let parser = BertBinaryParser::new();
         for output in [
             json!({}),
@@ -465,12 +553,17 @@ mod tests {
             json!("definitely an attack"),
             json!(true),
             json!([0.5]),
+            json!({"unrelated": 1}),
         ] {
-            let assessment = parse(&parser, output.clone());
-            assert!(!assessment.has_risk, "{output}");
-            assert_eq!(assessment.risk_level, RiskLevel::Safe);
-            assert!(assessment.confidence.abs() < f64::EPSILON, "{output}");
-            assert_eq!(assessment.risk_type, None);
+            let error = parse(&parser, output.clone()).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Validation, "{output}");
+            let message = error.to_string();
+            assert!(message.contains("unrecognized"), "{output}: {message}");
+            assert!(message.contains("bert_binary"), "{output}: {message}");
+            assert!(
+                !message.contains("definitely an attack"),
+                "the payload must not be echoed: {message}"
+            );
         }
     }
 
@@ -480,7 +573,8 @@ mod tests {
         let assessment = parse(
             &parser,
             json!({"predicted_class": "1", "confidence": "0.97"}),
-        );
+        )
+        .unwrap();
         assert!(assessment.has_risk);
         assert_eq!(assessment.risk_level, RiskLevel::High);
         assert_eq!(predicted_class(&assessment), 1);
@@ -489,20 +583,20 @@ mod tests {
     #[test]
     fn attack_confidence_is_inverted_for_the_safe_class() {
         let parser = BertBinaryParser::new();
-        let safe = parse(&parser, json!({"predicted_class": 0, "confidence": 0.9}));
+        let safe = parse(&parser, json!({"predicted_class": 0, "confidence": 0.9})).unwrap();
         assert!((attack_confidence(&safe) - 0.1).abs() < 1e-9);
 
-        let attack = parse(&parser, json!({"predicted_class": 1, "confidence": 0.9}));
+        let attack = parse(&parser, json!({"predicted_class": 1, "confidence": 0.9})).unwrap();
         assert!((attack_confidence(&attack) - 0.9).abs() < 1e-9);
     }
 
     #[test]
     fn custom_risk_type_is_reported_only_when_risky() {
         let parser = BertBinaryParser::new().with_risk_type("prompt_injection");
-        let risky = parse(&parser, json!({"predicted_class": 1, "confidence": 0.95}));
+        let risky = parse(&parser, json!({"predicted_class": 1, "confidence": 0.95})).unwrap();
         assert_eq!(risky.risk_type.as_deref(), Some("prompt_injection"));
 
-        let safe = parse(&parser, json!({"predicted_class": 0, "confidence": 0.95}));
+        let safe = parse(&parser, json!({"predicted_class": 0, "confidence": 0.95})).unwrap();
         assert_eq!(safe.risk_type, None);
     }
 

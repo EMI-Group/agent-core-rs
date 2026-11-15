@@ -8,13 +8,16 @@
 //!
 //! A launcher turns a [`SandboxLauncherConfig`] into a running container and is the only
 //! component that knows how a deployment is started (`docker run`, an AIO create call, a
-//! JiuwenBox/YuanRong environment request, ...). Every launcher failure is mapped onto
-//! Python's `sandbox launcher error` (code 199008) so a caller can distinguish "the runtime
-//! is missing" ([`openjiuwen_common::error::ErrorKind::Unsupported`]) from "the runtime
-//! exists and failed" (199008).
+//! JiuwenBox/YuanRong environment request, ...). A launcher failure *while doing its job* is
+//! mapped onto Python's `sandbox launcher error` (code 199008), while an operation the
+//! launcher cannot perform at all stays
+//! [`openjiuwen_common::error::ErrorKind::Unsupported`] (see
+//! [`unsupported_launcher_error`]), so a caller can tell "this runtime cannot do that" from
+//! "the runtime exists and failed".
 //!
 //! Only [`PreDeploymentLauncher`] ships with this crate: it points at an already deployed
-//! sandbox (`launcher_config.base_url`) and therefore has no pause/resume/delete calls.
+//! sandbox (`launcher_config.base_url`) and cannot suspend, resume, or destroy that
+//! container, so those calls report a typed refusal instead of a silent success.
 //! Container-creating launchers are host extensions registered through
 //! [`LauncherRegistry::register`] — [`global`] is the process-wide instance the
 //! [`crate::SysOperation`] facade uses.
@@ -65,7 +68,7 @@ use crate::result::OpResult;
 use crate::sandbox::config::SandboxLauncherConfig;
 use crate::status::{
     isolation_key_message, registry_message, sandbox_gateway_message, sandbox_launcher_message,
-    sandbox_provider_message, SysOpStatus,
+    sandbox_provider_message, unsupported_launcher_message, SysOpStatus,
 };
 
 /// Lifecycle state of one sandbox container.
@@ -148,12 +151,25 @@ impl LaunchedSandbox {
 
 /// Starts, suspends, resumes, and destroys sandbox containers.
 ///
-/// Python parity: `SandboxLauncher` (`launchers/base.py`). Like Python, only
-/// [`Self::launch`] has to be implemented: every other call defaults to a successful
-/// no-op (`check_status` reports [`SandboxStatus::Running`]), so a launcher overrides only
-/// what its runtime supports.
+/// Python parity: `SandboxLauncher` (`launchers/base.py`). Only [`Self::launch`] must be
+/// implemented. The other calls default to *typed refusals* instead of silent successes:
+/// [`Self::pause`], [`Self::resume`], and [`Self::delete`] return
+/// [`ErrorKind::Unsupported`] naming the launcher and the operation, and
+/// [`Self::check_status`] reports [`SandboxStatus::Unknown`]. A launcher overrides exactly
+/// the calls its runtime can perform; one that leaves a default in place makes a teardown
+/// fail loudly instead of leaking a container behind an `Ok(())`.
 #[async_trait]
 pub trait SandboxLauncher: Send + Sync {
+    /// The `launcher_type` this implementation manages (`"custom"` when not overridden).
+    ///
+    /// Defaulted so host implementations keep compiling. It appears only in diagnostics —
+    /// the unsupported-operation messages and the lifecycle's leaked-container warnings —
+    /// so a launcher registered under a specific key should override it (as
+    /// [`PreDeploymentLauncher`] does with `"pre_deploy"`).
+    fn launcher_type(&self) -> &'static str {
+        "custom"
+    }
+
     /// Starts (or resumes) a sandbox and returns its descriptor.
     ///
     /// `timeout_seconds` bounds how long the deployment may take and
@@ -175,36 +191,62 @@ pub trait SandboxLauncher: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns the launcher's own failure; mapped onto code 199008 by the caller.
+    /// The default returns [`ErrorKind::Unsupported`]
+    /// ([`unsupported_launcher_error`]) because a launcher that cannot suspend a container
+    /// must not report a suspension it did not perform; the sandbox keeps running. An
+    /// override returns its own failure, which the caller maps onto code 199008.
     async fn pause(&self, _sandbox_id: &str) -> Result<()> {
-        Ok(())
+        Err(unsupported_launcher_error(
+            self.launcher_type(),
+            "pause",
+            "this launcher cannot suspend containers; the sandbox keeps running",
+        ))
     }
 
     /// Resumes a previously paused sandbox.
     ///
     /// # Errors
     ///
-    /// Returns the launcher's own failure; mapped onto code 199008 by the caller.
+    /// The default returns [`ErrorKind::Unsupported`]
+    /// ([`unsupported_launcher_error`]) because a launcher that cannot resume a container
+    /// must not report one it did not revive. An override returns its own failure, which
+    /// the caller maps onto code 199008.
     async fn resume(&self, _sandbox_id: &str) -> Result<()> {
-        Ok(())
+        Err(unsupported_launcher_error(
+            self.launcher_type(),
+            "resume",
+            "this launcher cannot resume containers; the sandbox stays suspended",
+        ))
     }
 
     /// Destroys the sandbox and releases its resources.
     ///
     /// # Errors
     ///
-    /// Returns the launcher's own failure; mapped onto code 199008 by the caller.
+    /// The default returns [`ErrorKind::Unsupported`]
+    /// ([`unsupported_launcher_error`]) because a launcher that cannot destroy a container
+    /// must not report a teardown it did not perform — the container would leak. An
+    /// override returns its own failure, which the caller maps onto code 199008.
     async fn delete(&self, _sandbox_id: &str) -> Result<()> {
-        Ok(())
+        Err(unsupported_launcher_error(
+            self.launcher_type(),
+            "delete",
+            "this launcher cannot destroy containers; teardown would leak the sandbox",
+        ))
     }
 
     /// Reports the current state of the sandbox.
     ///
+    /// The default reports [`SandboxStatus::Unknown`], which is what a launcher that cannot
+    /// inspect its runtime must say; it is never a claim that the container is running.
+    /// Override it to report a real state: [`crate::sandbox::lifecycle::SandboxLifecycle`]
+    /// resumes a `Paused`/`Unknown` record and relaunches a [`SandboxStatus::Stopped`] one.
+    ///
     /// # Errors
     ///
-    /// Returns the launcher's own failure; mapped onto code 199008 by the caller.
+    /// An override returns its own failure, which the caller maps onto code 199008.
     async fn check_status(&self, _sandbox_id: &str) -> Result<SandboxStatus> {
-        Ok(SandboxStatus::Running)
+        Ok(SandboxStatus::Unknown)
     }
 }
 
@@ -212,14 +254,20 @@ pub trait SandboxLauncher: Send + Sync {
 ///
 /// Python parity: `PreDeploymentLauncher` (`launchers/pre_deployment_launcher.py`). Python's
 /// `delete` tears the container down through the extension providers (`YuanRong` /
-/// `JiuwenBox`
-/// shared-scope keys); that teardown is deferred, so `delete`, `pause`, and `resume` are the
-/// trait's no-ops.
+/// `JiuwenBox` shared-scope keys); that teardown is deferred, and this launcher owns no
+/// handle on the container at all. It therefore deliberately inherits the trait's typed
+/// refusals: `pause`, `resume`, and `delete` return
+/// [`ErrorKind::Unsupported`] and `check_status` reports [`SandboxStatus::Unknown`],
+/// instead of claiming a teardown or a state it cannot know.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PreDeploymentLauncher;
 
 #[async_trait]
 impl SandboxLauncher for PreDeploymentLauncher {
+    fn launcher_type(&self) -> &'static str {
+        DEFAULT_LAUNCHER_TYPE
+    }
+
     async fn launch(
         &self,
         config: &SandboxLauncherConfig,
@@ -258,8 +306,14 @@ pub struct LauncherRegistry {
 
 impl fmt::Debug for LauncherRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A poisoned registry is rendered explicitly: an empty list would claim that no
+        // launcher is registered, which is a different state.
+        let launchers = match self.launchers.read() {
+            Ok(map) => map.keys().cloned().collect::<Vec<_>>(),
+            Err(_) => vec!["<poisoned>".to_string()],
+        };
         f.debug_struct("LauncherRegistry")
-            .field("launchers", &self.launcher_types())
+            .field("launchers", &launchers)
             .finish()
     }
 }
@@ -298,20 +352,37 @@ impl LauncherRegistry {
     }
 
     /// Whether a launcher is registered under `launcher_type`.
+    ///
+    /// A poisoned registry lock reports `false` (the accessor is infallible) and is logged,
+    /// because "no launcher registered" is a different answer from "cannot tell".
     #[must_use]
     pub fn has(&self, launcher_type: &str) -> bool {
-        self.launchers
-            .read()
-            .is_ok_and(|map| map.contains_key(launcher_type))
+        if let Ok(map) = self.launchers.read() {
+            map.contains_key(launcher_type)
+        } else {
+            tracing::warn!(
+                launcher_type,
+                "the launcher registry lock is poisoned; reporting no such launcher"
+            );
+            false
+        }
     }
 
     /// The launcher registered under `launcher_type`, if any.
+    ///
+    /// A poisoned registry lock reports `None` and is logged; [`Self::create`] is the
+    /// fallible accessor and reports the poisoning as an error.
     #[must_use]
     pub fn get(&self, launcher_type: &str) -> Option<Arc<dyn SandboxLauncher>> {
-        self.launchers
-            .read()
-            .ok()
-            .and_then(|map| map.get(launcher_type).cloned())
+        if let Ok(map) = self.launchers.read() {
+            map.get(launcher_type).cloned()
+        } else {
+            tracing::warn!(
+                launcher_type,
+                "the launcher registry lock is poisoned; reporting no such launcher"
+            );
+            None
+        }
     }
 
     /// The launcher registered under `launcher_type`.
@@ -331,19 +402,32 @@ impl LauncherRegistry {
     }
 
     /// Removes the launcher registered under `launcher_type`, if any.
+    ///
+    /// A poisoned registry lock is reported at `warn!` rather than ignored: the launcher
+    /// then stays registered and the next `create` would still find it.
     pub fn unregister(&self, launcher_type: &str) {
         if let Ok(mut map) = self.launchers.write() {
             map.remove(launcher_type);
+        } else {
+            tracing::warn!(
+                launcher_type,
+                "the launcher registry lock is poisoned; the launcher was not removed"
+            );
         }
     }
 
     /// The registered launcher types, sorted.
+    ///
+    /// A poisoned registry lock yields the empty list (the accessor is infallible), which is
+    /// indistinguishable from "nothing registered": that case is logged at `warn!`.
     #[must_use]
     pub fn launcher_types(&self) -> Vec<String> {
-        self.launchers
-            .read()
-            .map(|map| map.keys().cloned().collect())
-            .unwrap_or_default()
+        if let Ok(map) = self.launchers.read() {
+            map.keys().cloned().collect()
+        } else {
+            tracing::warn!("the launcher registry lock is poisoned; reporting no launcher types");
+            Vec::new()
+        }
     }
 }
 
@@ -405,6 +489,19 @@ pub fn unknown_launcher_error(launcher_type: &str, registered: &[String]) -> Err
 /// A sandbox launcher failure: `ErrorKind::SysOp` with Python's code 199008 text.
 pub fn launcher_error(process: &str, reason: &str) -> Error {
     Error::sys_op(sandbox_launcher_message(process, reason))
+}
+
+/// An operation the launcher cannot perform at all:
+/// `ErrorKind::Unsupported` naming the launcher and the operation.
+///
+/// Deliberately *not* code 199008: 199008 means "the launcher exists and the call failed",
+/// which is a runtime problem a caller may retry. A capability the launcher does not have
+/// (destroying a pre-deployed container, suspending a runtime without pause, ...) is
+/// permanent, and pretending otherwise is how a teardown silently leaks a sandbox. The
+/// message is
+/// `sandbox launcher unsupported, launcher: {launcher}, process: {process}, reason: {reason}`.
+pub fn unsupported_launcher_error(launcher: &str, process: &str, reason: &str) -> Error {
+    Error::unsupported(unsupported_launcher_message(launcher, process, reason))
 }
 
 /// A sandbox provider failure: `ErrorKind::SysOp` with Python's code 199009 text.
@@ -475,6 +572,10 @@ mod tests {
 
     #[async_trait]
     impl SandboxLauncher for CountingLauncher {
+        fn launcher_type(&self) -> &'static str {
+            "counting"
+        }
+
         async fn launch(
             &self,
             config: &SandboxLauncherConfig,
@@ -488,8 +589,36 @@ mod tests {
             )
         }
 
+        async fn pause(&self, _sandbox_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn resume(&self, _sandbox_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete(&self, _sandbox_id: &str) -> Result<()> {
+            Ok(())
+        }
+
         async fn check_status(&self, _sandbox_id: &str) -> Result<SandboxStatus> {
             Ok(self.status)
+        }
+    }
+
+    /// A launcher that implements only [`SandboxLauncher::launch`], so every other call is
+    /// the trait default.
+    struct Minimal;
+
+    #[async_trait]
+    impl SandboxLauncher for Minimal {
+        async fn launch(
+            &self,
+            _config: &SandboxLauncherConfig,
+            _timeout_seconds: u64,
+            _isolation_key: Option<&str>,
+        ) -> Result<LaunchedSandbox> {
+            Ok(LaunchedSandbox::new("http://minimal"))
         }
     }
 
@@ -519,15 +648,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(descriptor, LaunchedSandbox::new("http://10.0.0.1:8080"));
+        assert_eq!(launcher.launcher_type(), "pre_deploy");
+    }
 
-        // Lifecycle calls default to successful no-ops.
+    #[tokio::test]
+    async fn pre_deploy_launcher_refuses_the_calls_it_cannot_perform() {
+        // The `pre_deploy` launcher owns no handle on its container: suspending, resuming,
+        // or destroying it is impossible, so every call is a typed refusal rather than a
+        // silent success that would leak the container.
+        let launcher = PreDeploymentLauncher;
+        for (process, outcome) in [
+            ("pause", launcher.pause("any").await),
+            ("resume", launcher.resume("any").await),
+            ("delete", launcher.delete("any").await),
+        ] {
+            let error = outcome.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "process: {process}");
+            assert!(
+                error.message().starts_with(&format!(
+                    "sandbox launcher unsupported, launcher: pre_deploy, process: {process}, \
+                     reason: "
+                )),
+                "unexpected message for {process}: {}",
+                error.message()
+            );
+        }
         assert_eq!(
             launcher.check_status("any").await.unwrap(),
-            SandboxStatus::Running
+            SandboxStatus::Unknown,
+            "the pre_deploy launcher cannot report a state"
         );
-        launcher.pause("any").await.unwrap();
-        launcher.resume("any").await.unwrap();
-        launcher.delete("any").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn defaulted_lifecycle_calls_are_unsupported_and_name_the_launcher() {
+        // `Minimal` overrides nothing but `launch`: the defaults must refuse, never succeed.
+        let launcher = Minimal;
+        assert_eq!(launcher.launcher_type(), "custom");
+
+        let delete = launcher.delete("c-1").await.unwrap_err();
+        assert_eq!(delete.kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            delete.message(),
+            "sandbox launcher unsupported, launcher: custom, process: delete, reason: this \
+             launcher cannot destroy containers; teardown would leak the sandbox"
+        );
+
+        let pause = launcher.pause("c-1").await.unwrap_err();
+        assert_eq!(pause.kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            pause.message(),
+            "sandbox launcher unsupported, launcher: custom, process: pause, reason: this \
+             launcher cannot suspend containers; the sandbox keeps running"
+        );
+
+        let resume = launcher.resume("c-1").await.unwrap_err();
+        assert_eq!(resume.kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            resume.message(),
+            "sandbox launcher unsupported, launcher: custom, process: resume, reason: this \
+             launcher cannot resume containers; the sandbox stays suspended"
+        );
+
+        assert_eq!(
+            launcher.check_status("c-1").await.unwrap(),
+            SandboxStatus::Unknown,
+            "a launcher that cannot inspect its runtime reports unknown, not running"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_override_still_wins_over_every_default() {
+        let launcher = CountingLauncher {
+            launches: AtomicU32::new(0),
+            status: SandboxStatus::Paused,
+        };
+        launcher.delete("c-1").await.unwrap();
+        launcher.pause("c-1").await.unwrap();
+        launcher.resume("c-1").await.unwrap();
+        assert_eq!(
+            launcher.check_status("c-1").await.unwrap(),
+            SandboxStatus::Paused
+        );
+        assert_eq!(launcher.launcher_type(), "counting");
     }
 
     #[tokio::test]

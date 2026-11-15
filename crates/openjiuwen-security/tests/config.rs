@@ -140,8 +140,9 @@ fn default_security_config_is_disabled_with_every_detector_at_its_default() {
 
     assert_eq!(config.policy, SecurityPolicy::default());
     assert_eq!(config.policy.block_level, RiskLevel::Critical);
-    assert_eq!(config.policy.failure_policy, FailurePolicy::FailOpen);
+    assert_eq!(config.policy.failure_policy, FailurePolicy::FailClosed);
     assert!(config.policy.stop_on_block);
+    assert!(!config.allow_all, "no silent opt-out of detection");
 
     assert_eq!(config.targets, ScanTargets::default());
     assert!(config.targets.prompts);
@@ -223,6 +224,11 @@ fn protected_enables_the_three_stock_guardrails_in_order() {
         "the empty content-rule table registers no content guardrail"
     );
     assert_eq!(pipeline.guardrails().len(), 3);
+    assert_eq!(
+        pipeline.policy().failure_policy,
+        FailurePolicy::FailClosed,
+        "the conventional opt-in keeps the fail-closed default"
+    );
 }
 
 // ports tests/unit_tests/core/security/guardrail/test_guardrail_base.py
@@ -369,6 +375,11 @@ fn a_full_config_round_trips_through_json() {
     let config = SecurityConfig::protected();
     let value = serde_json::to_value(&config).unwrap();
     assert_eq!(value["enabled"], json!(true));
+    assert_eq!(
+        value["allow_all"],
+        json!(false),
+        "the opt-out of detection is never silent"
+    );
 
     let patterns = value["sensitive_data"]["patterns"]
         .as_array()
@@ -411,6 +422,10 @@ fn a_partial_payload_defaults_every_other_field() {
     .unwrap();
 
     assert!(partial.enabled);
+    assert!(
+        !partial.allow_all,
+        "an omitted `allow_all` must not disable detection validation"
+    );
     assert_eq!(partial.prompt_injection.mode, "api");
     assert_eq!(
         partial.prompt_injection.api_url.as_deref(),
@@ -432,6 +447,55 @@ fn a_partial_payload_defaults_every_other_field() {
         partial.tool_arguments,
         ToolArgumentGuardrailConfig::default()
     );
+}
+
+// No Python equivalent: `allow_all` round-trips and is the only way an enabled
+// config may scan nothing.
+#[test]
+fn allow_all_round_trips_and_permits_an_empty_pipeline() {
+    let back: SecurityConfig = serde_json::from_value(json!({"enabled": true})).unwrap();
+    assert!(back.enabled);
+    assert!(!back.allow_all);
+    assert_eq!(
+        serde_json::to_value(&back).unwrap()["allow_all"],
+        json!(false)
+    );
+
+    let config: SecurityConfig =
+        serde_json::from_value(json!({"enabled": true, "allow_all": true})).unwrap();
+    assert!(config.enabled);
+    assert!(config.allow_all);
+    assert_eq!(
+        config,
+        SecurityConfig {
+            enabled: true,
+            allow_all: true,
+            ..SecurityConfig::default()
+        }
+    );
+
+    let serialized = serde_json::to_value(&config).unwrap();
+    assert_eq!(serialized["enabled"], json!(true));
+    assert_eq!(serialized["allow_all"], json!(true));
+    let round_tripped: SecurityConfig = serde_json::from_value(serialized).unwrap();
+    assert_eq!(round_tripped, config, "the record round-trips");
+
+    // An enabled config that selects an empty scan-target set still needs the
+    // opt-in; `allow_all` is what turns that from an error into an empty
+    // pipeline.
+    let nothing_scanned = SecurityConfig {
+        targets: ScanTargets {
+            prompts: false,
+            user_input: false,
+            model_outputs: false,
+            tool_inputs: false,
+            tool_outputs: false,
+        },
+        ..config
+    };
+    let pipeline = nothing_scanned.pipeline().unwrap();
+    assert!(pipeline.guardrails().is_empty(), "allow_all scans nothing");
+    assert_eq!(pipeline.policy(), &SecurityPolicy::default());
 }
 
 // No Python equivalent: the builder validates every detector it installs.
@@ -507,9 +571,10 @@ fn a_custom_policy_is_preserved_without_guardrails() {
 }
 
 // No Python equivalent: an empty stage list never means "every stage" for the
-// builder; it means nothing is scanned.
+// builder; it means nothing is scanned, which is a configuration error unless
+// the caller opts in with `allow_all`.
 #[test]
-fn disabling_every_target_yields_an_empty_pipeline() {
+fn disabling_every_target_requires_the_allow_all_opt_in() {
     let config = SecurityConfig {
         targets: ScanTargets {
             prompts: false,
@@ -521,9 +586,71 @@ fn disabling_every_target_yields_an_empty_pipeline() {
         ..SecurityConfig::protected()
     };
     assert!(config.enabled, "the detector configs are still enabled");
+    assert!(!config.allow_all);
     assert_eq!(config.targets.stages(), Vec::<ScanStage>::new());
 
-    let pipeline = config.pipeline().unwrap();
+    let Err(error) = config.pipeline() else {
+        panic!("an enabled config with no scan target must fail");
+    };
+    assert_eq!(error.kind(), ErrorKind::Config);
+    assert!(
+        error.to_string().contains("enables no scan target"),
+        "the message must name the reason: {error}"
+    );
+
+    let allowed = SecurityConfig {
+        allow_all: true,
+        ..config
+    };
+    let pipeline = allowed.pipeline().unwrap();
+    assert!(pipeline.guardrails().is_empty());
+    assert_eq!(pipeline.policy(), &SecurityPolicy::default());
+}
+
+// No Python equivalent: a detector table that silently selects nothing must be
+// an explicit decision, never the result of a misspelled or emptied config.
+#[test]
+fn an_enabled_config_with_no_detector_requires_the_allow_all_opt_in() {
+    let config = SecurityConfig {
+        targets: ScanTargets {
+            prompts: false,
+            user_input: false,
+            model_outputs: false,
+            tool_inputs: true,
+            tool_outputs: false,
+        },
+        sensitive_data: SensitiveDataGuardrailConfig {
+            enabled: false,
+            ..SensitiveDataGuardrailConfig::default()
+        },
+        content_rules: ContentRuleGuardrailConfig {
+            rules: Vec::new(),
+            ..ContentRuleGuardrailConfig::default()
+        },
+        tool_arguments: ToolArgumentGuardrailConfig {
+            deny_patterns: Vec::new(),
+            sensitive_data: None,
+            ..ToolArgumentGuardrailConfig::default()
+        },
+        ..SecurityConfig::protected()
+    };
+    assert!(config.enabled);
+    assert_eq!(config.targets.stages(), vec![ScanStage::ToolInvokeInput]);
+
+    let Err(error) = config.pipeline() else {
+        panic!("an enabled config with no detector must fail");
+    };
+    assert_eq!(error.kind(), ErrorKind::Config);
+    assert!(
+        error.to_string().contains("enables no detector"),
+        "the message must name the reason: {error}"
+    );
+
+    let allowed = SecurityConfig {
+        allow_all: true,
+        ..config
+    };
+    let pipeline = allowed.pipeline().unwrap();
     assert!(pipeline.guardrails().is_empty());
     assert_eq!(pipeline.policy(), &SecurityPolicy::default());
 }

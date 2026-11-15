@@ -132,7 +132,14 @@ impl TeamMemoryStore for InMemoryTeamMemoryStore {
             .into_iter()
             .filter(|record| scope.allows(record))
             .collect();
-        Ok(rank_candidates(candidates, query, options, Utc::now()))
+        Ok(rank_candidates(
+            candidates,
+            query,
+            options.query_embedding.as_deref(),
+            &options.ranking,
+            options,
+            Utc::now(),
+        ))
     }
     async fn delete(&self, team_id: &str, id: &str) -> Result<bool> {
         let mut rows = self.rows.write();

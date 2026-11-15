@@ -8,11 +8,18 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::sync::Arc;
+
+use futures::StreamExt;
+
 use openjiuwen_common::error::ErrorKind;
+use openjiuwen_sysop::config::LocalWorkConfig;
 use openjiuwen_sysop::encoding::cjk::{decode, decode_strict, CjkDecoder, CjkEncoding};
 use openjiuwen_sysop::encoding::{
     decode_text, detect_text_encoding, detected_encoding_name, encode_text, is_binary, TextEncoding,
 };
+use openjiuwen_sysop::fs::local_fs;
+use openjiuwen_sysop::fs::types::ReadFileParams;
 use openjiuwen_sysop::BinaryPolicy;
 
 /// `中文` in GBK/GB18030.
@@ -220,15 +227,65 @@ fn legacy_cjk_text_is_not_binary() {
 }
 
 #[test]
-fn writing_legacy_encodings_is_unsupported() {
-    for name in ["gbk", "gb18030", "big5", "shift-jis", "sjis"] {
-        let error = encode_text("中文", name).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported, "encoding {name}");
-        assert!(error.message().contains("not supported for writing"));
+fn writing_legacy_encodings_round_trips() {
+    // Every alias writes the codec's bytes and reads them back unchanged.
+    for name in ["gbk", "gb18030", "gb2312", "cp936", "GBK"] {
+        assert_eq!(
+            encode_text("中文", name).unwrap(),
+            ZHONG_WEN_GBK.to_vec(),
+            "encoding {name}"
+        );
+        let bytes = encode_text("中文 plus ascii\n", name).unwrap();
+        assert_eq!(
+            decode_text(&bytes, name, BinaryPolicy::Lossy).unwrap(),
+            "中文 plus ascii\n",
+            "encoding {name}"
+        );
+    }
+    for name in ["big5", "big5-hkscs", "cp950"] {
+        assert_eq!(
+            encode_text("中文", name).unwrap(),
+            ZHONG_WEN_BIG5.to_vec(),
+            "encoding {name}"
+        );
+    }
+    for name in ["shift-jis", "sjis", "cp932"] {
+        assert_eq!(
+            encode_text("日本語", name).unwrap(),
+            NIHONGO_SJIS.to_vec(),
+            "encoding {name}"
+        );
     }
     assert_eq!(encode_text("ascii", "utf-8").unwrap(), b"ascii");
 }
 
+#[tokio::test]
+async fn streaming_read_reports_a_line_it_cannot_re_encode() {
+    // An invalid Big5 byte decodes to `U+FFFD`, which Big5 cannot write back. The chunk size
+    // is that encoded length, so the stream must report the failure (199003) rather than a
+    // fabricated size.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("bad.txt"), [0x80_u8, b'\n']).unwrap();
+    let op = local_fs(LocalWorkConfig::unrestricted(
+        dir.path().to_string_lossy().to_string(),
+    ))
+    .unwrap();
+    let params = ReadFileParams::text("bad.txt").with_encoding("big5");
+    let chunks: Vec<_> = Arc::clone(&op).read_file_stream(params).collect().await;
+    assert_eq!(chunks.len(), 1, "the failure replaces the line chunk");
+    let failure = chunks.first().unwrap();
+    assert_eq!(failure.code, 199_003);
+    assert!(failure.message.contains("big5"), "{}", failure.message);
+    assert!(failure.message.contains("U+FFFD"), "{}", failure.message);
+
+    // A decodable line still streams with its encoded size.
+    std::fs::write(dir.path().join("ok.txt"), ZHONG_WEN_BIG5).unwrap();
+    let params = ReadFileParams::text("ok.txt").with_encoding("big5");
+    let chunks: Vec<_> = Arc::clone(&op).read_file_stream(params).collect().await;
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks.first().unwrap().code, 0);
+    assert_eq!(chunks.first().unwrap().data.as_ref().unwrap().chunk_size, 4);
+}
 #[test]
 fn unknown_encoding_names_are_unsupported() {
     let error = decode_text(b"x", "koi8-r", BinaryPolicy::Lossy).unwrap_err();

@@ -21,8 +21,10 @@ use std::time::Duration;
 use futures::StreamExt;
 use openjiuwen_agent::output::{AgentOutput, ResultType};
 use openjiuwen_common::error::{ErrorKind, Result};
+use openjiuwen_runner::monitor::RunMonitor;
 use openjiuwen_runner::spawn::{
-    AgentSpawner, SpawnSpec, SpawnedAgent, SubprocessConfig, SubprocessSpawner,
+    AgentSpawner, MonitoredSpawnedAgent, SpawnSpec, SpawnedAgent, SubprocessConfig,
+    SubprocessSpawner,
 };
 use serde_json::{json, Value};
 
@@ -591,8 +593,62 @@ async fn the_background_health_interval_is_re_tunable_on_a_live_child() {
     assert!(error.to_string().contains("has stopped"), "{error}");
 }
 
-// --- shutdown and ownership -------------------------------------------------
+#[tokio::test]
+async fn the_monitored_handle_re_tunes_the_real_background_loop() {
+    // The backend owns a real loop, so the decorator must forward the cadence
+    // rather than supervise a second one of its own.
+    let process = SubprocessSpawner::new(child_config("echo").with_health_check(
+        Duration::from_millis(250),
+        Duration::from_millis(300),
+        3,
+    ))
+    .spawn_process(spec())
+    .await
+    .expect("the fake child launches");
+    let monitor = Arc::new(RunMonitor::new());
+    let handle = MonitoredSpawnedAgent::track(
+        Arc::clone(&process) as Arc<dyn SpawnedAgent>,
+        Arc::clone(&monitor),
+        None,
+        json!({"backend": "subprocess"}),
+    );
+    let before = monitor.history(handle.run_id()).unwrap().len();
 
+    for interval in [Duration::ZERO, Duration::from_millis(80), Duration::ZERO] {
+        tokio::time::timeout(BOUND, handle.set_health_interval(interval))
+            .await
+            .expect("a re-tune must not hang")
+            .expect("a monitored subprocess handle stays re-tunable");
+        assert_eq!(
+            process.health_interval(),
+            interval,
+            "the value reached the real background loop"
+        );
+    }
+    assert_eq!(
+        monitor.history(handle.run_id()).unwrap().len(),
+        before,
+        "a cadence change is not a lifecycle transition"
+    );
+    assert!(!handle.is_finished(), "the run is still active");
+
+    // A stopped child is the backend's own failure, so the decorator neither
+    // starts a supervised loop nor hides it.
+    assert!(
+        tokio::time::timeout(BOUND, handle.shutdown(Duration::from_secs(2)))
+            .await
+            .expect("shutdown must not hang")
+            .expect("the fake child acknowledges the shutdown")
+    );
+    let error = handle
+        .set_health_interval(Duration::from_millis(100))
+        .await
+        .expect_err("a stopped child cannot be re-tuned");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.to_string().contains("has stopped"), "{error}");
+}
+
+// --- shutdown and ownership -------------------------------------------------
 #[tokio::test]
 async fn an_acknowledged_shutdown_exits_gracefully() {
     let process = spawner("shutdown_ack")

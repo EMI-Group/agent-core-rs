@@ -243,7 +243,11 @@ fn cancel_all_entries(entries: Vec<Entry>) -> usize {
     let count = entries.len();
     for entry in entries {
         if let Some(pid) = entry.group {
-            let _ = terminate_group(pid);
+            if !terminate_group(pid) {
+                // Either the group was already gone (the usual case) or the kill failed;
+                // `kill_group` logs the distinction.
+                tracing::debug!(pid, "the registered process group was not terminated");
+            }
         }
         entry.token.cancel();
     }

@@ -11,7 +11,9 @@
 //!   reference timestamp, so a caller knows a rebuild is owed.
 //! - [`PURGE_STALE_EMBEDDINGS`] is the opt-in second step ([`IndexVersionOptions::purge_stale`]):
 //!   it deletes the collections whose stamp still asks for a rebuild, counts the documents
-//!   it dropped, and keeps the stamp so the rebuild stays visible.
+//!   it dropped, and keeps the stamp so the rebuild stays visible. A collection whose
+//!   documents cannot be counted is purged anyway, and the unreadable count is reported — in
+//!   the report's `failed` tally (journalled) and in its `note` — instead of only logged.
 //!
 //! Only `uid_*` collections (the memory vector namespace) are considered; any other
 //! collection is left completely alone. Stamps are metadata, not a
@@ -30,9 +32,10 @@ use serde_json::json;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::store::{KvStore, KvValue};
 
-use super::operation::{MigrationOperationHandler, OperationReport};
+use super::operation::{MigrationOperationHandler, OperationOutcome, OperationReport};
 use super::plan::{
-    scan_collection, vector_field, MigrationContext, MigrationCounts, MigrationStep, Migrator,
+    scan_collection, unsearchable_reason, vector_field, MigrationContext, MigrationCounts,
+    MigrationStep, Migrator,
 };
 
 /// KV prefix of the per-collection index stamps (metadata, not a `KvFamily`).
@@ -342,6 +345,9 @@ impl Migrator for IndexVersionMigrator {
 }
 
 /// The [`STAMP_COLLECTIONS`] operation: write a rebuild-requesting stamp per stale collection.
+///
+/// The stamp records the collection's dimensions when the schema declares them; when it does
+/// not, the stamp says so in its own `reason`, so the rebuild owed is never blind.
 struct StampCollections {
     /// The migrator's behaviour.
     options: IndexVersionOptions,
@@ -369,14 +375,21 @@ impl MigrationOperationHandler for StampCollections {
                 skipped += 1;
                 continue;
             }
-            let (dimensions, _) = collection_dimensions(context, &collection).await?;
+            let (dimensions, unreadable) = collection_dimensions(context, &collection).await?;
+            let reason = format!("index version {current} is older than {target}");
+            // An unreadable dimension is not dropped: the stamp is the durable record a
+            // rebuild reads, so the reason it could not be read rides along with it.
+            let reason = match unreadable {
+                Some(problem) => format!("{reason}; {problem}"),
+                None => reason,
+            };
             let stamp = IndexStamp {
                 collection: collection.clone(),
                 version: target,
                 dimensions,
                 needs_rebuild: true,
                 updated_at: Some(context.now),
-                reason: Some(format!("index version {current} is older than {target}")),
+                reason: Some(reason),
             };
             if !context.is_dry_run() {
                 stamp.store(context.kv().as_ref()).await?;
@@ -400,6 +413,10 @@ impl MigrationOperationHandler for StampCollections {
 
 /// The [`PURGE_STALE_EMBEDDINGS`] operation: delete the collections whose stamp still asks
 /// for a rebuild, counting the documents they held.
+///
+/// A collection whose document count cannot be read is still purged — that is what the
+/// operation is for — but the failure is not only logged: it is counted in the report's
+/// `failed` tally, which the journal keeps, and named in the report's `note`.
 struct PurgeStaleEmbeddings {
     /// The migrator's behaviour.
     options: IndexVersionOptions,
@@ -420,6 +437,7 @@ impl MigrationOperationHandler for PurgeStaleEmbeddings {
         let mut purged = 0;
         let mut documents = 0;
         let mut skipped = 0;
+        let mut uncounted: Vec<String> = Vec::new();
         for collection in memory_collections(context).await? {
             let stamp = IndexStamp::load(context.kv().as_ref(), &collection).await?;
             let Some(stamp) = stamp else {
@@ -432,12 +450,15 @@ impl MigrationOperationHandler for PurgeStaleEmbeddings {
             }
             match scan_collection(context.vector().as_ref(), &collection).await {
                 Ok(docs) => documents += docs.len(),
-                Err(error) => tracing::warn!(
-                    target: "openjiuwen_memory::store",
-                    %error,
-                    collection,
-                    "could not count the documents of a stale collection; purging it anyway"
-                ),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "openjiuwen_memory::store",
+                        %error,
+                        collection,
+                        "could not count the documents of a stale collection; purging it anyway"
+                    );
+                    uncounted.push(format!("{collection:?}: {}", error.message()));
+                }
             }
             if !context.is_dry_run() {
                 context.vector().delete_collection(&collection).await?;
@@ -449,15 +470,38 @@ impl MigrationOperationHandler for PurgeStaleEmbeddings {
             purged,
             documents,
             skipped,
+            uncounted = uncounted.len(),
             "purged stale memory embedding collections"
         );
-        Ok(OperationReport::succeeded(
-            PURGE_STALE_EMBEDDINGS,
-            purged + documents,
+        Ok(OperationReport {
+            operation_id: PURGE_STALE_EMBEDDINGS.to_owned(),
+            outcome: OperationOutcome::Succeeded,
+            affected: purged + documents,
             skipped,
-            0,
-        ))
+            failed: uncounted.len(),
+            note: uncounted_note(&uncounted, context.max_issues),
+        })
     }
+}
+
+/// A note naming the purged collections whose documents could not be counted.
+///
+/// The list is bounded by `max_issues`, the same bound the plan's issue lists use, so a
+/// pathological store cannot turn one report into a huge note; the `failed` counter still
+/// accounts for every collection.
+fn uncounted_note(uncounted: &[String], max_issues: usize) -> Option<String> {
+    if uncounted.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = vec![format!(
+        "{} stale collection(s) were purged without counting their documents",
+        uncounted.len()
+    )];
+    parts.extend(uncounted.iter().take(max_issues).cloned());
+    if uncounted.len() > max_issues {
+        parts.push(format!("and {} more", uncounted.len() - max_issues));
+    }
+    Some(parts.join("; "))
 }
 
 /// The sorted `uid_*` collections of the injected vector store.
@@ -470,9 +514,10 @@ async fn memory_collections(context: &MigrationContext) -> Result<Vec<String>> {
 
 /// The collection's vector dimensions and, when they cannot be read, the reason.
 ///
-/// A collection whose schema declares no vector field cannot hold embeddings, so its
-/// dimensions are unknown; that is reported as an issue but never a panic, and the
-/// collection is never purged on the strength of a schema it does not have.
+/// A collection whose schema declares no searchable vector field cannot hold embeddings, so
+/// its dimensions are unknown; that is reported as an issue but never a panic, and the
+/// collection is never purged on the strength of a schema it does not have. The reason is
+/// [`unsearchable_reason`], shared with [`scan_collection`] so both report the same cause.
 async fn collection_dimensions(
     context: &MigrationContext,
     collection: &str,
@@ -480,12 +525,7 @@ async fn collection_dimensions(
     match context.vector().get_schema(collection).await? {
         Some(schema) => match vector_field(&schema) {
             Some((_, dimensions)) => Ok((Some(dimensions), None)),
-            None => Ok((
-                None,
-                Some(format!(
-                    "vector collection {collection:?} declares no FLOAT_VECTOR field; its dimensions are unknown"
-                )),
-            )),
+            None => Ok((None, Some(unsearchable_reason(collection, &schema)))),
         },
         None => Ok((
             None,
@@ -497,6 +537,8 @@ async fn collection_dimensions(
 #[cfg(test)]
 #[allow(clippy::assert_is_empty)] // `assert!(x.is_empty())` reads better in these tests
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::super::operation::{MigrationJournal, OperationOutcome};
     use super::super::plan::MigrationPlan;
     use super::*;
@@ -798,6 +840,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_uncountable_stale_collection_is_purged_and_reported_failed() {
+        let store = Arc::new(UnsearchableStore::new(FIRST));
+        let mut stores = MemoryStores::in_memory();
+        stores.vector = store.clone();
+        let context = MigrationContext::new(stores);
+        let mut stamp = IndexStamp::new(FIRST, CURRENT_INDEX_VERSION, None);
+        stamp.needs_rebuild = true;
+        stamp.store(context.kv().as_ref()).await.expect("stamp");
+
+        let handler = PurgeStaleEmbeddings {
+            options: IndexVersionOptions {
+                target_version: CURRENT_INDEX_VERSION,
+                purge_stale: true,
+            },
+        };
+        let step = MigrationStep::new(
+            PURGE_STALE_EMBEDDINGS,
+            MIGRATOR_ID,
+            MIGRATOR_VERSION,
+            "purge",
+        );
+        let report = handler.execute(&context, &step).await.expect("handler");
+        assert_eq!(report.outcome, OperationOutcome::Succeeded);
+        assert_eq!(
+            report.affected, 1,
+            "the collection itself; documents unknown"
+        );
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.failed, 1, "the uncountable collection is counted");
+        let note = report.note.as_deref().expect("a note naming the failure");
+        assert!(note.contains("purged without counting"), "{note}");
+        assert!(note.contains(FIRST), "{note}");
+        assert!(note.contains("no FLOAT_VECTOR field"), "{note}");
+        assert_eq!(
+            store.deleted.load(Ordering::SeqCst),
+            1,
+            "the collection is still purged"
+        );
+    }
+
+    #[test]
+    fn an_empty_uncounted_list_needs_no_note() {
+        assert_eq!(uncounted_note(&[], 100), None);
+        assert_eq!(
+            uncounted_note(&["a".to_owned()], 1).as_deref(),
+            Some("1 stale collection(s) were purged without counting their documents; a")
+        );
+        assert_eq!(
+            uncounted_note(&["a".to_owned(), "b".to_owned()], 1).as_deref(),
+            Some(
+                "2 stale collection(s) were purged without counting their documents; a; and 1 more"
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn a_collection_without_a_vector_field_is_an_issue_not_a_panic() {
         let mut stores = MemoryStores::in_memory();
         stores.vector = Arc::new(SchemaOnlyStore {
@@ -828,6 +926,20 @@ mod tests {
             .collection_exists("uid_odd")
             .await
             .expect("exists"));
+        let stamp = IndexStamp::load(context.kv().as_ref(), "uid_odd")
+            .await
+            .expect("load")
+            .expect("stamp");
+        assert_eq!(stamp.dimensions, None);
+        assert!(
+            stamp
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("older than")
+                    && reason.contains("no FLOAT_VECTOR field")),
+            "the stamp keeps the reason its dimensions are unknown: {:?}",
+            stamp.reason
+        );
     }
 
     #[test]
@@ -899,6 +1011,84 @@ mod tests {
         }
         async fn list_collection_names(&self) -> Result<Vec<String>> {
             Ok(vec!["uid_odd".to_owned()])
+        }
+    }
+
+    /// A vector store whose one collection cannot be searched, but can be deleted.
+    ///
+    /// It models a store that hands back a schema `CollectionSchema::validate` would reject
+    /// (here: no `FLOAT_VECTOR` field), which the in-memory backend cannot do — so the purge's
+    /// "purged, but its documents could not be counted" path is only reachable through a fake.
+    struct UnsearchableStore {
+        /// The one collection the store reports.
+        collection: &'static str,
+        /// How many times `delete_collection` was called.
+        deleted: Arc<AtomicUsize>,
+    }
+
+    impl UnsearchableStore {
+        /// A store reporting `collection`.
+        fn new(collection: &'static str) -> Self {
+            Self {
+                collection,
+                deleted: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl VectorStore for UnsearchableStore {
+        async fn create_collection(
+            &self,
+            _collection: &str,
+            _schema: CollectionSchema,
+        ) -> Result<()> {
+            Err(Error::unsupported("unused in this test"))
+        }
+        async fn delete_collection(&self, collection: &str) -> Result<()> {
+            assert_eq!(collection, self.collection);
+            self.deleted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn collection_exists(&self, _collection: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn get_schema(&self, _collection: &str) -> Result<Option<CollectionSchema>> {
+            Ok(Some(CollectionSchema::new(vec![FieldSchema {
+                name: "id".to_owned(),
+                dtype: VectorDataType::Varchar,
+                is_primary: true,
+                ..FieldSchema::default()
+            }])))
+        }
+        async fn add_docs(
+            &self,
+            _collection: &str,
+            _docs: Vec<Map<String, Value>>,
+        ) -> Result<usize> {
+            Err(Error::unsupported("unused in this test"))
+        }
+        async fn search(
+            &self,
+            _collection: &str,
+            _query: &VectorQuery,
+        ) -> Result<Vec<VectorSearchResult>> {
+            Err(Error::unsupported(
+                "an unsearchable collection must never be searched",
+            ))
+        }
+        async fn delete_docs_by_ids(&self, _collection: &str, _ids: &[String]) -> Result<usize> {
+            Err(Error::unsupported("unused in this test"))
+        }
+        async fn delete_docs_by_filters(
+            &self,
+            _collection: &str,
+            _filters: &Value,
+        ) -> Result<usize> {
+            Err(Error::unsupported("unused in this test"))
+        }
+        async fn list_collection_names(&self) -> Result<Vec<String>> {
+            Ok(vec![self.collection.to_owned()])
         }
     }
 }

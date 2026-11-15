@@ -22,6 +22,12 @@ pub enum DedupePolicy {
     /// Drop the incoming memory and report it as skipped.
     Skip,
     /// Replace the existing record's content with the incoming memory.
+    ///
+    /// The existing row is removed first, so the replacement never coexists with a stale
+    /// copy; the replacement is then stored under the removed row's id. The outcome
+    /// reports both halves: the superseded id in
+    /// [`AddOutcome::deleted`](super::AddOutcome::deleted) and the replacement record in
+    /// [`AddOutcome::merged`](super::AddOutcome::merged).
     Replace,
     /// Store the incoming memory even when a duplicate exists.
     Add,

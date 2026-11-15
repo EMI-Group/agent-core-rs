@@ -179,12 +179,37 @@ pub const fn effective_chunk_size(requested: usize, default: usize) -> usize {
 
 /// Byte length of `line` once encoded with `encoding` (Python `len(line.encode(encoding))`).
 ///
-/// An encoding this crate cannot write falls back to the UTF-8 length instead of failing,
-/// so a chunk size is still reported for a read that succeeded.
+/// # Errors
+///
+/// Returns the encoder's message when `encoding` is not a known write encoding or cannot
+/// represent `line`. Callers that report a size to the user use this so the failure
+/// surfaces instead of a made-up length.
+pub fn try_encoded_len(line: &str, encoding: &str) -> Result<u64, String> {
+    let len = crate::encoding::encode_text(line, encoding)
+        .map_err(|error| error.message().to_string())?
+        .len();
+    Ok(u64::try_from(len).unwrap_or(u64::MAX))
+}
+/// Byte length of `line` once encoded with `encoding`, as a bounded-size **estimate**.
+///
+/// When `encoding` cannot represent `line` (an unknown name, or a character the codec does
+/// not cover) the UTF-8 length is returned and a warning is logged, so sizing a buffer never
+/// fails. This is only safe for a size probe: a write must go through [`write_bytes`], which
+/// propagates the encoder error, and a caller that reports the size to the user should use
+/// [`try_encoded_len`] so the failure is visible.
 #[must_use]
 pub fn encoded_len(line: &str, encoding: &str) -> u64 {
-    let len = crate::encoding::encode_text(line, encoding).map_or(line.len(), |bytes| bytes.len());
-    u64::try_from(len).unwrap_or(u64::MAX)
+    match try_encoded_len(line, encoding) {
+        Ok(len) => len,
+        Err(reason) => {
+            tracing::warn!(
+                encoding,
+                %reason,
+                "size probe fell back to the UTF-8 length"
+            );
+            u64::try_from(line.len()).unwrap_or(u64::MAX)
+        }
+    }
 }
 
 /// Encodes the content of a write request exactly the way Python's `write_file` does.
@@ -197,7 +222,9 @@ pub fn encoded_len(line: &str, encoding: &str) -> u64 {
 /// # Errors
 ///
 /// Returns the encoder's message (without the `199003` status envelope) when
-/// `params.encoding` cannot be encoded.
+/// `params.encoding` is not a recognized write encoding or cannot represent the content, so
+/// `write_file` turns it into a `199003` failure instead of writing different bytes than the
+/// caller asked for.
 pub fn write_bytes(params: &WriteFileParams) -> Result<Vec<u8>, String> {
     match &params.content {
         FileContent::Bytes(bytes) => Ok(bytes.clone()),
@@ -388,7 +415,27 @@ mod tests {
         assert_eq!(encoded_len("abc", "utf-8"), 3);
         assert_eq!(encoded_len("é", "utf-8"), 2);
         assert_eq!(encoded_len("é", "utf-16le"), 2);
+        // Latin-1 and the CJK codecs report their real byte counts, not the UTF-8 length.
+        assert_eq!(encoded_len("é", "latin-1"), 1);
+        assert_eq!(encoded_len("中文", "gb18030"), 4);
+        assert_eq!(encoded_len("中文", "big5"), 4);
+        assert_eq!(encoded_len("日本語", "shift-jis"), 6);
+        // The estimate never fails: a name the encoder rejects degrades to the UTF-8 length.
         assert_eq!(encoded_len("abc", "not-an-encoding"), 3);
+        assert_eq!(encoded_len("中", "latin-1"), 3);
+    }
+
+    #[test]
+    fn try_encoded_len_reports_encoding_failures() {
+        assert_eq!(try_encoded_len("中文", "gbk"), Ok(4));
+        assert_eq!(try_encoded_len("é", "latin-1"), Ok(1));
+        assert_eq!(try_encoded_len("", "gb18030"), Ok(0));
+        let reason = try_encoded_len("中", "latin-1").unwrap_err();
+        assert!(reason.contains("latin-1"), "{reason}");
+        assert!(reason.contains("U+4E2D"), "{reason}");
+        assert!(try_encoded_len("x", "koi8-r")
+            .unwrap_err()
+            .contains("koi8-r"));
     }
 
     #[test]

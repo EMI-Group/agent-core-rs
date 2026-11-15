@@ -229,8 +229,25 @@ pub(super) fn stream_http(
     })
 }
 
-/// Asks the endpoint to cancel `task_id`.
-pub(super) async fn cancel_http(agent: &RemoteAgent, task_id: &str) -> Result<()> {
+/// Asks the endpoint to cancel `request_id`.
+///
+/// The body is the crate's own documented layout, so it grows additively:
+/// `{"task_id": …, "request_id": …, "reason": … | null}`. `task_id` is the key the
+/// first version posted and is kept so an endpoint written against it keeps
+/// working; `request_id` is the same id under its correlation name, and `reason`
+/// is written as `null` when the caller has none. The endpoint decides what a
+/// cancel means for the request it is running — this client only carries the id,
+/// and a non-2xx answer is mapped like every other remote failure.
+pub(super) async fn cancel_http(
+    agent: &RemoteAgent,
+    request_id: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    if request_id.trim().is_empty() {
+        return Err(Error::validation(
+            "a remote cancel needs a non-blank request_id",
+        ));
+    }
     let Some(url) = agent.config().cancel_url()? else {
         return Err(error::unsupported(
             "remote agent cancel_task",
@@ -242,7 +259,11 @@ pub(super) async fn cancel_http(agent: &RemoteAgent, task_id: &str) -> Result<()
     let response = client
         .post(&url)
         .timeout(deadline)
-        .json(&serde_json::json!({"task_id": task_id}))
+        .json(&serde_json::json!({
+            "task_id": request_id,
+            "request_id": request_id,
+            "reason": reason,
+        }))
         .send()
         .await
         .map_err(|error| {

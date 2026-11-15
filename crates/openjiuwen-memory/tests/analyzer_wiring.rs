@@ -18,11 +18,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_memory::analyzer::{
-    AnalyzerConfig, ConflictKind, ConsolidationAction, ExtractedFact, ExtractionInput,
-    ExtractionResult, ExtractorKind, FactExtractor, LlmExtractor, MemoryAnalyzer,
+    AnalyzerConfig, ClassifierKind, ConflictKind, ConsolidationAction, ExtractedFact,
+    ExtractionInput, ExtractionResult, ExtractorKind, FactExtractor, LlmExtractor, MemoryAnalyzer,
 };
 use openjiuwen_memory::config::{DedupeConfig, MemoryEngineConfig};
-use openjiuwen_memory::facade::LongTermMemory;
+use openjiuwen_memory::facade::{LongTermMemory, ScopeAnalyzerOverrideSpec};
 use openjiuwen_memory::record::{
     AddOptions, CallOptions, DedupePolicy, MemoryRecord, MemoryScope, MemoryType, NewMemory,
     SearchOptions,
@@ -357,6 +357,7 @@ async fn consolidate_plans_a_merge_for_a_redundant_memory() {
     let verdicts = ltm
         .analyzer()
         .classifier(None)
+        .expect("the default config asks for the rule classifier")
         .classify(
             &incoming,
             std::slice::from_ref(&stored),
@@ -387,7 +388,10 @@ async fn consolidate_adds_conflicting_and_unrelated_memories() {
         .expect("seed add")
         .added
         .remove(0);
-    let classifier = ltm.analyzer().classifier(None);
+    let classifier = ltm
+        .analyzer()
+        .classifier(None)
+        .expect("the default config asks for the rule classifier");
 
     // Same subject, different value: a conflict, never a silent delete or merge.
     let conflicting = NewMemory::semantic("Alice is a manager");
@@ -528,4 +532,61 @@ async fn rejected_inputs_are_validation_errors_and_store_nothing() {
     assert!(matches!(error, Error::Validation(_)), "{error:?}");
 
     assert_eq!(ltm.list(&scope, &[]).await.expect("list").len(), 0);
+}
+
+#[tokio::test]
+async fn a_scope_override_asking_for_the_llm_extractor_without_a_model_is_unsupported() {
+    // The facade holds no model, so the scope's `ExtractorKind::Llm` request cannot be
+    // honoured: it is a typed error naming the field, not a silent run of the rules.
+    let ltm = facade(MemoryEngineConfig::default()).await;
+    ltm.set_scope_overrides(
+        "ws",
+        &ScopeAnalyzerOverrideSpec::new().with_extractor(ExtractorKind::Llm),
+    )
+    .await
+    .expect("override");
+    let error = ltm
+        .remember(
+            &scope(),
+            &ExtractionInput::from_text("my name is Alice."),
+            &AddOptions::default(),
+        )
+        .await
+        .expect_err("a model-backed extractor needs a model");
+    let Error::Unsupported(message) = error else {
+        panic!("expected Unsupported, got {error:?}");
+    };
+    assert!(message.contains("extractor"), "{message}");
+    assert!(message.contains("no model was supplied"), "{message}");
+    assert!(
+        message.contains("ExtractorKind::Rule"),
+        "the fix is named: {message}"
+    );
+    assert_eq!(ltm.list(&scope(), &[]).await.expect("list").len(), 0);
+}
+
+#[tokio::test]
+async fn a_scope_override_asking_for_the_llm_classifier_without_a_model_is_unsupported() {
+    let ltm = facade(MemoryEngineConfig::default()).await;
+    ltm.set_scope_overrides(
+        "ws",
+        &ScopeAnalyzerOverrideSpec::new().with_classifier(ClassifierKind::Llm),
+    )
+    .await
+    .expect("override");
+    let error = ltm
+        .remember(
+            &scope(),
+            &ExtractionInput::from_text("my name is Alice."),
+            &AddOptions::default(),
+        )
+        .await
+        .expect_err("a model-backed classifier needs a model");
+    let Error::Unsupported(message) = error else {
+        panic!("expected Unsupported, got {error:?}");
+    };
+    assert!(message.contains("classifier"), "{message}");
+    assert!(message.contains("no model was supplied"), "{message}");
+    assert!(message.contains("ClassifierKind::Rule"), "{message}");
+    assert_eq!(ltm.list(&scope(), &[]).await.expect("list").len(), 0);
 }

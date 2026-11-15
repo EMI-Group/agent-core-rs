@@ -226,6 +226,80 @@ async fn list_pages_with_the_configured_offset_and_limit_and_honours_base_id() {
 }
 
 #[tokio::test]
+async fn add_without_a_memory_id_is_still_reported_added() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/memory/bases/mem_default/ingest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "memory_type": "fact",
+            "accepted": true,
+        })))
+        .mount(&server)
+        .await;
+
+    let outcome = handle(&server.uri())
+        .add(
+            &scope(),
+            vec![NewMemory::semantic("alice prefers dark mode")],
+            &AddOptions::default(),
+        )
+        .await
+        .expect("add");
+
+    assert_eq!(outcome.added.len(), 1, "the accepted ingest is a write");
+    assert!(outcome.skipped.is_empty(), "{outcome:?}");
+    let record = &outcome.added[0];
+    assert_eq!(
+        record.id.len(),
+        24,
+        "an answer with no `memory_id` keeps the client-generated id"
+    );
+    assert!(
+        record.id.chars().all(|c| c.is_ascii_hexdigit()),
+        "{record:?}"
+    );
+    assert_eq!(record.content, "alice prefers dark mode");
+    assert_eq!(record.metadata_str("memory_type"), Some("fact"));
+}
+
+#[tokio::test]
+async fn a_listing_body_without_a_row_array_is_a_typed_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/memory/bases/mem_default/memories"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "payload": [{ "memory_id": 1, "content": "one" }],
+            "total": 1,
+        })))
+        .mount(&server)
+        .await;
+
+    let handle = handle(&server.uri());
+    let filter = MemoryFilter::for_scope(&scope());
+
+    let error = handle.list(&filter).await.expect_err("shape drift");
+    assert!(matches!(error, Error::Validation(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("no recognised row array"), "{message}");
+    assert!(message.contains("payload"), "{message}");
+
+    let error = handle.clear(&filter).await.expect_err("shape drift");
+    assert!(
+        matches!(error, Error::Validation(_)),
+        "clear lists first and must not report an empty collection: {error:?}"
+    );
+
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 2, "one listing probe per call");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method == wiremock::http::Method::GET),
+        "nothing is deleted from a body that could not be read"
+    );
+}
+
+#[tokio::test]
 async fn get_and_delete_map_ids_and_update_is_not_part_of_the_api() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

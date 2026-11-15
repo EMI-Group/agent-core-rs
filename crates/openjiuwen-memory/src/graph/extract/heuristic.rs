@@ -61,6 +61,7 @@ impl EntityExtractor for HeuristicExtractor {
         Ok(Extraction {
             entities,
             relations,
+            degraded: None,
         })
     }
 }

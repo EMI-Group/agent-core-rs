@@ -102,13 +102,22 @@ pub struct ControllerConfig {
     /// Maximum number of tasks scheduled from one input (Rust routing).
     #[serde(default = "default_max_tasks")]
     pub max_tasks: usize,
-    /// Number of conversation entries kept for context (Rust routing).
+    /// Number of conversation **messages** kept per session (default `50`).
+    ///
+    /// Python bounds its chat history by a message-indexed slice
+    /// (`chat_history[-2 * max_turns:]`), so this counts messages, not turns
+    /// (a user prompt plus two executor answers is three units). `0` retains
+    /// nothing. See [`crate::controller::history`] for the trims that apply it.
     #[serde(default = "default_history_limit")]
     pub history_limit: usize,
     /// Answer used when nothing ran.
     #[serde(default)]
     pub default_response: DefaultResponse,
-    /// Whether reasoning frames are exposed to the caller.
+    /// Whether reasoning reported by a task executor is surfaced in frames and
+    /// `data.tasks[]`.
+    ///
+    /// A Rust extension with no Python counterpart: Python's controller has no
+    /// reasoning-exposure switch.
     #[serde(default)]
     pub expose_reasoning: bool,
     /// Task type used when an intent names none.
@@ -132,7 +141,11 @@ pub struct ControllerConfig {
     /// Whether task states are persisted for recovery.
     #[serde(default = "default_enable_task_persistence")]
     pub enable_task_persistence: bool,
-    /// Event processing timeout in milliseconds (Python `300` seconds).
+    /// Deadline in **milliseconds** for handling one drained event
+    /// (default `300_000`).
+    ///
+    /// Python's `event_timeout` is in seconds and defaults to `300`, which is
+    /// the same deadline expressed in milliseconds here. `0` means no deadline.
     #[serde(default = "default_event_timeout_ms")]
     pub event_timeout_ms: u64,
     /// Whether user intent is recognized at all.
@@ -147,7 +160,8 @@ pub struct ControllerConfig {
     /// Whether the `all_tasks_processed` signal is suppressed.
     #[serde(default)]
     pub suppress_completion_signal: bool,
-    /// Maximum wait for the first stream frame in milliseconds.
+    /// Deadline in **milliseconds** for a stream's first output frame after the
+    /// `processing` acknowledgment (default `30_000`). `0` means no deadline.
     #[serde(default = "default_stream_first_frame_timeout_ms")]
     pub stream_first_frame_timeout_ms: u64,
 }
@@ -207,6 +221,13 @@ impl ControllerConfig {
         self.max_tasks = max_tasks;
         self
     }
+    /// Sets the number of conversation **messages** kept per session (`0`
+    /// retains nothing).
+    #[must_use]
+    pub fn with_history_limit(mut self, history_limit: usize) -> Self {
+        self.history_limit = history_limit;
+        self
+    }
     /// Sets the task type used when an intent names none.
     #[must_use]
     pub fn with_default_task_type(mut self, task_type: impl Into<String>) -> Self {
@@ -263,6 +284,20 @@ impl ControllerConfig {
     #[must_use]
     pub fn with_task_timeout(mut self, task_timeout_ms: Option<u64>) -> Self {
         self.task_timeout_ms = task_timeout_ms;
+        self
+    }
+    /// Sets the deadline in **milliseconds** for handling one drained event;
+    /// `0` disables the deadline.
+    #[must_use]
+    pub fn with_event_timeout(mut self, event_timeout_ms: u64) -> Self {
+        self.event_timeout_ms = event_timeout_ms;
+        self
+    }
+    /// Sets the deadline in **milliseconds** for a stream's first output frame
+    /// after the `processing` acknowledgment; `0` disables the deadline.
+    #[must_use]
+    pub fn with_stream_first_frame_timeout(mut self, stream_first_frame_timeout_ms: u64) -> Self {
+        self.stream_first_frame_timeout_ms = stream_first_frame_timeout_ms;
         self
     }
     /// Whether `intent_type` is in [`intent_type_list`](Self::intent_type_list).
@@ -344,5 +379,47 @@ mod tests {
         );
         let config = ControllerConfig::new().with_default_response(set.clone());
         assert_eq!(config.default_response, set);
+    }
+
+    #[test]
+    fn history_and_timeout_builders_set_their_fields() {
+        let config = ControllerConfig::new()
+            .with_history_limit(8)
+            .with_event_timeout(1_500)
+            .with_stream_first_frame_timeout(250);
+        assert_eq!(config.history_limit, 8);
+        assert_eq!(config.event_timeout_ms, 1_500);
+        assert_eq!(config.stream_first_frame_timeout_ms, 250);
+        let disabled = config
+            .clone()
+            .with_history_limit(0)
+            .with_event_timeout(0)
+            .with_stream_first_frame_timeout(0);
+        assert_eq!(disabled.history_limit, 0);
+        assert_eq!(disabled.event_timeout_ms, 0);
+        assert_eq!(disabled.stream_first_frame_timeout_ms, 0);
+    }
+
+    #[test]
+    fn enforcement_defaults_match_python() {
+        let config = ControllerConfig::default();
+        assert_eq!(config.history_limit, 50);
+        assert_eq!(config.event_timeout_ms, 300_000);
+        assert_eq!(config.stream_first_frame_timeout_ms, 30_000);
+        assert!(!config.expose_reasoning);
+    }
+
+    #[test]
+    fn enforcement_wire_names_are_unchanged() {
+        let wire = serde_json::to_value(ControllerConfig::default()).unwrap();
+        assert_eq!(wire["history_limit"], json!(50));
+        assert_eq!(wire["event_timeout_ms"], json!(300_000));
+        assert_eq!(wire["stream_first_frame_timeout_ms"], json!(30_000));
+        assert_eq!(wire["expose_reasoning"], json!(false));
+        let parsed: ControllerConfig =
+            serde_json::from_value(json!({"history_limit": 5, "expose_reasoning": true})).unwrap();
+        assert_eq!(parsed.history_limit, 5);
+        assert!(parsed.expose_reasoning);
+        assert_eq!(parsed.event_timeout_ms, 300_000);
     }
 }

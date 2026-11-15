@@ -14,6 +14,12 @@
 //! exposed; the judge itself is injected, never built here, so this module owns
 //! no transport. Scanned text reaches only the judge call: it is never logged,
 //! never echoed into an error, and never stored in the assessment's `details`.
+//!
+//! Failure stays visible: the payload is projected with the checked
+//! [`GuardrailContext::text_view_checked`](crate::GuardrailContext::text_view_checked),
+//! an unscannable payload is a typed error, and a judge reply that is not a
+//! valid verdict (including `{}`) is an `Error::Llm` rather than a defaulted
+//! "no risk". Under the default fail-closed policy those errors block the call.
 #![allow(clippy::module_name_repetitions)]
 
 use std::fmt;
@@ -87,8 +93,10 @@ impl Default for LlmPromptInjectionBackendConfig {
 
 /// The JSON verdict the judge prompt asks for.
 ///
-/// Unknown extra fields are ignored so a chattier model still yields a verdict;
-/// only `has_risk` is required.
+/// Unknown extra fields are ignored so a chattier model still yields a verdict,
+/// but `has_risk` is *required*: there is no `#[serde(default)]` on it, so a
+/// verdict that omits it (including `{}`) fails to deserialize and becomes an
+/// `Error::Llm` rather than a defaulted "no risk".
 #[derive(Debug, Clone, Deserialize)]
 struct JudgeVerdict {
     /// Whether the judge considers the scanned content a prompt injection.
@@ -232,15 +240,18 @@ impl LlmPromptInjectionBackend {
     /// is stored verbatim except the judge's own risk level, which lands in
     /// `details.judge_risk_level`.
     ///
-    /// A verdict without `has_risk` is safe; an unknown or missing `risk_level`
-    /// for a risky verdict degrades to [`RiskLevel::High`]; a missing
+    /// A verdict without a boolean `has_risk` is an error, never a defaulted
+    /// "no risk"; an unknown or missing `risk_level` for a risky verdict
+    /// degrades to [`RiskLevel::High`] (the fail-safe end); a missing
     /// `risk_type` degrades to `"prompt_injection"`; `confidence` is clamped to
     /// `0.0..=1.0` and defaults to `1.0`.
     ///
     /// # Errors
     ///
     /// [`Error::Llm`] when the reply contains no JSON object or the object is
-    /// not a valid verdict (for example a missing `has_risk` field).
+    /// not a valid verdict (for example a `{}` verdict, a missing `has_risk`
+    /// field, or a non-boolean `has_risk`); the message names the invalid
+    /// verdict but never repeats the reply or the scanned text.
     pub fn parse_verdict(&self, output: &str) -> Result<RiskAssessment> {
         let candidate =
             verdict_json(output).ok_or_else(|| Error::llm("llm judge returned no JSON verdict"))?;
@@ -345,7 +356,9 @@ impl GuardrailBackend for LlmPromptInjectionBackend {
     }
 
     async fn analyze(&self, ctx: &GuardrailContext) -> Result<RiskAssessment> {
-        let text = ctx.text_view();
+        // The checked projection: an unscannable payload is a typed error, never
+        // a pass (and never a judge call with a lossy rendering of it).
+        let text = ctx.text_view_checked()?;
         if text.trim().is_empty() {
             return Ok(safe_assessment());
         }
@@ -395,6 +408,11 @@ mod tests {
 
     fn ctx(text: &str) -> GuardrailContext {
         GuardrailContext::text(text, ScanStage::UserInput)
+    }
+
+    /// A context whose content cannot be projected to text (`null` raw content).
+    fn unscannable_ctx() -> GuardrailContext {
+        GuardrailContext::raw("custom_event", Value::Null)
     }
 
     /// A scripted assistant reply in the `OpenAI` wire shape.
@@ -635,13 +653,7 @@ mod tests {
     fn parse_verdict_rejects_missing_or_malformed_json() {
         let backend = LlmPromptInjectionBackend::new(config());
 
-        for output in [
-            "",
-            "   ",
-            "no verdict here",
-            "```json\nno braces\n```",
-            "{}",
-        ] {
+        for output in ["", "   ", "no verdict here", "```json\nno braces\n```"] {
             let error = backend
                 .parse_verdict(output)
                 .expect_err(&format!("{output:?} is not a verdict"));
@@ -654,6 +666,56 @@ mod tests {
             "unexpected message: {error}"
         );
         assert!(!error.to_string().contains("not json"), "{error}");
+    }
+
+    #[test]
+    fn parse_verdict_rejects_a_verdict_without_has_risk() {
+        let backend = LlmPromptInjectionBackend::new(config());
+
+        // `{}` and every object without a boolean `has_risk` is an unusable
+        // verdict, never a defaulted "no risk".
+        for output in [
+            "{}",
+            r#"{ "risk_type": "jailbreak", "risk_level": "CRITICAL" }"#,
+            "```json\n{}\n```",
+        ] {
+            let error = backend
+                .parse_verdict(output)
+                .expect_err(&format!("{output:?} is not a verdict"));
+            assert_eq!(error.kind(), ErrorKind::Llm, "{output:?}: {error}");
+            let message = error.to_string();
+            assert!(message.contains("invalid verdict"), "{output:?}: {message}");
+            assert!(message.contains("has_risk"), "{output:?}: {message}");
+        }
+
+        // A non-boolean `has_risk` is invalid too.
+        let error = backend
+            .parse_verdict(r#"{"has_risk": "false"}"#)
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Llm);
+        assert!(error.to_string().contains("invalid verdict"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_judge_verdict_is_an_error_not_a_safe_grade() {
+        let server = MockServer::start().await;
+        mount_reply(&server, "{}").await;
+        let backend = judge_backend(&server, config());
+
+        let error = backend.analyze(&ctx("some text")).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Llm);
+        assert!(error.to_string().contains("invalid verdict"), "{error}");
+        assert!(!error.to_string().contains("some text"), "{error}");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn unscannable_payloads_are_validation_errors() {
+        let backend = LlmPromptInjectionBackend::new(config());
+
+        let error = backend.analyze(&unscannable_ctx()).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.to_string().contains("unscannable content"), "{error}");
     }
 
     #[tokio::test]

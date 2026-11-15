@@ -8,8 +8,8 @@ use super::empty_object;
 use super::kind::{TeamMemoryKind, TeamVisibility};
 use super::scope::TeamMemoryScope;
 use super::validate::{
-    normalize_tags, validate_component, validate_content, validate_importance, validate_tags,
-    validate_title,
+    normalize_tags, validate_component, validate_content, validate_embedding, validate_importance,
+    validate_tags, validate_title,
 };
 use super::{DEFAULT_IMPORTANCE, MAX_RECORD_ID_CHARS, MAX_SCOPE_ID_CHARS};
 use chrono::{DateTime, Utc};
@@ -51,6 +51,14 @@ pub struct TeamMemoryRecord {
     pub importance: f32,
     /// Normalized, unique, lowercase tags.
     pub tags: Vec<String>,
+    /// Optional embedding of the searchable text (`title`, `content`, `tags`).
+    ///
+    /// `None` (the default) means the record carries no vector, so the semantic group of
+    /// the search ranking contributes nothing for it. A record written by a facade with
+    /// an embedder attached carries one; the components must be finite and the vector
+    /// must not be empty (see [`TeamMemoryRecord::validate`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
     /// Free-form structured fields; always a JSON object, always serialized.
     #[serde(default = "empty_object")]
     pub metadata: Value,
@@ -82,6 +90,7 @@ impl Default for TeamMemoryRecord {
             title: None,
             importance: DEFAULT_IMPORTANCE,
             tags: Vec::new(),
+            embedding: None,
             metadata: empty_object(),
             created_at: now,
             updated_at: now,
@@ -108,6 +117,7 @@ impl TeamMemoryRecord {
             title: None,
             importance: DEFAULT_IMPORTANCE,
             tags: Vec::new(),
+            embedding: None,
             metadata: empty_object(),
             created_at: now,
             updated_at: now,
@@ -142,6 +152,12 @@ impl TeamMemoryRecord {
         S: Into<String>,
     {
         self.tags = normalize_tags(tags.into_iter().map(Into::into).collect());
+        self
+    }
+    /// Sets the record embedding (validated on [`TeamMemoryRecord::validate`]).
+    #[must_use]
+    pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
+        self.embedding = Some(embedding);
         self
     }
     /// Inserts one metadata key, recreating the object if it was not one.
@@ -193,8 +209,8 @@ impl TeamMemoryRecord {
     ///
     /// Ids go through the shared component rules, content/title must be non-blank and
     /// within their limits, importance must be finite and in `0.0..=1.0`, tags must be
-    /// normalized and unique, metadata must be an object, and visibility must be
-    /// valid.
+    /// normalized and unique, metadata must be an object, visibility must be valid, and
+    /// an embedding must be a non-empty vector of finite components.
     pub fn validate(&self) -> Result<()> {
         validate_component("id", &self.id, MAX_RECORD_ID_CHARS)?;
         validate_component("team_id", &self.team_id, MAX_SCOPE_ID_CHARS)?;
@@ -210,6 +226,9 @@ impl TeamMemoryRecord {
         }
         validate_importance(self.importance)?;
         validate_tags(&self.tags)?;
+        if let Some(embedding) = &self.embedding {
+            validate_embedding(embedding)?;
+        }
         if !self.metadata.is_object() {
             return Err(Error::validation(
                 "team memory `metadata` must be a JSON object",
@@ -400,6 +419,43 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("at least one member"));
+    }
+    #[test]
+    fn embedding_is_optional_validated_and_omitted_when_absent() {
+        let record = sample_record();
+        assert_eq!(record.embedding, None);
+        let json = serde_json::to_value(&record).unwrap();
+        assert!(
+            json.get("embedding").is_none(),
+            "an absent vector is not serialized"
+        );
+        let embedded = record.clone().with_embedding(vec![0.5, -1.0]);
+        embedded.validate().unwrap();
+        let json = serde_json::to_value(&embedded).unwrap();
+        assert_eq!(json["embedding"], serde_json::json!([0.5, -1.0]));
+        let restored: TeamMemoryRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, embedded);
+        // Tolerant of a payload that predates the field.
+        let mut json = serde_json::to_value(&embedded).unwrap();
+        json.as_object_mut().unwrap().remove("embedding");
+        assert_eq!(
+            serde_json::from_value::<TeamMemoryRecord>(json)
+                .unwrap()
+                .embedding,
+            None
+        );
+        let empty = record.clone().with_embedding(Vec::new());
+        assert!(empty
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("`embedding` must not be empty"));
+        let non_finite = record.with_embedding(vec![1.0, f32::INFINITY]);
+        let err = non_finite.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("`embedding` component 1 must be finite"),
+            "{err}"
+        );
     }
     #[test]
     fn is_expired_uses_an_inclusive_boundary() {

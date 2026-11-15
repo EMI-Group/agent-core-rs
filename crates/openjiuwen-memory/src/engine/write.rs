@@ -8,8 +8,11 @@
 //! assembles candidates, applies the configured policy, and keeps persistence
 //! consistent (a record is never left half-indexed).
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use openjiuwen_common::error::{Error, Result};
+use openjiuwen_retrieval::embedding::Embedding;
 
 use crate::recall::{find_duplicate, merge_records, Candidate};
 use crate::record::{
@@ -20,8 +23,25 @@ use crate::record::{
 /// The tracing target of engine diagnostics.
 const TARGET: &str = "openjiuwen_memory::engine";
 
+/// The result of a duplicate candidate scan.
+///
+/// [`degraded`](DedupeScan::degraded) carries the reason the scan could not run, so the
+/// caller can report "wrote without checking for duplicates" instead of silently treating
+/// a failed scan as "no duplicates".
+struct DedupeScan {
+    /// The records a duplicate check compares against.
+    candidates: Vec<Candidate>,
+    /// The reason the scan failed and degraded to "no candidates", when it did.
+    degraded: Option<String>,
+}
+
 impl super::MemoryEngine {
     /// Stores one memory, running duplicate detection according to `options`.
+    ///
+    /// Duplicate detection is best-effort: when the candidate scan fails for any reason
+    /// other than cancellation/timeout, the memory is still stored and
+    /// [`AddOutcome::degraded`] carries the reason, so the caller can tell a scope without
+    /// duplicates apart from one that could not be scanned.
     ///
     /// # Errors
     ///
@@ -34,7 +54,28 @@ impl super::MemoryEngine {
         memory: NewMemory,
         options: &AddOptions,
     ) -> Result<AddOutcome> {
-        self.add_many(scope, vec![memory], options).await
+        self.add_with_embedding(scope, memory, options, None).await
+    }
+
+    /// Stores one memory with `embedding` as the embedder of this call.
+    ///
+    /// `embedding` is the handle a per-scope override resolved to; `None` means "use the
+    /// engine's own model". A supplied handle is never replaced by the engine's, and an
+    /// absent engine handle with no supplied handle stores the record without a vector
+    /// (keyword-only recall), exactly like [`MemoryEngine::add`](super::MemoryEngine::add).
+    ///
+    /// # Errors
+    ///
+    /// See [`MemoryEngine::add`](super::MemoryEngine::add).
+    pub async fn add_with_embedding(
+        &self,
+        scope: &MemoryScope,
+        memory: NewMemory,
+        options: &AddOptions,
+        embedding: Option<&Arc<dyn Embedding>>,
+    ) -> Result<AddOutcome> {
+        self.add_many_with_embedding(scope, vec![memory], options, embedding)
+            .await
     }
 
     /// Stores a batch sequentially under one scope lock, deduping against stored and
@@ -53,6 +94,22 @@ impl super::MemoryEngine {
         memories: Vec<NewMemory>,
         options: &AddOptions,
     ) -> Result<AddOutcome> {
+        self.add_many_with_embedding(scope, memories, options, None)
+            .await
+    }
+
+    /// Stores a batch under one scope lock with `embedding` as the embedder of this call.
+    ///
+    /// # Errors
+    ///
+    /// See [`MemoryEngine::add_many`](super::MemoryEngine::add_many).
+    pub async fn add_many_with_embedding(
+        &self,
+        scope: &MemoryScope,
+        memories: Vec<NewMemory>,
+        options: &AddOptions,
+        embedding: Option<&Arc<dyn Embedding>>,
+    ) -> Result<AddOutcome> {
         scope.validate()?;
         let mut outcome = AddOutcome::default();
         if memories.is_empty() {
@@ -66,7 +123,7 @@ impl super::MemoryEngine {
             memory.validate()?;
             let record = self.build_record(scope, &memory, now);
             record.validate()?;
-            self.write_record(record, options, now, &mut outcome)
+            self.write_record(record, options, now, &mut outcome, embedding)
                 .await?;
         }
         Ok(outcome)
@@ -87,7 +144,10 @@ impl super::MemoryEngine {
     ///
     /// Content changes are re-embedded before anything is written, so a failed
     /// embedding leaves the stored record unchanged. A kind change moves the record's
-    /// vector to the new kind collection.
+    /// vector to the new kind collection; when indexing that vector fails, the previous
+    /// record and its vector are restored, so the record is never left persisted but
+    /// unsearchable (see
+    /// [`MemoryEngine::update_with_embedding`](super::MemoryEngine::update_with_embedding)).
     ///
     /// # Errors
     ///
@@ -99,6 +159,29 @@ impl super::MemoryEngine {
         id: &str,
         patch: MemoryUpdate,
         options: &CallOptions,
+    ) -> Result<MemoryRecord> {
+        self.update_with_embedding(scope, id, patch, options, None)
+            .await
+    }
+
+    /// Applies `patch` with `embedding` as the embedder of this call.
+    ///
+    /// A kind change deletes the previous kind's vector before the new one is indexed. When
+    /// that indexing fails, the previous record row is restored and its vector is
+    /// regenerated from its content (one extra embedding call), and the error names that
+    /// restore. If the restore itself fails, the row is still put back first and the error
+    /// names the leftover state: the record is keyword-searchable only.
+    ///
+    /// # Errors
+    ///
+    /// See [`MemoryEngine::update`](super::MemoryEngine::update).
+    pub async fn update_with_embedding(
+        &self,
+        scope: &MemoryScope,
+        id: &str,
+        patch: MemoryUpdate,
+        options: &CallOptions,
+        embedding: Option<&Arc<dyn Embedding>>,
     ) -> Result<MemoryRecord> {
         scope.validate()?;
         patch.validate()?;
@@ -134,8 +217,11 @@ impl super::MemoryEngine {
         record.validate()?;
 
         let kind_changed = record.kind != previous.kind;
-        let embedding = if (content_changed || kind_changed) && self.has_embedding() {
-            Some(self.embed_text(&record.content, options).await?)
+        let vector = if (content_changed || kind_changed) && self.has_embedding_with(embedding) {
+            Some(
+                self.embed_text_with(embedding, &record.content, options)
+                    .await?,
+            )
         } else {
             None
         };
@@ -145,7 +231,7 @@ impl super::MemoryEngine {
             self.storage().delete_embedding(&previous).await?;
         }
         self.storage().put_record(&record).await?;
-        if let Some(vector) = embedding.as_deref() {
+        if let Some(vector) = vector.as_deref() {
             if let Err(error) = self.storage().index_embedding(&record, vector).await {
                 if !kind_changed {
                     // The old vector was replaced lazily (same collection), so restoring
@@ -154,11 +240,58 @@ impl super::MemoryEngine {
                         tracing::warn!(target: TARGET, %restore, id = %record.id,
                             "failed to restore a memory record after an embedding index failure");
                     }
+                    return Err(error);
                 }
-                return Err(error);
+                // A kind change deleted the previous kind's vector before the new one was
+                // indexed, so restoring the JSON row alone would leave the record without
+                // a vector. Put the previous record back and re-index it, so a failed kind
+                // change is undone instead of leaving the new content persisted but
+                // unsearchable.
+                let context = match self.restore_indexed(&previous, embedding, options).await {
+                    Ok(()) => format!(
+                        "re-indexing memory record `{}` as `{}` failed after changing its \
+                             kind from `{}`; the previous record and its vector were restored",
+                        record.id, record.kind, previous.kind
+                    ),
+                    Err(restore) => {
+                        tracing::warn!(target: TARGET, %restore, id = %record.id,
+                                "failed to restore a memory record after a kind-changing re-index failure");
+                        format!(
+                            "re-indexing memory record `{}` as `{}` failed after changing its \
+                                 kind from `{}`, and restoring the previous record failed too \
+                                 ({restore}); the stored record has no vector and is only \
+                                 keyword-searchable",
+                            record.id, record.kind, previous.kind
+                        )
+                    }
+                };
+                return Err(error.with_context(context));
             }
         }
         Ok(record)
+    }
+
+    /// Restores `previous` after a failed re-index: its record row and its vector.
+    ///
+    /// The stored record snapshot never carries an embedding (the vector collection is the
+    /// authoritative copy), so the vector is regenerated by embedding
+    /// `previous.content` again before it is indexed. The row is written first, so a
+    /// failing re-embedding still leaves the previous JSON in place; the first error is
+    /// returned for the caller to report.
+    async fn restore_indexed(
+        &self,
+        previous: &MemoryRecord,
+        embedder: Option<&Arc<dyn Embedding>>,
+        options: &CallOptions,
+    ) -> Result<()> {
+        self.storage().put_record(previous).await?;
+        if !self.has_embedding_with(embedder) {
+            return Ok(());
+        }
+        let vector = self
+            .embed_text_with(embedder, &previous.content, options)
+            .await?;
+        self.storage().index_embedding(previous, &vector).await
     }
 
     /// Deletes one record and its embedding, returning whether it existed.
@@ -261,10 +394,14 @@ impl super::MemoryEngine {
         options: &AddOptions,
         now: DateTime<Utc>,
         outcome: &mut AddOutcome,
+        embedder: Option<&Arc<dyn Embedding>>,
     ) -> Result<()> {
-        let embeds = self.has_embedding() && !options.skip_embedding;
+        let embeds = self.has_embedding_with(embedder) && !options.skip_embedding;
         let embedding = if embeds {
-            Some(self.embed_text(&record.content, &options.call).await?)
+            Some(
+                self.embed_text_with(embedder, &record.content, &options.call)
+                    .await?,
+            )
         } else {
             None
         };
@@ -273,8 +410,17 @@ impl super::MemoryEngine {
         let policy = options.dedupe.unwrap_or(self.config.dedupe.policy);
         let dedupe = self.config.dedupe.enabled && options.dedupe != Some(DedupePolicy::Add);
         let candidates = if dedupe {
-            self.dedupe_candidates(&record, embedding.as_deref(), options)
-                .await?
+            let scan = self
+                .dedupe_candidates(&record, embedding.as_deref(), options, embedder)
+                .await?;
+            if let Some(reason) = scan.degraded {
+                // The first failure of a batch is the one worth reporting: it names both
+                // the record that went unchecked and the reason every later item shares.
+                if outcome.degraded.is_none() {
+                    outcome.degraded = Some(reason);
+                }
+            }
+            scan.candidates
         } else {
             Vec::new()
         };
@@ -293,7 +439,10 @@ impl super::MemoryEngine {
             DedupePolicy::Merge => {
                 let merged = merge_records(&existing, &record, now);
                 let merged_embedding = if embeds {
-                    Some(self.embed_text(&merged.content, &options.call).await?)
+                    Some(
+                        self.embed_text_with(embedder, &merged.content, &options.call)
+                            .await?,
+                    )
                 } else {
                     None
                 };
@@ -305,9 +454,14 @@ impl super::MemoryEngine {
             }
             DedupePolicy::Replace => {
                 self.storage().delete_record(&existing).await?;
+                // The superseded row is a real removal, so it is reported as one even
+                // though the replacement reuses its id: `deleted` names the row that was
+                // removed and `merged` carries the record that now holds that id.
+                let replaced_id = existing.id.clone();
                 record.id = existing.id;
                 record.embedding = None;
                 self.persist(&record, embedding.as_deref()).await?;
+                outcome.deleted.push(replaced_id);
                 outcome.merged.push(record);
             }
         }
@@ -318,14 +472,17 @@ impl super::MemoryEngine {
     ///
     /// A semantic scan is used when the incoming content was embedded; otherwise the
     /// scope is scanned and candidates are keyword-only. A failing scan degrades to "no
-    /// candidates" with a warning (dedupe is best-effort, Python parity), except for
-    /// cancellation/timeout which must abort the write.
+    /// candidates" with a warning (dedupe is best-effort, Python parity) and reports the
+    /// reason in [`DedupeScan::degraded`], so the caller can surface it in
+    /// [`AddOutcome::degraded`] instead of writing an unchecked duplicate as if the scope
+    /// had no duplicates. Cancellation/timeout never degrade: they abort the write.
     async fn dedupe_candidates(
         &self,
         incoming: &MemoryRecord,
         vector: Option<&[f32]>,
         options: &AddOptions,
-    ) -> Result<Vec<Candidate>> {
+        embedder: Option<&Arc<dyn Embedding>>,
+    ) -> Result<DedupeScan> {
         let search = SearchOptions {
             top_k: self.config.dedupe.candidate_top_k,
             threshold: 0.0,
@@ -339,21 +496,38 @@ impl super::MemoryEngine {
             call: options.call.clone(),
         };
         match self
-            .recall(&incoming.scope, &incoming.content, vector, &search, false)
+            .recall(
+                &incoming.scope,
+                &incoming.content,
+                vector,
+                &search,
+                false,
+                embedder,
+            )
             .await
         {
-            Ok(hits) => Ok(hits
-                .into_iter()
-                .map(|hit| Candidate::new(hit.record, Some(hit.similarity)))
-                .collect()),
+            Ok(hits) => Ok(DedupeScan {
+                candidates: hits
+                    .into_iter()
+                    .map(|hit| Candidate::new(hit.record, Some(hit.similarity)))
+                    .collect(),
+                degraded: None,
+            }),
             Err(error @ (Error::Cancelled | Error::Timeout(_))) => Err(error),
             Err(error) => {
                 tracing::warn!(
                     target: TARGET,
                     %error,
-                    "duplicate candidate scan failed; treating the write as non-duplicate"
+                    id = %incoming.id,
+                    "duplicate candidate scan failed; writing without duplicate detection"
                 );
-                Ok(Vec::new())
+                Ok(DedupeScan {
+                    candidates: Vec::new(),
+                    degraded: Some(format!(
+                        "duplicate candidate scan failed, so memory record `{}` was written without a duplicate check: {error}",
+                        incoming.id
+                    )),
+                })
             }
         }
     }
@@ -607,6 +781,12 @@ mod tests {
         assert_eq!(outcome.merged.len(), 1);
         assert_eq!(outcome.merged[0].id, existing_id);
         assert_eq!(outcome.merged[0].content, "Alice prefers dark mode!");
+        // The superseded row is a real deletion, so the outcome reports it even though
+        // the replacement reuses the id; nothing else was merged, skipped, or added.
+        assert_eq!(outcome.deleted, vec![existing_id.clone()]);
+        assert_eq!(outcome.added.len(), 0);
+        assert_eq!(outcome.skipped.len(), 0);
+        assert_eq!(outcome.degraded, None);
         let stored = engine
             .list(&MemoryFilter::for_scope(&scope))
             .await

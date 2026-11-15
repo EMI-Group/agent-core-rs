@@ -57,6 +57,19 @@
 //! for a provider with no endpoint at all). A spec without a health call is probed with
 //! its own `list` on the sentinel scope `("__health__", "__health__")`.
 //!
+//! [`initialize`](super::provider::MemoryProvider::initialize) runs the same probe but
+//! honours its verdict: a rejected credential (`401`/`403`) or any other non-`2xx` answer
+//! is a typed error and the handle stays uninitialized, so "wrong `api_key`" can never be
+//! mistaken for a healthy handle.
+//!
+//! # Pagination
+//!
+//! [`list`](super::provider::MemoryProvider::list) follows a vendor's own paging when the
+//! spec implements `next_list_call`: it collects every page (bounded by
+//! `MAX_LIST_PAGES`) before decoding, so `list` and the list-then-delete fallback of
+//! [`clear`](super::provider::MemoryProvider::clear) see the whole collection instead of
+//! only its first page. A spec that pages in one request leaves the hook unimplemented.
+//!
 //! # Unconfigured handles
 //!
 //! [`RestProvider::from_config`] never fails: a handle without an `endpoint` is a valid,
@@ -101,7 +114,8 @@ use super::registry::ProviderConfig;
 
 pub use super::rest_json::{
     body_value, error_detail, field_f32, field_f64, field_i64, field_str, field_value,
-    parse_timestamp, results_array, scope_id, truncate_detail, user_id, vendor_hit, vendor_record,
+    listing_record, parse_timestamp, rank_hits, results_array, results_array_checked, scope_id,
+    truncate_detail, user_id, vendor_hit, vendor_record,
 };
 
 /// `tracing` target of every event the transport emits.
@@ -114,6 +128,9 @@ const DEFAULT_MAX_RETRIES: u32 = 2;
 const DEFAULT_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 /// Upper bound on the exponential retry backoff.
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+/// Upper bound on the pages one `list` follows, so a vendor that never stops paging
+/// cannot loop forever; reaching it is a typed error, never a silent partial listing.
+const MAX_LIST_PAGES: usize = 200;
 /// Number of response-body characters quoted in an error message.
 const BODY_SNIPPET_CHARS: usize = 512;
 /// `User-Agent` sent with every request.
@@ -316,6 +333,29 @@ impl RestProvider {
                 &detail,
             )),
         }
+    }
+
+    /// Maps a failed health probe onto a typed error.
+    ///
+    /// Unlike [`RestProvider::status_error`], this always names the *initialization* probe
+    /// as the failure, because that is what the caller asked for: `401`/`403` become a
+    /// [`Error::Security`] stating the credentials were rejected, and every other status a
+    /// [`Error::Transport`] carrying the vendor's own message when it sent one.
+    fn probe_error(&self, response: &HttpResponse) -> Error {
+        let vendor = self.spec.display();
+        let message = format!(
+            "the {vendor} memory provider failed its initialization probe (HTTP {} for {})",
+            response.status, response.url
+        );
+        if matches!(response.status, 401 | 403) {
+            return Error::security(detailed(
+                message,
+                "the credentials were rejected; check `api_key` and the auth scheme",
+            ));
+        }
+        let detail = error_detail(&response.text())
+            .unwrap_or_else(|| truncate_detail(&response.text(), BODY_SNIPPET_CHARS));
+        Error::transport(detailed(message, &detail))
     }
 
     /// Builds the wire request for one call against `base`.
@@ -571,11 +611,31 @@ impl MemoryProvider for RestProvider {
         }
     }
 
-    /// Marks the handle initialized and, when the spec has a health call, probes it.
+    /// Whether [`MemoryProvider::initialize`] has successfully probed the backend.
     ///
-    /// Any answer — including `4xx`/`5xx` — is success, mirroring the Python adapters,
-    /// which only warn; a transport failure is returned so a caller can tell "wrong
-    /// credentials" from "nothing is listening". Idempotent: the second call does no I/O.
+    /// The flag only ever reflects a *successful* probe: a handle that failed its
+    /// initialization — or was never initialized — reports `false`, so a caller can tell a
+    /// rejected credential from a healthy handle without sending a request.
+    fn is_initialized(&self) -> bool {
+        self.initialized.load(Ordering::SeqCst)
+    }
+
+    /// Probes the backend and marks the handle initialized only when the probe succeeds.
+    ///
+    /// A spec with a health call is probed with it; that probe is the only verification a
+    /// handle can perform, so its verdict is honoured:
+    ///
+    /// | Probe answer | Result |
+    /// | --- | --- |
+    /// | any `2xx` | `Ok(())`, `initialized = true` |
+    /// | `401`/`403` | [`Error::Security`] naming the rejected credentials |
+    /// | any other non-`2xx` | [`Error::Transport`] naming the status and URL |
+    /// | transport failure | that error, unwrapped |
+    ///
+    /// A handle that fails its probe stays uninitialized, so a later call retries it. A
+    /// spec whose `health_call` reports [`Error::Unsupported`] has no probe to run and is
+    /// simply marked initialized; any other error from building the probe is returned.
+    /// Idempotent: once initialized, a call does no I/O.
     async fn initialize(&self) -> Result<()> {
         self.require_configured()?;
         if self.initialized.load(Ordering::SeqCst) {
@@ -584,9 +644,32 @@ impl MemoryProvider for RestProvider {
         if self.spec.supports(Op::Health) {
             let scope = self.spec.default_scope(&self.config);
             let cx = SpecContext::new(&self.config, &scope);
-            if let Ok(call) = self.spec.health_call(&cx) {
-                self.execute(Op::Health, &call, &CallOptions::default())
-                    .await?;
+            match self.spec.health_call(&cx) {
+                Ok(call) => {
+                    let response = self
+                        .execute(Op::Health, &call, &CallOptions::default())
+                        .await?;
+                    if !response.is_success() {
+                        let error = self.probe_error(&response);
+                        self.initialized.store(false, Ordering::SeqCst);
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            vendor = self.spec.id(),
+                            status = response.status,
+                            %error,
+                            "the memory provider failed its initialization probe"
+                        );
+                        return Err(error);
+                    }
+                }
+                Err(Error::Unsupported(_)) => {
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        vendor = self.spec.id(),
+                        "the memory provider documents no health probe; initializing unverified"
+                    );
+                }
+                Err(error) => return Err(error),
             }
         }
         self.initialized.store(true, Ordering::SeqCst);
@@ -724,23 +807,43 @@ impl MemoryProvider for RestProvider {
         self.spec.delete_result(&cx, &response, id)
     }
 
-    /// Lists the filter, using the filter's scope when it names one.
+    /// Lists every record matching the filter, following the vendor's pages.
+    ///
+    /// The spec's `list_call` asks for the first page; when it also implements
+    /// `next_list_call`, each answer is followed by the next request until the vendor says
+    /// the collection is exhausted, so a paged vendor (mem0) never reports only its first
+    /// page. `MAX_LIST_PAGES` bounds the walk: a vendor that keeps paging forever is a
+    /// typed transport error, never a truncated listing. A spec that answers a whole
+    /// collection in one request (every other vendor here) leaves the hook unimplemented
+    /// and is called exactly once.
     async fn list(&self, filter: &MemoryFilter) -> Result<Vec<MemoryRecord>> {
         self.require_configured()?;
         let scope = self.scope_for(filter);
         scope.validate()?;
         let cx = SpecContext::new(&self.config, &scope);
-        let call = self.spec.list_call(&cx, filter)?;
-        let response = self
-            .execute(Op::List, &call, &CallOptions::default())
-            .await?;
-        self.ensure_success(Op::List, &response)?;
-        self.spec.list_result(&cx, &response, filter)
+        let mut call = self.spec.list_call(&cx, filter)?;
+        let mut records: Vec<MemoryRecord> = Vec::new();
+        for page in 1..=MAX_LIST_PAGES {
+            let response = self
+                .execute(Op::List, &call, &CallOptions::default())
+                .await?;
+            self.ensure_success(Op::List, &response)?;
+            records.extend(self.spec.list_result(&cx, &response, filter)?);
+            match self.spec.next_list_call(&cx, filter, &response, page)? {
+                Some(next) => call = next,
+                None => return Ok(records),
+            }
+        }
+        Err(Error::transport(format!(
+            "the {} memory provider listing did not finish within {MAX_LIST_PAGES} pages",
+            self.spec.display()
+        )))
     }
 
     /// Removes every matching record.
     ///
-    /// Without a `clear_call`, this lists the filter and deletes the ids one by one,
+    /// Without a `clear_call`, this lists the filter — following every page, so a paged
+    /// vendor loses nothing beyond the first page — and deletes the ids one by one,
     /// counting the successes; a delete that answers `404` counts as "not removed" rather
     /// than as a failure.
     async fn clear(&self, filter: &MemoryFilter) -> Result<usize> {

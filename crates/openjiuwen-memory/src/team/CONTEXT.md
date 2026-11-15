@@ -29,21 +29,23 @@ Model (`team::model`, plain `serde` data, no I/O):
 - `TeamMemoryScope { team_id, member_id: Option<String>, session_id: Option<String> }` with `new`, `member`, `with_member`, `with_session`, `validate`, and `allows(&record)` (the read rule).
 - `TeamMemoryKind` — `SharedFact` (default), `MemberProfile`, `Decision`, `Task`, `Artifact`, `HandoffNote`, `Custom(String)`; `as_str`, `BUILTIN`, `is_builtin`, `extractor_tag`, `parse`, `FromStr`, `Display`; serde is a plain string and unknown strings become `Custom`.
 - `TeamVisibility` — `Team` (default), `Members(Vec<String>)`, `Private`; `members(iter)` normalizes the list, `member_list`, `validate`.
-- `TeamMemoryRecord` — `id`, `team_id`, `member_id`, `session_id`, `kind`, `content`, `title`, `importance`, `tags`, `metadata: serde_json::Value`, `created_at`, `updated_at`, `source`, `visibility`, `expires_at`; `new(scope, content, kind)`, builders, `is_expired(now)`, `metadata_object`, `metadata_str`, `validate`.
+- `TeamMemoryRecord` — `id`, `team_id`, `member_id`, `session_id`, `kind`, `content`, `title`, `importance`, `tags`, `metadata: serde_json::Value`, `created_at`, `updated_at`, `source`, `visibility`, `expires_at`, `embedding: Option<Vec<f32>>`; `new(scope, content, kind)`, builders (including `with_embedding`), `is_expired(now)`, `metadata_object`, `metadata_str`, `validate`.
+- `embedding` is derived state that only an embedding-backed facade fills in; it validates as a non-empty vector of finite components and is absent from the JSON when empty.
 - `NewTeamMemory` — constructors `shared_fact`, `member_profile`, `decision`, `task`, `artifact`, `handoff_note`, builders, `validate`, `to_record(now, default_importance)`.
 - `TeamMemoryUpdate` — builders, `is_empty`, `validate`, `apply(&mut record, now)`.
 - `TeamMemoryFilter` — `for_team` (mandatory team id), `kind`, `member`, `with_limit`, `with_offset`, `validate`, `matches(record, now)`.
 - `TeamMemoryStats { total, by_kind, by_member, expired, oldest, newest }`; team-wide records count under `TEAM_WIDE_MEMBER_KEY = "__team__"`.
-- `TeamSearchHit { #[serde(flatten)] record, score, keyword, importance, recency }`.
+- `TeamSearchHit { #[serde(flatten)] record, score, similarity, keyword, importance, recency }`; `similarity` is the normalized semantic component, `0.0` whenever the search carried no query vector.
 - `normalize_tags`, `new_team_memory_id`, and the limit constants (`MAX_SCOPE_ID_CHARS` 128, `MAX_RECORD_ID_CHARS` 128, `MAX_CONTENT_CHARS` 16384, `MAX_TITLE_CHARS` 256, `MAX_TAGS` 32, `MAX_TAG_CHARS` 64, `MAX_VISIBILITY_MEMBERS` 256, `DEFAULT_IMPORTANCE` 0.5).
 
 Store (`team::store`):
 - `#[async_trait] TeamMemoryStore: Send + Sync` — `upsert`, `get(team_id, id)`, `list(filter)`, `search(scope, query, options)`, `delete`, `clear`, `stats`, `set_expiry`, `prune_expired(now)`.
-- `TeamSearchOptions { top_k, threshold, kinds, tags, include_expired, call }` (`CallOptions`, so it is not serde) with builders and `validate`.
+- `TeamSearchOptions { top_k, threshold, kinds, tags, include_expired, query_embedding, ranking, call }` (`CallOptions`, so it is not serde) with builders (including `with_query_embedding`, `with_ranking`) and `validate` (a supplied query vector is validated as an embedding, and the ranking weights must be valid).
 - `InMemoryTeamMemoryStore` — `new`, `len`, `is_empty`, `Default`.
-- `TeamMemory` facade — `new(store)`, `in_memory()`, `sqlite(path)` (feature `sqlite`), `with_default_importance`, `default_importance`, `store`, `remember`, `remember_many`, `get`, `update`, `list`, `search`, `forget`, `clear`, `stats`, `set_expiry`, `prune_expired`, `to_jsonl`, `from_jsonl`.
+- `TeamMemory` facade — `new(store)`, `in_memory()`, `sqlite(path)` (feature `sqlite`), `with_default_importance`, `default_importance`, `with_embedding`, `embedding`, `with_ranking`, `ranking`, `store`, `remember`, `remember_many`, `get`, `update`, `list`, `search`, `forget`, `clear`, `stats`, `set_expiry`, `prune_expired`, `to_jsonl`, `from_jsonl`.
 - Constants `DEFAULT_SEARCH_TOP_K = 5`, `DEFAULT_SEARCH_THRESHOLD = 0.3`, `SEARCH_RECENCY_HALF_LIFE_SECS = 2_592_000`.
-- `rank_candidates(records, query, options, now)` is the crate-internal ranking shared by every backend.
+- `keyword_only_ranking()` is `RankingConfig::default` with `similarity_weight: 0.0`, the default of `TeamSearchOptions` and the weights a search without a query vector ends up using.
+- `rank_candidates(records, query, query_embedding, ranking, options, now)` is the crate-internal ranking shared by every backend.
 
 SQLite (`team::sqlite`, feature `sqlite`):
 - `SqliteTeamMemoryStore` — `open(path)`, `connect(url)`, `from_pool(pool)`, `pool()`, full `TeamMemoryStore` impl.
@@ -109,6 +111,7 @@ Observability (`team::observe`):
 `visibility` is externally tagged: `"team"`, `"private"`, or `{"members": ["alice", "bob"]}`.
 `kind` is a plain string, so an unknown kind round-trips as `TeamMemoryKind::Custom`.
 `metadata` must be a JSON object; `importance` is in `0.0..=1.0`; timestamps are RFC 3339 UTC.
+`embedding` is omitted when the record carries no vector and is a JSON array of numbers otherwise, and a decoded record without it gets `None`.
 
 ## Read Rule and Validation
 
@@ -123,6 +126,7 @@ Validation rules (`Error::Validation`, message names the field and offending val
 - content is non-whitespace and at most 16384 characters; a title is non-whitespace and at most 256 characters;
 - importance is finite and inside `0.0..=1.0`; `NewTeamMemory::to_record` and `TeamMemoryUpdate::apply` clamp finite out-of-range values, non-finite input is rejected;
 - tags are trimmed, lowercased, deduplicated, non-empty, at most 64 characters, and at most 32 per record; a *stored* record rejects case-insensitive duplicates;
+- an `embedding`, when present, is a non-empty vector whose every component is finite;
 - `TeamVisibility::Members` names 1..=256 members;
 - a filter requires a non-empty `team_id` and a `limit` greater than zero when set.
 
@@ -132,7 +136,8 @@ Validation rules (`Error::Validation`, message names the field and offending val
 - `upsert` validates the record, overwrites the row with that `id`, and keeps the existing `created_at` (a new row uses the record's `created_at`); `updated_at` always comes from the input.
 - `get` is a direct lookup: it returns expired records too and `None` for an unknown id or another team.
 - `list` validates the filter, matches at `Utc::now()`, applies `offset`/`limit`, and orders by `updated_at` descending then `id` ascending.
-- `search` validates scope and options, keeps records the scope `allows`, drops expired records unless `include_expired`, drops candidates with zero keyword overlap, ranks, and truncates to `top_k`.
+- `search` validates scope and options, keeps records the scope `allows`, drops expired records unless `include_expired`, scores every survivor, drops candidates with neither keyword nor semantic signal, ranks, and truncates to `top_k`.
+- `search` reads the query vector from `TeamSearchOptions::query_embedding`, so a caller that embeds its own queries needs no facade embedder; without one the similarity weight is forced to `0.0`.
 - `delete` returns `false` when absent; `clear` requires a filter (always team-scoped) and returns the deleted count; `set_expiry` returns `false` when absent or owned by another team and never touches `updated_at`; `prune_expired(now)` deletes rows with `expires_at <= now` across teams and returns the count.
 - `stats` aggregates the filter-matched set with per-kind counts, per-member counts, the expired count, and the oldest/newest `created_at`.
 - The facade adds cancellation: `CallOptions::check` runs before and after each store call, and a triggered token yields `Error::Cancelled` without a partial write beyond records already committed by `remember_many`/`from_jsonl`.
@@ -141,14 +146,26 @@ Validation rules (`Error::Validation`, message names the field and offending val
 ## Search Ranking
 
 ```
-document = title + " " + content + " " + tags.join(" ")
-keyword  = normalized_bm25_scores(query, documents)      // 0 when no term overlaps
-recency  = 0.5 ^ (age_secs(updated_at) / 30 days)
-score    = blend(0.0, keyword, importance, recency, RankingConfig { similarity_weight: 0.0, ..default })
+document   = title + " " + content + " " + tags.join(" ")
+keyword    = normalized_bm25_scores(query, documents)                          // 0 when no term overlaps
+recency    = 0.5 ^ (age_secs(updated_at) / 30 days)
+similarity = (cosine(query_embedding, record.embedding) + 1) / 2               // 0 without vectors
+score      = blend(similarity, keyword, importance, recency, &effective)
 ```
-Because `similarity_weight` is zero, the semantic group renormalizes to the keyword term, giving `score = 0.85 * keyword + 0.10 * importance + 0.05 * recency`.
-Candidates with `keyword == 0.0` are dropped before ranking, so a recent or important but unrelated record is never returned.
+`effective` is the caller's `RankingConfig` with `similarity_weight` forced to `0.0` whenever the search carries no query vector, so a vector-less search computes `score = 0.85 * keyword + 0.10 * importance + 0.05 * recency` byte-identically to a build without embedding support.
+With a query vector the semantic group is live at `similarity_weight: 0.70`, and a candidate with no keyword overlap survives on its similarity alone.
+A record without an embedding (a row written before an embedder was attached) scores `similarity = 0.0` and is still ranked through its keyword term.
+Without a query vector a candidate is dropped when `keyword == 0.0`, so a recent or important but unrelated record is never returned.
 Ordering: `score` descending, then `updated_at` descending, then `id` ascending (deterministic for identical scores).
+
+## Embeddings
+
+`TeamMemory::with_embedding` attaches an `openjiuwen_retrieval::embedding::Embedding`; `embedding()` reports it.
+Writes embed `document_text` (`title + " " + content + " " + tags`, the same text the keyword signal reads) into `TeamMemoryRecord::embedding`: `remember`, `remember_many`, `update`, and `from_jsonl` for lines that carry no vector.
+`search` embeds the query, clones the options with that vector and `TeamMemory::ranking`, and lets the store rank semantically; a blank query is not embedded, so the keyword-only path answers it.
+Embedding calls run through `CallOptions::run`, so cancellation and deadlines apply, and an embedding failure is a typed error that fails the write (nothing is stored) or the search rather than degrading to an empty result.
+`with_ranking`/`ranking` set the weights an embedding-backed search uses; the default is `RankingConfig::default` and attaching weights without a query vector still ends in the keyword-only formula.
+The vector is derived state: the `MemoryRecord` projection and `TEAM_MEMORY.md` both drop it, while the JSONL round trip keeps it.
 
 ## SQLite Schema and Behaviour
 
@@ -168,17 +185,19 @@ CREATE TABLE IF NOT EXISTS team_memories (
     source TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    expires_at TEXT
+    expires_at TEXT,
+    embedding_json TEXT
 );
 CREATE INDEX IF NOT EXISTS team_memories_team_updated_idx ON team_memories (team_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS team_memories_team_kind_idx ON team_memories (team_id, kind);
 CREATE INDEX IF NOT EXISTS team_memories_team_member_idx ON team_memories (team_id, member_id);
 ```
-- Timestamps are RFC 3339 UTC strings with millisecond precision (`2026-01-02T03:04:05.000Z`), so lexical ordering equals time ordering; `expires_at` is `NULL` when absent.
+- Timestamps are RFC 3339 UTC strings with millisecond precision (`2026-01-02T03:04:05.000Z`), so lexical ordering equals time ordering; `expires_at` is `NULL` when absent and `embedding_json` is `NULL` for a record without a vector.
+- `embedding_json` is additive: a table created before embeddings existed keeps its rows, gains the column with `NULL` vectors, and `from_pool` performs that check-and-`ALTER` on every open, so both `open`/`connect`/`from_pool` reach a usable schema.
 - Every statement is parameter-bound; dynamic predicates are built with a private `Where`/`Param` helper using numbered `?N` placeholders.
 - `list`/`clear`/`stats` express the whole filter in SQL (team/member/session, `kind IN (...)`, exact `visibility_json`, tags via `json_each`, `text_contains` via escaped `LIKE`, importance, time bounds, expiry) and `list` applies `LIMIT`/`OFFSET` in SQL.
 - `search` selects the team's rows and reuses the shared `rank_candidates`, so ranking cannot drift between backends.
-- Degradation (documented, never fails a query): malformed `visibility_json` → `TeamVisibility::Private` (fail closed); malformed `tags_json` → `[]`; malformed/non-object `metadata_json` → `{}`; non-finite or out-of-range `importance` → clamped or `DEFAULT_IMPORTANCE`; an unparseable `created_at`/`updated_at` skips the row; an unparseable `expires_at` means no expiry. Every degradation logs `tracing::warn!(target: "openjiuwen_memory::team", ...)`.
+- Degradation (documented, never fails a query): malformed `visibility_json` → `TeamVisibility::Private` (fail closed); malformed `tags_json` → `[]`; malformed/non-object `metadata_json` → `{}`; a malformed or degenerate `embedding_json` → no vector; non-finite or out-of-range `importance` → clamped or `DEFAULT_IMPORTANCE`; an unparseable `created_at`/`updated_at` skips the row; an unparseable `expires_at` means no expiry. Every degradation logs `tracing::warn!(target: "openjiuwen_memory::team", ...)`.
 - Deliberate backend differences: SQLite `lower`/`LIKE` fold ASCII only (the in-memory backend folds full Unicode), and SQLite stores millisecond-precision timestamps.
 
 ## Projection Rules
@@ -191,6 +210,7 @@ CREATE INDEX IF NOT EXISTS team_memories_team_member_idx ON team_memories (team_
 
 `TeamMemoryRecord::from_memory_record(&MemoryRecord)` requires the reserved `team_memory` object (a plain `MemoryRecord` is rejected with `Error::Validation`), rebuilds every team field from it, takes `content`/`importance`/`source`/timestamps from the record, restores the non-reserved metadata entries, and validates the result.
 Round-tripping is lossless for every kind (including `Custom`) and every visibility, including title, tags, metadata, source, expiry, importance, id, and both timestamps.
+The reserved payload carries no vector, so `from_memory_record` reads `embedding` from the projected record itself.
 The projection is a view: it is not a second source of truth, and writing it back into the long-term memory engine does not update the team store.
 
 ## TEAM_MEMORY.md Format
@@ -319,13 +339,14 @@ Python has only `memory_logger` warning lines, so the event seam is a Rust addit
 - A retention daemon, timer-driven pruning, background consolidation/dreaming for team memory, and monitor/UI reporting are deferred; the caller owns `prune_expired` and `on_session_end`.
 - The OTel exporter itself (spans, metrics, attribute names) is deferred to `openjiuwen-extensions`; this node ships the `TeamMemoryObserver` seam, the no-op and the `tracing` implementation only.
 - An org/tenant layer above `team_id` (membership services, tenant isolation, cross-team sharing) is not modelled.
-- Embedding-based team recall is deferred: the schema has no embedding column, so search is keyword + importance + recency.
+- Team recall runs no ANN index: the store scores every readable candidate in process, so an embedding-backed search costs one pass over the team's rows.
+- Rows written before an embedder was attached keep `embedding: None`; nothing re-embeds them in the background, so they score through their keyword term until they are written again.
 
 ## Test Strategy
 
 - Unit tests live beside every module (`#[cfg(test)] mod tests`): validation/normalization, scope visibility matrix, kind/visibility serde, record/input/update semantics, filter clauses, ranking formula, in-memory store behaviour, facade cancellation/JSONL, projection round-trip matrix, and SQLite CRUD/filters/search/stats/expiry/decode.
 - New suites: `document` (lossless export→parse round trip across every kind/visibility/CJK/multi-line/`#`-prefixed content, render determinism, Python-authored import, idempotent re-import, SQLite export/import across a reopen), `extractor`/`prompts` (rule marker inventory, dedupe/caps, parse variants, `ScriptedModel` happy path, fallback with a `degraded` reason, cancellation), `hooks` (full sequence, retry after extractor failure, invalid-output rollback, cancellation, buffer bounds, config switches, observer events, SQLite persistence across a reopen), `toolkit` (schema shape, happy paths, argument validation, privacy/deletes, read-only contexts, envelope), `observe` (event builders/serde, emit matrix, failure events).
-- Counts: the `team` filter holds 185 tests without `sqlite` and 225 with `--features sqlite`; the crate as a whole is 972 tests with default features and 1058 with `--all-features`.
+- Counts: the `team` filter holds 188 tests without `sqlite` and 231 with `--features sqlite`; embedding, ranking and JSONL-vector cases are part of the default set.
 - Deterministic offline data: fixed `DateTime::from_timestamp` values, `tempfile::tempdir()` for SQLite files, `ScriptedModel` for the model-backed extractor, no network, no wall-clock ordering.
 - Gates: `cargo fmt -p openjiuwen-memory -- --check`, `cargo clippy -p openjiuwen-memory --all-targets --all-features -- -D warnings`, `cargo test -p openjiuwen-memory` with and without `--all-features`, and `cargo doc -p openjiuwen-memory --no-deps --all-features` warning-free.
 

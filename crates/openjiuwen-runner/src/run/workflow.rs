@@ -30,7 +30,11 @@ use crate::callback::{CallbackContext, CallbackEvent};
 
 /// Runs one workflow invocation to completion.
 ///
-/// The reference is resolved first (a missing id is
+/// A distributed-configured context is refused first:
+/// [`RunServices::require_local`] returns `Error::Unsupported` naming the
+/// deferred transports before anything else happens.
+///
+/// The reference is resolved next (a missing id is
 /// [`openjiuwen_common::error::Error::NotFound`] before any session is created),
 /// then `WorkflowInvokeInput` is fired, the session is resolved (caller-owned, or
 /// a fresh [`WorkflowSession`]), and the engine runs with the run's cancellation
@@ -53,6 +57,7 @@ pub async fn invoke_workflow(
     inputs: Value,
     options: RunOptions,
 ) -> Result<WorkflowOutput> {
+    services.require_local()?;
     let run_id = Uuid::new_v4().to_string();
     let started = Instant::now();
 
@@ -172,6 +177,10 @@ pub async fn invoke_workflow(
 
 /// Runs one workflow invocation as a stream of [`WorkflowChunk`] frames.
 ///
+/// A distributed-configured context refuses as this stream's **single** terminal
+/// `Err` frame ([`RunServices::require_local`]): nothing else happens — no
+/// reference resolution, no session, no callback, no monitor or hub status.
+///
 /// The stream is returned immediately, so a resolution failure is delivered as a
 /// one-element stream yielding that error. On success the stream fires
 /// `WorkflowStreamInput` first, forwards the engine's frames verbatim, and fires
@@ -190,6 +199,13 @@ pub fn stream_workflow(
 ) -> BoxStream<'static, Result<WorkflowChunk>> {
     let run_id = Uuid::new_v4().to_string();
     async_stream::stream! {
+        // Mode enforcement is the stream's first statement: a distributed runner
+        // refuses as the single terminal `Err` frame, before a reference is
+        // resolved, a session is created, a callback fires, or a status exists.
+        if let Err(error) = services.require_local() {
+            yield Err(error);
+            return;
+        }
         let started = Instant::now();
         let workflow = match resolve_workflow(&services, &workflow) {
             Ok(workflow) => workflow,

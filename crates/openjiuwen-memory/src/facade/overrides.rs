@@ -12,26 +12,40 @@
 //!
 //! [`ScopeAnalyzerOverrideSpec::resolve`] is the bridge: it resolves the document against
 //! the handles the facade actually owns ([`ScopeOverrideHandles`]) and fails loudly when a
-//! name cannot be satisfied. The engine's embedding model is fixed at construction, so a
-//! scope naming a *different* embedding is [`Error::Unsupported`] naming the requested
-//! handle — never a silent fallback to the engine's model.
+//! name cannot be satisfied. The registry holds every handle registered under a name —
+//! the engine's own model and embedding (under their `model_name()`) plus whatever
+//! [`LongTermMemoryBuilder::model_named`](super::LongTermMemoryBuilder::model_named) /
+//! [`LongTermMemoryBuilder::embedding_named`](super::LongTermMemoryBuilder::embedding_named)
+//! added — so a scope can really swap its model *and* its embedding. A name that is
+//! registered nowhere is [`Error::Unsupported`] listing the registered names, never a
+//! silent fallback to the engine's handle.
+//!
+//! # Which entry points honour a per-scope handle
+//!
+//! The facade resolves the document once per call and threads the result into the call
+//! it serves: `search`/`recall` (recall embedding), `add`/`add_many`/`update` and the
+//! message-extraction writes (write/dedupe embedding), `set_variable`/`assign_variable`
+//! and the variable-assignment writers (projection embedding), and
+//! `remember`/`remember_with_assignments`/`consolidate` (analyzer model *and* embedding).
+//! Engine-level handles that never consult this namespace — `memory.engine()`,
+//! `memory.coding()`, `memory.provider()` and `memory.graph()` — keep using the engine's
+//! own model and embedding, exactly like a direct `MemoryEngine` call: the override
+//! document is a facade-level contract.
 //!
 //! The stored document is a *sibling* of the scope config, not part of it:
 //! [`LongTermMemory::delete_scope_config`](super::LongTermMemory::delete_scope_config)
 //! keeps its signature and its behaviour (it clears `memory_scope_config/{scope_id}` only),
 //! and [`LongTermMemory::delete_scope_overrides`] clears this namespace. Deleting one never
 //! touches the other.
-use std::fmt;
 use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_foundation::llm::Model;
-use openjiuwen_retrieval::embedding::Embedding;
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{ClassifierKind, ExtractorKind, ScopeAnalyzerOverrides, StageConfig};
 use crate::record::{MemoryScope, DEFAULT_ID};
 
+use super::handles::ScopeOverrideHandles;
 use super::LongTermMemory;
 
 /// The tracing target of facade diagnostics.
@@ -168,55 +182,46 @@ impl ScopeAnalyzerOverrideSpec {
     /// Resolves the document against the handles `facade` actually holds.
     ///
     /// The scalar overrides and the stage selection are copied; a named `model` /
-    /// `embedding` is resolved to a handle. `model: None`/`embedding: None` means "use the
-    /// engine's" and adds no handle.
+    /// `embedding` is resolved to the handle registered under that exact name. `model:
+    /// None`/`embedding: None` means "use the engine's" and adds no handle.
     ///
     /// # Errors
     ///
     /// [`Error::Validation`] for an invalid document (see
     /// [`ScopeAnalyzerOverrideSpec::validate`]).
     ///
-    /// [`Error::Unsupported`] when a named handle cannot be satisfied, naming the
-    /// requested handle and the reason: no model is attached, the facade only holds a
-    /// differently named model, or a per-scope embedding was requested while the engine's
-    /// embedding model is fixed at construction. A name is never silently ignored.
+    /// [`Error::Unsupported`] when a named handle is not registered, naming the requested
+    /// handle and every name that *is* registered. There is never a silent fallback to
+    /// the engine's handle and never a silent drop of the override: a document that names
+    /// a model or embedding the facade does not hold fails every call that resolves it,
+    /// until the handle is registered
+    /// ([`LongTermMemoryBuilder::model_named`](super::LongTermMemoryBuilder::model_named) /
+    /// [`LongTermMemoryBuilder::embedding_named`](super::LongTermMemoryBuilder::embedding_named))
+    /// or the override is removed.
     pub fn resolve(&self, handles: &ScopeOverrideHandles) -> Result<ScopeAnalyzerOverrides> {
         self.validate()?;
         let mut overrides = self.scalars();
         if let Some(requested) = &self.model {
-            let available = handles.model.as_ref().ok_or_else(|| {
+            let available = handles.model_named(requested).ok_or_else(|| {
                 Error::unsupported(format!(
-                    "scope override requests model `{requested}`, but no model is attached to this \
-                     facade; attach one with LongTermMemoryBuilder::model or drop the `model` \
-                     override"
+                    "scope override requests model `{requested}`, but no model is registered \
+                     under that name on this facade; registered models: {}; register one with \
+                     LongTermMemoryBuilder::model_named (or drop the `model` override)",
+                    registered(&handles.model_names())
                 ))
             })?;
-            if available.model_name() != requested {
-                return Err(Error::unsupported(format!(
-                    "scope override requests model `{requested}`, but this facade only holds the \
-                     engine model `{}`; a per-scope model must be registered on the facade \
-                     (LongTermMemoryBuilder::model), not resolved by name",
-                    available.model_name()
-                )));
-            }
             overrides = overrides.with_model(Arc::clone(available));
         }
         if let Some(requested) = &self.embedding {
-            let available = handles.embedding.as_ref().ok_or_else(|| {
+            let available = handles.embedding_named(requested).ok_or_else(|| {
                 Error::unsupported(format!(
-                    "scope override requests embedding `{requested}`, but no embedding model is \
-                     attached and the engine's embedding model is fixed at construction \
-                     (LongTermMemoryBuilder::embedding)"
+                    "scope override requests embedding `{requested}`, but no embedding is \
+                     registered under that name on this facade; registered embeddings: {}; \
+                     register one with LongTermMemoryBuilder::embedding_named (or drop the \
+                     `embedding` override)",
+                    registered(&handles.embedding_names())
                 ))
             })?;
-            if available.model_name() != requested {
-                return Err(Error::unsupported(format!(
-                    "scope override requests embedding `{requested}`, but the engine's embedding \
-                     model is fixed at construction (`{}`); openjiuwen-memory cannot swap the \
-                     embedding per scope",
-                    available.model_name()
-                )));
-            }
             overrides = overrides.with_embedding(Arc::clone(available));
         }
         Ok(overrides)
@@ -244,72 +249,6 @@ impl ScopeAnalyzerOverrideSpec {
             overrides = overrides.with_stages(stages.clone());
         }
         overrides
-    }
-}
-
-/// The in-memory handles a [`ScopeAnalyzerOverrideSpec`] resolves its names against.
-///
-/// The facade fills these from the engine it was built with, so a spec can only name what
-/// the process actually owns. The manual [`fmt::Debug`] reports handle *names* only, so
-/// logging a resolution request never leaks a provider client or credentials.
-#[derive(Clone, Default)]
-pub struct ScopeOverrideHandles {
-    /// The model the facade exposes to per-scope analysis.
-    model: Option<Arc<dyn Model>>,
-    /// The embedding model the engine was constructed with.
-    embedding: Option<Arc<dyn Embedding>>,
-}
-
-impl ScopeOverrideHandles {
-    /// Builds empty handles (nothing to resolve against).
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns the handles with `model` set.
-    #[must_use]
-    pub fn with_model(mut self, model: Arc<dyn Model>) -> Self {
-        self.model = Some(model);
-        self
-    }
-
-    /// Returns the handles with `embedding` set.
-    #[must_use]
-    pub fn with_embedding(mut self, embedding: Arc<dyn Embedding>) -> Self {
-        self.embedding = Some(embedding);
-        self
-    }
-
-    /// Returns the model handle, when one is held.
-    #[must_use]
-    pub fn model(&self) -> Option<&Arc<dyn Model>> {
-        self.model.as_ref()
-    }
-
-    /// Returns the embedding handle, when one is held.
-    #[must_use]
-    pub fn embedding(&self) -> Option<&Arc<dyn Embedding>> {
-        self.embedding.as_ref()
-    }
-
-    /// Returns `true` when neither handle is held.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.model.is_none() && self.embedding.is_none()
-    }
-}
-
-impl fmt::Debug for ScopeOverrideHandles {
-    /// Reports handle names only.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let model = self.model.as_deref().map(Model::model_name);
-        let embedding = self.embedding.as_deref().map(Embedding::model_name);
-        formatter
-            .debug_struct("ScopeOverrideHandles")
-            .field("model", &model)
-            .field("embedding", &embedding)
-            .finish()
     }
 }
 
@@ -410,17 +349,14 @@ impl LongTermMemory {
         }
         Ok(overrides)
     }
+}
 
-    /// The handles a scope override document can name.
-    pub(super) fn scope_override_handles(&self) -> ScopeOverrideHandles {
-        let mut handles = ScopeOverrideHandles::new();
-        if let Some(model) = self.engine.model() {
-            handles = handles.with_model(Arc::clone(model));
-        }
-        if let Some(embedding) = self.engine.embedding() {
-            handles = handles.with_embedding(Arc::clone(embedding));
-        }
-        handles
+/// Renders a name list for an unresolvable-name error (`none` when it is empty).
+fn registered(names: &[&str]) -> String {
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(", ")
     }
 }
 
@@ -438,7 +374,8 @@ mod tests {
     use super::*;
     use crate::analyzer::{AnalyzerConfig, StageKind};
     use crate::config::MemoryEngineConfig;
-    use openjiuwen_retrieval::embedding::HashEmbedding;
+    use openjiuwen_foundation::llm::Model;
+    use openjiuwen_retrieval::embedding::{Embedding, HashEmbedding};
     use openjiuwen_test_support::ScriptedModel;
     use serde_json::json;
 
@@ -605,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_accepts_the_handles_it_names() {
+    fn resolve_accepts_every_registered_name() {
         let spec = ScopeAnalyzerOverrideSpec::new()
             .with_model("scripted-model")
             .with_embedding("hash-embedding");
@@ -622,6 +559,26 @@ mod tests {
                 .map(|embedding| Embedding::model_name(embedding.as_ref())),
             Some("hash-embedding")
         );
+        // A registration under a caller-chosen name resolves too, even when that name is
+        // not the handle's own `model_name()`.
+        let registry = handles()
+            .with_named_model("scope-model", model())
+            .with_named_embedding(
+                "wide",
+                Arc::new(HashEmbedding::new(24).with_model_name("wide")),
+            );
+        let resolved = ScopeAnalyzerOverrideSpec::new()
+            .with_model("scope-model")
+            .with_embedding("wide")
+            .resolve(&registry)
+            .expect("named resolve");
+        assert_eq!(
+            resolved
+                .embedding()
+                .map(|embedding| Embedding::model_name(embedding.as_ref())),
+            Some("wide"),
+            "the handle registered as `wide` is the one that resolved"
+        );
         // An empty handle set resolves the empty spec (nothing is named).
         assert!(ScopeAnalyzerOverrideSpec::new()
             .resolve(&ScopeOverrideHandles::new())
@@ -634,22 +591,27 @@ mod tests {
         let missing = ScopeAnalyzerOverrideSpec::new().with_model("gpt-4o");
         let error = missing
             .resolve(&ScopeOverrideHandles::new())
-            .expect_err("no model attached");
+            .expect_err("nothing is registered");
         match error {
             Error::Unsupported(reason) => {
                 assert!(reason.contains("gpt-4o"), "{reason}");
-                assert!(reason.contains("no model is attached"), "{reason}");
+                assert!(reason.contains("registered models: none"), "{reason}");
+                assert!(reason.contains("model_named"), "{reason}");
             }
             other => panic!("expected Error::Unsupported, got {other:?}"),
         }
 
+        // An unregistered name never falls back to the engine handle: the error lists what
+        // *is* registered instead.
+        let registry = handles().with_named_model("scope-model", model());
         let error = missing
-            .resolve(&ScopeOverrideHandles::new().with_model(model()))
-            .expect_err("only the engine model is held");
+            .resolve(&registry)
+            .expect_err("only other names are registered");
         match error {
             Error::Unsupported(reason) => {
                 assert!(reason.contains("gpt-4o"), "{reason}");
                 assert!(reason.contains("scripted-model"), "{reason}");
+                assert!(reason.contains("scope-model"), "{reason}");
             }
             other => panic!("expected Error::Unsupported, got {other:?}"),
         }
@@ -657,23 +619,26 @@ mod tests {
         let embedding = ScopeAnalyzerOverrideSpec::new().with_embedding("text-embedding-3-large");
         let error = embedding
             .resolve(&handles())
-            .expect_err("the engine embedding is fixed");
+            .expect_err("the name is not registered");
         match error {
             Error::Unsupported(reason) => {
                 assert!(reason.contains("text-embedding-3-large"), "{reason}");
-                assert!(reason.contains("fixed at construction"), "{reason}");
-                assert!(reason.contains("hash-embedding"), "{reason}");
+                assert!(
+                    reason.contains("registered embeddings: hash-embedding"),
+                    "{reason}"
+                );
+                assert!(reason.contains("embedding_named"), "{reason}");
             }
             other => panic!("expected Error::Unsupported, got {other:?}"),
         }
 
         let error = embedding
             .resolve(&ScopeOverrideHandles::new())
-            .expect_err("no embedding attached");
+            .expect_err("nothing is registered");
         match error {
             Error::Unsupported(reason) => {
                 assert!(reason.contains("text-embedding-3-large"), "{reason}");
-                assert!(reason.contains("fixed at construction"), "{reason}");
+                assert!(reason.contains("registered embeddings: none"), "{reason}");
             }
             other => panic!("expected Error::Unsupported, got {other:?}"),
         }

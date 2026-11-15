@@ -11,16 +11,25 @@
 //! assertion depends on the wall clock.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use openjiuwen_common::error::{Error, Result};
+use openjiuwen_foundation::store::{
+    CollectionSchema, InMemoryVectorStore, VectorQuery, VectorSearchResult, VectorStore,
+};
+use openjiuwen_memory::analyzer::ExtractionInput;
 use openjiuwen_memory::config::MemoryEngineConfig;
 use openjiuwen_memory::facade::LongTermMemory;
-use openjiuwen_memory::record::{AddOptions, DedupePolicy, MemoryScope, NewMemory};
+use openjiuwen_memory::record::{
+    AddOptions, AddOutcome, CallOptions, DedupePolicy, MemoryScope, MemoryType, MemoryUpdate,
+    NewMemory, SearchOptions,
+};
+use openjiuwen_memory::store::{keys, MemoryStores};
 use openjiuwen_retrieval::embedding::{Embedding, HashEmbedding};
-use serde_json::json;
+use serde_json::{json, Map, Value};
 
 /// Builds an empty in-memory facade over `config`.
 async fn facade(config: MemoryEngineConfig) -> Arc<LongTermMemory> {
@@ -368,6 +377,10 @@ async fn replace_policy_keeps_the_id_but_takes_the_incoming_content() {
         .expect("replace duplicate");
     assert_eq!(replaced.added.len(), 0);
     assert_eq!(replaced.merged.len(), 1);
+    // The superseded row was really removed, so the outcome reports the deletion even
+    // though the replacement is stored under the same id.
+    assert_eq!(replaced.deleted, vec![id.clone()]);
+    assert_eq!(replaced.skipped.len(), 0);
     let record = &replaced.merged[0];
 
     // Actual `Replace` semantics: the existing id survives, and the whole incoming
@@ -571,4 +584,398 @@ async fn texts_below_the_similarity_thresholds_stay_separate() {
     assert_eq!(listed.len(), 2);
     assert!(listed.iter().any(|record| record.content == first_text));
     assert!(listed.iter().any(|record| record.content == second_text));
+}
+
+// --- degraded dedupe and partial-update findings -------------------------------
+//
+// Two write-path failures used to be swallowed: a failed duplicate candidate scan
+// looked exactly like "no duplicates", and a failed re-index after a kind change left
+// the new content persisted but unsearchable. Both are now caller-visible, and these
+// tests pin that with stores whose one broken half is armed on demand.
+
+/// Builds an in-memory store bundle whose vector backend is `vector`.
+fn stores_with(vector: Arc<dyn VectorStore>) -> MemoryStores {
+    let mut stores = MemoryStores::in_memory();
+    stores.vector = vector;
+    stores
+}
+
+/// A vector store whose `search` can be armed to fail, so the dedupe candidate scan —
+/// the only recall that runs inside a write — fails deterministically.
+///
+/// Indexing (`add_docs`) keeps working, which is what a store with a broken *read* path
+/// looks like: writes land, duplicate detection cannot look.
+#[derive(Clone)]
+struct ArmedSearchStore {
+    inner: Arc<InMemoryVectorStore>,
+    mode: Arc<AtomicU8>,
+}
+
+impl ArmedSearchStore {
+    /// Creates an unarmed store (`search` delegates to the in-memory backend).
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(InMemoryVectorStore::new()),
+            mode: Arc::new(AtomicU8::new(0)),
+        }
+    }
+
+    /// Makes `search` fail with a backend error.
+    fn fail_search(&self) {
+        self.mode.store(1, Ordering::SeqCst);
+    }
+
+    /// Makes `search` fail the way a cancelled call does.
+    fn cancel_search(&self) {
+        self.mode.store(2, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl VectorStore for ArmedSearchStore {
+    async fn create_collection(&self, collection: &str, schema: CollectionSchema) -> Result<()> {
+        self.inner.create_collection(collection, schema).await
+    }
+
+    async fn delete_collection(&self, collection: &str) -> Result<()> {
+        self.inner.delete_collection(collection).await
+    }
+
+    async fn collection_exists(&self, collection: &str) -> Result<bool> {
+        self.inner.collection_exists(collection).await
+    }
+
+    async fn get_schema(&self, collection: &str) -> Result<Option<CollectionSchema>> {
+        self.inner.get_schema(collection).await
+    }
+
+    async fn add_docs(&self, collection: &str, docs: Vec<Map<String, Value>>) -> Result<usize> {
+        self.inner.add_docs(collection, docs).await
+    }
+
+    async fn search(
+        &self,
+        collection: &str,
+        query: &VectorQuery,
+    ) -> Result<Vec<VectorSearchResult>> {
+        match self.mode.load(Ordering::SeqCst) {
+            1 => Err(Error::llm("vector index is unavailable")),
+            2 => Err(Error::Cancelled),
+            _ => self.inner.search(collection, query).await,
+        }
+    }
+
+    async fn delete_docs_by_ids(&self, collection: &str, ids: &[String]) -> Result<usize> {
+        self.inner.delete_docs_by_ids(collection, ids).await
+    }
+
+    async fn delete_docs_by_filters(&self, collection: &str, filters: &Value) -> Result<usize> {
+        self.inner.delete_docs_by_filters(collection, filters).await
+    }
+
+    async fn list_collection_names(&self) -> Result<Vec<String>> {
+        self.inner.list_collection_names().await
+    }
+}
+
+/// A vector store that fails `add_docs` for one armed collection only, so a single
+/// kind's re-index fails while every other collection keeps working.
+#[derive(Clone)]
+struct FailingCollectionStore {
+    inner: Arc<InMemoryVectorStore>,
+    failing: Arc<Mutex<Option<String>>>,
+}
+
+impl FailingCollectionStore {
+    /// Creates a store that accepts every write.
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(InMemoryVectorStore::new()),
+            failing: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Makes every `add_docs` call for `collection` fail with a backend error.
+    fn fail(&self, collection: String) {
+        *self.failing.lock().expect("lock") = Some(collection);
+    }
+}
+
+#[async_trait]
+impl VectorStore for FailingCollectionStore {
+    async fn create_collection(&self, collection: &str, schema: CollectionSchema) -> Result<()> {
+        self.inner.create_collection(collection, schema).await
+    }
+
+    async fn delete_collection(&self, collection: &str) -> Result<()> {
+        self.inner.delete_collection(collection).await
+    }
+
+    async fn collection_exists(&self, collection: &str) -> Result<bool> {
+        self.inner.collection_exists(collection).await
+    }
+
+    async fn get_schema(&self, collection: &str) -> Result<Option<CollectionSchema>> {
+        self.inner.get_schema(collection).await
+    }
+
+    async fn add_docs(&self, collection: &str, docs: Vec<Map<String, Value>>) -> Result<usize> {
+        let armed = self
+            .failing
+            .lock()
+            .expect("lock")
+            .as_deref()
+            .is_some_and(|failing| failing == collection);
+        if armed {
+            return Err(Error::llm(format!(
+                "vector collection `{collection}` rejected the write"
+            )));
+        }
+        self.inner.add_docs(collection, docs).await
+    }
+
+    async fn search(
+        &self,
+        collection: &str,
+        query: &VectorQuery,
+    ) -> Result<Vec<VectorSearchResult>> {
+        self.inner.search(collection, query).await
+    }
+
+    async fn delete_docs_by_ids(&self, collection: &str, ids: &[String]) -> Result<usize> {
+        self.inner.delete_docs_by_ids(collection, ids).await
+    }
+
+    async fn delete_docs_by_filters(&self, collection: &str, filters: &Value) -> Result<usize> {
+        self.inner.delete_docs_by_filters(collection, filters).await
+    }
+
+    async fn list_collection_names(&self) -> Result<Vec<String>> {
+        self.inner.list_collection_names().await
+    }
+}
+
+/// Asserts `outcome` is complete (nothing degraded) and returns its single added id.
+fn one_added(outcome: &AddOutcome) -> String {
+    assert_eq!(
+        outcome.degraded, None,
+        "a write over a working store must not degrade"
+    );
+    assert_eq!(outcome.added.len(), 1);
+    outcome.added[0].id.clone()
+}
+
+#[tokio::test]
+async fn a_failed_candidate_scan_is_reported_and_the_record_is_still_stored() {
+    let vector = ArmedSearchStore::new();
+    let ltm = LongTermMemory::builder(MemoryEngineConfig::default())
+        .stores(stores_with(Arc::new(vector.clone())))
+        .embedding(Arc::new(HashEmbedding::new(16)))
+        .build()
+        .expect("facade");
+    let scope = scope();
+    let first = ltm
+        .add(
+            &scope,
+            NewMemory::semantic("Alice prefers dark mode"),
+            &AddOptions::default(),
+        )
+        .await
+        .expect("add");
+    let first_id = one_added(&first);
+
+    // The read half of the vector store breaks: the duplicate candidate scan cannot
+    // look, but writes still land.
+    vector.fail_search();
+    let outcome = ltm
+        .add(
+            &scope,
+            NewMemory::semantic("Bob prefers light mode"),
+            &AddOptions::default(),
+        )
+        .await
+        .expect("degraded add");
+    let reason = outcome
+        .degraded
+        .clone()
+        .expect("a failed candidate scan must be caller-visible, not silently empty");
+    assert!(
+        reason.contains("duplicate candidate scan failed"),
+        "{reason}"
+    );
+    assert!(reason.contains("vector index is unavailable"), "{reason}");
+    assert_eq!(
+        reason.matches(&outcome.added[0].id).count(),
+        1,
+        "the reason must name the unchecked record: {reason}"
+    );
+    assert_eq!(outcome.added.len(), 1);
+    assert_eq!(outcome.merged, Vec::new());
+
+    let stored = ltm
+        .get(&scope, &outcome.added[0].id)
+        .await
+        .expect("get")
+        .expect("stored");
+    assert_eq!(stored.content, "Bob prefers light mode");
+    let listed = ltm.list(&scope, &[]).await.expect("list");
+    assert_eq!(
+        listed.len(),
+        2,
+        "the unchecked record is stored beside the existing one"
+    );
+    assert!(listed.iter().any(|record| record.id == first_id));
+}
+
+#[tokio::test]
+async fn remember_reports_a_degraded_write_and_still_stores_the_fact() {
+    let vector = ArmedSearchStore::new();
+    let ltm = LongTermMemory::builder(MemoryEngineConfig::default())
+        .stores(stores_with(Arc::new(vector.clone())))
+        .embedding(Arc::new(HashEmbedding::new(16)))
+        .build()
+        .expect("facade");
+    let scope = scope();
+
+    // One stored user-profile record creates the vector collection the scan reads, so the
+    // armed failure is reached instead of the scan short-circuiting on "no collection".
+    ltm.add(
+        &scope,
+        NewMemory::new("Alice prefers tea", MemoryType::UserProfile),
+        &AddOptions::default(),
+    )
+    .await
+    .expect("add");
+
+    // The read half of the vector store is broken before the `remember` write, so the
+    // analyzer's fact is stored without any duplicate check.
+    vector.fail_search();
+    let conversation = ExtractionInput::from_text("I prefer dark mode.");
+    let report = ltm
+        .remember(&scope, &conversation, &AddOptions::default())
+        .await
+        .expect("remember");
+    assert_eq!(report.extracted, 1, "{report:?}");
+    assert_eq!(report.added, 1, "{report:?}");
+    assert_eq!(report.merged, 0, "{report:?}");
+    assert_eq!(report.skipped, 0, "{report:?}");
+    assert_eq!(report.gated, None, "{report:?}");
+
+    // The write's degradation is the report's: an unchecked fact write must not look
+    // like a clean one just because the analysis pass was clean.
+    let reason = report
+        .degraded
+        .as_deref()
+        .expect("a fact stored without a duplicate check must be caller-visible");
+    assert!(
+        reason.contains("duplicate candidate scan failed"),
+        "{reason}"
+    );
+    assert!(reason.contains("vector index is unavailable"), "{reason}");
+
+    // The fact is still stored: the failed scan degrades the check, never the write.
+    let stored = ltm.list(&scope, &[]).await.expect("list");
+    assert_eq!(stored.len(), 2, "the unchecked fact is still stored");
+    let unchecked = stored
+        .iter()
+        .find(|record| record.content.contains("dark mode"))
+        .expect("the unchecked fact");
+    assert_eq!(unchecked.kind, MemoryType::UserProfile);
+}
+
+#[tokio::test]
+async fn a_cancelled_candidate_scan_aborts_instead_of_degrading() {
+    let vector = ArmedSearchStore::new();
+    let ltm = LongTermMemory::builder(MemoryEngineConfig::default())
+        .stores(stores_with(Arc::new(vector.clone())))
+        .embedding(Arc::new(HashEmbedding::new(16)))
+        .build()
+        .expect("facade");
+    let scope = scope();
+    let first = ltm
+        .add(
+            &scope,
+            NewMemory::semantic("Alice prefers dark mode"),
+            &AddOptions::default(),
+        )
+        .await
+        .expect("add");
+    let first_id = one_added(&first);
+
+    // A cancelled scan is not a degraded write: cancellation must abort.
+    vector.cancel_search();
+    let error = ltm
+        .add(
+            &scope,
+            NewMemory::semantic("Bob prefers light mode"),
+            &AddOptions::default(),
+        )
+        .await
+        .expect_err("cancelled scan");
+    assert!(matches!(error, Error::Cancelled), "{error:?}");
+    let listed = ltm.list(&scope, &[]).await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, first_id);
+}
+
+#[tokio::test]
+async fn a_failed_reindex_after_a_kind_change_restores_the_previous_record() {
+    let vector = FailingCollectionStore::new();
+    let ltm = LongTermMemory::builder(MemoryEngineConfig::default())
+        .stores(stores_with(Arc::new(vector.clone())))
+        .embedding(Arc::new(HashEmbedding::new(16)))
+        .build()
+        .expect("facade");
+    let scope = scope();
+    let added = ltm
+        .add(
+            &scope,
+            NewMemory::semantic("Alice prefers dark mode"),
+            &AddOptions::default(),
+        )
+        .await
+        .expect("add");
+    let id = one_added(&added);
+
+    // Only the new kind's collection rejects writes, so the kind change deletes the old
+    // vector and then fails to index the new one.
+    vector.fail(keys::vector_collection(&scope, MemoryType::UserProfile));
+    let error = ltm
+        .update(
+            &scope,
+            &id,
+            MemoryUpdate::content("Alice prefers light mode").with_kind(MemoryType::UserProfile),
+            &CallOptions::new(),
+        )
+        .await
+        .expect_err("re-index failure");
+    assert!(matches!(error, Error::Llm(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(
+        message.contains("restored"),
+        "the error must name the restored state: {message}"
+    );
+    assert!(message.contains(&id), "{message}");
+
+    let restored = ltm
+        .get(&scope, &id)
+        .await
+        .expect("get")
+        .expect("the previous record is restored, not deleted");
+    assert_eq!(restored.content, "Alice prefers dark mode");
+    assert_eq!(restored.kind, MemoryType::SemanticMemory);
+
+    // The previous vector was re-indexed, so the record is searchable again.
+    let hits = ltm
+        .search(
+            &scope,
+            "Alice prefers dark mode",
+            &SearchOptions::default().with_threshold(0.0),
+        )
+        .await
+        .expect("search");
+    assert!(
+        hits.iter().any(|hit| hit.record.id == id),
+        "the restored record must be searchable, got {hits:?}"
+    );
 }

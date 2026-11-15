@@ -32,7 +32,10 @@
 //! `add`, and an ordinary recall never returns it. It becomes recallable only when a
 //! caller passes the kind explicitly in `SearchOptions::kinds`.
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
+use openjiuwen_retrieval::embedding::Embedding;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -91,6 +94,27 @@ impl super::MemoryEngine {
         value: &str,
         options: &AddOptions,
     ) -> Result<VariableWrite> {
+        self.write_variable_with_embedding(scope, name, value, options, None)
+            .await
+    }
+
+    /// Stores `name = value` with `embedding` as the embedder of this call.
+    ///
+    /// `embedding` is the handle a per-scope override resolved to; `None` means "use the
+    /// engine's own model". The projection record is embedded with it (unless
+    /// `options.skip_embedding`).
+    ///
+    /// # Errors
+    ///
+    /// See `MemoryEngine::write_variable`.
+    pub async fn write_variable_with_embedding(
+        &self,
+        scope: &MemoryScope,
+        name: &str,
+        value: &str,
+        options: &AddOptions,
+        embedding: Option<&Arc<dyn Embedding>>,
+    ) -> Result<VariableWrite> {
         scope.validate()?;
         validate_variable_name(name)?;
         self.check_forbidden_variable(name)?;
@@ -104,8 +128,11 @@ impl super::MemoryEngine {
         let previous = self.variable_projection(scope, &id).await?;
         let record = self.projection_record(scope, &id, name, value, previous.as_ref(), now);
 
-        let embedding = if self.has_embedding() && !options.skip_embedding {
-            Some(self.embed_text(&record.content, &options.call).await?)
+        let vector = if self.has_embedding_with(embedding) && !options.skip_embedding {
+            Some(
+                self.embed_text_with(embedding, &record.content, &options.call)
+                    .await?,
+            )
         } else {
             None
         };
@@ -114,7 +141,7 @@ impl super::MemoryEngine {
             .set_variable(scope, scope.session_id.as_deref(), name, value)
             .await?;
         options.call.check()?;
-        self.persist(&record, embedding.as_deref()).await?;
+        self.persist(&record, vector.as_deref()).await?;
         Ok(VariableWrite {
             record_id: id,
             created: previous.is_none(),

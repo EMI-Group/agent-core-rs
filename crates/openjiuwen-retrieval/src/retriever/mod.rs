@@ -17,8 +17,8 @@
 //! - [`AgenticRetriever`] loops retrieve → read triples → rewrite and fuses every
 //!   iteration, working offline with deterministic heuristics unless a model is
 //!   supplied.
-//! - [`rrf_fusion`] and [`deduplicate`] merge result lists the way Python's
-//!   `rrf_fusion` does.
+//! - [`rrf_fusion`], [`weighted_fusion`], and [`deduplicate`] merge result lists
+//!   the way Python's `rrf_fusion` and Milvus' weighted ranker do.
 
 pub mod agentic;
 pub mod fusion;
@@ -28,7 +28,10 @@ pub mod sparse;
 pub mod vector;
 
 pub use agentic::{AgenticConfig, AgenticRetriever, AgenticStopReason, AgenticTrace};
-pub use fusion::{deduplicate, rrf_fusion, rrf_fusion_default, DEFAULT_RRF_K};
+pub use fusion::{
+    deduplicate, rrf_fusion, rrf_fusion_channels, rrf_fusion_default, rrf_fusion_weighted,
+    weighted_fusion, DEFAULT_RRF_K,
+};
 pub use graph::GraphRetriever;
 pub use hybrid::HybridRetriever;
 pub use sparse::SparseRetriever;

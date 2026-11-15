@@ -7,6 +7,7 @@ All three are `GuardrailBackend` implementations, so they plug into `BackendGuar
 They have no Python counterpart (Python ships only the `ApiModelBackend` transport seam); they exist because the crate's parity goal names OpenAI, Azure, and Aliyun moderation as the deferred adapters.
 No vendor SDK is linked: requests are built with `HttpRequest` and sent through the shared `HttpClient`, so the whole surface is offline-testable against a loopback server.
 They depend on `crate::backends::http` for client construction (`http_client`), status/JSON mapping (`json_body`), and timeout sanitising (`resolve_timeout`).
+A `2xx` reply is graded only when it carries the vendor's documented schema; a body whose schema the adapter does not recognize is an `Error::Validation`, never a fabricated safe verdict.
 
 ## API Surface
 
@@ -60,11 +61,23 @@ Crate root re-exports the three backends and their configs plus `AliyunGreenAuth
 Every config is `serde` (`snake_case`, `#[serde(default)]`, unknown fields tolerated), keeps seconds as `f64` (Python-style timeouts), and hides credentials behind `SecretString`.
 `Default` values: OpenAI — public URL at construction, no key, `omni-moderation-latest`, `30.0` s, 2 retries, risk type `openai_moderation`; Azure — no endpoint, API version `2024-09-01`, the four default categories, `30.0` s, 2 retries, risk type `azure_content_safety`; Aliyun — public endpoint, `AliyunGreenAuth::None`, `nickname_detection`, `2022-03-02`, region `cn-shanghai`, `30.0` s, 2 retries, risk type `aliyun_green`.
 
+## Reply Schema Contract
+
+Each adapter splits its `parse_response` branches into a recognized benign verdict and an unrecognized schema; nothing else may produce `Ok(safe_assessment())`.
+A recognized benign verdict is a reply the adapter fully understands and that reports no risk: OpenAI `results[0].flagged == false`, Azure a non-empty `categoriesAnalysis` with at least one `{severity}` entry whose grades are all `0`, Aliyun a `200` `Code` whose `Data` object carries `Labels` or `Result` with an empty label union and no positive `Confidence`.
+An unrecognized schema returns `Error::validation` naming the vendor and the required fields: `"openai moderation reply does not match the moderations schema: expected a non-empty `results` array whose first entry carries a boolean `flagged`"`, `"azure content safety reply does not match the text:analyze schema: expected a non-empty `categoriesAnalysis` array holding at least one `{category, severity}` entry"`, and `"aliyun green reply does not match the TextModeration envelope: expected an integer `Code` and a `Data` object carrying `Labels` or `Result`"`.
+The empty-object body (`json!({})`), a missing/empty/non-array result list, a non-object result entry, a missing or non-boolean `flagged`, a missing/empty/entry-less `categoriesAnalysis`, and an absent `Code`/`Data` envelope all take that validation branch.
+Messages carry the vendor name and field names only: no matched words, no raw body, no scanned text, no credential.
+The pipeline records the error as an evaluation failure, and under the crate's default `FailurePolicy::FailClosed` it becomes a blocking `CRITICAL` finding (`risk_type = "guardrail_error"`) instead of letting the call through — which is the point of rejecting the shape rather than guessing it is clean.
+Value-level tolerance is unchanged and never errors: an out-of-range or unreadable severity/confidence value keeps the documented clamp into the severity bands, and unknown score values keep their documented band.
+Blank or whitespace-only text is short-circuited to `safe_assessment()` inside `analyze` before any request (nothing to scan), so it never reaches `parse_response`.
+
 ## Wire Contracts
 
 **OpenAI** — `POST {api_url}` (default `https://api.openai.com/v1/moderations`) with `{"input": <text>, "model": <model>}`.
 `OpenAI-Organization` is sent when configured non-blank; `Authorization: Bearer <key>` only when a non-empty key is set.
-`results` missing, empty, or non-array → `Error::Transport`; `results[0].flagged != true` → safe assessment.
+`results` missing, empty, or non-array → `Error::Validation`; a first `results` entry that is not an object, or that has no boolean `flagged`, → `Error::Validation`.
+`results[0].flagged == false` is a recognized benign verdict → safe assessment.
 A flagged result takes its severity from the highest finite `category_scores` entry (`>= 0.90` Crit, `>= 0.75` High, `>= 0.50` Medium, else Low; ties go to the lexicographically smaller category) and reports that category as the risk type with the score as confidence.
 A flagged result without scores reports `High` with the configured `risk_type` and confidence `1.0`.
 `details`: `provider` = `"openai"`, `model` (result model, else response model, else configured), `categories` (sorted flagged names), `top_score` (4-decimal), `request_id` when the reply carries one.
@@ -72,26 +85,28 @@ A flagged result without scores reports `High` with the configured `risk_type` a
 **Azure** — `POST {endpoint}/contentsafety/text:analyze?api-version={version}` with `{"text": <text>, "categories": [...]}`.
 `analyze_url` keeps a configured endpoint that already contains `contentsafety/text:analyze` (appending `api-version` only when it has no query) and trims a trailing `/`.
 The resource key travels in `Ocp-Apim-Subscription-Key`, never as a bearer token, and is omitted when blank.
-`categoriesAnalysis` missing/empty → `Error::Transport`; every severity `0` → safe.
+`categoriesAnalysis` missing, non-array, empty, or without any object carrying a `severity` member → `Error::Validation`; an `error` object on a `2xx` reply → `Error::Transport` naming the vendor `code`.
 Severities are clamped to `0..=7` (floats truncated, negatives/non-numerics read as `0`) and band as `1..=2` Low, `3..=4` Medium, `5..=6` High, `>= 7` Critical; the highest category names the risk type (ties keep the first in wire order) and confidence is `max_severity / 7` rounded to 4 decimals.
+Every recognized severity `0` is a benign verdict → safe assessment.
 `details`: `provider` = `"azure"`, `categories` (name → severity map), `max_severity`, `blocklist_matches` (count only; blocklist terms are dropped).
-A 2xx reply carrying an `error` object becomes `Error::Transport` naming the vendor `code`.
 
 **Aliyun** — `POST {endpoint}` with the `TextModeration` RPC (version `2022-03-02`) and body `{"Service": <service>, "ServiceParameters": "{\"content\": <text>}"}`.
 Headers `host`, `x-acs-action: TextModeration`, `x-acs-version`, `x-acs-date` (RFC 3339 UTC), `x-acs-signature-nonce` (UUID v4), `x-acs-content-sha256` (SHA-256 of the body).
 `AliyunGreenAuth::Bearer` sends `Authorization: Bearer <token>`; `Aksk` builds `ACS3-HMAC-SHA256 Credential=<id>,SignedHeaders=host;x-acs-action;x-acs-content-sha256;x-acs-date;x-acs-signature-nonce;x-acs-version,Signature=<hex>` over the canonical request (`POST\n/\n<headers>\n<signed names>\n<body sha>`), signed with an in-module RFC 2104 HMAC-SHA256 over `sha2` (the access key secret is never transmitted).
-`Code` absent, non-integer, or non-`200` → `Error::Transport` quoting the code and at most 120 characters of the collapsed `Message`.
-`Data.Labels` is split on `,`, trimmed, and filtered; blank or `nonLabel`-only labels → safe, otherwise the first label is the risk type.
+`Code` absent or non-integer, or a `Data` value that is not an object carrying `Labels` or `Result` → `Error::Validation`.
+An integer `Code` other than `200` → `Error::Transport` quoting the code and at most 120 characters of the collapsed `Message`.
+`Data.Labels` is split on `,`, trimmed, and filtered; blank or `nonLabel`-only labels with no positive `Confidence` → benign verdict → safe assessment, otherwise the first label is the risk type.
 Confidence is the maximum `Data.Result[].Confidence` (`0..=100`) banded at `90`/`75`/`50` and reported as `max / 100` rounded to 4 decimals; no score reports `High` with confidence `1.0`.
 `details`: `provider` = `"aliyun"`, `service`, `region`, `labels`, `confidence`, `request_id` when present; vendor `RiskWords`, `Reason`, and per-result `RiskWords` are deliberately dropped.
 
 ## Constraints
 
 - `GuardrailBackend` is object-safe and async; `name()` returns the module `NAME` constant.
-- Every adapter short-circuits blank/whitespace `text_view()` to `crate::backends::safe_assessment()` without any HTTP call.
+- Every adapter short-circuits blank/whitespace `text_view()` to `crate::backends::safe_assessment()` inside `analyze` without any HTTP call, before `parse_response`.
 - Secrets are `SecretString`; `Debug` prints presence/kind only, and serialization keeps plaintext for config round-trips.
-- Findings never carry scanned text or vendor matched words; errors carry service, status, vendor code, and a bounded body excerpt only.
-- Failure mapping is uniform: `Error::Validation` for unusable construction input, `Error::Transport` for status/decoding/vendor-code failures, `Error::Timeout` when the deadline expires, `Error::Config` when the shared client cannot be built.
+- Findings never carry scanned text or vendor matched words; errors carry service, status, vendor code, the vendor name, the mismatched field names, and a bounded body excerpt only.
+- Failure mapping is uniform: `Error::Validation` for unusable construction input and for a reply whose schema is not recognized, `Error::Transport` for status/decoding/vendor-code failures, `Error::Timeout` when the deadline expires, `Error::Config` when the shared client cannot be built.
+- A `2xx` body the adapter cannot read never becomes a safe assessment, so the fail-closed pipeline default turns it into a blocking finding rather than an allow.
 - Retries come from the shared client (`429` and `5xx`, exponential backoff capped at 5 s); `max_retries = 0` sends exactly one request, which is what the test suites use.
 - One request per scan and only the first result is graded (OpenAI `results[0]`); batch/streaming moderation is out of scope.
 - `OpenAiModerationBackend` and `AliyunGreenBackend` derive `Clone` (their `HttpClient` is cloneable); `AzureContentSafetyBackend` does not derive `Clone` but is rebuildable from `config()`.
@@ -100,13 +115,15 @@ Confidence is the maximum `Data.Result[].Confidence` (`0..=100`) banded at `90`/
 ## Routing Table
 
 - `./mod.rs` → module list and the six re-exports
-- `./openai.rs` → OpenAI moderation config/backend, score-band mapping, wire + loopback tests behind the module docs
-- `./azure.rs` → Azure Content Safety config/backend, URL composition, severity mapping, wire + loopback tests
-- `./aliyun/` → Aliyun Green adapter as a directory module (`src/backends/vendors/aliyun/CONTEXT.md`): `mod.rs` (config/auth/backend, RPC body, label/confidence mapping), `signing.rs` (ACS3-HMAC-SHA256), `tests.rs` (wire + loopback tests)
+- `./openai.rs` → OpenAI moderation config/backend, schema rejection, score-band mapping, wire + loopback tests behind the module docs
+- `./azure.rs` → Azure Content Safety config/backend, URL composition, schema rejection, severity mapping, wire + loopback tests
+- `./aliyun/` → Aliyun Green adapter as a directory module (`src/backends/vendors/aliyun/CONTEXT.md`): `mod.rs` (config/auth/backend, RPC body, envelope rejection, label/confidence mapping), `signing.rs` (ACS3-HMAC-SHA256), `tests.rs` (wire + loopback tests)
 
 ## Test Strategy
 
 - Each module carries `#[cfg(test)] mod tests` over a loopback `wiremock` server: exact request path/headers/body, credential placement, benign vs flagged replies, band boundaries, missing/error payloads, and empty-text short-circuit.
+- Each adapter pins the schema boundary directly: `json!({})`, the vendor's empty-results / entry-less-`categoriesAnalysis` / missing-`Data` shape, and a non-boolean `flagged` or non-integer `Code` assert `ErrorKind::Validation` with a message naming the vendor and the required fields and repeating no payload text.
+- Each adapter also pins that a recognized benign reply still yields `RiskLevel::Safe` with no `details`, so the schema check cannot swallow genuine clean verdicts.
 - Config tests pin every default, the serde round-trip, unknown-field tolerance, and that `Debug` never prints a credential.
 - Aliyun additionally pins SHA-256/HMAC-SHA256 test vectors and the determinism of the canonical request and signature; the live wire test mounts a `Bearer`/`Aksk` request and checks the header shape.
 - Crate-level behaviour through the pipeline (blocking, failure policy, stage binding, no content leak) lives in `crates/openjiuwen-security/tests/adapters.rs`.

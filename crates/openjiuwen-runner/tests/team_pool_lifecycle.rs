@@ -1,5 +1,5 @@
 //! The team runtime pool's lifecycle: `stop`, `stop_all`, the concurrency bound
-//! with queued admission, and `pause`/`resume`.
+//! with queued admission, and the typed `pause`/`resume` refusals.
 //!
 //! Every case runs a real in-process handoff team whose single member blocks on a
 //! gate nobody opens, so a "live run" is genuinely live (it holds the key, the
@@ -7,7 +7,8 @@
 //! from the pool.
 //!
 //! Ports `team_runner.py::_TeamRunnerMixin.stop_agent_team` /
-//! `pause_agent_team` / `_maybe_release_team_session`, the
+//! `pause_agent_team` (kept as a typed refusal: an in-process strategy has no
+//! mid-flight suspension seam) / `_maybe_release_team_session`, the
 //! `TeamRuntimeManager.activate` admission guard (Python's pool bound), and
 //! `TeamRuntimeManager.finalize` (the exactly-once teardown).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -285,12 +286,12 @@ async fn a_start_beyond_the_capacity_queues_until_a_permit_frees() {
 }
 
 // ---------------------------------------------------------------------------
-// pause / resume
+// pause / resume refusals
 // ---------------------------------------------------------------------------
 
-// ports team_runner.py::_TeamRunnerMixin.pause_agent_team
+// ports team_runner.py::_TeamRunnerMixin.pause_agent_team (a typed refusal)
 #[tokio::test]
-async fn pause_and_resume_flip_the_gate_and_reject_unknown_keys() {
+async fn pause_and_resume_refuse_a_live_key_and_reject_unknown_ones() {
     let pool = TeamPool::new();
     let (team, _gate) = blocked_team("pause-crew");
     let run = pool
@@ -301,32 +302,37 @@ async fn pause_and_resume_flip_the_gate_and_reject_unknown_keys() {
     let mut frames = run.subscribe();
     until(|| run.state() == RunPhase::Running).await;
 
-    pool.pause(&key).unwrap();
-    let paused = pool.get(&key).expect("the entry stays while paused");
-    assert_eq!(paused.state, RunPhase::Paused);
-    assert!(paused.gate_closed, "pause closes the interaction gate");
-    assert!(paused.running, "pausing releases no permit");
-    assert_eq!(run.state(), RunPhase::Paused);
-    assert_eq!(pool.list_active().len(), 1, "a paused run is still active");
+    for (action, result) in [("pause", pool.pause(&key)), ("resume", pool.resume(&key))] {
+        let error = result.expect_err("a live pooled run cannot be suspended");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("`{action}`"))
+                && message.contains(run.run_id())
+                && message.contains("InteractGate")
+                && message.contains("cancel"),
+            "the refusal names the call, the run, the missing seam, and the              alternative: {message}"
+        );
+    }
 
-    pool.resume(&key).unwrap();
-    let resumed = pool.get(&key).expect("the entry stays after resume");
-    assert_eq!(resumed.state, RunPhase::Running);
-    assert!(!resumed.gate_closed, "resume opens the gate again");
+    // The refusal changed nothing: same phase, open gate, permit and entry kept.
+    let live = pool.get(&key).expect("the entry stays live");
+    assert_eq!(live.state, RunPhase::Running);
+    assert!(!live.gate_closed, "the refusal left the gate open");
+    assert!(live.running, "the refusal released no permit");
     assert_eq!(run.state(), RunPhase::Running);
+    assert_eq!(pool.list_active().len(), 1);
 
-    // Both signals are published as frames (best effort, never replayed).
+    // Nothing is published for a refused pause/resume.
     let published: Vec<PoolFrame> = std::iter::from_fn(|| frames.try_recv().ok()).collect();
     assert!(
-        published.contains(&PoolFrame::Paused),
-        "the pause frame was published: {published:?}"
-    );
-    assert!(
-        published.contains(&PoolFrame::Resumed),
-        "the resume frame was published: {published:?}"
+        !published
+            .iter()
+            .any(|frame| matches!(frame, PoolFrame::Output { .. })),
+        "the blocked team published no frame yet: {published:?}"
     );
 
-    // An unknown key is a not-found error on both signals.
+    // An unknown key is a not-found error on both verbs.
     let ghost = PoolKey::new("ghost", "nowhere");
     let error = pool.pause(&ghost).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::NotFound);
@@ -337,12 +343,14 @@ async fn pause_and_resume_flip_the_gate_and_reject_unknown_keys() {
     assert_eq!(error.message(), PoolError::not_found(&ghost).to_string());
     assert_eq!(pool.resume(&ghost).unwrap_err().kind(), ErrorKind::NotFound);
 
+    // A refused pause leaves the run stoppable: the pool still cancels it.
     assert_eq!(pool.stop_all().await.stopped, 1);
+    assert_eq!(run.state(), RunPhase::Cancelled);
 }
 
 // ports team_runner.py::_TeamRunnerMixin.pause_agent_team (the leased surface)
 #[tokio::test]
-async fn a_lease_pauses_and_resumes_the_run_it_holds() {
+async fn a_lease_refusal_keeps_the_run_and_its_lease_intact() {
     let pool = TeamPool::new();
     let (team, _gate) = blocked_team("lease-pause-crew");
     let lease = pool
@@ -351,16 +359,24 @@ async fn a_lease_pauses_and_resumes_the_run_it_holds() {
         .unwrap();
     until(|| lease.state() == RunPhase::Running).await;
 
-    lease.pause().unwrap();
-    assert_eq!(lease.state(), RunPhase::Paused);
-    let paused = pool.get(lease.key()).expect("the entry is retained");
-    assert!(paused.gate_closed);
-    assert_eq!(paused.leases, 1, "the lease is still held while paused");
-
-    lease.resume().unwrap();
+    for error in [
+        lease.pause().expect_err("a live lease cannot be paused"),
+        lease.resume().expect_err("a live lease cannot be resumed"),
+    ] {
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
     assert_eq!(lease.state(), RunPhase::Running);
-    assert!(!pool.get(lease.key()).unwrap().gate_closed);
+    let live = pool.get(lease.key()).expect("the entry is retained");
+    assert!(!live.gate_closed, "the refusal left the gate open");
+    assert_eq!(live.leases, 1, "the lease is still held");
     assert!(!lease.is_released());
 
-    assert_eq!(pool.stop_all().await.stopped, 1);
+    // The leased run is still stoppable through the pool.
+    assert!(pool.stop(lease.key()).await.unwrap());
+    assert_eq!(lease.state(), RunPhase::Cancelled);
+    assert_eq!(
+        pool.stop_all().await.stopped,
+        0,
+        "the run was already swept"
+    );
 }

@@ -11,11 +11,15 @@
 //! - `filters` — `list` filter combinations, ordering, pagination, `stats`, and expiry.
 //! - `search` — visibility and keyword ranking through the shared ranker.
 //! - `decode` — malformed rows degrade or skip instead of failing the listing.
+//! - `embedding` — the additive `embedding_json` column: round trip, the upgrade of a
+//!   table written before it existed, semantic ranking from stored vectors, and the
+//!   degradation of a malformed vector.
 use super::*;
 use crate::team::model::{TeamMemoryKind, TeamMemoryRecord, TeamMemoryScope};
 use chrono::{DateTime, Utc};
 mod crud;
 mod decode;
+mod embedding;
 mod filters;
 mod search;
 /// A fixed instant used as "now" in fixture records.

@@ -40,14 +40,13 @@
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use crate::fs::types::{
     CopyData, CopyParams, DeleteData, DeleteParams, FileStat, MkdirData, MkdirParams, MoveData,
     MoveParams,
 };
 use crate::result::{fs_failure, OpResult};
-use crate::util::{format_modified_time, format_path, octal_permissions};
+use crate::util::{format_path, octal_permissions};
 use crate::workspace::PathPolicy;
 
 /// Method name reported by `stat` in failure messages.
@@ -85,14 +84,27 @@ pub async fn stat(policy: &PathPolicy, path: &str) -> OpResult<FileStat> {
         Ok(metadata) => metadata,
         Err(error) => return io_failure(STAT, &resolved, &error),
     };
-    let target = tokio::fs::metadata(&resolved).await.ok();
+    let target = match tokio::fs::metadata(&resolved).await {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        // A dangling link is a normal case (both kinds are `false`); any other error means
+        // the link's target could not be inspected, which the caller should be able to see.
+        Err(error) => {
+            tracing::debug!(
+                path = %format_path(&resolved),
+                %error,
+                "cannot inspect the stat target's metadata; reporting it as a link"
+            );
+            None
+        }
+    };
     OpResult::success(FileStat {
         path: format_path(&resolved),
         is_file: target.as_ref().is_some_and(std::fs::Metadata::is_file),
         is_directory: target.as_ref().is_some_and(std::fs::Metadata::is_dir),
         is_symlink: link_metadata.file_type().is_symlink(),
         size: link_metadata.len(),
-        modified_time: format_modified_time(link_metadata.modified().unwrap_or(UNIX_EPOCH)),
+        modified_time: crate::util::modified_time_of(&link_metadata, &resolved),
         permissions: octal_permissions(&link_metadata),
     })
 }
@@ -100,7 +112,9 @@ pub async fn stat(policy: &PathPolicy, path: &str) -> OpResult<FileStat> {
 /// Returns whether `path` exists, following symbolic links.
 ///
 /// A missing path is a successful `false`, not an error; a broken symbolic link therefore
-/// reports `false` as well.
+/// reports `false` as well. Any *other* metadata failure (a permission failure on a parent
+/// directory, for instance) is also reported as `false`, matching Python's `Path.exists()`,
+/// and logged so the caller is not left guessing.
 ///
 /// # Errors
 ///
@@ -110,7 +124,18 @@ pub async fn exists(policy: &PathPolicy, path: &str) -> OpResult<bool> {
         Ok(resolved) => resolved,
         Err(reason) => return fs_failure(EXISTS, &reason),
     };
-    OpResult::success(tokio::fs::metadata(&resolved).await.is_ok())
+    match tokio::fs::metadata(&resolved).await {
+        Ok(_) => OpResult::success(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => OpResult::success(false),
+        Err(error) => {
+            tracing::debug!(
+                path = %format_path(&resolved),
+                %error,
+                "cannot read the metadata of an existence check; reporting it as absent"
+            );
+            OpResult::success(false)
+        }
+    }
 }
 
 /// Creates a directory.
@@ -248,13 +273,17 @@ pub async fn copy(policy: &PathPolicy, params: &CopyParams) -> OpResult<CopyData
     if let Some(reason) = into_itself_reason(&source, &target, is_directory, "copy") {
         return fs_failure(COPY, &reason);
     }
-    if tokio::fs::symlink_metadata(&target).await.is_ok() {
-        if !params.overwrite {
-            return fs_failure(COPY, &format!("target exists: {}", format_path(&target)));
+    match target_exists(&target).await {
+        Ok(false) => {}
+        Ok(true) => {
+            if !params.overwrite {
+                return fs_failure(COPY, &format!("target exists: {}", format_path(&target)));
+            }
+            if let Err(error) = remove_existing(&target).await {
+                return fs_failure(COPY, &error.to_string());
+            }
         }
-        if let Err(error) = remove_existing(&target).await {
-            return fs_failure(COPY, &error.to_string());
-        }
+        Err(error) => return io_failure(COPY, &target, &error),
     }
     let copied = if is_directory {
         copy_tree(&source, &target).await
@@ -300,13 +329,17 @@ pub async fn move_path(policy: &PathPolicy, params: &MoveParams) -> OpResult<Mov
     if let Some(reason) = into_itself_reason(&source, &target, is_directory, "move") {
         return fs_failure(MOVE, &reason);
     }
-    if tokio::fs::symlink_metadata(&target).await.is_ok() {
-        if !params.overwrite {
-            return fs_failure(MOVE, &format!("target exists: {}", format_path(&target)));
+    match target_exists(&target).await {
+        Ok(false) => {}
+        Ok(true) => {
+            if !params.overwrite {
+                return fs_failure(MOVE, &format!("target exists: {}", format_path(&target)));
+            }
+            if let Err(error) = remove_existing(&target).await {
+                return fs_failure(MOVE, &error.to_string());
+            }
         }
-        if let Err(error) = remove_existing(&target).await {
-            return fs_failure(MOVE, &error.to_string());
-        }
+        Err(error) => return io_failure(MOVE, &target, &error),
     }
     match tokio::fs::rename(&source, &target).await {
         Ok(()) => {}
@@ -349,6 +382,20 @@ fn io_failure<T>(execution: &str, path: &Path, error: &std::io::Error) -> OpResu
         );
     }
     fs_failure(execution, &error.to_string())
+}
+
+/// Returns whether `path` exists, distinguishing "absent" from "cannot be inspected".
+///
+/// # Errors
+///
+/// Returns the OS error when the path's existence cannot be determined at all (a permission
+/// failure or a symlink loop), so a rejected overwrite is not silently skipped.
+async fn target_exists(path: &Path) -> std::io::Result<bool> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Returns the reason a target is invalid relative to its source, if any.
@@ -951,5 +998,36 @@ mod tests {
             into_itself.message
         );
         assert!(root(&dir).join("dst/nested/a.txt").exists());
+    }
+    /// A target whose existence cannot be determined is an error, not "absent".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_reports_an_unreadable_target_instead_of_overwriting_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("b.txt"), b"old").unwrap();
+        let policy = policy(&dir);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = copy(&policy, &CopyParams::new("a.txt", "locked/b.txt")).await;
+        let enforced = std::fs::metadata(locked.join("b.txt")).is_err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !enforced {
+            eprintln!("skipping: permission bits are not enforced for this user");
+            return;
+        }
+        assert_eq!(result.code, 199_003, "{}", result.message);
+        assert!(
+            !result.message.contains("target exists"),
+            "an inspection failure must not be reported as an existing target: {}",
+            result.message
+        );
+        assert_eq!(
+            std::fs::read(root(&dir).join("locked/b.txt")).unwrap(),
+            b"old".to_vec(),
+            "the unreadable target must be left untouched"
+        );
     }
 }

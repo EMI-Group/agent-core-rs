@@ -332,11 +332,13 @@ impl MessageQueueConfig {
 ///
 /// Distributed execution is **deferred** in this port: the struct preserves
 /// Python's field names and defaults so configuration round-trips, but
-/// [`crate::Runner`] never starts a broker — [`crate::Runner::start`] refuses a
+/// [`crate::Runner`] never starts a broker — [`crate::Runner::start`], the six
+/// execution entry points, and pool admission refuse a
 /// [`RunnerConfig::distributed_mode`] runner with `Error::Unsupported` naming the
-/// missing `drunner/` transports (Pulsar/ZeroMQ reply-topic routing,
-/// `RemoteProtocol::Mq`/`A2a`, cross-process attach). The values are persisted
-/// and inspected by hosts; nothing in-process reads them. See `docs/PARITY.md`.
+/// missing `drunner/` transports (`Pulsar`/`ZeroMQ` reply-topic routing,
+/// `RemoteProtocol::Mq`/`A2a`, cross-process attach) through
+/// [`RunnerConfig::require_local`]. The values are persisted and inspected by
+/// hosts; nothing in-process reads them. See `docs/PARITY.md`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct DistributedConfig {
@@ -372,12 +374,15 @@ pub struct RunnerConfig {
     /// Whether distributed execution was configured (Python `distributed_mode`).
     ///
     /// Persisted and inspected by hosts, but **execution is refused**: this build
-    /// ships no distributed transport (`drunner/` — Pulsar/ZeroMQ reply-topic
+    /// ships no distributed transport (`drunner/` — `Pulsar`/`ZeroMQ` reply-topic
     /// routing, `RemoteProtocol::Mq`/`A2a`, cross-process attach), so
-    /// [`crate::Runner::start`] returns `Error::Unsupported` naming it.
+    /// [`crate::Runner::start`], the six execution entry points, and pool
+    /// admission all return `Error::Unsupported` naming it
+    /// ([`RunnerConfig::require_local`] is the one guard they share).
     /// [`crate::Runner::with_config`] still accepts the tree (a host can build,
-    /// serialize, and inspect it) and every in-process path — runs, callbacks,
-    /// registries, the team pool — is unaffected by the flag.
+    /// serialize, and inspect it), callbacks and registries keep working, and the
+    /// spawn seam stays local: a spawned child is backend-selected, not
+    /// mode-selected.
     pub distributed_mode: bool,
     /// Distributed settings (kept for parity and future use).
     pub distributed: DistributedConfig,
@@ -451,9 +456,11 @@ impl RunnerConfig {
 
     /// Enables distributed mode: configuration only.
     ///
-    /// The flag round-trips and is visible to hosts, but [`crate::Runner::start`]
-    /// refuses a distributed runner (`Error::Unsupported`) until a distributed
-    /// transport lands; see [`RunnerConfig::distributed_mode`].
+    /// The flag round-trips and is visible to hosts, but every entry point that
+    /// would need a distributed transport — [`crate::Runner::start`], the six
+    /// execution entry points, and pool admission — refuses with
+    /// `Error::Unsupported` until a transport lands; see
+    /// [`RunnerConfig::distributed_mode`] and [`RunnerConfig::require_local`].
     #[must_use]
     pub fn with_distributed_mode(mut self, enabled: bool) -> Self {
         self.distributed_mode = enabled;
@@ -494,6 +501,35 @@ impl RunnerConfig {
             .as_ref()
             .and_then(|config| config.path.as_ref())
     }
+
+    /// Refuses a distributed-configured runner on an entry point that would need
+    /// a distributed transport.
+    ///
+    /// `Ok(())` when [`RunnerConfig::distributed_mode`] is off. Otherwise a typed
+    /// [`openjiuwen_common::error::Error::Unsupported`] naming the mode and the
+    /// reason: this build ships no distributed transport (`Pulsar`, `ZeroMQ`, and `A2A`
+    /// reply-topic transports are deferred).
+    ///
+    /// This is the **one** guard every such path consults, so the wording is
+    /// identical and no path runs in-process under a distributed name:
+    /// [`crate::Runner::start`], the six execution entry points
+    /// ([`crate::run::invoke_agent`], [`crate::run::stream_agent`],
+    /// [`crate::run::invoke_workflow`], [`crate::run::stream_workflow`],
+    /// [`crate::run::invoke_team`], [`crate::run::stream_team`], through
+    /// [`crate::run::RunServices::require_local`]), and pool admission
+    /// ([`crate::pool::TeamPool::start`], [`crate::pool::TeamPool::try_start`],
+    /// [`crate::pool::TeamPool::acquire`]).
+    ///
+    /// # Errors
+    ///
+    /// [`openjiuwen_common::error::ErrorKind::Unsupported`] when
+    /// [`RunnerConfig::distributed_mode`] is on.
+    pub fn require_local(&self) -> openjiuwen_common::error::Result<()> {
+        if self.distributed_mode {
+            return Err(crate::error::distributed_mode());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -525,6 +561,41 @@ mod tests {
         let text = serde_json::to_string(&config).expect("serialize");
         let back: RunnerConfig = serde_json::from_str(&text).expect("deserialize");
         assert_eq!(back, config);
+    }
+
+    #[test]
+    fn require_local_accepts_a_local_runner() {
+        assert!(RunnerConfig::default().require_local().is_ok());
+        assert!(RunnerConfig::default()
+            .with_distributed_mode(false)
+            .require_local()
+            .is_ok());
+    }
+
+    #[test]
+    fn require_local_refuses_a_distributed_runner_with_one_message() {
+        let error = RunnerConfig::default()
+            .with_distributed_mode(true)
+            .require_local()
+            .expect_err("distributed mode has no transport");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Unsupported
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("distributed runner mode"),
+            "`{message}` should name the mode"
+        );
+        for transport in ["Pulsar", "ZeroMQ", "A2A"] {
+            assert!(
+                message.contains(transport),
+                "`{message}` should name {transport} as deferred"
+            );
+        }
+        assert!(message.contains("deferred"), "`{message}` should say why");
+        // The guard is the crate's single source of truth for this wording.
+        assert_eq!(message, crate::error::distributed_mode().to_string());
     }
 
     #[test]

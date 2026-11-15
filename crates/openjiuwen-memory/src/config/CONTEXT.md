@@ -127,13 +127,13 @@ impl Default for StorageBackend { /* InMemory */ }
 
 ## Validation Rules (`MemoryEngineConfig::validate`)
 
-- `default_top_k > 0`; `0.0 <= default_threshold <= 1.0`; `0.0 <= importance_default <= 1.0`.
-- `searchable_kinds` non-empty and contains no `Variable`; duplicates rejected.
-- `ranking`: every weight finite and `>= 0`; `similarity_weight + keyword_weight > 0`; `semantic_weight + importance_weight + recency_weight > 0`; `recency_half_life_secs > 0`; `max_candidates > 0`; `keyword_min_score`/`threshold` in `0..=1`.
+- `default_top_k > 0`; `0.0 <= default_threshold <= 1.0`; `0.0 <= importance_default <= 1.0`; `token_budget` is either absent or `> 0` (`Some(0)` is rejected because a zero budget would silently empty every recall).
+- `searchable_kinds` non-empty, contains neither `Variable` (not searchable) nor `Unknown` (no record is stored under it), and has no duplicates.
+- `ranking`: every weight finite and `>= 0`; `similarity_weight + keyword_weight > 0`; `semantic_weight + importance_weight + recency_weight > 0`; `recency_half_life_secs > 0`; `max_candidates > 0`; `candidate_multiplier` positive and finite; `keyword_min_score`/`threshold` in `0..=1`.
 - `dedupe`: thresholds in `0..=1`, `candidate_top_k > 0`.
 - `extraction`: `max_facts > 0`, `min_message_len > 0`.
-- `graph`: `max_depth <= 4`, `max_neighbors > 0`, `min_score` in `0..=1`.
-- `coding`: `max_index_lines > 0`, `default_fact_type` non-empty.
+- `graph`: `max_depth <= 4`, `max_neighbors > 0`, `max_entities > 0`, `min_score` in `0..=1`.
+- `coding`: `max_index_lines > 0`, `fact_types` non-empty with no blank entry, `default_fact_type` non-empty and a member of `fact_types`.
 - `input_msg_max_len > 0`, `single_turn_history_summary_max_token > 0`, `message_history_limit > 0`.
 - Errors are `Error::Config` with the field name and offending value.
 
@@ -160,5 +160,5 @@ Rust-only defaults are the ranking/dedupe/graph/coding knobs documented above; c
 
 ## Test Strategy
 
-- Unit tests assert every default value, JSON round-trip, unknown-field tolerance, and each validation failure (one test per rule).
+- Unit tests assert every default value, JSON round-trip, unknown-field tolerance, and each validation failure (one test per rule, including a zero `token_budget`, a non-positive `candidate_multiplier`, `graph.max_entities == 0`, an empty or blank `fact_types`, a `default_fact_type` outside `fact_types`, and `Unknown` in `searchable_kinds`).
 - A test pins the documented weight sums (`0.70 + 0.30`, `0.85 + 0.10 + 0.05`) so a default drift breaks visibly.

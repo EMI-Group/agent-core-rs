@@ -133,6 +133,9 @@ impl TeamMemoryRecord {
             title: optional_string(object, "title")?,
             importance: record.importance,
             tags: tag_list(object)?,
+            // The vector is not part of the reserved metadata payload, so it comes from
+            // the projected record itself when it has one.
+            embedding: record.embedding.clone(),
             metadata: Value::Object(metadata),
             created_at: record.timestamp,
             updated_at: record.updated_at,

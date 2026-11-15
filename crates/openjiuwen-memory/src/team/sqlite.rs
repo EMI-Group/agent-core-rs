@@ -10,8 +10,9 @@
 //!
 //! One row per [`TeamMemoryRecord`]: the scalar fields map to columns of the same name,
 //! `visibility`/`tags`/`metadata` are stored as JSON text (`visibility_json`,
-//! `tags_json`, `metadata_json`, always present), and `expires_at` is `NULL` when the
-//! record never expires. Timestamps are RFC 3339 UTC strings with millisecond precision
+//! `tags_json`, `metadata_json`, always present), `embedding` is `embedding_json` (a JSON
+//! array of numbers, `NULL` when the record carries no vector), and `expires_at` is
+//! `NULL` when the record never expires. Timestamps are RFC 3339 UTC strings with millisecond precision
 //! and a literal `Z`, which makes them lexicographically ordered exactly like the
 //! instants they denote — so `ORDER BY`, `MIN`/`MAX`, and the expiry comparisons are plain
 //! text comparisons (see `sqlite::schema`).
@@ -81,8 +82,8 @@ const LOG_TARGET: &str = "openjiuwen_memory::team";
 const UPSERT_SQL: &str = "\
 INSERT INTO team_memories
     (id, team_id, member_id, session_id, kind, visibility_json, title, content, importance,
-     tags_json, metadata_json, source, created_at, updated_at, expires_at)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+     tags_json, metadata_json, source, created_at, updated_at, expires_at, embedding_json)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
 ON CONFLICT(id) DO UPDATE SET
     team_id = excluded.team_id,
     member_id = excluded.member_id,
@@ -96,7 +97,8 @@ ON CONFLICT(id) DO UPDATE SET
     metadata_json = excluded.metadata_json,
     source = excluded.source,
     updated_at = excluded.updated_at,
-    expires_at = excluded.expires_at
+    expires_at = excluded.expires_at,
+    embedding_json = excluded.embedding_json
 RETURNING created_at";
 /// The read ordering of every listing: newest update first, then id.
 const LIST_ORDER: &str = " ORDER BY updated_at DESC, id ASC";
@@ -168,6 +170,7 @@ impl SqliteTeamMemoryStore {
                 .await
                 .map_err(Error::external)?;
         }
+        ensure_embedding_column(&pool).await?;
         Ok(Self { pool })
     }
     /// The underlying pool, for callers that need to run companion queries.
@@ -294,6 +297,42 @@ fn bind_params<'q>(
     }
     query
 }
+/// Adds [`schema::EMBEDDING_COLUMN`] to a table that predates it.
+///
+/// The base DDL already creates the column, so the `ALTER TABLE` only runs against a
+/// database written by an older release. `pragma_table_info` is the existence check
+/// because `SQLite` cannot express `ADD COLUMN IF NOT EXISTS`, which keeps the schema
+/// step idempotent: reopening the same file runs zero `ALTER` statements.
+///
+/// # Errors
+///
+/// [`Error::External`] when the column list cannot be read or the `ALTER TABLE` fails.
+async fn ensure_embedding_column(pool: &SqlitePool) -> Result<()> {
+    let rows = sqlx::query("SELECT name FROM pragma_table_info('team_memories')")
+        .fetch_all(pool)
+        .await
+        .map_err(Error::external)?;
+    let mut present = false;
+    for row in &rows {
+        let name: String = row.try_get("name").map_err(Error::external)?;
+        if name == schema::EMBEDDING_COLUMN {
+            present = true;
+            break;
+        }
+    }
+    if !present {
+        sqlx::query(schema::ADD_EMBEDDING_COLUMN)
+            .execute(pool)
+            .await
+            .map_err(Error::external)?;
+        debug!(
+            target: LOG_TARGET,
+            column = schema::EMBEDDING_COLUMN,
+            "added the team memory embedding column to an existing table"
+        );
+    }
+    Ok(())
+}
 /// Decodes an aggregate timestamp column (`oldest`/`newest`).
 ///
 /// A `NULL` (no matching row) is `None`; an unparseable value is `None` plus a warning,
@@ -321,6 +360,12 @@ impl TeamMemoryStore for SqliteTeamMemoryStore {
         let visibility_json = serde_json::to_string(&record.visibility).map_err(Error::external)?;
         let tags_json = serde_json::to_string(&record.tags).map_err(Error::external)?;
         let metadata_json = serde_json::to_string(&record.metadata).map_err(Error::external)?;
+        let embedding_json = record
+            .embedding
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(Error::external)?;
         let created_at = render_ts(record.created_at);
         let updated_at = render_ts(record.updated_at);
         let expires_at = record.expires_at.map(render_ts);
@@ -340,6 +385,7 @@ impl TeamMemoryStore for SqliteTeamMemoryStore {
             .bind(&created_at)
             .bind(&updated_at)
             .bind(expires_at.as_deref())
+            .bind(embedding_json.as_deref())
             .fetch_one(&self.pool)
             .await
             .map_err(Error::external)?;
@@ -408,7 +454,14 @@ impl TeamMemoryStore for SqliteTeamMemoryStore {
         }
         let mut records = self.fetch_records(&where_clause, "").await?;
         records.retain(|record| scope.allows(record));
-        Ok(rank_candidates(records, query, options, Utc::now()))
+        Ok(rank_candidates(
+            records,
+            query,
+            options.query_embedding.as_deref(),
+            &options.ranking,
+            options,
+            Utc::now(),
+        ))
     }
     async fn delete(&self, team_id: &str, id: &str) -> Result<bool> {
         let result = sqlx::query("DELETE FROM team_memories WHERE team_id = ?1 AND id = ?2")

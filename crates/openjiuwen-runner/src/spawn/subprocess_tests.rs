@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
+use crate::spawn::protocol::CancelRequest;
 use openjiuwen_common::error::ErrorKind;
 
 fn assert_backend<T: SpawnedAgent>() {}
@@ -282,13 +283,20 @@ fn emit(out: &mut impl std::io::Write, kind: SpawnMessageKind, payload: Value) {
 /// It answers an invocation with an `output` frame, a `health_check` with a
 /// healthy `health_check_response`, and a `shutdown` with `shutdown_ack`.
 /// `FAKE_CHILD_MODE=silent_input` ignores invocations (so a caller deadline must
-/// expire) and `FAKE_CHILD_MODE=silent_shutdown` ignores a shutdown and never
-/// exits (so the parent must enforce its deadline and kill it).
+/// expire), `FAKE_CHILD_MODE=silent_shutdown` ignores a shutdown and never exits
+/// (so the parent must enforce its deadline and kill it), and
+/// `FAKE_CHILD_MODE=cancel_echo` holds an invocation open, records the request id
+/// it is holding in the file named by `FAKE_CHILD_MARKER` (the parent's barrier:
+/// one ordered stdin pipe means the cancel is written after the invoke frame), and
+/// answers a `cancel` frame with a `cancel_ack` plus a terminal `done` whose
+/// output text echoes the id and whether it matched the pending request.
 #[test]
 #[ignore = "re-executed as the hermetic protocol child by the backend tests"]
 fn fake_child() {
     use std::io::{BufRead, Write as _};
     let mode = std::env::var("FAKE_CHILD_MODE").unwrap_or_default();
+    // The request `cancel_echo` is holding open, if any.
+    let mut pending: Option<String> = None;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     // libtest prints `running 1 test` and then `test ... ` without a trailing
@@ -309,11 +317,51 @@ fn fake_child() {
                 if frame.payload.get("spawn_spec").is_some() || mode == "silent_input" {
                     continue;
                 }
+                if mode == "cancel_echo" {
+                    // Hold the request open and let the parent know it arrived.
+                    // An invocation frame is `{"inputs": <inputs>}`, so the
+                    // caller's correlation id travels inside `inputs`.
+                    pending = frame
+                        .payload
+                        .get("inputs")
+                        .and_then(|inputs| inputs.get("request_id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    if let Ok(path) = std::env::var("FAKE_CHILD_MARKER") {
+                        let _ = std::fs::write(path, pending.clone().unwrap_or_default());
+                    }
+                    continue;
+                }
                 emit(
                     &mut out,
                     SpawnMessageKind::Output,
                     AgentOutput::answer("pong").to_value(),
                 );
+            }
+            SpawnMessageKind::Cancel => {
+                let request = CancelRequest::from_frame(&frame)
+                    .expect("the parent writes a well-formed cancel frame");
+                let matched = pending.as_deref() == Some(request.request_id.as_str());
+                emit(
+                    &mut out,
+                    SpawnMessageKind::CancelAck,
+                    json!({
+                        "request_id": request.request_id,
+                        "reason": request.reason,
+                        "matched": matched,
+                    }),
+                );
+                // `done` is parsed as an `AgentOutput`, so the echo travels in its
+                // `output` text (unknown fields would be dropped by the parser).
+                emit(
+                    &mut out,
+                    SpawnMessageKind::Done,
+                    json!({
+                        "output": format!("cancelled {} matched {}", request.request_id, matched),
+                        "result_type": "answer",
+                    }),
+                );
+                pending = None;
             }
             SpawnMessageKind::HealthCheck => emit(
                 &mut out,
@@ -333,6 +381,81 @@ fn fake_child() {
             _ => {}
         }
     }
+}
+
+/// Waits (bounded) for the fake child to record that it read the invoke frame.
+///
+/// The marker file is the test's synchronization barrier: the child writes it
+/// from its single read loop, so once it exists the invoke frame has been
+/// consumed and the next frame on that one ordered stdin pipe is the cancel.
+async fn wait_for_marker(path: &std::path::Path) {
+    let deadline = tokio::time::Instant::now() + BOUND;
+    while !path.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the fake child never read the invoke frame"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        "req-42",
+        "the child holds the request the caller named"
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_frame_carries_the_request_id_to_the_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("invoke-seen");
+    let config = child_config_in("cancel_echo")
+        .with_env("FAKE_CHILD_MARKER", marker.to_string_lossy().into_owned());
+    let agent: Arc<dyn SpawnedAgent> = tokio::time::timeout(
+        BOUND,
+        SubprocessSpawner::new(config).spawn(SpawnSpec::class_agent("tests.spawn", "FakeAgent")),
+    )
+    .await
+    .expect("spawn must not hang")
+    .expect("the fake child launches");
+    let sender = Arc::clone(&agent);
+    let request = tokio::spawn(async move {
+        sender
+            .send(json!({"request_id": "req-42", "work": "endless"}))
+            .await
+    });
+    wait_for_marker(&marker).await;
+    // A blank id names nothing: it is refused before a byte is written.
+    let blank = agent
+        .cancel_task_with_request_id("  ", Some("operator stop"))
+        .await
+        .expect_err("a blank id names nothing");
+    assert_eq!(blank.kind(), ErrorKind::Validation);
+    agent
+        .cancel_task_with_request_id("req-42", Some("operator stop"))
+        .await
+        .expect("the child receives the cancel frame");
+    let output = tokio::time::timeout(BOUND, request)
+        .await
+        .expect("the cancel must terminate the request")
+        .expect("the send task ran")
+        .expect("the cancelled request ends cleanly");
+    assert_eq!(
+        output.output, "cancelled req-42 matched true",
+        "the child echoes the id the caller used, so it correlated the request"
+    );
+    assert!(
+        tokio::time::timeout(BOUND, agent.shutdown(Duration::from_secs(5)))
+            .await
+            .expect("shutdown must not hang")
+            .expect("the fake child acknowledges the shutdown")
+    );
+    // Nothing is left to receive a frame: the child is gone.
+    let after = agent
+        .cancel_task("req-42")
+        .await
+        .expect_err("a stopped child receives nothing");
+    assert_eq!(after.kind(), ErrorKind::Transport);
+    assert!(after.to_string().contains("cancel"), "{after}");
 }
 
 #[tokio::test]

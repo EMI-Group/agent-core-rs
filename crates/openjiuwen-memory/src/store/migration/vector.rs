@@ -339,11 +339,25 @@ async fn inspect(context: &MigrationContext) -> Result<Inspection> {
     Ok(inspection)
 }
 
+/// The reason a scan reported, when it is one this migrator reports instead of raising.
+///
+/// [`scan_collection`] answers `Validation` for a schema no search can be defined on (no
+/// `FLOAT_VECTOR` field, or no positive dimension) and `Unsupported` for a collection the
+/// store cannot describe at all; both name exactly one collection, so the recollector reports
+/// them as a [`CollectionCheck::Issue`] and keeps going. Every other error — a store that
+/// failed, a validation error the store raised on its own query — is raised unchanged.
+fn scan_issue_reason(error: &Error) -> Option<String> {
+    match error {
+        Error::Validation(reason) | Error::Unsupported(reason) => Some(reason.clone()),
+        _ => None,
+    }
+}
+
 /// Reads one legacy collection and its canonical counterpart.
 ///
-/// A collection that cannot be read (its schema declares no vector field, a document has no
-/// primary key, the target uses another primary key) is a [`CollectionCheck::Issue`]; a store
-/// error is propagated.
+/// A collection that cannot be read (its schema has no searchable `FLOAT_VECTOR` field, a
+/// document has no primary key, the target uses another primary key) is a
+/// [`CollectionCheck::Issue`]; a store error is propagated.
 async fn inspect_collection(
     store: &dyn VectorStore,
     source: String,
@@ -364,8 +378,10 @@ async fn inspect_collection(
     };
     let source_docs = match scan_collection(store, &source).await {
         Ok(docs) => docs,
-        Err(Error::Unsupported(reason)) => return Ok(issue(&source, reason)),
-        Err(error) => return Err(error),
+        Err(error) => match scan_issue_reason(&error) {
+            Some(reason) => return Ok(issue(&source, reason)),
+            None => return Err(error),
+        },
     };
     let mut source_ids = BTreeSet::new();
     for doc in &source_docs {
@@ -392,8 +408,10 @@ async fn inspect_collection(
                 .iter()
                 .filter_map(|doc| document_key(doc, &primary_key))
                 .collect(),
-            Err(Error::Unsupported(reason)) => return Ok(issue(&target, reason)),
-            Err(error) => return Err(error),
+            Err(error) => match scan_issue_reason(&error) {
+                Some(reason) => return Ok(issue(&target, reason)),
+                None => return Err(error),
+            },
         };
     }
 
@@ -512,14 +530,16 @@ async fn copy_candidate(context: &MigrationContext, candidate: &Candidate) -> Re
                     ));
                 }
             }
-            Err(Error::Unsupported(reason)) => {
-                return Ok(PairOutcome::incomplete(
-                    copied,
-                    candidate.present,
-                    format!("cannot verify {target:?}: {reason}"),
-                ))
-            }
-            Err(error) => return Err(error),
+            Err(error) => match scan_issue_reason(&error) {
+                Some(reason) => {
+                    return Ok(PairOutcome::incomplete(
+                        copied,
+                        candidate.present,
+                        format!("cannot verify {target:?}: {reason}"),
+                    ))
+                }
+                None => return Err(error),
+            },
         }
         if let Err(error) = store.delete_collection(source).await {
             return Ok(PairOutcome::incomplete(

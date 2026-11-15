@@ -34,7 +34,7 @@ use openjiuwen_sysop::{
             global as global_launchers, register_builtin_launchers, LaunchedSandbox,
             LauncherRegistry, SandboxLauncher, SandboxStatus,
         },
-        lifecycle::{FixedClock, SandboxLifecycle},
+        lifecycle::{container_config_hash, Clock, FixedClock, SandboxLifecycle},
         operation::{
             sandbox_operations, sandbox_operations_for_session, sandbox_operations_with_registries,
         },
@@ -411,6 +411,7 @@ fn pre_deploy_launcher_is_registered_idempotently() {
 #[tokio::test]
 async fn pre_deploy_launch_returns_the_configured_base_url_and_requires_it() {
     let launcher = global_launchers().create("pre_deploy").unwrap();
+    assert_eq!(launcher.launcher_type(), "pre_deploy");
     let config = gateway("pre_deploy", "aio", Some("http://predeployed:8080"), None);
     let descriptor = launcher
         .launch(config.launcher_config.as_ref().unwrap(), 17, Some("key"))
@@ -418,6 +419,34 @@ async fn pre_deploy_launch_returns_the_configured_base_url_and_requires_it() {
         .unwrap();
     assert_eq!(descriptor, LaunchedSandbox::new("http://predeployed:8080"));
     assert_eq!(descriptor.sandbox_id, None);
+
+    // The launcher owns no handle on the container, so it refuses the lifecycle calls and
+    // never claims a state it cannot know.
+    assert_eq!(
+        launcher.check_status("container::key").await.unwrap(),
+        SandboxStatus::Unknown
+    );
+    for (process, outcome) in [
+        ("pause", launcher.pause("container::key").await),
+        ("resume", launcher.resume("container::key").await),
+        ("delete", launcher.delete("container::key").await),
+    ] {
+        let error = outcome.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "process: {process}");
+        assert_eq!(
+            error.message(),
+            format!(
+                "sandbox launcher unsupported, launcher: pre_deploy, process: {process}, \
+                 reason: {}",
+                match process {
+                    "pause" => "this launcher cannot suspend containers; the sandbox keeps running",
+                    "resume" =>
+                        "this launcher cannot resume containers; the sandbox stays suspended",
+                    _ => "this launcher cannot destroy containers; teardown would leak the sandbox",
+                }
+            )
+        );
+    }
 
     for base_url in [None, Some("   ")] {
         let config = gateway("pre_deploy", "aio", base_url, None);
@@ -990,4 +1019,179 @@ async fn the_facade_carries_local_registry_side_effects_only() {
             .is_empty()
             .await
     );
+}
+
+// ── typed launcher refusals (pre_deploy cannot tear its container down) ──────────────────
+
+/// A `pre_deploy` lifecycle: the built-in launcher registered in a local registry, so a
+/// managed `ensure_endpoint` really launches (and records) the pre-deployed endpoint.
+fn pre_deploy_lifecycle(now: u64) -> SandboxLifecycle {
+    let launchers = LauncherRegistry::new();
+    register_builtin_launchers(&launchers).unwrap();
+    lifecycle_with(launchers, now)
+}
+
+#[tokio::test]
+async fn releasing_a_pre_deploy_container_is_unsupported_and_keeps_the_record() {
+    let lifecycle = pre_deploy_lifecycle(NOW);
+    let config = gateway("pre_deploy", "aio", Some("http://predeployed:8080"), None);
+    let endpoint = lifecycle
+        .ensure_endpoint(&config, "key", NOW)
+        .await
+        .unwrap();
+    assert_eq!(endpoint.base_url, "http://predeployed:8080");
+    assert_eq!(endpoint.sandbox_id, None);
+    let stored = lifecycle.record("key").await.unwrap();
+    assert_eq!(stored.launcher_type, "pre_deploy");
+    assert_eq!(stored.status, SandboxStatus::Running);
+
+    // `delete` cannot be performed: report it instead of pretending the sandbox is gone.
+    let error = lifecycle
+        .release("key", OnStop::Delete)
+        .await
+        .expect_err("a pre_deploy teardown must not report success");
+    assert_eq!(
+        error.kind(),
+        ErrorKind::Unsupported,
+        "the refusal must not be flattened into 199008: {error}"
+    );
+    assert_eq!(
+        error.message(),
+        "sandbox launcher unsupported, launcher: pre_deploy, process: delete, reason: this \
+         launcher cannot destroy containers; teardown would leak the sandbox"
+    );
+    assert_eq!(
+        lifecycle.record("key").await.unwrap(),
+        stored,
+        "the record is restored so the release can be retried"
+    );
+
+    // `pause` cannot be performed either.
+    let error = lifecycle
+        .release("key", OnStop::Pause)
+        .await
+        .expect_err("a pre_deploy pause must not report success");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert_eq!(
+        error.message(),
+        "sandbox launcher unsupported, launcher: pre_deploy, process: pause, reason: this \
+         launcher cannot suspend containers; the sandbox keeps running"
+    );
+    assert_eq!(lifecycle.record("key").await.unwrap(), stored);
+
+    // `keep` calls no launcher, so it still succeeds and only refreshes the record.
+    lifecycle.release("key", OnStop::Keep).await.unwrap();
+    assert_eq!(
+        lifecycle.record("key").await.unwrap().status,
+        SandboxStatus::Running
+    );
+}
+
+#[tokio::test]
+async fn a_pre_deploy_record_without_a_sandbox_id_is_relaunched_not_resumed() {
+    let lifecycle = pre_deploy_lifecycle(NOW);
+    let config = gateway("pre_deploy", "aio", Some("http://predeployed:8080"), None);
+    lifecycle
+        .ensure_endpoint(&config, "key", NOW)
+        .await
+        .unwrap();
+    // The pre_deploy launch reports no sandbox id, so there is nothing to resume: the call
+    // relaunches instead of failing, and the record keeps one container's bookkeeping.
+    let endpoint = lifecycle
+        .ensure_endpoint(&config, "key", NOW + 5)
+        .await
+        .unwrap();
+    assert_eq!(endpoint.sandbox_id, None);
+    assert_eq!(lifecycle.len().await, 1);
+
+    // The launcher itself still answers with the typed refusals a paused/unknown record
+    // would hit.
+    let launcher = global_launchers().create("pre_deploy").unwrap();
+    assert_eq!(
+        launcher.check_status("anything").await.unwrap(),
+        SandboxStatus::Unknown,
+        "a launcher that cannot inspect its runtime reports unknown"
+    );
+    assert_eq!(
+        launcher.resume("anything").await.unwrap_err().kind(),
+        ErrorKind::Unsupported
+    );
+}
+
+// ── container config hash and metadata through the public lifecycle ─────────────────────
+
+#[tokio::test]
+async fn the_record_tracks_the_launcher_config_hash_and_labels() {
+    let launcher = Arc::new(FakeLauncher::new("http://docker:1"));
+    let lifecycle = lifecycle_with(launchers_with("docker", Arc::clone(&launcher)), NOW);
+    let config = gateway("docker", "aio", None, None);
+    lifecycle
+        .ensure_endpoint(&config, "session_key", NOW)
+        .await
+        .unwrap();
+
+    let record = lifecycle.record("session_key").await.unwrap();
+    assert_eq!(
+        record.container_config_hash,
+        container_config_hash(config.launcher_config.as_ref().unwrap())
+    );
+    assert_eq!(record.container_config_hash.len(), 64);
+    assert_eq!(record.metadata["launcher_type"], "docker");
+    assert_eq!(record.metadata["sandbox_type"], "aio");
+
+    // Reusing the container under a different launcher configuration updates the hash and
+    // the labels without relaunching.
+    let changed = gateway("docker", "jiuwenbox", None, None);
+    lifecycle
+        .ensure_endpoint(&changed, "session_key", NOW + 60)
+        .await
+        .unwrap();
+    assert_eq!(launcher.count("launch"), 1, "the container was reused");
+    let record = lifecycle.record("session_key").await.unwrap();
+    assert_eq!(
+        record.container_config_hash,
+        container_config_hash(changed.launcher_config.as_ref().unwrap())
+    );
+    assert_eq!(record.metadata["sandbox_type"], "jiuwenbox");
+}
+
+#[tokio::test]
+async fn the_idle_sweep_spares_a_non_expiring_record_and_reports_the_expired_one() {
+    let clock = Arc::new(FixedClock::new(NOW + 200));
+    let launcher = Arc::new(FakeLauncher::new("http://docker:1"));
+    let lifecycle =
+        SandboxLifecycle::with_clock(launchers_with("docker", launcher.clone()), clock.clone());
+    let config = gateway("docker", "aio", None, Some(120));
+
+    lifecycle
+        .ensure_endpoint(&config, "idle", NOW)
+        .await
+        .unwrap();
+    lifecycle
+        .ensure_endpoint(&config, "later", NOW + 200)
+        .await
+        .unwrap();
+    // `idle` was already 200 seconds old when `later` launched, so the launch-time sweep took
+    // it: the surviving record is the fresh one.
+    assert!(lifecycle.record("idle").await.is_none());
+    let surviving = lifecycle.record("later").await.unwrap();
+    assert_eq!(surviving.status, SandboxStatus::Running);
+
+    clock.advance(60);
+    assert_eq!(
+        lifecycle
+            .evict_idle_for(&config, clock.now_epoch_secs())
+            .await,
+        Vec::<String>::new(),
+        "60 seconds idle is below the 120 second TTL"
+    );
+    clock.advance(60);
+    assert_eq!(
+        lifecycle
+            .evict_idle_for(&config, clock.now_epoch_secs())
+            .await,
+        vec!["later".to_string()]
+    );
+    assert_eq!(launcher.calls().last().unwrap(), "delete:container::later");
+    assert!(lifecycle.is_empty().await);
 }

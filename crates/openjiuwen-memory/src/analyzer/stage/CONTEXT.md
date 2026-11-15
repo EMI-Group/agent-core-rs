@@ -13,7 +13,7 @@ The directory sits inside `crate::analyzer` and re-exports nothing outside it �
 `plan.rs`: `PlanIntent` (correction/directive/variable/preference/identity/project/general/none, `as_str`, `is_actionable`, `parse` with aliases), `PlanOperation` (resolve_references/normalize_time/extract_facts/extract_variables/extract_summary/handle_directives), `ExtractionPlan` (`empty`, `extracts_facts`, `has`, `is_actionable`, `selected_turns`), `RulePlanStage`, `LlmPlanStage`, `PLAN_SYSTEM_PROMPT`, `PLAN_JSON_SCHEMA`, `parse_plan_response`, `SUMMARY_TOKEN_THRESHOLD`.
 `reasoning.rs`: `ReasoningBasis` (explicit/identity/preference/project/variable/statement/planned/modeled/unknown), `FactReasoning { fact_index, rationale, basis }`, `RuleReasoningStage` (`new`, `with_metadata_key`, `key`, `config`, `reason`, `rationale`, `attach`), `LlmReasoningStage`, `REASONING_SYSTEM_PROMPT`, `REASONING_JSON_SCHEMA`, `parse_reasoning_response`, `DEFAULT_REASONING_KEY`.
 `proactive.rs`: `ProactiveSignal` (explicit_directive/correction/decision/preference/repetition/high_importance, `promotes_batch`, `promotes_batch_write`), `ProactiveConfig` (`enabled`, `importance_threshold`, `min_transcript_chars`, `repetition_threshold`, `validate`), `ProactiveDecision` (`write`, `reason`, `signals`, `fact_indexes`, `importance`, `degraded`, `skip`, `is_degraded`), `RuleProactiveStage`, `LlmProactiveStage`, `PROACTIVE_SYSTEM_PROMPT`, `PROACTIVE_JSON_SCHEMA`, `parse_proactive_response`.
-`pipeline.rs`: `StageKind { Rule (default), Llm }`, `StageConfig { plan, reasoning, proactive, proactive_config, reasoning_key }` (+ `validate`), `FactVerdict`, `ExtractStage`, `ConflictStage`, `StagedResult`, `StagedAnalyzer` (`new`, `from_config`, `from_engine`, `with_stage_config`, `with_overrides`, `with_dedupe`, `with_stages`, `config`, `overrides`, `stage_config`, `effective_config`, `analyze`, `analyze_against`, `consolidate`).
+`pipeline.rs`: `StageKind { Rule (default), Llm }`, `StageConfig { plan, reasoning, proactive, proactive_config, reasoning_key }` (+ `validate`), `FactVerdict`, `ExtractStage`, `ConflictStage`, `StagedResult`, `StagedAnalyzer` (`new`, `from_config`/`from_engine -> Result<Self>`, `with_stage_config`, `with_overrides`, `with_dedupe`, `with_stages`, `config`, `overrides`, `stage_config`, `effective_config`, `analyze`, `analyze_against`, `consolidate`).
 `overrides.rs`: `ScopeAnalyzerOverrides` (builders `with_model`/`with_embedding`/`with_extractor`/`with_classifier`/`with_min_importance`/`with_max_facts`/`with_default_importance`/`with_stages`, getters, `is_empty`, `validate`, `effective_config(&AnalyzerConfig) -> AnalyzerConfig` merging extractor/classifier/thresholds/caps over the base analyzer config — the `stages` override stays separate via `stages()`/`StagedAnalyzer::stage_config`); manual `Debug` prints handle names only.
 
 ## Stage Contract
@@ -21,7 +21,7 @@ The directory sits inside `crate::analyzer` and re-exports nothing outside it �
 Stages never mutate the shared state: they return a `StageOutput` and `StageOutput::apply` merges only the fields the stage set, so a stage can be reordered or omitted safely.
 The default sequence is `plan → extract → reasoning → proactive → conflict`; `with_stages` replaces it with the caller's list verbatim, so a custom sequence that omits the plan stage runs with the default non-actionable plan and leaves `ExtractionResult::extractor` empty unless a stage sets it.
 Every stage receives the same `&CallOptions`, so a cancelled token short-circuits before any model call.
-`extract` honours `plan.extracts_facts()` and narrows turns with `plan.selected_turns`; `reasoning` runs after `extract` (one `FactReasoning` per fact, in index order); `proactive` runs after `reasoning` and sees the fact importances; `conflict` runs last over `StageInput::candidates` capped by `max_candidates`, emitting one `FactVerdict` per (fact, candidate) pair.
+`extract` honours `plan.extracts_facts()` and narrows turns with `plan.selected_turns`; `reasoning` runs after `extract` (one `FactReasoning` per fact, in index order); `proactive` runs after `reasoning` and sees the fact importances; `conflict` runs last over `StageInput::candidates` capped by `max_candidates`, emitting one `FactVerdict` per (fact, candidate) pair and reporting a blank-content fact as skipped on its own `degraded` reason.
 `StagedResult::is_degraded()` is true if the extraction result, the plan, the decision, or any stage reason carries a degradation, and `StagedResult` exposes the executed stage names in order as the public field `stages: Vec<String>` (there is no accessor method).
 
 ## Degradation
@@ -29,7 +29,8 @@ Every stage receives the same `&CallOptions`, so a cancelled token short-circuit
 Every model-backed stage checks `options.check()?` before its first call (zero invocations when already cancelled), retries `config.model_retries + 1` times, and treats unparseable/empty output as a failed attempt.
 On failure it runs its deterministic counterpart and records `llm <stage> fell back to rules: <reason>` on its own output (`ExtractionPlan::degraded`, `ProactiveDecision::degraded`, the reasoning output's `degraded`) and logs via `tracing::warn!`.
 A partial LLM reasoning answer is merged rather than discarded: the answered indices keep their model rationale and the rest are filled by rules, with `llm reasoning answered N of M facts; rule rationales filled the rest`.
-`StageKind::Llm` without an injected model builds the rule stage and logs a warning — a documented degradation, never a panic or `Error::Unsupported`.
+`StageKind::Llm` without an injected model builds the rule stage and records that fallback on `StagedResult::result.degraded` (one reason per degraded stage kind) as well as logging a warning — a documented degradation, never a panic.
+The extract and conflict stages are stricter because the crate cannot honour the request at all: `StagedAnalyzer::from_config`/`from_engine` and every `analyze`/`analyze_against`/`consolidate` run return `Error::Unsupported` when the effective configuration asks for an `ExtractorKind::Llm`/`ClassifierKind::Llm` and no model is present, so `StagedAnalyzer::new` (deterministic pipeline) and `from_config` differ only in that validation.
 
 ## Constraints
 
@@ -43,7 +44,7 @@ Stage prompts repeat their JSON schema inline because `concat!` accepts literals
 ## Known Issues
 
 `RulePlanStage` detects reference and time signals (`PRONOUN`, `RELATIVE_TIME`) to select `ResolveReferences`/`NormalizeTime`, but no stage rewrites the fact text from those signals — the operations are advisory metadata, matching the parent module's documented gap.
-`ScopeAnalyzerOverrides` carries an `Arc<dyn Embedding>` that nothing in this module calls; resolving per-scope overrides and feeding the embedding to the write path is facade/engine work.
+`ScopeAnalyzerOverrides` carries an `Arc<dyn Embedding>` that nothing in this module calls: the facade resolves the handle and the engine's `*_with_embedding` entry points consume it.
 
 ## Routing Table
 
@@ -60,5 +61,5 @@ Stage prompts repeat their JSON schema inline because `concat!` accepts literals
 Plan: intent/operation selection across representative transcripts, disabled analyzer, focus-turn selection and fallback, serde round trip plus intent aliases, prompt/schema embedding, LLM parse/fallback/cancellation.
 Reasoning: ordered attachment and metadata, configurable and validated metadata key, empty input, partial-merge, unparseable fallback, cancellation, tolerant parsing.
 Proactive: directive/correction/decision/preference/repetition writes, skip reasons for short/empty/disabled input, LLM parse/fallback/cancellation, config validation and decision serde.
-Pipeline: parity with `MemoryAnalyzer`, plan-skipped extraction, conflict against existing records, override threshold and extractor switching, `StageKind::Llm` without a model, custom stage sequence, cancellation with zero model calls, `consolidate` parity, `StagedResult` JSON round trip, `StageConfig` validation.
+Pipeline: parity with `MemoryAnalyzer`, plan-skipped extraction, conflict against existing records, override threshold and extractor switching, `StageKind::Llm` without a model (rule stages plus the recorded reason on `StagedResult::result.degraded`), a blank-content fact reported as skipped, custom stage sequence, cancellation with zero model calls, `consolidate` parity, `StagedResult` JSON round trip, `StageConfig` validation.
 Gates: `cargo test -p openjiuwen-memory --offline --lib analyzer::stage`, `cargo clippy -p openjiuwen-memory --all-targets --all-features --offline -- -D warnings`, `cargo doc -p openjiuwen-memory --no-deps`.

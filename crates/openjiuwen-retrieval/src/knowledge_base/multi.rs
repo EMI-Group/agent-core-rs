@@ -6,11 +6,19 @@
 //! [`futures::future::join_all`]), tolerate a failing knowledge base by logging
 //! and dropping its results, deduplicate by exact result text, and keep the
 //! highest score seen for each text.
+//!
+//! The compatible functions never report which knowledge base failed. Callers
+//! that must see per-KB failures can use the `_reporting` variants, which return
+//! the same merged results plus a [`MultiKbFailure`] entry per failed knowledge
+//! base, or the `_strict` variants, which turn "every knowledge base failed"
+//! into an [`Error`].
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::future::join_all;
+use serde::{Deserialize, Serialize};
 
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::logging::warn;
 
 use crate::common::{Metadata, MultiKBRetrievalResult, RetrievalResult, DEFAULT_TOP_K};
@@ -22,18 +30,62 @@ const RAW_SCORE_FIELD: &str = "raw_score";
 /// Metadata key holding the unmerged score scaled into `[0, 1]`.
 const RAW_SCORE_SCALED_FIELD: &str = "raw_score_scaled";
 
+/// One knowledge base that failed during a multi-KB retrieval.
+///
+/// `kb_id` is the knowledge base identifier (`SimpleKnowledgeBase::id()`) and
+/// `error` is the failure's `Display` text, so a report is fully serializable
+/// and independent of the error type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MultiKbFailure {
+    /// Identifier of the knowledge base whose retrieval failed.
+    pub kb_id: String,
+    /// The failure rendered as text (`error.to_string()`).
+    pub error: String,
+}
+
+/// Merged results of a multi-KB retrieval plus every per-KB failure.
+///
+/// The failures are in the order the knowledge bases were supplied, so a caller
+/// can correlate them with its own slice. A report whose `failures` is empty is
+/// a fully successful retrieval; one whose `results` is empty with non-empty
+/// `failures` means every knowledge base failed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MultiKbReport {
+    /// Deduplicated, descending merged results (the same ones the compatible
+    /// [`retrieve_multi_kb`] returns, with the same limit).
+    pub results: Vec<RetrievalResult>,
+    /// One entry per knowledge base that failed, in input order.
+    pub failures: Vec<MultiKbFailure>,
+}
+
+/// Merged with-source results of a multi-KB retrieval plus every per-KB failure.
+///
+/// Identical to [`MultiKbReport`] except that the results carry their source
+/// `kb_ids` ([`MultiKBRetrievalResult`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MultiKbSourceReport {
+    /// Deduplicated, descending merged results with their source knowledge base
+    /// ids (the same ones the compatible [`retrieve_multi_kb_with_source`]
+    /// returns, with the same limit).
+    pub results: Vec<MultiKBRetrievalResult>,
+    /// One entry per knowledge base that failed, in input order.
+    pub failures: Vec<MultiKbFailure>,
+}
+
 /// Runs `query` against every knowledge base and returns the deduplicated,
 /// descending results limited to `top_k` (default [`DEFAULT_TOP_K`]).
 ///
 /// Duplicates are detected by exact `text`; the surviving result keeps the first
 /// occurrence's metadata and the maximum score of all occurrences. A knowledge
-/// base that fails contributes nothing and is logged at `warn`.
+/// base that fails contributes nothing and is logged at `warn`; use
+/// [`retrieve_multi_kb_reporting`] or [`retrieve_multi_kb_strict`] to observe
+/// those failures instead of only logging them.
 pub async fn retrieve_multi_kb(
     kbs: &[Arc<SimpleKnowledgeBase>],
     query: &str,
     top_k: Option<usize>,
 ) -> Vec<RetrievalResult> {
-    let per_kb = retrieve_all(kbs, query, "retrieve_multi_kb").await;
+    let (per_kb, _failures) = retrieve_all(kbs, query, "retrieve_multi_kb").await;
     merge_results(per_kb, limit(top_k))
 }
 
@@ -41,28 +93,134 @@ pub async fn retrieve_multi_kb(
 /// result and merges the `raw_score`/`raw_score_scaled` metadata fields.
 ///
 /// `kb_ids` are sorted ascending and deduplicated; `metadata` comes from the
-/// first occurrence of a text.
+/// first occurrence of a text. A knowledge base that fails contributes nothing
+/// and is logged at `warn`; use [`retrieve_multi_kb_with_source_reporting`] or
+/// [`retrieve_multi_kb_with_source_strict`] to observe those failures.
 pub async fn retrieve_multi_kb_with_source(
     kbs: &[Arc<SimpleKnowledgeBase>],
     query: &str,
     top_k: Option<usize>,
 ) -> Vec<MultiKBRetrievalResult> {
-    let per_kb = retrieve_all(kbs, query, "retrieve_multi_kb_with_source").await;
+    let (per_kb, _failures) = retrieve_all(kbs, query, "retrieve_multi_kb_with_source").await;
     merge_results_with_source(per_kb, limit(top_k))
+}
+
+/// Like [`retrieve_multi_kb`], but also reports every knowledge base that
+/// failed.
+///
+/// `results` uses exactly the merge, sort, and limit rules of
+/// [`retrieve_multi_kb`]; `failures` lists one [`MultiKbFailure`] per failed
+/// knowledge base in input order and is empty when every knowledge base
+/// answered. An empty `kbs` slice yields an empty report.
+pub async fn retrieve_multi_kb_reporting(
+    kbs: &[Arc<SimpleKnowledgeBase>],
+    query: &str,
+    top_k: Option<usize>,
+) -> MultiKbReport {
+    let (per_kb, failures) = retrieve_all(kbs, query, "retrieve_multi_kb_reporting").await;
+    MultiKbReport {
+        results: merge_results(per_kb, limit(top_k)),
+        failures,
+    }
+}
+
+/// Like [`retrieve_multi_kb_with_source`], but also reports every knowledge base
+/// that failed.
+///
+/// `results` uses exactly the merge, source-attribution, sort, and limit rules
+/// of [`retrieve_multi_kb_with_source`]; `failures` lists one [`MultiKbFailure`]
+/// per failed knowledge base in input order and is empty when every knowledge
+/// base answered. An empty `kbs` slice yields an empty report.
+pub async fn retrieve_multi_kb_with_source_reporting(
+    kbs: &[Arc<SimpleKnowledgeBase>],
+    query: &str,
+    top_k: Option<usize>,
+) -> MultiKbSourceReport {
+    let (per_kb, failures) =
+        retrieve_all(kbs, query, "retrieve_multi_kb_with_source_reporting").await;
+    MultiKbSourceReport {
+        results: merge_results_with_source(per_kb, limit(top_k)),
+        failures,
+    }
+}
+
+/// Like [`retrieve_multi_kb`], but fails when every knowledge base failed.
+///
+/// A partial failure still returns `Ok` with the surviving merged results, so
+/// this is the strict variant only for the total-failure case. Rules:
+///
+/// - an empty `kbs` slice returns `Ok(vec![])` (no failure can occur);
+/// - if **every** knowledge base failed, returns
+///   [`ErrorKind::Retrieval`](openjiuwen_common::error::ErrorKind::Retrieval)
+///   with the message `every knowledge base failed: {kb_id}: {error}; …`, one
+///   entry per knowledge base in input order;
+/// - otherwise returns `Ok` with the merged results of the knowledge bases that
+///   answered (identical to [`retrieve_multi_kb`]).
+///
+/// Every failure is still logged at `warn`, exactly like the compatible variant.
+pub async fn retrieve_multi_kb_strict(
+    kbs: &[Arc<SimpleKnowledgeBase>],
+    query: &str,
+    top_k: Option<usize>,
+) -> Result<Vec<RetrievalResult>> {
+    let report = retrieve_multi_kb_reporting(kbs, query, top_k).await;
+    ensure_not_all_failed(&report.failures, kbs.len())?;
+    Ok(report.results)
+}
+
+/// Like [`retrieve_multi_kb_with_source`], but fails when every knowledge base
+/// failed.
+///
+/// Follows the same rules as [`retrieve_multi_kb_strict`]: an empty `kbs` slice
+/// returns `Ok(vec![])`, a total failure returns
+/// [`ErrorKind::Retrieval`](openjiuwen_common::error::ErrorKind::Retrieval) with
+/// the message `every knowledge base failed: {kb_id}: {error}; …`, and any
+/// partial success returns `Ok` with the merged with-source results.
+pub async fn retrieve_multi_kb_with_source_strict(
+    kbs: &[Arc<SimpleKnowledgeBase>],
+    query: &str,
+    top_k: Option<usize>,
+) -> Result<Vec<MultiKBRetrievalResult>> {
+    let report = retrieve_multi_kb_with_source_reporting(kbs, query, top_k).await;
+    ensure_not_all_failed(&report.failures, kbs.len())?;
+    Ok(report.results)
+}
+
+/// Rejects a retrieval in which every supplied knowledge base failed.
+///
+/// `failure_count == kb_count` is only a total failure when at least one
+/// knowledge base was supplied, so an empty slice stays `Ok`.
+fn ensure_not_all_failed(failures: &[MultiKbFailure], kb_count: usize) -> Result<()> {
+    if kb_count == 0 || failures.len() != kb_count {
+        return Ok(());
+    }
+    let detail = failures
+        .iter()
+        .map(|failure| format!("{}: {}", failure.kb_id, failure.error))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(Error::retrieval(format!(
+        "every knowledge base failed: {detail}"
+    )))
 }
 
 /// Retrieves from every knowledge base concurrently, keeping the kb id with each
 /// result set so the with-source merge can attribute hits.
+///
+/// Returns the per-KB result sets (in `kbs` order) together with the failures of
+/// the knowledge bases that errored (also in `kbs` order), so both the
+/// compatible and the reporting/strict callers share one fan-out. Each failure
+/// is logged at `warn` for every caller.
 async fn retrieve_all(
     kbs: &[Arc<SimpleKnowledgeBase>],
     query: &str,
     caller: &'static str,
-) -> Vec<(String, Vec<RetrievalResult>)> {
+) -> (Vec<(String, Vec<RetrievalResult>)>, Vec<MultiKbFailure>) {
     let futures = kbs.iter().map(|kb| {
         let kb_id = kb.id().to_owned();
         async move {
             match kb.retrieve(query).await {
-                Ok(results) => (kb_id, results),
+                Ok(results) => Ok((kb_id, results)),
                 Err(error) => {
                     warn!(
                         caller,
@@ -70,12 +228,23 @@ async fn retrieve_all(
                         error = %error,
                         "knowledge base retrieval failed; skipping its results"
                     );
-                    (kb_id, Vec::new())
+                    Err(MultiKbFailure {
+                        kb_id,
+                        error: error.to_string(),
+                    })
                 }
             }
         }
     });
-    join_all(futures).await
+    let mut per_kb = Vec::with_capacity(kbs.len());
+    let mut failures = Vec::new();
+    for outcome in join_all(futures).await {
+        match outcome {
+            Ok(entry) => per_kb.push(entry),
+            Err(failure) => failures.push(failure),
+        }
+    }
+    (per_kb, failures)
 }
 
 /// Resolves the result limit: the explicit `top_k`, or [`DEFAULT_TOP_K`].

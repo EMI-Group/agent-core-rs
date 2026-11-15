@@ -5,6 +5,21 @@
 //! [`Error::NotFound`], and carries cancellation into the store calls. It never caches, so
 //! two facades over the same store observe the same rows.
 //!
+//! # Embeddings
+//!
+//! A facade built with [`TeamMemory::with_embedding`] derives a vector for every record
+//! it writes: `upsert`-bound writes embed `title + " " + content + " " + tags` (the same
+//! `document_text` the keyword signal reads) and store it on
+//! [`TeamMemoryRecord::embedding`], and `search` embeds the query and ranks with
+//! [`TeamMemory::ranking`]. Without an embedder nothing changes: records keep
+//! `embedding: None` and search uses the keyword-only formula documented on [`super`].
+//!
+//! The vector is derived state, so an embedding failure is a typed error that fails the
+//! write (nothing is stored) or the search (no degraded empty result). Embedding calls run
+//! through [`CallOptions::run`], so cancellation and deadlines are honoured exactly like
+//! the store calls. `from_jsonl` keeps the vector a line already carries and only embeds
+//! lines without one.
+//!
 //! # Cancellation
 //!
 //! The methods that take [`CallOptions`] (`remember`, `remember_many`, `update`,
@@ -28,6 +43,7 @@
 //! traffic. See [`crate::team::observe`] for the seam itself.
 use super::memory::InMemoryTeamMemoryStore;
 use super::{TeamMemoryStore, TeamSearchOptions};
+use crate::config::RankingConfig;
 use crate::record::CallOptions;
 use crate::team::model::{
     NewTeamMemory, TeamMemoryFilter, TeamMemoryKind, TeamMemoryRecord, TeamMemoryScope,
@@ -36,6 +52,7 @@ use crate::team::model::{
 use crate::team::observe::{TeamMemoryEvent, TeamMemoryObserver, TeamMemoryOperation};
 use chrono::{DateTime, Utc};
 use openjiuwen_common::error::{Error, Result};
+use openjiuwen_retrieval::embedding::Embedding;
 use std::future::Future;
 use std::sync::Arc;
 use tracing::debug;
@@ -49,6 +66,8 @@ pub struct TeamMemory {
     store: Arc<dyn TeamMemoryStore>,
     default_importance: f32,
     observer: Option<Arc<dyn TeamMemoryObserver>>,
+    embedding: Option<Arc<dyn Embedding>>,
+    ranking: RankingConfig,
 }
 impl TeamMemory {
     /// Builds a facade over `store`, with no observer attached.
@@ -58,6 +77,8 @@ impl TeamMemory {
             store,
             default_importance: DEFAULT_IMPORTANCE,
             observer: None,
+            embedding: None,
+            ranking: RankingConfig::default(),
         }
     }
     /// Builds a facade over a fresh [`InMemoryTeamMemoryStore`].
@@ -120,6 +141,57 @@ impl TeamMemory {
     pub fn observer(&self) -> Option<&Arc<dyn TeamMemoryObserver>> {
         self.observer.as_ref()
     }
+    /// Attaches `embedding` as the model that derives record and query vectors.
+    ///
+    /// Attaching is additive for existing rows: a record written without an embedder keeps
+    /// `embedding: None` and is still ranked through its keyword term, and only the records
+    /// this facade writes (or updates) afterwards carry a vector. Replacing the model
+    /// leaves stored vectors alone; a vector of another dimension simply scores `0.0`
+    /// against a new query (see [`crate::recall::normalized_similarity`]).
+    #[must_use]
+    pub fn with_embedding(mut self, embedding: Arc<dyn Embedding>) -> Self {
+        self.embedding = Some(embedding);
+        self
+    }
+    /// The embedding model deriving record and query vectors, when one is attached.
+    #[must_use]
+    pub fn embedding(&self) -> Option<&Arc<dyn Embedding>> {
+        self.embedding.as_ref()
+    }
+    /// Sets the ranking weights used by [`TeamMemory::search`] when an embedder is
+    /// attached.
+    ///
+    /// The default is [`RankingConfig::default`] (`similarity_weight: 0.70`,
+    /// `keyword_weight: 0.30`, ...). It only takes effect on a search, and only together
+    /// with a query vector: a facade without an embedder ranks with
+    /// [`keyword_only_ranking`](super::keyword_only_ranking), so attaching weights alone
+    /// never changes a score.
+    #[must_use]
+    pub fn with_ranking(mut self, ranking: RankingConfig) -> Self {
+        self.ranking = ranking;
+        self
+    }
+    /// The ranking weights used by an embedding-backed search.
+    #[must_use]
+    pub fn ranking(&self) -> &RankingConfig {
+        &self.ranking
+    }
+    /// Embeds `record`'s searchable text into `record.embedding`.
+    ///
+    /// A no-op without an embedder, so a keyword-only facade writes exactly the record the
+    /// caller built. The model call runs through `call`, and its error is returned
+    /// unchanged instead of leaving an unembedded record behind.
+    async fn embed_record(&self, record: &mut TeamMemoryRecord, call: &CallOptions) -> Result<()> {
+        let Some(embedding) = self.embedding.clone() else {
+            return Ok(());
+        };
+        call.check()?;
+        let text = super::document_text(record);
+        let vector = embed_document(embedding.as_ref(), &text, call).await?;
+        call.check()?;
+        record.embedding = Some(vector);
+        Ok(())
+    }
     /// Forwards `event` to the attached observer; a no-op when none is attached.
     pub fn emit(&self, event: &TeamMemoryEvent) {
         if let Some(observer) = &self.observer {
@@ -177,7 +249,8 @@ impl TeamMemory {
         call: &CallOptions,
     ) -> Result<TeamMemoryRecord> {
         call.check()?;
-        let record = input.to_record(Utc::now(), self.default_importance)?;
+        let mut record = input.to_record(Utc::now(), self.default_importance)?;
+        self.embed_record(&mut record, call).await?;
         let stored = call.run(self.store.upsert(&record)).await??;
         call.check()?;
         debug!(target: LOG_TARGET, team_id = %stored.team_id, id = %stored.id, "remembered team memory");
@@ -216,7 +289,8 @@ impl TeamMemory {
     ) -> Result<()> {
         call.check()?;
         for input in inputs {
-            let record = input.to_record(Utc::now(), self.default_importance)?;
+            let mut record = input.to_record(Utc::now(), self.default_importance)?;
+            self.embed_record(&mut record, call).await?;
             let saved = call.run(self.store.upsert(&record)).await??;
             call.check()?;
             stored.push(saved);
@@ -263,6 +337,7 @@ impl TeamMemory {
                 Error::not_found(format!("team memory `{id}` not found in team `{team_id}`"))
             })?;
         update.apply(&mut record, Utc::now())?;
+        self.embed_record(&mut record, call).await?;
         let stored = call.run(self.store.upsert(&record)).await??;
         call.check()?;
         debug!(target: LOG_TARGET, team_id = %team_id, id = %id, "updated team memory");
@@ -277,7 +352,9 @@ impl TeamMemory {
     /// Searches the records `scope` may read.
     ///
     /// The ranking formula is documented on [`super`]; the cancellation token carried by
-    /// `options` is honored before and after the store call.
+    /// `options` is honored before and after the store and embedding calls. A facade with
+    /// an embedder ranks semantically (see the module's `Embeddings` section), one without
+    /// ranks with the keyword-only formula.
     pub async fn search(
         &self,
         scope: &TeamMemoryScope,
@@ -292,6 +369,11 @@ impl TeamMemory {
         .await
     }
     /// The store half of [`TeamMemory::search`], without observation.
+    ///
+    /// With an embedder attached the query is embedded first (a blank query is not: there
+    /// is nothing to embed, so the keyword-only path returns no hits), the options are
+    /// cloned with that vector and [`TeamMemory::ranking`], and the store ranks with the
+    /// semantic group enabled.
     async fn search_hits(
         &self,
         scope: &TeamMemoryScope,
@@ -299,9 +381,19 @@ impl TeamMemory {
         options: &TeamSearchOptions,
     ) -> Result<Vec<TeamSearchHit>> {
         options.call.check()?;
+        let mut options = options.clone();
+        if let Some(embedding) = self.embedding.clone() {
+            if options.query_embedding.is_none() && !query.trim().is_empty() {
+                options.query_embedding =
+                    Some(embed_query_text(embedding.as_ref(), query, &options.call).await?);
+            }
+            if options.query_embedding.is_some() {
+                options.ranking = self.ranking.clone();
+            }
+        }
         let hits = options
             .call
-            .run(self.store.search(scope, query, options))
+            .run(self.store.search(scope, query, &options))
             .await??;
         options.call.check()?;
         Ok(hits)
@@ -377,7 +469,7 @@ impl TeamMemory {
             if line.trim().is_empty() {
                 continue;
             }
-            let record = serde_json::from_str::<TeamMemoryRecord>(line).map_err(|error| {
+            let mut record = serde_json::from_str::<TeamMemoryRecord>(line).map_err(|error| {
                 Error::validation(format!(
                     "team memory jsonl line {number} is not a team memory record: {error}"
                 ))
@@ -385,6 +477,11 @@ impl TeamMemory {
             record
                 .validate()
                 .map_err(|error| with_line_number(number, error))?;
+            if record.embedding.is_none() {
+                self.embed_record(&mut record, call)
+                    .await
+                    .map_err(|error| with_line_number(number, error))?;
+            }
             let saved = call.run(self.store.upsert(&record)).await??;
             call.check()?;
             stored.push(saved);
@@ -392,6 +489,59 @@ impl TeamMemory {
         debug!(target: LOG_TARGET, imported = stored.len(), "imported team memory jsonl");
         Ok(stored)
     }
+}
+/// Embeds one team memory document with `embedding`, racing the call against `call`.
+///
+/// A model that returns no vector, more than one vector, an empty vector, or a
+/// non-finite component is a contract violation and is reported as [`Error::Memory`];
+/// the model's own error is propagated unchanged.
+async fn embed_document(
+    embedding: &dyn Embedding,
+    text: &str,
+    call: &CallOptions,
+) -> Result<Vec<f32>> {
+    let model = embedding.model_name();
+    let mut vectors = call
+        .run(embedding.embed_documents(&[text.to_owned()], None))
+        .await??;
+    if vectors.len() != 1 {
+        return Err(Error::memory(format!(
+            "embedding model `{model}` returned {} vectors for one team memory document",
+            vectors.len()
+        )));
+    }
+    let vector = vectors.remove(0);
+    validate_vector(&vector, model, "team memory document")?;
+    Ok(vector)
+}
+/// Embeds one search query with `embedding`, racing the call against `call`.
+async fn embed_query_text(
+    embedding: &dyn Embedding,
+    query: &str,
+    call: &CallOptions,
+) -> Result<Vec<f32>> {
+    let model = embedding.model_name();
+    let vector = call.run(embedding.embed_query(query)).await??;
+    validate_vector(&vector, model, "team memory query")?;
+    Ok(vector)
+}
+/// Rejects a vector a vector store could not compare: empty or with non-finite parts.
+fn validate_vector(vector: &[f32], model: &str, what: &str) -> Result<()> {
+    if vector.is_empty() {
+        return Err(Error::memory(format!(
+            "embedding model `{model}` returned an empty vector for the {what}"
+        )));
+    }
+    if let Some((index, value)) = vector
+        .iter()
+        .enumerate()
+        .find(|(_, component)| !component.is_finite())
+    {
+        return Err(Error::memory(format!(
+            "embedding model `{model}` returned a non-finite {what} component {index} (got {value})"
+        )));
+    }
+    Ok(())
 }
 /// The `Write` event for a record whose member and kind are known up front.
 fn write_event(

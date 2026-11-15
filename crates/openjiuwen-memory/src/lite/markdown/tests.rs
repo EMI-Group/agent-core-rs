@@ -388,3 +388,192 @@ fn parsing_never_panics_on_hostile_input() {
         let _rendered = document.render();
     }
 }
+
+#[test]
+fn a_duplicate_entry_keeps_the_last_copy() {
+    let text = concat!(
+        "# Memory\n\n## Project\n\n",
+        "### build\n\n- description: old\n\ncargo build\n\n",
+        "### build\n\n- description: new\n\ncargo build --release\n",
+    );
+    let mut document = MarkdownMemory::parse(text).unwrap().with_scope(scope());
+    assert_eq!(document.facts().len(), 1, "one entry per name");
+    let build = document.fact("build").unwrap();
+    assert_eq!(build.description, "new", "the last occurrence wins");
+    assert_eq!(build.content, "cargo build --release");
+
+    // A write after the duplicate parse must not leave the stale copy behind.
+    let _replaced = document.upsert_fact(&fact("build", "cargo test"));
+    assert_eq!(document.facts().len(), 1);
+    assert_eq!(document.fact("build").unwrap().content, "cargo test");
+    let rendered = document.render();
+    assert_eq!(rendered.matches("### build").count(), 1, "{rendered}");
+    assert!(!rendered.contains("cargo build --release"), "{rendered}");
+}
+
+#[test]
+fn a_delete_drains_every_copy_of_a_name() {
+    let text = concat!(
+        "# Memory\n\n## Project\n\n### build\n\nbody one\n\n",
+        "## Feedback\n\n### build\n\nbody two\n",
+    );
+    let mut document = MarkdownMemory::parse(text).unwrap().with_scope(scope());
+    // The parse already deduped across the two sections (the later one wins) ...
+    assert_eq!(document.facts().len(), 1);
+    assert_eq!(
+        document.fact("build").unwrap().fact_type,
+        CodingFactType::Feedback
+    );
+    // ... and a delete leaves nothing behind, in either section.
+    assert!(document.remove("build"));
+    assert!(!document.remove("build"));
+    let rendered = document.render();
+    assert!(!rendered.contains("### build"), "{rendered}");
+    assert!(!rendered.contains("## Feedback"), "{rendered}");
+}
+
+#[test]
+fn a_bracketed_tag_list_without_quotes_is_read_as_a_list() {
+    let text = "# Memory\n\n## Project\n\n### a\n\n- tags: [one, two]\n\nbody\n";
+    let document = MarkdownMemory::parse(text).unwrap();
+    let tags = document.fact("a").unwrap().tags;
+    assert_eq!(tags, vec!["one".to_owned(), "two".to_owned()]);
+    let rendered = document.render();
+    assert!(rendered.contains("- tags: [\"one\",\"two\"]"), "{rendered}");
+    assert!(!rendered.contains("[\"["), "{rendered}");
+    assert_eq!(
+        MarkdownMemory::parse(&rendered)
+            .unwrap()
+            .fact("a")
+            .unwrap()
+            .tags,
+        tags
+    );
+}
+
+#[test]
+fn every_body_line_survives_the_escape_round_trip() {
+    for line in [
+        "plain body",
+        "# not a title",
+        "## not a section",
+        "### not an entry",
+        "###",
+        "##",
+        "#",
+        "\\## already escaped",
+        "\\\\ two backslashes",
+        "\\",
+        "#hashtag",
+    ] {
+        let mut document = MarkdownMemory::new().with_scope(scope());
+        let _ = document.upsert_fact(&fact("line", line));
+        let rendered = document.render();
+        let parsed = MarkdownMemory::parse(&rendered)
+            .unwrap()
+            .with_scope(scope());
+        assert_eq!(parsed.facts().len(), 1, "line {line:?}: {rendered}");
+        assert_eq!(parsed.fact("line").unwrap().content, line, "line {line:?}");
+        assert_eq!(parsed.render(), rendered, "line {line:?} is not stable");
+    }
+}
+
+#[test]
+fn a_body_that_looks_escaped_survives_a_round_trip() {
+    let mut document = MarkdownMemory::new().with_scope(scope());
+    let body = "\\## not a section\n\\# not a title\nplain";
+    let _ = document.upsert_fact(&fact("backslashes", body));
+    let rendered = document.render();
+    let parsed = MarkdownMemory::parse(&rendered)
+        .unwrap()
+        .with_scope(scope());
+    assert_eq!(parsed.fact("backslashes").unwrap().content, body);
+    assert_eq!(parsed.render(), rendered, "the escape is stable");
+}
+
+#[test]
+fn a_non_attribute_bullet_keeps_the_later_attributes() {
+    let text = concat!(
+        "# Memory\n\n## Project\n\n### build\n\n",
+        "- description: d\n",
+        "- see also docs/BUILD.md\n",
+        "- tags: [\"ci\"]\n",
+        "- path: docs/BUILD.md\n",
+        "\nbody\n",
+    );
+    let document = MarkdownMemory::parse(text).unwrap();
+    let build = document.fact("build").unwrap();
+    assert_eq!(build.description, "d");
+    assert_eq!(
+        build.tags,
+        vec!["ci".to_owned()],
+        "the later tags still parse"
+    );
+    assert_eq!(build.path.as_deref(), Some("docs/BUILD.md"));
+    assert_eq!(build.content, "body");
+    let rendered = document.render();
+    assert!(rendered.contains("- see also docs/BUILD.md"), "{rendered}");
+    assert_eq!(
+        MarkdownMemory::parse(&rendered)
+            .unwrap()
+            .fact("build")
+            .unwrap(),
+        build
+    );
+}
+
+#[test]
+fn a_bullet_body_line_after_a_blank_line_stays_the_body() {
+    let text = "# Memory\n\n## Project\n\n### build\n\n- description: d\n\n- a body bullet\n";
+    let document = MarkdownMemory::parse(text).unwrap();
+    let build = document.fact("build").unwrap();
+    assert_eq!(build.description, "d");
+    assert_eq!(build.content, "- a body bullet");
+}
+
+#[test]
+fn an_unparsable_timestamp_is_kept_verbatim() {
+    let text =
+        "# Memory\n\n## Project\n\n### a\n\n- description: d\n- updated_at: yesterday\n\nbody\n";
+    let mut document = MarkdownMemory::parse(text).unwrap().with_scope(scope());
+    assert_eq!(
+        document.fact("a").unwrap().updated_at,
+        DateTime::<Utc>::default(),
+        "the fact uses the documented epoch default"
+    );
+    let rendered = document.render();
+    assert!(rendered.contains("- updated_at: yesterday"), "{rendered}");
+    assert!(!rendered.contains("1970-01-01"), "{rendered}");
+    assert_eq!(MarkdownMemory::parse(&rendered).unwrap().render(), rendered);
+
+    // A write replaces the preserved text with a real timestamp.
+    let _replaced = document.upsert_fact(&fact("a", "new body"));
+    let rendered = document.render();
+    assert!(!rendered.contains("yesterday"), "{rendered}");
+    assert!(
+        rendered.contains("- updated_at: 2026-11-13T07:00:00Z"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn an_unrecognized_section_keeps_its_entries_as_text() {
+    let text = concat!(
+        "# Memory\n\n## Project\n\n### build\n\nbody\n\n",
+        "## Notes\n\n### loose\n\n- description: kept as prose\n",
+    );
+    let document = MarkdownMemory::parse(text).unwrap().with_scope(scope());
+    assert_eq!(
+        document.facts().len(),
+        1,
+        "only the known section holds facts"
+    );
+    let rendered = document.render();
+    assert!(rendered.contains("## Notes"), "{rendered}");
+    assert!(rendered.contains("### loose"), "{rendered}");
+    assert!(
+        rendered.contains("- description: kept as prose"),
+        "{rendered}"
+    );
+    assert_eq!(MarkdownMemory::parse(&rendered).unwrap().render(), rendered);
+}

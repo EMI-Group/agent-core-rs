@@ -54,8 +54,15 @@ module beside the code.
 - `./traversal.rs` → sandbox containment: `..`, absolute escapes, symlinks, root-prefix false positives
 - `./shell_local.rs` → local shell: allowlist/denylist, capture, truncation, timeout, cwd, env, argv, streaming, background
 - `./code_local.rs` → local code: python3/node execution, non-zero exit semantics, validation, temp-file strategy, timeout
+- `./encoding_cjk.rs` → legacy CJK names, decoding, auto-detection and the encode round-trips for the same codecs
+- `./encoding_write.rs` → write-side round-trips for every encoding, known byte fixtures, unknown/unrepresentable failures
+- `./file_locks.rs` → cross-process `flock` contention, timeout mapping, second-process proof
+- `./process_group.rs` → process-group teardown on timeout, cancellation and background stop
+- `./pty_streaming.rs` → PTY terminal detection, line-buffered chunks, exit codes
 - `./tool_specs.rs` → 13 generated tool specs, ids, names, JSON schemas, kind filtering
 - `./sandbox_stub.rs` → `sandbox`-feature behavior without a remote provider: card validation, unsupported errors, forwarding shape
+- `./sandbox_lifecycle.rs` → managed containers: reuse/resume, `on_stop` refusals, config hash/metadata, clock-driven idle sweeps
+- `./sandbox_gateway_errors.rs` → 199012 capability gaps vs 199007 gateway failures, unary and streaming
 
 ## Notes for Agents
 

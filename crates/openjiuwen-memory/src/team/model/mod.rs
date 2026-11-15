@@ -54,6 +54,7 @@ pub use record::*;
 pub use results::*;
 pub use scope::*;
 pub use validate::normalize_tags;
+pub(crate) use validate::validate_embedding;
 
 /// Longest accepted team, member, or session id, in characters.
 pub const MAX_SCOPE_ID_CHARS: usize = 128;

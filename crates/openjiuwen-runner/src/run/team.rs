@@ -35,7 +35,11 @@ use super::{
 
 /// Runs one agent-team invocation to completion.
 ///
-/// The reference is resolved first (a missing id is
+/// A distributed-configured context is refused first:
+/// [`RunServices::require_local`] returns `Error::Unsupported` naming the
+/// deferred transports before anything else happens.
+///
+/// The reference is resolved next (a missing id is
 /// [`openjiuwen_common::error::Error::NotFound`]), the team's transport is
 /// started (idempotently), and a [`SessionLease`] is taken: without a
 /// caller-provided team session the lease creates and binds one, and its
@@ -73,6 +77,7 @@ pub async fn invoke_team(
     inputs: Value,
     options: RunOptions,
 ) -> Result<Value> {
+    services.require_local()?;
     let run_id = Uuid::new_v4().to_string();
     let started = Instant::now();
 
@@ -154,6 +159,11 @@ pub async fn invoke_team(
 
 /// Runs one agent-team invocation as a stream of wire frames.
 ///
+/// A distributed-configured context refuses as this stream's **single** terminal
+/// `Err` frame ([`RunServices::require_local`]): nothing else happens — no
+/// reference resolution, no transport start, no session lease, no callback, no
+/// monitor or hub status.
+///
 /// The stream is returned immediately, so a resolution or transport-start
 /// failure is delivered as a one-element stream yielding that error. On success
 /// the strategy's frames are forwarded verbatim (nothing is re-wrapped) and the
@@ -185,6 +195,13 @@ pub fn stream_team(
 ) -> BoxStream<'static, Result<Value>> {
     let run_id = Uuid::new_v4().to_string();
     async_stream::stream! {
+        // Mode enforcement is the stream's first statement: a distributed runner
+        // refuses as the single terminal `Err` frame, before a reference is
+        // resolved, the team is started, a session is leased, or a status exists.
+        if let Err(error) = services.require_local() {
+            yield Err(error);
+            return;
+        }
         let started = Instant::now();
         let team = match resolve_team(&services, &team) {
             Ok(team) => team,

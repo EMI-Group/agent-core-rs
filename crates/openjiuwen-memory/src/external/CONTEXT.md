@@ -16,7 +16,7 @@ Provider SPI (`provider.rs`):
 - `MemoryProvider` — `#[async_trait] Send + Sync`, all methods `&self`: `name`, `capabilities`, `initialize`, `add`, `search`, `get`, `update`, `delete`, `list`, `clear`, `health`.
 - `ProviderCapabilities { semantic_search, keyword_search, graph, variables, message_history, pagination, max_batch }` — `none()` is the conservative default, `local(has_embedding)` is the engine's report.
 - `ProviderHealth { healthy, detail, checked_at }` — `healthy()`, `degraded(detail)`, `with_detail(..)`.
-- Provided rail methods: `is_available()`, `is_initialized()` (`false`), `default_scope()` (`MemoryScope::default()`), `get_tool_schemas()`, `handle_tool_call(tool, args)`, `prefetch(query)`, `sync_turn(user_msg, assistant_msg)`, `system_prompt_block()` (`""`), `on_session_end(messages)` (no-op).
+- Provided rail methods: `is_available()`, `is_initialized()` (`false`, overridden by `EngineProvider` and by `RestProvider` to report its probe state), `default_scope()` (`MemoryScope::default()`), `get_tool_schemas()`, `handle_tool_call(tool, args)`, `prefetch(query)`, `sync_turn(user_msg, assistant_msg)`, `system_prompt_block()` (`""`), `on_session_end(messages)` (no-op).
 - The default rail dispatches `add_memory` / `search_memory` / `list_memories` / `delete_memory` against `default_scope()`; an unknown name answers `{"error": "unknown tool: <name>"}` and a backend failure answers `{"error": …}` (never a raised error), matching the Python rail.
 
 Rail helpers (`rail.rs`, pure, no I/O):
@@ -34,8 +34,9 @@ Transport (`rest.rs` + `rest/{call,auth,wire}.rs` + `rest_json.rs`):
 - `AuthScheme { None, Bearer, Token, Header, Query }`, `resolve_auth(default, config)`.
 - `Op { Add, Search, Get, Update, Delete, List, Clear, Health }` (`as_str`, `is_idempotent`), `SpecContext`.
 - `WireSpec` — one static spec per vendor: `id`/`display`/`missing`/`capabilities`/`default_auth`/`headers`/`default_scope`/`supports`, plus an `*_call`/`*_result` pair per record verb and `health_call`; every shape method defaults to a typed `Unsupported`.
+- `WireSpec::next_list_call` is the optional paging hook: a spec that pages answers the request for the next page from the answer it was given, and defaults to `None` (one page).
 - `RestProvider` — `from_config(spec, config)`, `spec`, `config`, `is_configured`, `endpoints`, `client`, and the full `MemoryProvider` impl.
-- `rest_json` — `body_value`, `results_array`, `field_str`/`field_f64`/`field_i64`/`field_f32`/`field_value`, `parse_timestamp`, `vendor_record`, `vendor_hit`, `truncate_detail`, `error_detail`, `scope_id`/`user_id`.
+- `rest_json` — `body_value`, `results_array`, `results_array_checked`, `field_str`/`field_f64`/`field_i64`/`field_f32`/`field_value`, `parse_timestamp`, `vendor_record`, `listing_record`, `vendor_hit`, `rank_hits`, `truncate_detail`, `error_detail`, `scope_id`/`user_id`.
 
 Vendor adapters (`vendor/`): `Mem0MemoryProvider`, `JiuwenMemoryProvider`, `LakeBaseMemoryProvider`, `OpenVikingMemoryProvider`, `AgentArtsMemoryProvider`, plus `vendor_factories()`.
 
@@ -50,13 +51,18 @@ Vendor adapters (`vendor/`): `Mem0MemoryProvider`, `JiuwenMemoryProvider`, `Lake
 - **Writes**: `add` sends one request per memory (every vendor API accepts one content per call) and concatenates the outcomes.
 - **Clear**: a spec without `clear_call` falls back to `list` + one `delete` per id; a vendor with neither ends in its typed `Unsupported`.
 - **Health**: `health_call` when the spec has one (`2xx` healthy, anything else `Ok(degraded)`), otherwise a `list` probe on the sentinel scope `("__health__", "__health__")`; a configured provider never fails `health`.
+- **Initialization**: `initialize` runs that same probe but honours its verdict — `401`/`403` is `Error::Security` naming the credential, any other non-`2xx` is `Error::Transport` carrying the vendor detail, and the handle stays uninitialized on both; a spec with no health call initializes unverified.
+- **Pagination**: `list` follows `WireSpec::next_list_call` page by page, bounded by `MAX_LIST_PAGES = 200`, and an unfinished walk is a typed error rather than a silent partial listing, so `list` and `clear`'s list-then-delete fallback see the whole collection.
+- **Listing shape**: `mem0` and `lakebase` decode listings with `results_array_checked`, which reports a non-empty `2xx` body that carries no recognised row array as `Error::Validation` naming the URL and the answered keys, so a renamed wrapper or a proxy error page cannot read as an empty collection; `results_array` stays tolerant for write and point-read answers.
+- **Listing rows**: `listing_record` skips a row that carries no memory content (with a warning naming the operation and the row's keys), and `openviking` additionally skips directory entries, so a listing never reports an invented id or an empty body; a point read or write answer still uses `vendor_record`, which fills the id in locally.
+- **Recall scoring**: an absent vendor score stays absent — `rank_hits` keeps an unscored row whatever `threshold` is, ranks scored rows first by score with the unscored rows after them in vendor order, and only then applies `top_k`, so a vendor whose recall answer omits `score` still answers with its matches.
 - **Unconfigured handles**: `from_config` never fails; a handle without any endpoint reports `ProviderCapabilities::none()` and every method returns `Unsupported` naming `WireSpec::missing()` plus ``no `endpoint` is configured``. This contract is asserted by `crates/openjiuwen-memory/tests/external_provider.rs` (read-only for this node).
 
 ## Vendor Matrix
 
 | Vendor | Transport | Auth | HTTP operations | Typed `Unsupported` |
 | --- | --- | --- | --- | --- |
-| `mem0` | `https://api.mem0.ai`-shaped REST | `Authorization: Token` | `POST /v1/memories/`, `POST /v1/memories/search/`, `GET /v1/memories/`, `GET|PUT|DELETE /v1/memories/{id}/`, `GET /v1/ping/` | — |
+| `mem0` | `https://api.mem0.ai`-shaped REST | `Authorization: Token` | `POST /v1/memories/`, `POST /v1/memories/search/`, paged `GET /v1/memories/`, `GET|PUT|DELETE /v1/memories/{id}/`, `GET /v1/ping/` | a listing `filter` field other than `user_id`/`agent_id` |
 | `jiuwen_memory` | Mem2 server | `Authorization: Bearer` | `POST /v1/search`, `POST /v1/add`, `GET /healthz` | `get`, `update`, `delete`, `list`, `clear` (the documented Mem2 API has no such verbs) |
 | `lakebase` | DBay REST (`.../api/v1` base) | `Authorization: Bearer` | `POST …/memory/bases/{base_id}/ingest`, `POST …/recall`, `GET …/memories`, `GET|DELETE …/memories/{id}`, `GET …/stats` | `update` (no documented endpoint) |
 | `openviking` | OpenViking REST | `X-API-Key` + `X-OpenViking-{Account,User,Agent}` | `POST /api/v1/search/find`, `POST /api/v1/sessions/{id}/messages`, `GET /api/v1/content/read`, `GET /api/v1/fs/ls`, `GET /health`, rail-only `/api/v1/fs/{tree,stat}`, `/api/v1/content/{abstract,overview}`, `POST /api/v1/resources`, `POST /api/v1/sessions/{id}/commit` | `delete`, `update`, `clear` (no documented endpoints) |
@@ -64,6 +70,12 @@ Vendor adapters (`vendor/`): `Mem0MemoryProvider`, `JiuwenMemoryProvider`, `Lake
 
 Per-vendor rail: `mem0_*` (3 tools), `mem2_*` (2), `lkb_*` (6), `viking_*` (5), `external_memory_search` (1), each with its Python prompt block, `prefetch` heading and payload shapes.
 `openviking` also overrides `sync_turn` (two session messages) and `on_session_end` (session commit); `lakebase` overrides `sync_turn` (episode ingest).
+
+Per-vendor decode rules:
+- `mem0` pages `GET /v1/memories/` through `next_list_call` (a short page ends the walk) and rejects a listing `filter` it cannot express with a typed `Unsupported` naming the fields, because the endpoint accepts only `user_id` and `agent_id`.
+- `jiuwen_memory` propagates a non-JSON recall body as a typed error instead of reading it as "no hits", and reports an accepted write whose answer is not a top-level JSON array as **added**; only an empty unit array is a dedupe skip.
+- `lakebase` warns and reports a client-generated id when an ingest answer carries no `memory_id`, and sends a multi-kind `filter.kinds` listing unfiltered because the API takes one `memory_type`.
+- `openviking` decodes its directory listing from `result`, skipping directories and entries with neither a `uri` nor content.
 
 ## Constraints
 
@@ -89,7 +101,12 @@ Per-vendor rail: `mem0_*` (3 tools), `mem2_*` (2), `lkb_*` (6), `viking_*` (5), 
 ## Known Issues
 
 - `clear` on `jiuwen_memory` and `openviking` runs the transport's list-then-delete fallback and therefore ends in the vendor's typed `Unsupported` (nothing is removed); the same is true for a `lakebase`/`openviking` clear where `delete` is supported but `list` is not.
-- A `drop`/`clear` of a `mem0` memory group is a no-op at the vendor; only per-id deletes exist.
+- `jiuwen_memory`'s write decoder overwrites the decoded content with its `segments` join, so a unit without `segments` yields an `added` record with empty content (and `mem2_add` answers `"stored"` with `content: ""`).
+- `vendor_record` fills in a local id when a vendor row carries none, so an id-less row from a point read or a listing decodes to a record whose id cannot address it remotely.
+- `lakebase` reports `added` from any `2xx` ingest even without a `memory_id` (warning only), and sends a multi-kind `filter.kinds` listing unfiltered.
+- `SearchMode::Hybrid` is not validated against `ProviderCapabilities`, so a semantic-only vendor (`mem0`, `openviking`) answers a hybrid request with its semantic result instead of a typed `Unsupported`.
+- `OpenVikingSpec::add_result` and the `viking_add_resource` rail tool report success from a `2xx` without decoding it (a client-generated id, an empty `root_uri`), which is deliberate for session-message writes but loses any vendor rejection carried in a `2xx` body.
+- `openviking`'s directory listing decodes a body that carries no `result` array as an empty listing rather than a shape-drift error.
 
 ## Deferred (not implemented here)
 
@@ -116,11 +133,11 @@ Per-vendor rail: `mem0_*` (3 tools), `mem2_*` (2), `lkb_*` (6), `viking_*` (5), 
 
 ## Test Strategy
 
-- 160 offline unit tests under `external::` (`cargo test -p openjiuwen-memory --offline --lib external`).
+- 168 offline unit tests under `external::` (`cargo test -p openjiuwen-memory --offline --lib external`).
 - `rest/tests.rs` (19) — wiremock: auth header per scheme, add/search/get/delete/list bodies, `404` → `None`/`false`, `401` → `Security`, `422` → `Validation`, `503` → retry then success, failover to a second server, all-failed names the last endpoint, pre-cancelled options → `Cancelled`, and the unconfigured-handle message.
-- `rest_json.rs` (9) — array/alias/timestamp decoding and `vendor_record`/`vendor_hit` fallbacks.
+- `rest_json.rs` (13) — array/alias/timestamp decoding, `vendor_record`/`vendor_hit` fallbacks, `rank_hits` threshold/ordering with scored and unscored rows, `results_array_checked` shape drift, and `listing_record` skipping.
 - `provider.rs` (11) + `rail.rs` (9) + `local.rs` (9) — rail defaults through an unbacked provider, schema shape, argument bounds, `EngineProvider` rail round trip.
 - `registry.rs` (14) + `mod.rs` (1) + `vendor/mod.rs` (6) — kinds/configs/redaction/registry semantics, the unconfigured surface of every vendor, configured capability flags, failover ordering, factory order and kind mismatch.
-- Per vendor: `mem0` (14), `jiuwen` (14), `lakebase` (16), `openviking` (30), `agentarts` (8) — request method/path/body/auth assertions, response mapping with threshold filtering, `404` handling, retry, failover, cancellation, capability flags, and the rail (schemas, `handle_tool_call` happy/unknown path, `prefetch`, prompt block, `sync_turn`/`on_session_end`).
+- Per vendor: `mem0` (14), `jiuwen` (16), `lakebase` (16), `openviking` (32), `agentarts` (8) — request method/path/body/auth assertions, response mapping with threshold filtering and unscored rows, `404` handling, retry, failover, cancellation, listing pagination and shape drift, capability flags, and the rail (schemas, `handle_tool_call` happy/unknown path, `prefetch`, prompt block, `sync_turn`/`on_session_end`).
 - Everything runs offline through `wiremock`; no API key, network, or wall-clock ordering is needed.
 - Gates: `cargo fmt -p openjiuwen-memory -- --check`, `cargo test -p openjiuwen-memory --offline --all-features`, `cargo clippy -p openjiuwen-memory --all-targets --all-features --offline -- -D warnings`, `cargo doc -p openjiuwen-memory --no-deps`.

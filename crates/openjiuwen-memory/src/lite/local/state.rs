@@ -54,6 +54,12 @@ pub(super) struct LocalState {
     pub(super) facts_stamp: Option<DirStamp>,
     /// Whether the on-disk projection trails the cached document.
     pub(super) projections_dirty: bool,
+    /// The version of the cached document, bumped on every change.
+    ///
+    /// The chunk index records the version it was built from, so a document that changed
+    /// outside the store — an editor, another process, the watcher — is re-embedded before
+    /// the next semantic recall instead of being scored with stale vectors.
+    pub(super) version: u64,
 }
 
 impl LocalState {
@@ -65,7 +71,18 @@ impl LocalState {
             index_stamps: [None; 2],
             facts_stamp: None,
             projections_dirty: false,
+            version: 0,
         }
+    }
+
+    /// Records that the cached document changed, so derived state keyed on it is stale.
+    pub(super) fn touch(&mut self) {
+        self.version = self.version.wrapping_add(1);
+    }
+
+    /// The current document version.
+    pub(super) fn version(&self) -> u64 {
+        self.version
     }
 }
 
@@ -93,7 +110,11 @@ pub(super) struct Inner {
     /// The content-hash keyed vector cache shared by the embedding index.
     pub(super) cache: EmbeddingCache,
     /// The chunked vector index, built lazily and refreshed on every mutation.
-    pub(super) embeddings: Mutex<Option<EmbeddingIndex>>,
+    ///
+    /// The index is paired with the document version it was built from
+    /// ([`LocalState::version`]), so a document changed outside the store is re-embedded
+    /// before it is scored.
+    pub(super) embeddings: Mutex<Option<EmbeddingIndexState>>,
     /// Whether the per-fact file layout (`facts/` plus `MEMORY.md`/`USER.md`) is enabled.
     pub(super) fact_files: bool,
     /// The per-fact file store of this root and scope.
@@ -114,6 +135,14 @@ pub(super) struct ActiveWatch {
     pub(super) watcher: MemoryWatcher,
     /// The reload task fed by the watcher.
     pub(super) task: JoinHandle<()>,
+}
+
+/// The chunk index together with the document version it was built from.
+pub(super) struct EmbeddingIndexState {
+    /// The chunked vector index over the fact bodies.
+    pub(super) index: EmbeddingIndex,
+    /// The [`LocalState::version`] the index was built from.
+    pub(super) version: u64,
 }
 
 /// A local coding-memory store rooted at one directory.

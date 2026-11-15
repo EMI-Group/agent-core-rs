@@ -5,6 +5,12 @@
 //! Metadata follows the other office loaders (`source_type = "document"`) and
 //! adds the paragraph and table counts plus the `dc:title` the `meta.xml` part
 //! carries, when it is present.
+//!
+//! Elements the parser renders no text for (drawings, footnotes, tables of
+//! contents, tracked changes, annotations, unknown blocks) are not dropped
+//! silently: `odt_unsupported_elements` lists each one as
+//! `<prefixed name> (×<count>)` and `odt_incomplete` flags whether the list is
+//! non-empty, next to the other metadata keys.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -34,13 +40,17 @@ impl OdtLoader {
 /// The text is [`OdtDocument::text`] (Markdown-flavoured headings, paragraphs,
 /// and tables joined by newlines), and the metadata keeps `paragraph_count`,
 /// `table_count`, `source_type = "document"`, and `title` only when the
-/// properties part carries one.
+/// properties part carries one. `odt_unsupported_elements` (a JSON array of the
+/// elements that contributed no text) and `odt_incomplete` (`true` iff that
+/// array is non-empty) are always inserted, so a consumer can tell a complete
+/// extraction from a partial one without parsing logs.
 fn text_document(document: OdtDocument) -> Document {
     let OdtDocument {
         text,
         paragraph_count,
         table_count,
         title,
+        unsupported_elements,
     } = document;
     let mut metadata = Metadata::new();
     if let Some(title) = title {
@@ -51,6 +61,19 @@ fn text_document(document: OdtDocument) -> Document {
     metadata.insert(
         "source_type".to_owned(),
         Value::String("document".to_owned()),
+    );
+    metadata.insert(
+        "odt_incomplete".to_owned(),
+        Value::Bool(!unsupported_elements.is_empty()),
+    );
+    metadata.insert(
+        "odt_unsupported_elements".to_owned(),
+        Value::Array(
+            unsupported_elements
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+        ),
     );
     Document::new(text).with_metadata(metadata)
 }
@@ -124,6 +147,19 @@ mod tests {
   <office:meta><dc:title>Meeting notes</dc:title></office:meta>
 </office:document-meta>"#;
 
+    /// `content.xml` fixture with a body paragraph, a drawing, and a footnote.
+    const PARTIAL_CONTENT_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+    xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0">
+  <office:body><office:text>
+    <text:p>Rendered <draw:frame><draw:image href="Pictures/a.png"/></draw:frame>body</text:p>
+    <text:p>Footnote<text:note><text:note-citation>1</text:note-citation>
+      <text:note-body><text:p>hidden</text:p></text:note-body></text:note></text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+
     /// Two-paragraph document built by the shared fixture.
     fn document_bytes() -> Vec<u8> {
         odt_document(&["Intro", "Body & <text>"]).unwrap()
@@ -149,8 +185,77 @@ mod tests {
             Some(&Value::String("document".to_owned()))
         );
         assert!(document.metadata.get("title").is_none());
+        assert_eq!(
+            document.metadata.get("odt_incomplete"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            document.metadata.get("odt_unsupported_elements"),
+            Some(&Value::Array(Vec::new()))
+        );
         assert_eq!(document.id.len(), 36);
         assert!(uuid::Uuid::parse_str(&document.id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn partial_documents_report_the_unsupported_elements() {
+        let bytes = build_zip(&[("content.xml", PARTIAL_CONTENT_XML)]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.odt");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let documents = OdtLoader::new().load(path.to_str().unwrap()).await.unwrap();
+        let document = &documents[0];
+        assert_eq!(document.text, "Rendered body\nFootnote");
+        assert_eq!(
+            document.metadata.get("odt_incomplete"),
+            Some(&Value::Bool(true))
+        );
+        let elements = document
+            .metadata
+            .get("odt_unsupported_elements")
+            .and_then(Value::as_array)
+            .expect("odt_unsupported_elements is a JSON array");
+        assert_eq!(
+            elements,
+            &vec![
+                Value::String("draw:frame (×1)".to_owned()),
+                Value::String("draw:image (×1)".to_owned()),
+                Value::String("text:note (×1)".to_owned()),
+            ]
+        );
+        assert!(
+            elements
+                .iter()
+                .any(|value| value.as_str() == Some("draw:image (×1)")),
+            "drawings are reported: {elements:?}"
+        );
+        // The keys that predate the completeness markers still apply.
+        assert_eq!(
+            document.metadata.get("paragraph_count"),
+            Some(&Value::from(2))
+        );
+        assert_eq!(document.metadata.get("table_count"), Some(&Value::from(0)));
+        assert_eq!(
+            document.metadata.get("source_type"),
+            Some(&Value::String("document".to_owned()))
+        );
+
+        // In-memory loading reports exactly the same list.
+        let from_bytes = OdtLoader::new()
+            .load_bytes(
+                &DocumentBytes::new("partial.odt", bytes),
+                &LoadOptions::new(),
+            )
+            .await
+            .unwrap();
+        for key in ["odt_incomplete", "odt_unsupported_elements"] {
+            assert_eq!(
+                from_bytes[0].metadata.get(key),
+                document.metadata.get(key),
+                "metadata key {key}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -205,6 +310,14 @@ mod tests {
         assert_eq!(
             from_bytes[0].metadata.get("source_type"),
             from_path[0].metadata.get("source_type")
+        );
+        assert_eq!(
+            from_bytes[0].metadata.get("odt_incomplete"),
+            from_path[0].metadata.get("odt_incomplete")
+        );
+        assert_eq!(
+            from_bytes[0].metadata.get("odt_unsupported_elements"),
+            from_path[0].metadata.get("odt_unsupported_elements")
         );
         assert_eq!(from_bytes[0].id.len(), 36);
     }

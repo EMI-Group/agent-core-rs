@@ -2,12 +2,15 @@
 //!
 //! Port of the Python chunker registry (`register_chunker` / `get_chunker`) plus
 //! the extra `"recursive"` and `"token"` built-ins of this crate.
+//! `"hybrid"` mirrors Python's `_hybrid_factory`: it takes the same size/overlap
+//! pair as every other factory and builds a [`HybridChunker`] over a
+//! [`CharChunker`] with the default no-split predicate.
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
 
-use super::{CharChunker, Chunker, RecursiveCharChunker, TokenChunker};
+use super::{CharChunker, Chunker, HybridChunker, RecursiveCharChunker, TokenChunker};
 
 /// Factory that builds a chunker from a size and an overlap.
 pub type ChunkerFactory = Arc<dyn Fn(usize, usize) -> Result<Arc<dyn Chunker>> + Send + Sync>;
@@ -15,7 +18,8 @@ pub type ChunkerFactory = Arc<dyn Fn(usize, usize) -> Result<Arc<dyn Chunker>> +
 /// Registry mapping chunker names to factories.
 ///
 /// Names are trimmed and lowercased, so lookups are case-insensitive. The
-/// built-ins are `"char"` (alias `"fixed"`), `"recursive"`, and `"token"`.
+/// built-ins are `"char"` (alias `"fixed"`), `"recursive"`, `"token"`, and
+/// `"hybrid"`.
 #[derive(Clone, Default)]
 pub struct ChunkerRegistry {
     /// Normalized name to factory.
@@ -35,6 +39,7 @@ impl ChunkerRegistry {
         registry.insert("fixed", Arc::new(create_char));
         registry.insert("recursive", Arc::new(create_recursive));
         registry.insert("token", Arc::new(create_token));
+        registry.insert("hybrid", Arc::new(create_hybrid));
         registry
     }
 
@@ -115,6 +120,12 @@ fn create_token(chunk_size: usize, chunk_overlap: usize) -> Result<Arc<dyn Chunk
     Ok(Arc::new(TokenChunker::new(chunk_size, chunk_overlap)?))
 }
 
+/// Builds a [`HybridChunker`] over a [`CharChunker`] (Python's default factory).
+fn create_hybrid(chunk_size: usize, chunk_overlap: usize) -> Result<Arc<dyn Chunker>> {
+    let inner = Arc::new(CharChunker::new(chunk_size, chunk_overlap)?);
+    Ok(Arc::new(HybridChunker::new(inner)))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -129,7 +140,7 @@ mod tests {
         assert_eq!(registry.create("token", 7, 1).unwrap().chunk_size(), 7);
         assert!(registry.contains("char"));
         assert!(registry.contains("fixed"));
-        assert!(!registry.contains("hybrid"));
+        assert!(registry.contains("hybrid"));
     }
 
     #[test]
@@ -143,6 +154,14 @@ mod tests {
         assert_eq!(char_chunker.chunk_overlap(), 2);
         let token_chunker = registry.create("token", 2, 0).unwrap();
         assert_eq!(token_chunker.chunk_text("a b c").unwrap(), ["a b", "c"]);
+        // The hybrid factory wraps a char chunker with the same parameters.
+        let hybrid_chunker = registry.create("hybrid", 5, 2).unwrap();
+        assert_eq!(hybrid_chunker.chunk_size(), 5);
+        assert_eq!(hybrid_chunker.chunk_overlap(), 2);
+        assert_eq!(
+            hybrid_chunker.chunk_text("abcdefgh").unwrap(),
+            ["abcde", "defgh", "gh"]
+        );
     }
 
     #[test]
@@ -185,9 +204,9 @@ mod tests {
     #[test]
     fn unknown_names_are_unsupported() {
         let registry = ChunkerRegistry::with_defaults();
-        let error = registry.create("hybrid", 8, 2).err().unwrap();
+        let error = registry.create("semantic", 8, 2).err().unwrap();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
-        assert!(error.to_string().contains("unknown chunker: hybrid"));
+        assert!(error.to_string().contains("unknown chunker: semantic"));
     }
 
     #[test]

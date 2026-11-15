@@ -237,9 +237,22 @@ fn is_static_launcher(launcher: &SandboxLauncherConfig) -> bool {
 }
 
 /// The static endpoint of a pre-deployed sandbox (today's dispatch endpoint).
+///
+/// A `pre_deploy` launcher without a `base_url` yields the empty base URL, which is kept for
+/// compatibility (the provider decides whether it can serve such an endpoint; the built-in
+/// HTTP gateway rejects it with a typed error). It is logged, because an empty endpoint is
+/// otherwise indistinguishable from a real one until the first call fails.
 fn static_endpoint(launcher: &SandboxLauncherConfig, isolation_key: String) -> SandboxEndpoint {
+    let base_url = launcher.base_url.clone().unwrap_or_default();
+    if base_url.trim().is_empty() {
+        tracing::warn!(
+            launcher_type = %launcher.launcher_type,
+            sandbox_type = %launcher.sandbox_type,
+            "the static sandbox endpoint has no base_url; the provider must reject it"
+        );
+    }
     SandboxEndpoint {
-        base_url: launcher.base_url.clone().unwrap_or_default(),
+        base_url,
         sandbox_id: None,
         isolation_key: Some(isolation_key),
     }
@@ -950,7 +963,7 @@ mod tests {
             .create_fs("aio_http_test", &endpoint, &gateway)
             .unwrap();
         let result = fs.read_file(ReadFileParams::text("x")).await;
-        assert_eq!(result.code, 199_007);
+        assert_eq!(result.code, 199_012);
         assert!(result.message.contains("sandbox gateway error"));
     }
 }

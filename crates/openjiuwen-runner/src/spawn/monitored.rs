@@ -24,6 +24,30 @@
 //! on success, a `healthy: false` detail carrying the error on failure) while
 //! still returning the probe's own result to the caller.
 //!
+//! **A cadence the backend cannot honour is supervised here.**
+//! [`crate::spawn::SpawnedAgent::set_health_interval`] forwards to the wrapped
+//! handle first: a backend that runs its own loop keeps owning its cadence and the
+//! decorator records nothing extra, because a cadence is configuration, not a
+//! lifecycle transition. When the backend answers
+//! [`openjiuwen_common::error::Error::Unsupported`] the decorator starts — and on
+//! the next call re-tunes — one supervised loop of its own over the wrapped handle
+//! and returns `Ok(())`: a monitored handle honours the cadence even when the
+//! backend cannot, and a [`Duration::ZERO`] interval stops that loop (the zero is
+//! still forwarded to the backend). The loop is one owned task, so a re-tune
+//! reschedules instead of accumulating, and `shutdown`, `force_kill`, a terminal
+//! finish, [`Drop`] and the run reaching a terminal phase all stop it.
+//!
+//! Each supervised tick records exactly what
+//! [`crate::spawn::SpawnedAgent::health`] records — the same probe, the same
+//! `backend`/`alive`/`healthy`/`pid` detail on success, the same `healthy: false`
+//! plus `error` detail on failure, and the same dead-child rule — and an
+//! observation error is discarded with `let _ =`, so it never fails the spawn. The
+//! one difference is deliberate: a backend whose own probe is
+//! [`openjiuwen_common::error::Error::Unsupported`] (a bare host handle) is
+//! observed by liveness, because `is_alive`/`pid` are real data while a fabricated
+//! probe result would not be; that tick records
+//! `{"backend", "alive", "healthy", "pid", "probe": "liveness_only"}`.
+//!
 //! **A dead child is terminal.** Liveness is the one thing the decorator can
 //! decide without a backend-specific probe, so it is what ends a run whose child
 //! exited on its own: after every probe, and after a `send`/`stream` (or their
@@ -33,8 +57,8 @@
 //! The call itself is unaffected — the probe result and the error are returned
 //! unchanged — and a failure against a *live* child (a protocol desync, a
 //! timed-out probe) leaves the run active, because the child is still there.
-//! Nothing is polled in the background; a host that never probes or calls a dead
-//! child keeps seeing it as active.
+//! Nothing is polled unless a cadence was asked for; a host that never probes,
+//! never calls a dead child, and never sets an interval keeps seeing it as active.
 //!
 //! **Finished exactly once.** `shutdown`, `force_kill`, [`Drop`] and the dead-child
 //! rule all finish the run, and a [`std::sync::atomic::AtomicBool`] latches the
@@ -48,18 +72,23 @@ use crate::spawn::{SpawnBackend, SpawnHealth, SpawnedAgent};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use openjiuwen_agent::output::{AgentChunk, AgentOutput};
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{ErrorKind, Result};
 use serde_json::{json, Value};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// A [`SpawnedAgent`] decorator that reports its child's lifecycle into a
 /// [`RunMonitor`].
 ///
-/// See the [module docs](self) for the transitions it records; every
-/// [`SpawnedAgent`] method forwards to the wrapped handle unchanged.
+/// See the [module docs](self) for the transitions it records and for the health
+/// cadence it supervises when the wrapped backend cannot: every
+/// [`SpawnedAgent`] method forwards to the wrapped handle, and
+/// [`SpawnedAgent::set_health_interval`] forwards first and then supervises the
+/// cadence itself when the backend answers
+/// [`openjiuwen_common::error::Error::Unsupported`].
 pub struct MonitoredSpawnedAgent {
     /// The wrapped child handle.
     inner: Arc<dyn SpawnedAgent>,
@@ -72,6 +101,11 @@ pub struct MonitoredSpawnedAgent {
     /// Shared with the [`SpawnWatch`] a returned stream carries, so a stream frame
     /// and the handle itself contend for the same latch.
     closed: Arc<AtomicBool>,
+    /// The supervised health loop, when the wrapped backend cannot re-tune its own.
+    ///
+    /// Nothing runs until a caller asks for a cadence the backend rejects with
+    /// [`openjiuwen_common::error::Error::Unsupported`].
+    supervisor: Arc<HealthSupervisor>,
 }
 
 /// The observation state a returned stream needs, detached from the handle.
@@ -114,6 +148,162 @@ impl SpawnWatch {
             json!({"reason": "child_exited", "backend": self.inner.backend().as_str()}),
         ));
     }
+
+    /// Probes the wrapped child and records the observation into the monitor.
+    ///
+    /// Both the explicit probe path
+    /// ([`SpawnedAgent::health`](crate::spawn::SpawnedAgent::health)) and the
+    /// supervised tick funnel through here, so they record the same details: a
+    /// successful probe records `{"backend", "alive", "healthy", "pid"}`, a failed
+    /// one `{"healthy": false, "error"}`.
+    ///
+    /// `mode` decides what an *unimplemented* probe means: the explicit path
+    /// records it as the failure it is, while a supervised tick records the
+    /// liveness it can still read (`{"backend", "alive", "healthy", "pid",
+    /// "probe": "liveness_only"}`), because there is a real difference between "the
+    /// child is up but cannot answer a probe" and "the child is gone".
+    ///
+    /// Every monitor call is discarded with `let _ =` — an observation error must
+    /// never fail the spawn — and the probe's own result is returned unchanged,
+    /// including the dead-child rule that finishes the run after it.
+    async fn record_probe(&self, mode: ProbeMode) -> Result<bool> {
+        let result = self.inner.health().await;
+        match &result {
+            Ok(healthy) => {
+                let _ = self.monitor.update(
+                    &self.run_id,
+                    RunPhase::Running,
+                    json!({
+                        "backend": self.inner.backend().as_str(),
+                        "alive": self.inner.is_alive(),
+                        "healthy": healthy,
+                        "pid": self.inner.pid(),
+                    }),
+                );
+            }
+            Err(error) if mode == ProbeMode::Tick && error.kind() == ErrorKind::Unsupported => {
+                let _ = self.monitor.update(
+                    &self.run_id,
+                    RunPhase::Running,
+                    json!({
+                        "backend": self.inner.backend().as_str(),
+                        "alive": self.inner.is_alive(),
+                        "healthy": self.inner.is_healthy(),
+                        "pid": self.inner.pid(),
+                        "probe": "liveness_only",
+                    }),
+                );
+            }
+            Err(error) => {
+                let _ = self.monitor.update(
+                    &self.run_id,
+                    RunPhase::Running,
+                    json!({"healthy": false, "error": error.to_string()}),
+                );
+            }
+        }
+        self.finish_if_child_exited();
+        result
+    }
+}
+
+/// Which observation a probe result is recorded as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeMode {
+    /// An explicit [`crate::spawn::SpawnedAgent::health`] call: record the probe's
+    /// own answer, and an unimplemented probe as the failed observation it is.
+    Probe,
+    /// A supervised tick: an unimplemented probe is recorded by liveness instead of
+    /// as a fabricated failure.
+    Tick,
+}
+
+/// One supervised health loop, plus the signal that stops it.
+struct SupervisedLoop {
+    /// Cancels the loop between observations, so a re-tune never abandons a probe.
+    stop: CancellationToken,
+    /// The loop task; joined by [`HealthSupervisor::stop`], aborted on drop.
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Owns the decorator's one supervised health loop.
+///
+/// A backend that implements
+/// [`SpawnedAgent::set_health_interval`](crate::spawn::SpawnedAgent::set_health_interval)
+/// supervises itself, so the decorator never starts a loop for it. A backend that
+/// answers [`openjiuwen_common::error::Error::Unsupported`] cannot, so the
+/// decorator owns the cadence here: one slot, which means a re-tune cancels and
+/// joins the previous loop before arming the next (no task is ever leaked), and a
+/// [`Duration::ZERO`] interval leaves the slot empty.
+///
+/// The loop task holds only a [`SpawnWatch`] and a stop token, never an [`Arc`] of
+/// this supervisor, so it can never keep its own owner alive.
+#[derive(Default)]
+struct HealthSupervisor {
+    /// The running loop, if a cadence was requested and the backend refused it.
+    slot: parking_lot::Mutex<Option<SupervisedLoop>>,
+}
+
+impl HealthSupervisor {
+    /// A supervisor with no loop running.
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cancels and joins the running loop, if any.
+    async fn stop(&self) {
+        let Some(running) = self.slot.lock().take() else {
+            return;
+        };
+        running.stop.cancel();
+        let _ = running.task.await;
+    }
+
+    /// Replaces the running loop with one observing every `interval`.
+    ///
+    /// A [`Duration::ZERO`] interval stops the loop and arms nothing.
+    async fn retune(&self, interval: Duration, watch: SpawnWatch) {
+        self.stop().await;
+        if interval.is_zero() {
+            return;
+        }
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(supervised_health_loop(interval, watch, stop.clone()));
+        *self.slot.lock() = Some(SupervisedLoop { stop, task });
+    }
+}
+
+impl Drop for HealthSupervisor {
+    /// Aborts the supervised loop when the last handle goes away.
+    fn drop(&mut self) {
+        if let Some(running) = self.slot.get_mut().take() {
+            running.stop.cancel();
+            running.task.abort();
+        }
+    }
+}
+
+/// The supervised loop: one observation per interval until the run finishes.
+///
+/// The loop ends on the stop token, on the crate's own latch (a terminal finish
+/// from a shutdown, a kill, a dead child, or a dropped handle), and therefore
+/// always within one interval of the run finishing.
+async fn supervised_health_loop(interval: Duration, watch: SpawnWatch, stop: CancellationToken) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick completes immediately; consume it so the first observation
+    // comes one whole interval after the re-tune.
+    ticker.tick().await;
+    loop {
+        if watch.closed.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::select! {
+            () = stop.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+        let _ = watch.record_probe(ProbeMode::Tick).await;
+    }
 }
 
 /// Wraps `inner` so a terminal error frame from a dead child finishes the run.
@@ -154,6 +344,7 @@ impl MonitoredSpawnedAgent {
             monitor,
             run_id: run_id.into(),
             closed: Arc::new(AtomicBool::new(false)),
+            supervisor: Arc::new(HealthSupervisor::new()),
         }
     }
 
@@ -334,14 +525,17 @@ impl SpawnedAgent for MonitoredSpawnedAgent {
 
     /// Forwards the graceful shutdown and records its result.
     ///
-    /// A graceful exit finishes the run as
-    /// [`RunOutcome::completed`] with `{"graceful": graceful}`; an error finishes
-    /// it as [`RunOutcome::failed`] with the message and is returned unchanged.
+    /// The supervised health loop — if one is running — is cancelled and joined
+    /// before the shutdown exchange, so no probe can race it. A graceful exit then
+    /// finishes the run as [`RunOutcome::completed`] with `{"graceful": graceful}`;
+    /// an error finishes it as [`RunOutcome::failed`] with the message and is
+    /// returned unchanged.
     ///
     /// # Errors
     ///
     /// Whatever the inner handle reports.
     async fn shutdown(&self, timeout: Duration) -> Result<bool> {
+        self.supervisor.stop().await;
         match self.inner.shutdown(timeout).await {
             Ok(graceful) => {
                 self.finish_once(
@@ -358,7 +552,8 @@ impl SpawnedAgent for MonitoredSpawnedAgent {
 
     /// Forwards the kill and records its result.
     ///
-    /// A successful kill finishes the run as [`RunOutcome::cancelled`] with
+    /// The supervised health loop — if one is running — is cancelled and joined
+    /// first. A successful kill finishes the run as [`RunOutcome::cancelled`] with
     /// `{"reason": "force_kill"}`; an error finishes it as failed with the message
     /// and is returned unchanged.
     ///
@@ -366,6 +561,7 @@ impl SpawnedAgent for MonitoredSpawnedAgent {
     ///
     /// Whatever the inner handle reports.
     async fn force_kill(&self) -> Result<()> {
+        self.supervisor.stop().await;
         match self.inner.force_kill().await {
             Ok(()) => {
                 self.finish_once(
@@ -410,54 +606,76 @@ impl SpawnedAgent for MonitoredSpawnedAgent {
     ///
     /// Whatever the inner handle's probe reports.
     async fn health(&self) -> Result<bool> {
-        let result = self.inner.health().await;
-        match &result {
-            Ok(healthy) => {
-                let _ = self.monitor.update(
-                    &self.run_id,
-                    RunPhase::Running,
-                    json!({
-                        "backend": self.inner.backend().as_str(),
-                        "alive": self.inner.is_alive(),
-                        "healthy": healthy,
-                        "pid": self.inner.pid(),
-                    }),
-                );
-            }
-            Err(error) => {
-                let _ = self.monitor.update(
-                    &self.run_id,
-                    RunPhase::Running,
-                    json!({"healthy": false, "error": error.to_string()}),
-                );
-            }
-        }
-        self.finish_if_child_exited();
-        result
+        self.watch().record_probe(ProbeMode::Probe).await
     }
 
-    /// Forwards a health-interval re-tune to the inner handle.
+    /// Forwards a health-interval re-tune to the inner handle, supervising the
+    /// cadence here when the backend cannot.
     ///
-    /// A monitored subprocess handle therefore stays re-tunable; nothing extra is
-    /// recorded, because a cadence change is a configuration choice, not a
-    /// lifecycle transition.
+    /// The forward happens first and its answer decides:
+    ///
+    /// - the backend accepted, so its own loop owns the cadence (a decorator loop
+    ///   would report every observation twice) and any supervised loop is stopped;
+    /// - the backend answered [`openjiuwen_common::error::Error::Unsupported`], so
+    ///   the decorator starts — or re-tunes — one supervised loop over the wrapped
+    ///   handle and returns `Ok(())`: the handle honours the cadence, and a
+    ///   [`Duration::ZERO`] interval stops that loop without cancelling a request;
+    /// - anything else is the backend's own failure (a stopped child, say) and is
+    ///   returned unchanged, with no supervised loop started.
+    ///
+    /// Nothing is recorded either way: a cadence change is a configuration choice,
+    /// not a lifecycle transition.
     ///
     /// # Errors
     ///
-    /// Whatever the inner handle reports — including
-    /// [`openjiuwen_common::error::Error::Unsupported`] from a backend with no
-    /// background loop.
+    /// Whatever the inner handle reports other than
+    /// [`openjiuwen_common::error::Error::Unsupported`].
     async fn set_health_interval(&self, interval: Duration) -> Result<()> {
-        self.inner.set_health_interval(interval).await
+        match self.inner.set_health_interval(interval).await {
+            Ok(()) => {
+                self.supervisor.stop().await;
+                Ok(())
+            }
+            Err(error) if error.kind() == ErrorKind::Unsupported => {
+                self.supervisor.retune(interval, self.watch()).await;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Forwards task cancellation to the inner handle.
+    ///
+    /// Task cancellation is not a lifecycle transition: the run keeps its status
+    /// until the cancelled request actually ends (a terminal frame, a failed call,
+    /// a dead child, or a shutdown). A backend with no cancellation keeps the
+    /// trait's typed `Unsupported`, which is returned unchanged.
     ///
     /// # Errors
     ///
     /// Whatever the inner handle reports.
     async fn cancel_task(&self, task_id: &str) -> Result<()> {
         self.inner.cancel_task(task_id).await
+    }
+
+    /// Forwards a reason-carrying, id-correlated cancel to the inner handle.
+    ///
+    /// Forwarded with the reason so a backend whose wire carries it (the process
+    /// backends' `cancel` frame, the HTTP client's `/cancel` body) delivers both;
+    /// a backend that only knows [`SpawnedAgent::cancel_task`] gets the trait's
+    /// default, which is that method with the same id.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the inner handle reports.
+    async fn cancel_task_with_request_id(
+        &self,
+        request_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.inner
+            .cancel_task_with_request_id(request_id, reason)
+            .await
     }
 }
 
@@ -470,504 +688,5 @@ impl Drop for MonitoredSpawnedAgent {
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
-    use super::*;
-    use openjiuwen_common::error::{Error, Result};
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
-    use std::sync::Mutex;
-
-    /// A child handle with configurable identity, backend and probe behaviour.
-    struct FakeChild {
-        /// Stable handle id.
-        id: String,
-        /// Backend the handle reports.
-        backend: SpawnBackend,
-        /// Whether `health` answers `Ok(true)` or an error.
-        probe_ok: bool,
-        /// Whether `send` answers an error instead of an echo.
-        send_fails: bool,
-        /// How many `cancel_task` calls arrived.
-        cancelled: Arc<AtomicUsize>,
-        /// Whether the handle reports itself alive.
-        alive: AtomicBool,
-        /// Deadlines `send_with_timeout` received, in call order.
-        send_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
-        /// Deadlines `stream_with_timeout` received, in call order.
-        stream_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
-        /// Health intervals `set_health_interval` received, in call order.
-        health_intervals: Arc<Mutex<Vec<Duration>>>,
-        /// How many frames `stream`/`stream_with_timeout` yield.
-        stream_frames: i64,
-    }
-
-    impl FakeChild {
-        /// An alive, healthy child reporting `backend` under `id`.
-        fn new(id: &str, backend: SpawnBackend) -> Self {
-            Self {
-                id: id.to_owned(),
-                backend,
-                probe_ok: true,
-                send_fails: false,
-                cancelled: Arc::new(AtomicUsize::new(0)),
-                alive: AtomicBool::new(true),
-                send_timeouts: Arc::new(Mutex::new(Vec::new())),
-                stream_timeouts: Arc::new(Mutex::new(Vec::new())),
-                health_intervals: Arc::new(Mutex::new(Vec::new())),
-                stream_frames: 0,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl SpawnedAgent for FakeChild {
-        fn id(&self) -> &str {
-            &self.id
-        }
-
-        fn is_alive(&self) -> bool {
-            self.alive.load(Ordering::Acquire)
-        }
-
-        fn pid(&self) -> Option<u32> {
-            Some(4242)
-        }
-
-        async fn send(&self, inputs: Value) -> Result<AgentOutput> {
-            if self.send_fails {
-                return Err(Error::transport("the child did not answer"));
-            }
-            Ok(AgentOutput {
-                output: format!("echo: {inputs}"),
-                ..AgentOutput::default()
-            })
-        }
-
-        fn stream(&self, _inputs: Value) -> BoxStream<'static, Result<AgentChunk>> {
-            let frames: Vec<Result<AgentChunk>> = (0..self.stream_frames)
-                .map(|index| Ok(AgentChunk::llm_output(index, "tick")))
-                .collect();
-            Box::pin(futures::stream::iter(frames))
-        }
-
-        async fn send_with_timeout(
-            &self,
-            inputs: Value,
-            timeout: Option<Duration>,
-        ) -> Result<AgentOutput> {
-            self.send_timeouts.lock().unwrap().push(timeout);
-            self.send(inputs).await
-        }
-
-        fn stream_with_timeout(
-            &self,
-            inputs: Value,
-            timeout: Option<Duration>,
-        ) -> BoxStream<'static, Result<AgentChunk>> {
-            self.stream_timeouts.lock().unwrap().push(timeout);
-            self.stream(inputs)
-        }
-
-        async fn shutdown(&self, _timeout: Duration) -> Result<bool> {
-            self.alive.store(false, Ordering::Release);
-            Ok(true)
-        }
-
-        async fn force_kill(&self) -> Result<()> {
-            self.alive.store(false, Ordering::Release);
-            Ok(())
-        }
-
-        fn backend(&self) -> SpawnBackend {
-            self.backend
-        }
-
-        async fn health(&self) -> Result<bool> {
-            if self.probe_ok {
-                Ok(true)
-            } else {
-                Err(Error::transport("probe failed"))
-            }
-        }
-
-        async fn cancel_task(&self, _task_id: &str) -> Result<()> {
-            self.cancelled.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn set_health_interval(&self, interval: Duration) -> Result<()> {
-            self.health_intervals.lock().unwrap().push(interval);
-            Ok(())
-        }
-    }
-
-    fn tracked(
-        id: &str,
-        probe_ok: bool,
-    ) -> (MonitoredSpawnedAgent, Arc<FakeChild>, Arc<RunMonitor>) {
-        let monitor = Arc::new(RunMonitor::new());
-        let child = Arc::new(FakeChild {
-            probe_ok,
-            ..FakeChild::new(id, SpawnBackend::InProcess)
-        });
-        let handle = MonitoredSpawnedAgent::track(
-            Arc::clone(&child) as Arc<dyn SpawnedAgent>,
-            Arc::clone(&monitor),
-            Some("s-1"),
-            json!({"backend": "in_process"}),
-        );
-        (handle, child, monitor)
-    }
-
-    #[test]
-    fn forwards_the_child_surface() {
-        let (handle, child, _monitor) = tracked("child-1", true);
-        assert_eq!(handle.id(), "child-1");
-        assert_eq!(handle.backend(), SpawnBackend::InProcess);
-        assert_eq!(handle.pid(), Some(4242));
-        assert!(handle.is_alive());
-        assert!(handle.is_healthy());
-        assert_eq!(handle.health_snapshot().pid, Some(4242));
-        assert!(!handle.is_finished());
-        assert_eq!(handle.inner().id(), child.id());
-        assert!(format!("{handle:?}").contains("child-1"));
-    }
-
-    #[tokio::test]
-    async fn forwards_the_health_interval_re_tune_without_recording_a_transition() {
-        let (handle, child, monitor) = tracked("child-15", true);
-        let before = monitor.history(handle.run_id()).unwrap().len();
-
-        handle.set_health_interval(Duration::ZERO).await.unwrap();
-        handle
-            .set_health_interval(Duration::from_millis(250))
-            .await
-            .unwrap();
-        assert_eq!(
-            child.health_intervals.lock().unwrap().clone(),
-            vec![Duration::ZERO, Duration::from_millis(250)],
-            "the decorator forwards every re-tune verbatim"
-        );
-        assert_eq!(
-            monitor.history(handle.run_id()).unwrap().len(),
-            before,
-            "a cadence change is not a lifecycle transition"
-        );
-        assert!(!handle.is_finished(), "the run is still active");
-    }
-
-    #[tokio::test]
-    async fn forwards_send_stream_and_cancel_task() {
-        let (handle, child, _monitor) = tracked("child-2", true);
-        let output = handle.send(json!({"query": "hi"})).await.unwrap();
-        assert_eq!(output.output, "echo: {\"query\":\"hi\"}");
-
-        let mut frames = handle.stream(json!({}));
-        assert!(futures::StreamExt::next(&mut frames).await.is_none());
-
-        handle.cancel_task("task-7").await.unwrap();
-        assert_eq!(child.cancelled.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn forwards_the_bounded_invocation_deadlines_verbatim() {
-        let (handle, child, _monitor) = tracked("child-14", true);
-
-        handle
-            .send_with_timeout(json!({}), Some(Duration::from_millis(25)))
-            .await
-            .unwrap();
-        handle.send_with_timeout(json!({}), None).await.unwrap();
-        assert_eq!(
-            *child.send_timeouts.lock().unwrap(),
-            vec![Some(Duration::from_millis(25)), None],
-            "both deadlines reached the wrapped handle, so the decorator's own \
-             overrides ran instead of the defaulting trait bodies"
-        );
-
-        let _: Vec<Result<AgentChunk>> = futures::StreamExt::collect(
-            handle.stream_with_timeout(json!({}), Some(Duration::from_millis(25))),
-        )
-        .await;
-        let _: Vec<Result<AgentChunk>> =
-            futures::StreamExt::collect(handle.stream_with_timeout(json!({}), None)).await;
-        assert_eq!(
-            *child.stream_timeouts.lock().unwrap(),
-            vec![Some(Duration::from_millis(25)), None],
-            "the stream variant forwards its deadline too"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_bounded_stream_forwards_frames_and_terminates_like_stream() {
-        let monitor = Arc::new(RunMonitor::new());
-        let child = Arc::new(FakeChild {
-            stream_frames: 2,
-            ..FakeChild::new("child-15", SpawnBackend::InProcess)
-        });
-        let handle = MonitoredSpawnedAgent::track(
-            Arc::clone(&child) as Arc<dyn SpawnedAgent>,
-            Arc::clone(&monitor),
-            None,
-            json!({"backend": "in_process"}),
-        );
-
-        let plain: Vec<Result<AgentChunk>> =
-            futures::StreamExt::collect(handle.stream(json!({}))).await;
-        let bounded: Vec<Result<AgentChunk>> = futures::StreamExt::collect(
-            handle.stream_with_timeout(json!({}), Some(Duration::from_millis(25))),
-        )
-        .await;
-
-        assert_eq!(plain.len(), 2);
-        assert_eq!(
-            bounded.len(),
-            plain.len(),
-            "the bounded stream terminates exactly like `stream`"
-        );
-        for (bounded, plain) in bounded.iter().zip(&plain) {
-            assert_eq!(
-                bounded.as_ref().unwrap().payload,
-                plain.as_ref().unwrap().payload
-            );
-        }
-        assert_eq!(
-            monitor.snapshot(handle.run_id()).unwrap().phase,
-            RunPhase::Running,
-            "a bounded stream is not a terminal transition"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failed_bounded_send_from_a_dead_child_finishes_the_run() {
-        let monitor = Arc::new(RunMonitor::new());
-        let child = Arc::new(FakeChild {
-            send_fails: true,
-            ..FakeChild::new("child-16", SpawnBackend::InProcess)
-        });
-        let handle = MonitoredSpawnedAgent::track(
-            Arc::clone(&child) as Arc<dyn SpawnedAgent>,
-            Arc::clone(&monitor),
-            None,
-            json!({"backend": "in_process"}),
-        );
-
-        // A live child's failed bounded request — a timed-out exchange — only
-        // observes.
-        let error = handle
-            .send_with_timeout(json!({}), Some(Duration::from_millis(25)))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Transport);
-        assert_eq!(
-            monitor.snapshot(handle.run_id()).unwrap().phase,
-            RunPhase::Running,
-            "a live child's failure only observes"
-        );
-        assert!(!handle.is_finished());
-
-        child.alive.store(false, Ordering::Release);
-        let error = handle.send_with_timeout(json!({}), None).await.unwrap_err();
-        assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Transport);
-        let status = monitor.snapshot(handle.run_id()).unwrap();
-        assert_eq!(status.phase, RunPhase::Failed);
-        assert_eq!(
-            status.detail,
-            json!({"reason": "child_exited", "backend": "in_process"})
-        );
-        assert!(handle.is_finished());
-        assert_eq!(monitor.list_active().len(), 0);
-    }
-
-    #[test]
-    fn track_admits_a_live_spawn_run() {
-        let (handle, _child, monitor) = tracked("child-3", true);
-        let status = monitor.snapshot(handle.run_id()).unwrap();
-        assert_eq!(status.run_id, "child-3");
-        assert_eq!(status.kind, RunKind::Spawn);
-        assert_eq!(status.label, "child-3");
-        assert_eq!(status.phase, RunPhase::Running);
-        assert_eq!(status.session_id.as_deref(), Some("s-1"));
-        assert_eq!(status.detail, json!({"backend": "in_process"}));
-        assert!(status.finished_at.is_none());
-        assert_eq!(monitor.list_active().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn health_records_the_observation_and_returns_the_probe() {
-        let (handle, _child, monitor) = tracked("child-4", true);
-        assert!(handle.health().await.unwrap());
-        let status = monitor.snapshot(handle.run_id()).unwrap();
-        assert_eq!(status.phase, RunPhase::Running);
-        assert_eq!(status.detail["backend"], json!("in_process"));
-        assert_eq!(status.detail["alive"], json!(true));
-        assert_eq!(status.detail["healthy"], json!(true));
-        assert_eq!(status.detail["pid"], json!(4242));
-    }
-
-    #[tokio::test]
-    async fn a_failing_probe_is_recorded_and_propagated() {
-        let (handle, _child, monitor) = tracked("child-5", false);
-        let error = handle.health().await.unwrap_err();
-        assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Transport);
-        let status = monitor.snapshot(handle.run_id()).unwrap();
-        assert_eq!(status.phase, RunPhase::Running);
-        assert_eq!(status.detail["healthy"], json!(false));
-        assert!(
-            status.detail["error"]
-                .as_str()
-                .unwrap()
-                .contains("probe failed"),
-            "{:?}",
-            status.detail
-        );
-    }
-
-    #[tokio::test]
-    async fn a_probe_of_a_dead_child_finishes_the_run() {
-        let (handle, child, monitor) = tracked("child-11", true);
-        child.alive.store(false, Ordering::Release);
-
-        assert!(
-            handle.health().await.unwrap(),
-            "the probe result is returned unchanged"
-        );
-        let status = monitor.snapshot(handle.run_id()).unwrap();
-        assert_eq!(status.phase, RunPhase::Failed);
-        assert_eq!(status.error.as_deref(), Some("spawned child exited"));
-        assert_eq!(
-            status.detail,
-            json!({"reason": "child_exited", "backend": "in_process"})
-        );
-        assert!(handle.is_finished());
-        assert_eq!(monitor.list_active().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn a_failed_send_from_a_live_child_is_not_terminal() {
-        let monitor = Arc::new(RunMonitor::new());
-        let child = Arc::new(FakeChild {
-            send_fails: true,
-            ..FakeChild::new("child-12", SpawnBackend::InProcess)
-        });
-        let handle = MonitoredSpawnedAgent::track(
-            Arc::clone(&child) as Arc<dyn SpawnedAgent>,
-            Arc::clone(&monitor),
-            None,
-            json!({"backend": "in_process"}),
-        );
-
-        let error = handle.send(json!({})).await.unwrap_err();
-        assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Transport);
-        assert_eq!(
-            monitor.snapshot(handle.run_id()).unwrap().phase,
-            RunPhase::Running,
-            "a live child's failure only observes"
-        );
-        assert!(!handle.is_finished());
-        assert_eq!(monitor.list_active().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_failed_send_from_a_dead_child_finishes_the_run() {
-        let monitor = Arc::new(RunMonitor::new());
-        let child = Arc::new(FakeChild {
-            send_fails: true,
-            ..FakeChild::new("child-13", SpawnBackend::InProcess)
-        });
-        let handle = MonitoredSpawnedAgent::track(
-            Arc::clone(&child) as Arc<dyn SpawnedAgent>,
-            Arc::clone(&monitor),
-            None,
-            json!({"backend": "in_process"}),
-        );
-
-        child.alive.store(false, Ordering::Release);
-        let error = handle.send(json!({})).await.unwrap_err();
-        assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Transport);
-        let status = monitor.snapshot(handle.run_id()).unwrap();
-        assert_eq!(status.phase, RunPhase::Failed);
-        assert_eq!(
-            status.detail,
-            json!({"reason": "child_exited", "backend": "in_process"})
-        );
-        assert!(handle.is_finished());
-        assert_eq!(monitor.list_active().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn shutdown_finishes_the_run_as_completed() {
-        let (handle, _child, monitor) = tracked("child-6", true);
-        assert!(handle.shutdown(Duration::from_secs(1)).await.unwrap());
-        assert!(handle.is_finished());
-        let status = monitor.snapshot(handle.run_id()).unwrap();
-        assert_eq!(status.phase, RunPhase::Completed);
-        assert_eq!(status.detail, json!({"graceful": true}));
-        assert!(status.finished_at.is_some());
-        assert_eq!(monitor.list_active().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn force_kill_finishes_the_run_as_cancelled() {
-        let (handle, _child, monitor) = tracked("child-7", true);
-        handle.force_kill().await.unwrap();
-        assert!(handle.is_finished());
-        let status = monitor.snapshot(handle.run_id()).unwrap();
-        assert_eq!(status.phase, RunPhase::Cancelled);
-        assert_eq!(status.detail, json!({"reason": "force_kill"}));
-        assert_eq!(monitor.list_active().len(), 0);
-    }
-
-    #[test]
-    fn dropping_an_unfinished_handle_finishes_it() {
-        let monitor = Arc::new(RunMonitor::new());
-        let child: Arc<dyn SpawnedAgent> =
-            Arc::new(FakeChild::new("child-8", SpawnBackend::InProcess));
-        let handle = MonitoredSpawnedAgent::track(
-            child,
-            Arc::clone(&monitor),
-            None,
-            json!({"backend": "in_process"}),
-        );
-        let run_id = handle.run_id().to_owned();
-        drop(handle);
-        let status = monitor.snapshot(&run_id).unwrap();
-        assert_eq!(status.phase, RunPhase::Completed);
-        assert_eq!(status.detail, json!({"reason": "handle_dropped"}));
-        assert_eq!(monitor.list_active().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn a_second_finish_attempt_is_harmless() {
-        let (handle, _child, monitor) = tracked("child-9", true);
-        handle.shutdown(Duration::from_secs(1)).await.unwrap();
-        let finished_at = monitor.snapshot(handle.run_id()).unwrap().finished_at;
-        assert!(handle.shutdown(Duration::from_secs(1)).await.unwrap());
-        handle.force_kill().await.unwrap();
-        let status = monitor.snapshot(handle.run_id()).unwrap();
-        assert_eq!(status.phase, RunPhase::Completed, "the first finish wins");
-        assert_eq!(status.detail, json!({"graceful": true}));
-        assert_eq!(status.finished_at, finished_at);
-        assert_eq!(
-            monitor.history(handle.run_id()).unwrap().len(),
-            3,
-            "queued, running, and one terminal event"
-        );
-    }
-
-    #[test]
-    fn new_wraps_without_admitting_a_run() {
-        let monitor = Arc::new(RunMonitor::new());
-        let child: Arc<dyn SpawnedAgent> =
-            Arc::new(FakeChild::new("child-10", SpawnBackend::Subprocess));
-        let handle = MonitoredSpawnedAgent::new(child, Arc::clone(&monitor), "child-10");
-        assert_eq!(monitor.list_active().len(), 0);
-        assert!(monitor.snapshot("child-10").is_err());
-        drop(handle);
-        assert!(
-            monitor.snapshot("child-10").is_err(),
-            "no run to finish either: the drop is a discarded NotFound"
-        );
-    }
-}
+#[path = "monitored_tests.rs"]
+mod tests;

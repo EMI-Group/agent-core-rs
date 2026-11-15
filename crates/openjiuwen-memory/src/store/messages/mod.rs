@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use openjiuwen_common::error::Result;
 use openjiuwen_foundation::prompt::BaseMessage;
 use openjiuwen_foundation::store::{Document, DocumentStore, Query, SortOrder};
@@ -57,6 +57,19 @@ const FIELD_ROLE: &str = "role";
 const FIELD_CONTENT: &str = "content";
 /// Document field holding the RFC 3339 timestamp.
 const FIELD_TIMESTAMP: &str = "timestamp";
+
+/// Renders `timestamp` in the one RFC 3339 form the message rows and the pagination
+/// bounds share: UTC with an explicit `+00:00` offset and exactly six fractional digits
+/// (`2023-11-14T22:13:20.000123+00:00`).
+///
+/// One fixed precision matters because the document filter compares these strings
+/// lexicographically: a fixed-width fraction keeps lexical order chronological, and using
+/// the same width for the stored row and for a [`MessageCursor`] bound means the bound is
+/// exactly the row it points at instead of a truncated (or rounded) neighbour. Nanoseconds
+/// below the microsecond are dropped, which the row and the cursor drop identically.
+pub(crate) fn rfc3339_micros(timestamp: DateTime<Utc>) -> String {
+    timestamp.to_rfc3339_opts(SecondsFormat::Micros, false)
+}
 
 /// One persisted conversation message.
 ///
@@ -279,7 +292,7 @@ pub(crate) fn stored_document(message: &StoredMessage) -> Document {
         .with_field(FIELD_SCOPE_ID, message.scope_id.clone())
         .with_field(FIELD_ROLE, message.role.clone())
         .with_field(FIELD_CONTENT, message.content.clone())
-        .with_field(FIELD_TIMESTAMP, message.timestamp.to_rfc3339());
+        .with_field(FIELD_TIMESTAMP, rfc3339_micros(message.timestamp));
     if let Some(session_id) = &message.session_id {
         document = document.with_field(FIELD_SESSION_ID, session_id.clone());
     }
@@ -412,7 +425,12 @@ mod tests {
         assert_eq!(value[FIELD_CONTENT], Value::String("rules".to_owned()));
         assert_eq!(
             value[FIELD_TIMESTAMP],
-            Value::String(timestamp.to_rfc3339())
+            Value::String("2023-11-14T22:13:20.000000+00:00".to_owned()),
+            "the stored row carries the canonical microsecond timestamp"
+        );
+        assert_eq!(
+            rfc3339_micros(timestamp),
+            "2023-11-14T22:13:20.000000+00:00"
         );
     }
 
@@ -673,6 +691,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn appends_within_one_millisecond_page_without_duplicates_or_gaps() {
+        let store = store();
+        let scope = scope();
+        let mut expected = Vec::new();
+        for (index, text) in ["one", "two", "three", "four", "five"].iter().enumerate() {
+            // One millisecond, six orders of magnitude of room: every row shares the
+            // millisecond and its id suffix, so only the sub-millisecond stamp (and the
+            // id tie-break) can order them.
+            let timestamp = Utc
+                .timestamp_opt(1_700_000_000, 123_000_000 + index as u32 * 1_000)
+                .single()
+                .expect("fixed time");
+            let stored = store
+                .append(&scope, &[BaseMessage::user(*text)], timestamp)
+                .await
+                .expect("append")
+                .pop()
+                .expect("one message");
+            expected.push(stored);
+        }
+        let millis = expected[0].timestamp.timestamp_millis();
+        assert!(expected
+            .iter()
+            .all(|message| message.timestamp.timestamp_millis() == millis));
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = store
+                .page(&scope, 2, cursor.as_deref(), None)
+                .await
+                .expect("page");
+            pages += 1;
+            assert!(page.items.len() <= 2);
+            seen.extend(page_ids(&page).into_iter().map(str::to_owned));
+            match page.next_cursor {
+                Some(next) => {
+                    assert!(page.has_more);
+                    let decoded = MessageCursor::decode(&next).expect("decode");
+                    assert_eq!(
+                        decoded,
+                        MessageCursor::of(&expected[seen.len() - 1]),
+                        "the token names the last returned row"
+                    );
+                    cursor = Some(next);
+                }
+                None => break,
+            }
+            assert!(pages <= 5, "pagination must terminate");
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(
+            seen,
+            expected.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn malformed_cursors_are_rejected_by_page() {
         let store = store();
         let scope = scope();
@@ -773,7 +849,7 @@ mod tests {
         };
         // The token carries the position of the last returned row (`timestamp`, `id`), not
         // an offset, so it stays valid against a store instance this process did not open.
-        assert!(cursor.starts_with("mc1."), "{cursor}");
+        assert!(cursor.starts_with("mc2."), "{cursor}");
         let reopened = MessageStore::new(Arc::new(
             LocalFileDocumentStore::new(&root)
                 .await

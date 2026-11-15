@@ -499,3 +499,35 @@ fn invalid_patterns_fail_construction_with_validation_errors() {
         "{error}"
     );
 }
+
+// No Python equivalent: an unusable payload is a failure, never a pass. Null
+// arguments cannot be projected, so the pipeline blocks them by default and a
+// directly invoked guardrail reports the typed validation error.
+#[tokio::test]
+async fn unscannable_arguments_block_instead_of_passing() {
+    let pipeline = pipeline_for(ToolArgumentGuardrailConfig::default());
+
+    let outcome = pipeline.scan_tool_input("search", &json!(null)).await;
+    assert!(
+        outcome.is_blocked(),
+        "null arguments must never read as safe"
+    );
+    assert_eq!(outcome.decision, SecurityDecision::Block);
+    assert_eq!(outcome.risk_level, RiskLevel::Critical);
+    let finding = sole_finding(&outcome);
+    assert_eq!(finding.guardrail, "context");
+    assert_eq!(finding.risk_type, "unscannable_content");
+    assert!(finding.blocking);
+    assert_eq!(outcome.enforce().unwrap_err().kind(), ErrorKind::Security);
+
+    // The same payload as a raw context: blocked through `run`, and a typed
+    // failure when the guardrail is invoked directly.
+    let ctx = GuardrailContext::raw(ScanStage::ToolInvokeInput.event(), Value::Null);
+    let outcome = pipeline.run(&ctx).await;
+    assert!(outcome.is_blocked());
+    assert_eq!(sole_finding(&outcome).risk_type, "unscannable_content");
+
+    let error = ToolArgumentGuardrail::new().check(&ctx).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.to_string().contains("unscannable content"), "{error}");
+}

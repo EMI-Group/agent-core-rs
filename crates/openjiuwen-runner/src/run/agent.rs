@@ -27,7 +27,11 @@ use crate::callback::{CallbackContext, CallbackEvent};
 
 /// Runs one agent invocation to completion.
 ///
-/// The reference is resolved first: an unregistered id is
+/// A distributed-configured context is refused first:
+/// [`RunServices::require_local`] returns `Error::Unsupported` naming the
+/// deferred transports before anything else happens.
+///
+/// The reference is resolved next: an unregistered id is
 /// [`openjiuwen_common::error::Error::NotFound`] before any session is created
 /// or callback fires. Then `AgentInvokeInput` is fired, the session is resolved
 /// (caller-owned, or a fresh [`AgentSession`] announced with
@@ -52,6 +56,7 @@ pub async fn invoke_agent(
     inputs: Value,
     options: RunOptions,
 ) -> Result<AgentOutput> {
+    services.require_local()?;
     let run_id = Uuid::new_v4().to_string();
     let started = Instant::now();
 
@@ -153,6 +158,10 @@ pub async fn invoke_agent(
 
 /// Runs one agent invocation as a stream of [`AgentChunk`] frames.
 ///
+/// A distributed-configured context refuses as this stream's **single** terminal
+/// `Err` frame ([`RunServices::require_local`]): nothing else happens — no
+/// reference resolution, no session, no callback, no monitor or hub status.
+///
 /// The stream is returned immediately, so a resolution or session-setup failure
 /// (a missing id, an aborting `AgentSessionCreated`/`AgentStreamInput` handler)
 /// is delivered as a one-element stream yielding that error. On success the
@@ -173,6 +182,13 @@ pub fn stream_agent(
 ) -> BoxStream<'static, Result<AgentChunk>> {
     let run_id = Uuid::new_v4().to_string();
     async_stream::stream! {
+        // Mode enforcement is the stream's first statement: a distributed runner
+        // refuses as the single terminal `Err` frame, before a reference is
+        // resolved, a session is created, a callback fires, or a status exists.
+        if let Err(error) = services.require_local() {
+            yield Err(error);
+            return;
+        }
         let started = Instant::now();
         let agent = match resolve_agent(&services, &agent) {
             Ok(agent) => agent,

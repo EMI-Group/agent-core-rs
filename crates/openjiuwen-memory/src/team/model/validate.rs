@@ -108,6 +108,28 @@ pub(super) fn validate_importance(importance: f32) -> Result<()> {
     }
     Ok(())
 }
+/// Validates a record embedding: a non-empty vector whose components are all finite.
+///
+/// An empty vector is rejected instead of being read as "no vector": a caller that
+/// meant to clear the embedding clears the option, and an embedder that returned
+/// nothing is a bug worth surfacing.
+pub(crate) fn validate_embedding(embedding: &[f32]) -> Result<()> {
+    if embedding.is_empty() {
+        return Err(Error::validation(
+            "team memory `embedding` must not be empty",
+        ));
+    }
+    if let Some((index, value)) = embedding
+        .iter()
+        .enumerate()
+        .find(|(_, component)| !component.is_finite())
+    {
+        return Err(Error::validation(format!(
+            "team memory `embedding` component {index} must be finite (got {value})"
+        )));
+    }
+    Ok(())
+}
 /// Validates tag entries as supplied by a caller: at most [`MAX_TAGS`] entries, each
 /// trimmed non-blank, free of NUL, and at most [`MAX_TAG_CHARS`] characters long.
 ///

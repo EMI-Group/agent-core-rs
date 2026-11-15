@@ -20,6 +20,15 @@
 //! Reference resolution happens before anything else: an id that is not
 //! registered fails with [`openjiuwen_common::error::Error::NotFound`] before a
 //! session is created or a callback is fired.
+//!
+//! Mode enforcement comes before even that: every path calls
+//! [`RunServices::require_local`] first, so a runner configured for distributed
+//! mode ([`RunnerConfig::distributed_mode`]) refuses with one typed
+//! `Error::Unsupported` naming the deferred transports instead of silently
+//! running in-process. A streaming path refuses as its **single** terminal `Err`
+//! frame — nothing else happens (no reference resolution, no session, no
+//! callback, no monitor or hub status) — because the stream is returned before
+//! any work starts.
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::BTreeMap;
@@ -138,6 +147,33 @@ impl RunServices {
     pub fn with_hitl(mut self, hub: Arc<crate::hitl::InteractionHub>) -> Self {
         self.hitl = Some(hub);
         self
+    }
+
+    /// Refuses this context on a node configured for distributed mode.
+    ///
+    /// Delegates to [`RunnerConfig::require_local`], the crate's single guard and
+    /// message: `Ok(())` for a local runner, and a typed
+    /// [`openjiuwen_common::error::Error::Unsupported`] naming the mode and the
+    /// deferred transports (`Pulsar`, `ZeroMQ`, `A2A` reply-topic) otherwise.
+    ///
+    /// Every execution path consults it **first**, before resolving a reference
+    /// or creating a session, so no path runs in-process under a distributed
+    /// name: [`invoke_agent`], [`stream_agent`], [`invoke_workflow`],
+    /// [`stream_workflow`], [`invoke_team`], and [`stream_team`] — and the team
+    /// pool ([`crate::pool::TeamPool::start`], `try_start`, `acquire`) admits
+    /// nothing under it either.
+    ///
+    /// A streaming path reports the refusal as the stream's **single** terminal
+    /// `Err` frame: nothing else happens — no reference resolution, no session,
+    /// no callback, no monitor or hub status.
+    ///
+    /// # Errors
+    ///
+    /// [`openjiuwen_common::error::ErrorKind::Unsupported`] when
+    /// [`RunnerConfig::distributed_mode`] is on. The spawn seam is deliberately
+    /// exempt: a spawned child is selected by backend, not by runner mode.
+    pub fn require_local(&self) -> Result<()> {
+        self.config.require_local()
     }
 }
 

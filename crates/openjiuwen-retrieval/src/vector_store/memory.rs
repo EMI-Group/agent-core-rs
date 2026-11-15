@@ -283,6 +283,44 @@ fn record_matches(record: &VectorRecord, filter: &MetadataFilter) -> bool {
     filter.matches(&effective_metadata(record))
 }
 
+/// Validates the stored vector widths against each other and against the query.
+///
+/// An empty store has no known width, so any query vector is accepted; otherwise
+/// the store must be internally consistent (one width for every record) and that
+/// width must match `query_len`. This keeps a width mismatch visible instead of
+/// silently returning fewer hits than the caller asked for.
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] when two stored records disagree on their vector
+/// width (the first inconsistent pair in insertion order is named) or when the
+/// store's width differs from `query_len`.
+fn validate_dimensions(records: &IndexMap<String, VectorRecord>, query_len: usize) -> Result<()> {
+    let mut expected: Option<(&str, usize)> = None;
+    for (id, record) in records {
+        let len = record.vector.len();
+        match expected {
+            None => expected = Some((id.as_str(), len)),
+            Some((first_id, first_len)) if first_len != len => {
+                return Err(Error::validation(format!(
+                    "the vector store is internally inconsistent: record `{first_id}` has \
+                     {first_len}-dimensional vectors but record `{id}` has {len} dimensions"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some((_, store_len)) = expected {
+        if store_len != query_len {
+            return Err(Error::validation(format!(
+                "vector dimension mismatch: the store holds {store_len}-dimensional vectors, \
+                 the query vector has {query_len} dimensions"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Converts a record into a hit, injecting the ids into the result metadata.
 fn search_result(record: &VectorRecord, score: f32) -> SearchResult {
     let metadata = effective_metadata(record).into_owned();
@@ -359,15 +397,27 @@ impl VectorStore for InMemoryVectorStore {
         Ok(removed)
     }
 
+    /// Cosine search with metadata filtering, descending score order, and `top_k`.
+    ///
+    /// The query vector's width is validated before scoring: an empty store
+    /// accepts any width, a store whose records disagree on their width is
+    /// `Error::Validation("the vector store is internally inconsistent: …")`, and a
+    /// store width that differs from the query width is
+    /// `Error::Validation("vector dimension mismatch: …")`. No record is silently
+    /// dropped for its width.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for either dimension validation failure.
     async fn search(&self, query: VectorQuery) -> Result<Vec<SearchResult>> {
         if query.top_k == 0 {
             return Ok(Vec::new());
         }
         let mut hits: Vec<SearchResult> = {
             let stored = self.records.read();
+            validate_dimensions(&stored, query.vector.len())?;
             stored
                 .values()
-                .filter(|record| record.vector.len() == query.vector.len())
                 .filter(|record| {
                     query
                         .filter

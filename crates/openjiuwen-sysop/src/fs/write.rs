@@ -46,7 +46,20 @@ pub(crate) async fn write_file(
         Ok(path) => path,
         Err(error) => return fs_failure(WRITE_FILE, &error.message()),
     };
-    let metadata = tokio::fs::metadata(&path).await.ok();
+    let metadata = match metadata_if_exists(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            // A target that cannot be stat'ed is not the same as a missing one: reporting
+            // "File does not exist" here would hide a permission or symlink-loop failure,
+            // and treating it as missing would let `create_if_absent` replace it.
+            tracing::debug!(
+                path = %format_path(&path),
+                %error,
+                "cannot read the write target's metadata"
+            );
+            return fs_failure(WRITE_FILE, &error.to_string());
+        }
+    };
     if metadata.as_ref().is_some_and(std::fs::Metadata::is_dir) {
         return fs_failure(
             WRITE_FILE,
@@ -81,6 +94,19 @@ fn version_conflict<T>() -> OpResult<T> {
     )
 }
 
+/// Stats `path`, distinguishing a missing target from an I/O failure.
+///
+/// `Ok(None)` means the target does not exist. Every other error (a permission failure, a
+/// symlink loop, an I/O error) is returned unchanged so the caller reports the OS message
+/// instead of turning it into "the file does not exist".
+async fn metadata_if_exists(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Rejects the write flag combinations Python refuses before touching the filesystem.
 ///
 /// # Errors
@@ -102,7 +128,17 @@ fn validate_write(params: &WriteFileParams) -> Result<(), String> {
 /// The conditional checks run *before* the file is opened for writing, so a rejected
 /// compare-and-swap leaves the target byte-identical.
 async fn write_locked(path: &Path, params: &WriteFileParams) -> OpResult<WriteFileData> {
-    let exists = tokio::fs::metadata(path).await.is_ok();
+    let exists = match metadata_if_exists(path).await {
+        Ok(metadata) => metadata.is_some(),
+        Err(error) => {
+            tracing::debug!(
+                path = %format_path(path),
+                %error,
+                "cannot re-read the write target's metadata under the lock"
+            );
+            return fs_failure(WRITE_FILE, &error.to_string());
+        }
+    };
     if params.create_if_absent && exists {
         return version_conflict();
     }
@@ -192,7 +228,7 @@ fn apply_permissions(path: &Path, permissions: Option<&str>) {
 mod tests {
     use super::*;
     use crate::fs::local::test_util::{backend, read_back};
-    use crate::fs::types::ReadMode;
+    use crate::fs::types::{FileContent, ReadFileParams, ReadMode};
     use crate::operation::FsOperation;
 
     // ----- write_file ---------------------------------------------------------------
@@ -319,5 +355,134 @@ mod tests {
         created.create_if_absent = true;
         op.write_file(created).await.into_result().unwrap();
         assert_eq!(read_back(&dir, "fresh.txt"), b"x".to_vec());
+    }
+
+    // ----- declared write encodings -------------------------------------------------
+    #[tokio::test]
+    async fn write_and_read_round_trip_the_declared_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = backend(&dir);
+        let mut gbk = vec![0xD6_u8, 0xD0, 0xCE, 0xC4];
+        gbk.extend_from_slice(b"\nascii");
+        for (name, text, expected, encoding) in [
+            ("gb.txt", "中文", vec![0xD6_u8, 0xD0, 0xCE, 0xC4], "gb18030"),
+            ("gbk.txt", "中文\nascii", gbk, "gbk"),
+            ("big5.txt", "中文", vec![0xA4_u8, 0xA4, 0xA4, 0xE5], "big5"),
+            (
+                "sjis.txt",
+                "日本語",
+                vec![0x93_u8, 0xFA, 0x96, 0x7B, 0x8C, 0xEA],
+                "shift-jis",
+            ),
+            ("latin1.txt", "café", b"caf\xE9".to_vec(), "latin-1"),
+            (
+                "utf16.txt",
+                "hi",
+                vec![0x68_u8, 0x00, 0x69, 0x00],
+                "utf-16le",
+            ),
+        ] {
+            op.write_file(WriteFileParams::raw(name, text).with_encoding(encoding))
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(read_back(&dir, name), expected, "{encoding} bytes");
+            let read = op
+                .read_file(ReadFileParams::text(name).with_encoding(encoding))
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                read.content,
+                FileContent::Text(text.to_string()),
+                "{encoding} round trip"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_rejects_unknown_encodings_without_creating_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = backend(&dir);
+        let failure = op
+            .write_file(WriteFileParams::raw("a.txt", "x").with_encoding("koi8-r"))
+            .await;
+        assert_eq!(failure.code, 199_003);
+        assert!(failure.message.contains("koi8-r"), "{}", failure.message);
+        assert!(!dir.path().join("a.txt").exists());
+        // `auto` is a read policy, so it is refused for writing too.
+        let auto = op
+            .write_file(WriteFileParams::raw("b.txt", "x").with_encoding("auto"))
+            .await;
+        assert_eq!(auto.code, 199_003);
+        assert!(
+            auto.message.contains("cannot be used for writing"),
+            "{}",
+            auto.message
+        );
+        assert!(!dir.path().join("b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn write_rejects_unrepresentable_content_and_keeps_the_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        let op = backend(&dir);
+        let failure = op
+            .write_file(WriteFileParams::raw("a.txt", "中文").with_encoding("latin-1"))
+            .await;
+        assert_eq!(failure.code, 199_003);
+        assert!(failure.message.contains("latin-1"), "{}", failure.message);
+        assert!(failure.message.contains("U+4E2D"), "{}", failure.message);
+        // The encode happens before the file is opened, so the target is untouched.
+        assert_eq!(read_back(&dir, "a.txt"), b"old".to_vec());
+        let failure = op
+            .write_file(WriteFileParams::raw("new.txt", "\u{1F600}").with_encoding("big5"))
+            .await;
+        assert_eq!(failure.code, 199_003);
+        assert!(failure.message.contains("U+1F600"), "{}", failure.message);
+        assert!(!dir.path().join("new.txt").exists());
+    }
+    /// A target that cannot be stat'ed is a real failure, not "the file does not exist".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stat_failure_is_reported_instead_of_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A self-referencing link makes `metadata` fail with `ELOOP`, which is neither
+        // "missing" nor a directory.
+        std::os::unix::fs::symlink("loop.txt", dir.path().join("loop.txt")).unwrap();
+        let op = backend(&dir);
+        let mut params = WriteFileParams::raw("loop.txt", "x");
+        params.create_if_not_exist = false;
+        let failure = op.write_file(params).await;
+        assert_eq!(failure.code, 199_003);
+        assert!(
+            !failure.message.contains("File does not exist"),
+            "an I/O error must not be reported as a missing file: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.to_lowercase().contains("symbolic link"),
+            "{}",
+            failure.message
+        );
+    }
+
+    /// The same failure under the lock must not silently treat the target as absent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_if_absent_refuses_an_unstatable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("loop.txt", dir.path().join("loop.txt")).unwrap();
+        let op = backend(&dir);
+        let mut params = WriteFileParams::raw("loop.txt", "x");
+        params.create_if_absent = true;
+        let failure = op.write_file(params).await;
+        assert_eq!(failure.code, 199_003);
+        assert!(
+            failure.message.to_lowercase().contains("symbolic link"),
+            "{}",
+            failure.message
+        );
     }
 }

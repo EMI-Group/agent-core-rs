@@ -7,6 +7,9 @@
 //! unusable answer is retried; once the retry budget is spent the classifier runs
 //! [`RuleClassifier`] and stamps `degraded` on every verdict, so a caller can tell a
 //! rule-based decision from a model-based one instead of silently getting the fallback.
+//! Records past the [`AnalyzerConfig::max_candidates`] cap are never sent to the model;
+//! they keep an unrelated verdict that also carries a `degraded` reason, so "the model
+//! saw nothing wrong" is distinguishable from "the model never saw it".
 use crate::analyzer::config::AnalyzerConfig;
 use crate::analyzer::conflict::{ConflictClassifier, ConflictVerdict, RuleClassifier};
 use crate::analyzer::parse::parse_conflict_response;
@@ -118,9 +121,22 @@ impl ConflictClassifier for LlmClassifier {
                         .map(|message| message.text().into_owned())
                         .unwrap_or_default();
                     if let Some(mut verdicts) = parse_conflict_response(&raw, &candidates) {
-                        // Candidates beyond the cap keep a default (unrelated) verdict so
-                        // the caller still gets one verdict per supplied record.
-                        verdicts.resize(existing.len(), ConflictVerdict::default());
+                        // Candidates beyond the cap are never shown to the model, so the
+                        // extra verdicts stay "unrelated" — but they are marked `degraded`
+                        // so the caller can tell a record the model judged unrelated from
+                        // one that was never classified at all.
+                        while verdicts.len() < existing.len() {
+                            verdicts.push(ConflictVerdict {
+                                degraded: Some(format!(
+                                    "candidate #{} was not classified: it exceeds \
+                                     `AnalyzerConfig::max_candidates` ({})",
+                                    verdicts.len(),
+                                    self.config.max_candidates
+                                )),
+                                ..ConflictVerdict::default()
+                            });
+                        }
+                        verdicts.truncate(existing.len());
                         return Ok(verdicts);
                     }
                     failure.get_or_insert_with(|| {
@@ -330,8 +346,23 @@ mod tests {
             .unwrap();
         assert_eq!(verdicts.len(), 3);
         assert_eq!(verdicts[0].kind, ConflictKind::Unrelated);
-        assert_eq!(verdicts[1].kind, ConflictKind::Unrelated);
-        assert_eq!(verdicts[2].kind, ConflictKind::Unrelated);
+        assert!(
+            verdicts[0].degraded.is_none(),
+            "the candidate the model saw is not degraded"
+        );
+        // The records beyond the cap keep an unrelated verdict, reported as a
+        // degradation: they were never classified.
+        for (index, verdict) in verdicts.iter().enumerate().skip(1) {
+            assert_eq!(verdict.kind, ConflictKind::Unrelated);
+            let degraded = verdict
+                .degraded
+                .as_deref()
+                .unwrap_or_else(|| panic!("candidate #{index} must be marked degraded"));
+            assert!(
+                degraded.contains("max_candidates"),
+                "candidate #{index}: {degraded}"
+            );
+        }
         let user = handle
             .last_call()
             .and_then(|call| call.last_user_text())

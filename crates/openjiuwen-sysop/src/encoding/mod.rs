@@ -1,21 +1,25 @@
-//! Text encoding detection, BOM handling, binary sniffing, and decoding.
+//! Text encoding detection, BOM handling, binary sniffing, decoding, and encoding.
 //!
 //! Python parity: `local/_text_encoding.py` (`detect_text_encoding`) plus the
-//! `errors="replace"` decoding every read uses. Rust additions: an explicit
-//! [`BinaryPolicy`] so a caller can refuse binary content instead of decoding it.
+//! `errors="replace"` decoding every read uses and the `content.encode(encoding)` every
+//! text write uses. Rust additions: an explicit [`BinaryPolicy`] so a caller can refuse
+//! binary content instead of decoding it.
 //!
 //! Supported encodings: UTF-8 (with or without BOM), UTF-16 LE/BE (BOM or heuristic),
 //! US-ASCII, Latin-1, and the legacy CJK encodings GB18030/GBK, Big5 and Shift-JIS.
-//! The CJK decoders are table driven ([`cjk`]); their tables are generated offline from
+//! The CJK codecs are table driven ([`cjk`]); their tables are generated offline from
 //! Python's codecs by `scripts/gen_cjk_tables.py`, so decoding matches the Python
 //! reference byte for byte, including `U+FFFD` replacement of invalid sequences.
-//! Writes stay UTF-8: [`encode_text`] still rejects the legacy names.
+//! Every one of those encodings can also be written: [`encode_text`] builds the reverse
+//! lookup for a CJK codec lazily from the same tables (the private `encode` module), writes Latin-1 as
+//! single bytes, and refuses content the declared encoding cannot represent.
 //!
 //! `auto` detection follows Python: BOM, valid UTF-8, a UTF-16 NUL-parity heuristic, then a
 //! quality-scored choice between strict GB18030 and strict Big5, and Latin-1 as the last
 //! resort. Shift-JIS is **never** auto-detected (decoding it explicitly is supported):
 //! Shift-JIS bytes are usually also valid GB18030 or Big5, and Python's detector does not
-//! consider the encoding either.
+//! consider the encoding either. `auto` is a read policy only: writing needs a declared
+//! encoding.
 //!
 //! ```
 //! use openjiuwen_sysop::encoding::{TextEncoding, detect_text_encoding};
@@ -31,11 +35,12 @@ use crate::config::BinaryPolicy;
 use crate::constants::AUTO_ENCODING;
 
 pub mod cjk;
+mod encode;
 mod tables;
 
 pub use cjk::{CjkDecoder, CjkEncoding};
 
-/// A text encoding this crate can decode.
+/// A text encoding this crate can decode and encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TextEncoding {
     /// UTF-8, optionally with a byte-order mark.
@@ -343,29 +348,53 @@ pub fn detected_encoding_name(bytes: &[u8]) -> String {
         .to_string()
 }
 
-/// Encodes text for writing.
+/// The write encodings this crate supports, spelled for error messages.
+const SUPPORTED_WRITE_ENCODINGS: &str =
+    "utf-8, utf-16le, utf-16be, latin-1, gb18030 (gbk), big5, and shift-jis";
+
+/// Encodes text for writing with the declared encoding.
 ///
-/// UTF-8 is the only encoding this crate writes; UTF-16 LE/BE are also available because
-/// they round-trip exactly, and Latin-1 (like every other single-byte request) falls back
-/// to UTF-8 bytes.
+/// Every encoding [`TextEncoding::parse`] understands is writable, and every one of them
+/// round-trips through [`decode_text`] with the same name:
+///
+/// - `utf-8` (and the `us-ascii` alias) is copied as its UTF-8 bytes;
+/// - `utf-16le`/`utf-16be` write the UTF-16 code units for the declared endianness;
+/// - `latin-1` writes one byte per `U+0000..=U+00FF` character;
+/// - `gb18030` (also `gbk`/`gb2312`/`cp936`), `big5` (`cp950`, `big5-hkscs`) and
+///   `shift-jis` (`sjis`, `cp932`) write the codec's two-byte codes, plus the codec's other
+///   forms: GB18030's four-byte form for everything outside its two-byte area (including
+///   supplementary-plane characters) and Shift-JIS's single-byte halfwidth katakana.
+///
+/// `auto` is a read policy and is rejected here: a write must declare the bytes it produces.
 ///
 /// # Errors
 ///
-/// Returns `ErrorKind::Unsupported` for the legacy CJK names: decoding them is supported,
-/// but writing GB18030/Big5/Shift-JIS bytes is not (Python lets the caller pick a codec).
+/// - `ErrorKind::Config` when the name is not recognized (the message lists the supported
+///   write encodings) or is `"auto"`.
+/// - `ErrorKind::Validation` when a character cannot be represented in the declared
+///   encoding; the message names the encoding and the character (`U+XXXX ('c')`), so the
+///   caller can fix the content. Nothing is ever silently written as UTF-8 instead.
 pub fn encode_text(text: &str, encoding: &str) -> Result<Vec<u8>> {
-    match TextEncoding::parse(encoding) {
-        Some(TextEncoding::Utf16Le) => Ok(encode_utf16(text, true)),
-        Some(TextEncoding::Utf16Be) => Ok(encode_utf16(text, false)),
-        Some(TextEncoding::Gb18030 | TextEncoding::Big5 | TextEncoding::ShiftJis) => {
-            Err(Error::unsupported(format!(
-                "encoding '{encoding}' is not supported for writing; use utf-8"
-            )))
-        }
-        Some(TextEncoding::Utf8 | TextEncoding::Latin1) => Ok(text.as_bytes().to_vec()),
-        None => Err(Error::unsupported(format!(
-            "encoding '{encoding}' is not supported for writing; use utf-8"
-        ))),
+    if encoding.trim().eq_ignore_ascii_case(AUTO_ENCODING) {
+        return Err(Error::config(format!(
+            "encoding '{AUTO_ENCODING}' cannot be used for writing; declare an encoding \
+             (supported: {SUPPORTED_WRITE_ENCODINGS})"
+        )));
+    }
+    let parsed = TextEncoding::parse(encoding).ok_or_else(|| {
+        Error::config(format!(
+            "encoding '{encoding}' is not recognized; supported encodings are \
+             {SUPPORTED_WRITE_ENCODINGS}"
+        ))
+    })?;
+    match parsed {
+        TextEncoding::Utf8 => Ok(text.as_bytes().to_vec()),
+        TextEncoding::Utf16Le => Ok(encode_utf16(text, true)),
+        TextEncoding::Utf16Be => Ok(encode_utf16(text, false)),
+        TextEncoding::Latin1 => encode::encode_latin1(text),
+        TextEncoding::Gb18030 => encode::encode_cjk(text, CjkEncoding::Gb18030),
+        TextEncoding::Big5 => encode::encode_cjk(text, CjkEncoding::Big5),
+        TextEncoding::ShiftJis => encode::encode_cjk(text, CjkEncoding::ShiftJis),
     }
 }
 
@@ -512,14 +541,65 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cjk_names_are_rejected_for_writing() {
-        let error = encode_text("中文", "gbk").unwrap_err();
+    fn every_supported_encoding_round_trips_on_write() {
+        for (text, name) in [
+            ("plain ascii", "utf-8"),
+            ("café", "latin-1"),
+            ("\u{0}\u{7F}\u{FF}", "latin-1"),
+            ("中文", "gbk"),
+            ("中文", "gb18030"),
+            ("中文", "big5"),
+            ("日本語", "shift-jis"),
+            ("日本語", "sjis"),
+            ("混合 ascii 中文\n", "gb18030"),
+            ("\u{1F600}", "gb18030"),
+        ] {
+            let bytes = encode_text(text, name).unwrap();
+            assert_eq!(
+                decode_text(&bytes, name, BinaryPolicy::Lossy).unwrap(),
+                text,
+                "encoding {name}"
+            );
+        }
+        assert_eq!(encode_text("hello", "ascii").unwrap(), b"hello");
+        // Latin-1 is a real single-byte codec, not a UTF-8 fallback.
+        assert_eq!(encode_text("é", "latin-1").unwrap(), vec![0xE9]);
+        assert_eq!(encode_text("é", "utf-8").unwrap(), "é".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn write_errors_are_typed_and_never_unsupported() {
+        // An unknown name is a configuration problem, and the message lists what works.
+        let error = encode_text("x", "koi8-r").unwrap_err();
+        assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Config);
+        assert!(error.message().contains("koi8-r"), "{}", error.message());
+        assert!(error.message().contains("gb18030"), "{}", error.message());
+        assert!(error.message().contains("shift-jis"), "{}", error.message());
+
+        // `auto` is a read policy.
+        let error = encode_text("x", "AUTO").unwrap_err();
+        assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Config);
+        assert!(
+            error.message().contains("cannot be used for writing"),
+            "{}",
+            error.message()
+        );
+
+        // Unrepresentable content is a validation problem naming encoding and character.
+        let error = encode_text("中", "latin-1").unwrap_err();
         assert_eq!(
             error.kind(),
-            openjiuwen_common::error::ErrorKind::Unsupported
+            openjiuwen_common::error::ErrorKind::Validation
         );
-        assert!(error.message().contains("not supported for writing"));
-        assert_eq!(encode_text("hello", "ascii").unwrap(), b"hello");
+        assert!(error.message().contains("latin-1"), "{}", error.message());
+        assert!(error.message().contains("U+4E2D"), "{}", error.message());
+        let error = encode_text("\u{1F600}", "big5").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Validation
+        );
+        assert!(error.message().contains("big5"), "{}", error.message());
+        assert!(error.message().contains("U+1F600"), "{}", error.message());
     }
 
     #[test]

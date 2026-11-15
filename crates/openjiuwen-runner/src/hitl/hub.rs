@@ -62,7 +62,7 @@ pub(super) struct Entry {
     detail: Value,
     /// The hub's coordination state.
     state: RunPhase,
-    /// Whether the interaction gate is closed (paused or cancelled).
+    /// Whether the interaction gate is closed (cancelled or finished).
     gate_closed: bool,
     /// The run's cancellation token.
     cancellation: CancellationToken,
@@ -237,9 +237,9 @@ impl InteractionHub {
     /// Removes a registered run.
     ///
     /// Drops the inbox, the attached session, and the pending set, closes the
-    /// gate (the entry is gone, so no delivery or pause can reach it), and cancels
+    /// gate (the entry is gone, so no delivery or cancel can reach it), and cancels
     /// the run's watcher token so the task ends. When a monitor is attached and
-    /// the run is still non-terminal (`Queued`/`Running`/`Paused`), it is
+    /// the run is still non-terminal (`Queued`/`Running`), it is
     /// finalised as [`RunOutcome::completed`]; a monitor that no longer knows the
     /// run is logged at debug. The watcher task is never waited on.
     ///
@@ -459,67 +459,65 @@ impl InteractionHub {
             .collect()
     }
 
-    /// Marks `run_id` paused and closes its interaction gate.
+    /// Refuses to pause `run_id`: nothing can suspend a live invocation.
     ///
-    /// A status/coordination signal only: nothing suspends the agent or team loop
-    /// (in-loop gate enforcement is Python's `InteractGate`, deferred). Idempotent
-    /// while already paused.
+    /// A live run answers [`Error::Unsupported`] naming the missing seam (the
+    /// in-process team strategy owns no mid-flight suspension, and Python's
+    /// in-loop `InteractGate` is deferred), because a pause that reported `Ok`
+    /// would have paused nothing. The refusal changes no state: the entry keeps
+    /// its phase, its gate, and its monitor status, and no run is marked
+    /// [`RunPhase::Paused`]. A host that must stop a run calls
+    /// [`InteractionHub::cancel`], which trips the run's own cancellation token.
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] for an unknown id, and [`Error::Validation`]
-    /// (`"run '<id>' has already been cancelled"`) after [`InteractionHub::cancel`].
+    /// [`Error::NotFound`] for an unknown id, [`Error::Validation`]
+    /// (`"run '<id>' has already been cancelled"`) after
+    /// [`InteractionHub::cancel`], [`Error::Validation`]
+    /// (`"run '<id>' has already finished"`) for a completed or failed run, and
+    /// [`Error::Unsupported`] for a live one.
     pub fn pause(&self, run_id: &str) -> Result<()> {
         {
-            let mut inner = self.inner.lock();
+            let inner = self.inner.lock();
             let entry = inner
                 .runs
-                .get_mut(run_id)
+                .get(run_id)
                 .ok_or_else(|| super::not_registered(run_id))?;
             match entry.state {
-                RunPhase::Paused => return Ok(()),
                 RunPhase::Cancelled => return Err(super::already_cancelled(run_id)),
                 RunPhase::Completed | RunPhase::Failed => {
                     return Err(super::already_finished(run_id))
                 }
-                RunPhase::Queued | RunPhase::Running => {}
+                RunPhase::Queued | RunPhase::Running | RunPhase::Paused => {}
             }
-            entry.state = RunPhase::Paused;
-            entry.gate_closed = true;
         }
-        self.mirror(run_id, RunPhase::Paused);
-        Ok(())
+        Err(crate::error::no_suspension_seam("pause", run_id))
     }
 
-    /// Marks `run_id` running and opens its interaction gate.
+    /// Refuses to resume `run_id`: nothing can restart a live invocation.
     ///
-    /// A status/coordination signal only, like [`InteractionHub::pause`].
-    /// Idempotent while already running.
+    /// Like [`InteractionHub::pause`], this is a typed refusal rather than a
+    /// state flip: no phase change, no gate change, no monitor transition.
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] for an unknown id, and [`Error::Validation`]
-    /// (`"run '<id>' has already been cancelled"`) after [`InteractionHub::cancel`].
+    /// Same as [`InteractionHub::pause`].
     pub fn resume(&self, run_id: &str) -> Result<()> {
         {
-            let mut inner = self.inner.lock();
+            let inner = self.inner.lock();
             let entry = inner
                 .runs
-                .get_mut(run_id)
+                .get(run_id)
                 .ok_or_else(|| super::not_registered(run_id))?;
             match entry.state {
-                RunPhase::Running => return Ok(()),
                 RunPhase::Cancelled => return Err(super::already_cancelled(run_id)),
                 RunPhase::Completed | RunPhase::Failed => {
                     return Err(super::already_finished(run_id))
                 }
-                RunPhase::Queued | RunPhase::Paused => {}
+                RunPhase::Queued | RunPhase::Running | RunPhase::Paused => {}
             }
-            entry.state = RunPhase::Running;
-            entry.gate_closed = false;
         }
-        self.mirror(run_id, RunPhase::Running);
-        Ok(())
+        Err(crate::error::no_suspension_seam("resume", run_id))
     }
 
     /// Cancels a run: trips its token, settles its pending interactions, and
@@ -646,21 +644,6 @@ impl InteractionHub {
         }
     }
 
-    /// Mirrors `phase` into the monitor, logging a rejected transition.
-    fn mirror(&self, run_id: &str, phase: RunPhase) {
-        let Some(monitor) = self.monitor() else {
-            return;
-        };
-        if let Err(error) = monitor.update(run_id, phase, Value::Null) {
-            warn!(
-                target: TARGET,
-                run_id,
-                phase = ?phase,
-                %error,
-                "run status mirror failed"
-            );
-        }
-    }
     /// Finalises a cancelled run on the monitor with `finish`.
     ///
     /// A terminal phase never goes through `update`, so the mirrored run gets its

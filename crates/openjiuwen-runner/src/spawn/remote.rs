@@ -394,15 +394,33 @@ pub trait RemoteClient: Send + Sync {
         inputs: Value,
         timeout: Option<Duration>,
     ) -> BoxStream<'static, Result<AgentChunk>>;
-    /// Asks the agent to cancel `task_id`.
+    /// Asks the agent to cancel `task_id`, with no reason.
+    ///
+    /// The convenience form of [`Self::cancel_task_with_request_id`].
     ///
     /// # Errors
     ///
     /// [`Error::Unsupported`] when the client has no cancel endpoint,
-    /// [`Error::Validation`] for an unusable URL, [`Error::NotFound`] when the
-    /// task is unknown, [`Error::Timeout`] when the deadline elapses, and
-    /// [`Error::Transport`] for every other failure.
+    /// [`Error::Validation`] for a blank id or an unusable URL,
+    /// [`Error::NotFound`] when the task is unknown, [`Error::Timeout`] when the
+    /// deadline elapses, and [`Error::Transport`] for every other failure.
     async fn cancel_task(&self, task_id: &str) -> Result<()>;
+
+    /// Asks the agent to cancel `request_id`, carrying `reason` when known.
+    ///
+    /// Defaults to [`Self::cancel_task`]: a client whose wire cannot say more than
+    /// the id still correlates by id, so nothing is lost by the default.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::cancel_task`] reports for this client.
+    async fn cancel_task_with_request_id(
+        &self,
+        request_id: &str,
+        _reason: Option<&str>,
+    ) -> Result<()> {
+        self.cancel_task(request_id).await
+    }
 }
 
 /// The mutable part of a [`RemoteAgent`], shared across clones.
@@ -534,7 +552,16 @@ impl RemoteClient for RemoteAgent {
     }
 
     async fn cancel_task(&self, task_id: &str) -> Result<()> {
-        remote_io::cancel_http(self, task_id).await
+        remote_io::cancel_http(self, task_id, None).await
+    }
+
+    /// The same endpoint, with the optional reason in the body.
+    async fn cancel_task_with_request_id(
+        &self,
+        request_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        remote_io::cancel_http(self, request_id, reason).await
     }
 }
 
@@ -618,12 +645,30 @@ impl SpawnedAgent for RemoteAgent {
     /// # Errors
     ///
     /// [`openjiuwen_common::error::Error::Unsupported`] when no `cancel_path` is
-    /// configured, [`openjiuwen_common::error::Error::NotFound`] when the task is
-    /// unknown, [`openjiuwen_common::error::Error::Timeout`] when the deadline
-    /// elapses, and [`openjiuwen_common::error::Error::Transport`] for every other
-    /// failure.
+    /// configured, [`openjiuwen_common::error::Error::Validation`] for a blank id,
+    /// [`openjiuwen_common::error::Error::NotFound`] when the task is unknown,
+    /// [`openjiuwen_common::error::Error::Timeout`] when the deadline elapses, and
+    /// [`openjiuwen_common::error::Error::Transport`] for every other failure.
     async fn cancel_task(&self, task_id: &str) -> Result<()> {
         RemoteClient::cancel_task(self, task_id).await
+    }
+
+    /// Posts the id **and** the optional reason to the cancel endpoint.
+    ///
+    /// The body is this crate's own layout (`{"task_id": …, "request_id": …,
+    /// "reason": … | null}`), so the id travels under both the original
+    /// `task_id` key and its correlation name, and the reason travels with it —
+    /// nothing about a remote cancel is dropped on the way out.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`SpawnedAgent::cancel_task`].
+    async fn cancel_task_with_request_id(
+        &self,
+        request_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        RemoteClient::cancel_task_with_request_id(self, request_id, reason).await
     }
 }
 

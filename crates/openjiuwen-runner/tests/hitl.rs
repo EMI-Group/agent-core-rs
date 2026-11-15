@@ -1,13 +1,13 @@
-//! Human-in-the-loop hub behaviour: the live-run registry, inbox delivery, the
-//! pause/resume/cancel signals, real interaction round trips through a session,
-//! and the run-path seam that registers and finalises a run.
+//! Human-in-the-loop hub behaviour: the live-run registry, inbox delivery,
+//! cancellation, the typed pause/resume refusals, real interaction round trips
+//! through a session, and the run-path seam that registers and finalises a run.
 //!
 //! Drives only the public `openjiuwen_runner::hitl` surface plus the
 //! `run::RunServices::with_monitor` / `with_hitl` seams, exactly as a host UI and
 //! the execution paths do. Ports `team_runner.py`'s `interact_agent_team`
 //! (delivery + `DeliverResult`), `register_human_agent_inbound` (the inbound
-//! channel), and `pause_agent_team` / `stop_agent_team` (the coordination
-//! signals).
+//! channel), `pause_agent_team` (kept as a typed refusal: nothing suspends an
+//! in-flight invocation), and `stop_agent_team` (a real cancellation).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -175,12 +175,12 @@ async fn a_closed_or_full_inbox_is_reported_never_dropped_silently() {
 }
 
 // ---------------------------------------------------------------------------
-// Coordination signals
+// Pause/resume refusals and cancellation
 // ---------------------------------------------------------------------------
 
-// ports team_runner.py::pause_agent_team / stop_agent_team
+// ports team_runner.py::pause_agent_team (a typed refusal) / stop_agent_team
 #[test]
-fn pause_and_resume_flip_the_state_gate_and_mirror_once_each() {
+fn pause_and_resume_are_refused_without_changing_the_run() {
     let monitor = Arc::new(RunMonitor::new());
     let hub = InteractionHub::new().with_monitor(Arc::clone(&monitor));
     let handle = hub.register(ActiveRunSpec {
@@ -189,35 +189,71 @@ fn pause_and_resume_flip_the_state_gate_and_mirror_once_each() {
     });
     let run_id = handle.run_id().to_string();
 
-    hub.pause(&run_id).expect("pause");
-    let info = hub.list_active().remove(0);
-    assert_eq!(info.state, RunPhase::Paused);
-    assert!(info.gate_closed);
+    for (action, result) in [
+        ("pause", hub.pause(&run_id)),
+        ("resume", hub.resume(&run_id)),
+    ] {
+        let error = result.expect_err("a live run cannot be suspended");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.to_string();
+        assert!(
+            message.contains("InteractGate") && message.contains("cancel"),
+            "the refusal names the missing seam and the alternative: {message}"
+        );
+        assert!(
+            message.contains(&format!("`{action}`")) && message.contains(&run_id),
+            "the refusal names the call and the run: {message}"
+        );
+    }
 
-    hub.resume(&run_id).expect("resume");
     let info = hub.list_active().remove(0);
-    assert_eq!(info.state, RunPhase::Running);
-    assert!(!info.gate_closed);
-
+    assert_eq!(info.state, RunPhase::Queued, "the refusal changed no phase");
+    assert!(!info.gate_closed, "the refusal left the gate open");
     assert_eq!(
         phases(&monitor, &run_id),
-        vec![RunPhase::Queued, RunPhase::Paused, RunPhase::Running],
-        "register published the `Queued` event once, then one event per signal"
+        vec![RunPhase::Queued],
+        "a refused pause/resume publishes no monitor event"
     );
 
+    // Cancelling still works end to end: terminal phase, closed gate, one event.
     hub.cancel(&run_id).expect("cancel");
     let info = hub.list_active().remove(0);
     assert_eq!(info.state, RunPhase::Cancelled);
     assert!(info.gate_closed);
     assert_eq!(
         phases(&monitor, &run_id),
-        vec![
-            RunPhase::Queued,
-            RunPhase::Paused,
-            RunPhase::Running,
-            RunPhase::Cancelled
-        ]
+        vec![RunPhase::Queued, RunPhase::Cancelled]
     );
+}
+
+#[test]
+fn a_cancelled_run_rejects_pause_and_resume_as_validation() {
+    let hub = InteractionHub::new();
+    let handle = hub.register(session_spec("s-1"));
+    let run_id = handle.run_id().to_string();
+    hub.cancel(&run_id).expect("cancel");
+
+    for result in [hub.pause(&run_id), hub.resume(&run_id)] {
+        let error = result.expect_err("a cancelled run cannot be paused or resumed");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert_eq!(
+            error.to_string(),
+            format!("validation: run '{run_id}' has already been cancelled")
+        );
+    }
+}
+
+#[test]
+fn an_unknown_run_is_not_found_on_pause_and_resume() {
+    let hub = InteractionHub::new();
+    for result in [hub.pause("run-x"), hub.resume("run-x")] {
+        let error = result.expect_err("an unknown run");
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert_eq!(
+            error.to_string(),
+            "not_found: run 'run-x' is not registered"
+        );
+    }
 }
 
 #[tokio::test]

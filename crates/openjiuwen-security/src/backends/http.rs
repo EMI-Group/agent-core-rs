@@ -7,6 +7,14 @@
 //! to [`Error::Transport`] facts (service, status, bounded body excerpt) that
 //! never repeat the scanned text.
 //!
+//! A `2xx` reply is only accepted when it carries a JSON *object*: an empty
+//! body, a non-JSON body, and a non-object JSON body (an array, a string, a
+//! number, a boolean, or `null`) are all [`Error::Transport`] naming the status
+//! and the shape found, so a mis-pointed or misbehaving endpoint can never read
+//! as a clean verdict. Those failures are final: retries cover transport errors
+//! and the retryable statuses (`429`, `5xx`) only, so a garbage `200` fails fast
+//! instead of being re-sent.
+//!
 //! The crate-internal helpers `http_client`, `json_body`, and `resolve_timeout`
 //! are shared with the vendor adapters, so client construction, status/JSON
 //! error mapping, and timeout sanitising live in one place instead of being
@@ -250,13 +258,17 @@ impl HttpModerationTransport {
 impl ModerationTransport for HttpModerationTransport {
     /// Posts the request text to the resolved endpoint and returns the JSON reply.
     ///
+    /// The reply must be a JSON object; anything else is rejected rather than
+    /// defaulted (see `json_body` and `require_object`).
+    ///
     /// # Errors
     ///
     /// [`Error::Validation`] when neither the request nor the configuration
     /// carries an endpoint, [`Error::Timeout`] when the deadline expires, and
     /// [`Error::Transport`] for connection failures, non-2xx statuses, and
-    /// non-JSON bodies. Errors carry the service, status, and a bounded body
-    /// excerpt — never the scanned text or a credential.
+    /// bodies that are empty, not JSON, or not a JSON object. Errors carry the
+    /// service, status, and a bounded body excerpt — never the scanned text or a
+    /// credential.
     async fn moderate(&self, request: &ModerationRequest) -> Result<Value> {
         let url = resolve_endpoint(&self.config.url, &request.url)?.to_owned();
         let service = service_name(&url);
@@ -288,7 +300,8 @@ impl ModerationTransport for HttpModerationTransport {
             status,
             "moderation request completed"
         );
-        json_body(response, &service)
+        let reply = json_body(response, &service)?;
+        require_object(reply, status, &service)
     }
 }
 
@@ -296,7 +309,8 @@ impl ModerationTransport for HttpModerationTransport {
 ///
 /// Retries cover rate limiting (`429`) and every server error (`5xx`), with an
 /// exponential backoff capped at [`RETRY_MAX_BACKOFF`]; `max_retries == 0`
-/// disables retries entirely.
+/// disables retries entirely. A `2xx` reply with an unusable body is *not*
+/// retried: it is a final [`Error::Transport`], so a garbage `200` fails fast.
 ///
 /// # Errors
 ///
@@ -320,12 +334,19 @@ pub(crate) fn http_client(
 /// `service` names the endpoint in diagnostics (normally the URL host); it is
 /// never the scanned text. A non-2xx status becomes [`Error::Transport`]
 /// carrying the status code and at most [`ERROR_SNIPPET_CHARS`] characters of
-/// the whitespace-collapsed body, and a 2xx body that is not JSON becomes
-/// [`Error::Transport`] naming only the body length and the parse failure.
+/// the whitespace-collapsed body; a 2xx empty body becomes [`Error::Transport`]
+/// naming the status and the empty body; and a 2xx body that is not JSON becomes
+/// [`Error::Transport`] naming the status, the body length, and the parse
+/// failure. No branch echoes the scanned text or a credential.
+///
+/// A decoded body is returned as-is, whatever its JSON shape: callers that need
+/// a specific shape validate it (the transport requires an object, see
+/// [`require_object`]).
 ///
 /// # Errors
 ///
-/// Returns [`Error::Transport`] for a non-2xx status or an undecodable body.
+/// Returns [`Error::Transport`] for a non-2xx status, an empty body, or an
+/// undecodable body.
 pub(crate) fn json_body(response: HttpResponse, service: &str) -> Result<Value> {
     let HttpResponse { status, body, .. } = response;
     if !(200..300).contains(&status) {
@@ -340,6 +361,18 @@ pub(crate) fn json_body(response: HttpResponse, service: &str) -> Result<Value> 
             body_snippet(&body)
         )));
     }
+    if body.iter().all(u8::is_ascii_whitespace) {
+        tracing::warn!(
+            target: LOG_TARGET,
+            service,
+            status,
+            "moderation endpoint returned an empty body"
+        );
+        return Err(Error::transport(format!(
+            "moderation service {service} returned HTTP {status} with an empty body; expected a \
+             JSON object"
+        )));
+    }
     serde_json::from_slice(&body).map_err(|err| {
         tracing::warn!(
             target: LOG_TARGET,
@@ -348,10 +381,52 @@ pub(crate) fn json_body(response: HttpResponse, service: &str) -> Result<Value> 
             "moderation endpoint returned a non-JSON body"
         );
         Error::transport(format!(
-            "moderation service {service} returned a non-JSON body of {} bytes: {err}",
+            "moderation service {service} returned HTTP {status} with a non-JSON body of {} \
+             bytes: {err}",
             body.len()
         ))
     })
+}
+
+/// Requires a decoded moderation reply to be a JSON object.
+///
+/// Moderation services answer with a JSON object; an array, a bare string, a
+/// number, a boolean, or `null` is an unusable reply, so it becomes
+/// [`Error::Transport`] naming the status and the shape found instead of being
+/// handed to a parser that would have to guess. The message carries no part of
+/// the payload.
+///
+/// # Errors
+///
+/// Returns [`Error::Transport`] when `reply` is not a JSON object.
+fn require_object(reply: Value, status: u16, service: &str) -> Result<Value> {
+    if reply.is_object() {
+        return Ok(reply);
+    }
+    let shape = json_shape(&reply);
+    tracing::warn!(
+        target: LOG_TARGET,
+        service,
+        status,
+        shape,
+        "moderation endpoint returned a non-object JSON body"
+    );
+    Err(Error::transport(format!(
+        "moderation service {service} returned HTTP {status} with a JSON {shape} body; expected a \
+         JSON object"
+    )))
+}
+
+/// Names the JSON shape of `value` for a diagnostics message.
+fn json_shape(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 /// Converts a Python-style timeout in seconds into a [`Duration`].
@@ -658,7 +733,110 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::Transport);
-        assert!(error.to_string().contains("non-JSON"), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("non-JSON"), "{message}");
+        assert!(message.contains("HTTP 200"), "{message}");
+        assert!(!message.contains("scanned"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn empty_success_body_maps_to_a_transport_error() {
+        let server = server_with(ResponseTemplate::new(200)).await;
+        let error = transport_with(config_for(&server))
+            .moderate(&call("scanned"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Transport);
+        let message = error.to_string();
+        assert!(message.contains("empty body"), "{message}");
+        assert!(message.contains("HTTP 200"), "{message}");
+        assert!(message.contains("JSON object"), "{message}");
+        assert!(!message.contains("scanned"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn non_object_success_bodies_map_to_a_transport_error() {
+        for (body, shape) in [
+            (json!([]), "array"),
+            (json!("clean"), "string"),
+            (json!(0), "number"),
+            (json!(false), "boolean"),
+            (Value::Null, "null"),
+        ] {
+            let server = server_with(ResponseTemplate::new(200).set_body_json(body.clone())).await;
+            let error = transport_with(config_for(&server))
+                .moderate(&call("scanned"))
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind(), ErrorKind::Transport, "{body}");
+            let message = error.to_string();
+            assert!(message.contains("HTTP 200"), "{body}: {message}");
+            assert!(message.contains(shape), "{body}: {message}");
+            assert!(
+                message.contains("expected a JSON object"),
+                "{body}: {message}"
+            );
+            assert!(!message.contains("scanned"), "{body}: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unusable_success_body_is_not_retried() {
+        // Two retries are configured: a garbage `200` must still be sent once.
+        let server = server_with(ResponseTemplate::new(200).set_body_string("not json")).await;
+        let config = config_for(&server).with_max_retries(2);
+        let error = transport_with(config)
+            .moderate(&call("scanned"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Transport);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "a 2xx with an unusable body is final, not retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_errors_follow_the_retry_contract() {
+        // One `500` is retried once, so the following `200` is accepted.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/moderate"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/moderate"))
+            .respond_with(ok_reply())
+            .mount(&server)
+            .await;
+
+        let reply = transport_with(config_for(&server).with_max_retries(1))
+            .moderate(&call("scanned"))
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({"ok": true}));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+
+        // A persistent `500` is attempted `max_retries + 1` times.
+        let failing = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/moderate"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&failing)
+            .await;
+        let error = transport_with(config_for(&failing).with_max_retries(2))
+            .moderate(&call("scanned"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Transport);
+        assert!(error.to_string().contains("500"), "{error}");
+        assert_eq!(failing.received_requests().await.unwrap().len(), 3);
     }
 
     #[tokio::test]

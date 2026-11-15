@@ -32,8 +32,10 @@ pub struct TeamMemoryStats {
 ///
 /// The record is flattened onto the top level (so a hit has the same JSON fields as a
 /// record plus the score components), matching `RecallHit` in [`crate::record`].
-/// `score` is the blended score the caller filtered on; `keyword`, `importance`, and
-/// `recency` are the exact `0.0..=1.0` components it was computed from.
+/// `score` is the blended score the caller filtered on; `similarity`, `keyword`,
+/// `importance`, and `recency` are the exact `0.0..=1.0` components it was computed from.
+/// `similarity` stays `0.0` whenever the search had no query embedding (or the record has
+/// none), which is the "no semantic signal" value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TeamSearchHit {
     /// The recalled record, flattened into this object.
@@ -41,6 +43,9 @@ pub struct TeamSearchHit {
     pub record: TeamMemoryRecord,
     /// Final blended score in `0.0..=1.0`.
     pub score: f32,
+    /// Normalized semantic similarity component in `0.0..=1.0`.
+    #[serde(default)]
+    pub similarity: f32,
     /// Normalized keyword component.
     pub keyword: f32,
     /// The record's importance component.
@@ -65,6 +70,7 @@ mod tests {
         TeamSearchHit {
             record,
             score,
+            similarity: 0.0,
             keyword: 0.4,
             importance: 0.5,
             recency: 0.9,
@@ -110,6 +116,7 @@ mod tests {
         assert_eq!(json["content"], serde_json::json!("some content"));
         assert_eq!(json["kind"], serde_json::json!("shared_fact"));
         assert_eq!(json["score"], serde_json::json!(0.75));
+        assert_eq!(json["similarity"], serde_json::json!(0.0_f32));
         assert_eq!(json["keyword"], serde_json::json!(0.4_f32));
         assert_eq!(json["importance"], serde_json::json!(0.5_f32));
         assert_eq!(json["recency"], serde_json::json!(0.9_f32));

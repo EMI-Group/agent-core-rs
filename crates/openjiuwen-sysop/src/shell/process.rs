@@ -254,7 +254,7 @@ pub(crate) async fn run_captured(mut child: Child, options: RunOptions) -> RunOu
         // Kill the whole tree before reaping: the group is still addressable while the
         // unreaped child leads it, so grandchildren die with it.
         group.terminate(false);
-        let _ = child.start_kill();
+        kill_direct_child(&mut child);
     }
     let exit_code = exit_code_of(child.wait().await);
     let stdout = join_reader(stdout_task).await;
@@ -347,7 +347,7 @@ pub(crate) fn drive_child(
         if interrupted.is_some() {
             // The child has not been reaped here, so its group is still addressable.
             group.terminate(false);
-            let _ = child.start_kill();
+            kill_direct_child(&mut child);
         }
         let code = exit_code_of(child.wait().await);
         match interrupted {
@@ -373,9 +373,18 @@ async fn stream_reader<R>(
     let mut buffer = vec![0_u8; constants::DEFAULT_TEXT_CHUNK_SIZE];
     loop {
         let read = match pipe.read(&mut buffer).await {
-            // EOF and read failures both mean "no more data"; dropping the sender
-            // signals the end of this pipe to the generator.
-            Ok(0) | Err(_) => break,
+            // EOF means "no more data"; dropping the sender signals the end of this pipe
+            // to the generator.
+            Ok(0) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break,
+            Err(error) => {
+                tracing::warn!(
+                    ?kind,
+                    %error,
+                    "reading the child's stream failed; the streamed output is incomplete"
+                );
+                break;
+            }
             Ok(read) => read,
         };
         if marked {
@@ -498,12 +507,21 @@ where
     let mut truncated = false;
     loop {
         match pipe.read(&mut buffer).await {
-            // EOF and I/O errors both end the capture; whatever was read is kept.
-            Ok(0) | Err(_) => break,
+            // EOF ends the capture; whatever was read is kept.
+            Ok(0) => break,
             Ok(read) => {
                 let take = limit.saturating_sub(kept.len()).min(read);
                 kept.extend_from_slice(&buffer[..take]);
                 truncated |= take < read;
+            }
+            Err(error) => {
+                // The capture cannot be resumed, so the text is incomplete: say so instead
+                // of returning a short-but-plausible output.
+                tracing::warn!(
+                    %error,
+                    "reading the child's captured output failed; the captured text is incomplete"
+                );
+                break;
             }
         }
     }
@@ -515,12 +533,42 @@ where
 }
 
 /// Awaits a pipe reader, giving up after [`READER_GRACE`].
+///
+/// A reader that panicked or is still busy yields the empty capture (the run must not hang
+/// on it), and both cases are logged because the captured text is then incomplete.
 async fn join_reader(mut task: tokio::task::JoinHandle<CapturedText>) -> CapturedText {
-    if let Ok(Ok(captured)) = tokio::time::timeout(READER_GRACE, &mut task).await {
-        return captured;
+    match tokio::time::timeout(READER_GRACE, &mut task).await {
+        Ok(Ok(captured)) => captured,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                %error,
+                "the captured-output reader failed; the captured text is incomplete"
+            );
+            CapturedText::default()
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = READER_GRACE.as_millis(),
+                "the captured-output reader did not finish in time; the captured text is \
+                 incomplete"
+            );
+            task.abort();
+            CapturedText::default()
+        }
     }
-    task.abort();
-    CapturedText::default()
+}
+
+/// Signals the direct child, naming the harmless "it already exited" case.
+///
+/// The process group was already signalled by [`ProcessGroup::terminate`]; this is the
+/// belt-and-braces direct kill, so a failure here only means the child is gone.
+fn kill_direct_child(child: &mut Child) {
+    if let Err(error) = child.start_kill() {
+        tracing::debug!(
+            %error,
+            "the direct child could not be signalled; it has most likely exited already"
+        );
+    }
 }
 
 /// Wall-clock milliseconds since `started`, saturating at `u64::MAX`.
@@ -529,8 +577,24 @@ fn elapsed_ms(started: Instant) -> u64 {
 }
 
 /// The exit code of `status`, or `-1` when the child died from a signal.
+///
+/// `-1` is Python's convention for a child that never reported an exit status; both cases
+/// that produce it are named in the log, because the caller cannot tell them apart.
 pub(crate) fn exit_code_of(status: std::io::Result<ExitStatus>) -> i32 {
-    status.ok().and_then(|status| status.code()).unwrap_or(-1)
+    match status {
+        Ok(status) => {
+            if let Some(code) = status.code() {
+                code
+            } else {
+                tracing::debug!("the child was terminated by a signal; reporting exit code -1");
+                -1
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "the child's exit status could not be collected; reporting -1");
+            -1
+        }
+    }
 }
 
 /// Builds Python's early-exit message (`process exited early with code <n>: <stderr>`).
@@ -540,7 +604,10 @@ pub(crate) async fn background_early_exit(
     stderr_task: Option<tokio::task::JoinHandle<String>>,
     sink: &Arc<Mutex<StderrSink>>,
 ) -> String {
-    let code = status.code().unwrap_or(-1);
+    let code = status.code().unwrap_or_else(|| {
+        tracing::debug!("the backgrounded child was terminated by a signal; reporting -1");
+        -1
+    });
     let stderr = collect_stderr(stderr_task, sink).await;
     let trimmed = stderr.trim();
     let message = if trimmed.is_empty() {
@@ -574,8 +641,16 @@ where
     let mut buffer = vec![0_u8; constants::DEFAULT_TEXT_CHUNK_SIZE];
     loop {
         let read = match pipe.read(&mut buffer).await {
-            // EOF or a read failure ends the capture and keeps what was retained.
-            Ok(0) | Err(_) => break,
+            // EOF ends the capture and keeps what was retained.
+            Ok(0) => break,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "reading a backgrounded command's stderr failed; the retained stderr is \
+                     incomplete"
+                );
+                break;
+            }
             Ok(read) => read,
         };
         let mut state = lock_sink(&sink);
@@ -600,8 +675,16 @@ async fn collect_stderr(
     let Some(mut task) = task else {
         return String::new();
     };
-    if let Ok(Ok(text)) = tokio::time::timeout(STDERR_JOIN_GRACE, &mut task).await {
-        return text;
+    match tokio::time::timeout(STDERR_JOIN_GRACE, &mut task).await {
+        Ok(Ok(text)) => return text,
+        Ok(Err(error)) => tracing::debug!(
+            %error,
+            "the stderr reader failed; reporting the bytes it retained"
+        ),
+        Err(_) => tracing::debug!(
+            timeout_ms = STDERR_JOIN_GRACE.as_millis(),
+            "the stderr reader is still busy; reporting the bytes it retained"
+        ),
     }
     task.abort();
     let state = lock_sink(sink);

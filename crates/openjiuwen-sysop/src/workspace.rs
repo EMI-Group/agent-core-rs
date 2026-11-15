@@ -24,6 +24,7 @@
 //! assert!(!is_within(Path::new("/a/bc"), Path::new("/a/b")));
 //! ```
 
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use openjiuwen_common::error::{Error, Result};
@@ -222,12 +223,25 @@ pub async fn canonicalize_containing(path: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
     let mut suffix: Vec<std::ffi::OsString> = Vec::new();
     loop {
-        if let Ok(canonical) = tokio::fs::canonicalize(&current).await {
-            let mut resolved = canonical;
-            for segment in suffix.iter().rev() {
-                resolved.push(segment);
+        match tokio::fs::canonicalize(&current).await {
+            Ok(canonical) => {
+                let mut resolved = canonical;
+                for segment in suffix.iter().rev() {
+                    resolved.push(segment);
+                }
+                return clean_path(&resolved);
             }
-            return clean_path(&resolved);
+            Err(error) if error.kind() != ErrorKind::NotFound => {
+                // A missing prefix is the normal case for a write target; any other failure
+                // (a permission failure, a symlink loop) means the containment check below
+                // only sees the lexical path, so it is named rather than swallowed.
+                tracing::debug!(
+                    path = %format_path(&current),
+                    %error,
+                    "cannot canonicalize a path prefix; falling back to the lexical path"
+                );
+            }
+            Err(_) => {}
         }
         let Some(name) = current.file_name().map(std::ffi::OsStr::to_os_string) else {
             return clean_path(path);

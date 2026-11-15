@@ -12,9 +12,9 @@ use super::sweep_lock::SweepLockSkip;
 
 /// The result of one completed dream attempt.
 ///
-/// A [`DreamRepository::complete`](crate::dreaming::DreamRepository::complete) call
-/// stores the outcome's state and metrics on the job; the notes stay with the caller
-/// (they may be logged or merged into a [`DreamRunSummary`]).
+/// A [`DreamRepository::complete`](crate::dreaming::DreamRepository::complete) call stores
+/// the outcome's state, metrics and notes on the job, so a degraded fallback or a partial
+/// answer stays visible after the sweep summary is gone.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct DreamOutcome {
@@ -24,7 +24,7 @@ pub struct DreamOutcome {
     pub state: DreamState,
     /// Counters describing the attempt.
     pub metrics: DreamMetrics,
-    /// Human-readable notes, e.g. why the job was skipped.
+    /// Human-readable notes, e.g. why the job was skipped or degraded.
     pub notes: Vec<String>,
 }
 

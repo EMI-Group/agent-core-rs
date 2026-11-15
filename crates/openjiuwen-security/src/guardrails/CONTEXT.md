@@ -4,6 +4,7 @@
 
 The detectors shipped with the crate: prompt-injection heuristics (Python parity), sensitive-data/PII detection with redaction, configurable regex content rules, and tool-call argument validation.
 Each one is a `Guardrail` implementation: stateless after construction, async `check(&GuardrailContext) -> Result<GuardrailResult>`, with a serde config and Python-compatible defaults where Python has an equivalent (`PromptInjectionGuardrailConfig`, `RuleBasedBackendConfig`).
+Each detector reads its payload through the checked text projection, so an unscannable payload is a typed error the pipeline's failure policy resolves, never a silent pass.
 
 ## API Surface
 
@@ -62,11 +63,21 @@ Stage defaults: prompt injection `[LlmInvokeInput, ToolInvokeOutput]` (Python `D
 ## Constraints
 
 - Every rule list is compiled once at construction with `regex::RegexBuilder` (`case_insensitive(true)` unless the config says otherwise); an invalid pattern returns `Error::Validation("invalid <kind> pattern '<name>': <regex error>")` — never a panic, never a silent skip.
-- All regexes run against `GuardrailContext::text_view()`; matches are found with `find_iter` and redaction is applied on the original text by byte range, last-to-first, so ranges stay valid.
+- All regexes run against the checked text projection (`GuardrailContext::text_view_checked`); matches are found with `find_iter` and redaction is applied on the original text by byte range, last-to-first, so ranges stay valid.
 - Findings never embed matched text: `details` carries pattern/rule names, `match_count`, and, for tool arguments, `tool_name`. Redacted text is exposed only through `modified_data` (`{"sanitized_text": ...}` for text, `{"sanitized_arguments": ...}` for tool arguments).
-- An empty/whitespace text (or empty arguments) is always `GuardrailResult::pass()`; detectors do no work without content.
+- An empty or whitespace-only *scannable* text (or empty arguments) is always `GuardrailResult::pass()`; detectors do no work without content, and "nothing to find" is not a failure.
 - `SensitiveDataGuardrail` claims byte ranges in table order (patterns then `extra_patterns`), so the earliest pattern wins and an overlapping match of a later pattern is dropped; each claimed range is redacted exactly once.
 - `allowlist` entries are compared to the full matched substring (exact match, case-sensitive) and skip that match.
+
+## Unscannable payloads and failure policy
+
+Every detector's `check` projects the payload with `GuardrailContext::text_view_checked()`, never the total `text_view()`.
+A payload the projection cannot read (non-string `text` content, a non-array `messages` payload, `null` content, or a message array carrying neither text nor tool-call arguments) makes `check` return `Error::validation("unscannable content: ...")` instead of a silent pass.
+`ToolArgumentGuardrail` walks the argument JSON structurally but still runs the checked projection first, so `null` arguments short-circuit with the same typed error.
+`GuardrailPipeline::run` resolves the error through `SecurityPolicy::failure_policy`: the default `FailClosed` turns it into a blocking `Critical` finding (`risk_type = "guardrail_error"`), and the explicit `FailOpen` opt-in only records it.
+An empty string, an empty message array, and empty/whitespace-only argument leaves are scannable, so they still return `GuardrailResult::pass()`.
+A caller invoking `check` directly outside a pipeline sees the typed error and decides its own policy; the pipeline is not required for the failure to be visible.
+Module tests cover the typed error for `GuardrailContext::raw("user_input", Value::Null)` in each detector, the empty-scannable pass, and both `FailurePolicy` branches of an `api`-mode transport failure.
 
 ## Default sensitive-data table
 
@@ -99,13 +110,13 @@ Denied tool names and allowlist violations use `denied_tool_risk_level` (`Critic
 
 `PromptInjectionGuardrail::with_config` reproduces Python's construction validation and message strings:
 `"invalid mode: {mode}, must be 'rules', 'api' or 'local'"`, `"api_url is required for api mode"`, `"model_path is required for local mode"`, `"either model_type or parser must be specified for api/local mode"`, `"unknown model_type: {model_type}"`, checked in that order.
-Mode `rules` → `RuleBasedPromptInjectionBackend` with `custom_patterns` and `risk_level`; `api` → `ApiModelBackend::http` over the built-in HTTP transport derived from `api_url`/`api_key`/`timeout` (real remote moderation, no extra wiring; transport failures surface as the backend's error and are recorded by the pipeline), plus the default parser (`BertBinaryParser { risk_type: "prompt_injection", confidence_thresholds, attack_class_id }` for `bert`, `QwenGuardParser { risk_type: qwen_risk_type }` for `qwen`, or a custom parser); `local` → `LocalModelBackend` with the same parser choice, whose `analyze` returns the typed `Unsupported` (no inference runtime is linked).
+Mode `rules` → `RuleBasedPromptInjectionBackend` with `custom_patterns` and `risk_level`; `api` → `ApiModelBackend::http` over the built-in HTTP transport derived from `api_url`/`api_key`/`timeout` (real remote moderation, no extra wiring; transport failures surface as the backend's error and are recorded by the pipeline), plus the default parser (`BertBinaryParser { risk_type: "prompt_injection", confidence_thresholds, attack_class_id }` for `bert`, `QwenGuardParser { risk_type: qwen_risk_type }` for `qwen`, or a custom parser); `local` → `LocalModelBackend` with the same parser choice, whose `analyze` always returns the typed `Unsupported` (no in-process inference runtime is linked), so every `check` in `local` mode errors and the default fail-closed policy blocks it as a configuration error; use `api` mode or an injected `ApiModelBackend` for a real inference server over HTTP.
 Python's `config.parser` is deliberately not a serde field (a parser is a runtime collaborator); `with_config_and_parser` is its exact counterpart and makes `model_type` optional.
-`check` returns the backend's assessment as a `GuardrailResult`: `is_safe = !has_risk`, level and type verbatim (`risk_type` stays `None` for safe results), `details` from the assessment; `modified_data` is `None`.
+`check` first pre-checks `ctx.text_view_checked()?` and then returns the backend's assessment as a `GuardrailResult`: `is_safe = !has_risk`, level and type verbatim (`risk_type` stays `None` for safe results), `details` from the assessment; `modified_data` is `None`.
 `SensitiveDataGuardrail::check` blocks with `risk_type = "sensitive_data"`, `risk_level` = the maximum of the matched patterns' levels (`SensitivePattern::risk_level` falling back to `config.risk_level`), `details = {"matched_patterns": [..], "match_count": n}`, and `modified_data = {"sanitized_text": redacted}` when `redact` is true.
 `SensitiveDataGuardrailConfig::enabled` is consumed by `SecurityConfig::pipeline()`, not by `check`: a guardrail instance always scans.
 `ContentRuleGuardrail::check`: first matching rule yields `risk_type = rule.risk_type`, `risk_level = rule.risk_level`, `details = {"rule": name, "matched_pattern": pattern}` and `modified_data = {"sanitized_text": ...}` when `redact`; other rules still run for reporting when no match has been found yet is not attempted — one result per scan (first match wins, Python rule-backend semantics).
-`ToolArgumentGuardrail::check`: reads `ctx.get_tool_name()` and the argument JSON; order = allow/deny list, `max_argument_bytes`, deny patterns, sensitive data. It returns the first failure as the `GuardrailResult`; otherwise `pass()`. When sensitive data is redacted it returns the finding with `modified_data = {"sanitized_arguments": <arguments with redacted strings>}`.
+`ToolArgumentGuardrail::check`: pre-checks `ctx.text_view_checked()?` (so unprojectable arguments are a typed failure, never a pass), then reads `ctx.get_tool_name()` and the argument JSON; order = allow/deny list, `max_argument_bytes`, deny patterns, sensitive data. It returns the first failure as the `GuardrailResult`; otherwise `pass()`. When sensitive data is redacted it returns the finding with `modified_data = {"sanitized_arguments": <arguments with redacted strings>}`.
 
 ## Routing Table
 

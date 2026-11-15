@@ -261,18 +261,23 @@ async fn the_subprocess_handle_reports_identity_health_and_uncancellable_tasks()
         .expect("the echo child answers through the seam");
     assert_eq!(output.output, "through-the-seam");
 
-    // The NDJSON protocol carries no request correlation id, so a child handle
-    // owns no cancellable task and says so instead of pretending.
-    let cancel = child
+    // Cancellation is a frame: the id (and reason) reach the child, which decides
+    // what it means for the request it is running.
+    child
         .cancel_task("t-1")
         .await
-        .expect_err("the subprocess backend cannot cancel a task");
-    assert_eq!(cancel.kind(), ErrorKind::Unsupported);
-    assert!(cancel.to_string().contains("subprocess"), "{cancel}");
-    assert!(
-        cancel.to_string().contains("cancellable task handle"),
-        "{cancel}"
-    );
+        .expect("the child receives the cancel frame");
+    child
+        .cancel_task_with_request_id("t-2", Some("operator stop"))
+        .await
+        .expect("the id and the reason both reach the child");
+    // A blank id names nothing, so it is refused before a byte is written.
+    let blank = child
+        .cancel_task("  ")
+        .await
+        .expect_err("a blank id names nothing");
+    assert_eq!(blank.kind(), ErrorKind::Validation);
+    assert!(blank.to_string().contains("request_id"), "{blank}");
 
     let graceful = tokio::time::timeout(BOUND, child.shutdown(Duration::from_secs(2)))
         .await
@@ -640,7 +645,19 @@ async fn the_remote_backend_reports_health_and_cancels_through_the_seam() {
     assert_eq!(received[1].url.path(), "/agents/echo/cancel");
     assert_eq!(
         serde_json::from_slice::<Value>(&received[1].body).expect("the cancel body is JSON"),
-        json!({"task_id": "t-1"})
+        json!({"task_id": "t-1", "request_id": "t-1", "reason": null}),
+        "the id travels under its original key and its correlation name"
+    );
+    // The reason-carrying form reaches the same endpoint with both keys filled.
+    child
+        .cancel_task_with_request_id("t-2", Some("operator stop"))
+        .await
+        .expect("the configured cancel path answers");
+    let received = recorded(&server, remote_routes).await;
+    assert_eq!(received.len(), 3, "one invoke, two cancels");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&received[2].body).expect("the cancel body is JSON"),
+        json!({"task_id": "t-2", "request_id": "t-2", "reason": "operator stop"})
     );
 
     // No background health loop runs behind an HTTP handle, so a re-tune
@@ -814,6 +831,17 @@ async fn the_defaulted_seam_methods_report_the_missing_capability() {
     assert!(
         cancel.to_string().contains("cancellable task handle"),
         "the message explains why: {cancel}"
+    );
+    // The reason-carrying form defaults to `cancel_task`, so a backend with no
+    // cancellation reports the same typed absence rather than succeeding.
+    let correlated = child
+        .cancel_task_with_request_id("req-1", Some("operator stop"))
+        .await
+        .expect_err("a default handle owns no correlatable request");
+    assert_eq!(correlated.kind(), ErrorKind::Unsupported);
+    assert!(
+        correlated.to_string().contains("cancellable task handle"),
+        "the default forwards to cancel_task: {correlated}"
     );
 
     assert_eq!(

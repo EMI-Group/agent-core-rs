@@ -35,7 +35,7 @@ use super::{DISPLAY, ID, MISSING};
 use crate::external::provider::ProviderCapabilities;
 use crate::external::registry::ProviderConfig;
 use crate::external::rest::{
-    body_value, field_f32, field_str, vendor_hit, vendor_record, AuthScheme, RestCall, SpecContext,
+    body_value, field_f32, field_str, listing_record, rank_hits, AuthScheme, RestCall, SpecContext,
     WireSpec,
 };
 use crate::record::{
@@ -159,9 +159,11 @@ impl WireSpec for OpenVikingSpec {
     /// Decodes every context list into scored hits, best first.
     ///
     /// Hits are sorted by the vendor score descending, dropped below `options.threshold`
-    /// when it is positive, and truncated to `options.top_k`. A `null` `result`, a
-    /// non-object `result`, or a missing list decodes as "no hits" instead of failing, so
-    /// an empty knowledge base is not an error.
+    /// when it is positive, and truncated to `options.top_k`. An item the backend answered
+    /// without a `score` is a match it did not rank, so the threshold never drops it; an
+    /// item that carries neither a `uri` nor an `abstract` is not a memory and is skipped
+    /// with a warning. A `null` `result`, a non-object `result`, or a missing list decodes
+    /// as "no hits" instead of failing, so an empty knowledge base is not an error.
     ///
     /// # Errors
     ///
@@ -173,14 +175,14 @@ impl WireSpec for OpenVikingSpec {
         options: &SearchOptions,
     ) -> Result<Vec<RecallHit>> {
         let value = body_value(response)?;
-        let mut hits: Vec<RecallHit> = find_items(&value)
+        let candidates = find_items(&value)
             .into_iter()
-            .map(|(_kind, item)| vendor_hit(item_record(item, cx.scope), item_score(item)))
-            .filter(|hit| options.threshold <= 0.0 || hit.score >= options.threshold)
+            .filter_map(|(_kind, item)| {
+                let record = find_record(item, cx.scope)?;
+                Some((record, field_f32(item, &["score"])))
+            })
             .collect();
-        hits.sort_by(|left, right| right.score.total_cmp(&left.score));
-        hits.truncate(options.top_k);
-        Ok(hits)
+        Ok(rank_hits(candidates, options.threshold, options.top_k))
     }
 
     /// Writes one memory through a session message.
@@ -335,8 +337,10 @@ impl WireSpec for OpenVikingSpec {
     /// Decodes the directory listing, skipping every directory entry.
     ///
     /// Each non-directory entry becomes a record whose id is its `uri` and whose content is
-    /// its `abstract`, `rel_path`, or `name` (in that order). A non-list `result` or an
-    /// absent `result` decodes as an empty listing.
+    /// its `abstract`, `rel_path`, or `name` (in that order). A `result` that is not a list
+    /// decodes as an empty listing, and an entry that is a directory — or that carries no
+    /// `uri` and no content of any kind — is skipped with a warning instead of being
+    /// reported as a record with an invented id.
     ///
     /// # Errors
     ///
@@ -350,8 +354,7 @@ impl WireSpec for OpenVikingSpec {
         let value = body_value(response)?;
         Ok(list_entries(&value)
             .iter()
-            .filter(|entry| !is_directory(entry))
-            .map(|entry| listing_record(entry, cx.scope))
+            .filter_map(|entry| entry_record(entry, cx.scope))
             .collect())
     }
 
@@ -488,45 +491,100 @@ pub(super) fn answer_total(value: &Value) -> Option<u64> {
 }
 
 /// The score of one context item (`0.0` when absent or non-finite).
+///
+/// Used for display only (the `prefetch` block and the rail's result rows). Recall uses the
+/// optional [`field_f32`] directly, so an absent score is never mistaken for a real `0.0`
+/// and then dropped by the caller's threshold.
 pub(super) fn item_score(item: &Value) -> f32 {
     field_f32(item, &["score"]).unwrap_or(0.0)
 }
 
 /// Maps one find item onto a record: id from `uri`, content from `abstract`.
-pub(super) fn item_record(item: &Value, scope: &MemoryScope) -> MemoryRecord {
-    vendor_record(
-        &normalized_row(item, &["uri"], &["abstract"]),
-        scope,
-        MemoryType::SemanticMemory,
-    )
+///
+/// `None` when the item carries neither a `uri` nor an `abstract`: such an item is not a
+/// memory, and reporting it would invent an id and an empty body. The skip is logged, so a
+/// drifted answer leaves a trace instead of silently shrinking the result.
+pub(super) fn find_record(item: &Value, scope: &MemoryScope) -> Option<MemoryRecord> {
+    let row = normalized_row(item, &["uri"], &["abstract"]);
+    skip_unless_logged(&row, item, scope, "search")
 }
 
 /// Maps one listing entry onto a record.
 ///
 /// The id is the entry's `uri`; the content is its `abstract`, else its `rel_path`, else
-/// its `name`, so a directory entry that carries no abstract still lists readably (it is
-/// skipped by [`WireSpec::list_result`] anyway).
-pub(super) fn listing_record(entry: &Value, scope: &MemoryScope) -> MemoryRecord {
-    vendor_record(
-        &normalized_row(entry, &["uri"], &["abstract", "rel_path", "name"]),
-        scope,
-        MemoryType::SemanticMemory,
-    )
+/// its `name`. A directory entry is skipped — listing one would report a folder as a
+/// memory — and so is an entry with no `uri` and no content of any kind; both skips are
+/// logged.
+pub(super) fn entry_record(entry: &Value, scope: &MemoryScope) -> Option<MemoryRecord> {
+    if is_directory(entry) {
+        tracing::warn!(
+            target: super::LOG_TARGET,
+            uri = field_str(entry, &["uri"]).unwrap_or_default(),
+            "skipping a directory entry in the OpenViking listing"
+        );
+        return None;
+    }
+    let row = normalized_row(entry, &["uri"], &["abstract", "rel_path", "name"]);
+    skip_unless_logged(&row, entry, scope, "list")
+}
+
+/// Decodes a normalized row, logging the skip when it carries no memory content or no uri.
+///
+/// Unlike mem0 or `LakeBase`, an `OpenViking` record *is* its `viking://` uri: `get` reads
+/// by uri, so a row without one could never be read back. Reporting such a row under a
+/// generated id would hand the caller an address that does not exist, so it is skipped.
+fn skip_unless_logged(
+    row: &Value,
+    original: &Value,
+    scope: &MemoryScope,
+    operation: &str,
+) -> Option<MemoryRecord> {
+    let uri = field_str(row, &["id"]);
+    let content = field_str(row, &["content"]);
+    if uri.is_none() || content.is_none() {
+        tracing::warn!(
+            target: super::LOG_TARGET,
+            operation,
+            uri = field_str(original, &["uri"]).unwrap_or_default(),
+            has_uri = uri.is_some(),
+            has_content = content.is_some(),
+            "skipping an OpenViking entry that carries no content or no uri"
+        );
+        return None;
+    }
+    listing_record(row, scope, MemoryType::SemanticMemory, operation)
 }
 
 /// Whether one listing entry is a directory (`isDir`, or its `snake_case` alias).
+///
+/// Tolerant in both directions the vendor is known to answer: a boolean `true`, and the
+/// string/number spellings (`"true"`, `"1"`, `1`) a JSON encoder may emit. An absent flag
+/// is `false`, because a file entry legitimately omits it.
 pub(super) fn is_directory(entry: &Value) -> bool {
     ["isDir", "is_dir"]
         .into_iter()
-        .find_map(|key| entry.get(key).and_then(Value::as_bool))
+        .find_map(|key| entry.get(key).map(truthy))
         .unwrap_or(false)
 }
 
-/// Rewrites a vendor item as a row [`vendor_record`] understands.
+/// Interprets one JSON scalar as a boolean flag.
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_i64() == Some(1),
+        Value::String(text) => {
+            let text = text.trim();
+            text.eq_ignore_ascii_case("true") || text == "1"
+        }
+        Value::Null | Value::Array(_) | Value::Object(_) => false,
+    }
+}
+
+/// Rewrites a vendor item as a row `rest::vendor_record`/`rest::listing_record` understands.
 ///
-/// `vendor_record` reads ids from `id`/`memory_id`/… and content from
+/// Those accessors read ids from `id`/`memory_id`/… and content from
 /// `memory`/`content`/`text`/`data`, while `OpenViking` names them `uri` and `abstract`,
-/// so the aliases are resolved here instead of duplicating its decoding.
+/// so the aliases are resolved here instead of duplicating their decoding.
 fn normalized_row(item: &Value, id_keys: &[&str], content_keys: &[&str]) -> Value {
     let mut row = Map::new();
     if let Some(id) = field_str(item, id_keys) {

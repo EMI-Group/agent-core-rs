@@ -14,15 +14,31 @@
 //! `tracing::warn!` instead of an `Err`: a broken observer must not fail a
 //! model/tool run. The payload is not built at all when no callback subscribed.
 //!
-//! ## Steering is rail-free
+//! ## Steering drain hook
 //!
 //! The loop drains the steering backlog at the top of every iteration, so a
 //! message pushed before the run lands in the first request and one pushed
-//! mid-run lands in the next iteration's window. No rail event is fired for
-//! steering: [`RailEvent`](crate::rails::RailEvent) has no `BeforeSteeringDrain`
-//! variant, and the read-only `openjiuwen-harness` crate matches that enum
-//! exhaustively, so adding one would break it. The whole backlog is drained as
-//! one batch of `user` messages.
+//! mid-run lands in the next iteration's window. [`drain_steering`] fires
+//! [`AgentRail::before_steering_drain`](crate::rails::AgentRail::before_steering_drain)
+//! exactly when — and only when — the backlog is non-empty, mirroring Python's
+//! `_drain_steering_batch`, which skips the event on an empty queue.
+//!
+//! A rail reads [`RailContext::steering_pending`](crate::rails::RailContext::steering_pending)
+//! and may cap how many messages this drain takes by setting
+//! [`RailContext::steering_limit`](crate::rails::RailContext::steering_limit);
+//! an untouched limit drains the whole backlog. Rails run in priority order and
+//! the last limit set wins. The drained messages are appended as one batch of
+//! `user` messages, and a capped batch leaves the surplus queued in order for
+//! the next iteration or the next run.
+//!
+//! The hook is *method-dispatched* rather than a [`RailEvent`](crate::rails::RailEvent)
+//! variant: `RailEvent` has no `BeforeSteeringDrain`, and the read-only
+//! `openjiuwen-harness` crate matches that enum exhaustively, so a new variant
+//! would break it. `ctx.event` therefore keeps reporting the previous firing
+//! point while the hook runs.
+//!
+//! A rail error is *not* advisory: [`drain_steering`] propagates it and aborts
+//! the run before anything is drained (contrast the callback section above).
 use crate::abilities::ToolCallResult;
 use crate::callbacks::{
     AgentCallbackEvent, CallbackPayload, InvokeEndPayload, InvokeStartPayload, StepEndPayload,
@@ -30,6 +46,7 @@ use crate::callbacks::{
 };
 use crate::output::AgentOutput;
 use crate::policy::{FinalRequestContext, FinalRequestDecision};
+use crate::rails::RailContext;
 use crate::react::agent_loop::AgentRuntime;
 use crate::react::model_step::ModelReply;
 use openjiuwen_common::error::Result;
@@ -177,19 +194,43 @@ pub(crate) async fn invoke_end(
 
 /// Drains the steering backlog into the conversation window.
 ///
-/// The whole backlog is appended as one batch of `user` messages, so the next
-/// model request of the run observes every message pushed since the previous
-/// iteration. See the module docs for why no rail event is fired.
+/// Fires [`AgentRail::before_steering_drain`](crate::rails::AgentRail::before_steering_drain)
+/// through [`RailRegistry::fire_steering_drain`](crate::rails::RailRegistry::fire_steering_drain)
+/// only when the backlog is non-empty, so a run nobody steered observes no hook
+/// at all. While the hook runs,
+/// [`ctx.steering_pending`](crate::rails::RailContext::steering_pending)
+/// reports the queue length and a rail may cap the batch through
+/// [`ctx.steering_limit`](crate::rails::RailContext::steering_limit); an
+/// untouched limit drains the whole backlog. Both fields are restored (`0`/`None`)
+/// afterwards, even when a rail fails, so the next firing point starts clean.
+///
+/// The drained messages are appended as one batch of `user` messages, and any
+/// message beyond a rail's cap stays queued in order for the next drain.
 ///
 /// # Errors
 ///
-/// Returns the context engine's error when a message cannot be observed.
+/// Returns the rail's error, which aborts the run before anything is drained,
+/// or the context engine's error when a message cannot be observed.
 pub(crate) async fn drain_steering(
     runtime: &AgentRuntime,
+    ctx: &mut RailContext,
     context: &Arc<ConversationContext>,
 ) -> Result<()> {
-    for message in runtime.steering.drain_messages() {
-        runtime.engine.observe(context, message).await?;
+    if runtime.steering.is_empty() {
+        return Ok(());
+    }
+    ctx.steering_pending = runtime.steering.len();
+    ctx.steering_limit = None;
+    let fired = runtime.rails.fire_steering_drain(ctx).await;
+    let limit = ctx.steering_limit;
+    ctx.steering_pending = 0;
+    ctx.steering_limit = None;
+    fired?;
+    for message in runtime.steering.drain_limit(limit) {
+        runtime
+            .engine
+            .observe(context, message.to_message())
+            .await?;
     }
     Ok(())
 }

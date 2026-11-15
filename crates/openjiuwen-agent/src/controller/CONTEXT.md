@@ -8,13 +8,15 @@ The background half (`executors::background::TaskSchedulerLoop`) runs the tasks 
 The task-operation layer (`reasoner`) turns one intent into `TaskOp`s (create/pause/resume/cancel/continue/supplement/modify) and applies them to the store behind a confidence gate.
 `group::GroupRouter` is the agent-group seam behind point-to-point sends and publishes; `queue::TaskQueue` tracks at most one running task per conversation for the legacy wrapper's preemption.
 Two Python generations live here without sharing types: the current event-queue pipeline (`schema`, `config`, `intent`, `executors`, `task_manager`, `base`, `reasoner`, `group`, `queue`) and the superseded string-routed lineage (`legacy`), whose types carry a `Legacy` prefix.
+The turn also keeps a per-session conversation history (`history.rs`) bounded by `ControllerConfig::history_limit` and hands it to the intent recognizer and the dispatched executors.
+The four behavioural knobs `history_limit`, `expose_reasoning`, `event_timeout_ms` and `stream_first_frame_timeout_ms` are enforced by the turn loop and the background scheduler; see *Config Enforcement*.
 
 ## API Surface
 
 ### Turn loop — `base/`
 
 - `Controller` — `card`, `invoke(inputs, session) -> Result<ControllerOutput>`, `stream(inputs, session) -> BoxStream<'static, Result<ControllerOutputChunk>>`.
-- `BaseController` (holds an `Arc<Inner>`, is `Clone`) — `new(card, config)`, `with_recognizer`, `card`/`config`/`set_config`, `push_event`/`drain_events`/`pending_events`, `set_intent_recognizer`/`intent_recognizer`, `set_event_handler`/`clear_event_handler`, `set_router`/`clear_router`, `set_planner`, `add_executor`/`add_default_executor`/`remove_executor`/`executor`/`task_types`/`registry`/`scheduler`, `task_manager`, `start`/`stop`/`shutdown`/`is_running`/`scheduler_loop`, `scheduler_state`/`wake_scheduler`/`running_tasks`, `pause_task`/`cancel_task`, `bind_session`/`unbind_session`/`bound_sessions`, `save_state`/`load_state`, `reasoner`/`apply_task_ops`, `set_group`/`clear_group`/`group`/`group_router`/`with_group`/`send_to_agent`/`publish`, plus `impl TaskControl` (a resume flips `Paused` → `Submitted` and wakes the loop).
+- `BaseController` (holds an `Arc<Inner>`, is `Clone`) — `new(card, config)`, `with_recognizer`, `card`/`config`/`set_config`, `push_event`/`drain_events`/`pending_events`, `set_intent_recognizer`/`intent_recognizer`, `set_event_handler`/`clear_event_handler`, `set_router`/`clear_router`, `set_planner`, `add_executor`/`add_default_executor`/`remove_executor`/`executor`/`task_types`/`registry`/`scheduler`, `task_manager`/`tasks`, `start`/`stop`/`shutdown`/`is_running`/`scheduler_loop`, `scheduler_state`/`wake_scheduler`/`running_tasks`, `pause_task`/`cancel_task`, `bind_session`/`unbind_session`/`bound_sessions`, `save_state`/`load_state`, `reasoner`/`apply_task_ops`, `set_group`/`clear_group`/`group`/`group_router`/`with_group`/`send_to_agent`/`publish`, plus `impl TaskControl` (a resume flips `Paused` → `Submitted` and wakes the loop).
 - `TaskSchedulerState` — the host-facing scheduler view: `Stopped` (the running flag is false), `Running` (flag set and a live `TaskSchedulerLoop` backs it), `Stopping` (flag set, no live loop: started outside a runtime or winding down); `as_str()`/`Display` yield the snake_case wire names and the type is serde-serializable.
 - `EventHandler` / `EventHandlerOutcome` — `Intents(Vec<Intent>)`, `Output(Box<ControllerOutput>)`, `Ignored`; a handler replaces the built-in recognizer for an event and is what the `Reasoner`-driven path installs on.
 - `TASKS_STATE_KEY` — `"__controller_tasks__"`; the session state key holds `{"tasks": [...], "next_seq": n}` (a `TaskManagerState`).
@@ -23,7 +25,18 @@ Two Python generations live here without sharing types: the current event-queue 
 - The scheduling knobs are set through `ControllerConfig` builders: `with_max_concurrent_tasks`, `with_schedule_interval`, `with_task_timeout`; dependency gating has no config field because the loop reads `metadata["depends_on"]` per task.
 - The per-conversation `TaskQueue` is legacy-scoped: `BaseController` dispatches each turn synchronously and tracks no per-conversation turn, so the queue (and `has_running`/`running_conversations`/`interrupt`) lives only on `IntentDetectionController`.
 - Global aggregate precedence is `InputRequired` > `Completed` > `Failed`; completed texts are joined by `\n\n`, `default_response.text` fills an empty aggregate, and `data` is `{"tasks": [{"task_id", "status", "output"}...]}`.
-- `stream` emits one `processing` chunk, then the turn's frames, then one terminal `last_chunk` chunk unless `suppress_completion_signal` is set; a preempted/aborted turn is `Error::Cancelled`.
+- `stream` emits one `processing` chunk, then the turn's frames re-indexed with `last_chunk` cleared, then exactly one terminal `last_chunk` chunk; a turn that fails instead emits one `Err` item and no terminal chunk, and `suppress_completion_signal` only drops the turn output's own completion frame.
+- `history(session_id) -> Vec<HistoryEntry>` returns the session's stored log trimmed with the current `history_limit`, and `clear_history(session_id)` drops it; the store is a per-session `RwLock<BTreeMap<String, Vec<HistoryEntry>>>` on `Inner`.
+- `process_event` calls `IntentRecognizer::recognize_with_history(event, &history)` and builds both turn `TaskContext`s with `.with_history(..)`/`.with_expose_reasoning(..)`, so the recognizer, the event handler and every executor of the turn see the same trimmed window.
+- `dispatch_runs` adds one `OutputKind::Reasoning` frame after each run whose `TaskRun::reasoning()` is non-empty, plus a `reasoning` key in that run's `data.tasks[]` entry, and does both only when `expose_reasoning` is on.
+
+### Conversation history — `history.rs`
+
+- `HistoryRole { User, Assistant }` (wire `"user"`/`"assistant"`, `as_str`, `Display`) and `HistoryEntry { role, text, task_id: Option<String> }` (serde snake_case, unknown fields tolerated) with `HistoryEntry::user(text)`, `assistant(text)` and `with_task_id(..)`.
+- `trim_history(&mut Vec<HistoryEntry>, limit, turn_start)` runs on append: it removes only the oldest prefix and never an entry at index `>= turn_start`, so a turn that alone produces more messages than the limit keeps its own entries; `limit == 0` clears the log.
+- `window(&[HistoryEntry], limit) -> &[HistoryEntry]` is the read-time trim: the newest `limit` entries (`0` → empty), so lowering `history_limit` takes effect on the very next read.
+- The limit counts **messages**, not turns, matching Python's message-indexed `chat_history[-2 * max_turns:]` slice.
+- Recording is one `user` entry per turn (its first non-empty event text) plus one `assistant` entry for a non-empty aggregated output, written after the turn's dispatch; the current turn is therefore never part of what its own recognizer or executors observe.
 
 ### Task store — `task_manager/`
 
@@ -40,24 +53,26 @@ Two Python generations live here without sharing types: the current event-queue 
 - `SessionProvider = Arc<dyn Fn(&str) -> Option<Arc<dyn Session>> + Send + Sync>` resolves a driving session per task session id; `TaskContext::cancellation` hands the executor a `CancellationToken`.
 - Scan: dependency gate first (`metadata["depends_on"]` — a `Waiting` task whose dependencies are all `Completed` is promoted to `Submitted`), then `Submitted` tasks in priority-descending order with `created_seq`/`task_id` tiebreaks; already-running tasks are skipped; admission respects `max_concurrent_tasks` (with a value of `0` meaning unlimited).
 - Driving one task: `claim_task`, run the executor under `task_timeout_ms` (timeout → `Failed` with `"Task timeout after {t} seconds"`), swallow cancellation, write `Completed`/`InputRequired`/`Failed`, untrack, `wake()` the next scan.
+- The driver context carries the controller's `expose_reasoning` flag (its history stays empty: a scheduled run has no dispatching turn); after the status write, `record_outputs` prepends one `OutputKind::Reasoning` chunk before the `task_completion`/`task_interaction`/`task_failed` chunk when the flag is on and the executor reported reasoning (that reasoning chunk becomes the terminal one when the run carries no result frames), appends nothing else, and drops the whole append when the stored task's status has moved on.
 - Waiting: `tokio::sync::Notify` woken on submit and on every completion, capped by `schedule_interval_ms` so a lost wakeup cannot stall the loop; loop errors are logged and followed by a short sleep, never killing the loop.
 - Completion sentinel: once a session has no `Submitted`/`Working` task, `ALL_TASKS_PROCESSED` (`"all_tasks_processed"`) carries `frames_text("All tasks have been successfully processed")` with `last_chunk: true`, written once per idle stretch and suppressed by `ControllerConfig::suppress_completion_signal`.
 - Two-phase pause/cancel: a `Submitted` cancel short-circuits to `Canceled`; terminal states are idempotent `true`; otherwise the executor is asked outside the lock, the running entry is re-checked, the driver token is cancelled and the driver awaited, and only then is the status written (`Paused`/`Canceled`). A resume flips `Paused` → `Submitted` so the next scan picks it up.
 
 ### Executors — `executors/mod.rs`, `executors/builtin.rs`
 
-- `TaskExecutor` — `task_type`, `description`, `async execute(&Task, &TaskContext<'_>) -> Result<TaskResult>`, plus four defaulted hooks: `can_pause() -> (bool, String)` (`(false, "task executor does not support pausing")`), `pause() -> bool` (`false`), `can_cancel() -> (bool, String)` (`(true, "")`), `cancel() -> bool` (`false`).
-- `TaskExecutorRegistry`, `TaskScheduler` (sequential value-type dispatch with `max_tasks` and an optional timeout), `TaskRun { status, text, frames }`, `TaskContext { session, controller_id, cancellation }` (`with_cancellation`), `TaskRouter::select(query, intents)`.
+- `TaskExecutor` — `task_type`, `description` (defaults to an empty string), `async execute(&Task, &TaskContext<'_>) -> Result<TaskResult>`, plus four defaulted `async` hooks taking `(&Task, &TaskContext<'_>)`: `can_pause() -> (bool, String)` (`(false, "task executor does not support pausing")`), `pause() -> bool` (`false`), `can_cancel() -> (bool, String)` (`(true, "")`), `cancel() -> bool` (`false`).
+- `TaskExecutorRegistry`, `TaskScheduler` (sequential value-type dispatch with `max_tasks` and an optional timeout), `TaskRun { status, text, frames }` (`reasoning()` reads the successful result's `TaskResult::reasoning`), `TaskContext { session, controller_id, cancellation, history, expose_reasoning }` (`with_cancellation`, `with_history`, `with_expose_reasoning`; a fresh context carries an empty history and `expose_reasoning == false`, which is what background runs get), `TaskRouter::select(query, intents)`.
 - Built-ins: `ControllerAgent` (task type `agent`), `WorkflowController` (task type `workflow`, `map_output`), `ExecutorInfo`, `LLMController` (the router; one registered executor is chosen without a model call), constants `AGENT_TASK_TYPE`/`WORKFLOW_TASK_TYPE`/`LLM_TASK_TYPE`.
+- `ControllerAgent` invokes the wrapped agent when `TaskContext::expose_reasoning` is off and streams it when it is on, folding every `llm_reasoning` chunk's `content` into `TaskResult::reasoning` and taking the run's output from the final `answer` chunk through `AgentOutput::from_value`; interrupts still map onto `input_required` because that chunk carries the whole interrupt output. `WorkflowController` and `LLMController` do not capture reasoning.
 
 ### Reasoner — `reasoner/`
 
 - `TaskOp` — `Create { intent, task_type }`, `Pause { task_id }`, `Resume { task_id }`, `Cancel { task_id }`, `Continue { depend_task_id, event, metadata, description }`, `Supplement { task_id, info }`, `Modify { task_id, details }`, `Unknown { prompt }`; `kind()` and `task_id()` describe it.
 - `TaskOpOutcome { kind, task_id, status, applied, message, clarification }`; `TaskControl` (`async pause/cancel/resume(&str) -> bool`) is the seam the controller implements so the reasoner can drive the scheduler.
-- `Reasoner` — `new(config, Option<Arc<dyn TaskControl>>)`, `config`/`set_config`, `control`/`set_control`, `plan_ops(&Intent, session_id) -> Vec<TaskOp>`, `reason(intents, session, ..)`, `apply_task_ops(ops, session_id, session)`.
-- `plan_ops` maps Python's task-op intents onto ops: create (task type from the intent, else `default_task_type`), pause/cancel/resume by target, a switch-task intent into a cancel plus a create, and a control intent with an unknown target into `Unknown`; an op at or below `intent_confidence_threshold` degrades to `Unknown`.
-- `reason` records a clarification prompt in the session (`CLARIFICATION_STATE_KEY = "__controller_clarification__"`, default `"Please clarify your request."`) and emits a `TaskInteraction` frame; `apply_task_ops` is non-aborting (one outcome per op, `applied: false` + message on failure).
-- Create mints the task through the `Planner` with `task_type`, `priority = 1`, `status = Submitted`, `context_id = "<session>_<task_id>"`, the intent's events as inputs and its metadata; pause/cancel/resume go through `TaskControl`; continue gathers the dependency task's inputs and context; supplement pauses and appends `"\n\n任务补充信息:\n{info}"` to the description, then resubmits; modify cancels, replaces and resubmits.
+- `Reasoner` — `new(config, Option<Arc<dyn TaskControl>>)`, `config`/`set_config`, `control`/`set_control`, `plan_ops(&Intent) -> Vec<TaskOp>`, `async reason(&Intent, Option<&Arc<dyn Session>>) -> Result<Vec<TaskOp>>`, `async apply_task_ops(ops, &TaskManager, &mut Planner, session_id, session) -> Vec<TaskOpOutcome>`.
+- `plan_ops` maps Python's task-op intents onto ops: create (task type from the intent, else `default_task_type`), pause/cancel/resume by target, a switch-task intent into a cancel plus a create, and a control intent with an unknown target into `Unknown`; an intent whose confidence is below `intent_confidence_threshold` (or `NaN`) degrades to exactly one `Unknown`.
+- `reason` records a clarification prompt in the session (`CLARIFICATION_STATE_KEY = "__controller_clarification__"`, default `DEFAULT_CLARIFICATION = "Please clarify your request."`) and emits a `TaskInteraction` frame; `apply_task_ops` is non-aborting (one outcome per op, `applied: false` + message on failure).
+- Create mints the task through the `Planner` with `task_type`, `priority = 1`, `status = Submitted`, `context_id = "<session>_<task_id>"`, the intent's events as inputs and its metadata; pause/cancel/resume go through `TaskControl`; continue gathers the dependency task's inputs and context; supplement pauses and appends `SUPPLEMENT_MARKER` (`"\n\n任务补充信息:\n{info}"`) to the description, then resubmits; modify cancels, appends `MODIFY_MARKER` (`"\n\n修改详情:\n{details}"`) to a fresh copy of the task, then stores the copy as a child of the cancelled task.
 
 ### Group routing — `group.rs`
 
@@ -76,15 +91,24 @@ Two Python generations live here without sharing types: the current event-queue 
 ### Legacy lineage — `legacy/`
 
 - `IntentDetectionController` wraps `BaseController`: `intent_detection`, `add_executor`, `set_router`, `set_event_handler`, the inherited controller surface, plus `task_queue`/`has_running`/`running_conversations`/`interrupt` and `set_group`/`clear_group`/`group`/`send_to_agent`/`publish`.
-- Preemption: the conversation id comes from `conversation_id`/`conversation` in the payload, then the session id, then `"default"`; a new message aborts the previous turn's handler (fire-and-forget), cancels the tracked run, then enqueues itself.
+- Preemption: the conversation id comes from `conversation_id`/`conversation` in the payload, then the session id, then `"default"`; a new message aborts the previous turn's handler (fire-and-forget), cancels the tracked run, then enqueues itself, and a turn stopped before it hands its result over returns `Error::Cancelled` from `invoke`.
 - `IntentDetector` / `LegacyPlanner` — tolerant `{"result": n}` category classification and the one-undefined-task planner stub; `legacy::reasoner` holds their helpers.
 - `legacy::schema` — `LegacyTask`, `LegacyTaskStatus`, `TaskInput`, `LegacyTaskResult`, `TaskDependency`, `DependencyType`, `LegacyEvent` (with `receiver_id`/`custom_event_type`, both skipped when unset, plus `with_receiver`/`with_custom_event_type`/`handoff_to_agent`/`routed_to`), `LegacyEventType`, `EventPriority`, `SourceType`, `EventSource`, `EventContent`, `EventContext`.
 - `IntentDetectionController` falls back to inline known-intent handling when no tokio runtime is available (no preemption handles to abort).
 
 ### Schema and re-exports
 
-- `schema` — `DataFrame` family (`TextDataFrame`, `FileDataFrame`, `JsonDataFrame`), `frames_text`, `Event`/`EventType`, `Intent`/`IntentType`, `Task`/`TaskStatus`/`TaskResult`, `ControllerOutputPayload`/`ControllerOutputChunk`/`ControllerOutput`/`OutputKind`, constants `ALL_TASKS_PROCESSED`/`CONTROLLER_OUTPUT_TYPE`/`TASK_PROCESSING`.
+- `schema` — `DataFrame` family (`TextDataFrame`, `FileDataFrame`, `JsonDataFrame`), `frames_text`, `Event`/`EventType`, `Intent`/`IntentType`, `Task`/`TaskStatus`/`TaskResult` (`TaskResult::reasoning` + `with_reasoning`), `ControllerOutputPayload`/`ControllerOutputChunk`/`ControllerOutput`/`OutputKind` (`task_completion`, `task_interaction`, `task_failed`, `reasoning`, `processing`, `all_tasks_processed`), constants `ALL_TASKS_PROCESSED`/`CONTROLLER_OUTPUT_TYPE`/`TASK_PROCESSING`.
 - `mod.rs` re-exports the controller-level names of every module; `schema` and `legacy::schema` keep their own namespaces.
+
+## Config Enforcement
+
+Each enforced knob and its unit; the Python-shaped knobs keep Python's defaults (`history_limit` 50, `event_timeout_ms` 300_000, `stream_first_frame_timeout_ms` 30_000) and the Rust extension defaults to off (`expose_reasoning` `false`).
+
+- `history_limit` (messages, default 50, `0` = retain nothing): one `user` entry per turn (its first non-empty event text) and one `assistant` entry for a non-empty aggregated output (carrying the output's `task_id` when it names one) are recorded after the dispatch; the append trim drops only the oldest prefix beyond the limit and never the turn being recorded, reads apply `window` with the current limit, and the intent recognizer, the event handler and every dispatched `TaskContext` see that trimmed window with the current turn excluded.
+- `expose_reasoning` (bool, default `false`, Rust extension): when on, `dispatch_runs` emits one `OutputKind::Reasoning` frame after the run that reported reasoning plus a `reasoning` key in `data.tasks[]`, the background scheduler prepends the same chunk before its terminal frame, and `ControllerAgent` captures the wrapped agent's `llm_reasoning` stream into `TaskResult::reasoning`; when off, reasoning is dropped from frames and `data` everywhere and every executor sees `TaskContext::expose_reasoning == false`.
+- `event_timeout_ms` (milliseconds, default 300_000, `0` = no deadline): each drained event's handling in `invoke_turn` runs under `tokio::time::timeout`; expiry returns `Error::timeout("controller event handling timed out after <n> ms")` (`ErrorKind::Timeout`) to `invoke` and as the `Err` frame of `stream`, and dropping the future cancels the stalled work. No deadline is applied when no tokio runtime is available (the legacy inline fallback).
+- `stream_first_frame_timeout_ms` (milliseconds, default 30_000, `0` = no deadline): `stream_turn` sends the local `processing` acknowledgment first (a sentinel, not a turn frame, so it never consumes the deadline), then bounds the wait for the turn's first output frame; expiry sends exactly one `Err(Error::timeout("controller stream first frame timed out after <n> ms"))`, drops the turn (cancelling it) and ends the stream, so no frame follows and the next poll is `None`. It never bounds `invoke`, and `legacy::IntentDetectionController::stream` inherits it because it delegates to `BaseController::stream`.
 
 ## Constraints
 
@@ -93,7 +117,7 @@ Two Python generations live here without sharing types: the current event-queue 
 - `invoke` is single-turn and in-process; the background loop is additive and only runs what the manager holds after a turn (or what a `Reasoner`/host added to it).
 - No panics, `unwrap`, or `expect` outside tests; `tracing` for diagnostics; no new dependencies beyond the crate's existing set.
 - No `parking_lot` guard is held across an `.await`: the scheduler clones what it needs, drops the guard, then awaits.
-- Files stay around ≤1000 lines; `intent.rs` (918), `executors/background/tests.rs` (917), `legacy/schema.rs` (900) and `legacy/tests.rs` (586) are data- and test-heavy with documented roles.
+- Files stay around ≤1000 lines; `intent.rs` (1112, recognizer + planner plus two test modules), `base/mod.rs` (964), `base/tests.rs` (966), `executors/background/tests.rs` (1035), `legacy/schema.rs` (900) and `legacy/tests.rs` (586) are data- and test-heavy with documented roles.
 - Only this node's files are edited; `src/lib.rs`, `src/CONTEXT.md`, the crate `CONTEXT.md`, and `docs/` belong to other nodes.
 
 ## Design Decisions
@@ -104,7 +128,7 @@ Two Python generations live here without sharing types: the current event-queue 
 - **Intent carries Python's fields plus two Rust extensions** (`name`, `task_type`, both skipped when unset) so routing and dedupe need no side table.
 - **`ControllerOutput` is a batch record** (`output`, `task_id`, `status`, `data`, `frames`), whereas Python's batch `ControllerOutput` is a `type`/`data`/`input_event_id` envelope; the streaming form is `ControllerOutputChunk` with the `controller_output` frame type.
 - **The LLM recognizer uses a JSON-array contract**, not Python's `IntentToolkits` tool-call loop; malformed answers degrade to the default intent.
-- **The router is a seam** (`TaskRouter`), not a `Runner.resource_mgr` model lookup: `BaseController` consults it once per turn and only when at least two executors are registered; one executor is chosen without a model call.
+- **The router is a seam** (`TaskRouter`), not a `Runner.resource_mgr` model lookup: `BaseController` consults it once per turn and only when at least two executors are registered, so a single executor is picked without any model call.
 - **One task store, two dispatchers**: the synchronous turn dispatches its batch directly and then records the tasks in the manager, while the loop dispatches from the manager; `claim_task` guarantees a task is executed once even if both paths see it.
 - **The manager owns hierarchy and indexes**: `created_seq`, priority levels, parent/child links and the root set live in the store so filtering and scheduling need no side tables; Python's `TaskManagerState` index serialization is replaced by one flat task list plus `next_seq`.
 - **Pause/cancel is two-phase** (ask the executor outside the lock, re-check membership, cancel the driver, then write the status) so a task that finished in the meantime can never be resurrected into a non-terminal state.
@@ -118,15 +142,18 @@ Two Python generations live here without sharing types: the current event-queue 
 - `max_concurrent_tasks = 0` is unlimited (see above).
 - There is no asyncio event queue or pub/sub: the bounded FIFO is drained by the turn that enqueued into it, a dispatched task's result is recorded on the task, and `publish`/`send_to_agent` exist only through the `GroupRouter` seam.
 - Group routing is a trait seam: Python's `Controller` publishes to a group object it owns; here the host installs any `GroupRouter`.
-- The LLM intent toolkits (`IntentToolkits` schemas, tool-result feedback), the intent-detector prompt history (`chat_history`, `enable_history`, `category_info`, `example_content`), the context-engine/ability-manager injection into request handlers, and telemetry spans are not ported.
-- `event_timeout_ms`, `history_limit`, `expose_reasoning` and `stream_first_frame_timeout_ms` are carried for parity but unused (no stream host, no context engine); `intent_confidence_threshold` only gates the reasoner.
+- The LLM intent toolkits (`IntentToolkits` schemas, tool-result feedback), the intent-detector prompt history (`chat_history`, `enable_history`, `category_info`, `example_content`), the context-engine/ability-manager injection into request handlers, and telemetry spans are not ported; the LLM recognizer replays the trailing conversation history as prior turns instead (the newest `HISTORY_REPLAY_LIMIT` = 8 messages).
+- `history_limit` counts **messages**, matching Python's message-indexed `chat_history[-2 * max_turns:]` slice, and the turn being recorded is protected from the append trim; Python keeps chat history in `ReasonerUtils.get_chat_history` (`agent_context.get_messages()`) rather than in `ControllerConfig`, and its newer `IntentRecognizer` asks the context for the newest 50 messages (current turn included).
+- `expose_reasoning` has no Python counterpart: Python always streams reasoning as `llm_reasoning` frames, while this port gates reasoning behind the flag and drops it entirely when off.
+- `event_timeout_ms` is in milliseconds (`0` = no deadline, Python's `None`) and also bounds the turn's synchronous value-type dispatch, because this port dispatches in-turn while Python's task execution is asynchronous (`task_timeout` covers that).
+- `stream_first_frame_timeout_ms` bounds the first output frame **after** the `processing` acknowledgment (Python bounds one `__anext__` on the session stream, which that acknowledgment already is) and does not bound `invoke`.
 - `ReasonerConfig`/`PlannerConfig`/`ProactiveIdentifierConfig`/`ReflectorConfig` are not ported; `agent_reasoner.py` is an empty artifact in Python and is covered by the `reasoner` task-op layer instead.
 - The `Message*` legacy aliases are not ported; `WorkflowController`'s LLM workflow selection lives in `crate::workflow_agent`.
 - `enable_task_persistence` defaults to `true` (Python's default is `false`) because the turn loop always saves; `false` makes `save_state` a no-op while in-memory state still accumulates.
 
 ## Notes for Agents
 
-- `Event::from_user_inputs` accepts a string, a string array (one text frame per item), `{"query": ...}` (string or JSON payload), an interactive object (`user_inputs`/`interrupt_answers`), and any other object as a JSON frame; `Null`/scalars are `Error::validation`.
+- `Event::from_user_inputs` accepts a string, a string array (one text frame per item, non-strings as their JSON text), `{"query": ...}` (a string as text, anything else as a `{"query": <json>}` frame), an interactive object (`user_inputs`/`interrupt_answers`) and any other object as a JSON input frame; `Null`/scalars are `Error::validation`.
 - `BaseController::start` spawns the loop only inside a tokio runtime (`Handle::try_current()`); outside one it stays a no-op and every pause/cancel falls back to the manager's status writes.
 - `stop` is fire-and-forget (it requests the loop's cancellation and drops the handle), so a later `start` brings up a fresh loop; `shutdown` awaits the cancellation.
 - Pause/cancel without a started loop still write statuses on the manager: cancel of an unknown task is `false`, of a `Submitted` task `Canceled` + `true`, of a terminal task `true`; pause of an `Submitted`/`Working` task `Paused` + `true`.
@@ -141,30 +168,40 @@ Two Python generations live here without sharing types: the current event-queue 
 - `legacy::schema::SourceType::Agent` keeps Python's `"single_agent"` wire value; `EventPriority` maps to Python's integer 1–4 via `EventPriority::value`.
 - A legacy handoff sets `to_agent_id`; `handoff_to_agent()` translates it into `receiver_id`, which `routed_to(agent_id)` matches.
 - `TaskQueue` deliberately keeps a cancelled entry until its owner unregisters it, so the next message can still see `has_running` while the previous driver winds down.
+- The conversation history is in-memory only (never written to the session state), so `load_state` does not restore it and a fresh controller instance starts empty; `set_config` neither clears nor prunes it, the next append or read trims it.
+- A turn that alone exceeds `history_limit` leaves the stored log longer than the limit (the append trim protects the turn being recorded) while `history()` still windows the read to the newest `limit` entries.
+- `event_timeout_ms` needs a tokio runtime: without one the deadline is skipped rather than panicking, which keeps the legacy inline fallback working.
+- A stream under `stream_first_frame_timeout_ms` emits the turn's own error (an event timeout, a recognizer failure) as the single `Err` frame after the `processing` ack; only a turn that produces no frame at all is replaced by the first-frame timeout error.
+- Reasoning frames are `OutputKind::Reasoning` chunks, and `TaskRun::frames` does not produce them: the turn appends one after each run's own frames, while the background `record_outputs` prepends one before the terminal chunk (and makes it the terminal chunk when the run carries no result frames).
 
 ## Test Strategy
 
-- Inline `#[cfg(test)]` modules in every file, offline and deterministic; the controller suite is 250 unit tests and runs in a couple of seconds.
+- Inline `#[cfg(test)]` modules in every file, offline and deterministic; the controller suite is 298 unit tests (50 `executors`, 46 `task_manager`, 42 `base`, 42 `legacy`, 39 `schema`, 26 `intent`, 19 `reasoner`, 9 `history`, 9 `config`, 6 `queue`, 6 `group`, 4 in `mod.rs`) and runs in a couple of seconds.
 - `task_manager` (46) covers filters and their validation matrix, union/narrowing/`with_children` resolution, deep-copy isolation, duplicate ids, claim atomicity, status updates with children, priority ordering, child promotion, and the snapshot/restore round-trip plus tolerance to corrupt state.
-- `executors` (42) covers the registry, sequential dispatch, unknown types, `max_tasks`, timeouts, executor errors, the built-ins' answer/error/interrupt mapping, and `LLMController` selection — plus the `background` loop: admission order, the concurrency gate (unlimited and serial), dependency promotion, timeout text, two-phase pause/cancel and their idempotency, `stop`, `in_flight`, and the completion sentinel including its suppression.
+- `executors` (50) covers the registry, sequential dispatch, unknown types, `max_tasks`, timeouts, executor errors, the built-ins' answer/error/interrupt mapping, and `LLMController` selection — plus the `background` loop: admission order, the concurrency gate (unlimited and serial), dependency promotion, timeout text, two-phase pause/cancel and their idempotency, `stop`, `in_flight`, and the completion sentinel including its suppression.
 - `reasoner` (19) covers `plan_ops` for every op kind, the confidence gate, the clarification state/frame, and each `apply_task_ops` mutation against a real `TaskManager` with fake executors.
-- `base` (24) runs the loop end to end: routing (two executors through `LLMController`, the single-executor shortcut), unregistered task types, persistence across turns and a fresh restore, streaming shape, lifecycle and queue bounds, the three handler outcomes, task interaction, pause/cancel intents, and the started-loop scheduler path.
+- `base` (42) runs the loop end to end: routing (two executors through `LLMController`, the single-executor shortcut), unregistered task types, persistence across turns and a fresh restore, streaming shape, lifecycle and queue bounds, the three handler outcomes, task interaction, pause/cancel intents, max-intent truncation, group routing, the reasoner-created task, the completion sentinel, and the started-loop scheduler path.
 - `legacy` (42) covers wire round-trips, query extraction, detector parsing, the planner stub, delegation, per-conversation preemption, group delegation, and handoff translation.
 - `queue` (6) and `group` (6) cover preemption bookkeeping and the typed not-in-group errors plus forwarding.
-- `schema` (35), `intent` (21) and `config` (5) cover the wire shapes, tolerant LLM parsing, planner budgeting, and the config defaults.
-- Timing-sensitive scheduler tests hold a load-bearing sleep ≥10× the step they wait for (e.g. `SLOW_EXECUTOR_HOLD` 500 ms against a 10 ms timeout) or poll with a bound, so they stay green under build load; every await that could hang is wrapped in `tokio::time::timeout`.
-- Tests use `openjiuwen_test_support::ScriptedModel`, stub executors/handlers, and `AgentSession`; no network and no wall-clock ordering assertions.
+- `schema` (39), `intent` (26), `config` (9) and `history` (9) cover the wire shapes, tolerant LLM parsing, planner budgeting, the config defaults, and the append/read trims.
+- The conversation history is exercised end to end through `BaseController::history`/`clear_history`: one `user` plus one `assistant` entry per turn attributed to the producing `task_id`, the newest-window trim, `history_limit = 0` retaining nothing, the re-trim on the very next read after a smaller `set_config`, and the recognizer and every executor seeing the previous turns only with the current turn excluded.
+- `expose_reasoning` is covered on both paths: the turn emits one frame after the reporting run's own frame plus the `data.tasks[]` key when the flag is on and drops every trace of it when it is off, the background scheduler prepends it before the terminal chunk (recording it alone when the run carries no result frames), and `ControllerAgent` folds the agent's `llm_reasoning` stream into `TaskResult::reasoning` only when the flag is on.
+- The `event_timeout_ms` suites (3) prove a stalled event is cancelled and reported as `ErrorKind::Timeout` (`controller event handling timed out after 20 ms`, also as the single `Err` item after the stream's `processing` frame), that the dropped run never finishes, and that `0` lets a slow turn complete.
+- The `stream_first_frame_timeout_ms` suites (3) pin the frame sequence (`processing`, one `Err`, then the end of the stream) and the cancellation behind it, that `0` streams the slow turn through to its terminal chunk, and that the deadline never bounds `invoke`.
+- Timing-sensitive scheduler tests hold a load-bearing sleep the suite asserts is at least 25× the step it waits for (`SLOW_EXECUTOR_HOLD`, 500 ms against a 10 ms timeout) or poll through `wait_for_status`/`wait_for_executions`/`wait_for_frames` against a five-second deadline, so they stay green under build load.
+- The suites need no scripts or fixtures on disk: they run through `cargo test --lib`, drive the doubles in `base/fixtures.rs` (`StubExecutor`, `ContextExecutor`, `CooperativeExecutor`, `StallingExecutor`, `StubHandler`, `CountingRecognizer`, `RecordingRecognizer`, `RecordingSession`), wrap every await that could hang in `bounded` (a 10 s guard), and use `openjiuwen_test_support::ScriptedModel` for the LLM recognizer and router — no network and no wall-clock ordering assertions.
 
 ## Routing Table
 
 - `./schema/` → payload frames, events, intents, tasks, controller output (`schema/CONTEXT.md`)
-- `./config.rs` → `ControllerConfig`, `DefaultResponse`
-- `./intent.rs` → `IntentRecognizer`, `IntentRule`, `RuleIntentRecognizer`, `LlmIntentRecognizer`, `Planner`
+- `./config.rs` → `ControllerConfig`, `DefaultResponse`, and the builders of the enforced knobs (`with_history_limit`, `with_event_timeout`, `with_stream_first_frame_timeout`, `with_expose_reasoning`)
+- `./history.rs` → `HistoryEntry`/`HistoryRole`, the append trim (`trim_history`) and the read window (`window`) behind `history_limit`
+- `./intent.rs` → `IntentRecognizer` (incl. the defaulted `recognize_with_history`), `IntentRule`, `RuleIntentRecognizer`, `LlmIntentRecognizer` (history replay), `Planner`
 - `./task_manager/` → `TaskManager`, `TaskFilter`, indexes, hierarchy, persistence (`task_manager/CONTEXT.md`)
 - `./executors/` → executor seam/registry, value-type `TaskScheduler`, built-in executors, and the background `TaskSchedulerLoop` (`executors/CONTEXT.md`)
 - `./reasoner/` → `TaskOp`/`TaskOpOutcome`/`TaskControl` and the intent → task-op state machine (`reasoner/CONTEXT.md`)
 - `./queue.rs` → per-conversation `TaskQueue`/`RunningTask`
 - `./group.rs` → `GroupRouter` seam, `GroupMethod`, typed not-in-group errors
-- `./base/` → `Controller`, `BaseController`, `EventHandler`, the turn loop, task control, persistence (`base/CONTEXT.md`)
+- `./base/` → `Controller`, `BaseController`, `EventHandler`, the turn loop, task control, persistence, and the per-session conversation history (`base/CONTEXT.md`)
 - `./legacy/` → legacy value objects, `IntentDetector`, `LegacyPlanner`, `IntentDetectionController` preemption and group delegation (`legacy/CONTEXT.md`)
 - `./mod.rs` → module declarations, controller-level re-exports, and the module-level architecture notes

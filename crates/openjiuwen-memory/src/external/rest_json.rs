@@ -5,14 +5,33 @@
 //! `unit_id`/`uuid`; memory text under `memory`/`content`/`text`/`data`; timestamps as
 //! RFC 3339 strings or unix seconds. These helpers absorb that variation so a spec's
 //! `*_result` method stays a few lines long and never panics on an unexpected shape:
-//! an absent field yields `None`, an unrecognized body yields an empty slice.
+//! an absent field yields `None`.
+//!
+//! # Tolerance versus shape drift
+//!
+//! There are two kinds of "unexpected" body, and they must not look alike:
+//!
+//! - **An optional field is missing** — a row without a timestamp, importance, or id. Here
+//!   tolerance is right: [`vendor_record`] keeps what the vendor sent and leaves the rest
+//!   at its documented default.
+//! - **The body's shape changed** — a renamed wrapper, an HTML page from a proxy, a row
+//!   that is not a memory at all. Here tolerance is a silent failure: a renamed wrapper
+//!   would read as "no rows", which is indistinguishable from an empty collection.
+//!
+//! So a *listing* decoder uses [`results_array_checked`] (a non-empty body with no
+//! recognised row array is [`Error::Validation`]) and [`listing_record`] (a row with no
+//! memory content is skipped with a `tracing::warn!` instead of becoming a record with an
+//! invented id and an empty body). [`results_array`] and [`vendor_record`] stay tolerant
+//! because a write or a point read legitimately answers a single object rather than an
+//! array.
 //!
 //! The module is declared next to [`rest`](super::rest) and re-exported from it, so a
 //! spec only needs `use super::rest::*`.
 //!
 //! Nothing here performs I/O: the helpers accept a [`Value`] (or an already-buffered
 //! [`HttpResponse`] for [`body_value`]) and are pure and infallible apart from
-//! [`body_value`], which reports a non-JSON body as a typed transport error.
+//! [`body_value`] and [`results_array_checked`], which report an unusable body as a typed
+//! error.
 
 use chrono::{DateTime, Utc};
 use openjiuwen_common::error::{Error, Result};
@@ -20,6 +39,11 @@ use openjiuwen_common::http::HttpResponse;
 use serde_json::Value;
 
 use crate::record::{MemoryRecord, MemoryScope, MemoryType, RecallHit};
+
+/// `tracing` target of the shape-drift diagnostics this module emits.
+const LOG_TARGET: &str = "openjiuwen_memory::external::rest_json";
+/// Longest list of row keys quoted in one diagnostic.
+const QUOTED_KEYS: usize = 8;
 
 /// Object keys a vendor body may wrap its row array in.
 const RESULT_KEYS: &[&str] = &["results", "memories", "items", "data", "entries"];
@@ -66,11 +90,18 @@ pub fn body_value(response: &HttpResponse) -> Result<Value> {
     })
 }
 
-/// Returns the row array of a vendor body.
+/// Returns the row array of a vendor body, tolerantly.
 ///
-/// Accepts a top-level array or one wrapped in `RESULT_KEYS`. An unrecognized shape
-/// yields an empty slice rather than an error, so a spec can map it without a special
-/// case (`{"results": []}` and `{"ok": true}` both read as "no rows").
+/// Accepts a top-level array or one wrapped in `RESULT_KEYS`. An unrecognized shape yields
+/// an empty slice rather than an error, because several vendors answer a *single* object
+/// on a write or a point read (`{"id": …}`, `{"memory": …}`), where "no row array" is the
+/// documented shape and not drift. A scalar body (a bare string, number, or boolean) is
+/// never a documented answer, so it is logged as drift; an object body is not, because it
+/// may legitimately be a single record.
+///
+/// A listing decoder must not use this function: it fills
+/// [`results_array_checked`], which reports a renamed wrapper instead of reading it as an
+/// empty collection.
 #[must_use]
 pub fn results_array(value: &Value) -> &[Value] {
     if let Value::Array(items) = value {
@@ -81,7 +112,52 @@ pub fn results_array(value: &Value) -> &[Value] {
             return items;
         }
     }
+    if value.is_boolean() || value.is_number() || value.is_string() {
+        tracing::warn!(
+            target: LOG_TARGET,
+            "a vendor body that is a bare scalar carries no row array; reading it as no rows"
+        );
+    }
     &[]
+}
+
+/// Returns the row array of a listing answer, reporting shape drift.
+///
+/// Accepts everything [`results_array`] accepts, plus an empty body ([`Value::Null`],
+/// which several vendors answer on an empty collection) as "no rows". Every other
+/// non-empty body — a renamed wrapper such as `{"payload": […]}` (a pure object with no
+/// recognised array key), a scalar, or an object whose `results`-style key holds a
+/// non-array — is reported as a typed [`Error::Validation`] naming the response URL and
+/// the keys the vendor answered with, after a `tracing::warn!`. That keeps a vendor rename
+/// or a proxy error page from being read as an empty collection.
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] when a non-empty body carries no recognised row array.
+pub fn results_array_checked<'a>(response: &HttpResponse, value: &'a Value) -> Result<&'a [Value]> {
+    if value.is_null() {
+        return Ok(&[]);
+    }
+    if let Value::Array(items) = value {
+        return Ok(items);
+    }
+    for key in RESULT_KEYS {
+        if let Some(Value::Array(items)) = value.get(*key) {
+            return Ok(items);
+        }
+    }
+    let keys = quoted_keys(value);
+    tracing::warn!(
+        target: LOG_TARGET,
+        %keys,
+        url = %response.url,
+        "a vendor listing body carries no recognised row array; refusing to read it as no rows"
+    );
+    Err(Error::validation(format!(
+        "the memory provider returned a body with no recognised row array for {} (answered keys: {keys}); expected a JSON array or one wrapped in {}",
+        response.url,
+        RESULT_KEYS.join("/")
+    )))
 }
 
 /// Returns the first present, non-null value under `keys`.
@@ -193,6 +269,10 @@ fn from_seconds_f64(seconds: f64) -> Option<DateTime<Utc>> {
 /// content, "now", importance `0.5`, and no metadata. The function never fails — a
 /// vendor row that lacks a documented field must not break a whole listing — but it also
 /// never invents content: an empty result is visible to the caller.
+///
+/// This is the accessor for a *single* record (a point read or a write answer), where
+/// returning something is required. A listing uses [`listing_record`], which drops a row
+/// that carries no content at all.
 #[must_use]
 pub fn vendor_record(value: &Value, scope: &MemoryScope, kind: MemoryType) -> MemoryRecord {
     let content = field_str(value, CONTENT_KEYS)
@@ -220,6 +300,37 @@ pub fn vendor_record(value: &Value, scope: &MemoryScope, kind: MemoryType) -> Me
     record
 }
 
+/// Maps one row of a *listing* onto a [`MemoryRecord`], skipping a row that is not a memory.
+///
+/// A row is a memory when it carries at least one content alias (`memory`/`content`/
+/// `text`/`data`). A row without one is skipped, after a `tracing::warn!` naming
+/// `operation` and the row's own keys, because reporting it would invent an id and an
+/// empty body the vendor never stored. An id-less but content-bearing row stays usable:
+/// mem0 and `LakeBase` recall answers legitimately omit the id, and a listing is read-only
+/// anyway. Everything else about the row is decoded by [`vendor_record`], so an absent
+/// timestamp, importance, or metadata object stays tolerated.
+///
+/// `None` means "this row is not a memory"; the caller's listing simply omits it.
+#[must_use]
+pub fn listing_record(
+    row: &Value,
+    scope: &MemoryScope,
+    kind: MemoryType,
+    operation: &str,
+) -> Option<MemoryRecord> {
+    if field_str(row, CONTENT_KEYS).is_none() {
+        let keys = quoted_keys(row);
+        tracing::warn!(
+            target: LOG_TARGET,
+            operation,
+            %keys,
+            "skipping a vendor row that carries no memory content"
+        );
+        return None;
+    }
+    Some(vendor_record(row, scope, kind))
+}
+
 /// Wraps `record` and `score` into a [`RecallHit`].
 ///
 /// A remote backend returns one blended score and nothing else, so `similarity` mirrors
@@ -241,6 +352,43 @@ pub fn vendor_hit(record: MemoryRecord, score: f32) -> RecallHit {
         keyword: 0.0,
         recency: 0.0,
     }
+}
+
+/// Filters, ranks, and truncates vendor recall candidates into hits.
+///
+/// Each candidate carries the record and the score the vendor reported for it, or `None`
+/// when the row carried no score at all. An absent score is *absent*, not zero: the vendor
+/// matched the row but did not rank it, so `threshold` never drops it (otherwise a vendor
+/// whose recall answer omits `score` would always look like "nothing matched" under the
+/// default `0.3`). A scored row keeps the documented `score >= threshold` semantics, and a
+/// non-positive `threshold` keeps everything.
+///
+/// Scored rows come first, ordered by their score descending; unscored rows follow in the
+/// vendor's own order, since they have no rank to sort by. `top_k` then truncates the
+/// merged list, so a vendor that sends both kinds still honours the caller's page size.
+#[must_use]
+pub fn rank_hits(
+    candidates: Vec<(MemoryRecord, Option<f32>)>,
+    threshold: f32,
+    top_k: usize,
+) -> Vec<RecallHit> {
+    let mut kept: Vec<(MemoryRecord, Option<f32>)> = candidates
+        .into_iter()
+        .filter(|(_, score)| match score {
+            Some(score) => threshold <= 0.0 || *score >= threshold,
+            None => true,
+        })
+        .collect();
+    kept.sort_by(|left, right| match (left.1, right.1) {
+        (Some(left), Some(right)) => right.total_cmp(&left),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    kept.truncate(top_k);
+    kept.into_iter()
+        .map(|(record, score)| vendor_hit(record, score.unwrap_or(0.0)))
+        .collect()
 }
 
 /// Collapses whitespace and shortens `body` to at most `limit` characters.
@@ -312,6 +460,26 @@ fn nested_message(object: &serde_json::Map<String, Value>) -> Option<String> {
     None
 }
 
+/// The top-level keys of a vendor body, comma-joined for a diagnostic.
+///
+/// Quotes key *names* only, never a value, so a log line can never carry memory content.
+/// A non-object body is described by its JSON kind instead.
+fn quoted_keys(value: &Value) -> String {
+    match value {
+        Value::Object(object) => {
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            keys.truncate(QUOTED_KEYS);
+            keys.join(", ")
+        }
+        Value::Array(_) => "[]".to_owned(),
+        Value::String(_) => "a string".to_owned(),
+        Value::Number(_) => "a number".to_owned(),
+        Value::Bool(_) => "a boolean".to_owned(),
+        Value::Null => "an empty body".to_owned(),
+    }
+}
+
 /// The scope id of `scope`, as a `&str`.
 #[must_use]
 pub fn scope_id(scope: &MemoryScope) -> &str {
@@ -331,6 +499,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::record::SearchOptions;
 
     /// Builds a buffered response carrying `body` as the payload.
     #[allow(clippy::default_trait_access)] // `HeaderMap` is not a named dependency here.
@@ -371,6 +540,123 @@ mod tests {
         }
         assert_eq!(results_array(&json!({"ok": true})), [] as [Value; 0]);
         assert_eq!(results_array(&json!(null)), [] as [Value; 0]);
+    }
+
+    #[test]
+    fn results_array_checked_reads_an_empty_body_as_no_rows() {
+        let empty = response("");
+        let value = body_value(&empty).expect("empty body");
+        assert_eq!(
+            results_array_checked(&empty, &value).expect("an empty body is no rows"),
+            [] as [Value; 0]
+        );
+        let wrapped = response(r#"{"results": []}"#);
+        let value = body_value(&wrapped).expect("json");
+        assert_eq!(
+            results_array_checked(&wrapped, &value).expect("an empty array"),
+            [] as [Value; 0]
+        );
+    }
+
+    #[test]
+    fn results_array_checked_rejects_shape_drift_instead_of_reporting_no_rows() {
+        for body in [
+            r#"{"payload": [{"id": "a"}]}"#,
+            r#"{"ok": true}"#,
+            r#"{"results": {"id": "a"}}"#,
+            r#""a bare string""#,
+        ] {
+            let http = response(body);
+            let value = body_value(&http).expect("json");
+            let error = results_array_checked(&http, &value)
+                .expect_err("shape drift must not read as no rows");
+            assert!(matches!(error, Error::Validation(_)), "{body}: {error:?}");
+            let message = error.to_string();
+            assert!(
+                message.contains("http://vendor.test/items"),
+                "{body}: {message}"
+            );
+            assert!(message.contains("no recognised row array"), "{body}");
+        }
+        let drifted = response(r#"{"payload": []}"#);
+        let value = body_value(&drifted).expect("json");
+        let error = results_array_checked(&drifted, &value).expect_err("drift");
+        assert!(
+            error.to_string().contains("payload"),
+            "the answered keys must be named: {error}"
+        );
+    }
+
+    #[test]
+    fn listing_record_skips_a_row_without_content() {
+        let scope = MemoryScope::new("alice", "ws");
+        let usable = listing_record(
+            &json!({"id": "a", "memory": "hello"}),
+            &scope,
+            MemoryType::SemanticMemory,
+            "list",
+        )
+        .expect("a content-bearing row is a record");
+        assert_eq!(usable.id, "a");
+        assert_eq!(usable.content, "hello");
+        let idless = listing_record(
+            &json!({"content": "no id"}),
+            &scope,
+            MemoryType::SemanticMemory,
+            "list",
+        )
+        .expect("an id-less row stays usable");
+        assert_eq!(idless.content, "no id");
+        assert_ne!(idless.id, "", "the generated id is only a placeholder");
+        for row in [
+            json!({}),
+            json!({"id": "a"}),
+            json!({"memory_id": 7, "score": 0.9}),
+            json!({"content": "   "}),
+        ] {
+            assert!(
+                listing_record(&row, &scope, MemoryType::SemanticMemory, "list").is_none(),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn rank_hits_keeps_an_unscored_row_and_filters_a_scored_one() {
+        let scope = MemoryScope::new("alice", "ws");
+        let record =
+            |content: &str| MemoryRecord::new(scope.clone(), content, MemoryType::SemanticMemory);
+        let candidates = vec![
+            (record("scored low"), Some(0.1)),
+            (record("unscored"), None),
+            (record("scored high"), Some(0.9)),
+        ];
+        let hits = rank_hits(candidates.clone(), 0.3, 5);
+        assert_eq!(
+            hits.len(),
+            2,
+            "the low score is dropped, the unscored row stays"
+        );
+        assert_eq!(hits[0].record.content, "scored high");
+        assert_eq!(hits[0].score, 0.9_f32);
+        assert_eq!(hits[1].record.content, "unscored");
+        assert!(hits[1].score.abs() < f32::EPSILON, "no score is invented");
+        assert_eq!(
+            rank_hits(candidates.clone(), 0.0, 5).len(),
+            3,
+            "a non-positive threshold keeps a low score but still never drops an unscored row"
+        );
+        assert_eq!(
+            rank_hits(
+                vec![(record("only unscored"), None)],
+                SearchOptions::default().threshold,
+                5
+            )
+            .len(),
+            1,
+            "the default threshold never hides an unscored row"
+        );
+        assert_eq!(rank_hits(candidates, 0.3, 1).len(), 1, "top_k truncates");
     }
 
     #[test]

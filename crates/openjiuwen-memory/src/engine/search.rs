@@ -7,8 +7,11 @@
 //! Every score comes from [`crate::recall::rank`]; this module only chooses candidates,
 //! applies the caller's filters, and records access statistics.
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use openjiuwen_common::error::{Error, Result};
+use openjiuwen_retrieval::embedding::Embedding;
 
 use crate::recall::{rank, trim_to_token_budget, ScoredCandidate};
 use crate::record::{MemoryFilter, MemoryScope, MemoryType, RecallHit, SearchMode, SearchOptions};
@@ -32,15 +35,47 @@ impl super::MemoryEngine {
         query: &str,
         options: &SearchOptions,
     ) -> Result<Vec<RecallHit>> {
-        self.recall(scope, query, None, options, true).await
+        self.search_with_embedding(scope, query, options, None)
+            .await
     }
 
-    /// The shared recall pipeline behind [`MemoryEngine::search`] and the dedupe
+    /// Searches the stored memories with `embedding` as the query embedder of this call.
+    ///
+    /// `embedding` is the handle a per-scope override resolved to; `None` means "use the
+    /// engine's own model". A supplied handle is the *only* embedder the call uses, so a
+    /// scope whose vectors were written with its own embedder is recalled with that same
+    /// embedder rather than the engine's.
+    ///
+    /// # Errors
+    ///
+    /// See [`MemoryEngine::search`](super::MemoryEngine::search).
+    pub async fn search_with_embedding(
+        &self,
+        scope: &MemoryScope,
+        query: &str,
+        options: &SearchOptions,
+        embedding: Option<&Arc<dyn Embedding>>,
+    ) -> Result<Vec<RecallHit>> {
+        self.recall(scope, query, None, options, true, embedding)
+            .await
+    }
+
+    /// The shared recall pipeline behind
+    /// [`MemoryEngine::search`](super::MemoryEngine::search) and the dedupe
     /// candidate scan.
     ///
     /// `vector` supplies the query embedding when the caller already computed it;
     /// `touch` controls whether the returned records' access counters are updated (the
     /// internal dedupe scan must not count as a recall).
+    ///
+    /// A keyword/scope-scan recall (keyword mode, or any mode without an embedding model)
+    /// scores at most `ranking.max_candidates` records
+    /// ([`RankingConfig`](crate::config::RankingConfig)): the scope is listed newest
+    /// first and the remainder is dropped, so which records are scored is decided by the
+    /// cap, not by relevance. When that happens a `tracing::warn!` on target
+    /// `openjiuwen_memory::engine` names the cap, the pool size, and how many records were
+    /// not scored. Raise `ranking.max_candidates` (or attach an embedding model, which
+    /// searches per-kind vector collections instead) to score a larger scope.
     pub(crate) async fn recall(
         &self,
         scope: &MemoryScope,
@@ -48,6 +83,7 @@ impl super::MemoryEngine {
         vector: Option<&[f32]>,
         options: &SearchOptions,
         touch: bool,
+        embedder: Option<&Arc<dyn Embedding>>,
     ) -> Result<Vec<RecallHit>> {
         scope.validate()?;
         if query.trim().is_empty() {
@@ -55,7 +91,8 @@ impl super::MemoryEngine {
         }
         validate_search_options(options)?;
         options.call.check()?;
-        if options.mode == SearchMode::Semantic && !self.has_embedding() {
+        let has_embedding = self.has_embedding_with(embedder);
+        if options.mode == SearchMode::Semantic && !has_embedding {
             return Err(Error::unsupported(
                 "semantic search requires an embedding model",
             ));
@@ -66,10 +103,10 @@ impl super::MemoryEngine {
         let now = Utc::now();
         let mut candidates = Vec::new();
 
-        if options.mode != SearchMode::Keyword && self.has_embedding() {
+        if options.mode != SearchMode::Keyword && has_embedding {
             let query_vector = match vector {
                 Some(vector) => vector.to_vec(),
-                None => self.embed_text(query, &options.call).await?,
+                None => self.embed_text_with(embedder, query, &options.call).await?,
             };
             for kind in &kinds {
                 options.call.check()?;
@@ -107,7 +144,22 @@ impl super::MemoryEngine {
             let mut filter = MemoryFilter::for_scope(scope);
             filter.kinds.clone_from(&kinds);
             let records = self.storage().list_records(&filter).await?;
-            for record in records.into_iter().take(self.config.ranking.max_candidates) {
+            let cap = self.config.ranking.max_candidates;
+            if records.len() > cap {
+                let total = records.len();
+                let dropped = total - cap;
+                tracing::warn!(
+                    target: TARGET,
+                    cap,
+                    total,
+                    dropped,
+                    scope = ?scope,
+                    "keyword recall scored only the {cap} newest of {total} candidate records \
+                     (ranking.max_candidates); {dropped} record(s) beyond the cap were not \
+                     scored"
+                );
+            }
+            for record in records.into_iter().take(cap) {
                 options.call.check()?;
                 candidates.push(ScoredCandidate::keyword_only(record));
             }
@@ -583,5 +635,159 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    /// A tracing subscriber that keeps every event as one `"<message> <fields>"` line, so a
+    /// test can assert on the diagnostics the engine emits (the crate has no log-capture
+    /// harness, and the workspace adds no dependencies for one).
+    struct CaptureLogs {
+        /// The captured lines, in event order.
+        lines: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for CaptureLogs {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = EventFields::default();
+            event.record(&mut visitor);
+            if let Ok(mut lines) = self.lines.lock() {
+                lines.push(visitor.into_line());
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Collects the message and the fields of one tracing event.
+    #[derive(Default)]
+    struct EventFields {
+        /// The event message.
+        message: String,
+        /// The event fields, rendered as `name=value`.
+        fields: Vec<String>,
+    }
+
+    impl EventFields {
+        /// Renders the captured event as one line.
+        fn into_line(self) -> String {
+            format!("{} {}", self.message, self.fields.join(" "))
+        }
+
+        /// Stores `value` as the message or as a named field.
+        fn record_field(&mut self, field: &tracing::field::Field, value: String) {
+            if field.name() == "message" {
+                self.message = value;
+            } else {
+                self.fields.push(format!("{}={value}", field.name()));
+            }
+        }
+    }
+
+    impl tracing::field::Visit for EventFields {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.record_field(field, value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.record_field(field, format!("{value:?}"));
+        }
+    }
+
+    /// An engine over `config` with in-memory stores and no embedding model.
+    fn keyword_engine(config: MemoryEngineConfig) -> Arc<MemoryEngine> {
+        MemoryEngine::new(config, MemoryStores::in_memory()).expect("engine")
+    }
+
+    #[test]
+    fn the_keyword_scan_warns_about_candidates_dropped_beyond_the_cap() {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = CaptureLogs {
+            lines: Arc::clone(&lines),
+        };
+        let (scored, dropped_id) = tracing::subscriber::with_default(capture, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            runtime.block_on(async {
+                let config = MemoryEngineConfig {
+                    // Identical content keeps every candidate's keyword score equal, so the
+                    // only thing separating them is the cap.
+                    dedupe: crate::config::DedupeConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    ranking: crate::config::RankingConfig {
+                        max_candidates: 2,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let engine = keyword_engine(config);
+                let scope = scope();
+                let mut ids = Vec::new();
+                for offset in [0_i64, 10, 20] {
+                    let outcome = engine
+                        .add(
+                            &scope,
+                            NewMemory::semantic("alpha beta").with_timestamp(ts(offset)),
+                            &AddOptions::default(),
+                        )
+                        .await
+                        .expect("add");
+                    ids.push(outcome.added[0].id.clone());
+                }
+                let hits = engine
+                    .search(
+                        &scope,
+                        "alpha beta",
+                        &SearchOptions::default()
+                            .with_mode(SearchMode::Keyword)
+                            .with_threshold(0.0)
+                            .with_top_k(10),
+                    )
+                    .await
+                    .expect("search");
+                let scored: Vec<String> = hits.iter().map(|hit| hit.record.id.clone()).collect();
+                (scored, ids[0].clone())
+            })
+        });
+
+        // Behavioural boundary: the scope holds three candidates, the cap scores two, and the
+        // oldest record (last in the newest-first scan) never reaches the ranker.
+        assert_eq!(
+            scored.len(),
+            2,
+            "only the capped pool is scored: {scored:?}"
+        );
+        assert!(
+            !scored.contains(&dropped_id),
+            "the record beyond the cap must not be scored"
+        );
+        let captured = lines.lock().expect("lock").clone();
+        let warning = captured
+            .iter()
+            .find(|line| line.contains("ranking.max_candidates"))
+            .unwrap_or_else(|| panic!("the cap must be reported, captured {captured:?}"));
+        assert!(
+            warning.contains("1 record(s) beyond the cap were not scored"),
+            "{warning}"
+        );
+        assert!(warning.contains("dropped=1"), "{warning}");
+        assert!(warning.contains("cap=2"), "{warning}");
+        assert!(warning.contains("total=3"), "{warning}");
     }
 }

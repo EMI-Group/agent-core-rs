@@ -177,11 +177,12 @@ impl DreamFilter {
 /// - **`complete(job_id, outcome)`** validates the outcome, requires the stored job to
 ///   be `Running` (anything else is an [`Error::Validation`]; an unknown id is
 ///   [`Error::NotFound`]), and requires `outcome.job_id == job_id`. It stores the
-///   outcome's state and metrics, sets `finished_at = updated_at = now`, and clears
+///   outcome's state, metrics and notes, sets `finished_at = updated_at = now`, and clears
 ///   `last_error` — that field only ever describes a failed attempt.
 /// - **`fail(job_id, error)`** requires the stored job to be `Running`. It records
-///   `last_error`. When `attempts >= max_attempts` the job becomes terminal `Failed`
-///   with `finished_at = updated_at = now`; otherwise it returns to `Pending` with
+///   `last_error` and clears the recorded `notes`, because notes describe a completion
+///   this attempt did not reach. When `attempts >= max_attempts` the job becomes terminal
+///   `Failed` with `finished_at = updated_at = now`; otherwise it returns to `Pending` with
 ///   `finished_at = None`, keeps `started_at` as the retry marker, and sets
 ///   `updated_at = now`. Attempts are counted by the claim, not by the failure.
 /// - **`get`** returns `None` for an unknown id.
@@ -547,6 +548,7 @@ impl DreamRepository for InMemoryDreamRepository {
         let now = Utc::now();
         job.state = outcome.state;
         job.metrics = outcome.metrics;
+        job.notes = outcome.notes;
         job.finished_at = Some(now);
         job.updated_at = now;
         job.last_error = None;
@@ -564,6 +566,9 @@ impl DreamRepository for InMemoryDreamRepository {
         }
         let now = Utc::now();
         job.last_error = Some(error.to_owned());
+        // A failed attempt never leaves a previous completion's notes behind: they describe
+        // work that this attempt did not do.
+        job.notes.clear();
         job.updated_at = now;
         if job.attempts >= job.max_attempts {
             job.state = DreamState::Failed;
@@ -897,11 +902,36 @@ mod tests {
             .unwrap();
         assert_eq!(completed.state, DreamState::Succeeded);
         assert_eq!(completed.metrics, metrics);
+        assert_eq!(
+            completed.notes,
+            vec!["done".to_owned()],
+            "the completion's notes are persisted with the job"
+        );
         assert!(completed.finished_at.is_some());
         assert!(completed.updated_at >= completed.created_at);
         assert_eq!(completed.last_error, None);
         assert!(completed.validate().is_ok());
         assert_eq!(completed.attempts, 1);
+        assert_eq!(
+            repo.get("job-1").await.unwrap().unwrap().notes,
+            vec!["done".to_owned()],
+            "a later read sees the same notes"
+        );
+    }
+    #[tokio::test]
+    async fn fail_clears_the_notes_of_a_previous_completion() {
+        let repo = InMemoryDreamRepository::new();
+        repo.enqueue(job("job-1", 0, 0).with_notes(vec!["stale".to_owned()]))
+            .await
+            .unwrap();
+        let claimed = claimed(&repo, ts(1)).await;
+        assert_eq!(claimed.notes, vec!["stale".to_owned()]);
+        let requeued = repo.fail(&claimed.id, "boom").await.unwrap();
+        assert!(requeued.notes.is_empty(), "{:?}", requeued.notes);
+        assert_eq!(
+            repo.get("job-1").await.unwrap().unwrap().notes,
+            Vec::<String>::new()
+        );
     }
 
     #[tokio::test]

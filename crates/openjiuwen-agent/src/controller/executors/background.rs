@@ -45,7 +45,14 @@
 //! - A completed run appends `TaskResult::data` as one
 //!   [`ControllerOutputChunk`] on the task (the same way the controller's turn
 //!   loop records a signal) instead of streaming the executor's chunk
-//!   iterator to the session.
+//!   iterator to the session. When
+//!   [`expose_reasoning`](ControllerConfig::expose_reasoning) is on and the
+//!   executor captured reasoning, a [`OutputKind::Reasoning`] chunk is appended
+//!   before that terminal completion/interaction/failure chunk.
+//! - The driver builds its [`TaskContext`] from the live configuration: the
+//!   `expose_reasoning` flag is read next to `task_timeout_ms` before any
+//!   `.await`, and the history stays empty because a scheduled run has no
+//!   dispatching turn.
 //! - The loop is single-use: [`stop`](TaskSchedulerLoop::stop) cancels the
 //!   loop token, so a stopped scheduler must be rebuilt (not restarted) to run
 //!   again.
@@ -630,8 +637,18 @@ impl TaskSchedulerLoop {
     async fn drive(&self, task: Task, session: Arc<dyn Session>, token: CancellationToken) {
         let task_id = task.task_id.clone();
         let session_id = task.session_id.clone();
+        // The two knobs the run needs are read once, before any await: the
+        // guard is never held across an `.await`.
+        let (timeout, expose_reasoning) = {
+            let config = self.config.read();
+            (
+                config.task_timeout_ms.map(Duration::from_millis),
+                config.expose_reasoning,
+            )
+        };
         let ctx = TaskContext::new(Some(Arc::clone(&session)), &self.controller_id)
-            .with_cancellation(token.clone());
+            .with_cancellation(token.clone())
+            .with_expose_reasoning(expose_reasoning);
         let resolved = self.registry.read().get(&task.task_type);
         let Some(executor) = resolved else {
             let message = format!("task executor not found: {}", task.task_type);
@@ -649,11 +666,6 @@ impl TaskSchedulerLoop {
             return;
         };
         self.set_executor(&task_id, Arc::clone(&executor));
-        let timeout = self
-            .config
-            .read()
-            .task_timeout_ms
-            .map(Duration::from_millis);
         // The failure text is Python's: an executor error reports its message
         // (not the `<kind>: <message>` rendering), and a timed-out run reports
         // `Task timeout after <seconds> seconds` verbatim.
@@ -711,7 +723,13 @@ impl TaskSchedulerLoop {
         };
         self.manager
             .update_task_status(&task_id, status, false, false, error_message);
-        self.record_outputs(&task_id, status, &result.data);
+        self.record_outputs(
+            &task_id,
+            status,
+            &result.data,
+            expose_reasoning,
+            result.reasoning.as_deref(),
+        );
         self.finish(&task_id, &session_id).await;
     }
 
@@ -722,12 +740,29 @@ impl TaskSchedulerLoop {
         self.ensure_completion_signal(session_id).await;
     }
 
-    /// Appends the result frames of `task_id` as one output chunk.
+    /// Appends the result frames of `task_id` as output chunks.
     ///
     /// Mirrors `base/turn.rs::record_signal`, which folds a task signal into the
-    /// persisted task the same way.
-    fn record_outputs(&self, task_id: &str, status: TaskStatus, data: &[DataFrame]) {
-        if data.is_empty() {
+    /// persisted task the same way. When `expose_reasoning` is on and the
+    /// executor reported non-empty `reasoning`, a [`OutputKind::Reasoning`]
+    /// chunk is appended first and the completion/interaction/failure chunk
+    /// (always the last one) after it, so the reasoning never displaces the
+    /// terminal frame. With the flag off, reasoning is dropped instead of
+    /// appearing in a frame.
+    fn record_outputs(
+        &self,
+        task_id: &str,
+        status: TaskStatus,
+        data: &[DataFrame],
+        expose_reasoning: bool,
+        reasoning: Option<&str>,
+    ) {
+        let reasoning = if expose_reasoning {
+            reasoning.filter(|text| !text.is_empty())
+        } else {
+            None
+        };
+        if data.is_empty() && reasoning.is_none() {
             return;
         }
         let kind = match status {
@@ -735,8 +770,24 @@ impl TaskSchedulerLoop {
             TaskStatus::InputRequired => OutputKind::TaskInteraction,
             _ => OutputKind::TaskFailed,
         };
-        let chunk =
-            ControllerOutputChunk::last(0, ControllerOutputPayload::new(kind, data.to_vec()));
+        let mut chunks = Vec::with_capacity(2);
+        if let Some(reasoning) = reasoning {
+            chunks.push(ControllerOutputChunk::new(
+                0,
+                ControllerOutputPayload::text(OutputKind::Reasoning, reasoning),
+            ));
+        }
+        if !data.is_empty() {
+            let index = i64::try_from(chunks.len()).unwrap_or(i64::MAX);
+            chunks.push(ControllerOutputChunk::last(
+                index,
+                ControllerOutputPayload::new(kind, data.to_vec()),
+            ));
+        } else if let Some(chunk) = chunks.last_mut() {
+            // Reasoning without result frames: the reasoning chunk is the only
+            // and therefore terminal chunk of this run.
+            chunk.last_chunk = true;
+        }
         let Some(mut task) = self.manager.task(task_id) else {
             return;
         };
@@ -745,7 +796,7 @@ impl TaskSchedulerLoop {
             // when the stored task is still the one this run recorded.
             return;
         }
-        task.outputs.push(chunk);
+        task.outputs.extend(chunks);
         let _ = self.manager.update_task(task);
     }
 

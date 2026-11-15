@@ -52,6 +52,14 @@
 //! verdict for classification). A cancelled [`crate::record::CallOptions`] returns
 //! [`openjiuwen_common::error::Error::Cancelled`] before the first model call.
 //!
+//! A *missing* model is a different case and is never degraded silently:
+//! [`MemoryAnalyzer::from_config`]/[`MemoryAnalyzer::from_engine`] return
+//! [`openjiuwen_common::error::Error::Unsupported`] when [`ExtractorKind::Llm`] is
+//! configured without a model, [`MemoryAnalyzer::classifier`] does the same for
+//! [`ClassifierKind::Llm`], and a [`StageKind::Llm`] stage configured without a model runs
+//! its rule implementation while naming the stage in the result's
+//! `degraded` reason.
+//!
 //! # Deviations from Python
 //!
 //! - Extraction is rule-based by default instead of prompt-only, so memory works offline
@@ -62,9 +70,10 @@
 //!   New information never deletes anything; a verdict only describes the relation.
 //! - The analyzer is an explicit value (config + extractor) rather than a global
 //!   singleton, and it never touches storage: callers apply the plan.
-//! - Planned-with-no-model behaviour: `ExtractorKind::Llm` without a supplied model
-//!   degrades to the rule extractor instead of failing, mirroring the Python behaviour of
-//!   running without a memory model.
+//! - A configuration that requests the model-backed extractor or classifier without a
+//!   model is a typed `Unsupported` error naming the field and the fix, where Python
+//!   would simply run without a memory model; rules stay available explicitly through
+//!   [`MemoryAnalyzer::rule`] or `ExtractorKind::Rule`/`ClassifierKind::Rule`.
 mod config;
 mod conflict;
 mod fact;

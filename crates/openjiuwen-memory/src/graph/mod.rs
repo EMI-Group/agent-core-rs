@@ -83,6 +83,20 @@ const IMPORTANCE_KEY: &str = "importance";
 /// Entity property holding the stored embedding vector.
 const EMBEDDING_KEY: &str = "embedding";
 
+/// Describes why `vector` cannot index an entity, or `None` when it can.
+///
+/// An empty or non-finite vector carries no similarity signal, so storing it would
+/// quietly downgrade the entity to keyword-only recall.
+fn unusable_vector(vector: &[f32]) -> Option<&'static str> {
+    if vector.is_empty() {
+        Some("the vector is empty")
+    } else if !vector.iter().all(|component| component.is_finite()) {
+        Some("the vector contains a non-finite component")
+    } else {
+        None
+    }
+}
+
 /// Per-call options for [`GraphMemory::add`].
 ///
 /// `extractor` overrides the instance default (an attached model, else the heuristic
@@ -163,6 +177,21 @@ pub struct CombinedRecall {
     pub memories: Vec<RecallHit>,
     /// Entity hits, ordered by graph recall (`score` descending, then `depth`).
     pub entities: Vec<GraphRecallHit>,
+    /// Why graph recall produced no entities, when it failed rather than found none.
+    ///
+    /// Graph recall stays best-effort — [`CombinedRecall::memories`] is still returned —
+    /// but a failure is reported here instead of masquerading as "the graph had no
+    /// match". The field is omitted from JSON when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_error: Option<String>,
+}
+
+impl CombinedRecall {
+    /// Returns `true` when graph recall failed and only the memory hits are complete.
+    #[must_use]
+    pub fn is_partial(&self) -> bool {
+        self.graph_error.is_some()
+    }
 }
 
 /// Entity/relation memory over one graph store.
@@ -228,6 +257,9 @@ impl GraphMemory {
     /// The extractor is [`GraphAddOptions::extractor`] when set, else [`LlmExtractor`]
     /// when a model is attached, else [`HeuristicExtractor`]. Cancellation is checked
     /// before the extraction, after it (before any write), and inside the extractor.
+    /// A degraded extraction (the model path falling back to heuristics) is returned
+    /// with [`Extraction::degraded`] set and logged at `warn`; the entities are still
+    /// persisted, so the caller sees both the result and the quality change.
     ///
     /// # Errors
     ///
@@ -261,6 +293,14 @@ impl GraphMemory {
             "extracting graph memory"
         );
         let extraction = extractor.extract(text, scope, &options.call).await?;
+        if let Some(reason) = extraction.degraded_reason() {
+            tracing::warn!(
+                target: "openjiuwen_memory::graph",
+                extractor = extractor.name(),
+                reason,
+                "graph extraction degraded to a fallback extractor"
+            );
+        }
         options.call.check()?;
         let (entities, relations) = self.add_extracted(scope, &extraction).await?;
         tracing::debug!(
@@ -287,8 +327,10 @@ impl GraphMemory {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Validation` for an invalid scope or a provider that returns the
-    /// wrong number of vectors, and the store/embedding error kind otherwise.
+    /// Returns `Error::Validation` for an invalid scope, a provider that returns the
+    /// wrong number of vectors, or a vector that is empty or non-finite (an entity is
+    /// never stored without a usable embedding), and the store/embedding error kind
+    /// otherwise.
     pub async fn add_extracted(
         &self,
         scope: &MemoryScope,
@@ -356,7 +398,9 @@ impl GraphMemory {
     ///
     /// The whole batch goes through one [`Embedding::embed_documents`] call; a provider
     /// returning the wrong number of vectors is a validation error rather than a silent
-    /// truncation.
+    /// truncation, and so is a vector that cannot index anything (empty or holding a
+    /// non-finite component). Either way the call fails before any entity is written, so
+    /// no unembedded entity is ever stored behind a successful return.
     async fn embed_entities(&self, entities: &mut [Entity]) -> Result<()> {
         let Some(embedding) = &self.embedding else {
             return Ok(());
@@ -374,13 +418,17 @@ impl GraphMemory {
             )));
         }
         for (entity, vector) in entities.iter_mut().zip(vectors) {
-            if vector.is_empty() || !vector.iter().all(|component| component.is_finite()) {
+            if let Some(reason) = unusable_vector(&vector) {
                 tracing::warn!(
                     target: "openjiuwen_memory::graph",
                     entity = %entity.name,
-                    "embedding provider returned an unusable vector; storing the entity without an embedding"
+                    reason,
+                    "embedding provider returned an unusable vector; refusing to store an unembedded entity"
                 );
-                continue;
+                return Err(Error::validation(format!(
+                    "embedding provider returned an unusable vector for entity `{}`: {reason}",
+                    entity.name
+                )));
             }
             let values = vector.into_iter().map(Value::from).collect();
             entity
@@ -620,6 +668,30 @@ mod tests {
         let combined = CombinedRecall::default();
         let value = serde_json::to_value(&combined).expect("combined json");
         assert_eq!(value, serde_json::json!({"memories": [], "entities": []}));
+        assert!(!combined.is_partial());
+
+        // A graph failure is serialized (and therefore caller-visible) rather than
+        // collapsing into an empty entity list.
+        let partial = CombinedRecall {
+            graph_error: Some("graph store unavailable".to_owned()),
+            ..CombinedRecall::default()
+        };
+        let value = serde_json::to_value(&partial).expect("partial json");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "memories": [],
+                "entities": [],
+                "graph_error": "graph store unavailable",
+            })
+        );
+        assert!(partial.is_partial());
+        let restored: CombinedRecall = serde_json::from_value(value).expect("tolerant decode");
+        assert_eq!(restored, partial);
+        let legacy: CombinedRecall =
+            serde_json::from_value(serde_json::json!({"memories": [], "entities": []}))
+                .expect("legacy decode");
+        assert_eq!(legacy.graph_error, None);
     }
 
     #[tokio::test]
@@ -665,6 +737,7 @@ mod tests {
                 to: "Acme".into(),
                 relation_type: "works_at".into(),
             }],
+            degraded: None,
         };
         let (entities, relations) = memory
             .add_extracted(&scope(), &extraction)
@@ -689,6 +762,91 @@ mod tests {
         assert_eq!(entities.len(), 0);
         assert_eq!(relations.len(), 0);
         assert_eq!(memory.stats(&scope()).await.expect("stats").entities, 0);
+    }
+
+    /// An embedder that answers every text with the same vector.
+    struct FixedEmbedding(Vec<f32>);
+
+    #[async_trait::async_trait]
+    impl Embedding for FixedEmbedding {
+        fn model_name(&self) -> &'static str {
+            "fixed"
+        }
+
+        async fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
+            Ok(self.0.clone())
+        }
+
+        async fn embed_documents(
+            &self,
+            texts: &[String],
+            _batch_size: Option<usize>,
+        ) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| self.0.clone()).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn unusable_vectors_are_validation_errors_not_silent_gaps() {
+        for (vector, expected) in [
+            (Vec::<f32>::new(), "the vector is empty"),
+            (
+                vec![0.5_f32, f32::NAN, 0.5],
+                "the vector contains a non-finite component",
+            ),
+        ] {
+            let memory = memory().with_embedding(Arc::new(FixedEmbedding(vector)));
+            let extraction = Extraction {
+                entities: vec![extracted("Alice", "Person", None)],
+                ..Extraction::default()
+            };
+            let error = memory
+                .add_extracted(&scope(), &extraction)
+                .await
+                .expect_err("an unusable vector must not be stored silently");
+            match &error {
+                Error::Validation(message) => {
+                    assert!(
+                        message.contains("Alice"),
+                        "the error must name the entity: {message}"
+                    );
+                    assert!(
+                        message.contains(expected),
+                        "the error must name the defect `{expected}`: {message}"
+                    );
+                }
+                other => panic!("expected a validation error, got {other:?}"),
+            }
+            // Nothing was written: no entity survives with a missing embedding.
+            assert_eq!(memory.stats(&scope()).await.expect("stats").entities, 0);
+            assert_eq!(
+                memory.entities(&scope(), 0).await.expect("entities").len(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_usable_vector_is_still_stored_on_every_entity() {
+        let memory = memory().with_embedding(Arc::new(FixedEmbedding(vec![0.25, 0.5, 0.75])));
+        let extraction = Extraction {
+            entities: vec![
+                extracted("Alice", "Person", None),
+                extracted("Acme", "Project", None),
+            ],
+            ..Extraction::default()
+        };
+        let (entities, _) = memory
+            .add_extracted(&scope(), &extraction)
+            .await
+            .expect("add");
+        assert_eq!(entities.len(), 2);
+        for entity in &entities {
+            let vector = entity
+                .embedding()
+                .expect("every entity keeps its embedding");
+            assert_eq!(vector, vec![0.25, 0.5, 0.75]);
+        }
     }
 
     #[tokio::test]

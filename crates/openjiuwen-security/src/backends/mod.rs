@@ -10,6 +10,20 @@
 //! pipeline turns assessments into findings and applies the
 //! [`SecurityPolicy`](crate::SecurityPolicy).
 //!
+//! Two rules keep a broken detector from reading as "clean":
+//!
+//! - the payload is projected with the *checked*
+//!   [`GuardrailContext::text_view_checked`](crate::GuardrailContext::text_view_checked),
+//!   so an unscannable payload is an [`Error`](openjiuwen_common::error::Error)
+//!   rather than a pass;
+//! - an unusable reply (an empty body, a non-JSON body, a non-object body, an
+//!   unrecognized vendor schema, or an invalid judge verdict) is an error too,
+//!   which under the default
+//!   [`FailurePolicy::FailClosed`](crate::FailurePolicy::FailClosed) becomes a
+//!   blocking `Critical` finding.
+//!
+//! Only a blank *scannable* payload short-circuits to `safe_assessment`.
+//!
 //! Backends never log or return the scanned text: diagnostics carry backend and
 //! pattern names, stages, levels, and lengths only.
 #![allow(clippy::module_name_repetitions)]
@@ -33,11 +47,21 @@ pub use vendors::{
     AzureContentSafetyConfig, OpenAiModerationBackend, OpenAiModerationConfig,
 };
 
-/// The assessment a backend reports when it finds no risk.
+/// The assessment a backend reports when there is nothing to scan.
 ///
-/// Every backend short-circuits empty text to `has_risk = false`,
-/// [`RiskLevel::Safe`], and `confidence = 1.0` (Python parity), which differs
-/// from [`RiskAssessment::default`] only in its zero confidence.
+/// This is the verdict for a **blank scannable** payload only: the checked text
+/// projection ([`GuardrailContext::text_view_checked`](crate::GuardrailContext::text_view_checked))
+/// succeeded and produced nothing but whitespace (the empty string, or an empty
+/// message array). It reports `has_risk = false`, [`RiskLevel::Safe`], and
+/// `confidence = 1.0`, which differs from [`RiskAssessment::default`] only in
+/// its zero confidence.
+///
+/// It is never the answer to a failure: a payload the projection cannot read
+/// (see `text_view_checked`) and a backend that cannot reach a verdict both
+/// return [`Error`](openjiuwen_common::error::Error) instead, which the pipeline
+/// resolves through its
+/// [`FailurePolicy`](crate::FailurePolicy) (blocking by default). Callers must
+/// therefore never use this value to paper over an error.
 pub(crate) fn safe_assessment() -> RiskAssessment {
     RiskAssessment {
         has_risk: false,

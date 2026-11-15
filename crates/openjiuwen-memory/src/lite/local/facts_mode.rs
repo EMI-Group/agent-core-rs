@@ -32,6 +32,14 @@
 //!   a changed facts directory wins: every fact file is loaded, the cached document is
 //!   rebuilt, and both index documents are re-rendered. When both changed the index wins
 //!   and a warning records the fact.
+//! - An index document that is empty, missing, or holds no entry is "no information", not
+//!   "no facts": the fact files of that level are kept and the entry set of the other
+//!   level still applies. Only a non-empty document expresses a removal, so a truncated or
+//!   emptied `MEMORY.md` can never delete fact files. `import_index` follows the same
+//!   rule; to remove a fact, edit it out of a non-empty document or call `delete`.
+//! - A fact file that does not decode as a fact is left untouched by an export, and its
+//!   path is reported: the store cannot tell a deleted fact from a file it failed to
+//!   parse, so it never deletes what it could not read.
 //! - Importing, exporting, and any refresh that rewrites files run under the cross-process
 //!   [`FileLock`](crate::lite::lock::FileLock) and then the state guard, never the other
 //!   way round. A refresh reached from a reader (or from the embedding refresh hook) holds
@@ -66,13 +74,24 @@ use std::sync::atomic::Ordering;
 use openjiuwen_common::error::{Error, Result};
 
 use crate::lite::fact::CodingFact;
-use crate::lite::facts::{parse_level, render_level, IndexLevel};
+use crate::lite::facts::{level_of, parse_level, render_level, IndexLevel};
 use crate::lite::lock::FileLock;
 use crate::lite::markdown::MarkdownMemory;
 
 use super::layout::{load_document, write_document, FileStamp};
 use super::state::{LocalCodingMemory, LocalState};
 use super::TARGET;
+
+/// What the two rendered index documents say.
+///
+/// `absent` names the levels whose document was missing, empty, or unreadable as facts, so
+/// the caller knows which levels carry no information this time round.
+struct IndexDocuments {
+    /// The facts both documents hold, merged by name (`USER.md` wins a duplicate).
+    facts: Vec<CodingFact>,
+    /// The levels whose document carries no importable entry.
+    absent: Vec<IndexLevel>,
+}
 
 impl LocalCodingMemory {
     /// Whether the per-fact file layout is enabled.
@@ -129,6 +148,12 @@ impl LocalCodingMemory {
     /// derived indices rebuilt. Rendering the imported facts therefore reproduces the
     /// hand-edited document byte for byte.
     ///
+    /// A level whose document is missing or empty carries no information, so the facts of
+    /// that level that the per-fact files already hold are kept: an emptied (or truncated)
+    /// index document never deletes fact files. A genuine removal is expressed by editing a
+    /// non-empty document — delete the entry there, or call
+    /// [`LocalCodingMemory::delete`](crate::lite::local::LocalCodingMemory::delete).
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Unsupported`] when the per-fact layout is disabled, the lock,
@@ -158,7 +183,14 @@ impl LocalCodingMemory {
     /// The caller holds the cross-process file lock.
     pub(super) async fn initialize_fact_files(&self) -> Result<()> {
         let mut state = self.inner.state.lock().await;
-        let stored = self.inner.facts.read_all().await?;
+        let (stored, skipped) = self.inner.facts.read_all_report().await?;
+        if !skipped.is_empty() {
+            tracing::warn!(
+                target: TARGET,
+                count = skipped.len(),
+                "some fact files are not decodable and were skipped while opening the store"
+            );
+        }
         if !stored.is_empty() {
             let _count = self.adopt_facts(&mut state, stored);
         }
@@ -184,11 +216,19 @@ impl LocalCodingMemory {
                 load_document(&self.inner.memory_path, &self.inner.scope).await?;
             state.document = document;
             state.stamp = stamp;
+            state.touch();
             let _bumped = self.inner.reloads.fetch_add(1, Ordering::Relaxed);
             let facts = state.document.facts();
             return self.rebuild_index_from(&facts).await;
         }
-        let stored = self.inner.facts.read_all().await?;
+        let (stored, skipped) = self.inner.facts.read_all_report().await?;
+        if !skipped.is_empty() {
+            tracing::warn!(
+                target: TARGET,
+                count = skipped.len(),
+                "some fact files are not decodable and were skipped by the reindex"
+            );
+        }
         let facts = if stored.is_empty() {
             self.read_index_documents().await?
         } else {
@@ -199,6 +239,7 @@ impl LocalCodingMemory {
                 load_document(&self.inner.memory_path, &self.inner.scope).await?;
             state.document = document;
             state.stamp = stamp;
+            state.touch();
         } else {
             let _count = self.adopt_facts(state, facts);
         }
@@ -234,7 +275,15 @@ impl LocalCodingMemory {
         let facts = if index_changed {
             self.read_index_documents().await?
         } else {
-            self.inner.facts.read_all().await?
+            let (facts, skipped) = self.inner.facts.read_all_report().await?;
+            if !skipped.is_empty() {
+                tracing::warn!(
+                    target: TARGET,
+                    count = skipped.len(),
+                    "some fact files are not decodable and were skipped by the reload"
+                );
+            }
+            facts
         };
         let _count = self.adopt_facts(state, facts);
         if write {
@@ -251,13 +300,25 @@ impl LocalCodingMemory {
 
     /// Writes every fact file, removes the stale ones, renders both index documents, and
     /// records the stamps. The caller holds the file lock and the state guard.
+    ///
+    /// Only a fact file whose content decodes as a fact can be recognized as stale: a file
+    /// that does not decode is left untouched, because the store cannot tell a deleted
+    /// fact from a file it merely failed to parse.
     pub(super) async fn export_locked(&self, state: &mut LocalState) -> Result<usize> {
         let facts = state.document.facts();
         for fact in &facts {
             let _path = self.inner.facts.write(fact).await?;
         }
         let live: BTreeSet<String> = facts.iter().map(|fact| fact.name.clone()).collect();
-        for stored in self.inner.facts.read_all().await? {
+        let (stored, skipped) = self.inner.facts.read_all_report().await?;
+        if !skipped.is_empty() {
+            tracing::warn!(
+                target: TARGET,
+                count = skipped.len(),
+                "leaving undecodable fact files untouched during the export"
+            );
+        }
+        for stored in stored {
             if !live.contains(&stored.name) {
                 let _removed = self.inner.facts.remove(&stored.name).await?;
             }
@@ -277,27 +338,78 @@ impl LocalCodingMemory {
             let _replaced = document.upsert_fact(&fact);
         }
         state.document = document;
+        state.touch();
         facts.len()
     }
 
-    /// Reads and merges both index documents, `USER.md` winning on a duplicate name.
+    /// Reads and merges both index documents into the fact set to adopt.
+    ///
+    /// `USER.md` wins on a duplicate name. A level whose document is missing or empty holds
+    /// no importable entry, so the facts of that level that the per-fact files already hold
+    /// are added back: an empty document is "no information", never "no facts", which keeps
+    /// a truncated or emptied index from deleting every fact file. A name present in both a
+    /// document and the fact files is taken from the document (the hand edit wins).
     pub(super) async fn read_index_documents(&self) -> Result<Vec<CodingFact>> {
+        let documents = self.index_documents().await?;
+        if documents.absent.is_empty() {
+            return Ok(documents.facts);
+        }
+        let (stored, skipped) = self.inner.facts.read_all_report().await?;
+        if !skipped.is_empty() {
+            tracing::warn!(
+                target: TARGET,
+                count = skipped.len(),
+                "some fact files are not decodable and are left untouched by the import"
+            );
+        }
+        let mut merged: BTreeMap<String, CodingFact> = documents
+            .facts
+            .into_iter()
+            .map(|fact| (fact.name.clone(), fact))
+            .collect();
+        let mut kept = 0_usize;
+        for stored in stored {
+            if documents.absent.contains(&level_of(stored.fact_type))
+                && !merged.contains_key(&stored.name)
+            {
+                kept += 1;
+                let _previous = merged.insert(stored.name.clone(), stored);
+            }
+        }
+        if kept > 0 {
+            tracing::warn!(
+                target: TARGET,
+                count = kept,
+                "an index document is missing or empty; keeping the fact files of that level \
+                 instead of treating them as deleted"
+            );
+        }
+        Ok(merged.into_values().collect())
+    }
+
+    /// Reads both index documents and reports which levels were missing or empty.
+    async fn index_documents(&self) -> Result<IndexDocuments> {
         let mut merged: BTreeMap<String, CodingFact> = BTreeMap::new();
+        let mut absent: Vec<IndexLevel> = Vec::new();
         for level in IndexLevel::ALL {
             let path = self.level_path(level);
             let text = match tokio::fs::read_to_string(path).await {
                 Ok(text) => text,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    absent.push(level);
+                    continue;
+                }
                 Err(error) => {
                     return Err(Error::external(error)
                         .with_context(format!("reading the index document {}", path.display())));
                 }
             };
             if text.trim().is_empty() {
+                absent.push(level);
                 continue;
             }
-            for fact in parse_level(&text)? {
-                let mut fact = fact;
+            let facts = parse_level(&text)?;
+            for mut fact in facts {
                 fact.scope = self.inner.scope.clone();
                 if level == IndexLevel::User && merged.contains_key(&fact.name) {
                     tracing::warn!(
@@ -309,7 +421,10 @@ impl LocalCodingMemory {
                 let _previous = merged.insert(fact.name.clone(), fact);
             }
         }
-        Ok(merged.into_values().collect())
+        Ok(IndexDocuments {
+            facts: merged.into_values().collect(),
+            absent,
+        })
     }
 
     /// Renders both index documents from `facts`, writing each atomically.
@@ -617,6 +732,99 @@ mod tests {
         assert!(!read(&store.user_path()).contains("### theme"));
         assert_eq!(store.list().await.expect("the list succeeds").len(), 1);
         assert!(store.facts_dir().join(file_name_for("build")).is_file());
+    }
+
+    #[tokio::test]
+    async fn an_emptied_index_document_keeps_the_fact_files() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = seeded(&temp).await;
+        store.export_index().await.expect("the export succeeds");
+        let build_file = store.facts_dir().join(file_name_for("build"));
+        let theme_file = store.facts_dir().join(file_name_for("theme"));
+        assert!(build_file.is_file(), "the build fact file exists");
+        assert!(theme_file.is_file(), "the theme fact file exists");
+
+        // A truncated (emptied) document is "no information", not "every fact was deleted".
+        std::fs::write(store.memory_path(), "").expect("the truncation is written");
+        let facts = store.list().await.expect("the list succeeds");
+        assert_eq!(
+            sorted(facts).len(),
+            2,
+            "the fact files survive an empty index"
+        );
+        assert!(build_file.is_file(), "the build fact file survives");
+        assert!(theme_file.is_file(), "the theme fact file survives");
+        assert_eq!(store.reload_count(), 1, "the reload happened");
+
+        // The next locked operation restores the projection from the fact files.
+        let count = store.export_index().await.expect("the export succeeds");
+        assert_eq!(count, 2);
+        assert!(read(store.memory_path()).contains("### build"));
+        assert!(read(&store.user_path()).contains("### theme"));
+        assert!(build_file.is_file() && theme_file.is_file());
+    }
+
+    #[tokio::test]
+    async fn importing_an_emptied_index_document_keeps_the_fact_files() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = seeded(&temp).await;
+        store.export_index().await.expect("the export succeeds");
+        let build_file = store.facts_dir().join(file_name_for("build"));
+
+        std::fs::write(store.memory_path(), "   \n").expect("the truncation is written");
+        let count = store.import_index().await.expect("the import succeeds");
+        assert_eq!(count, 2, "the kept fact files are imported back");
+        assert!(
+            build_file.is_file(),
+            "the build fact file survives the import"
+        );
+        assert!(read(store.memory_path()).contains("### build"));
+        assert_eq!(store.list().await.expect("the list succeeds").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn removing_an_entry_from_a_non_empty_index_deletes_the_fact_file() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = seeded(&temp).await;
+        store.export_index().await.expect("the export succeeds");
+        let build_file = store.facts_dir().join(file_name_for("build"));
+        assert!(build_file.is_file());
+
+        // A non-empty document lists the facts of its level, so dropping the entry is a
+        // genuine removal: the fact file goes away and `USER.md` keeps its own fact.
+        let rendered = read(store.memory_path());
+        let without_build = rendered
+            .split("### build")
+            .next()
+            .expect("the prefix before the entry")
+            .to_owned();
+        assert!(!without_build.contains("### build"));
+        std::fs::write(store.memory_path(), &without_build).expect("the removal is written");
+
+        let count = store.import_index().await.expect("the import succeeds");
+        assert_eq!(count, 1);
+        assert!(!build_file.is_file(), "the removed fact file is deleted");
+        let facts = store.list().await.expect("the list succeeds");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].name, "theme");
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_fact_file_is_reported_and_never_deleted() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = seeded(&temp).await;
+        store.export_index().await.expect("the export succeeds");
+        let prose = store.facts_dir().join("hand-written.md");
+        std::fs::write(&prose, "just prose, not a coding fact\n").expect("the stray file");
+
+        let count = store.export_index().await.expect("the export succeeds");
+        assert_eq!(count, 2);
+        assert!(prose.is_file(), "an undecodable file is left untouched");
+
+        // The delete path removes only the fact it names, never the stray file.
+        assert!(store.delete("build").await.expect("the delete succeeds"));
+        assert!(prose.is_file(), "the stray file survives the delete");
+        assert_eq!(store.list().await.expect("the list succeeds").len(), 1);
     }
 
     #[tokio::test]
