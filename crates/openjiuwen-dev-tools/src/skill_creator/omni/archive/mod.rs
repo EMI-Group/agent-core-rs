@@ -19,6 +19,20 @@
 //! is available offline, so [`ArchiveUnpacker::unpack`] answers them with
 //! [`Error::unsupported`] naming the codec instead of guessing.
 //!
+//! `zip` is the only container here that can carry an encrypted entry.
+//! Traditional PKWARE encryption (`ZipCrypto`, general-purpose flag bit 0) is
+//! decrypted when the caller supplies a password through [`UnpackOptions`], the
+//! opt-in companion of [`ArchiveUnpacker::unpack_with_options`] and
+//! [`ArchiveUnpacker::unpack_auto_with_options`]; `unpack`/`unpack_auto` stay the
+//! no-password shorthand, so an encrypted entry read through them is a
+//! [`Error::validation`] naming the entry and the option to set. The three
+//! schemes this reader does not implement stay typed [`Error::unsupported`]:
+//! `WinZip` AES (compression method `99` or the `0x9901` extra field), PKWARE
+//! strong encryption (flag bit 6), and an encrypted central directory (flag bit
+//! 13). A password is ignored for `tar` and `gzip`, which cannot declare one,
+//! and it only reaches a top-level `zip`: a `zip` nested inside a `gzip` wrapper
+//! is read by the `gzip` decoder's own no-password path.
+//!
 //! Every entry path is validated before it is returned: absolute paths, `..`
 //! components, and backslashes are rejected, so a caller can never write outside
 //! the bundle root. Unpacking is bounded by [`MAX_ENTRY_UNCOMPRESSED_BYTES`] per
@@ -133,11 +147,67 @@ pub struct ArchiveEntry {
     pub mode: Option<u32>,
 }
 
+/// Options for unpacking an archive that needs more than its bytes.
+///
+/// Today the only option is the `ZipCrypto` password: a `zip` entry whose
+/// general-purpose flag bit 0 is set can only be read when its password is
+/// supplied here. Every format that cannot be encrypted (`tar`) or that declares
+/// no encryption (`gzip`) ignores the password, and an empty password is a
+/// validation error rather than a silent attempt, because the scheme's empty
+/// password is its identity.
+///
+/// The default value carries no password, exactly like
+/// [`ArchiveUnpacker::unpack`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct UnpackOptions {
+    /// The password of a traditional PKWARE (`ZipCrypto`) encrypted `zip` entry.
+    ///
+    /// Its UTF-8 bytes seed the entry's keys, which is exact for the ASCII
+    /// passwords every `zip` writer accepts; a password an archiver interpreted
+    /// in another code page cannot be reproduced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl UnpackOptions {
+    /// Options that carry no password.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { password: None }
+    }
+
+    /// The same options with `password` set for `ZipCrypto` entries.
+    #[must_use]
+    pub fn with_password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    /// Rejects an empty password.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::validation`] when `password` is `Some("")`: an empty
+    /// password leaves the `ZipCrypto` keys at their initial values, so it can
+    /// only ever be a mistake.
+    pub fn validate(&self) -> Result<()> {
+        if self.password.as_deref() == Some("") {
+            return Err(Error::validation(
+                "invalid unpack options: the password is empty, and a ZipCrypto entry needs its \
+                 non-empty password",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Associated functions for sniffing and unpacking archives.
 ///
 /// This type is never instantiated: it only groups the entry points so call
 /// sites read as [`ArchiveUnpacker::unpack`] / [`ArchiveUnpacker::unpack_auto`],
-/// matching the associated-function style of `SkillBundle`.
+/// matching the associated-function style of `SkillBundle`. Passwords travel
+/// through the `*_with_options` variants.
 #[derive(Debug, Clone, Copy)]
 pub struct ArchiveUnpacker;
 
@@ -147,17 +217,49 @@ impl ArchiveUnpacker {
     /// `tar`, `zip`, and `gzip` are decoded in-process. `bzip2`, `xz`, and
     /// `zstd` are recognized containers this reader cannot decode.
     ///
+    /// This is the no-password shorthand for
+    /// [`unpack_with_options`](Self::unpack_with_options).
+    ///
     /// # Errors
     ///
     /// Returns [`Error::validation`] for malformed, truncated, unsafe, or
-    /// oversized content, and [`Error::unsupported`] for capabilities this
-    /// in-process implementation deliberately does not provide (ZIP64, encrypted
-    /// entries, compression methods other than stored and DEFLATE, and the
-    /// `bzip2`, `xz`, and `zstd` codecs, which no bundled decoder handles).
+    /// oversized content and for an encrypted `zip` entry, which needs a
+    /// password, and [`Error::unsupported`] for capabilities this in-process
+    /// implementation deliberately does not provide (`WinZip` AES, PKWARE strong
+    /// encryption and encrypted central directories, compression methods other
+    /// than stored and DEFLATE, and the `bzip2`, `xz`, and `zstd` codecs, which
+    /// no bundled decoder handles).
     pub fn unpack(format: ArchiveFormat, bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
+        Self::unpack_with_options(format, bytes, &UnpackOptions::new())
+    }
+
+    /// Unpacks `bytes` as `format` with `options`, returning entries in archive
+    /// order.
+    ///
+    /// A `zip` entry protected by traditional PKWARE encryption (`ZipCrypto`) is
+    /// decrypted with [`UnpackOptions::password`]; every other format ignores it,
+    /// because `tar` cannot encrypt an entry and `gzip` declares no encryption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::validation`] for unusable options (an empty password),
+    /// malformed, truncated, unsafe, or oversized content, and an encrypted entry
+    /// with no password or a password that fails the entry's check byte; and
+    /// [`Error::unsupported`] for `WinZip` AES, PKWARE strong encryption, an
+    /// encrypted central directory, compression methods other than stored and
+    /// DEFLATE, and the `bzip2`, `xz`, and `zstd` codecs.
+    pub fn unpack_with_options(
+        format: ArchiveFormat,
+        bytes: &[u8],
+        options: &UnpackOptions,
+    ) -> Result<Vec<ArchiveEntry>> {
+        options.validate()?;
         match format {
             ArchiveFormat::Tar => tar::unpack(bytes),
-            ArchiveFormat::Zip => zip::unpack(bytes),
+            ArchiveFormat::Zip => match options.password.as_deref() {
+                Some(password) => zip::unpack_with_password(bytes, Some(password)),
+                None => zip::unpack(bytes),
+            },
             ArchiveFormat::Gzip => gzip::unpack(bytes),
             ArchiveFormat::Bzip2 => Err(decoder_unavailable("bzip2")),
             ArchiveFormat::Xz => Err(decoder_unavailable("xz")),
@@ -167,21 +269,41 @@ impl ArchiveUnpacker {
 
     /// Sniffs the format with [`detect`] and then [`unpack`](Self::unpack)s it.
     ///
+    /// This is the no-password shorthand for
+    /// [`unpack_auto_with_options`](Self::unpack_auto_with_options).
+    ///
     /// # Errors
     ///
     /// Returns [`Error::validation`] when the bytes carry no recognized archive
     /// signature, plus everything [`unpack`](Self::unpack) can return — in
     /// particular [`Error::unsupported`] naming `bzip2`, `xz`, or `zstd`.
     pub fn unpack_auto(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
-        let format = detect(bytes).ok_or_else(|| {
-            Error::validation(format!(
-                "unrecognized archive: no gzip, zip, ustar, bzip2, xz, or zstd signature in {} \
-                 bytes",
-                bytes.len()
-            ))
-        })?;
+        let format = detect(bytes).ok_or_else(|| undetected(bytes.len()))?;
         Self::unpack(format, bytes)
     }
+
+    /// Sniffs the format with [`detect`] and then
+    /// [`unpack_with_options`](Self::unpack_with_options) it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::validation`] when the bytes carry no recognized archive
+    /// signature, plus everything
+    /// [`unpack_with_options`](Self::unpack_with_options) can return.
+    pub fn unpack_auto_with_options(
+        bytes: &[u8],
+        options: &UnpackOptions,
+    ) -> Result<Vec<ArchiveEntry>> {
+        let format = detect(bytes).ok_or_else(|| undetected(bytes.len()))?;
+        Self::unpack_with_options(format, bytes, options)
+    }
+}
+
+/// The [`Error::validation`] answer for bytes with no archive signature.
+fn undetected(len: usize) -> Error {
+    Error::validation(format!(
+        "unrecognized archive: no gzip, zip, ustar, bzip2, xz, or zstd signature in {len} bytes"
+    ))
 }
 
 /// The [`Error::unsupported`] answer for a container this reader cannot decode.
@@ -578,5 +700,82 @@ mod tests {
             .charge(MAX_ENTRY_UNCOMPRESSED_BYTES + 1, "entry")
             .expect_err("per-entry cap");
         assert!(error.to_string().contains("per-entry"), "{error}");
+    }
+
+    #[test]
+    fn unpack_options_default_to_no_password_and_round_trip_through_json() {
+        let empty = UnpackOptions::default();
+        assert_eq!(empty, UnpackOptions::new());
+        assert_eq!(empty.password, None);
+        // An absent password stays out of the payload rather than becoming `null`.
+        assert_eq!(
+            serde_json::to_value(&empty).expect("serializes"),
+            serde_json::json!({})
+        );
+
+        let options = UnpackOptions::new().with_password("hunter2");
+        let json = serde_json::to_value(&options).expect("serializes");
+        assert_eq!(json, serde_json::json!({"password": "hunter2"}));
+        let decoded: UnpackOptions = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(decoded, options);
+
+        // A legacy payload without the key, and unknown keys, both deserialize.
+        let legacy: UnpackOptions =
+            serde_json::from_value(serde_json::json!({})).expect("no password");
+        assert_eq!(legacy, empty);
+        let tolerant: UnpackOptions = serde_json::from_value(serde_json::json!({
+            "password": "secret",
+            "unknown": 1,
+        }))
+        .expect("unknown fields are tolerated");
+        assert_eq!(tolerant.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn unpack_options_reject_an_empty_password() {
+        UnpackOptions::new()
+            .validate()
+            .expect("no password is usable");
+        UnpackOptions::new()
+            .with_password("hunter2")
+            .validate()
+            .expect("a password is usable");
+        let error = UnpackOptions::new()
+            .with_password("")
+            .validate()
+            .expect_err("an empty password is a mistake");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Validation
+        );
+        assert!(error.to_string().contains("empty"), "{error}");
+
+        // The dispatcher validates before it looks at a single byte, so an empty
+        // password is the same typed answer for every format.
+        let error = ArchiveUnpacker::unpack_with_options(
+            ArchiveFormat::Tar,
+            b"not even a tar",
+            &UnpackOptions::new().with_password(""),
+        )
+        .expect_err("empty password");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Validation
+        );
+        assert!(error.to_string().contains("empty"), "{error}");
+    }
+
+    #[test]
+    fn a_password_is_ignored_by_the_formats_that_cannot_be_encrypted() {
+        // A `tar` payload carrying no entry at all: two zero blocks. The password
+        // cannot make it any less readable, and an empty archive is valid.
+        let archive = [0_u8; 1024];
+        let entries = ArchiveUnpacker::unpack_with_options(
+            ArchiveFormat::Tar,
+            &archive,
+            &UnpackOptions::new().with_password("hunter2"),
+        )
+        .expect("tar ignores the password");
+        assert_eq!(entries, Vec::new());
     }
 }
