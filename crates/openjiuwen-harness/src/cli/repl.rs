@@ -324,7 +324,7 @@ impl Repl {
     /// The kernel session is rebuilt around `id`, so every following
     /// [`Repl::run_turn`] continues that kernel session and the REPL record
     /// [`Repl::run_turn`] maintains is the existing `<home>/sessions/<id>.json`
-    /// — appended to, never truncated (unlike [`Repl::start_new_session`]). The
+    /// — appended to, never truncated (unlike `Repl::start_new_session`). The
     /// caller owns the transcript: seed it from a
     /// [`ResumePlan`](crate::persistent_agent::ResumePlan) with
     /// [`Repl::seed_history`] *before* the first turn, after any

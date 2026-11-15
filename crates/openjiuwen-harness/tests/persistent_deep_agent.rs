@@ -118,7 +118,10 @@ async fn assert_first_turn_recorded(
         .open_log(&execution.execution_id)
         .await?;
     let entries = log.read().await?.entries;
-    let kinds: Vec<EntryKind> = entries.iter().map(|entry| entry.kind()).collect();
+    let kinds: Vec<EntryKind> = entries
+        .iter()
+        .map(openjiuwen_harness::ExecutionEntry::kind)
+        .collect();
     ensure!(
         kinds.len() == 3
             && kinds[0] == EntryKind::ExecutionStarted

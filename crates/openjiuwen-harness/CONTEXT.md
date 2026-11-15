@@ -76,7 +76,7 @@ Every public item is also re-exported flat from the crate root.
 `tools` ← `schema`, `workspace`, `permission`, `lsp`, `worktree`, sysop/foundation, kernel memory.
 `subagents` ← `schema`, `prompts`, agent runtime.
 `task_loop` ← `schema`, agent.
-`agent` ← all of the above (facade).
+`agent` ← all of the above (facade); it also drives `persistent_agent::recording` when `DeepAgentConfig::persistent_agent` is on.
 `protocol` ← `agent`, `schema`, `openjiuwen-harness-protocol`.
 `spec` ← `agent`, `schema`, `tools`, `skills`, `subagents`.
 `lsp`, `worktree` ← `schema`, `permission`, sysop; no harness module above them.
@@ -194,14 +194,14 @@ Every public item is also re-exported flat from the crate root.
 - Protocol tests drive `NativeHarness` end to end (start/send/events/stop/checkpoint) and assert capability gating.
 - Tool tests assert exact names/JSON schemas/description tables and `success=false` error payloads; web/media/cron/goal/spec/worktree suites use injected fetchers, fixture bytes, scripted git output and frozen clocks.
 - `tests/memory_tools.rs` drives the eight memory tools (never the backend) over a temp workspace: Python path mapping, line windows, payload shapes, edit failures, keyword-search results, typed traversal failures, and that `DeepAgentBuilder` mounts the backend by default.
-- `tests/subagent_spawner.rs` proves a built `DeepAgent` exposes a working spawner over its own runtime, a caller-supplied `subagent` rail still wins, an agent without sub-agents has none, and the concurrency ledger rejects the extra live spawn and frees the slot at a terminal instance.
-- `tests/persistent_deep_agent.rs` journals two real turns with `persistent_agent` on, re-derives execution/catalogue/journal/session from disk alone, resumes into a continued transcript, and asserts recording is off by default.
 - Subagent tests cover quota refusals and frees, per-parent/depth limits, LRU eviction with transcript digests, and persistence round-trips.
+- `tests/subagent_spawner.rs` proves a built `DeepAgent` exposes a working spawner over its own runtime, a caller-supplied `subagent` rail still wins, an agent without sub-agents has none, and the concurrency ledger rejects the extra live spawn and frees the slot at a terminal instance.
 - CLI tests inject reader/writer/env/home/shell/model and assert slash commands, history round-trip, colour opt-out byte output, instruction precedence, MCP config errors, allow-rule YAML write-back, `!cmd`, skill slash, the onboarding paths, resumed-run output parity and that seeding precedes the new query in the model request.
 - LSP tests cover framing edge cases, transport lifecycles, timeout/cancel/retry, diagnostics push+pull, discovery, a fake in-process server, and every text form (`LspToolConfig` spec, `LspAction` spellings, `LspArgs` grammar) with its error paths and `Display` round-trips.
 - Cron tests cover both grammars, every action's happy and failure path, run-history rotation and cross-instance persistence with frozen clocks.
 - MoA tests use scripted proposers for fan-out, partial/all-fail, ranking, aggregation, rail activation and history round-trips.
 - Persistent-agent tests append/rotate/reopen a journal, resume after a simulated crash, assemble windows under tight budgets, assert share-bundle/`Unsupported` behaviour, enumerate a log root and a session store, and round-trip a `ResumePlan` through JSON.
+- `tests/persistent_deep_agent.rs` journals two real turns with `persistent_agent` on, re-derives execution/catalogue/journal/session from disk alone, resumes into a continued transcript, and asserts recording is off by default.
 - Host resume tests run turn one through the CLI path, drop every handle, rediscover the execution and session from disk only, then continue the CLI record with `run_with_model_resumed`, asserting the rebuilt window precedes the new query and the transcript is continued rather than truncated.
 - Watcher tests (feature `notify`) drive OS notifications over a temp workspace: create/modify/remove delivery, burst coalescing, reload handlers, error storms and idempotent shutdown; the feature-off build asserts the typed `Unsupported` reason; `WatcherConfig` has its own feature-independent `FromStr`/`Display` suite.
 - Rails tests cover heartbeat cadence with an injected clock, KV-cache affinity/release, personal-context path safety, ingestion and BM25F recall.
