@@ -176,6 +176,18 @@ pub fn sandbox_launcher_message(process: &str, reason: &str) -> String {
     format!("sandbox launcher error, process: {process}, reason: {reason}")
 }
 
+/// `sandbox launcher unsupported, launcher: {launcher}, process: {process}, reason: {reason}`.
+///
+/// No status code: this text belongs to [`openjiuwen_common::error::ErrorKind::Unsupported`]
+/// errors, which report a capability the launcher does not have rather than a failed call
+/// (code 199008, [`sandbox_launcher_message`]).
+#[must_use]
+pub fn unsupported_launcher_message(launcher: &str, process: &str, reason: &str) -> String {
+    format!(
+        "sandbox launcher unsupported, launcher: {launcher}, process: {process}, reason: {reason}"
+    )
+}
+
 /// `sandbox provider error, process: {process}, reason: {reason}` (199009).
 #[must_use]
 pub fn sandbox_provider_message(process: &str, reason: &str) -> String {
@@ -271,6 +283,11 @@ mod tests {
         assert_eq!(
             sandbox_launcher_message("launch", "down"),
             "sandbox launcher error, process: launch, reason: down"
+        );
+        assert_eq!(
+            unsupported_launcher_message("pre_deploy", "delete", "cannot destroy containers"),
+            "sandbox launcher unsupported, launcher: pre_deploy, process: delete, reason: \
+             cannot destroy containers"
         );
         assert_eq!(
             sandbox_provider_message("create", "down"),
