@@ -175,6 +175,7 @@ Absent or typed `Error::Unsupported`, listed here rather than stubbed:
 ## Notes for Agents
 
 - A `//!` doc block cannot link items defined in the same file module; write `[`X`](crate::retrieval::types::X)`.
+- `types.rs`, `artifacts.rs`, `build/scanner.rs` and `build/workflows.rs` sit just over the 1000-line soft cap because their `#[cfg(test)]` suites must stay in-file; their non-test halves are under it, so do not split them further on size alone.
 - The artifact bytes are a contract: changing `render_tree_yaml`/`render_catalog`/`render_manifest` breaks index compatibility with Python's loader, and `catalog_content_hash` covers the catalog only.
 - Never write a cid containing a dot, a blank segment, or a `.`/`..` segment; `parse_tree_yaml` and `build_tree_root` trust the prefix rule.
 - `tests/retrieval_build.rs` and `tests/retrieval_artifacts.rs` share a 1–10 coverage numbering; keep it ascending when adding cases.
