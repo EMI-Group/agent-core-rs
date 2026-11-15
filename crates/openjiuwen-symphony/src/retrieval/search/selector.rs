@@ -209,7 +209,7 @@ impl LexicalTopKSelector {
 /// - the expression is bounded by [`MAX_QUERY_CHARS`] by dropping trailing alternatives,
 ///   never by cutting inside one — except for a single token longer than the bound, which
 ///   is cut on a character boundary.
-fn ranking_expression(text: &str) -> String {
+pub(crate) fn ranking_expression(text: &str) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<&str>>().join(" ");
     if collapsed.is_empty() {
         return String::new();
@@ -240,7 +240,7 @@ fn ranking_expression(text: &str) -> String {
 ///
 /// The body and the aliases stay empty: the exposure carries no long text for a candidate,
 /// which is exactly what Python's tree walk sees too.
-fn document(target: &SelectableTarget) -> LexicalDocument {
+pub(crate) fn document(target: &SelectableTarget) -> LexicalDocument {
     LexicalDocument {
         key: target.resolution.canonical_id.clone(),
         name: target.resolution.display_name.clone(),
@@ -392,7 +392,7 @@ impl TopKSelector for DefaultTopKSelector {
 }
 
 /// Records the one `fragment_selected` event of a selection.
-fn record_selection(
+pub(crate) fn record_selection(
     trace: &mut RetrieverTrace,
     cursor: &SearchCursor,
     mode: &str,

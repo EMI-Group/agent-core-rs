@@ -60,6 +60,7 @@
 //! the embedding path is additive and reuses `openjiuwen-retrieval`'s
 //! [`Embedding`](openjiuwen_retrieval::Embedding) trait.
 
+pub mod blend_selector;
 pub mod codebooks;
 pub mod config;
 pub mod contracts;
@@ -74,6 +75,7 @@ pub mod selector;
 pub mod subtree;
 pub mod truncation;
 
+pub use blend_selector::{EmbeddingBlendedTopKSelector, MODE_EMBEDDING_BLEND};
 pub use codebooks::{
     default_compact_boundary_codebook, CodeTrie, CompactCodebook, DEFAULT_COMPACT_CODEBOOK_SIZE,
 };
