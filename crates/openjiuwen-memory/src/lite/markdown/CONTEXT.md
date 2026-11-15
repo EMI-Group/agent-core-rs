@@ -4,6 +4,7 @@
 
 The Markdown source of truth of the lite coding memory: one `MEMORY.md` document per scope, with a `---` front-matter block, a title, and one section per coding-fact type.
 Parsing is total for free-form input; rendering emits the single canonical shape that parsing round-trips byte for byte.
+A hand edit may repeat an entry, leave a bullet that is not `- key: value` inside an attribute block, or carry a timestamp the crate cannot parse; each is kept in a defined way rather than rejected.
 The directory splits the format in three: `front_matter.rs` owns the `---` block, `document.rs` owns the document model and the fact entries, and `tests.rs` holds the contract tests; the public paths are `crate::lite::markdown::MarkdownMemory` and `crate::lite::markdown::FrontMatter`.
 
 ## API Surface
