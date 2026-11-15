@@ -15,6 +15,7 @@
 //! handshake that exceeds the connection timeout is
 //! [`openjiuwen_common::error::ErrorKind::Timeout`].
 use openjiuwen_common::error::{Error, Result};
+use std::result::Result as StdResult;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -53,20 +54,15 @@ pub(super) async fn handshake(
 
 /// The process-wide client configuration (built once, including the trust roots).
 fn client_config() -> Result<&'static Arc<ClientConfig>> {
-    static CONFIG: OnceLock<Option<Arc<ClientConfig>>> = OnceLock::new();
+    static CONFIG: OnceLock<StdResult<Arc<ClientConfig>, String>> = OnceLock::new();
     CONFIG
         .get_or_init(build_client_config)
         .as_ref()
-        .ok_or_else(|| {
-            Error::transport(
-                "redis TLS is unavailable: rustls rejected the default protocol versions for the \
-             `ring` crypto provider",
-            )
-        })
+        .map_err(|reason| Error::transport(format!("redis TLS is unavailable: {reason}")))
 }
 
-/// Builds the client configuration, or `None` when rustls rejects the versions.
-fn build_client_config() -> Option<Arc<ClientConfig>> {
+/// Builds the client configuration, carrying rustls' own reason on failure.
+fn build_client_config() -> StdResult<Arc<ClientConfig>, String> {
     let provider = tokio_rustls::rustls::crypto::ring::default_provider();
     // A host application may already have installed a provider; the client always
     // builds with `ring` explicitly, so an existing default is simply kept.
@@ -75,8 +71,13 @@ fn build_client_config() -> Option<Arc<ClientConfig>> {
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let builder = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
-        .ok()?;
-    Some(Arc::new(
+        .map_err(|error| {
+            format!(
+                "rustls rejected the default protocol versions for the `ring` crypto provider: \
+                 {error}"
+            )
+        })?;
+    Ok(Arc::new(
         builder.with_root_certificates(roots).with_no_client_auth(),
     ))
 }
