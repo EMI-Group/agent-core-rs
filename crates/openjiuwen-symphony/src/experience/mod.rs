@@ -15,8 +15,11 @@
 //!   dedupe, and search.
 //! - [`ExperienceIndex`](crate::experience::ExperienceIndex) — the persisted,
 //!   embedding-backed catalog: one vector per item, a JSONL scalar file, and an integrity
-//!   manifest under an index directory (Python's `ExperienceBank(index_dir, ...)` layout
-//!   without faiss).
+//!   manifest under an index directory (Python's `ExperienceBank(index_dir, ...)` layout,
+//!   with a JSON vector matrix instead of numpy and faiss). Its vector algorithm is `flat`
+//!   by default; an IVF factory name adds a trained coarse quantiser and probe search
+//!   ([`ExperienceIndex::new_with_algorithm`](crate::experience::ExperienceIndex::new_with_algorithm),
+//!   [`ExperienceIndex::open_with_algorithm`](crate::experience::ExperienceIndex::open_with_algorithm)).
 //! - [`ExperienceHit`](crate::experience::ExperienceHit),
 //!   [`ExperienceRanking`](crate::experience::ExperienceRanking), and
 //!   [`SearchOptions`](crate::experience::SearchOptions) — the ranking configuration and
@@ -29,7 +32,7 @@
 //! [`ExperienceStore`](crate::experience::ExperienceStore), and re-derives embeddings at
 //! search time. [`ExperienceIndex`](crate::experience::ExperienceIndex) is the durable
 //! embedding catalog: it persists the vectors next to the items, rehydrates them on open
-//! instead of re-embedding, and keeps an integrity manifest of both files. Both share the
+//! instead of re-embedding, and keeps an integrity manifest of the data files. Both share the
 //! generated-id counter, the dedupe merge (the crate-private `merge_item`), and the ranking
 //! helpers, so an item behaves identically in either.
 //!
@@ -44,6 +47,14 @@
 //! `search_by_embedding` applies its `threshold` after `faiss.search` truncation, and
 //! the port keeps that order so a low `top_k` behaves identically.
 //!
+//! A flat [`ExperienceIndex`](crate::experience::ExperienceIndex) scores every stored
+//! vector. An IVF index adds one step before that rank: the normalised query probes
+//! [`ExperienceIndex::nprobe`](crate::experience::ExperienceIndex::nprobe) coarse lists of
+//! the deterministic quantiser and only the gathered candidates are scored, so
+//! `nprobe >= nlist` reproduces the flat neighbour list exactly. The test is a recall
+//! trade-off only; no vector is compressed, because a factory name's `pq<m>` part is
+//! recorded rather than applied.
+//!
 //! # Intentional difference: deterministic dedupe
 //!
 //! Python's bank appends blindly and treats `id` as the only key, so two entries with
@@ -54,7 +65,8 @@
 //! `last_hit_at` wins, and an existing embedding survives. The merge keeps the id of the
 //! entry that was stored first.
 //!
-//! `bank.rs` holds the store-backed catalog, `index/` the persisted embedding catalog,
+//! `bank.rs` holds the store-backed catalog, `index/` the persisted embedding catalog (the
+//! algorithm grammar, the coarse quantiser and the on-disk layout in its own submodules),
 //! `store.rs` the persistence seam and its backends, and `ranking.rs` the hit type, ranking
 //! configuration, and scoring helpers.
 //!
@@ -62,12 +74,15 @@
 //!
 //! `trace/` parses agent-runtime session exports into
 //! [`TraceRecord`](crate::experience::TraceRecord)s and caches them next to the sessions;
-//! `cluster.rs` groups those records by skill set and query topic; `collector.rs` turns
-//! each cluster into an [`ExperienceItem`](crate::experience::ExperienceItem) and writes
-//! it into an [`ExperienceBank`](crate::experience::ExperienceBank) or an
+//! `cluster.rs` groups those records by skill set and then runs a deterministic k-means over
+//! the query embeddings; `collector.rs` turns each cluster into an
+//! [`ExperienceItem`](crate::experience::ExperienceItem) and writes it into an
+//! [`ExperienceBank`](crate::experience::ExperienceBank) or an
 //! [`ExperienceIndex`](crate::experience::ExperienceIndex). Python's LLM distillation is
 //! replaced by the cluster's centroid query and a deterministic token-similarity merge, so
-//! the whole input half works offline.
+//! the whole input half works offline: [`cluster_traces`](crate::experience::cluster_traces)
+//! runs the same k-means over `HashEmbedding` vectors, and a collector with a real embedder
+//! uses the asynchronous entry point.
 //!
 //! # Query-time retrieval, batching, and grading
 //!
