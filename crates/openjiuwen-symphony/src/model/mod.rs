@@ -23,6 +23,8 @@ pub mod descriptor;
 pub mod fingerprint;
 /// Deterministic name normalization and fuzzy name comparison.
 pub mod naming;
+/// I/O-name and I/O-spec normalization with a full audit trail.
+pub mod normalization;
 
 pub use datatype::{normalize_type, DataTypeVocabulary};
 pub use descriptor::{CapabilityDescriptor, CapabilityIo, CapabilityKey, DEFAULT_IO_TYPE};
@@ -31,3 +33,10 @@ pub use fingerprint::{
     FINGERPRINT_VERSION,
 };
 pub use naming::{fuzzy_name_distance, fuzzy_name_similarity, normalize_name_key};
+pub use normalization::{
+    builtin_io_name_vocabulary, normalize_io_name, normalize_io_specs,
+    normalize_io_specs_for_direction, normalize_io_specs_with_audit,
+    normalize_io_specs_with_issues, sanitize_io_specs, DataTypeResolution, DataTypeSource,
+    IONameResolution, IONameTerm, IONameVocabulary, IONormalizationResult, IoDirection,
+    NormalizationDecision, NormalizationIssue, IO_NAME_VOCAB_VERSION,
+};
