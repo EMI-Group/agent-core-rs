@@ -104,7 +104,7 @@ Re-exports:
 
 ## Consumer contract (outside the crate)
 
-- Every item in `mod.rs` is `pub` and flat re-exported from `persistent_agent`; the crate-root list in `src/lib.rs` names the pre-existing surface (`resume`, `ResumePlan`, `FileSessionStore`, …) but not yet the discovery additions (`ExecutionCatalog`, `ExecutionSummary`, `SessionSummary`, `PersistentAgentLayout`, `percent_decode_identifier`, `PERSISTENT_AGENT_NODE`/`LOGS_DIR`/`SESSIONS_DIR`/`LINKS_DIR`), so those are reachable today only as `openjiuwen_harness::persistent_agent::…`.
+- Every item in `mod.rs` is `pub` and flat re-exported from `persistent_agent`, and the crate-root `pub use persistent_agent::{…}` block in `src/lib.rs` re-exports the whole surface — the discovery additions (`ExecutionCatalog`, `ExecutionSummary`, `SessionSummary`, `PersistentAgentLayout`, `percent_decode_identifier`, `PERSISTENT_AGENT_NODE`/`LOGS_DIR`/`SESSIONS_DIR`/`LINKS_DIR`) included — so both `openjiuwen_harness::X` and `openjiuwen_harness::persistent_agent::X` resolve.
 - No other part of the crate consumes this module: `src/cli/`, `src/agent/` and `src/protocol/` contain zero references to `persistent_agent`, `ResumePlan`, `PersistentSessionRecord` or `WindowAssembly`, so nothing feeds a `ResumePlan` or its `WindowAssembly::messages` back into `run_once`, `Repl`, `DeepAgent::invoke`/`stream` or `NativeHarness`.
 - Re-seeding a model window is kernel-shaped, not module-shaped: `ContextOptions::history` / `ContextEngine::load_contexts` (`crates/openjiuwen-context/src/engine_options.rs`, `engine/persistence.rs:60`) or a custom `HarnessRail::before_model_call` mutating `RailContext::messages`; `ResumePlan::seed_messages`/`seed_history` are the plan-side source those paths can be fed from.
 - Discovery is module-side: `ExecutionCatalog::list` enumerates executions under a log root, `FileSessionStore::list` enumerates session records, and `PersistentAgentLayout` names the three standard roots, so a host no longer has to `read_dir` the roots itself or guess the subdirectory names.
@@ -143,6 +143,7 @@ Re-exports:
 - Opening recomputes the counters by scanning the segments and rewrites `meta.json`, so reopening is idempotent and a stale metadata generation never loses entries.
 - A read skips empty, unparseable, zero-`seq` and non-RFC-3339 lines into `skipped_invalid`, collapses exact duplicates by `digest()`, drops a whole sequence group whose members disagree, and reports gaps from `1` before retention trimming.
 - A torn trailing line stays in place rather than being truncated: the next append opens the file in append mode, and the invalid line is skipped by every later read.
+- Appends are one `O_APPEND` `write_all` per line with no `fsync`/`flush` anywhere in the module, so durability is process-crash level: a killed process can leave a torn tail line that every later read skips, an OS-level crash can lose the tail entries that were never flushed.
 - `LogDigest::tool_outcomes` is keyed by the status's snake-case string because `ToolStatus` is not `Ord`, which keeps the map serde-serializable and its rendering deterministic.
 - `LogSnapshot::replay()` reports `generation = 0` because a snapshot does not carry the segment counter; `ExecutionLog::cursor()` and `ExecutionLog::replay()` report the live value.
 - `ExecutionLog::for_workspace`, `next_seq` and `cursor` are async because each reads the same write mutex an append takes.
@@ -167,6 +168,7 @@ Re-exports:
 - The emitter advances `local_seq` before the sink call, so a failed ordinary sink write leaves a gap but never a duplicate; critical frames (`tool_intent`, `execution_paused`, `execution_final`) propagate the sink error.
 - `emit_ending` retries the same numbered event once, so a host that saw the failed attempt deduplicates by `event_id`.
 - Event spellings are snake_case (`execution_started`), where Python's lifecycle frames are dotted (`execution.started`).
+- `EventType` declares eleven kinds but `PersistentEvent` only has nine bodies, so `ParticipationDecided` and `OutputProposed` are nameable spellings that cannot be emitted; the nine variants map one-to-one through `event_type()`.
 - Model call ids are deterministic (`mc_` + 32 hex characters of a digest over identity + iteration) where Python uses `uuid4`; the id stays opaque and stable across a retry.
 - `ModelCallRail` answers a denial with `Error::Config` naming the gate's reason; the task loop owns the pause, so the rail owns only the decision's record.
 - A `ModelCallGate::report` failure is logged and never aborts the run, and a missing tool-call id gets a synthetic stable key (`name:index`) so an intent and its outcome still match.
