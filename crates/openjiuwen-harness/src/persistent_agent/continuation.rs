@@ -14,11 +14,12 @@
 // Size note: ~700 lines of implementation plus an inline test module; the overrun is the test
 // module below, which verifies resume against real temporary journals and link stores.
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
+use openjiuwen_foundation::prompt::message::BaseMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -258,6 +259,12 @@ impl FileLinkStore {
         Self { root: root.into() }
     }
 
+    /// Returns the root directory the per-execution links live under.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Returns the file holding the link of `execution_id`.
     #[must_use]
     pub fn link_path(&self, execution_id: &str) -> PathBuf {
@@ -321,19 +328,45 @@ impl RootLogSource {
         self.clock = clock;
         self
     }
+
+    /// Returns the root directory the per-execution journals live under.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Returns the journal directory of `execution_id`.
+    ///
+    /// This is the one definition of the layout: [`ExecutionCatalog`](super::catalog::ExecutionCatalog)
+    /// and [`ExecutionLogSource::open_log`] both use it.
+    #[must_use]
+    pub fn dir_for(&self, execution_id: &str) -> PathBuf {
+        self.root.join(percent_encode_identifier(execution_id))
+    }
+
+    /// Opens the journal stored in `dir` for `identity`, reusing this source's capacity and clock.
+    ///
+    /// This is the entry point for a caller that already walked the root (the catalogue does), and
+    /// it keeps journal opening in one place.
+    pub(crate) async fn open_dir(
+        &self,
+        dir: impl AsRef<Path>,
+        identity: ExecutionIdentity,
+    ) -> Result<ExecutionLog> {
+        ExecutionLog::open_with_clock(dir, identity, self.capacity, Arc::clone(&self.clock)).await
+    }
 }
 
 #[async_trait]
 impl ExecutionLogSource for RootLogSource {
     async fn open_log(&self, execution_id: &str) -> Result<ExecutionLog> {
-        let dir = self.root.join(percent_encode_identifier(execution_id));
+        let dir = self.dir_for(execution_id);
         let Some(meta) = read_json::<LogMeta>(&dir.join(LOG_META_FILE)).await? else {
             return Err(Error::not_found(format!(
                 "execution log is missing for {execution_id}"
             )));
         };
-        ExecutionLog::open_with_clock(&dir, meta.identity, self.capacity, Arc::clone(&self.clock))
-            .await
+        self.open_dir(dir, meta.identity).await
     }
 }
 
@@ -426,7 +459,12 @@ impl LogPreview {
 }
 
 /// The plan a continuation resumes from.
-#[derive(Debug, Clone)]
+///
+/// The whole plan round-trips through JSON: every field is serde data, so a host can persist a
+/// plan and resume from it later, or hand it to another process. The JSON view is stable — field
+/// names are `snake_case`, unknown fields are tolerated, and the plan carries no live handles — so
+/// the shape may only change additively.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResumePlan {
     /// The loaded session record, with its stale scene settled and its continuation cursor set.
     pub record: PersistentSessionRecord,
@@ -440,6 +478,24 @@ pub struct ResumePlan {
     pub background: String,
     /// Counts and totals of the recovery execution's journal.
     pub digest: LogDigest,
+}
+
+impl ResumePlan {
+    /// Returns the reconstructed model window a resumed turn starts from.
+    ///
+    /// These are the messages [`WindowAssembler`] rebuilt from the
+    /// recovery execution's journal — the summary message first, then the retained groups — so a
+    /// host seeds its run with them instead of re-deriving the transcript.
+    #[must_use]
+    pub fn seed_messages(&self) -> &[BaseMessage] {
+        &self.window.messages
+    }
+
+    /// Returns an owned copy of [`ResumePlan::seed_messages`].
+    #[must_use]
+    pub fn seed_history(&self) -> Vec<BaseMessage> {
+        self.window.messages.clone()
+    }
 }
 
 /// Loads a session record, traces its execution chain and rebuilds the continuation state.
@@ -655,8 +711,8 @@ mod tests {
 
     use super::{
         continuation_background, render_preview_line, resume, Continuation, ExecutionLink,
-        ExecutionLinkSource, ExecutionLogSource, FileLinkStore, LogPreview, RootLogSource,
-        CONTINUATION_RULES,
+        ExecutionLinkSource, ExecutionLogSource, FileLinkStore, LogPreview, ResumePlan,
+        RootLogSource, CONTINUATION_RULES,
     };
     use crate::persistent_agent::entry::{EntryPayload, ModelUsage};
     use crate::persistent_agent::identity::{ExecutionIdentity, LinkRelation, SessionBinding};
@@ -816,6 +872,55 @@ mod tests {
         assert!(plan.background.contains(&CONTINUATION_RULES.to_string()));
         assert!(plan.background.contains("exec1（首次执行）"));
         let _ = store_dir;
+    }
+
+    #[tokio::test]
+    async fn a_resume_plan_round_trips_through_json_and_seeds_the_window() {
+        let (_store_dir, store) = store_with_record().await;
+        let log_dir = tempfile::TempDir::new().unwrap();
+        let link_dir = tempfile::TempDir::new().unwrap();
+        seed_log(
+            log_dir.path(),
+            "exec2",
+            &[
+                EntryPayload::execution_started("ship it"),
+                EntryPayload::model_turn("mc_1", "working", ModelUsage::known(10, 5)),
+            ],
+        )
+        .await;
+        let links = FileLinkStore::new(link_dir.path());
+        seed_link(&links, "exec2", None, LinkRelation::First).await;
+        let continuation = Continuation::new("exec2", None, 2).unwrap();
+        let plan = resume(
+            &store,
+            &RootLogSource::new(log_dir.path(), LogCapacity::default()).with_clock(clock()),
+            &links,
+            &binding(),
+            "request",
+            &continuation,
+            &assembler(),
+        )
+        .await
+        .unwrap();
+
+        let encoded = serde_json::to_string_pretty(&plan).unwrap();
+        let decoded: ResumePlan = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, plan, "the whole plan survives the JSON round trip");
+        assert_eq!(decoded.record, plan.record);
+        assert_eq!(decoded.cursor, plan.cursor);
+        assert_eq!(decoded.window, plan.window);
+        assert_eq!(decoded.chain, plan.chain);
+        assert_eq!(decoded.background, plan.background);
+        assert_eq!(decoded.digest, plan.digest);
+        assert!(
+            decoded
+                .seed_messages()
+                .iter()
+                .any(|message| message.text().contains("ship it")),
+            "the seed window carries the journalled task"
+        );
+        assert_ne!(decoded.seed_messages().len(), 0);
+        assert_eq!(decoded.seed_history(), decoded.window.messages.clone());
     }
 
     #[tokio::test]

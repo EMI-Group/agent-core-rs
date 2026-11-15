@@ -11,12 +11,14 @@
 //! deterministic and offline in tests. The `CONTEXT.md` file in this directory carries the API
 //! contract and routing table; the module-level [`Clock`] is the crate's existing injectable
 //! clock ([`crate::subagents::Clock`]) re-exported here.
+pub mod catalog;
 pub mod continuation;
 pub mod control;
 pub mod emitter;
 pub mod entry;
 pub mod handoff;
 pub mod identity;
+pub mod layout;
 pub mod log;
 pub mod rails;
 pub mod session;
@@ -26,6 +28,7 @@ pub mod window;
 
 pub use crate::subagents::{rfc3339_from_ms, Clock, ManualClock, SystemClock};
 
+pub use catalog::{ExecutionCatalog, ExecutionSummary};
 pub use continuation::{
     continuation_background, resume, Continuation, ExecutionLink, ExecutionLinkSource,
     ExecutionLogSource, FileLinkStore, LogPreview, ResumePlan, RootLogSource, CONTINUATION_RULES,
@@ -44,6 +47,7 @@ pub use handoff::{
     LocalHandoff, RemoteHandoff,
 };
 pub use identity::{ExecutionIdentity, LinkRelation, SessionBinding, SESSION_KEY_PREFIX};
+pub use layout::{PersistentAgentLayout, LINKS_DIR, LOGS_DIR, PERSISTENT_AGENT_NODE, SESSIONS_DIR};
 pub use log::{
     ExecutionLog, LogCapacity, LogCursor, LogDigest, LogMeta, LogSnapshot, Replay, LOG_ENCODING,
     LOG_ENTRY_FILE, LOG_META_FILE,
@@ -55,7 +59,7 @@ pub use rails::{
 pub use session::{
     patch_stopped_calls, CheckpointKind, ContinuationCursor, FileSessionStore,
     ParticipationDecision, ParticipationState, PersistentSessionRecord, RecordCheckpoint,
-    RecordEnding, RecordRollover, RolloverTrigger, SessionStateStore, WaitingScene,
+    RecordEnding, RecordRollover, RolloverTrigger, SessionStateStore, SessionSummary, WaitingScene,
     HANDOFF_TEXT_PREFIX, PLACEHOLDER_TEXT, RECORD_INVALID_PREFIX, SESSION_RECORD_VERSION,
 };
 pub use share_file::{
@@ -64,8 +68,9 @@ pub use share_file::{
     SHARE_BUNDLE_SCHEMA_VERSION, SHARE_FILE_MAX_BYTES, SHARE_MODES,
 };
 pub use util::{
-    atomic_write, canonical_json, digest_hex, is_valid_identifier, percent_encode_identifier,
-    read_json, sha256_hex_str, truncate_chars, write_json_atomic, IDENTIFIER_MAX_CHARS,
+    atomic_write, canonical_json, digest_hex, is_valid_identifier, percent_decode_identifier,
+    percent_encode_identifier, read_json, sha256_hex_str, truncate_chars, write_json_atomic,
+    IDENTIFIER_MAX_CHARS,
 };
 pub use window::{
     Capacity, ElidedEntry, ElisionReason, ExtractiveSummarizer, UnsupportedModelSummarizer,

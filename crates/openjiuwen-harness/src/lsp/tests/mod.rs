@@ -13,6 +13,7 @@ mod diagnostics;
 mod discovery;
 mod fake_server;
 mod framing;
+mod parse;
 mod retry;
 mod tool;
 mod tool_lifecycle;

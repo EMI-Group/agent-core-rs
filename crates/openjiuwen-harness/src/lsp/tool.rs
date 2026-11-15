@@ -182,6 +182,58 @@ pub struct LspArgs {
     pub context_lines: Option<u32>,
 }
 
+impl LspArgs {
+    /// Builds the arguments for `action` with every optional field unset.
+    ///
+    /// The builder methods below fill in [`LspArgs::path`], [`LspArgs::line`]/[`LspArgs::column`],
+    /// [`LspArgs::query`] and [`LspArgs::context_lines`]; a single CLI token can also be parsed
+    /// with [`LspArgs::from_str`](std::str::FromStr) (grammar documented on
+    /// `crate::lsp::parse`).
+    #[must_use]
+    pub const fn new(action: LspAction) -> Self {
+        Self {
+            action,
+            path: None,
+            line: None,
+            column: None,
+            query: None,
+            context_lines: None,
+        }
+    }
+
+    /// Returns these arguments with `path` set.
+    #[must_use]
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Returns these arguments with a one-based `line` and `column` set.
+    ///
+    /// Both values are stored verbatim and are validated when the tool resolves the position
+    /// (line and column are one-based, so `0` is rejected with a `success=false` payload).
+    #[must_use]
+    pub const fn with_position(mut self, line: u32, column: u32) -> Self {
+        self.line = Some(line);
+        self.column = Some(column);
+        self
+    }
+
+    /// Returns these arguments with `query` set (used by `workspace_symbols`).
+    #[must_use]
+    pub fn with_query(mut self, query: impl Into<String>) -> Self {
+        self.query = Some(query.into());
+        self
+    }
+
+    /// Returns these arguments with the per-call source-line count set (capped at 20).
+    #[must_use]
+    pub const fn with_context_lines(mut self, lines: u32) -> Self {
+        self.context_lines = Some(lines);
+        self
+    }
+}
+
 /// Configuration of one [`LspTool`].
 ///
 /// Server selection follows [`LspToolConfig::server`], then [`LspToolConfig::servers`], then
@@ -228,6 +280,20 @@ impl Default for LspToolConfig {
 }
 
 impl LspToolConfig {
+    /// Builds the default configuration (the same value as [`LspToolConfig::default`]).
+    ///
+    /// The `with_*` methods refine it; [`LspToolConfig::from_str`](std::str::FromStr) parses the
+    /// scalar knobs from a comma-separated `key=value` spec (see `crate::lsp::parse` and
+    /// [`LspToolConfig::SPEC_KEYS`]).
+    /// Server definitions stay builder-only ([`LspToolConfig::with_server`],
+    /// [`LspToolConfig::with_servers`], [`LspToolConfig::with_discovered_server`],
+    /// [`LspToolConfig::with_builtin_servers`]) because they carry a process description, not a
+    /// scalar.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Returns this configuration with a different workspace root.
     #[must_use]
     pub fn with_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {

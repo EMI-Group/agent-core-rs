@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use super::entry::{EntryKind, EntryPayload, ExecutionEntry, ToolStatus, UsageStatus};
 use super::identity::ExecutionIdentity;
+use super::layout::PersistentAgentLayout;
 use super::util::{read_json_blocking, write_json_atomic_blocking};
 use super::{Clock, SystemClock};
 use crate::workspace::Workspace;
@@ -54,12 +55,6 @@ const SEGMENT_PREFIX: &str = "entries.";
 
 /// Suffix of an archived segment file name (`entries.<generation>.jsonl`).
 const SEGMENT_SUFFIX: &str = ".jsonl";
-
-/// Workspace node the journal directory lives under.
-const PERSISTENT_AGENT_NODE: &str = "persistent_agent";
-
-/// Subdirectory of the workspace node that holds the per-execution journals.
-const LOG_SUBDIR: &str = "logs";
 
 /// Default number of entries kept by a journal.
 const DEFAULT_MAX_ENTRIES: usize = 4096;
@@ -465,10 +460,8 @@ impl ExecutionLog {
         identity: ExecutionIdentity,
         capacity: LogCapacity,
     ) -> Result<Self> {
-        let base = workspace
-            .get_node_path(PERSISTENT_AGENT_NODE)
-            .unwrap_or_else(|| workspace.root_path.join(PERSISTENT_AGENT_NODE));
-        let dir = base.join(LOG_SUBDIR).join(identity.directory_name());
+        let layout = PersistentAgentLayout::for_workspace(workspace);
+        let dir = layout.logs_root().join(identity.directory_name());
         Self::open(dir, identity, capacity).await
     }
 

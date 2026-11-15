@@ -336,3 +336,100 @@ async fn unsupported_paths_are_typed() {
     }
     assert_eq!(HandoffTransport::InProcess.reason(), "");
 }
+
+#[tokio::test]
+async fn layout_catalogue_and_resume_round_trip_from_disk() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let layout = PersistentAgentLayout::new(dir.path());
+    let identity =
+        ExecutionIdentity::new("ns", "agent", "session", "request", "exec-1", "source").unwrap();
+
+    {
+        let log = ExecutionLog::open_with_clock(
+            layout.logs_root().join(identity.directory_name()),
+            identity.clone(),
+            LogCapacity::default(),
+            frozen_clock(),
+        )
+        .await
+        .unwrap();
+        log.append(EntryPayload::execution_started("do work"))
+            .await
+            .unwrap();
+        log.append(EntryPayload::model_turn(
+            "mc_1",
+            "done",
+            ModelUsage::known(10, 5),
+        ))
+        .await
+        .unwrap();
+    }
+
+    let store = FileSessionStore::new(layout.sessions_root());
+    let mut record = PersistentSessionRecord::new(&binding()).unwrap();
+    record.messages = vec![BaseMessage::user("do work")];
+    let record = record
+        .with_ending(RecordEnding {
+            outcome: "completed".to_string(),
+            request_id: "request".to_string(),
+            execution_id: "exec-1".to_string(),
+            ..RecordEnding::default()
+        })
+        .unwrap();
+    store.save(&record).await.unwrap();
+
+    let links = FileLinkStore::new(layout.links_root());
+    links
+        .write_link(&ExecutionLink::from_identity(&identity, None, LinkRelation::First).unwrap())
+        .await
+        .unwrap();
+
+    let catalog = ExecutionCatalog::new(layout.logs_root(), LogCapacity::default());
+    let summaries = catalog.list().await.unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].execution_id, "exec-1");
+    assert_eq!(summaries[0].entries, 2);
+    assert_eq!(summaries[0].last_seq, Some(2));
+    assert!(summaries[0].usable);
+    assert_eq!(summaries[0].created_at, "2023-11-14T22:13:20.000Z");
+    assert_eq!(
+        catalog.open("exec-1").await.unwrap().identity(),
+        &identity,
+        "the catalogue opens the very journal it listed"
+    );
+
+    let sessions = store.list().await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].binding, binding());
+    assert!(!sessions[0].waiting);
+    assert!(sessions[0].has_ending);
+    assert!(!sessions[0].has_checkpoint);
+    assert_eq!(sessions[0].state_path, store.path_for(&binding()));
+
+    let plan = resume(
+        &store,
+        &RootLogSource::new(layout.logs_root(), LogCapacity::default()).with_clock(frozen_clock()),
+        &links,
+        &binding(),
+        "request-2",
+        &Continuation::new("exec-1", None, 2).unwrap(),
+        &WindowAssembler::new(Capacity::default()),
+    )
+    .await
+    .unwrap();
+    let encoded = serde_json::to_string(&plan).unwrap();
+    let decoded: ResumePlan = serde_json::from_str(&encoded).unwrap();
+    assert!(
+        decoded
+            .seed_messages()
+            .iter()
+            .any(|message| message.text().contains("do work")),
+        "the reconstructed messages still carry the run's text"
+    );
+    assert_eq!(
+        decoded.cursor.resume_seq, 3,
+        "two entries, so continue at 3"
+    );
+    assert_eq!(decoded.digest.entries, 2);
+    assert_eq!(decoded, plan, "the JSON view is lossless");
+}

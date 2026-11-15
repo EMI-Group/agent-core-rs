@@ -11,7 +11,7 @@ All persistence is file-based under caller-provided directories; every clock is 
 ## API Surface
 
 Foundation (`util`, `identity`, `entry`):
-- `util`: `canonical_json`, `digest_hex`, `sha256_hex_str`, `percent_encode_identifier`, `is_valid_identifier`, `atomic_write`, `write_json_atomic`, `read_json`, `truncate_chars`, `IDENTIFIER_MAX_CHARS`.
+- `util`: `canonical_json`, `digest_hex`, `sha256_hex_str`, `percent_encode_identifier`, `percent_decode_identifier`, `is_valid_identifier`, `atomic_write`, `write_json_atomic`, `read_json`, `truncate_chars`, `IDENTIFIER_MAX_CHARS`.
 - `identity`: `ExecutionIdentity { namespace_id, agent_id, session_id, request_id, execution_id, source_ref }`, `SessionBinding { agent_id, session_id }`, `LinkRelation { first, confirmation_resume, continuation }`, `SESSION_KEY_PREFIX` (`"pa:"`).
 - `SessionBinding`: `new`, `key_prefix()` (`pa:{encoded agent}:{encoded session}:`), `state_key()`, `archive_key(window_seq)`, `archive_index_key()`.
 - `ExecutionIdentity`: `new`, `validate`, `session_binding`, `event_id(local_seq)`, `directory_name()`.
@@ -38,7 +38,9 @@ Session state (`session`):
 - Nested records: `RecordCheckpoint { request_id, execution_id, iteration_seq, kind, last_group_message_id }`, `CheckpointKind { react_iteration, request_start, rollover }`, `RecordEnding { outcome, request_id, execution_id, spec_fingerprint, reply_target, output_refs }`, `RecordRollover { old_window_id, old_window_seq, new_window_id, new_window_seq, archive_ref, trigger_kind, token_usage }`, `RolloverTrigger { agent, capacity_fallback, request_entry }`.
 - `WaitingScene { request_id, reply_target, spec_fingerprint }`, `ParticipationState { decision, reason, event_id, decided_at }`, `ParticipationDecision { ignore, respond, intervene }`, `ContinuationCursor { recovery_ref, predecessor_id, relation, resume_seq, last_group_message_id }`.
 - `PersistentSessionRecord` methods: `new`, `validate`, `binding`, `is_waiting`, `waiting_scene`, `with_checkpoint`, `with_ending`, `patch_stopped_calls`, `clear_stale_scene`.
-- `SessionStateStore` trait (`load`, `save`, `delete`) plus `FileSessionStore` (`new`, `for_workspace`, `path_for`) writing `<root>/<encoded agent>/<encoded session>/state.json` atomically.
+- `SessionStateStore` trait (`load`, `save`, `delete`) plus `FileSessionStore` (`new`, `for_workspace`, `root`, `path_for`, `list`) writing `<root>/<encoded agent>/<encoded session>/state.json` atomically.
+- `SessionSummary { binding, waiting, current_window_id, window_seq, has_checkpoint, has_ending, state_path }` (serde) is what `FileSessionStore::list` reports: identity plus boundary flags plus the `state.json` path, never the message window.
+- `FileSessionStore::list()` scans `<root>/<encoded agent>/<encoded session>/state.json`, decodes the directory names (falling back to the record's own ids), skips unreadable/invalid records with `tracing::warn!`, and orders by agent id then session id; a missing root yields an empty list.
 - `patch_stopped_calls(&[BaseMessage]) -> Vec<BaseMessage>` is also a free function, so a host can settle a window without a record.
 - Constants: `SESSION_RECORD_VERSION = 1`, `PLACEHOLDER_TEXT = "结果未取得，实际效果需核实"`, `HANDOFF_TEXT_PREFIX = "【实际交出的最终回答】\n"`, `RECORD_INVALID_PREFIX = "session state record is invalid: "`.
 
@@ -54,10 +56,12 @@ Window assembly (`window`):
 Continuation and handoff (`continuation`, `handoff`):
 - `Continuation { recovery_ref, instruction, chain_limit }` with `new`, `continued_query` (`"{text}\n\n【继续指示】{instruction}"`), `CONTINUATION_RULES` (literal `&str`).
 - `ExecutionLink` (identity ids + `predecessor_id` + `relation`) with `from_identity`, `validate`, `matches`.
-- `ExecutionLinkSource` trait + `FileLinkStore` (`new`, `link_path`; `<root>/<encoded execution>/link.json`).
-- `ExecutionLogSource` trait + `RootLogSource` (`new(root, capacity)`, `with_clock`; opens `<root>/<encoded execution>/` from its `meta.json`).
+- `ExecutionLinkSource` trait + `FileLinkStore` (`new`, `root`, `link_path`; `<root>/<encoded execution>/link.json`).
+- `ExecutionLogSource` trait + `RootLogSource` (`new(root, capacity)`, `with_clock`, `root`, `dir_for(execution_id)`; opens `<root>/<encoded execution>/` from its `meta.json`).
 - `LogPreview::preview(&LogSnapshot)` renders the deterministic per-execution preview block.
 - `resume(store, logs, links, binding, request_id, continuation, assembler) -> ResumePlan`; `ResumePlan { record, cursor, window, chain, background, digest }`.
+- `ResumePlan` is `Serialize + Deserialize + PartialEq`: the JSON view is stable (snake_case, unknown-field tolerant, no live handles) and may only change additively, so a host can persist a plan and resume from it later.
+- `ResumePlan::seed_messages() -> &[BaseMessage]` and `seed_history() -> Vec<BaseMessage>` return `window.messages` — the reconstructed model window a resumed turn starts from.
 - `continuation_background(continuation, successor_execution_id, chain, snapshots, stop)` renders the deterministic background document.
 - `HandoffTransfer { from, to, record, cursor, window, next_goal, shared_files }` with `validate`, `HandoffReceipt { successor_session, accepted_entries, transferred_at, successor_execution_id }`.
 - `HandoffTarget` trait (`transport`, `accept`), `HandoffTransport { in_process, remote, distributed }` with `as_str`, `reason`, `LocalHandoff::new(clock)`/`take`, `RemoteHandoff`, `DistributedHandoff`.
@@ -72,6 +76,12 @@ Seams (`control`, `emitter`, `share_file`):
 - `ShareFile::export(bundle_id, binding, files, sources) -> ShareBundle` writes `bundle.json` atomically and copies files under `files/<index>.bin`; `import` verifies sizes and digests.
 - `is_logical_path`, `valid_caption`, `BUNDLE_FILE` (`"bundle.json"`), `SHARE_BUNDLE_SCHEMA_VERSION`, `SHARE_FILE_MAX_BYTES` (32 MiB), `MAX_SHARED_FILES` (64), `FILE_PATH_MAX_CHARS`, `CAPTION_MAX_CHARS`, `SHARE_MODES`.
 
+Catalogue and layout (`catalog`, `layout`):
+- `ExecutionSummary { execution_id, namespace_id, agent_id, session_id, request_id, source_ref, created_at, generation, entries, last_seq, usable }` (serde, `#[serde(default)]`, unknown fields tolerated) describes one persisted execution without carrying its entries.
+- `ExecutionCatalog`: `new(root, capacity)`, `with_clock`, `root()`, `path_for(execution_id)`, async `list() -> Result<Vec<ExecutionSummary>>`, async `open(execution_id) -> Result<ExecutionLog>`; it delegates to an internal `RootLogSource`, so the catalogue and the resume path share one layout.
+- `ExecutionCatalog::list()` is best effort per directory: a missing root is `Ok(Vec::new())`, an unreadable entry or a missing/malformed `meta.json` is skipped with `tracing::warn!`, a journal that cannot be opened/read is still listed with `usable = false`, and the result is sorted by `created_at` then `execution_id`.
+- `PersistentAgentLayout`: `new(base)`, `for_workspace(workspace)`, `base()`, `logs_root()`, `sessions_root()`, `links_root()`; the single definition of the standard roots (`logs/`, `sessions/`, `links/`) used by `ExecutionLog::for_workspace`, `FileSessionStore::for_workspace` and the resume recipe.
+- Layout constants: `PERSISTENT_AGENT_NODE` (`"persistent_agent"`), `LOGS_DIR` (`"logs"`), `SESSIONS_DIR` (`"sessions"`), `LINKS_DIR` (`"links"`).
 Rails (`rails`):
 - `ExecutionRecordRail` (`HarnessRail`, priority 5): `new`, `with_policy`; `before_tool_call` records `tool_intent`, `after_tool_call` records `tool_completed`, `after_model_call` records `model_turn`.
 - `ModelCallRail` (`HarnessRail`, priority 10) backed by `ModelCallGate` (`admit`, `report`) and `ModelAdmission { admitted { reservation_ref }, denied { reason } }`.
@@ -94,23 +104,25 @@ Re-exports:
 
 ## Consumer contract (outside the crate)
 
-- Every item in `mod.rs` is `pub` and flat re-exported from the crate root (`src/lib.rs:261-285`), so an external binary can name `resume`, `ResumePlan`, `FileSessionStore`, `RootLogSource`, `FileLinkStore`, `SessionBinding`, `ExecutionIdentity`, `WindowAssembler`, `Capacity`, `WindowPolicy` and `ExecutionLog` without a private path.
+- Every item in `mod.rs` is `pub` and flat re-exported from `persistent_agent`; the crate-root list in `src/lib.rs` names the pre-existing surface (`resume`, `ResumePlan`, `FileSessionStore`, …) but not yet the discovery additions (`ExecutionCatalog`, `ExecutionSummary`, `SessionSummary`, `PersistentAgentLayout`, `percent_decode_identifier`, `PERSISTENT_AGENT_NODE`/`LOGS_DIR`/`SESSIONS_DIR`/`LINKS_DIR`), so those are reachable today only as `openjiuwen_harness::persistent_agent::…`.
 - No other part of the crate consumes this module: `src/cli/`, `src/agent/` and `src/protocol/` contain zero references to `persistent_agent`, `ResumePlan`, `PersistentSessionRecord` or `WindowAssembly`, so nothing feeds a `ResumePlan` or its `WindowAssembly::messages` back into `run_once`, `Repl`, `DeepAgent::invoke`/`stream` or `NativeHarness`.
-- Re-seeding a model window is kernel-shaped, not module-shaped: `ContextOptions::history` / `ContextEngine::load_contexts` (`crates/openjiuwen-context/src/engine_options.rs`, `engine/persistence.rs:60`) or a custom `HarnessRail::before_model_call` mutating `RailContext::messages`.
-- There is no enumeration helper anywhere in the module: `FileSessionStore` exposes only `path_for`, `RootLogSource` opens one execution id at a time (`Error::NotFound` without `meta.json`), `FileLinkStore` exposes only `link_path`; a host must `read_dir` the roots itself.
-- `ResumePlan` derives `Debug + Clone` only (no `Serialize`), so a plan cannot be cached as JSON; `record` and `window` are its serializable parts.
-- Identifier rule: `is_valid_identifier` accepts 1..=512 Unicode scalar values with no whitespace and no control characters (`util.rs:111`); every constructor that takes an id enforces it.
+- Re-seeding a model window is kernel-shaped, not module-shaped: `ContextOptions::history` / `ContextEngine::load_contexts` (`crates/openjiuwen-context/src/engine_options.rs`, `engine/persistence.rs:60`) or a custom `HarnessRail::before_model_call` mutating `RailContext::messages`; `ResumePlan::seed_messages`/`seed_history` are the plan-side source those paths can be fed from.
+- Discovery is module-side: `ExecutionCatalog::list` enumerates executions under a log root, `FileSessionStore::list` enumerates session records, and `PersistentAgentLayout` names the three standard roots, so a host no longer has to `read_dir` the roots itself or guess the subdirectory names.
+- `ResumePlan` is serde data end to end (`Serialize + Deserialize + PartialEq`), so a plan can be cached as JSON and replayed; `seed_messages` is the reconstructed window it carries.
+- Identifier rule: `is_valid_identifier` accepts 1..=512 Unicode scalar values with no whitespace and no control characters (`util.rs`); every constructor that takes an id enforces it, and `percent_decode_identifier` is the inverse of the directory-name encoding (invalid escapes or non-UTF-8 yield `None`).
 
 ## Routing Table
 
 - `./mod.rs` → module docs, module declarations, flat re-exports, `#[cfg(test)] mod tests`
-- `./util.rs` → canonical JSON, digests, percent encoding, identifier checks, atomic file helpers
+- `./layout.rs` → `PersistentAgentLayout` (base + `logs_root`/`sessions_root`/`links_root`) and the workspace-node rule the stores share
+- `./catalog.rs` → `ExecutionCatalog`/`ExecutionSummary` enumeration over a log root (best-effort list, deterministic order, open by id)
+- `./util.rs` → canonical JSON, digests, percent encoding/decoding, identifier checks, atomic file helpers
 - `./identity.rs` → `ExecutionIdentity`, `SessionBinding`, session key scheme, `LinkRelation`
 - `./entry.rs` → execution-entry types, payloads, redaction/argument helpers, digests
 - `./log.rs` → execution journal: append, rotation/retention, snapshot, replay, digest
-- `./session.rs` → persisted session record, validation, waiting scene, session store
+- `./session.rs` → persisted session record, validation, waiting scene, session store, store enumeration
 - `./window.rs` → capacity, token-budgeted window assembly, elision reporting, rollover planning
-- `./continuation.rs` → continuation record, execution links, log source, resume and background preview
+- `./continuation.rs` → continuation record, execution links, log source, resume, background preview and the serializable `ResumePlan`
 - `./handoff.rs` → handoff transfer/receipt, in-process target, unsupported transports
 - `./control.rs` → pause/resume/abort flags and outcome locking
 - `./emitter.rs` → lifecycle event types, sequence/event ids, event sinks
@@ -160,11 +172,16 @@ Re-exports:
 - A `ModelCallGate::report` failure is logged and never aborts the run, and a missing tool-call id gets a synthetic stable key (`name:index`) so an intent and its outcome still match.
 - Tool intents are recorded only for non-read-only tools; read-only calls still produce a `tool_completed` receipt without an `operation_id`, and a failed call that had an intent is recorded as `unknown`, not `failed`.
 - Share bundles copy file bytes under `files/` and record `sha256` + size; import verifies both, so a tampered bundle is rejected rather than silently accepted.
+- The catalogue is a view, never a second store: `ExecutionCatalog` owns a `RootLogSource`, so listing, opening and `resume` cannot disagree about where a journal lives or how it is opened.
+- Listing is best effort and deterministic: a corrupt `meta.json` is skipped, a journal that exists but cannot be read is reported as `usable = false`, and the fixed sort (`created_at`, then `execution_id`) makes a listing reproducible across runs.
+- `PersistentAgentLayout` is the one place the standard roots are spelled out; `ExecutionLog::for_workspace` and `FileSessionStore::for_workspace` derive their paths from it, so the directory names can never drift apart.
+- Session `list()` decodes the directory names it walked (the store's own encoding is the inverse) and falls back to the record's ids only when a name does not decode, so a summary describes the path the file was actually found at.
+- The plan's JSON view is a contract: `ResumePlan` is data only, so serializing it and parsing it back is lossless, and a host resumes by feeding `seed_messages` into its model window.
 
 ## Test Strategy
 
 - Inline unit tests per module: canonical JSON/digest/percent-encoding, entry serde round-trips and redaction, log append/rotation/replay/digest, hard-budget truncation at every boundary, digest and redaction serialization-failure fallbacks, log preview skipping unrenderable lines, 32 concurrent appends staying contiguous and replayable, session record round-trip with unknown fields, validation rules, window assembly under tight/loose budgets with elision reports, control flags, emitter sequencing and failure policy, share bundle round-trip and tamper rejection, handoff transfer, continuation links and resume.
-- Cross-module flows live in `src/persistent_agent/tests.rs` (an integration file under `crates/openjiuwen-harness/tests/` would also work but is outside this module's write scope): crash-and-reopen resume, in-process handoff, share-bundle round trip with tamper rejection, emitter-vs-journal sequence independence, and the exact `Unsupported` messages.
+- Cross-module flows live in `src/persistent_agent/tests.rs` (an integration file under `crates/openjiuwen-harness/tests/` would also work but is outside this module's write scope): crash-and-reopen resume, in-process handoff, share-bundle round trip with tamper rejection, emitter-vs-journal sequence independence, the exact `Unsupported` messages, and the discovery recipe (layout roots → journal + record + link on disk → catalogue/session listing → `resume` → plan JSON round trip carrying the run's text).
 - All tests use `tempfile::TempDir`, `ManualClock`, file-backed stores and no sleeps; nothing opens a socket or reads the wall clock.
 - Definition of done: `cargo test -p openjiuwen-harness --offline` (default, `--no-default-features`, `--all-features`), `cargo fmt -p openjiuwen-harness`, `cargo clippy -p openjiuwen-harness --all-targets --all-features --offline -- -D warnings`, `cargo doc -p openjiuwen-harness --no-deps`.
 
