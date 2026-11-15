@@ -4,6 +4,7 @@
 //! file proves the same surface is usable by an external consumer with plain kernel `Tool`
 //! objects, without reaching for any crate-private item.
 #![cfg(feature = "mcp")]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

@@ -48,7 +48,7 @@ impl FakeClient {
     }
 
     /// Scripts a successful reply whose `data` is `payload`.
-    fn script_success(&self, tool_name: &str, payload: JsonValue) {
+    fn script_success(&self, tool_name: &str, payload: &JsonValue) {
         let data = payload.as_object().cloned().unwrap_or_default();
         self.replies
             .lock()
@@ -146,7 +146,7 @@ fn remote_tools() -> Vec<McpRemoteTool> {
 /// Builds the fixture gateway over two real `McpTool`s from one fake server.
 async fn fixture() -> (Arc<FakeClient>, McpToolGateway) {
     let client = Arc::new(FakeClient::new("srv-1", "docs", remote_tools()));
-    client.script_success("search_docs", json!({"content": "found 2 docs"}));
+    client.script_success("search_docs", &json!({"content": "found 2 docs"}));
     let tools = load_mcp_tools(client.clone(), McpToolOptions::default())
         .await
         .unwrap();
@@ -261,7 +261,7 @@ async fn entries_carry_the_mcp_provenance_the_definition_cannot() {
     assert_eq!(search.card_id, "srv-1.docs.search_docs");
     assert!(search.parallel_safe);
     assert_eq!(search.metadata["mcp"], json!(true));
-    assert!(gateway.servers().is_empty());
+    assert_eq!(gateway.servers().len(), 0);
     assert!(!gateway.is_empty());
 }
 
@@ -344,7 +344,7 @@ async fn invalid_arguments_are_a_validation_error_and_never_reach_the_server() {
         .message()
         .starts_with("MCP tool `search_docs` failed: "));
     assert!(error.message().contains("input does not match schema"));
-    assert!(client.calls().is_empty());
+    assert_eq!(client.calls().len(), 0);
 }
 
 #[tokio::test]

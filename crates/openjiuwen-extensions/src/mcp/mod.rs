@@ -1,8 +1,8 @@
 //! MCP tools served to an external harness through the `ToolGateway` seam (feature `mcp`).
 //!
 //! MCP client/server tooling itself lives in `openjiuwen_foundation::tool::mcp`: the stdio, SSE,
-//! streamable-HTTP and OpenAPI transports, the JSON-RPC session, and the `McpTool` projection of a
-//! remote tool onto the kernel `Tool` contract. Enabling this crate's `mcp` feature only turns
+//! streamable-HTTP and `OpenAPI` transports, the JSON-RPC session, and the `McpTool` projection of
+//! a remote tool onto the kernel `Tool` contract. Enabling this crate's `mcp` feature only turns
 //! that kernel feature on (`openjiuwen-foundation/mcp`), and the foundation default already
 //! enables it, so no umbrella feature can turn MCP off.
 //!
@@ -29,9 +29,10 @@
 //! `ToolDefinition` has no metadata field, so the MCP provenance the kernel card carries (`mcp:
 //! true`, `server_name`, `server_id`) plus the card id and the `parallel_safe` flag live on
 //! [`McpToolEntry`], which [`McpToolGateway::entries`] hands out alongside the definition.
-//! [`McpToolGateway::definitions`] is deterministic: tools are sorted by name (ascending) at
-//! construction, so the same set of tools always produces the same list — unlike the kernel's
-//! `Vec<McpTool>`, whose order follows the server's `tools/list` reply.
+//! [`McpToolGateway::definitions`](openjiuwen_harness_protocol::ToolGateway::definitions) is
+//! deterministic: tools are sorted by name (ascending) at construction, so the same set of tools
+//! always produces the same list — unlike the kernel's `Vec<McpTool>`, whose order follows the
+//! server's `tools/list` reply.
 //!
 //! # Invocation outcome (`openjiuwen_common::error::Error` → harness result)
 //!
@@ -44,12 +45,12 @@
 //! |---|---|
 //! | `Ok(value)` that does not read as a kernel `ToolOutput` | success: `content = {"text": <rendered>, "structured": <value>}` |
 //! | `Ok(ToolOutput)` with `success: true` | success: `content = {"text": <rendered>, "structured": <ToolOutput.data>}` |
-//! | `Ok(ToolOutput)` with `success: false` | error result (`is_error: true`), `content = {"error": "MCP tool \`<name>\` failed: <ToolOutput.error>"}` |
+//! | `Ok(ToolOutput)` with `success: false` | error result (`is_error: true`), `content = {"error": "MCP tool <name> failed: <ToolOutput.error>"}` |
 //! | `Err(Error::Validation)` | [`HarnessError::validation`](openjiuwen_harness_protocol::HarnessError::validation) naming the tool |
 //! | `Err(Error::Unsupported)` | [`HarnessError::unsupported_capability`](openjiuwen_harness_protocol::HarnessError::unsupported_capability) naming the tool |
 //! | `Err(Error::Config)` | [`HarnessError::protocol`](openjiuwen_harness_protocol::HarnessError::protocol) — the host cannot address the tool it advertised |
 //! | `Err(Error::Cancelled)` | [`HarnessError::state`](openjiuwen_harness_protocol::HarnessError::state) — the call was cancelled before it produced a result |
-//! | any other `Err` (`Tool`, `Mcp`, `Transport`, `Timeout`, `NotFound`, …) | error result (`is_error: true`), `content = {"error": "MCP tool \`<name>\` failed: <detail>"}` |
+//! | any other `Err` (`Tool`, `Mcp`, `Transport`, `Timeout`, `NotFound`, …) | error result (`is_error: true`), `content = {"error": "MCP tool <name> failed: <detail>"}` |
 //!
 //! A tool-level failure travels in the result channel (`is_error`) so the harness can show it to
 //! the model and continue; only caller mistakes and unresolvable capability/config/state

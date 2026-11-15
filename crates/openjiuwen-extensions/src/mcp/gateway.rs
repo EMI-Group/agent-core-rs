@@ -283,7 +283,7 @@ impl ToolGateway for McpToolGateway {
         let arguments = json_object_to_value(&invocation.arguments);
         match served.tool.invoke(arguments, &context).await {
             Ok(value) => Ok(success_result(&invocation.name, value)),
-            Err(error) => map_kernel_error(&invocation.name, error),
+            Err(error) => map_kernel_error(&invocation.name, &error),
         }
     }
 }
@@ -348,7 +348,7 @@ fn success_result(tool_name: &str, value: JsonValue) -> ToolExecutionResult {
 }
 
 /// Maps a kernel invocation error onto the harness channel.
-fn map_kernel_error(tool_name: &str, error: Error) -> HarnessResult<ToolExecutionResult> {
+fn map_kernel_error(tool_name: &str, error: &Error) -> HarnessResult<ToolExecutionResult> {
     let kind = error.kind();
     let detail = truncate_detail(error.message().as_ref());
     let message = failure_message(tool_name, &detail);
