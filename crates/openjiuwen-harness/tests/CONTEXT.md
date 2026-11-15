@@ -7,18 +7,20 @@ Unit tests live beside their modules; these cover cross-module behavior.
 
 ## API Surface
 
-Test files (one concern each, thirteen binaries, 119 tests total with `--all-features`):
+Test files (one concern each, fifteen binaries, 132 tests total with `--all-features`):
 - `deep_agent_loop.rs` (6) — no-tool answer, real `FunctionTool` round, built-in `bash` permission denial, max-iteration truncation, follow-up queue drain, idempotent abort.
 - `workspace_safety.rs` (9) — cn/en schema seeding and markers, traversal/absolute/drive/UNC rejection, top-level-only `get_node_path`, idempotent rebuild, `is_safe_relative_path` truth table, unsafe node paths.
 - `permissions.rs` (14) — allow/ask/deny precedence and `strictest` fold, file-guard fold, session-scoped approvals via the rail, rail `skip_tool` denial, `PermissionConfirmResponse::parse` shapes.
 - `state_persistence.rs` (7) — `DeepAgentState` round-trip, exact `deepagent` key set, plan-mode/follow-up survival, default state, repeated-save null-key preservation, `todo.json` location and item keys.
 - `subagents_skills.rs` (19) — built-in presets, fake factory spawn/wait/close/capacity, quota refusal/free and per-parent/depth limits, activity lifecycle and LRU eviction with transcript digests, subagent tool payloads, skill discovery/budget/disabled state, `SkillRootMount`.
+- `memory_tools.rs` (9) — the eight memory tools over the file-backed `WorkspaceMemoryBackend`, driven only through `Tool::invoke` on a temp workspace: write/read round trip with line windows, Python scope/path mapping, edit success and failure payloads, keyword-search result objects and typed traversal failures, plus `DeepAgentBuilder` mounting the backend by default.
 - `subagent_spawner.rs` (5) — the production `RuntimeSubAgentSpawner`: a built `DeepAgent` exposes a spawner over its own runtime (a real `DeepAgentSubAgentFactory` child answering from a `ScriptedModel` runs to `Completed` through `spawn`/`wait`/`list`/`close`), a caller `subagent` rail wins (accessor `None`), no mounted sub-agents means no spawner, a saturated single-permit spawner rejects the extra spawn with the typed limit error and reuses the slot once final, and unknown ids are `NotFound`.
 - `protocol.rs` (8) — `NativeHarness` lifecycle, capability gating, single-consumer cursors, checkpoint export, provider `create` from JSON, capability card.
-- `cli.rs` (21) — clap grammar/flags/formats, headless `run_with_model` in all three output formats, scripted REPL transcript, permission answer mapping.
-- `public_surface.rs` (12) — every newly landed item resolves flat from the crate root and does real work: `MoaConfig`/`MoaRail` (asserting the published consultation protocol text in both languages), `ExecutionLog`/`WindowAssembler`, `HeartbeatRail`, `PersonalContextStore`, `WorktreeLock`/`SparseConfig`, `ActivityThrottle`, `drain_rail_events`, `DiagnosticRegistry`/`Diagnostic`, `WorkspaceWatcher` (a real delivered write plus a silent shutdown with `notify`, its typed `Unsupported` refusal without), `GoalRail`, and the resume surface (`ExecutionCatalog`/`ExecutionSummary`, `PersistentAgentLayout` with the `LOGS_DIR`/`SESSIONS_DIR`/`LINKS_DIR`/`PERSISTENT_AGENT_NODE` constants, `FileSessionStore::list` → `SessionSummary`, `percent_decode_identifier`, `seed_state`, plus signature pins of `run_once_resumed`, `run_with_model_resumed`, `Repl::seed_history` and `DeepAgent::seed_history`).
+- `cli.rs` (22) — clap grammar/flags/formats, headless `run_with_model` in all three output formats, scripted REPL transcript, permission answer mapping.
+- `public_surface.rs` (13) — every newly landed item resolves flat from the crate root and does real work: `MoaConfig`/`MoaRail` (asserting the published consultation protocol text in both languages), `ExecutionLog`/`WindowAssembler`, `HeartbeatRail`, `PersonalContextStore`, `WorktreeLock`/`SparseConfig`, `ActivityThrottle`, `drain_rail_events`, `DiagnosticRegistry`/`Diagnostic`, `WorkspaceWatcher` (a real delivered write plus a silent shutdown with `notify`, its typed `Unsupported` refusal without), `GoalRail`, and the resume surface (`ExecutionCatalog`/`ExecutionSummary`, `PersistentAgentLayout` with the `LOGS_DIR`/`SESSIONS_DIR`/`LINKS_DIR`/`PERSISTENT_AGENT_NODE` constants, `FileSessionStore::list` → `SessionSummary`, `percent_decode_identifier`, `seed_state`, plus signature pins of `run_once_resumed`, `run_with_model_resumed`, `Repl::seed_history` and `DeepAgent::seed_history`).
 - `moa_rail.rs` (4) — two scripted proposers through `consult`/`rank_with_config`, the rail's prompt section and `MoaSnapshot`/`MoaOutcome` extra keys, the all-proposers-fail `Error::Llm`, and the refusal of a reference-free configuration.
 - `persistent_agent_resume.rs` (4) — a rotated journal reopened from disk (`replay`, digest, monotone sequences), `resume` → `ResumePlan` with a rebuilt window and continuation prompt, `ShareFile` export/import round trip plus tamper detection, the typed `Unsupported` of the remote/distributed handoffs, and the end-to-end host restart: one CLI turn (`run_with_model_resumed` on a `ScriptedModel`) journalled through `ExecutionLog` with a `PersistentSessionRecord` and an `ExecutionLink`, every handle dropped, the execution and session rediscovered through `ExecutionCatalog::list`/`FileSessionStore::list`, the plan round-tripped through JSON, and the continued turn sending the restored transcript ahead of the new query while the CLI record keeps both turns.
+- `persistent_deep_agent.rs` (2) — `persistent_agent` recording end to end: two real `DeepAgent` turns journalled as `execution_started`/`model_turn`/`execution_final` entries plus a `PersistentSessionRecord`, everything re-derived from disk alone, `resume` rebuilding the window for a second agent that continues the seeded transcript, and recording off by default.
 - `goal_rail_events.rs` (4) — a settled goal auto-registers `GoalRail` through a mounted `get_current_goal` tool and reaches both the `stream` interaction frame and `drain_rail_events` exactly once; an active goal publishes the reminder and no event; no goal tool means no rail; the event's output frame round-trips.
 - `watcher_targets.rs` (6) — `#![cfg(feature = "notify")]`: independent per-target steps (a new skill file, an `IDENTITY.md` rewrite, an MCP-config rewrite) each await their own event, one watcher keeps sequences monotonic across targets, a write burst coalesces into one event, and a not-yet-created file target still fires while shutdown is idempotent and publishes nothing afterwards.
 
@@ -42,11 +44,14 @@ Test files (one concern each, thirteen binaries, 119 tests total with `--all-fea
 - `./permissions.rs` → permission engine and rail
 - `./state_persistence.rs` → session state round-trip
 - `./subagents_skills.rs` → subagents and skills
+- `./memory_tools.rs` → the eight memory tools over the workspace backend
+- `./subagent_spawner.rs` → the production subagent spawner over a built agent's runtime
 - `./protocol.rs` → native harness protocol
 - `./cli.rs` → CLI parsing and run
 - `./public_surface.rs` → flat crate-root re-exports of the new modules
 - `./moa_rail.rs` → MOA consultation, ranking and rail events
 - `./persistent_agent_resume.rs` → journal replay, resume plan and share bundles
+- `./persistent_deep_agent.rs` → per-turn persistent-agent recording and resume from disk
 - `./goal_rail_events.rs` → goal rail auto-registration, stream and drain
 - `./watcher_targets.rs` → `notify` watcher per-target delivery, cross-target sequences, coalescing and shutdown (feature-gated)
 

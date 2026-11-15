@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use openjiuwen_agent::{Agent, AgentChunk};
+use openjiuwen_agent::{Agent, AgentCard, AgentChunk};
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::Model;
 use openjiuwen_foundation::tool::mcp::{
@@ -76,6 +76,13 @@ const ROLE_USER: &str = "user";
 
 /// Session role of an assistant message in a persisted record.
 const ROLE_ASSISTANT: &str = "assistant";
+
+/// Stable name and id of the agent card a CLI run builds.
+///
+/// The persistent-agent session binding is `(agent_id, session_id)`, and the id is minted from
+/// the card, so it must not change between `openjiuwen` processes: a per-process uuid would make
+/// `chat --resume <id>` look for a record the previous process never wrote.
+const CLI_AGENT_ID: &str = "openjiuwen-cli";
 
 /// Result of one completed run.
 #[derive(Debug, Clone, PartialEq)]
@@ -304,9 +311,12 @@ pub async fn build_agent_with(
     let mut tools = cli_extended_tools(&workspace, &permissions);
     tools.extend(mcp_tools);
     let host: Arc<dyn PermissionHost> = Arc::new(permission_host(io, options, rules, &permissions));
+    // The id is pinned, not minted: the journal records it as part of the session binding, so a
+    // restarted process must reuse the same id for `--resume` to find the previous record.
+    let card = AgentCard::new(CLI_AGENT_ID).with_id(CLI_AGENT_ID);
     create_deep_agent(
         model,
-        None,
+        Some(card),
         Some(config),
         tools,
         Vec::new(),
@@ -717,6 +727,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.output, "scripted answer");
+    }
+
+    #[tokio::test]
+    async fn cli_agent_card_id_is_stable_across_processes() {
+        let temp = TempDir::new().unwrap();
+        let options = test_options(temp.path());
+        std::fs::create_dir_all(&options.workspace).unwrap();
+        let io = scripted_io(&[]);
+
+        // Two builds stand in for two `openjiuwen` processes with the same resolved options.
+        let first_model: Arc<dyn Model> = Arc::new(ScriptedModel::text("first"));
+        let first = build_agent_with(first_model, &options, &io, &FoundationMcpToolProvider)
+            .await
+            .unwrap();
+        let second_model: Arc<dyn Model> = Arc::new(ScriptedModel::text("second"));
+        let second = build_agent_with(second_model, &options, &io, &FoundationMcpToolProvider)
+            .await
+            .unwrap();
+
+        // The persistent-agent binding is `(agent_id, session_id)`, so a restarted process has to
+        // mint the same agent id or `--resume` cannot find the record the first one wrote.
+        assert_eq!(first.config().card.id, CLI_AGENT_ID);
+        assert_eq!(first.config().card.id, second.config().card.id);
     }
 
     #[tokio::test]

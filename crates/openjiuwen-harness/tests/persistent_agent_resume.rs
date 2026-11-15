@@ -392,9 +392,9 @@ fn cli_options(root: &std::path::Path) -> Result<CliOptions> {
 
 /// The `(agent, session)` pair the CLI recorded the first turn under.
 ///
-/// The CLI mints its agent card id per process, so the pair is read back from the catalogued
-/// execution rather than rebuilt from a constant: rediscovering it is exactly what a restarted
-/// host does.
+/// The pair is read back from the catalogued execution rather than rebuilt from a constant: the
+/// scenario must prove the record is discoverable from disk alone, exactly as a restarted host
+/// finds it.
 fn binding_of(execution: &ExecutionSummary) -> Result<SessionBinding> {
     Ok(SessionBinding::new(
         execution.agent_id.clone(),
