@@ -110,6 +110,8 @@ pub fn fuzzy_name_similarity(a: &str, b: &str) -> f64;   // 1 - distance/max_len
 Canonical data types: `any`, `string`, `text`, `number`, `integer`, `boolean`, `object`, `array`, `null`, `file`, `image`, `audio`.
 Aliases: `str`→`string`, `int`→`integer`, `float`/`double`→`number`, `bool`→`boolean`, `dict`/`map`/`record`/`json`→`object`, `list`/`tuple`→`array`, `bytes`→`bytes` (canonical), `text`→`text`.
 `can_feed` is true when the normalized types are equal, the target is `any`, or the source is a subtype of the target (`integer`→`number`, `text`→`string`); it is false when the source is `any` and the target is not.
+`model::normalization` is the ingest-side declaration layer: `normalize_io_name(raw, fallback)` folds a label, `IONameVocabulary` is the corpus-derived auditable vocabulary (`build`/`resolve`/`to_value`/validating `from_value`), and `normalize_io_specs{,_with_issues,_with_audit}` turns raw provider I/O mappings into `CapabilityIo`s while recording one `NormalizationIssue` or `NormalizationDecision` per renamed, coerced, defaulted, redacted or dropped field.
+See [`model`](src/model/CONTEXT.md) for the aliasing rules, issue codes and bounds.
 
 ### `store` (`src/store.rs`)
 
@@ -306,6 +308,8 @@ Candidate rules are `ExactIo` (same normalized name and type, confidence `1.0`),
 Plans are ranked by `0.45*mean(semantic) + 0.25*mean(edge_confidence) + 0.20*input_coverage - 0.03*(steps - 1)` under `max_depth`/`max_expansions`/`max_plans`, and `status` follows the best plan's root inputs.
 Execution compiles a plan into an `openjiuwen_graph` node per step, and the mutation contract adds a SHA-256 request digest over the declared id batch, a durable replay journal, source-revision CAS and change-set validation.
 See [`orchestration`](src/orchestration/CONTEXT.md) for the full surface, formulas, bounds and journal semantics.
+The matcher adapter (`orchestration::matcher`) renders the compact request document (`build_match_request`) and validates the model reply (`parse_match_response`) into `ValidatedMatch`es plus `GraphDiagnostic`s; it never calls a model itself.
+See [`orchestration::matcher`](src/orchestration/matcher/CONTEXT.md) for the pipeline order, diagnostic codes and the Rust-only evidence derivation.
 
 ### `evaluation` (`src/evaluation/`)
 
@@ -566,13 +570,12 @@ Pure-logic Python areas not ported:
 
 - `discovery/{directory_toolkit,toolkit}.py` — the model-facing `skill_index` operations (directory view, list/search/read, request validation, pagination cursors); `SkillFs` provides `visible_skill_names`, `prompt_snapshot` and the persistable `SkillNoticeState` cursor.
 - `orchestration/graph/artifacts.py`'s artifact-embedded journal and any diffing beyond the request contract — the request digest, durable journal, source-revision CAS and change-set validation are implemented (see [`orchestration::mutation`](src/orchestration/mutation.rs) and `runtime::mutations`); the journal is a separate JSON document, its digests are not chained over the file, and `source_revision` is optional.
-- `orchestration/graph/matcher/{protocol,model}.py` — the `matches_by_candidate`/`diagnostics_by_candidate` helpers and the cache's file lock/pending-merge batching; the persistent match cache, identity digests, endpoint hashing and `sanitize_metadata` are implemented.
-- `shared/fingerprint/normalization.py` — IO-name vocabulary, alias merging and normalization audit records.
+- `orchestration/graph/matcher/cache.py`'s file lock and pending-merge batching — the persistent cache, identity digests, endpoint hashing and the request/response protocol helpers are implemented (see [`orchestration::matcher`](src/orchestration/matcher/mod.rs)).
 - `retrieval/search/runtime/{lexical,selector,disclosure}.py` and `retrieval/build/io/*` — field-weighted lexical scoring, prebuilt-index loading and prompt disclosure rendering.
 - `retrieval/build/**` and `agent/retrieval_toolkit.py` — LLM-driven index construction over the progressive retriever (~9k lines, overlapping `llm::TreeRetriever`).
 - `experience/cluster.py`'s faiss k-means and LLM pattern distillation — replaced by deterministic token-Jaccard clustering and the collector's similarity merge.
 
-Implemented with deterministic offline substitutes: S3/OBS, GCS and Azure Blob artifacts; SKILL.md scanning, the `SkillFs` catalog, prompt snapshot and notice cursor; flow distillation, redaction, ten-check review, `SkillPack` packaging, `SwarmFlow` script generation and package rendering; the mutation request contract, digest, durable idempotency journal and source-revision CAS; the experience bank, persisted index, trace ingestion, clustering and collector; evaluation static/trace metrics and windows; LLM matching (with cache), scoring, retrieval, fingerprinting and judging; the graph-observation contract, append-only evidence log, qualification gating, rebinding and merged revisions (a JSONL log and in-process aggregation replace SQLite and the thread pool).
+Implemented with deterministic offline substitutes: S3/OBS, GCS and Azure Blob artifacts; SKILL.md scanning, the `SkillFs` catalog, prompt snapshot and notice cursor; flow distillation, redaction, ten-check review, `SkillPack` packaging, `SwarmFlow` script generation and package rendering; the mutation request contract, digest, durable idempotency journal and source-revision CAS; the experience bank, persisted index, trace ingestion, clustering and collector; evaluation static/trace metrics and windows; LLM matching (with cache) including the matcher request/response protocol; the I/O-name vocabulary and I/O-spec normalization layer; scoring, retrieval, fingerprinting and judging; the graph-observation contract, append-only evidence log, qualification gating, rebinding and merged revisions (a JSONL log and in-process aggregation replace SQLite and the thread pool).
 Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the stub shape, and `tests/{artifact_gcs,artifact_azure,experience_index}.rs` assert the remaining GPU/vendor boundaries.
 
 ## Error Strategy
@@ -590,6 +593,7 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
 
 - Unit tests live beside modules (`#[cfg(test)] mod tests`); cross-module behavior lives in `crates/openjiuwen-symphony/tests/`.
 - `tests/models.rs` — serde round-trips, `Card` impl, schemas, content hash, datatype `can_feed`, naming helpers.
+- `tests/normalization.rs` — I/O-name folding (unicode, punctuation runs, bounded length), vocabulary build/counts/aliases and order-independent content hash, vocabulary serde round-trip with version/hash/oversize rejection, I/O-spec normalization from list and mapping inputs with every alias key, issue/decision coverage, sensitive-name and metadata redaction, `sanitize_io_specs` depth cap, determinism.
 - `tests/registry.rs` — CRUD, validation, ordering, persistence, `load`/`reload`, revision counter.
 - `tests/search.rs` — BM25, filters, `top_k`, filter-only ordering, `HashEmbedding` semantic index.
 - `tests/graph.rs` — graph from descriptors, edge validation/upsert, incident-edge removal, JGF round-trip.
@@ -608,6 +612,7 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
 - `tests/redaction.rs` — every redaction entry point, idempotence, non-ASCII input, the JSON depth cap and key order, and a flow run whose model emits a key and a PEM block (recipe and pack materials must contain `<redacted>` and no secret).
 - `tests/evaluation.rs` — static card metrics, structure conformance, mixed success rates, `Observed` latency, hand-computed percentile interpolation, window boundaries, aggregation precedence and confidence tiers, `cache_signature` stability, the offline/model-backed judge, and serde round-trips.
 - `tests/llm.rs` — every stage with a scripted model and with no model: tree walk/fallback, ontology consensus, scoring, fingerprint, judge repair, round-trips, error mode.
+- `tests/matcher_protocol.rs` — compact request shape and positional ids (incl. reversed order), description/port truncation on character boundaries, direction omission, compact-reply expansion, explicit rejection, every protocol/validation diagnostic, threshold and reason-truncation behaviour, supporting-field completion and the `OntologyMatch` bridge, grouping helpers, byte-identical re-parse.
 - `tests/matcher_cache.rs` — identity digests, endpoint normalization, `sanitize_metadata`, cache round-trip and byte-stable layout, replay with zero model calls, `force` bypass, signature invalidation, malformed cache, degradation.
 - `tests/observation.rs` — contract validation (graph types, node labels/metadata, ports, edge endpoints, timezone, failure domain), `observed_at` UTC normalisation, the trace-record bridges, stable hashing and static-graph indexes, and the evidence/revision layout with dedupe, cursor, content-derived ids, immutability and atomic writes.
 - `tests/observation_service.rs` — one scenario per qualification reason, duplicate idempotency, the runtime-only threshold, symmetric bounded session-deduped weights, the high-water cursor, `safe_fallback` replay, quarantine/rebind across static republications, merged-revision pinning, persisted sanitisation and UTC persistence.
@@ -622,11 +627,12 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
 
 - `./src/lib.rs` → crate docs, module declarations, `crate_name`
 - `./src/error.rs` → error helpers (`unsupported`, `validation`, `is_unsupported`)
-- `./src/model/` → capability cards, fingerprints, data-type vocabulary, naming
+- `./src/model/` → capability cards, fingerprints, data-type vocabulary, naming, I/O-name and I/O-spec normalization; see [`src/model/CONTEXT.md`](src/model/CONTEXT.md)
   - `./src/model/descriptor.rs` → `CapabilityIo`, `CapabilityDescriptor`, schema derivation, content hash
   - `./src/model/fingerprint.rs` → `CapabilityFingerprint`, `SemanticProfile`, `FingerprintArtifact`
   - `./src/model/datatype.rs` → `DataTypeVocabulary`, `can_feed`, `is_subtype`
   - `./src/model/naming.rs` → `normalize_name_key`, fuzzy name distance/similarity
+  - `./src/model/normalization/` → `normalize_io_name`, `IONameVocabulary`, `normalize_io_specs`, `sanitize_io_specs`, issues/decisions audit
 - `./src/store.rs` → `AssetStore`, `KvAssetStore` (memory/JSON/SQLite)
 - `./src/registry.rs` → `CapabilityRegistry` CRUD + search
 - `./src/search/` → retrieval
@@ -646,12 +652,13 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
   - `./src/flow/render.rs` → `SkillPackAdapter`, `SkillAdapter`, `RenderedArtifact`, `render_package`
 - `./src/redaction/` → credential/PII redaction: scanner, sensitive-name matching, JSON redaction
 - `./src/llm/` → LLM-guided stages with deterministic fallbacks, model/metadata identity, match cache; see [`src/llm/CONTEXT.md`](src/llm/CONTEXT.md)
-- `./src/orchestration/` → planning, execution and the mutation contract; see [`src/orchestration/CONTEXT.md`](src/orchestration/CONTEXT.md)
+- `./src/orchestration/` → planning, execution, the matcher protocol and the mutation contract; see [`src/orchestration/CONTEXT.md`](src/orchestration/CONTEXT.md)
   - `./src/orchestration/plan.rs` → `OrchestrationPlan`, `PlanStep`, `PlanStatus`, JGF projection, stages
   - `./src/orchestration/candidates.rs` → `CandidateGenerator`, relation candidates
   - `./src/orchestration/planner.rs` → `Planner`, `PlanConfig`, `SemanticScorer`, language helpers
   - `./src/orchestration/executor.rs` → `PlanExecutor`, `CapabilityRunner`, plan → `openjiuwen-graph`
   - `./src/orchestration/mutation.rs` → `MutationRequest`, `request_digest`, `MutationJournal`, `validate_mutation_against_inventory`
+  - `./src/orchestration/matcher/` → the LLM-matcher request/response protocol adapter: `build_match_request`, `parse_match_response`, `ValidatedMatch`, `GraphDiagnostic`, grouping helpers; see [`src/orchestration/matcher/CONTEXT.md`](src/orchestration/matcher/CONTEXT.md)
 - `./src/evaluation/` → fail-soft evaluation: shared contract, static and trace metrics, suite aggregation, windows; see [`src/evaluation/CONTEXT.md`](src/evaluation/CONTEXT.md)
 - `./src/runtime/` → `SymphonyRuntime`, config, lifecycle, evolution, mutations; see [`src/runtime/CONTEXT.md`](src/runtime/CONTEXT.md)
   - `./src/runtime/mod.rs` → lifecycle, planning/invocation, lazy semantic sync, evolution
@@ -663,4 +670,4 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
   - `./src/observation/service/` → qualification, aggregation, rebinding, snapshot/fallback orchestration
   - `./src/observation/payload.rs`, `timestamp.rs` → sanitised payload builder and the hand-rolled RFC 3339 layer
 - `./src/deferred.rs` → the remaining GPU-only `Error::Unsupported` stub (`vLLM` logit selection)
-- `./tests/` → behavior suites: `models`, `registry`, `search`, `graph`, `artifact`, `object_artifact`, `artifact_gcs`, `artifact_azure`, `planner`, `executor`, `runtime`, `mutation_journal`, `discovery`, `skill_prompt`, `experience`, `experience_index`, `experience_trace`, `flow`, `flow_codegen`, `redaction`, `evaluation`, `llm`, `matcher_cache`, `deferred`
+- `./tests/` → behavior suites: `models`, `normalization`, `registry`, `search`, `graph`, `artifact`, `object_artifact`, `artifact_gcs`, `artifact_azure`, `planner`, `executor`, `runtime`, `mutation_journal`, `discovery`, `skill_prompt`, `experience`, `experience_index`, `experience_trace`, `flow`, `flow_codegen`, `redaction`, `evaluation`, `llm`, `matcher_protocol`, `matcher_cache`, `deferred`
