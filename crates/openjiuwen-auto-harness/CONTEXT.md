@@ -28,6 +28,10 @@ Exactly the canonical surface, re-exported at the crate root; no new items excep
 - Because the facade re-exports the same items, `openjiuwen_auto_harness::T` and `openjiuwen_rsi::auto_harness::T` are the same type (pinned by `tests/reexports.rs` via `TypeId`).
 - Dependency is `openjiuwen-rsi` only (plus the workspace lints); add a dependency only when the facade itself needs it.
 - `#![forbid(unsafe_code)]`; library code defines no `unsafe`, no globals, and no I/O.
+- `src/lib.rs` also carries `#![allow(clippy::module_name_repetitions)]` (the crate root intentionally repeats `auto_harness`) and `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]`.
+- `Cargo.toml` is 17 lines: `publish = false`, metadata inherited from `[workspace.package]` (version `0.1.0`, edition 2021, rust-version 1.85, license, repository, authors), one path dependency `openjiuwen-rsi.workspace = true`, an empty `[features] default = []`, and `[lints] workspace = true`; no dev-dependencies, no build script, no `description`/`keywords`.
+- The integration test therefore reaches the canonical crate through that ordinary dependency — there is no separate dev-dependency on `openjiuwen-rsi`.
+- The `openjiuwen` umbrella consumes the facade directly: `pub use openjiuwen_auto_harness as auto_harness;` (`crates/openjiuwen/src/lib.rs:130`); no other crate depends on it.
 - All behaviour contracts (errors, async, serde, logging, determinism) are inherited from `openjiuwen-rsi`; do not document or assert different ones here.
 
 ## Routing Table
@@ -39,6 +43,7 @@ Exactly the canonical surface, re-exported at the crate root; no new items excep
 
 ## Test Strategy
 
+- One integration binary, `tests/reexports.rs`, with 6 `#[test]` functions: `auto_harness_config_is_the_canonical_type`, `auto_harness_orchestrator_is_the_canonical_type`, `secondary_surface_is_the_canonical_type`, `module_reexports_match_the_canonical_modules`, `values_flow_between_the_facade_and_the_canonical_crate`, `crate_name_is_stable`.
 - `tests/reexports.rs` asserts `TypeId` equality for `AutoHarnessConfig`, `AutoHarnessOrchestrator`, `AutoHarnessEvent`, `Budget`, `SessionState`, `StopReason`, and the `checkpoint`/`config` submodule spellings, against both `openjiuwen_rsi::auto_harness` and `openjiuwen_rsi::harness_rsi::auto_harness`.
 - The same file checks value interop: facade-built `BudgetLimits`/`AutoHarnessConfig` feed the canonical `Budget` and `StopConditions`, and results type-check as facade items; plus `crate_name()` stability.
 - Behavioural coverage lives in `openjiuwen-rsi` (`src/harness_rsi/auto_harness/orchestrator_tests.rs`); this crate must not duplicate it.
