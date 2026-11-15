@@ -86,6 +86,10 @@ pub struct TaskResult {
     /// Frames the result carries (interaction prompts, partial output).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data: Vec<DataFrame>,
+    /// The executor's reasoning text; surfaced only when the controller's
+    /// `expose_reasoning` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 impl TaskResult {
     /// Builds a completed result carrying `output`.
@@ -139,6 +143,12 @@ impl TaskResult {
             Value::Null => String::new(),
             other => serde_json::to_string(other).unwrap_or_default(),
         }
+    }
+    /// Sets the executor's reasoning text.
+    #[must_use]
+    pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
+        self.reasoning = Some(reasoning.into());
+        self
     }
 }
 /// One scheduled task.
@@ -452,6 +462,32 @@ mod tests {
         assert_eq!(interrupted.data.len(), 1);
         let wire = serde_json::to_value(&interrupted).unwrap();
         assert_eq!(wire["status"], json!("input-required"));
+    }
+    #[test]
+    fn task_result_reasoning_builder() {
+        let result = TaskResult::text("done").with_reasoning("why");
+        assert_eq!(result.reasoning.as_deref(), Some("why"));
+        assert_eq!(result.status, TaskStatus::Completed);
+        assert_eq!(result.display(), "done");
+        assert_eq!(TaskResult::text("done").reasoning, None);
+        assert_eq!(TaskResult::default().reasoning, None);
+    }
+    #[test]
+    fn task_result_reasoning_wire_shape() {
+        let plain = serde_json::to_value(TaskResult::text("done")).unwrap();
+        assert!(plain.get("reasoning").is_none());
+        assert_eq!(plain, json!({"status": "completed", "output": "done"}));
+        let reasoned = TaskResult::text("done").with_reasoning("why");
+        let wire = serde_json::to_value(&reasoned).unwrap();
+        assert_eq!(
+            wire,
+            json!({"status": "completed", "output": "done", "reasoning": "why"})
+        );
+        let parsed: TaskResult = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed, reasoned);
+        let tolerated: TaskResult =
+            serde_json::from_value(json!({"status": "completed", "reasoning": "why"})).unwrap();
+        assert_eq!(tolerated.reasoning.as_deref(), Some("why"));
     }
     #[test]
     fn status_helpers() {
