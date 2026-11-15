@@ -335,13 +335,20 @@ impl TeamPool {
     /// is observable. A run whose entry token is tripped while queued is
     /// finalised as cancelled and never starts.
     ///
+    /// A distributed-configured [`RunServices`] is refused **before** any of
+    /// that: [`RunServices::require_local`] answers `Error::Unsupported` naming
+    /// the deferred transports, so no permit is consumed, no entry is created, and
+    /// no monitor or hub status exists.
+    ///
     /// # Errors
     ///
     /// [`PoolError::Busy`] when the key already has a live run,
     /// [`PoolError::Closed`] after [`TeamPool::stop_all`],
     /// [`openjiuwen_common::error::Error::Cancelled`] when the run was cancelled
-    /// while queued, and [`openjiuwen_common::error::ErrorKind::Config`] outside
-    /// a tokio runtime.
+    /// while queued,
+    /// [`openjiuwen_common::error::ErrorKind::Unsupported`] for a
+    /// distributed-configured runner, and
+    /// [`openjiuwen_common::error::ErrorKind::Config`] outside a tokio runtime.
     #[allow(clippy::needless_pass_by_value)]
     pub async fn start(&self, services: RunServices, request: PoolRequest) -> Result<PoolRun> {
         admit(&self.inner, services, request, false).await
@@ -350,11 +357,15 @@ impl TeamPool {
     /// Starts a new run only when a permit is available right now.
     ///
     /// Unlike [`TeamPool::start`], a full pool is [`PoolError::AtCapacity`] and
-    /// **no** entry is created.
+    /// **no** entry is created. A distributed-configured [`RunServices`] is
+    /// refused first ([`RunServices::require_local`]), ahead of every other
+    /// admission outcome.
     ///
     /// # Errors
     ///
-    /// [`PoolError::AtCapacity`], [`PoolError::Busy`], [`PoolError::Closed`], and
+    /// [`PoolError::AtCapacity`], [`PoolError::Busy`], [`PoolError::Closed`],
+    /// [`openjiuwen_common::error::ErrorKind::Unsupported`] for a
+    /// distributed-configured runner, and
     /// [`openjiuwen_common::error::ErrorKind::Config`] outside a tokio runtime.
     #[allow(clippy::needless_pass_by_value)]
     pub fn try_start(&self, services: RunServices, request: PoolRequest) -> Result<PoolRun> {
@@ -367,11 +378,17 @@ impl TeamPool {
     /// request's inputs, label, and options: the run keeps the inputs and options
     /// of the request that created it.
     ///
+    /// A distributed-configured [`RunServices`] is refused first
+    /// ([`RunServices::require_local`]): nothing is created or joined, so a
+    /// distributed runner can never attach to an in-process run under a
+    /// distributed name.
+    ///
     /// # Errors
     ///
     /// [`PoolError::Closed`], the cancellation error of a run cancelled while
-    /// queued, and [`openjiuwen_common::error::ErrorKind::Config`] outside a
-    /// tokio runtime.
+    /// queued, [`openjiuwen_common::error::ErrorKind::Unsupported`] for a
+    /// distributed-configured runner, and
+    /// [`openjiuwen_common::error::ErrorKind::Config`] outside a tokio runtime.
     #[allow(clippy::needless_pass_by_value)]
     pub async fn acquire(&self, services: RunServices, request: PoolRequest) -> Result<PoolLease> {
         let run = admit(&self.inner, services, request, true).await?;
@@ -457,6 +474,10 @@ async fn admit(
     request: PoolRequest,
     lease: bool,
 ) -> Result<PoolRun> {
+    // Mode enforcement comes before any admission work: a distributed-configured
+    // runner admits nothing, so no permit is consumed, no entry is created, no
+    // monitor status exists, and the mode refusal takes precedence over `Busy`.
+    services.require_local()?;
     if inner.is_closed() {
         return Err(PoolError::Closed.into_error());
     }
@@ -498,6 +519,9 @@ fn try_admit(
     services: RunServices,
     request: PoolRequest,
 ) -> Result<PoolRun> {
+    // Same ordering as `admit`: the mode refusal precedes every other admission
+    // outcome (no permit attempted, no entry created, no monitor status).
+    services.require_local()?;
     if inner.is_closed() {
         return Err(PoolError::Closed.into_error());
     }

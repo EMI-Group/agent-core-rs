@@ -62,6 +62,23 @@ pub fn unsupported(feature: &str, hint: &str) -> Error {
     Error::Unsupported(format!("{feature} is not supported: {hint}"))
 }
 
+/// A distributed-configured runner reaching an entry point that would need a
+/// distributed transport: `Error::Unsupported`, naming the mode and the reason.
+///
+/// This is the ONE message every such path reports — [`crate::Runner::start`],
+/// the six execution entry points, and pool admission all go through
+/// [`crate::config::RunnerConfig::require_local`], which builds it here — so a
+/// caller reads the same wording wherever the refusal surfaces. The feature name
+/// keeps Python's `drunner` spelling so the deferred area stays greppable.
+pub fn distributed_mode() -> Error {
+    unsupported(
+        "distributed runner mode (`drunner`)",
+        "this build ships no distributed transport (Pulsar, ZeroMQ, and A2A \
+         reply-topic transports are deferred); run in-process with \
+         `distributed_mode = false`",
+    )
+}
+
 /// A session of the wrong kind for an operation: `Error::Validation`.
 pub fn invalid_session(message: impl Into<String>) -> Error {
     Error::Validation(message.into())
@@ -161,6 +178,25 @@ mod tests {
             error.to_string(),
             "unsupported: pulsar message queue is not supported: use `in_memory`"
         );
+    }
+
+    #[test]
+    fn distributed_mode_names_the_mode_and_the_missing_transports() {
+        let error = distributed_mode();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.to_string();
+        for expected in [
+            "distributed runner mode",
+            "Pulsar",
+            "ZeroMQ",
+            "A2A",
+            "deferred",
+        ] {
+            assert!(
+                message.contains(expected),
+                "`{message}` should name {expected}"
+            );
+        }
     }
 
     #[test]
