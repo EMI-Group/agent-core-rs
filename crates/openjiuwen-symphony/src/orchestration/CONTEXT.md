@@ -179,10 +179,10 @@ pub struct RunnerContext { pub step_id: String, pub session_id: Option<String>, 
     async fn invoke(&self, capability: &CapabilityDescriptor, inputs: Value, context: &RunnerContext) -> Result<Value>;
 }
 pub struct UnsupportedRunner;          // invoke -> Error::Unsupported
-pub struct ExecutorConfig { pub max_steps: usize /*32*/, pub node_timeout_ms: Option<u64> /*None*/, pub fail_fast: bool /*true*/ }
-pub struct StepOutcome { pub step_id: String, pub capability_type: String, pub success: bool, pub output: Value, pub error: Option<String>, pub duration_ms: u64 }
+pub struct ExecutorConfig { pub max_steps: usize /*32*/, pub node_timeout_ms: Option<u64> /*None*/, pub fail_fast: bool /*true*/, pub fail_on_deferral: bool /*false*/ }
+pub struct StepOutcome { pub step_id: String, pub capability_type: String, pub success: bool, pub output: Value, pub error: Option<String>, pub error_kind: Option<String>, pub deferred: bool, pub duration_ms: u64 }
 pub struct PlanExecution { pub plan_id: String, pub graph_id: String, pub steps: BTreeMap<String, StepOutcome>, pub outputs: BTreeMap<String, Value>, pub state: Value }
-impl PlanExecution { pub fn failed_steps(&self) -> Vec<&StepOutcome>; pub fn succeeded(&self) -> bool; }
+impl PlanExecution { pub fn failed_steps(&self) -> Vec<&StepOutcome>; pub fn deferred_steps(&self) -> Vec<&StepOutcome>; pub fn has_deferrals(&self) -> bool; pub fn succeeded(&self) -> bool; }
 impl PlanExecutor {
     pub fn new(runner: Arc<dyn CapabilityRunner>) -> Self;
     pub fn with_config(config: ExecutorConfig, runner: Arc<dyn CapabilityRunner>) -> Self;
@@ -193,15 +193,19 @@ impl PlanExecutor {
 ```
 
 `executor.rs` compiles a plan into an `openjiuwen_graph::CompiledGraph` and runs it through a
-`CapabilityRunner`, recording per-step `StepOutcome`s; `ExecutorConfig` bounds steps, timeouts, and
-fail-fast behaviour, and `UnsupportedRunner` is the no-runner default.
+`CapabilityRunner`, recording per-step `StepOutcome`s; `ExecutorConfig` bounds steps, timeouts,
+fail-fast and strict-deferral behaviour, and `UnsupportedRunner` is the no-runner default.
 
 Execution mapping: each plan step becomes an `openjiuwen_graph` node whose id is the step id; plan edges become graph edges; entries are steps with no incoming edge and exits steps with no outgoing edge.
 A step's inputs start from `state["inputs"]` and are overlaid by predecessor step outputs whose normalized name matches an input name (a predecessor with exactly one output also fills a single unmatched input).
-Each node writes the top-level state key equal to its step id: `{"success", "output", "error", "duration_ms"}`.
-With `fail_fast` the first runner error aborts with `Error::Graph("step `<id>` failed: ...")`; otherwise every step runs and `failed_steps()` reports failures.
+Each node writes the top-level state key equal to its step id: `{"success", "output", "error", "error_kind", "deferred", "duration_ms"}`.
+`error_kind` is the failure's `ErrorKind` snake_case name (`"tool"`, `"timeout"`, `"graph"`, …) and stays `null` on success; `deferred` is `true` exactly when a failed step's kind is `"unsupported"`, so a typed capability gap is distinguishable from a runtime error without parsing the message, and both fields serde-default to `None`/`false` for a payload written before them.
+With `fail_fast` the first non-deferred runner error aborts with `Error::Graph("step `<id>` failed: ...")`; otherwise every step runs and the returned `PlanExecution` records every failure.
+`PlanExecution::failed_steps` lists every failed step (deferred ones included), `deferred_steps` isolates the typed capability gaps, `has_deferrals` reports whether any exist, and `succeeded` is `false` for a deferred step.
+`ExecutorConfig::fail_on_deferral` (default `false`) instead aborts the run on the first deferred step with `Error::Unsupported("step `<id>` deferred: ...")`, regardless of `fail_fast`, so an opted-in caller never receives a partial plan silently.
 `max_steps` is checked before compilation; the default session is `WorkflowSession::new(<uuid>)`; an empty plan executes to an empty `PlanExecution`.
 A `Cancelled` or `Unsupported` runner error keeps its own `ErrorKind` instead of becoming `Error::Graph`.
+No degradation is silent: an unfilled required input, a non-object seed, a declared predecessor without a record and a failed predecessor each emit a `tracing::warn!`, and a step the graph never recorded is reported as `success: false` with `error_kind: "graph"`.
 
 ### Mutation requests
 
