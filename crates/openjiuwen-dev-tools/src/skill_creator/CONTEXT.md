@@ -64,7 +64,7 @@ Resource paths must be relative, `/`-separated, free of empty/`.`/`..` component
 
 ## Deferred
 
-- Zip and gzip archive unpacking (`Error::unsupported` naming the format): no compression crate exists in the pinned offline dependency set.
+- Zip and gzip archive unpacking stops at the in-crate subset: `tar`, classic 32-bit zip (stored/DEFLATE) and gzip (DEFLATE) unpack; ZIP64, encrypted entries, and other compression methods are `Error::unsupported` (`omni/archive`).
 - Playwright browser automation, JS rendering, stealth user agents, and cookie-banner handling for scraping: replaced by the `Fetcher` seam plus static rule-based HTML extraction.
 - Pillow image decoding and the Python 80 px dimension gate, plus the LLM image-relevance judge (stage 3): replaced by magic sniffing, byte bounds, url-hint icon heuristics, and content/url deduplication.
 - Non-text resource extraction (PDF/DOCX parsing, OCR, video URLs and frame extraction) and Python's LLM "web plugin" scrape fallback: not ported.
