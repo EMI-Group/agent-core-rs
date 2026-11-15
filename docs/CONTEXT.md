@@ -7,7 +7,7 @@ The Context Tree (`CONTEXT.md` per crate) is the primary source of intent and AP
 
 ## Contents
 
-- `ARCHITECTURE.md` — §1 the 30 crates in layers 0–7 plus the three development crates; §2 the shared contracts (§2.1 cards/errors, §2.2 models, §2.3 tools, §2.4 sessions, §2.5 graph/workflow, §2.6 agents/runner, §2.7 harness protocol, §2.8 frame and event streams, §2.9 context engine, §2.10 memory providers, §2.11 observability, §2.12 resume and journal); §3 async/streaming model; §4 configuration and environment; §5 feature flags; §6 testing infrastructure; §7 porting method.
+- `ARCHITECTURE.md` — §1 the 27 crates in layers 0–7 plus the three development crates (30 in total); §2 the shared contracts (§2.1 cards/errors, §2.2 models, §2.3 tools, §2.4 sessions, §2.5 graph/workflow, §2.6 agents/runner, §2.7 harness protocol, §2.8 frame and event streams, §2.9 context engine, §2.10 memory providers, §2.11 observability, §2.12 resume and journal); §3 async/streaming model; §4 configuration and environment; §5 feature flags; §6 testing infrastructure; §7 porting method.
 - `PARITY.md` — the status legend, the per-Python-path package matrix, wire/behavior compatibility, the per-crate deferred-feature table, the `Error::Unsupported` surface, intentional differences, and the verification gates.
 
 ## API Surface
