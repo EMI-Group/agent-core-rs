@@ -14,11 +14,20 @@
 //!    model window, an optional `deepagent` state payload and the cursor naming
 //!    the execution it can be resumed from.
 //!
-//! [`Catalog::list`] merges the three into [`Row`]s, newest first.
+//! One CLI run writes to all three stores, so [`Catalog::list`] folds the entries
+//! that belong to the same `(agent id, session id)` into **one [`Row`] per
+//! session**, richest source first (`state` > `cli` > `execution`), newest-first
+//! overall. The other members of a group are kept in [`Row::sources`], so
+//! `--kind` still finds the stores a session used and `prune` deletes all of
+//! them.
+//!
 //! [`Catalog::resolve`] turns an id (or "the most recent one") into a
 //! [`Resolved`] turn: the session id to continue, the history to seed, the
 //! optional `deepagent` state, and the [`ResumePlan`] when a journal was traced.
-//! [`Catalog::prune`] deletes rows, optionally as a dry run.
+//! [`ResumeRequest::Continue`] takes the newest resumable row and then resolves
+//! it through the documented precedence (`state` > `cli` > `execution`).
+//! [`Catalog::prune`] deletes every source of the rows it selects, optionally as
+//! a dry run.
 //!
 //! Everything here is read-only apart from [`Catalog::prune`], so listing works
 //! on a home and a workspace that were never materialised.
@@ -44,6 +53,17 @@ pub(crate) const KIND_CLI: &str = "cli";
 pub(crate) const KIND_EXECUTION: &str = "execution";
 /// Kind tag of a persistent-agent session record.
 pub(crate) const KIND_STATE: &str = "state";
+/// Agent id a CLI run binds its persistent-agent state to.
+///
+/// A CLI session record carries no agent id, so the catalogue keys those records
+/// under this id to fold them together with the `state` and `execution` entries
+/// the same run leaves behind.
+///
+/// It mirrors the pinned card id `crates/openjiuwen-harness/src/cli/run.rs`
+/// journals CLI runs with (`CLI_AGENT_ID` there, private and not re-exported by
+/// `openjiuwen_harness::cli`); only the CLI writes CLI session records, so the
+/// two spellings have to agree.
+pub(crate) const CLI_AGENT_ID: &str = "openjiuwen-cli";
 /// How many executions a resume may trace when it rebuilds the window.
 const CHAIN_LIMIT: usize = 4;
 
@@ -62,20 +82,91 @@ pub(crate) enum Detail {
     State(StateSummary),
 }
 
-/// One persisted candidate as the catalogue reports it.
+impl Detail {
+    /// Returns the kind tag of the store this entry came from.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Cli(_) => KIND_CLI,
+            Self::Execution(_) => KIND_EXECUTION,
+            Self::State(_) => KIND_STATE,
+        }
+    }
+
+    /// Returns the `(agent id, session id)` pair the entry belongs to.
+    ///
+    /// A CLI record is keyed under [`CLI_AGENT_ID`] because it carries no agent
+    /// id; an execution with no session id keeps its own identity, so unrelated
+    /// session-less executions never collapse into one row.
+    fn group_key(&self) -> (String, String) {
+        match self {
+            Self::Cli(summary) => (CLI_AGENT_ID.to_owned(), summary.session_id.clone()),
+            Self::Execution(summary) => {
+                let session = if summary.session_id.is_empty() {
+                    summary.execution_id.clone()
+                } else {
+                    summary.session_id.clone()
+                };
+                (summary.agent_id.clone(), session)
+            }
+            Self::State(summary) => (
+                summary.binding.agent_id.clone(),
+                summary.binding.session_id.clone(),
+            ),
+        }
+    }
+
+    /// Returns how much a resume restores from this entry: `state` 3, `cli` 2,
+    /// `execution` 1.
+    fn richness(&self) -> u8 {
+        match self {
+            Self::State(_) => 3,
+            Self::Cli(_) => 2,
+            Self::Execution(_) => 1,
+        }
+    }
+}
+
+/// One persisted session as the catalogue reports it.
+///
+/// After the merge there is exactly one row per session, described by its
+/// richest source; the JSON shape is the row's own fields, never the group.
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct Row {
-    /// Session (or execution) identifier.
+    /// Session (or execution) identifier of the richest source.
     pub(crate) id: String,
-    /// Which store the row came from: `cli`, `execution` or `state`.
+    /// Which store the row is reported from: `cli`, `execution` or `state`.
     pub(crate) kind: &'static str,
-    /// RFC 3339 creation timestamp, when the store records one.
+    /// RFC 3339 creation timestamp, when any source of the session records one.
     pub(crate) created_at: Option<String>,
     /// One-line description of what the row holds.
     pub(crate) detail: String,
     /// The store entry behind the row.
     #[serde(skip)]
     pub(crate) data: Detail,
+    /// The other stores holding the same session, richest first then by id.
+    #[serde(skip)]
+    pub(crate) sources: Vec<Detail>,
+}
+
+impl Row {
+    /// Returns whether any store behind the row is of `kind`.
+    ///
+    /// A CLI run leaves state in all three stores but is listed once, from its
+    /// richest one (`state`); `--kind cli` still finds it, because the CLI record
+    /// is one of the row's sources.
+    pub(crate) fn has_kind(&self, kind: &str) -> bool {
+        self.data.kind() == kind || self.sources.iter().any(|detail| detail.kind() == kind)
+    }
+
+    /// Returns whether a resume could restore anything from the row.
+    ///
+    /// Only a group made entirely of unusable execution journals is
+    /// unresumable: every other source carries a window or a transcript.
+    pub(crate) fn is_resumable(&self) -> bool {
+        std::iter::once(&self.data)
+            .chain(self.sources.iter())
+            .any(|detail| !matches!(detail, Detail::Execution(summary) if !summary.usable))
+    }
 }
 
 /// What the user asked to resume.
@@ -147,13 +238,27 @@ impl Catalog {
         ExecutionCatalog::new(self.layout.logs_root(), LogCapacity::default())
     }
 
-    /// Lists every persisted candidate, newest first.
+    /// Lists every persisted session, newest first.
+    ///
+    /// The three stores are read into rows and then folded by `(agent id,
+    /// session id)`, so a conversation that left state everywhere is listed once
+    /// — from its richest source — with the rest kept in [`Row::sources`].
     ///
     /// # Errors
     ///
     /// Returns whatever the three stores report when a root exists but cannot be
     /// read at all; a single damaged record is skipped by the store itself.
     pub(crate) async fn list(&self) -> Result<Vec<Row>> {
+        let mut rows = self.cli_rows()?;
+        rows.extend(self.execution_rows().await?);
+        rows.extend(self.state_rows().await?);
+        let mut rows = merge_rows(rows);
+        sort_rows(&mut rows);
+        Ok(rows)
+    }
+
+    /// Builds one row per CLI session record.
+    fn cli_rows(&self) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         for summary in self.cli_store().list()? {
             rows.push(Row {
@@ -162,8 +267,15 @@ impl Catalog {
                 created_at: non_empty(&summary.created_at),
                 detail: format!("{} messages, model {}", summary.messages, summary.model),
                 data: Detail::Cli(summary),
+                sources: Vec::new(),
             });
         }
+        Ok(rows)
+    }
+
+    /// Builds one row per persistent-agent execution journal.
+    async fn execution_rows(&self) -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
         for summary in self.execution_catalog().list().await? {
             rows.push(Row {
                 id: summary.execution_id.clone(),
@@ -174,8 +286,18 @@ impl Catalog {
                     summary.entries, summary.session_id, summary.usable
                 ),
                 data: Detail::Execution(summary),
+                sources: Vec::new(),
             });
         }
+        Ok(rows)
+    }
+
+    /// Builds one row per persistent-agent session record.
+    ///
+    /// A record has no `created_at`, so the row is stamped with the `state.json`
+    /// modification time.
+    async fn state_rows(&self) -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
         for summary in self.state_store().list().await? {
             rows.push(Row {
                 id: summary.binding.session_id.clone(),
@@ -186,19 +308,20 @@ impl Catalog {
                     summary.binding.agent_id, summary.waiting, summary.has_ending
                 ),
                 data: Detail::State(summary),
+                sources: Vec::new(),
             });
         }
-        sort_rows(&mut rows);
         Ok(rows)
     }
 
     /// Resolves `request` into the turn a resumed run continues.
     ///
-    /// [`ResumeRequest::Id`] looks for a persistent session record, then a CLI
-    /// session record, then an execution journal, all by their own identifier.
-    /// [`ResumeRequest::Continue`] picks the newest usable execution, else the
-    /// newest persistent session record, else the newest CLI session record, and
-    /// then resolves it the same way.
+    /// Both forms resolve through the same precedence — a persistent session
+    /// record, then a CLI session record, then an execution journal, all by their
+    /// own identifier. They differ in how the id is chosen:
+    /// [`ResumeRequest::Id`] takes the caller's id, while
+    /// [`ResumeRequest::Continue`] takes the newest resumable row of
+    /// [`Catalog::list`] and then resolves that row's id the same way.
     ///
     /// # Errors
     ///
@@ -206,13 +329,16 @@ impl Catalog {
     /// journal reader or [`resume`] report.
     pub(crate) async fn resolve(&self, request: ResumeRequest<'_>) -> Result<Resolved> {
         match request {
-            ResumeRequest::Id(id) => self.resolve_id(id).await,
+            ResumeRequest::Id(id) => self.resolve_id(id, false).await,
             ResumeRequest::Continue => self.resolve_most_recent().await,
         }
     }
 
     /// Resolves one id through the documented precedence.
-    async fn resolve_id(&self, id: &str) -> Result<Resolved> {
+    ///
+    /// `most_recent` only changes the note: a `--continue` run says it continued
+    /// the most recent session, not the one the user named.
+    async fn resolve_id(&self, id: &str, most_recent: bool) -> Result<Resolved> {
         let state = self
             .state_store()
             .list()
@@ -220,7 +346,7 @@ impl Catalog {
             .into_iter()
             .find(|summary| summary.binding.session_id == id);
         if let Some(summary) = state {
-            if let Some(resolved) = self.resolve_state(&summary, false).await? {
+            if let Some(resolved) = self.resolve_state(&summary, most_recent).await? {
                 return Ok(resolved);
             }
         }
@@ -230,7 +356,7 @@ impl Catalog {
             .into_iter()
             .find(|summary| summary.session_id == id);
         if let Some(summary) = cli_summary {
-            if let Some(resolved) = Self::resolve_cli(&cli, &summary, false)? {
+            if let Some(resolved) = Self::resolve_cli(&cli, &summary, most_recent)? {
                 return Ok(resolved);
             }
         }
@@ -241,51 +367,22 @@ impl Catalog {
             .into_iter()
             .find(|summary| summary.execution_id == id);
         if let Some(summary) = execution {
-            return self.resolve_execution(&catalog, &summary, false).await;
+            return self.resolve_execution(&catalog, &summary, most_recent).await;
         }
         Err(Error::not_found(format!("unknown session: {id}")))
     }
 
-    /// Resolves the newest resumable candidate.
+    /// Resolves the newest resumable session.
+    ///
+    /// The merged listing is newest-first, so the first row a resume could
+    /// restore is the session to continue; ties break by id. Its id then resolves
+    /// through the same precedence as [`ResumeRequest::Id`], so a session with
+    /// state in every store is continued from the richest one.
     async fn resolve_most_recent(&self) -> Result<Resolved> {
-        let catalog = self.execution_catalog();
-        if let Some(summary) = newest_execution(catalog.list().await?) {
-            return self.resolve_execution(&catalog, &summary, true).await;
-        }
-        if let Some(summary) = self.newest_state().await? {
-            if let Some(resolved) = self.resolve_state(&summary, true).await? {
-                return Ok(resolved);
-            }
-        }
-        let cli = self.cli_store();
-        if let Some(summary) = newest_cli(cli.list()?) {
-            if let Some(resolved) = Self::resolve_cli(&cli, &summary, true)? {
-                return Ok(resolved);
-            }
-        }
-        Err(Error::not_found("no resumable session found"))
-    }
-
-    /// Returns the persistent session record with the newest `state.json`.
-    async fn newest_state(&self) -> Result<Option<StateSummary>> {
-        let mut newest: Option<(StateSummary, DateTime<Utc>)> = None;
-        for summary in self.state_store().list().await? {
-            let Some(at) = state_timestamp(&summary).await else {
-                continue;
-            };
-            let better = match &newest {
-                None => true,
-                Some((current, current_at)) => {
-                    at > *current_at
-                        || (at == *current_at
-                            && summary.binding.session_id < current.binding.session_id)
-                }
-            };
-            if better {
-                newest = Some((summary, at));
-            }
-        }
-        Ok(newest.map(|(summary, _)| summary))
+        let Some(row) = self.list().await?.into_iter().find(Row::is_resumable) else {
+            return Err(Error::not_found("no resumable session found"));
+        };
+        self.resolve_id(&row.id, true).await
     }
 
     /// Loads one persistent session record and rebuilds its window.
@@ -446,6 +543,11 @@ impl Catalog {
 
     /// Returns the row and the resolution behind one id.
     ///
+    /// The row is looked up by its id alone: after the merge a session can resolve
+    /// from a different store than the one its row is reported from (a journal
+    /// reached through its own id resolves under the session id the state record
+    /// kept), and `show` prints the resolution either way.
+    ///
     /// # Errors
     ///
     /// Everything [`Catalog::resolve`] reports.
@@ -454,7 +556,7 @@ impl Catalog {
         let rows = self.list().await?;
         let row = rows
             .into_iter()
-            .find(|row| row.id == resolved.id && row.kind == resolved.kind)
+            .find(|row| row.id == resolved.id)
             // A record that disappeared between the two scans has no row left;
             // the resolution itself already carries everything `show` prints.
             .unwrap_or_else(|| Row {
@@ -463,6 +565,7 @@ impl Catalog {
                 created_at: None,
                 detail: resolved.summary.clone(),
                 data: Detail::Cli(SessionSummary::default()),
+                sources: Vec::new(),
             });
         Ok((row, resolved))
     }
@@ -509,9 +612,21 @@ impl Catalog {
         Ok(selected)
     }
 
-    /// Deletes the store entry behind one row.
+    /// Deletes the store entries behind one row.
+    ///
+    /// A session that left state in several stores is deleted from **every** one
+    /// of them: deleting only the richest source would let the session reappear
+    /// from a leftover record on the next listing.
     async fn remove(&self, row: &Row) -> Result<()> {
-        match &row.data {
+        for detail in std::iter::once(&row.data).chain(row.sources.iter()) {
+            self.remove_detail(detail).await?;
+        }
+        Ok(())
+    }
+
+    /// Deletes the store entry behind one [`Detail`].
+    async fn remove_detail(&self, detail: &Detail) -> Result<()> {
+        match detail {
             Detail::Cli(summary) => {
                 remove_file(&self.cli_store().path_for(&summary.session_id)).await
             }
@@ -570,39 +685,88 @@ fn cutoff(days: f64) -> DateTime<Utc> {
 /// Orders rows newest first, timestamp-less rows last, ties by id ascending.
 fn sort_rows(rows: &mut [Row]) {
     rows.sort_by(|left, right| {
-        match (
-            parse_timestamp(left.created_at.as_deref()),
-            parse_timestamp(right.created_at.as_deref()),
-        ) {
-            (Some(left_at), Some(right_at)) => {
-                right_at.cmp(&left_at).then_with(|| left.id.cmp(&right.id))
-            }
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => left.id.cmp(&right.id),
-        }
+        compare_timestamps(left.created_at.as_deref(), right.created_at.as_deref())
+            .then_with(|| left.id.cmp(&right.id))
     });
 }
 
-/// Returns the newest usable execution, breaking ties by id.
-fn newest_execution(executions: Vec<ExecutionSummary>) -> Option<ExecutionSummary> {
-    executions
-        .into_iter()
-        .filter(|summary| summary.usable)
-        .max_by(|left, right| {
-            parse_timestamp(Some(&left.created_at))
-                .cmp(&parse_timestamp(Some(&right.created_at)))
-                .then_with(|| right.execution_id.cmp(&left.execution_id))
-        })
+/// Compares two timestamps newest first, treating a missing one as oldest.
+fn compare_timestamps(left: Option<&str>, right: Option<&str>) -> Ordering {
+    match (parse_timestamp(left), parse_timestamp(right)) {
+        (Some(left), Some(right)) => right.cmp(&left),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
-/// Returns the newest CLI session record, breaking ties by id.
-fn newest_cli(records: Vec<SessionSummary>) -> Option<SessionSummary> {
-    records.into_iter().max_by(|left, right| {
-        parse_timestamp(Some(&left.created_at))
-            .cmp(&parse_timestamp(Some(&right.created_at)))
-            .then_with(|| right.session_id.cmp(&left.session_id))
-    })
+/// Folds rows that describe the same conversation into one row per session.
+///
+/// The grouping key is the `(agent id, session id)` pair of the entry behind the
+/// row (see [`Detail::group_key`]). Groups keep the order of their first member,
+/// and [`fold_group`] is deterministic, so the merge itself never reorders the
+/// catalogue: [`sort_rows`] does that afterwards.
+fn merge_rows(rows: Vec<Row>) -> Vec<Row> {
+    let mut groups: Vec<((String, String), Vec<Row>)> = Vec::new();
+    for row in rows {
+        let key = row.data.group_key();
+        match groups.iter_mut().find(|(existing, _)| *existing == key) {
+            Some((_, members)) => members.push(row),
+            None => groups.push((key, vec![row])),
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|(_, members)| fold_group(members))
+        .collect()
+}
+
+/// Folds the members of one group into the single row the catalogue reports.
+///
+/// The kept member is the richest one (`state` > `cli` > `execution`), then the
+/// newest, then the one with the smallest id; its own timestamp is kept, and when
+/// it has none the row inherits the newest timestamp of the group, so ordering
+/// and `--older-than` still work. Every other member becomes a source, richest
+/// first then by id, so `--kind` and `prune` still reach it.
+fn fold_group(mut members: Vec<Row>) -> Option<Row> {
+    members.sort_by(by_richness);
+    let mut remaining = members.into_iter();
+    let mut kept = remaining.next()?;
+    let rest: Vec<Row> = remaining.collect();
+    if kept.created_at.is_none() {
+        kept.created_at = newest_timestamp(rest.iter().filter_map(|row| row.created_at.as_deref()));
+    }
+    let mut rest = rest;
+    rest.sort_by(by_kind_then_id);
+    kept.sources = rest.into_iter().map(|row| row.data).collect();
+    Some(kept)
+}
+
+/// Orders group members by richness: richest first, then newest, then by id.
+fn by_richness(left: &Row, right: &Row) -> Ordering {
+    right
+        .data
+        .richness()
+        .cmp(&left.data.richness())
+        .then_with(|| compare_timestamps(left.created_at.as_deref(), right.created_at.as_deref()))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+/// Orders source entries richest first, then by the id they are reported under.
+fn by_kind_then_id(left: &Row, right: &Row) -> Ordering {
+    right
+        .data
+        .richness()
+        .cmp(&left.data.richness())
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+/// Returns the newest parseable timestamp among `values`.
+fn newest_timestamp<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
+    values
+        .filter_map(|value| parse_timestamp(Some(value)).map(|at| (at, value)))
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, value)| value.to_owned())
 }
 
 /// Maps one persisted CLI message onto the kernel message type.
@@ -646,219 +810,6 @@ async fn remove_dir(path: &Path) -> Result<()> {
     }
 }
 
+
 #[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
-    use openjiuwen_harness::cli::MapEnv;
-    use openjiuwen_harness::{PersistentSessionRecord, RecordEnding, SessionBinding};
-    use openjiuwen_test_support::TempWorkspace;
-
-    use super::*;
-    use clap::Parser;
-
-    /// Resolves the harness options of an isolated temp home and workspace.
-    fn options(fixtures: &TempWorkspace) -> CliOptions {
-        let env = MapEnv::from_pairs([("OPENJIUWEN_HOME", fixtures.home().display().to_string())]);
-        let cli = openjiuwen_harness::cli::Cli::parse_from(["openjiuwen"]);
-        CliOptions::resolve_with(&cli, &env, None, &fixtures.workspace()).expect("test options")
-    }
-
-    fn row(id: &str, created_at: Option<&str>) -> Row {
-        Row {
-            id: id.to_owned(),
-            kind: KIND_CLI,
-            created_at: created_at.map(str::to_owned),
-            detail: String::new(),
-            data: Detail::Cli(SessionSummary::default()),
-        }
-    }
-
-    #[test]
-    fn rows_sort_newest_first_with_timestampless_rows_last() {
-        let mut rows = vec![
-            row("b", None),
-            row("a", Some("2024-01-01T00:00:00+00:00")),
-            row("d", Some("2024-03-01T00:00:00Z")),
-            row("c", Some("2024-01-01T00:00:00Z")),
-            row("e", None),
-        ];
-        sort_rows(&mut rows);
-        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
-        assert_eq!(ids, vec!["d", "a", "c", "b", "e"]);
-    }
-
-    #[test]
-    fn an_unparsable_timestamp_sorts_without_one() {
-        let mut rows = vec![
-            row("a", Some("not a timestamp")),
-            row("b", Some("2024-01-01T00:00:00Z")),
-        ];
-        sort_rows(&mut rows);
-        assert_eq!(rows[0].id, "b");
-        assert_eq!(rows[1].id, "a");
-    }
-
-    #[test]
-    fn cli_messages_map_onto_kernel_roles() {
-        let message = |role: &str| MessageRecord {
-            role: role.to_owned(),
-            content: "hi".to_owned(),
-            timestamp: String::new(),
-        };
-        assert_eq!(
-            message_from_record(&message("user")).map(|message| message.role.as_str().to_owned()),
-            Some("user".to_owned())
-        );
-        assert_eq!(
-            message_from_record(&message("assistant"))
-                .map(|message| message.role.as_str().to_owned()),
-            Some("assistant".to_owned())
-        );
-        assert_eq!(
-            message_from_record(&message("system")).map(|message| message.role.as_str().to_owned()),
-            Some("system".to_owned())
-        );
-        let tool = MessageRecord {
-            role: "tool".to_owned(),
-            content: "result".to_owned(),
-            timestamp: String::new(),
-        };
-        assert!(message_from_record(&tool).is_none());
-    }
-
-    #[test]
-    fn resume_notes_use_the_documented_prefix() {
-        assert_eq!(history_prefix("cli-1", false), "resuming session cli-1");
-        assert_eq!(
-            history_prefix("exec-1", true),
-            "resuming the most recent session exec-1"
-        );
-    }
-
-    #[test]
-    fn blank_timestamps_are_reported_as_missing() {
-        assert_eq!(non_empty("  "), None);
-        assert_eq!(
-            non_empty("2024-01-01T00:00:00Z").as_deref(),
-            Some("2024-01-01T00:00:00Z")
-        );
-    }
-
-    #[tokio::test]
-    async fn a_persistent_state_record_lists_resolves_and_prunes() {
-        let fixtures = TempWorkspace::new().expect("temp workspace");
-        let options = options(&fixtures);
-        let layout =
-            PersistentAgentLayout::for_workspace(&Workspace::new(options.workspace.clone()));
-        let store = FileSessionStore::new(layout.sessions_root());
-        let binding = SessionBinding {
-            agent_id: "agent-one".to_owned(),
-            session_id: "sess-1".to_owned(),
-        };
-        let mut record = PersistentSessionRecord::new(&binding).expect("draft record");
-        record.messages = vec![BaseMessage::user("hi"), BaseMessage::assistant("hello")];
-        let record = record
-            .with_ending(RecordEnding {
-                outcome: "completed".to_owned(),
-                request_id: "req-1".to_owned(),
-                ..RecordEnding::default()
-            })
-            .expect("ended record");
-        store.save(&record).await.expect("save record");
-
-        let catalog = Catalog::for_options(&options, None);
-        let rows = catalog.list().await.expect("list");
-        let row = rows
-            .iter()
-            .find(|row| row.id == "sess-1")
-            .expect("state row");
-        assert_eq!(row.kind, KIND_STATE);
-        assert!(row.created_at.is_some());
-        assert_eq!(row.detail, "agent agent-one, waiting false, ending true");
-
-        let resolved = catalog
-            .resolve(ResumeRequest::Id("sess-1"))
-            .await
-            .expect("resolve id");
-        assert_eq!(resolved.kind, KIND_STATE);
-        assert_eq!(resolved.history.len(), 2);
-        assert!(resolved.plan.is_none());
-        assert_eq!(
-            resolved.summary,
-            "resuming session sess-1 from the persistent session record (2 messages restored)"
-        );
-
-        let continued = catalog
-            .resolve(ResumeRequest::Continue)
-            .await
-            .expect("resolve latest");
-        assert_eq!(continued.id, "sess-1");
-        assert!(continued
-            .summary
-            .starts_with("resuming the most recent session sess-1"));
-
-        let pruned = catalog.prune(None, true, false).await.expect("prune");
-        assert_eq!(pruned.len(), 1);
-        assert!(catalog.list().await.expect("list after prune").is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_cli_record_resolves_with_its_transcript() {
-        let fixtures = TempWorkspace::new().expect("temp workspace");
-        let options = options(&fixtures);
-        let store = SessionStore::new(&options.home);
-        store
-            .new_session("cli-1", "mock-model")
-            .expect("new session");
-        store
-            .append_message("cli-1", "user", "hi")
-            .expect("append user");
-        store
-            .append_message("cli-1", "assistant", "hello")
-            .expect("append assistant");
-
-        let catalog = Catalog::for_options(&options, None);
-        let resolved = catalog
-            .resolve(ResumeRequest::Id("cli-1"))
-            .await
-            .expect("resolve id");
-        assert_eq!(resolved.kind, KIND_CLI);
-        assert_eq!(resolved.history.len(), 2);
-        assert_eq!(resolved.history[0].role.as_str(), "user");
-        assert_eq!(
-            resolved.summary,
-            "resuming session cli-1 from the CLI session record (2 messages)"
-        );
-        assert_eq!(
-            resolved.record.expect("cli record").model,
-            "mock-model".to_owned()
-        );
-
-        let (row, shown) = catalog.show("cli-1").await.expect("show");
-        assert_eq!(row.kind, KIND_CLI);
-        assert_eq!(shown.id, "cli-1");
-    }
-
-    #[tokio::test]
-    async fn an_unknown_id_and_an_empty_store_are_typed_not_found() {
-        let fixtures = TempWorkspace::new().expect("temp workspace");
-        let options = options(&fixtures);
-        let catalog = Catalog::for_options(&options, None);
-        let missing = catalog
-            .resolve(ResumeRequest::Id("nope"))
-            .await
-            .expect_err("unknown id");
-        assert!(missing.to_string().contains("unknown session: nope"));
-        let empty = catalog
-            .resolve(ResumeRequest::Continue)
-            .await
-            .expect_err("nothing to continue");
-        assert!(empty.to_string().contains("no resumable session found"));
-        let invalid = catalog
-            .prune(None, false, false)
-            .await
-            .expect_err("no selector");
-        assert!(invalid.to_string().contains("--older-than"));
-    }
-}
+mod tests;

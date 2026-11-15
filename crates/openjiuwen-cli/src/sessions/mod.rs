@@ -3,8 +3,12 @@
 //! One conversation can leave state in three places (see
 //! [`catalog`](self::catalog)): the CLI session records under `<home>/sessions`,
 //! the persistent-agent execution journals and the persistent-agent session
-//! records under the workspace's `persistent_agent` node. This command lists all
-//! three, shows what a resume would seed, and prunes old entries.
+//! records under the workspace's `persistent_agent` node. A single `openjiuwen
+//! run` writes to all three, so the catalogue folds them into **one row per
+//! session**, reported from its richest source (`state`, then `cli`, then
+//! `execution`). This command lists those sessions, shows what a resume would
+//! seed, and prunes old ones — pruning a session deletes it from every store
+//! that holds it.
 //!
 //! It is read-only apart from `prune`: listing works on a home and a workspace
 //! that were never materialised, so no directory is created here.
@@ -87,6 +91,10 @@ pub(crate) enum SessionsCommand {
 }
 
 /// The stores `list --kind` can select.
+///
+/// A session is listed once, from its richest source, but `--kind` matches **any**
+/// store that holds it: a CLI run is shown by `--kind state` (its row), and by
+/// `--kind cli` and `--kind execution` (its other sources).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum KindArg {
     /// CLI session records.
@@ -128,16 +136,19 @@ pub(crate) async fn run(args: &SessionsCli, base: &openjiuwen_harness::cli::Cli)
     }
 }
 
-/// Prints the persisted rows, newest first.
+/// Prints the persisted sessions, newest first.
 ///
-/// The kind filter is applied before `limit`, and `limit` 0 means "all".
+/// One row is one session: a conversation that left state in several stores is
+/// listed once, from its richest source. The kind filter matches any store behind
+/// the row, so `--kind cli` still finds a session whose row is reported from
+/// `state`. The filter is applied before `limit`, and `limit` 0 means "all".
 async fn list(catalog: &Catalog, kind: Option<KindArg>, limit: usize, json: bool) -> Result<()> {
     let rows: Vec<Row> = catalog
         .list()
         .await?
         .into_iter()
         .filter(|row| match kind {
-            Some(kind) => row.kind == kind.as_str(),
+            Some(kind) => row.has_kind(kind.as_str()),
             None => true,
         })
         .take(if limit == 0 { usize::MAX } else { limit })
@@ -206,7 +217,10 @@ async fn show(catalog: &Catalog, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Deletes (or reports) the rows the selectors match.
+/// Deletes (or reports) the sessions the selectors match.
+///
+/// Each selected row is one session, and a real prune deletes it from every store
+/// that holds it, so a pruned session cannot reappear from a leftover record.
 async fn prune(
     catalog: &Catalog,
     older_than: Option<f64>,
