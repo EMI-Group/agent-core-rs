@@ -11,8 +11,8 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 
 - `src/lib.rs` — marker module (`crate_name()`); the crate has no runtime API.
 - `tests/support/mod.rs` — the cross-scenario helper contract: `BOUND` (10 s per-await deadline), `within(what, future)`, `collect_bounded(stream, max)`. Scenario-specific fixtures stay in `openjiuwen-test-support` or beside the scenario.
-- Test binaries (each `tests/*.rs` is its own binary; no `[[test]]` entries), 24 of them:
-  `kernel_flow`, `workflow_components`, `context_engine`, `context_tokenizers`, `retrieval_pipeline`, `memory_recall`, `memory_dreaming`, `team_memory`, `deep_agent`, `harness_cli_tools`, `provider_native`, `team_flow`, `team_backend`, `runner_subprocess`, `runner_hosting`, `federation_transports`, `a2a_roundtrip`, `symphony_plan`, `symphony_artifacts`, `self_improvement`, `evaluation_ledger`, `plugin_observability`, `cli_binary`.
+- Test binaries (each `tests/*.rs` is its own binary; no `[[test]]` entries), 25 of them:
+  `kernel_flow`, `workflow_components`, `context_engine`, `context_tokenizers`, `retrieval_pipeline`, `memory_recall`, `memory_dreaming`, `team_memory`, `deep_agent`, `harness_cli_tools`, `provider_native`, `team_flow`, `team_backend`, `runner_subprocess`, `runner_hosting`, `federation_transports`, `a2a_roundtrip`, `symphony_plan`, `symphony_artifacts`, `self_improvement`, `evaluation_ledger`, `plugin_observability`, `persistent_agent_journal`, `cli_binary`.
 - Features: `default = []`;
   `a2a` (enables `openjiuwen/a2a` + `openjiuwen-extensions/a2a`, gates `a2a_roundtrip.rs`);
   `otel` (enables `openjiuwen/otel` + `openjiuwen-extensions/otel`, gates `plugin_observability.rs`);
@@ -25,7 +25,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 
 ## Scenario Matrix
 
-112 test functions across 24 scenario binaries: 111 pass with `--features sqlite,a2a,otel` (102 with default features), and exactly 1 documented `#[ignore]`.
+116 test functions across 25 scenario binaries: 115 pass with `--features sqlite,a2a,otel` (106 with default features), and exactly 1 documented `#[ignore]`.
 
 | Binary | Scenario | Crates / seams exercised |
 |---|---|---|
@@ -131,6 +131,10 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 | `plugin_observability.rs` (3, feature `otel`) | Team-memory hook events observed by a recording observer are projected onto spans and exported OTLP/HTTP JSON to a loopback collector: path, content type, resource attributes, scope name, span names/order/kind, ids and team attributes | `openjiuwen::core::memory::team` hooks + `extensions::otel::{OtelTraceSink, TracerHandle}`, `wiremock` |
 | `plugin_observability.rs` | A 500 collector yields exactly one POST per batch, no retry, and a clean bounded shutdown | OTLP exporter failure surface |
 | `plugin_observability.rs` | Two flushes export two ordered batches sharing the session trace id; `OtlpEncoding` fixes the path and content type | `OtlpEncoding`, `traces_url` |
+| `persistent_agent_journal.rs` (4) | A completed journal (five entries, one rotation) reopens from disk: segment line counts, metadata encoding/generation, `replay.cursor` (`next_seq`/`last_seq`/`generation`), digest sequence span, per-kind counts and token totals all read back | `openjiuwen::harness::persistent_agent` (`ExecutionLog`, `LogCapacity`, `EntryPayload`, `ModelUsage`, `EntryKind`, `Replay`, `LOG_ENTRY_FILE`/`LOG_META_FILE`/`LOG_ENCODING`), `ManualClock` |
+| `persistent_agent_journal.rs` | `resume` over two linked executions rebuilds `cursor` (`resume_seq`/`recovery_ref`/`predecessor_id`/relation), a non-empty window containing the journalled goal, the traced chain, the background document and the record's new continuation without rewriting the stored record | `resume`, `Continuation`, `RootLogSource`, `FileLinkStore`, `FileSessionStore`, `PersistentSessionRecord`/`RecordEnding`, `ExecutionLink`/`LinkRelation`, `WindowAssembler`/`Capacity` |
+| `persistent_agent_journal.rs` | A hand-damaged `entries.jsonl` (retried append, conflicting rewrite, torn trailing line) reports `skipped_invalid`/`duplicates_removed`/`conflicting_seqs`, stays usable, keeps the valid entries, and keeps accepting appends past the damage (`missing_ranges` appears once the writer continues) | `ExecutionEntry` serialization + the tolerant read (`LogSnapshot`, `LogDigest::summary`) |
+| `persistent_agent_journal.rs` | The remote and distributed handoff transports answer `Error::Unsupported` with their documented `reason()`; the in-process transport has none | `hand_off`, `RemoteHandoff`, `DistributedHandoff`, `HandoffTransfer`, `HandoffTransport` |
 | `cli_binary.rs` (5 + 1 ignored) | `run_with_model` one-shot: `text`, `json`, `stream-json` output contracts | `openjiuwen-harness` `cli` (`run_with_model`, `CliIo`, `OutputFormat`) |
 | `cli_binary.rs` | Pre-run validation (option resolution, blank prompt) rejects before any model call | `CliOptions::resolve_with`, `Cli::dispatch` |
 | `cli_binary.rs` | Process-boundary `--version`/`--help` — `#[ignore]`d, see Known Gaps | `openjiuwen-cli` binary, resolved at runtime |
@@ -177,6 +181,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 - `./tests/runner_subprocess.rs` → runner subprocess spawn seam: self-executing NDJSON child, request/reply, health, graceful shutdown, typed transport/validation errors
 - `./tests/agent_usage_events.rs` → `context.usage` / `llm_usage` frames, provider-usage normalization, session cache aggregation
 - `./tests/plugin_observability.rs` → team-memory events projected to OTLP/HTTP spans against a loopback collector (feature `otel`)
+- `./tests/persistent_agent_journal.rs` → persistent-agent journal durability: crash/reopen replay, `resume` cursor/window/chain, damaged-journal degradation, typed deferred handoffs
 - `./tests/cli_binary.rs` → harness CLI layer (one-shot output formats, pre-run validation, process boundary)
 - `./tests/support/mod.rs` → cross-scenario deadline and stream helpers (`BOUND`, `within`, `collect_bounded`)
 - `./Cargo.toml` → manifest, test-only dependency set, `a2a`/`otel`/`sqlite` features
@@ -187,7 +192,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 - Assert on recorded evidence, not timing: `ScriptedModel::calls()`/`call_count()`/`remaining()`, harness event sequences, collected frames, task board and mailbox state, store and file contents, `MockLlmServer::request_count`, `FakeCommandRunner::invocations()`, ledger `totals()`/`events()`, the fake servers' recorded commands and requests, exported OTLP payloads.
 - Fake only what a scenario cannot own: harness protocols, member factories, symphony capability runners, RSI harness runners, evolving targets, Docker (`FakeCommandRunner`), the subprocess child (the test binary itself), the Redis server, the object-storage APIs, the OTLP collector, and the dream consolidator (a per-scenario salience consolidator). Each fake is copied into the scenario that needs it, keeping every binary's contract explicit.
 - Fixtures that the library keeps private are rebuilt from public primitives inside the scenario (`build_zip` for the DOCX/XLSX fixtures uses `parsing::crc32`; the tokenizer fixture is a hand-written byte-level `tokenizer.json`), never by widening library visibility.
-- Gates: `cargo fmt -p openjiuwen-e2e -- --check`; `cargo test -p openjiuwen-e2e --offline`; `--features sqlite,a2a,otel`; `cargo clippy -p openjiuwen-e2e --all-targets [--all-features] --offline -- -D warnings`. Default features run 102 scenarios + 1 ignored, the feature set runs 111 + 1 ignored, and the whole suite finishes in seconds of test time (the subprocess, attach, federation and artifact scenarios included) and is stable across repeated runs.
+- Gates: `cargo fmt -p openjiuwen-e2e -- --check`; `cargo test -p openjiuwen-e2e --offline`; `--features sqlite,a2a,otel`; `cargo clippy -p openjiuwen-e2e --all-targets [--all-features] --offline -- -D warnings`. Default features run 106 scenarios + 1 ignored, the feature set runs 115 + 1 ignored, and the whole suite finishes in seconds of test time (the subprocess, attach, federation and artifact scenarios included) and is stable across repeated runs.
 
 ## Design Decisions
 
