@@ -33,6 +33,13 @@ export-path utilities around it.
 - `tool_outcome` — `TOOL_REPORTED_FAILURE`, `DEFAULT_FAILURE_REASON`, `EXCEPTION_RESULT_PREFIX`,
   `tool_failure_reason`, `tool_result_for_exception`.
 - `error_reporting` — `error_reason(exception_text, error_message, exception_type, default)`.
+- `deferred` — the typed `Unsupported` seams for the SDK-only modules: `init_observability`,
+  `shutdown_observability`, `force_flush_provider`, `tracer`, `is_initialized` (infallible `false`),
+  `acquire_observability_demand`/`release_observability_demand` with `ObservabilityDemand`,
+  `instrumentation_env_flag` (the portable env literal), `ensure_global_http_instrumentation`,
+  `reset_global_http_instrumentation_for_tests`, `register_span_consumer`, `publish_span_snapshot`,
+  `publish_stream_frame`, `emit_context_window_commit`, `emit_compaction_window_commit`, and the
+  three `*_DEFERRED_REASON` strings each of them carries.
 - `file_exporter` (`otel`) — `TraceFileExporter::{new, from_config}` implementing `SpanExporter`;
   behind `ExporterType::File` with `OtelTracerConfig::{traces_dir, file_retention_days}`.
 - `transforming` (`otel`) — `SpanTransform` (blanket impl for closures), `clone_span_with_attributes`,
@@ -61,17 +68,20 @@ export-path utilities around it.
 
 ## Deferred
 
+Every deferred capability keeps a typed entry point in `deferred.rs` that answers
+`ErrorKind::Unsupported` with the backend name and the supported alternative — no path is a silent
+no-op, and `is_initialized()`/`instrumentation_env_flag()` are the two deliberately infallible
+answers.
 - `setup.py`, `demand.py`, `runtime.py` — a process-global `TracerProvider` with reference-counted
   acquire/release. This crate keeps one `TracerHandle` per ownership scope and installs no global
   exporter or background runtime.
-- `span_record_processor.py`, `trajectory_events.py`, `span_context.py` — the async span-record and
-  stream-frame fan-out plus the contextvar span tracker; they need frozen `ReadableSpan`s and a
-  reader-side consumer registry that this workspace has no trajectory data plane for. Their pure
-  parts (record kinds, key literals, `@oj-seq` addressing) are ported.
+- `span_record_processor.py`, `trajectory_events.py`, `span_context.py`,
+  `context_compression_handler.py` — the async span-record and stream-frame fan-out plus the
+  contextvar span tracker; they need frozen `ReadableSpan`s and a reader-side consumer registry that
+  this workspace has no trajectory data plane for. Their pure parts (record kinds, key literals,
+  `@oj-seq` addressing) are ported.
 - `instrumentation.py` — monkey-patched `httpx`/`requests`/`aiohttp`/`FastAPI` instrumentation; Rust
-  has no equivalent hook surface.
-- `context_compression_handler.py` — the context-engine compaction to trajectory-event bridge; it
-  belongs with the deferred data plane.
+  has no equivalent hook surface, so a consumer instruments its own transport.
 
 ## Routing Table
 
@@ -80,5 +90,6 @@ export-path utilities around it.
 - `./content_addressing.rs` → `@oj-seq` prefix chains and OTLP JSON attribute addressing
 - `./tool_outcome.rs` → tool-failure classification over a tool result
 - `./error_reporting.rs` → the `error_reason` priority chain
+- `./deferred.rs` → typed `Unsupported` seams for the SDK-only Python modules (global provider lifecycle, HTTP instrumentation, trajectory data plane)
 - `./file_exporter.rs` → the OTLP-JSON WAL behind `ExporterType::File` (`otel` feature)
 - `./transforming.rs` → export-time span projection wrapper (`otel` feature)
