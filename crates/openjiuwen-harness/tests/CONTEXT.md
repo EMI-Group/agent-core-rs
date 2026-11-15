@@ -7,7 +7,7 @@ Unit tests live beside their modules; these cover cross-module behavior.
 
 ## API Surface
 
-Test files (one concern each, twelve binaries, 111 tests total):
+Test files (one concern each, twelve binaries, 113 tests total with `--all-features`):
 - `deep_agent_loop.rs` (6) — no-tool answer, real `FunctionTool` round, built-in `bash` permission denial, max-iteration truncation, follow-up queue drain, idempotent abort.
 - `workspace_safety.rs` (9) — cn/en schema seeding and markers, traversal/absolute/drive/UNC rejection, top-level-only `get_node_path`, idempotent rebuild, `is_safe_relative_path` truth table, unsafe node paths.
 - `permissions.rs` (14) — allow/ask/deny precedence and `strictest` fold, file-guard fold, session-scoped approvals via the rail, rail `skip_tool` denial, `PermissionConfirmResponse::parse` shapes.
@@ -15,9 +15,9 @@ Test files (one concern each, twelve binaries, 111 tests total):
 - `subagents_skills.rs` (19) — built-in presets, fake factory spawn/wait/close/capacity, quota refusal/free and per-parent/depth limits, activity lifecycle and LRU eviction with transcript digests, subagent tool payloads, skill discovery/budget/disabled state, `SkillRootMount`.
 - `protocol.rs` (8) — `NativeHarness` lifecycle, capability gating, single-consumer cursors, checkpoint export, provider `create` from JSON, capability card.
 - `cli.rs` (21) — clap grammar/flags/formats, headless `run_with_model` in all three output formats, scripted REPL transcript, permission answer mapping.
-- `public_surface.rs` (10) — every newly landed item resolves flat from the crate root and does real work: `MoaConfig`/`MoaRail` (asserting the published consultation protocol text in both languages), `ExecutionLog`/`WindowAssembler`, `HeartbeatRail`, `PersonalContextStore`, `WorktreeLock`/`SparseConfig`, `ActivityThrottle`, `drain_rail_events`, `DiagnosticRegistry`/`Diagnostic`, `WorkspaceWatcher` (a real delivered write plus a silent shutdown with `notify`, its typed `Unsupported` refusal without), `GoalRail`.
+- `public_surface.rs` (11) — every newly landed item resolves flat from the crate root and does real work: `MoaConfig`/`MoaRail` (asserting the published consultation protocol text in both languages), `ExecutionLog`/`WindowAssembler`, `HeartbeatRail`, `PersonalContextStore`, `WorktreeLock`/`SparseConfig`, `ActivityThrottle`, `drain_rail_events`, `DiagnosticRegistry`/`Diagnostic`, `WorkspaceWatcher` (a real delivered write plus a silent shutdown with `notify`, its typed `Unsupported` refusal without), `GoalRail`, and the resume surface (`ExecutionCatalog`/`ExecutionSummary`, `PersistentAgentLayout` with the `LOGS_DIR`/`SESSIONS_DIR`/`LINKS_DIR`/`PERSISTENT_AGENT_NODE` constants, `FileSessionStore::list` → `SessionSummary`, `percent_decode_identifier`, `seed_state`, plus signature pins of `run_once_resumed`, `run_with_model_resumed`, `Repl::seed_history` and `DeepAgent::seed_history`).
 - `moa_rail.rs` (4) — two scripted proposers through `consult`/`rank_with_config`, the rail's prompt section and `MoaSnapshot`/`MoaOutcome` extra keys, the all-proposers-fail `Error::Llm`, and the refusal of a reference-free configuration.
-- `persistent_agent_resume.rs` (3) — a rotated journal reopened from disk (`replay`, digest, monotone sequences), `resume` → `ResumePlan` with a rebuilt window and continuation prompt, `ShareFile` export/import round trip plus tamper detection, and the typed `Unsupported` of the remote/distributed handoffs.
+- `persistent_agent_resume.rs` (4) — a rotated journal reopened from disk (`replay`, digest, monotone sequences), `resume` → `ResumePlan` with a rebuilt window and continuation prompt, `ShareFile` export/import round trip plus tamper detection, the typed `Unsupported` of the remote/distributed handoffs, and the end-to-end host restart: one CLI turn (`run_with_model_resumed` on a `ScriptedModel`) journalled through `ExecutionLog` with a `PersistentSessionRecord` and an `ExecutionLink`, every handle dropped, the execution and session rediscovered through `ExecutionCatalog::list`/`FileSessionStore::list`, the plan round-tripped through JSON, and the continued turn sending the restored transcript ahead of the new query while the CLI record keeps both turns.
 - `goal_rail_events.rs` (4) — a settled goal auto-registers `GoalRail` through a mounted `get_current_goal` tool and reaches both the `stream` interaction frame and `drain_rail_events` exactly once; an active goal publishes the reminder and no event; no goal tool means no rail; the event's output frame round-trips.
 - `watcher_targets.rs` (6) — `#![cfg(feature = "notify")]`: independent per-target steps (a new skill file, an `IDENTITY.md` rewrite, an MCP-config rewrite) each await their own event, one watcher keeps sequences monotonic across targets, a write burst coalesces into one event, and a not-yet-created file target still fires while shutdown is idempotent and publishes nothing afterwards.
 
@@ -412,9 +412,29 @@ pub async fn run(cli: Cli) -> Result<()>                 // :233
 Permission prompt (`permissions.rs:56-66`): answers are trimmed/lowercased — approve `""|y|yes|ok|approve|allow|allow_once|true|1`, always `a|always|allow_always`, reject `n|no|deny|reject`, anything else is `Feedback`.
 `PermissionAnswer::to_response()` (`:75`) maps always to `{approved:true, auto_confirm:true, persist_allow:None}`; `CliPermissionHost::request_confirmation` (`:221`) returns `ConfirmationOutcome::Failed` without writing when `!io.is_interactive()`.
 
-### 11. Commands and known state
+### 11. Host resume (CLI turn + persistent agent)
+
+```rust
+ResumedTurn::new(session_id).with_history(Vec<BaseMessage>).with_state(Value)       // src/cli/resume.rs:65/75/85
+async run_with_model_resumed(&CliOptions, &RunArgs, &CliIo, Arc<dyn Model>, ResumedTurn) -> Result<RunOutcome> // :118
+async run_once_resumed(&CliOptions, &RunArgs, &CliIo, ResumedTurn) -> Result<RunOutcome> // :172 (builds the model: credentials)
+DeepAgent::seed_history(&Arc<dyn Session>, Vec<BaseMessage>) -> Result<()>            // src/agent/seed.rs:71
+async seed_state(&dyn Session, Value) -> Result<()>                                  // replaces the `deepagent` lane
+Repl::seed_history(&mut self, Vec<BaseMessage>) -> Result<()>                        // src/cli/repl.rs:523
+ExecutionCatalog::new(root, LogCapacity).with_clock(Arc<dyn Clock>).list()/open(id)   // src/persistent_agent/catalog.rs
+FileSessionStore::new(layout.sessions_root()).list() -> Vec<SessionSummary>           // src/persistent_agent/session.rs:636
+PersistentAgentLayout::{new, for_workspace}.{base, logs_root, sessions_root, links_root} // src/persistent_agent/layout.rs
+```
+
+`ResumePlan` is `Serialize`/`Deserialize`, so a host persists it and continues from the parsed copy; `seed_messages()`/`seed_history()` return the window it rebuilt from the journal.
+A resumed turn seeds *after* the agent build (`configure` drops pooled contexts), continues an existing CLI record instead of truncating it, and appends both new messages.
+The `run_with_model_resumed` seam is the test path (no credentials); `run_once_resumed` builds a provider model and is only signature-pinned.
+Test recipe (`persistent_agent_resume.rs`): fill `CliOptions` by hand (`workspace = <root>/workspace`, `home = OpenJiuwenHome::from_root(<root>)`, no key/base) and call `ensure_workspace()`, pass `CliIo::new` a never-consulted `LineReader` plus a discarding `Writer`, keep a `ScriptedModel` clone as the recording handle, and journal the turn with `ExecutionLog::open_with_clock` under `layout.logs_root().join(identity.directory_name())` (the `ExecutionCatalog`/`RootLogSource` path rule).
+A `ManualClock` frozen at `NOW_MS` makes `ExecutionSummary::created_at` and the session timestamps deterministic.
+
+### 12. Commands and known state
 
 - `cargo fmt -p openjiuwen-harness`; `cargo test -p openjiuwen-harness`; `cargo test -p openjiuwen-harness --no-default-features`; `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings`.
-- The twelve `*.rs` files above are the complete `tests/` tree; all twelve compile and pass (`cargo test -p openjiuwen-harness`: 1915 unit + 108 integration + 13 doc tests with `--all-features`; the `notify` binary is empty without the feature).
+- The twelve `*.rs` files above are the complete `tests/` tree; all twelve compile and pass (`cargo test -p openjiuwen-harness`: 2932 unit + 113 integration + 20 doc tests with `--all-features`; the `notify` binary is empty without the feature).
 - Non-public APIs tests must not reach for: `SubAgentRuntime`'s `test_support` module, `discover_skills`, `Workspace::root`/`get_node` (absent), CLI child modules and `Repl::build`, `DeepLoopEvent` fields (serde-only), `DeepAgent` private fields, protocol `inner`/`cursor`/`events`/`bridge`/`turn`.
 - No panics were found on the public surfaces above; `PermissionLevel` has no `Ord`, `HarnessError` is `#[non_exhaustive]` and not comparable, and `ScriptedModel` is `Clone` but not `Debug`/`Serialize`.
