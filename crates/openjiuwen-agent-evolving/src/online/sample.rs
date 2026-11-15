@@ -4,7 +4,7 @@
 //! (`TrajectorySampleStore` + `InMemoryTrajectoryStore`). The ledger keeps the
 //! same contract — one record per `sample_id`, a status index per status, and
 //! first-wins publication — on top of [`OnlineStore`] instead of an in-process
-//! dictionary, so the in-memory and future Redis backends share every rule.
+//! dictionary, so the in-memory and Redis backends share every rule.
 //!
 //! # Deviation from Python's score semantics
 //!

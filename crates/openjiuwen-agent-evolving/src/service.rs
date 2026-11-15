@@ -43,8 +43,10 @@
 //! - `service_not_ready` — `503`, the service is not accepting work yet, or its
 //!   configured executor cannot train.
 //! - `internal_error` — `500`, an unexpected evaluation or storage failure.
-//! - `unsupported` — `501`, a deferred capability the message names and points
-//!   at `docs/PARITY.md` for.
+//! - `unsupported` — `501`, built by [`ApiError::unsupported`] for a deferred
+//!   capability the message names and points at `docs/PARITY.md` for. No route
+//!   answers it today: every deferred capability this build exposes surfaces as
+//!   `service_not_ready` (`503`) or as a `failed` training-run record.
 //!
 //! The router is pure: building and exercising it binds no socket and needs no
 //! Redis, no model, and no credentials.
