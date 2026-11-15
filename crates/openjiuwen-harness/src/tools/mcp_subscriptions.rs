@@ -63,8 +63,10 @@
 //! subscription the provider rejected or no longer knows: a failed open registers nothing, and an
 //! `unsubscribe` the provider answers with [`Error::NotFound`] reaps the local entry instead of
 //! pinning it for the lifetime of the registry.
-// Size note: ~850 lines of implementation plus an inline test module; the registry,
-// per-URI buffer and the model-facing tool share one file because they are one concern.
+//!
+//! Size note: ~1067 lines of implementation plus an inline test module; the provider seam, the
+//! per-URI ring buffer with broadcast delivery, the notification ingest bridge and the model-facing
+//! tool support are one registry whose lag and slot accounting only the private internals can prove.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};

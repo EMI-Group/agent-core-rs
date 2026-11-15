@@ -19,6 +19,10 @@
 //! Legacy host YAML is upgraded once, at construction time, by
 //! [`prepare_permissions_for_engine`] (idempotent via the `layer: "builtin"`
 //! marker), which also fills missing rule `action`s from `severity`.
+//!
+//! Size note: ~464 lines of implementation plus an inline test module; the decision
+//! path (engine, precedence folding, project-root boundary, session-overlay
+//! hot-update) is one unit, and the 1000-line overrun is the test module alone.
 
 use std::path::PathBuf;
 

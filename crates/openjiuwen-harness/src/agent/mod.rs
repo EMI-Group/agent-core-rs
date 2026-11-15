@@ -51,6 +51,10 @@
 //! resolves the model through `builder::ensure_agent_wired`, and marks the
 //! agent wired. A failed resolution releases the claim so a later invocation can
 //! retry.
+//!
+//! Size note: ~1095 lines of implementation plus `tests.rs`; the facade, its `Agent`
+//! impl, the `RunningGuard` and the streaming `Driver` share the agent's private
+//! wiring, so they stay in one file.
 
 mod builder;
 mod factory;

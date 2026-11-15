@@ -33,8 +33,9 @@
 //! usable window, but that text is marked `摘要不可用` and the failure is recorded in
 //! [`WindowAssembly::summary_error`]; [`WindowAssembler::try_assemble`] and
 //! [`WindowAssembler::try_assemble_with_budget`] return the error to the caller instead.
-// Size note: ~1010 lines of implementation plus an inline test module; the rendering
-// table, budget accounting and rollover planner are one cohesive unit.
+// Size note: ~1144 lines of implementation plus an inline test module; the rendering table,
+// budget accounting, the summariser seam (`ExtractiveSummarizer`/`CompletionSummarizer`) and the
+// rollover planner are one cohesive pure unit whose invariants are tested together.
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;

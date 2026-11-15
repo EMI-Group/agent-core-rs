@@ -43,6 +43,10 @@
 //!   ported: the payload renders through the default [`Tool`] rendering.
 //! - A read that returns several `contents` entries (a multi-part resource) keeps the first and
 //!   logs the rest at `debug`, because this seam models one content per URI.
+//!
+//! Size note: ~608 lines of implementation plus an inline test module; the two tools, the
+//! live-client provider adapter and its notification drain are one seam, and the overrun past the
+//! 1000-line baseline is the inline test module alone.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
