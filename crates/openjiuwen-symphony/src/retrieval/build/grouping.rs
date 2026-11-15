@@ -77,6 +77,11 @@ use crate::model::naming::normalize_name_key;
 use crate::retrieval::build::scanner::SourceItem;
 use crate::retrieval::build::tree_text::{slug_term, text_tokens};
 
+/// Embedding-backed k-means clustering of items into tree branches (`GroupingStrategy::{Kmeans, FaissKmeans}`).
+pub mod kmeans;
+/// Model-guided tree grouping (`GroupingStrategy::LlmGrouping`) with no silent lexical fallback.
+pub mod llm;
+
 /// Python's `BRANCHING_FACTOR`: the default number of children one branch may hold.
 pub const DEFAULT_MAX_CHILDREN: usize = 8;
 /// Python's `MAX_DEPTH`: the default tree depth, counting the root as depth 1.
@@ -186,6 +191,10 @@ pub struct GroupingConfig {
     /// Preset branch paths (`Vec<Vec<String>>`, handed over by
     /// [`presets`](crate::retrieval::build::presets)) that override the derived path.
     pub taxonomy: Vec<Vec<String>>,
+    /// The cluster count for k-means grouping; `None` derives
+    /// `ceil(items / max_children)` (see
+    /// [`resolve_clusters`](crate::retrieval::build::grouping::kmeans::resolve_clusters)).
+    pub clusters: Option<usize>,
 }
 
 impl Default for GroupingConfig {
@@ -196,6 +205,7 @@ impl Default for GroupingConfig {
             max_depth: DEFAULT_MAX_DEPTH,
             root_segment: DEFAULT_ROOT_SEGMENT.to_string(),
             taxonomy: Vec::new(),
+            clusters: None,
         }
     }
 }
@@ -233,6 +243,13 @@ impl GroupingConfig {
     #[must_use]
     pub fn with_taxonomy(mut self, paths: Vec<Vec<String>>) -> Self {
         self.taxonomy = paths;
+        self
+    }
+
+    /// Sets the k-means cluster count, or `None` to derive it from `max_children`.
+    #[must_use]
+    pub fn with_clusters(mut self, clusters: Option<usize>) -> Self {
+        self.clusters = clusters;
         self
     }
 }
