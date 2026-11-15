@@ -312,10 +312,23 @@ The notice reminder is appended last and never lets the response exceed its budg
 - `./notice.rs` → `SkillNoticeState`, `SkillNotice`, incremental reminder rendering, notice constants
 - `./toolkit.rs` → `IncrementalNoticeRegistry`, `IncrementalNoticeSession`, `SkillCard` normalization, `tool_id`, reminder rendering
 - `./directory_toolkit/` → the model-facing `skill_index` tool; see [`directory_toolkit/mod.rs`](directory_toolkit/mod.rs)
-  - `./directory_toolkit/view.rs` → `SkillDirectoryView`, `DirectoryEntry`/`DirectoryNode`, category paths and skill counts
+  - `./directory_toolkit/view/` → `SkillDirectoryView`, `DirectoryEntry`/`DirectoryNode`, category paths and skill counts
+    - `./directory_toolkit/view/mod.rs` → types, constants, root accessors
+    - `./directory_toolkit/view/tree.rs` → construction and the `~n` disambiguation index
+    - `./directory_toolkit/view/paths.rs` → path normalization, children, skill counts, metadata paths
+    - `./directory_toolkit/view/entries.rs` → `entries`/`tree_entries`/`searchable_entries`/`scoped_records`
+    - `./directory_toolkit/view/category.rs` → category names, chains and text
   - `./directory_toolkit/render.rs` → pinned `list_row`/`search_row` rows, summary lines, `fit_rows`, `compact`, `metadata_card`
-  - `./directory_toolkit/validate.rs` → `SkillIndexRequest`, the six enums, `validate`/`apply_simple_defaults`, limits and `RequestIssue`
-  - `./directory_toolkit/ops.rs` → `execute_list`/`execute_search`/`execute_read`, `apply_pipeline`, search assembly and snippets
+  - `./directory_toolkit/validate/` → `SkillIndexRequest`, the six enums, `validate`/`apply_simple_defaults`, limits and `RequestIssue`
+    - `./directory_toolkit/validate/mod.rs` → module docs and re-exports
+    - `./directory_toolkit/validate/request.rs` → the request types and enums
+    - `./directory_toolkit/validate/rules.rs` → the per-operation field rules
+    - `./directory_toolkit/validate/pipeline.rs` → pipeline stage validation
+    - `./directory_toolkit/validate/limits.rs` → scalar limits, queries/paths/ids/category-path checks
+  - `./directory_toolkit/ops/` → `execute_list`/`execute_search`/`execute_read`, `apply_pipeline`, search assembly and snippets
+    - `./directory_toolkit/ops/mod.rs` → execution types, constants and re-exports
+    - `./directory_toolkit/ops/list.rs` / `read.rs` / `pipeline.rs` / `request.rs`
+    - `./directory_toolkit/ops/search.rs` → multi-query assembly, content/entry hits, snippets, category hints
   - `./directory_toolkit/toolkit.rs` → `SkillIndexToolkit`, `SkillIndexConfig`, `SkillIndexToolCard`, `SkillIndexResult`, cursors
   - `./directory_toolkit/matcher.rs` → `case_fold`, `glob_match`, `literal_match_rank`
 - `./settings.rs` → `DiscoverySettings`, token budget, settings defaults
