@@ -431,10 +431,7 @@ mod tests {
             mask_secrets(r#"{"client-secret": "s3cr3t"}"#),
             r#"{"client-secret": "s3cr3t"}"#
         );
-        assert_eq!(
-            mask_secrets(r"client_secret='s3cr3t'"),
-            "client_secret=***"
-        );
+        assert_eq!(mask_secrets(r"client_secret='s3cr3t'"), "client_secret=***");
     }
 
     #[test]
