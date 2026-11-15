@@ -43,6 +43,13 @@
 //! [`branch_description`](crate::retrieval::build::tree::branch_description) derives a
 //! stable sentence from the `cid` path, so a build never needs a model and never embeds
 //! prose that could drift between runs.
+//!
+//! # Visualizer
+//!
+//! [`visualizer`](crate::retrieval::build::tree::visualizer) renders this node list and
+//! its catalog as one `tree_index.html` document for humans. That file is an opt-in extra
+//! artifact outside the three-artifact publish contract: nothing in a build calls it, and
+//! the search runtime never reads it back, so it is purely derived data.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -53,6 +60,9 @@ use crate::retrieval::build::grouping::{
 use crate::retrieval::build::scanner::SourceItem;
 use crate::retrieval::build::tree_text::{join_cid, slug_term, sort_nodes, unique_child_cid};
 use crate::retrieval::types::{IndexNode, META_DONT_SELECT_WHEN, META_SELECT_WHEN};
+
+/// The opt-in `tree_index.html` visualizer of a built tree.
+pub mod visualizer;
 
 /// Builds the full flat node list (ordered `(depth, cid)`) for a set of placed items.
 ///
