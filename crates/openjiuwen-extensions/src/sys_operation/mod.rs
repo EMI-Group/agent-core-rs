@@ -23,7 +23,7 @@
 //! The kernel resolves the providers of a sandbox-mode `SysOperation` only from its process-global registry (`openjiuwen_sysop::sandbox::provider::global()`), while [`register_remote_providers`] takes any registry, so a host that drives `SysOperation` registers on `global()`.
 //! [`registered_types`] reports what a given registry holds.
 //!
-//! [`register_deferred`] used to install placeholder providers for the Python types; it is now a compatibility no-op that registers nothing and returns `Ok(())`.
+//! [`register_deferred`] is the idempotent setup path: it registers every type in [`REMOTE_SANDBOX_TYPES`] that the registry does not already hold, and skips the rest.
 //!
 //! # Errors
 //!
@@ -227,26 +227,34 @@ pub fn register(
     }
     Ok(())
 }
-/// Compatibility no-op kept for call sites that used to install the deferred providers.
+/// Registers every remote sandbox provider a registry is still missing.
 ///
-/// The Python types are real providers now, so registration belongs to
-/// [`register_remote_providers`] / [`register_remote`].
-/// This function registers nothing, logs one `debug` line under
-/// `openjiuwen_extensions::sys_operation`, and returns `Ok(())`, so calling it repeatedly
-/// (or after [`register_remote_providers`]) never fails.
+/// Idempotent setup entry point: for each type in [`REMOTE_SANDBOX_TYPES`] that
+/// [`registered_types`] does not already report, it calls [`register_remote`], so
+/// an empty registry ends up with `aio`, `jiuwenbox`, and `yuanrong`, while a
+/// registry that already holds some (or all) of them is left untouched and no
+/// duplicate-registration [`ErrorKind::SysOp`] is raised.
+/// Provider construction is lazy, so no container is contacted and no network
+/// request is made.
 ///
-/// The function stays `async` to mirror the Python async setup path that registers
-/// providers; it performs no I/O.
+/// The function stays `async` to mirror the Python async setup path that
+/// registers providers.
 ///
 /// # Errors
 ///
-/// Never returns an error; the `Result` keeps the historical signature.
+/// Returns the same errors as [`register_remote`]: [`ErrorKind::SysOp`] when a
+/// factory of a type it is about to install is already registered under that
+/// type (for example a shell factory registered without a filesystem one), and
+/// any kernel registration error.
 #[allow(clippy::unused_async)] // Python parity: registration happens in the async setup path.
-pub async fn register_deferred(_registry: &SandboxProviderRegistry) -> Result<()> {
-    tracing::debug!(
-        target: "openjiuwen_extensions::sys_operation",
-        "register_deferred is a compatibility no-op; use register_remote_providers"
-    );
+pub async fn register_deferred(registry: &SandboxProviderRegistry) -> Result<()> {
+    let registered = registered_types(registry);
+    for sandbox_type in REMOTE_SANDBOX_TYPES {
+        if registered.iter().any(|existing| existing == sandbox_type) {
+            continue;
+        }
+        register_remote(registry, sandbox_type)?;
+    }
     Ok(())
 }
 /// The sandbox types with at least one registered provider, sorted.
@@ -563,16 +571,50 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn register_deferred_is_a_no_op() {
+    async fn register_deferred_registers_every_missing_type() {
         let registry = SandboxProviderRegistry::new();
         register_deferred(&registry).await.unwrap();
-        assert_eq!(registry.sandbox_types(), Vec::<String>::new());
-        // Idempotent, and it never collides with a previous registration.
+        assert_eq!(
+            registered_types(&registry),
+            vec![
+                "aio".to_string(),
+                "jiuwenbox".to_string(),
+                "yuanrong".to_string()
+            ]
+        );
+        for sandbox_type in REMOTE_SANDBOX_TYPES {
+            assert!(registry.has_fs(sandbox_type));
+            assert!(registry.has_shell(sandbox_type));
+            assert!(registry.has_code(sandbox_type));
+        }
+    }
+    #[tokio::test]
+    async fn register_deferred_is_idempotent_and_never_duplicates() {
+        let registry = SandboxProviderRegistry::new();
         register_deferred(&registry).await.unwrap();
-        assert_eq!(registry.sandbox_types(), Vec::<String>::new());
-        register_remote(&registry, "aio").unwrap();
+        // A second call would trip the kernel's `SysOp` duplicate error if it
+        // re-registered anything, so `Ok` here is the idempotence assertion.
         register_deferred(&registry).await.unwrap();
-        assert_eq!(registered_types(&registry), vec!["aio".to_string()]);
+        register_deferred(&registry).await.unwrap();
+        assert_eq!(registered_types(&registry), REMOTE_SANDBOX_TYPES);
+    }
+    #[tokio::test]
+    async fn register_deferred_fills_the_gaps_of_a_partially_registered_registry() {
+        // Called after the real registration path: nothing is left to install.
+        let registry = SandboxProviderRegistry::new();
+        register_remote_providers(&registry).unwrap();
+        register_deferred(&registry).await.unwrap();
+        assert_eq!(registered_types(&registry), REMOTE_SANDBOX_TYPES);
+        // A registry that already holds one type keeps it and gains the others.
+        let registry = SandboxProviderRegistry::new();
+        register_remote(&registry, "jiuwenbox").unwrap();
+        register_deferred(&registry).await.unwrap();
+        assert_eq!(registered_types(&registry), REMOTE_SANDBOX_TYPES);
+        assert!(registry.has_fs("jiuwenbox"));
+        assert!(
+            registry.has_shell("jiuwenbox"),
+            "the pre-registered type keeps the whole factory set it was given"
+        );
     }
     #[test]
     fn duplicate_remote_registration_surfaces_sys_op() {

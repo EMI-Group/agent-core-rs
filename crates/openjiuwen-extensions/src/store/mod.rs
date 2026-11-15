@@ -278,7 +278,9 @@ pub async fn build_document_store(backend: &StoreBackend) -> Result<Arc<dyn Docu
 /// Builds a vector store from `backend`.
 ///
 /// `StoreBackend` carries no vector dimension, so the `elasticsearch` backend
-/// uses its own default (`768`).
+/// uses its own default (`768`). Its `url`, `index_prefix`, `username`,
+/// `password`, and `api_key` are forwarded, so a secured cluster authenticates
+/// for vectors exactly as it does for documents.
 ///
 /// # Errors
 ///
@@ -298,11 +300,18 @@ pub async fn build_vector_store(backend: &StoreBackend) -> Result<Arc<dyn Vector
         )),
         StoreBackend::Redis { url } => redis_vector_store(url.as_deref()).await,
         StoreBackend::Elasticsearch {
-            url, index_prefix, ..
+            url,
+            index_prefix,
+            username,
+            password,
+            api_key,
         } => {
             let config = elasticsearch::ElasticsearchVectorStoreConfig {
                 url: url.clone(),
                 index_prefix: index_prefix.clone(),
+                username: username.clone(),
+                password: password.clone(),
+                api_key: api_key.clone(),
                 ..elasticsearch::ElasticsearchVectorStoreConfig::default()
             };
             elasticsearch::ElasticsearchVectorStore::connect(config).await
@@ -362,23 +371,20 @@ fn elasticsearch_document_config(
     api_key: Option<&str>,
 ) -> Result<ElasticsearchConfig> {
     let parsed = elasticsearch_url(url)?;
-    let userinfo_username = (!parsed.username().is_empty()).then(|| parsed.username().to_string());
-    let userinfo_password = parsed.password().map(str::to_string);
-    let username = username.map(str::to_string).or(userinfo_username);
-    let password = match (password.map(str::to_string), username.is_some()) {
-        (Some(explicit), _) => Some(explicit),
-        (None, true) => Some(userinfo_password.unwrap_or_default()),
-        (None, false) => None,
-    };
-    let mut config = ElasticsearchConfig::new(endpoint_without_userinfo(&parsed))
-        .with_index_prefix(index_prefix);
-    if let Some(username) = username {
+    let credentials = elasticsearch::credentials::ElasticsearchCredentials::resolve(
+        &parsed, username, password, api_key,
+    );
+    let mut config = ElasticsearchConfig::new(
+        elasticsearch::credentials::endpoint_without_userinfo(&parsed),
+    )
+    .with_index_prefix(index_prefix);
+    if let Some(username) = credentials.username {
         config = config.with_username(username);
     }
-    if let Some(password) = password {
+    if let Some(password) = credentials.password {
         config = config.with_password(password);
     }
-    if let Some(api_key) = api_key {
+    if let Some(api_key) = credentials.api_key {
         config = config.with_api_key(api_key);
     }
     Ok(config)
@@ -408,16 +414,6 @@ fn elasticsearch_url(url: &str) -> Result<Url> {
         )));
     }
     Ok(parsed)
-}
-
-/// The endpoint without userinfo, query, fragment, or trailing slash.
-fn endpoint_without_userinfo(parsed: &Url) -> String {
-    let mut stripped = parsed.clone();
-    let _ = stripped.set_username("");
-    let _ = stripped.set_password(None);
-    stripped.set_query(None);
-    stripped.set_fragment(None);
-    stripped.as_str().trim_end_matches('/').to_string()
 }
 
 /// Builds the SQLite key-value store, or reports the missing feature.

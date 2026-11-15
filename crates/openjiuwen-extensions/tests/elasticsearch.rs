@@ -22,8 +22,9 @@ use openjiuwen_extensions::store::elasticsearch::{
     ElasticsearchVectorStore, ElasticsearchVectorStoreConfig,
 };
 use openjiuwen_extensions::store::{
-    build_document_store, CollectionSchema, Document, DocumentStore, ElasticsearchConfig,
-    ElasticsearchDocumentStore, Query, SortOrder, StoreBackend, VectorQuery, VectorStore,
+    build_document_store, build_vector_store, CollectionSchema, Document, DocumentStore,
+    ElasticsearchConfig, ElasticsearchDocumentStore, Query, SortOrder, StoreBackend, VectorQuery,
+    VectorStore,
 };
 use serde_json::{json, Value};
 use wiremock::matchers::{body_json, header, method, path};
@@ -67,9 +68,40 @@ async fn connect(server: &MockServer) -> Arc<dyn VectorStore> {
         url: server.uri(),
         index_prefix: "agent_vector".to_string(),
         dimension: 3,
+        ..ElasticsearchVectorStoreConfig::default()
     })
     .await
     .expect("connecting performs no I/O and accepts the mock endpoint")
+}
+
+/// The `GET /{index}/_mapping` + `POST /{index}/_search` pair a search sends,
+/// both carrying `authorization` (when `authorization` is `Some`).
+async fn mount_authenticated_search(server: &MockServer, authorization: Option<&str>) {
+    let mapping = Mock::given(method("GET")).and(path(format!("{INDEX}/_mapping")));
+    let search = Mock::given(method("POST")).and(path(format!("{INDEX}/_search")));
+    let (mapping, search) = match authorization {
+        Some(expected) => (
+            mapping.and(header("authorization", expected)),
+            search.and(header("authorization", expected)),
+        ),
+        None => (mapping, search),
+    };
+    mapping
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "agent_vector__docs": {"mappings": mappings()},
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+    search
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "hits": {"hits": [
+                {"_id": "a", "_score": 0.9, "_source": {"id": "a", "title": "A"}},
+            ]},
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
 }
 
 /// Mounts the `GET /{index}/_mapping` mock that every document operation needs,
@@ -644,6 +676,120 @@ async fn deleting_a_missing_collection_is_a_no_op() {
         .delete_collection("docs")
         .await
         .expect("a missing collection is a no-op");
+}
+
+// ---------------------------------------------------------------------------
+// Vector-store credentials
+//
+// Both Elasticsearch adapters resolve credentials through one shared helper, so
+// a secured cluster authenticates the vector store exactly as it authenticates
+// the document store: the URL userinfo supplies HTTP basic credentials, the
+// explicit `username`/`password` fields win over it field by field, and an
+// `api_key` is sent as `Authorization: ApiKey <key>` when no basic-auth pair
+// applies.
+// ---------------------------------------------------------------------------
+
+/// Runs one real k-NN search against `server`, which mounts the search pair.
+async fn search_once(store: &Arc<dyn VectorStore>) -> usize {
+    store
+        .search("docs", &VectorQuery::new(vec![1.0, 0.0, 0.0]).with_top_k(1))
+        .await
+        .expect("search")
+        .len()
+}
+
+#[tokio::test]
+async fn vector_basic_auth_comes_from_the_url_userinfo() {
+    let server = MockServer::start().await;
+    let expected = basic("elastic", "s3cret");
+    mount_authenticated_search(&server, Some(&expected)).await;
+
+    let store = ElasticsearchVectorStore::connect(ElasticsearchVectorStoreConfig {
+        url: uri_with_userinfo(&server, "elastic", "s3cret"),
+        index_prefix: "agent_vector".to_string(),
+        dimension: 3,
+        ..ElasticsearchVectorStoreConfig::default()
+    })
+    .await
+    .expect("the userinfo endpoint is accepted");
+    assert_eq!(search_once(&store).await, 1);
+    assert_eq!(
+        authorization_headers(&server).await,
+        vec![expected.clone(), expected],
+        "the mapping read and the search both carry the userinfo credentials"
+    );
+}
+
+#[tokio::test]
+async fn vector_explicit_credentials_win_over_the_url_userinfo() {
+    let server = MockServer::start().await;
+    let expected = basic("alice", "secret");
+    mount_authenticated_search(&server, Some(&expected)).await;
+
+    let store = ElasticsearchVectorStore::connect(ElasticsearchVectorStoreConfig {
+        url: uri_with_userinfo(&server, "bob", "wrong"),
+        index_prefix: "agent_vector".to_string(),
+        dimension: 3,
+        username: Some("alice".to_string()),
+        password: Some("secret".to_string()),
+        ..ElasticsearchVectorStoreConfig::default()
+    })
+    .await
+    .expect("the explicit credentials are accepted");
+    assert_eq!(search_once(&store).await, 1);
+    assert_eq!(
+        authorization_headers(&server).await,
+        vec![expected.clone(), expected],
+        "the explicit fields replace the userinfo pair"
+    );
+}
+
+#[tokio::test]
+async fn vector_api_key_header_comes_from_the_backend() {
+    let server = MockServer::start().await;
+    let expected = "ApiKey vector-key-123";
+    mount_authenticated_search(&server, Some(expected)).await;
+
+    let store = ElasticsearchVectorStore::connect(ElasticsearchVectorStoreConfig {
+        url: server.uri(),
+        index_prefix: "agent_vector".to_string(),
+        dimension: 3,
+        api_key: Some("vector-key-123".to_string()),
+        ..ElasticsearchVectorStoreConfig::default()
+    })
+    .await
+    .expect("the api key configuration is accepted");
+    assert_eq!(search_once(&store).await, 1);
+    assert_eq!(
+        authorization_headers(&server).await,
+        vec![expected.to_string(), expected.to_string()],
+        "every vector request carries the API key"
+    );
+}
+
+#[tokio::test]
+async fn vector_store_factory_forwards_the_backend_credentials() {
+    let server = MockServer::start().await;
+    let expected = basic("alice", "secret");
+    mount_authenticated_search(&server, Some(&expected)).await;
+
+    let backend = StoreBackend::from_json(&json!({
+        "kind": "elasticsearch",
+        "url": uri_with_userinfo(&server, "bob", "wrong"),
+        "index_prefix": "agent_vector",
+        "username": "alice",
+        "password": "secret",
+    }))
+    .expect("the backend configuration decodes");
+    let store = build_vector_store(&backend)
+        .await
+        .expect("the factory builds a live REST vector store");
+    assert_eq!(search_once(&store).await, 1);
+    assert_eq!(
+        authorization_headers(&server).await,
+        vec![expected.clone(), expected],
+        "the factory forwards the decoded credentials to the vector store"
+    );
 }
 
 // ---------------------------------------------------------------------------

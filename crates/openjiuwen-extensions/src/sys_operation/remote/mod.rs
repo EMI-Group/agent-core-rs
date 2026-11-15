@@ -4,9 +4,9 @@
 //! Python parity: `openjiuwen/extensions/sys_operation/sandbox/providers/`
 //! (v0.1.20). Those three modules each implement the kernel's filesystem, shell,
 //! and code operations by talking to a container, and this subtree does the
-//! same instead of registering the deferred sets of
-//! [`crate::sys_operation::register_deferred`]. The parents in
-//! [`crate::sys_operation`] stay the registration facade.
+//! same instead of leaving the three types without a transport.
+//! [`crate::sys_operation::register_deferred`] installs all three, and the
+//! parents in [`crate::sys_operation`] stay the registration facade.
 //!
 //! # Transports
 //!
