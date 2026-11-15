@@ -10,7 +10,10 @@ use super::cache::{
     sha256_hex, HF_ENDPOINT_ENV,
 };
 use super::lock::ArtifactLock;
-use crate::tokenizers::native::NativeTokenizer;
+use super::validate::{
+    expected_digest, missing_artifact_code, validate_body, validate_file, validate_file_body,
+    verify_digest,
+};
 use crate::tokenizers::{TokenizerEngine, TokenizerSpec};
 
 /// The default `HuggingFace` endpoint, matching Python's mirror default.
@@ -79,8 +82,8 @@ pub const PROVIDER_OFFICIAL_ADAPTER_NOT_CONFIGURED_CODE: &str =
 
 /// Compact code: the artefact declares a model type this crate does not decode.
 ///
-/// The code is published through [`ARTIFACT_ERROR_CODES`]; the constant itself stays crate-visible because this module's public surface is the re-export list in [`super`], which a downstream crate can extend without changing the manager.
-pub(crate) const TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE: &str = "tokenizer_model_type_unsupported";
+/// The code is published through [`ARTIFACT_ERROR_CODES`] and re-exported from [`super`] beside the other compact codes, so a caller can match on it without parsing a message.
+pub const TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE: &str = "tokenizer_model_type_unsupported";
 
 /// The vendor named in a `provider_official` message when nothing identifies one.
 const UNNAMED_VENDOR: &str = "provider-official";
@@ -306,6 +309,7 @@ impl TokenizerArtifactManager {
     /// The order matches Python's manager: an `artifact_path` (file or directory), then a `tokenizer_id` that exists on disk, then validation, then the hub source; `://` ids are refused before any source is considered.
     /// Failures return `None` and record the reason read back through [`TokenizerArtifactManager::last_error`], and the call never panics.
     /// A `provider_official` spec names the vendor and tokenizer id it could not resolve, and a downloaded artefact this crate cannot decode records `tokenizer_model_type_unsupported` with the declared model type, so neither failure looks like a cache miss.
+    /// Every returned path is validated for existence, the declared digest and the body, at a cost of one local parse per resolution.
     /// Unlike Python this method is `async`, because a download uses the workspace HTTP client; it performs no I/O at all when downloads are off.
     pub async fn resolve(&self, spec: &TokenizerSpec) -> Option<PathBuf> {
         self.clear_error();
@@ -328,6 +332,7 @@ impl TokenizerArtifactManager {
     /// Resolves `spec` against the local cache only, never the network.
     ///
     /// This is the rung the synchronous tokenizer selector uses: a cached (or explicitly configured) artefact is validated and returned, and anything else records [`REMOTE_DOWNLOAD_DISABLED_CODE`] when downloads are off, or [`TOKENIZER_NOT_IN_LOCAL_CACHE_CODE`] when they are enabled but a synchronous caller cannot wait for one.
+    /// Validation covers existence, the declared digest and the body, so a hand-placed artefact this crate cannot decode is refused with [`TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE`] instead of being returned for the selector to downgrade silently; the parse is one read of a local file per resolution.
     /// A `provider_official` spec records the adapter message naming its vendor and tokenizer id.
     #[must_use]
     pub fn resolve_cached(&self, spec: &TokenizerSpec) -> Option<PathBuf> {
@@ -540,25 +545,37 @@ impl TokenizerArtifactManager {
         self.cache_dir.join(format!("{key}.lock"))
     }
 
-    /// A cache entry that already validates, without touching the file twice.
+    /// A cache entry that already validates, digest and body included.
     ///
-    /// A file that cannot be read is not a silent "no cache": it is logged with
-    /// its path and the IO error and treated as a miss, so the caller downloads
-    /// the artefact again instead of reusing bytes nobody could digest.
+    /// A file that cannot be read or decoded is not a silent "no cache": it is
+    /// logged with its path and the reason and treated as a miss, so the caller
+    /// downloads the artefact again instead of reusing bytes nobody could digest
+    /// or decode.
     fn cached_target(target: &Path, spec: &TokenizerSpec) -> Option<PathBuf> {
         if !target.is_file() {
             return None;
         }
-        let Some(expected) = expected_digest(spec) else {
-            return Some(target.to_path_buf());
-        };
-        match sha256_file(target) {
-            Ok(actual) => (actual == expected).then(|| target.to_path_buf()),
+        if let Some(expected) = expected_digest(spec) {
+            match sha256_file(target) {
+                Ok(actual) if actual == expected => {}
+                Ok(_) => return None,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %target.display(),
+                        %error,
+                        "cached tokenizer artefact could not be read; downloading it again"
+                    );
+                    return None;
+                }
+            }
+        }
+        match validate_file_body(target) {
+            Ok(()) => Some(target.to_path_buf()),
             Err(error) => {
                 tracing::warn!(
                     path = %target.display(),
                     %error,
-                    "cached tokenizer artefact could not be read; downloading it again"
+                    "cached tokenizer artefact cannot be decoded; downloading it again"
                 );
                 None
             }
@@ -566,6 +583,12 @@ impl TokenizerArtifactManager {
     }
 
     /// The cached artefact of the exact revision a download would write.
+    ///
+    /// The probe itself is existence-only, and every caller validates what it
+    /// returns ([`resolve_cached`](TokenizerArtifactManager::resolve_cached) through
+    /// [`validate_file`], [`resolve`](TokenizerArtifactManager::resolve) through that
+    /// module's `validate_async`), so a cached artefact this loader cannot decode is
+    /// refused there with its typed reason and never handed back as a hit.
     fn hub_cached(&self, spec: &TokenizerSpec) -> Option<PathBuf> {
         let target = self.cache_target(spec)?;
         target.is_file().then_some(target)
@@ -625,36 +648,29 @@ impl TokenizerArtifactManager {
     }
 
     /// Validates an artefact on the synchronous seam.
+    ///
+    /// Existence, the declared digest and the body are checked in
+    /// [`validate_file`], so a hand-placed artefact this loader cannot decode is
+    /// refused here with its typed reason instead of being handed back for the
+    /// selector to downgrade.
     fn validate_cached(&self, path: &Path, spec: &TokenizerSpec) -> Option<PathBuf> {
         match validate_file(path, spec) {
             Ok(path) => {
                 self.clear_error();
                 Some(path)
             }
-            Err(code) => self.fail(code),
+            Err(error) => self.fail_error(&error),
         }
     }
 
     /// Validates an artefact off the async task.
     async fn validate_async(&self, path: PathBuf, spec: &TokenizerSpec) -> Option<PathBuf> {
-        let expected = expected_digest(spec);
-        let missing = missing_artifact_code(spec.engine);
-        let validated = tokio::task::spawn_blocking(move || {
-            validate_file_with(path, expected.as_deref(), missing)
-        })
-        .await;
-        match validated {
-            Ok(Ok(path)) => {
+        match super::validate::validate_async(path, spec).await {
+            Ok(path) => {
                 self.clear_error();
                 Some(path)
             }
-            Ok(Err(code)) => self.fail(code),
-            Err(error) => {
-                tracing::warn!(%error, "tokenizer artefact validation task failed");
-                self.fail_error(&Error::Validation(format!(
-                    "{TOKENIZER_DOWNLOAD_FAILED_CODE}: tokenizer artefact validation task failed: {error}"
-                )))
-            }
+            Err(error) => self.fail_error(&error),
         }
     }
 
@@ -740,15 +756,6 @@ fn revision_of(spec: &TokenizerSpec, source: HubSource) -> String {
     }
 }
 
-/// The declared digest, normalized to lowercase hex.
-fn expected_digest(spec: &TokenizerSpec) -> Option<String> {
-    spec.sha256
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_ascii_lowercase)
-}
-
 /// The lock-key material of one spec, joined with NUL like Python's.
 fn cache_key(spec: &TokenizerSpec) -> String {
     let engine = match spec.engine {
@@ -766,15 +773,6 @@ fn cache_key(spec: &TokenizerSpec) -> String {
     .join("\u{0}")
 }
 
-/// The compact code reported when the expected artefact is absent.
-fn missing_artifact_code(engine: TokenizerEngine) -> &'static str {
-    if engine == TokenizerEngine::Tiktoken {
-        TIKTOKEN_MODEL_MISSING_CODE
-    } else {
-        TOKENIZER_JSON_MISSING_CODE
-    }
-}
-
 /// The code for a declared `artifact_path` that holds no usable artefact.
 ///
 /// A spec that names a path is reporting a local installation, so a missing
@@ -786,73 +784,6 @@ fn declared_artifact_missing(spec: &TokenizerSpec) -> Option<&'static str> {
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
     declared.then(|| missing_artifact_code(spec.engine))
-}
-
-/// Validates existence and, when declared, the digest of an artefact.
-fn validate_file(path: &Path, spec: &TokenizerSpec) -> std::result::Result<PathBuf, &'static str> {
-    validate_file_with(
-        path.to_path_buf(),
-        expected_digest(spec).as_deref(),
-        missing_artifact_code(spec.engine),
-    )
-}
-
-/// Validates one artefact path against an already-normalized digest.
-fn validate_file_with(
-    path: PathBuf,
-    expected: Option<&str>,
-    missing: &'static str,
-) -> std::result::Result<PathBuf, &'static str> {
-    if !path.is_file() {
-        return Err(missing);
-    }
-    if let Some(expected) = expected {
-        let actual = sha256_file(&path).map_err(|_| TOKENIZER_DOWNLOAD_FAILED_CODE)?;
-        if actual != expected {
-            return Err(TOKENIZER_SHA256_MISMATCH_CODE);
-        }
-    }
-    Ok(path)
-}
-
-/// Refuses a body that cannot be the artefact its name promises.
-///
-/// A well-formed document of a model type this crate does not decode is a typed [`Error::Unsupported`] carrying [`TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE`] and the declared type, so the caller learns why counting falls back to `tiktoken` or the estimate instead of getting a silent downgrade.
-/// The bytes are not cached: an artefact this loader cannot decode would be handed straight back by [`TokenizerArtifactManager::resolve_cached`] for the selector to downgrade again, so the precedence is reject-before-write and a later loader that decodes the type downloads it afresh.
-/// Malformed text is rejected with [`Error::Validation`] and [`TOKENIZER_DOWNLOAD_FAILED_CODE`], and the SHA-256 check is unchanged.
-fn validate_body(spec: &TokenizerSpec, bytes: &[u8]) -> Result<()> {
-    let text = std::str::from_utf8(bytes).map_err(|error| {
-        Error::Validation(format!(
-            "{TOKENIZER_DOWNLOAD_FAILED_CODE}: artefact body is not UTF-8: {error}"
-        ))
-    })?;
-    let decoded = match spec.engine {
-        TokenizerEngine::Tiktoken => NativeTokenizer::from_tiktoken_model(text).map(|_| ()),
-        TokenizerEngine::Auto | TokenizerEngine::Native => {
-            NativeTokenizer::from_json_str(text).map(|_| ())
-        }
-    };
-    match decoded {
-        Ok(()) => Ok(()),
-        Err(Error::Unsupported(message)) => {
-            let id = spec
-                .tokenizer_id
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or_default();
-            let artifact = if id.is_empty() {
-                format!("the {} artefact", artifact_name(spec.engine))
-            } else {
-                format!("the tokenizer artefact {id:?}")
-            };
-            Err(Error::Unsupported(format!(
-                "{TOKENIZER_MODEL_TYPE_UNSUPPORTED_CODE}: {artifact} declares a model type this loader does not decode: {message}"
-            )))
-        }
-        Err(error) => Err(Error::Validation(format!(
-            "{TOKENIZER_DOWNLOAD_FAILED_CODE}: artefact body is not a usable tokenizer: {error}"
-        ))),
-    }
 }
 
 /// The typed refusal of a `provider_official` spec, naming vendor and id.
@@ -889,19 +820,6 @@ fn provider_official_vendor(spec: &TokenizerSpec) -> String {
     }
 }
 
-/// Compares the downloaded bytes with the declared digest.
-fn verify_digest(spec: &TokenizerSpec, bytes: &[u8]) -> Result<()> {
-    let Some(expected) = expected_digest(spec) else {
-        return Ok(());
-    };
-    if sha256_hex(bytes) == expected {
-        return Ok(());
-    }
-    Err(Error::Validation(format!(
-        "{TOKENIZER_SHA256_MISMATCH_CODE}: downloaded artefact does not match sha256 {expected}"
-    )))
-}
-
 /// Maps a transport failure onto the network-unavailable code.
 fn transport_error(error: Error, url: &str) -> Error {
     if error.kind() == ErrorKind::Timeout {
@@ -913,21 +831,6 @@ fn transport_error(error: Error, url: &str) -> Error {
             "{TOKENIZER_NETWORK_UNAVAILABLE_CODE}: {url} is unreachable: {error}"
         ))
     }
-}
-
-/// The compact code an error carries, else the download-failed default.
-///
-/// [`TokenizerArtifactManager::last_error`] now keeps the whole message, so this classification is only exercised by the tests that pin the message↔code contract.
-#[cfg(test)]
-fn error_code(error: &Error) -> &'static str {
-    let message = error.message();
-    let head = message.split(':').next().unwrap_or_default().trim();
-    for code in ARTIFACT_ERROR_CODES {
-        if head == *code {
-            return code;
-        }
-    }
-    TOKENIZER_DOWNLOAD_FAILED_CODE
 }
 
 #[cfg(test)]
@@ -993,16 +896,6 @@ mod tests {
         let restored = manager.with_endpoint("");
         assert_eq!(restored.endpoint(), DEFAULT_HUGGINGFACE_ENDPOINT);
         assert_eq!(restored.modelscope_endpoint(), DEFAULT_MODELSCOPE_ENDPOINT);
-    }
-
-    #[test]
-    fn error_codes_round_trip_through_the_message() {
-        let error = Error::Validation(format!("{TOKENIZER_SHA256_MISMATCH_CODE}: detail"));
-        assert_eq!(error_code(&error), TOKENIZER_SHA256_MISMATCH_CODE);
-        assert_eq!(
-            error_code(&Error::Validation("other".to_owned())),
-            TOKENIZER_DOWNLOAD_FAILED_CODE
-        );
     }
 
     #[test]

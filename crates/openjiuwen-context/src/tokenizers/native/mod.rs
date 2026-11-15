@@ -533,7 +533,7 @@ mod post_processing {
                     );
                     continue;
                 };
-                match special_ids(specials, name) {
+                match special_ids(specials, name, warnings) {
                     Some(ids) => pieces.push(Piece::Ids(ids)),
                     None => warnings.push(format!(
                         "TemplateProcessing special token `{name}` declares no ids; it is skipped"
@@ -576,16 +576,66 @@ mod post_processing {
     }
 
     /// The ids a `TemplateProcessing` special token declares.
-    fn special_ids(specials: Option<&Value>, name: &str) -> Option<Vec<u32>> {
-        let ids: Vec<u32> = specials?
-            .get(name)?
-            .get("ids")?
-            .as_array()?
-            .iter()
-            .filter_map(Value::as_u64)
-            .filter_map(|id| u32::try_from(id).ok())
-            .collect();
+    ///
+    /// A malformed entry of the `ids` array is skipped with a recorded warning naming the template piece and the entry, so the remaining ids still frame the sequence and the loss is never silent.
+    fn special_ids(
+        specials: Option<&Value>,
+        name: &str,
+        warnings: &mut Vec<String>,
+    ) -> Option<Vec<u32>> {
+        let entries = specials?.get(name)?.get("ids")?.as_array()?;
+        let mut ids = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match entry.as_u64().and_then(|id| u32::try_from(id).ok()) {
+                Some(id) => ids.push(id),
+                None => warnings.push(format!(
+                    "TemplateProcessing special token `{name}` declares the malformed id entry `{entry}`; it is skipped"
+                )),
+            }
+        }
         (!ids.is_empty()).then_some(ids)
+    }
+}
+
+/// Decodes one artefact file, choosing its kind by extension and then by content.
+///
+/// The dispatch is shared by the tokenizer selector and by the artefact
+/// manager's validation, so a file is validated exactly the way it will later be
+/// decoded: a `.model` extension is a `tiktoken` vocabulary, a `.json` extension
+/// is a `tokenizer.json`, and any other name is sniffed (a first meaningful line
+/// of `<base64-token> <rank>` means `.model`, otherwise `tokenizer.json` is
+/// tried first and `.model` second).
+///
+/// # Errors
+///
+/// - [`Error::NotFound`] when `path` does not exist;
+/// - [`Error::Validation`] when neither loader can decode the file, with both
+///   attempts in the message for an unrecognised extension;
+/// - [`Error::Unsupported`] when the document declares a model type this crate
+///   does not decode.
+pub(crate) fn load_artifact_file(path: &Path, display: &str) -> Result<NativeTokenizer> {
+    let extension = path.extension().and_then(std::ffi::OsStr::to_str);
+    if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("model")) {
+        return NativeTokenizer::from_tiktoken_model_file(path);
+    }
+    if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("json")) {
+        return NativeTokenizer::load(path);
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        // Let the `tokenizer.json` loader raise the typed read error.
+        return NativeTokenizer::load(path);
+    };
+    if tiktoken_model::looks_like_tiktoken_model(&text) {
+        return NativeTokenizer::from_tiktoken_model_file(path);
+    }
+    match NativeTokenizer::from_json_str(&text) {
+        Ok(native) => Ok(native),
+        Err(json_error) => match NativeTokenizer::from_tiktoken_model_file(path) {
+            Ok(native) => Ok(native),
+            Err(model_error) => Err(Error::Validation(format!(
+                "{display} is neither a decodable tokenizer.json ({json_error}) nor a tiktoken `.model` vocabulary ({model_error})"
+            ))),
+        },
     }
 }
 

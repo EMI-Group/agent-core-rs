@@ -5,7 +5,8 @@
 //! filesystem, and a waiter polls with bounded exponential backoff via
 //! [`tokio::time::sleep`] instead of busy-spinning. A marker whose mtime is
 //! older than [`STALE_LOCK_AFTER`] is treated as abandoned (a crashed
-//! downloader) and removed.
+//! downloader) and removed; a marker dated in the future is clock skew and stays
+//! live, logged with both mtimes.
 //!
 //! The guard removes the marker on drop, so success, failure and cancellation
 //! all release the lock.
@@ -118,6 +119,12 @@ impl Drop for ArtifactLock {
 }
 
 /// Whether the marker at `path` has not been touched for [`STALE_LOCK_AFTER`].
+///
+/// A marker whose mtime lies in the future is clock skew, not staleness: the two
+/// processes disagree about "now", so the elapsed time cannot be trusted either
+/// way. It is therefore treated as live — removing a marker a downloader really
+/// holds would let two writers race for one artefact — and logged with both
+/// mtimes so the skew is visible instead of silently extending the lock.
 async fn is_stale(path: &std::path::Path) -> bool {
     let metadata = match tokio::fs::metadata(path).await {
         Ok(metadata) => metadata,
@@ -141,9 +148,27 @@ async fn is_stale(path: &std::path::Path) -> bool {
             return false;
         }
     };
-    modified
-        .elapsed()
-        .is_ok_and(|elapsed| elapsed > STALE_LOCK_AFTER)
+    if let Ok(elapsed) = modified.elapsed() {
+        return elapsed > STALE_LOCK_AFTER;
+    }
+    tracing::warn!(
+        lock = %path.display(),
+        mtime_unix_ms = unix_millis(modified),
+        now_unix_ms = unix_millis(std::time::SystemTime::now()),
+        "the tokenizer download lock marker has an mtime in the future (clock skew); it is treated as live"
+    );
+    false
+}
+
+/// A system time in Unix milliseconds, for logging.
+///
+/// A time before the epoch has no representable value here, so it logs as `0`;
+/// only the skew diagnostic reads it.
+fn unix_millis(time: std::time::SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 #[cfg(test)]

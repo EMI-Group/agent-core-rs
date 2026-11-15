@@ -155,8 +155,9 @@ pub use telemetry::{
     with_operation_scope, CompressionOperation, CompressionStatePhase, CompressionStateSink,
     CompressionStateStatus, ContextCompressionMetric, ContextCompressionModifiedMessage,
     ContextCompressionSaved, ContextCompressionState, ContextCompressionUsage,
-    ContextProcessorStateInput, ContextProcessorStateRecorder, RecordingSink, COMPACTION_PURPOSE,
-    CONTEXT_COMPRESSION_STATE_TYPE, CONTEXT_OPERATION_ID_KEY, REQUEST_PURPOSE_KEY,
+    ContextProcessorStateInput, ContextProcessorStateRecorder, RecordingSink, TokenProvenance,
+    COMPACTION_PURPOSE, CONTEXT_COMPRESSION_STATE_TYPE, CONTEXT_OPERATION_ID_KEY,
+    REQUEST_PURPOSE_KEY,
 };
 pub use tokens::{check_budget, count_message, count_messages, TokenBudget};
 pub mod tokenizers;
@@ -176,8 +177,9 @@ pub use tokenizers::{
 };
 pub use usage::context_tokens::{
     count_context_window_tokens, count_messages_tokens, count_tools_tokens,
-    count_usage_tokens_with_tail,
+    count_usage_tokens_with_tail, ContextTokenCount,
 };
+pub use usage::models::CounterProvenance;
 pub use usage::{
     is_fallback_source, request_usage_from_metadata, source_name, AnalysisInput, Attribution,
     CacheAggregationKey, ContextCategory, ContextPartUsage, ContextUsageAnalyzer,
