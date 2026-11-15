@@ -654,7 +654,9 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   `reason: "settled"`, and the leader answer in `AgentOutput.output`; an open task keeps the stream
   open until the board settles; cancellation ends the run and publishes no completion event; a settled run
   over an injected wiring extracts the leader answer and the mailbox turn in one flush, and a later
-  `flush`/`stop` re-extracts neither.
+  `flush`/`stop` re-extracts neither; over a store that refuses `upsert` the run still returns the unchanged
+  leader answer, writes nothing and keeps both turns buffered, and a `stop` after recovery retries that batch
+  once (two distinct decisions, buffer drained).
 - `manager.rs`: activate → live, session-mismatch rejection for a temporary team, `interact` unknown
   (`not_active`) and after `stop_team` (`gate_closed`/`not_active`), `finalize_member`, `shutdown`,
   `stop_team` tearing the attach socket down.

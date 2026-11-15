@@ -698,4 +698,87 @@ mod tests {
             .collect();
         assert_eq!(after, decisions, "a later stop re-extracts nothing");
     }
+
+    #[tokio::test]
+    async fn a_failing_memory_store_does_not_fail_the_settled_run() {
+        let factory = ScriptedFactory::new();
+        let workspace = RecordingWorkspaceProvider::new();
+        factory.answering("boss", "We decided to use SQLite.");
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::memory::test_support::FailingTeamMemoryStore::shared();
+        assert!(store.is_failing());
+        let wiring = TeamMemoryWiring::with_store_for_tests(
+            "alpha",
+            MemoryConfig::default(),
+            dir.path(),
+            Arc::clone(&store) as Arc<dyn openjiuwen_memory::team::TeamMemoryStore>,
+        )
+        .await
+        .unwrap();
+        let agent = blueprint("alpha", "boss", &["dev-1"])
+            .build_with(deps(&factory, &workspace).with_memory(Arc::clone(&wiring)))
+            .await
+            .unwrap();
+        agent.start().await.unwrap();
+        // A leader-authored row for an unstarted teammate buffers the turn (mailbox seam) without
+        // steering the leader, so the run carries exactly one leader turn and one answer chunk.
+        agent
+            .send_message(Some("dev-1"), "We decided to migrate off Postgres.")
+            .await
+            .unwrap();
+
+        // The settled-run flush hits the failing store: memory is advisory, so the run still
+        // returns the leader answer unchanged.
+        let output = agent.invoke(json!("hello"), None).await.unwrap();
+        assert_eq!(
+            output.output, "We decided to use SQLite.",
+            "the failing memory write must not alter the answer: {output:?}"
+        );
+
+        assert!(
+            records(&wiring).await.is_empty(),
+            "nothing was written while the store refused"
+        );
+        assert_eq!(
+            wiring.hooks().pending_turns(),
+            2,
+            "the mailbox turn and the leader answer stay buffered for a retry"
+        );
+
+        // Once the store recovers, `stop` retries the retained batch exactly once.
+        store.stop_failing();
+        agent.stop().await.unwrap();
+        let stored = records(&wiring).await;
+        assert!(
+            stored
+                .iter()
+                .any(|record| record.content.contains("SQLite")),
+            "the retained leader answer was written on the retry: {stored:?}"
+        );
+        assert!(
+            stored
+                .iter()
+                .any(|record| record.content.contains("migrate off Postgres")),
+            "the retained mailbox turn was written on the retry: {stored:?}"
+        );
+        let decisions: Vec<String> = stored
+            .iter()
+            .filter(|record| record.kind == TeamMemoryKind::Decision)
+            .map(|record| record.id.clone())
+            .collect();
+        assert_eq!(
+            decisions.len(),
+            2,
+            "one decision per retained turn, no duplicate retry: {stored:?}"
+        );
+        assert_eq!(
+            decisions
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2,
+            "the retried decisions keep distinct ids: {stored:?}"
+        );
+        assert_eq!(wiring.hooks().pending_turns(), 0, "the retry drained it");
+    }
 }
