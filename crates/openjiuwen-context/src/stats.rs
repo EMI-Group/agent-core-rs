@@ -45,6 +45,24 @@ pub struct ContextStats {
     pub tokens_before_compression: usize,
     /// Token count after the most recent compression.
     pub tokens_after_compression: usize,
+    /// Whether the token fields are estimates rather than exact counts.
+    ///
+    /// [`compute_stats`] leaves this `false` because a [`TokenCounter`] cannot
+    /// describe itself; a caller that knows its counter approximates marks the
+    /// result with [`ContextStats::with_estimated`], and the compression-state
+    /// recorder does exactly that for the statistics it computes itself.
+    /// The field is additive and `serde`-defaulted, so an older record loads.
+    #[serde(default)]
+    pub estimated: bool,
+}
+
+impl ContextStats {
+    /// Marks the token fields as estimates (or exact, with `false`).
+    #[must_use]
+    pub fn with_estimated(mut self, estimated: bool) -> Self {
+        self.estimated = estimated;
+        self
+    }
 }
 
 /// Computes the statistics of `messages`.

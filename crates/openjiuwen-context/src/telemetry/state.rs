@@ -101,6 +101,11 @@ impl CompressionStatePhase {
 }
 
 /// Size of the history at one instant of a pass.
+///
+/// `estimated`/`tokens_source` are **additive** to Python's pydantic model: a
+/// record written by Python still loads here (both fields default), and a record
+/// written here stays valid JSON for any tolerant reader, because a tolerant
+/// reader ignores keys it does not know.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContextCompressionMetric {
@@ -112,12 +117,35 @@ pub struct ContextCompressionMetric {
     pub tokens: usize,
     /// `tokens` as a rounded percentage of the context window, clamped to 0–100.
     pub context_percent: Option<u32>,
+    /// Whether [`ContextCompressionMetric::tokens`] is an estimate.
+    ///
+    /// `true` says the number was produced by an approximating strategy — the
+    /// `ceil(characters / 3)` string-length fallback a recorder without a token
+    /// counter uses, an approximate or `tiktoken`-family counter, or a counter
+    /// that cannot describe itself — so it must never be read as exact.
+    /// Python's record carries no such flag, so a legacy record loads as `false`.
+    #[serde(default)]
+    pub estimated: bool,
+    /// How [`ContextCompressionMetric::tokens`] was produced, when it can be
+    /// named: a tokenizer source such as `native_tokenizer`, `tiktoken` or
+    /// `string_length_fallback`, the recorder's `string_length_estimate`
+    /// fallback, or a counter name such as `approx_token_counter`.
+    ///
+    /// Additive and absent rather than `null` when nothing can be named, which
+    /// is the one place this record departs from Python's `null`-preserving
+    /// dump: an unknown source has no spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_source: Option<String>,
 }
 
 /// What a pass saved, computed as `before - after`.
 ///
 /// Both deltas are signed: a pass that grows the history reports negative
 /// savings rather than saturating at zero.
+/// `estimated` is an **additive** field: it is `true` when either side of the
+/// subtraction is an estimate, so a saving computed from estimates is never
+/// published as an exact one. A record written by Python (which has no such
+/// field) still loads, and a tolerant reader ignores the extra key.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContextCompressionSaved {
@@ -127,6 +155,10 @@ pub struct ContextCompressionSaved {
     pub tokens: i64,
     /// [`ContextCompressionSaved::tokens`] as a percentage of the before size.
     pub percent: f64,
+    /// Whether [`ContextCompressionSaved::tokens`] inherits an estimate from
+    /// either side; an estimate is not an exact saving.
+    #[serde(default)]
+    pub estimated: bool,
 }
 
 /// The model tokens one or more processor calls consumed.
