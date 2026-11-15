@@ -8,7 +8,9 @@
 //!
 //! - slide order from `ppt/presentation.xml` (`<p:sldIdLst>`) through the
 //!   presentation relationships, falling back to numeric `ppt/slides/slideN.xml`
-//!   ordering when either part is absent;
+//!   ordering only when the presentation part declares no slides at all (a
+//!   missing presentation or relationships part, no `<p:sldIdLst>`, or an empty
+//!   list);
 //! - each slide's shapes (`<p:sp>`) and their paragraphs (`<a:p>`, with every
 //!   `<a:t>` run concatenated and `<a:br>` turned into a newline);
 //! - tables (`<a:tbl>`) inside graphic frames, rendered by
@@ -23,12 +25,21 @@
 //! Slide text is rendered Markdown-style: a `## Slide {index}` heading (1-based),
 //! the slide body lines, and, when notes exist, a `### Notes` heading followed by
 //! the notes lines.
+//!
+//! An unresolved slide keeps its deck position instead of disappearing: when a
+//! `<p:sldId>` has no `r:id`, its id is missing from the presentation
+//! relationships, the target is not a slide part, or the target part is absent
+//! from the archive, the slide becomes a placeholder
+//! ([`PptxSlide::missing_part`]) whose body reads `! missing slide part:
+//! {reference}`. Every unresolved entry is listed in [`PptxDocument::problems`]
+//! in presentation order and logged once at `warn`, so a lossy deck is visible in
+//! the parsed result rather than silently short of a slide.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_common::logging::debug;
+use openjiuwen_common::logging::{debug, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::multimodal::TableData;
@@ -54,10 +65,17 @@ pub const CORE_PROPERTIES_PART: &str = "docProps/core.xml";
 /// Directory the presentation relationship targets are relative to.
 const PRESENTATION_DIR: &str = "ppt";
 
+/// Reference reported for a `<p:sldId>` that carries no `r:id` at all.
+const NO_RELATIONSHIP_REFERENCE: &str = "<no r:id>";
+
 /// Placeholder types whose shape text becomes the slide title.
 const TITLE_PLACEHOLDERS: [&str; 2] = ["title", "ctrTitle"];
 
 /// One ordered, rendered slide.
+///
+/// A slide whose part could not be resolved from the presentation relationships
+/// is kept as a placeholder record instead of being dropped: see
+/// [`missing_part`](PptxSlide::missing_part).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PptxSlide {
     /// 1-based position of the slide in presentation order.
@@ -70,6 +88,19 @@ pub struct PptxSlide {
     pub notes: Option<String>,
     /// Whether a notes part exists for this slide, even when it is empty.
     pub has_notes: bool,
+    /// The unresolved relationship reference (e.g. `rId7`) when this slide's part
+    /// could not be resolved, `None` for a real slide.
+    ///
+    /// A placeholder slide keeps its 1-based deck position in
+    /// [`index`](PptxSlide::index), sets [`text`](PptxSlide::text) to exactly
+    /// `! missing slide part: {reference}`, and leaves
+    /// [`title`](PptxSlide::title) as `None` with no notes
+    /// ([`notes`](PptxSlide::notes) is `None`, [`has_notes`](PptxSlide::has_notes)
+    /// is `false`). A `<p:sldId>` that carries no `r:id` at all reports the
+    /// reference `<no r:id>`; every other unresolved slide reports its `r:id`.
+    /// The same string appears in [`PptxDocument::problems`].
+    #[serde(default)]
+    pub missing_part: Option<String>,
 }
 
 /// A parsed `PPTX` presentation.
@@ -78,12 +109,23 @@ pub struct PptxSlide {
 pub struct PptxDocument {
     /// Rendered document text: `## Slide {index}` blocks joined by `\n`.
     pub text: String,
-    /// Slides in presentation order.
+    /// Slides in presentation order, placeholder slides included.
     pub slides: Vec<PptxSlide>,
-    /// Number of slides, equal to `slides.len()`.
+    /// Number of slides, equal to `slides.len()`; placeholder slides count,
+    /// because they are slides in deck order.
     pub slide_count: usize,
     /// `dc:title` from the core properties, when present.
     pub title: Option<String>,
+    /// The unresolved slide entries, in presentation order.
+    ///
+    /// Each entry names the 1-based slide position, the relationship id (or its
+    /// absence), the target when known, and the reason, e.g.
+    /// `slide 2: rId7 is not mapped by ppt/_rels/presentation.xml.rels`,
+    /// `slide 3: rId8 target slides/slide3.xml is not a slide part`, or
+    /// `slide 4: rId9 target slides/slide4.xml is missing from the archive`.
+    /// An empty vector means the deck resolved completely.
+    #[serde(default)]
+    pub problems: Vec<String>,
 }
 
 impl PptxDocument {
@@ -133,8 +175,8 @@ impl PptxParser {
     ///
     /// Same as [`PptxParser::parse_bytes`].
     pub fn parse_archive(&self, archive: &ZipArchive) -> Result<PptxDocument> {
-        let parts = slide_parts(archive)?;
-        if parts.is_empty() {
+        let slots = slide_parts(archive)?;
+        if slots.is_empty() {
             return Err(Error::Validation(format!(
                 "PPTX has no slides: no slide part is reachable through {PRESENTATION_PART} \
                  or {SLIDES_DIR}"
@@ -144,10 +186,22 @@ impl PptxParser {
             title: read_title(archive),
             ..PptxDocument::default()
         };
-        for (position, part) in parts.iter().enumerate() {
-            document
-                .slides
-                .push(parse_slide(archive, part, position + 1)?);
+        for (position, slot) in slots.iter().enumerate() {
+            let index = position + 1;
+            let Some(part) = &slot.part else {
+                // Unresolved slot: keep the deck position and surface the loss.
+                document
+                    .slides
+                    .push(placeholder_slide(index, &slot.reference));
+                let problem = slot
+                    .problem
+                    .clone()
+                    .unwrap_or_else(|| format!("slide {index}: slide part unresolved"));
+                warn!(problem = %problem, "PPTX slide part unresolved");
+                document.problems.push(problem);
+                continue;
+            };
+            document.slides.push(parse_slide(archive, part, index)?);
         }
         document.slide_count = document.slides.len();
         document.text = render_document(&document.slides);
@@ -174,46 +228,113 @@ impl PptxParser {
     }
 }
 
-/// Returns the slide parts in presentation order.
+/// One slot in presentation order: a resolved slide part, or the reason the part
+/// could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlideSlot {
+    /// Archive path of the resolved slide part.
+    part: Option<String>,
+    /// Relationship reference (`rId7`, or [`NO_RELATIONSHIP_REFERENCE`]) of an
+    /// unresolved slot.
+    reference: String,
+    /// Human-readable reason an unresolved slot could not be turned into a part.
+    problem: Option<String>,
+}
+
+impl SlideSlot {
+    /// A slot resolving to `part`.
+    fn resolved(part: String) -> Self {
+        Self {
+            part: Some(part),
+            reference: String::new(),
+            problem: None,
+        }
+    }
+
+    /// A slot that keeps its deck position but has no part.
+    fn unresolved(reference: impl Into<String>, problem: String) -> Self {
+        Self {
+            part: None,
+            reference: reference.into(),
+            problem: Some(problem),
+        }
+    }
+}
+
+/// Returns the slides in presentation order.
 ///
-/// The presentation and relationships parts are authoritative when both exist;
-/// otherwise (or when they resolve to no existing slide) the numeric
-/// `ppt/slides/slideN.xml` ordering is used, which also covers hand-made decks
-/// without a presentation part.
-fn slide_parts(archive: &ZipArchive) -> Result<Vec<String>> {
+/// The presentation and relationships parts are authoritative when both exist
+/// and declare at least one `<p:sldId>`, whether or not the entries resolve: an
+/// unresolved entry becomes an unresolved [`SlideSlot`] so the caller can keep
+/// it as a placeholder. Only a presentation part that declares no slides at all
+/// (missing part, no `<p:sldIdLst>`, or an empty list) falls back to numeric
+/// `ppt/slides/slideN.xml` ordering, which also covers hand-made decks without a
+/// presentation part.
+fn slide_parts(archive: &ZipArchive) -> Result<Vec<SlideSlot>> {
     if archive.has_entry(PRESENTATION_PART) && archive.has_entry(PRESENTATION_RELS_PART) {
         let ordered = presentation_slide_parts(archive)?;
         if !ordered.is_empty() {
             return Ok(ordered);
         }
     }
-    Ok(numeric_slide_parts(archive))
+    Ok(numeric_slide_parts(archive)
+        .into_iter()
+        .map(SlideSlot::resolved)
+        .collect())
 }
 
 /// Resolves `<p:sldIdLst>` through the presentation relationships.
-fn presentation_slide_parts(archive: &ZipArchive) -> Result<Vec<String>> {
+///
+/// Entries the relationship chain cannot resolve are returned as unresolved
+/// slots, never dropped.
+fn presentation_slide_parts(archive: &ZipArchive) -> Result<Vec<SlideSlot>> {
     let presentation = read_part(archive, PRESENTATION_PART)?;
-    let relationships = read_relationships(archive)?;
     let Some(list) = presentation
         .root()
         .and_then(|root| root.find_first("sldIdLst"))
     else {
         return Ok(Vec::new());
     };
-    let mut parts = Vec::new();
-    for entry in list.find_all("sldId") {
-        let Some(id) = entry.attr("r:id").map(str::trim) else {
+    let relationships = read_relationships(archive)?;
+    let mut slots = Vec::new();
+    for (position, entry) in list.find_all("sldId").iter().enumerate() {
+        let index = position + 1;
+        let Some(id) = entry
+            .attr("r:id")
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            slots.push(SlideSlot::unresolved(
+                NO_RELATIONSHIP_REFERENCE,
+                format!("slide {index}: <p:sldId> has no r:id"),
+            ));
             continue;
         };
         let Some(target) = relationships.get(id) else {
+            slots.push(SlideSlot::unresolved(
+                id,
+                format!("slide {index}: {id} is not mapped by {PRESENTATION_RELS_PART}"),
+            ));
             continue;
         };
         let part = resolve_part(PRESENTATION_DIR, target);
-        if is_slide_part(&part) && archive.has_entry(&part) {
-            parts.push(part);
+        if !is_slide_part(&part) {
+            slots.push(SlideSlot::unresolved(
+                id,
+                format!("slide {index}: {id} target {target} is not a slide part"),
+            ));
+            continue;
         }
+        if !archive.has_entry(&part) {
+            slots.push(SlideSlot::unresolved(
+                id,
+                format!("slide {index}: {id} target {target} is missing from the archive"),
+            ));
+            continue;
+        }
+        slots.push(SlideSlot::resolved(part));
     }
-    Ok(parts)
+    Ok(slots)
 }
 
 /// Collects `ppt/slides/slideN.xml` parts, ordered by `N` then name.
@@ -327,7 +448,20 @@ fn parse_slide(archive: &ZipArchive, part: &str, index: usize) -> Result<PptxSli
         title,
         notes,
         has_notes,
+        missing_part: None,
     })
+}
+
+/// Builds the placeholder slide that keeps an unresolved slot's deck position.
+fn placeholder_slide(index: usize, reference: &str) -> PptxSlide {
+    PptxSlide {
+        index,
+        text: format!("! missing slide part: {reference}"),
+        title: None,
+        notes: None,
+        has_notes: false,
+        missing_part: Some(reference.to_owned()),
+    }
 }
 
 /// Returns a part's `<p:cSld>/<p:spTree>`, when it has one.
