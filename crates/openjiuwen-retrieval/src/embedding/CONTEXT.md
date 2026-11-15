@@ -14,6 +14,7 @@ No external SDK: requests go through `openjiuwen_common::http`.
   - `async fn embed_query(&self, text: &str) -> Result<Vec<f32>>`
   - `async fn embed_documents(&self, texts: &[String], batch_size: Option<usize>) -> Result<Vec<Vec<f32>>>`
   - default `async fn dimension(&self) -> Result<usize>` (hint or probe with `"test"`)
+  - `fn supports_multimodal(&self) -> bool` (default `false`): capability query gating `KnowledgeBaseConfig::use_caption_for_images`; text-only embedders always take the caption branch, and `false` + multimodal reports `Error::Unsupported` because image+text embedding is not implemented.
 - `validate_texts`/`validate_query` helpers: empty list and blank entries → `Error::Validation`.
 
 ### `fake.rs`
