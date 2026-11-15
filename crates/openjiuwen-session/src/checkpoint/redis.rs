@@ -18,17 +18,29 @@
 //!
 //! Two checkpointers with different prefixes never see each other's data, which
 //! is what tests and side-by-side deployments rely on.
+//!
+//! The transport follows the URL scheme: `redis://` is a clear-text socket and
+//! `rediss://` is TLS ([`super::resp`]), verified against the compiled-in
+//! `webpki_roots` roots plus, when [`RedisOptions::tls_ca_file`] is set, the
+//! anchors in that file. A failed handshake or an untrusted certificate is an
+//! [`openjiuwen_common::error::ErrorKind::Session`] error naming the host, never
+//! a silent fallback to clear text.
 #![allow(clippy::module_name_repetitions)]
+
+use std::collections::BTreeMap;
+use std::path::Path;
 
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::utils::id::{now_rfc3339, uuid_hex};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::Mutex;
 
 use super::resp::{RespConnection, RespValue};
 use super::{
     validate_checkpoint_id, validate_session_id, Checkpoint, CheckpointMeta, Checkpointer,
+    CheckpointerConfig,
 };
 
 /// The default key prefix, Python's `openjiuwen:session` namespace.
@@ -36,9 +48,11 @@ pub const DEFAULT_REDIS_KEY_PREFIX: &str = "openjiuwen:session";
 
 /// Configuration for [`RedisCheckpointer`].
 ///
-/// `url` uses the `redis://[user[:password]@]host[:port][/db]` form; `prefix`
-/// namespaces every key; `ttl` (when set) expires each checkpoint document;
-/// `database` selects a Redis database and overrides the database in the URL.
+/// `url` uses the `[redis|rediss]://[user[:password]@]host[:port][/db]` form
+/// (`rediss://` dials over TLS); `prefix` namespaces every key; `ttl` (when set)
+/// expires each checkpoint document; `database` selects a Redis database and
+/// overrides the database in the URL; `tls_ca_file` adds trust anchors for
+/// `rediss://`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct RedisOptions {
@@ -51,6 +65,15 @@ pub struct RedisOptions {
     pub ttl: Option<std::time::Duration>,
     /// The Redis database index, sent as `SELECT` after connecting.
     pub database: Option<u32>,
+    /// Additional root certificates for a `rediss://` URL, as a file path.
+    ///
+    /// The file holds either a PEM bundle of `-----BEGIN CERTIFICATE-----`
+    /// blocks or one DER certificate; its anchors are *added* to the compiled-in
+    /// webpki roots, so public CAs keep working. A `redis://` URL has no TLS
+    /// layer to verify, so combining this option with one is a validation error
+    /// instead of a silent no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_file: Option<String>,
 }
 
 impl Default for RedisOptions {
@@ -60,7 +83,71 @@ impl Default for RedisOptions {
             prefix: DEFAULT_REDIS_KEY_PREFIX.to_string(),
             ttl: None,
             database: None,
+            tls_ca_file: None,
         }
+    }
+}
+
+impl RedisOptions {
+    /// Builds options from a declarative [`CheckpointerConfig`].
+    ///
+    /// This is the reading half of `checkpoint::create_checkpointer`: the URL
+    /// comes from `extra["url"]`, falling back to the rendered
+    /// [`CheckpointerConfig::path`], and the optional `extra` keys are `prefix`
+    /// (string), `ttl_seconds` (unsigned integer), `database` (unsigned
+    /// integer), and `tls_ca_file` (string; the hyphenated `tls-ca-file`
+    /// spelling is accepted as an alias, and `tls_ca_file` wins when both are
+    /// present).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] when neither
+    /// `extra["url"]` nor a `path` is present, and when `database` does not fit
+    /// in a `u32`.
+    pub fn from_config(config: &CheckpointerConfig) -> Result<Self> {
+        let url = config
+            .extra
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| config.path.as_ref().map(|path| path.display().to_string()))
+            .ok_or_else(|| {
+                Error::validation(
+                    "redis checkpointer requires a `url` (extra.url or path) in the configuration",
+                )
+            })?;
+        let mut options = Self {
+            url,
+            ..Self::default()
+        };
+        options.apply_extra(&config.extra)?;
+        Ok(options)
+    }
+
+    /// Applies the optional keys of a [`CheckpointerConfig::extra`] map.
+    fn apply_extra(&mut self, extra: &BTreeMap<String, Value>) -> Result<()> {
+        if let Some(prefix) = extra.get("prefix").and_then(Value::as_str) {
+            self.prefix = prefix.to_string();
+        }
+        if let Some(seconds) = extra.get("ttl_seconds").and_then(Value::as_u64) {
+            self.ttl = Some(std::time::Duration::from_secs(seconds));
+        }
+        if let Some(database) = extra.get("database").and_then(Value::as_u64) {
+            self.database = Some(u32::try_from(database).map_err(|_| {
+                Error::validation(format!(
+                    "redis database index {database} does not fit in a u32"
+                ))
+            })?);
+        }
+        // `tls_ca_file` wins over the hyphenated alias.
+        if let Some(ca_file) = extra
+            .get("tls_ca_file")
+            .and_then(Value::as_str)
+            .or_else(|| extra.get("tls-ca-file").and_then(Value::as_str))
+        {
+            self.tls_ca_file = Some(ca_file.to_string());
+        }
+        Ok(())
     }
 }
 
@@ -85,6 +172,7 @@ impl std::fmt::Debug for RedisCheckpointer {
             .field("prefix", &self.options.prefix)
             .field("ttl", &self.options.ttl)
             .field("database", &self.options.database)
+            .field("tls_ca_file", &self.options.tls_ca_file)
             .finish_non_exhaustive()
     }
 }
@@ -96,9 +184,9 @@ impl RedisCheckpointer {
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for an empty
-    /// or malformed URL, [`openjiuwen_common::error::ErrorKind::Unsupported`]
-    /// for `rediss://`, and [`openjiuwen_common::error::ErrorKind::Session`]
-    /// when the connection or its handshake fails.
+    /// or malformed URL and [`openjiuwen_common::error::ErrorKind::Session`]
+    /// when the connection, the TLS handshake of a `rediss://` URL, or its
+    /// protocol handshake fails.
     pub async fn connect(url: impl Into<String>) -> Result<Self> {
         Self::connect_with_options(RedisOptions {
             url: url.into(),
@@ -110,12 +198,18 @@ impl RedisCheckpointer {
     /// Connects with explicit `options`, validating the connection eagerly so a
     /// misconfigured URL fails at construction rather than on first use.
     ///
+    /// A `rediss://` URL dials over TLS; [`RedisOptions::tls_ca_file`] adds trust
+    /// anchors for it. That option requires a `rediss://` URL, because a
+    /// clear-text connection has nothing to verify.
+    ///
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for an empty
-    /// URL or prefix, [`openjiuwen_common::error::ErrorKind::Unsupported`] for
-    /// `rediss://`, and [`openjiuwen_common::error::ErrorKind::Session`] when
-    /// the connection, the `SELECT`, or the handshake fails.
+    /// URL or prefix, a malformed URL, a malformed CA file, or a `tls_ca_file`
+    /// on a `redis://` URL, and
+    /// [`openjiuwen_common::error::ErrorKind::Session`] when the connection, the
+    /// `SELECT`, the TLS handshake (an untrusted certificate, a server that is
+    /// not speaking TLS), or the protocol handshake fails.
     pub async fn connect_with_options(options: RedisOptions) -> Result<Self> {
         if options.url.trim().is_empty() {
             return Err(Error::validation(
@@ -125,6 +219,12 @@ impl RedisCheckpointer {
         if options.prefix.trim().is_empty() {
             return Err(Error::validation(
                 "redis checkpointer requires a non-empty `prefix`",
+            ));
+        }
+        if options.tls_ca_file.is_some() && !RespConnection::uses_tls(&options.url)? {
+            return Err(Error::validation(
+                "redis `tls_ca_file` requires a rediss:// url: a redis:// connection has no TLS \
+                 layer to verify against those certificates",
             ));
         }
         let connection = dial(&options).await?;
@@ -376,7 +476,8 @@ impl Checkpointer for RedisCheckpointer {
 
 /// Connects to `options.url` and selects `options.database` when set.
 async fn dial(options: &RedisOptions) -> Result<RespConnection> {
-    let mut connection = RespConnection::connect(&options.url).await?;
+    let ca_file = options.tls_ca_file.as_deref().map(Path::new);
+    let mut connection = RespConnection::connect_with_ca_file(&options.url, ca_file).await?;
     if let Some(database) = options.database {
         connection.select_database(database).await?;
     }
@@ -412,27 +513,132 @@ mod tests {
         assert_eq!(options.prefix, DEFAULT_REDIS_KEY_PREFIX);
         assert_eq!(options.ttl, None);
         assert_eq!(options.database, None);
+        assert_eq!(options.tls_ca_file, None);
     }
 
     #[test]
     fn options_round_trip_through_json() {
         let options = RedisOptions {
-            url: "redis://cache:6379/1".to_string(),
+            url: "rediss://cache:6379/1".to_string(),
             prefix: "tests".to_string(),
             ttl: Some(std::time::Duration::from_secs(30)),
             database: Some(1),
+            tls_ca_file: Some("/etc/ssl/private-ca.pem".to_string()),
         };
         let encoded = serde_json::to_value(&options).unwrap();
-        assert_eq!(encoded["url"], "redis://cache:6379/1");
+        assert_eq!(encoded["url"], "rediss://cache:6379/1");
         assert_eq!(encoded["prefix"], "tests");
         assert_eq!(encoded["database"], 1);
         assert_eq!(encoded["ttl"]["secs"], 30);
+        assert_eq!(encoded["tls_ca_file"], "/etc/ssl/private-ca.pem");
         let decoded: RedisOptions = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, options);
-        // Unknown and missing keys are tolerated.
+        // Unknown and missing keys are tolerated, and an absent CA file is not
+        // serialized at all.
         let tolerant: RedisOptions =
             serde_json::from_value(serde_json::json!({ "extra": 1 })).unwrap();
         assert_eq!(tolerant, RedisOptions::default());
+        assert!(
+            serde_json::to_value(RedisOptions::default())
+                .unwrap()
+                .get("tls_ca_file")
+                .is_none(),
+            "an unset CA file is skipped"
+        );
+    }
+
+    #[test]
+    fn options_read_the_factory_extra_map() {
+        use crate::checkpoint::{CheckpointerConfig, CheckpointerKind};
+
+        let config = CheckpointerConfig {
+            kind: CheckpointerKind::Redis,
+            path: None,
+            extra: std::collections::BTreeMap::from([
+                ("url".to_string(), serde_json::json!("rediss://cache:6379")),
+                ("prefix".to_string(), serde_json::json!("factory")),
+                ("ttl_seconds".to_string(), serde_json::json!(120)),
+                ("database".to_string(), serde_json::json!(3)),
+                (
+                    "tls_ca_file".to_string(),
+                    serde_json::json!("/etc/ssl/private-ca.pem"),
+                ),
+            ]),
+        };
+        let options = RedisOptions::from_config(&config).unwrap();
+        assert_eq!(options.url, "rediss://cache:6379");
+        assert_eq!(options.prefix, "factory");
+        assert_eq!(options.ttl, Some(std::time::Duration::from_secs(120)));
+        assert_eq!(options.database, Some(3));
+        assert_eq!(
+            options.tls_ca_file.as_deref(),
+            Some("/etc/ssl/private-ca.pem")
+        );
+
+        // The hyphenated spelling is an alias, and the snake_case key wins.
+        let hyphens = CheckpointerConfig {
+            kind: CheckpointerKind::Redis,
+            path: None,
+            extra: std::collections::BTreeMap::from([
+                ("url".to_string(), serde_json::json!("rediss://cache:6379")),
+                (
+                    "tls-ca-file".to_string(),
+                    serde_json::json!("/etc/ssl/alias-ca.pem"),
+                ),
+            ]),
+        };
+        assert_eq!(
+            RedisOptions::from_config(&hyphens).unwrap().tls_ca_file,
+            Some("/etc/ssl/alias-ca.pem".to_string())
+        );
+        let both = CheckpointerConfig {
+            kind: CheckpointerKind::Redis,
+            path: None,
+            extra: std::collections::BTreeMap::from([
+                ("url".to_string(), serde_json::json!("rediss://cache:6379")),
+                (
+                    "tls_ca_file".to_string(),
+                    serde_json::json!("/etc/ssl/private-ca.pem"),
+                ),
+                (
+                    "tls-ca-file".to_string(),
+                    serde_json::json!("/etc/ssl/alias-ca.pem"),
+                ),
+            ]),
+        };
+        assert_eq!(
+            RedisOptions::from_config(&both).unwrap().tls_ca_file,
+            Some("/etc/ssl/private-ca.pem".to_string())
+        );
+
+        // `path` is the URL fallback, and a missing URL stays a validation error.
+        let from_path = CheckpointerConfig {
+            kind: CheckpointerKind::Redis,
+            path: Some("rediss://cache:6379".into()),
+            extra: std::collections::BTreeMap::new(),
+        };
+        assert_eq!(
+            RedisOptions::from_config(&from_path).unwrap().url,
+            "rediss://cache:6379"
+        );
+        let error = RedisOptions::from_config(&CheckpointerConfig {
+            kind: CheckpointerKind::Redis,
+            ..CheckpointerConfig::default()
+        })
+        .expect_err("a missing url must be rejected");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+
+        // A database index beyond `u32` is a validation error.
+        let error = RedisOptions::from_config(&CheckpointerConfig {
+            kind: CheckpointerKind::Redis,
+            path: None,
+            extra: std::collections::BTreeMap::from([
+                ("url".to_string(), serde_json::json!("redis://cache:6379")),
+                ("database".to_string(), serde_json::json!(u64::MAX)),
+            ]),
+        })
+        .expect_err("an oversized database index must be rejected");
+        assert_eq!(error.kind(), ErrorKind::Validation);
     }
 
     #[tokio::test]
@@ -451,10 +657,17 @@ mod tests {
         .expect_err("an empty prefix must be rejected");
         assert_eq!(error.kind(), ErrorKind::Validation);
 
-        let error = RedisCheckpointer::connect("rediss://127.0.0.1:6379")
-            .await
-            .expect_err("TLS is not supported");
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        // A CA file only means something for a TLS URL: pairing one with
+        // `redis://` is rejected instead of being silently ignored.
+        let error = RedisCheckpointer::connect_with_options(RedisOptions {
+            url: "redis://127.0.0.1:1".to_string(),
+            tls_ca_file: Some("/etc/ssl/private-ca.pem".to_string()),
+            ..RedisOptions::default()
+        })
+        .await
+        .expect_err("a CA file without a TLS url must be rejected");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.to_string().contains("tls_ca_file"), "{error}");
     }
 
     #[test]

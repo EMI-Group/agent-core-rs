@@ -6,16 +6,33 @@
 //! log (so tests can assert on `EXPIRE`, `SELECT`, `AUTH`, …), mimics Redis's
 //! rule that a set with no members disappears, and is aborted when
 //! [`FakeRedis`] is dropped.
+//!
+//! [`FakeRedis::start`] serves clear text (`redis://`); [`FakeRedis::start_tls`]
+//! wraps the same command handling in a `tokio-rustls` handshake
+//! (`rediss://`) using the static DER fixtures in `tests/fixtures/tls/`. Both
+//! share the command log, the store and the hang-up switch.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
+use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
+
+/// How long a client may stay silent before its connection is dropped.
+///
+/// The real server would keep the socket open; the fake one closes it so a
+/// client that never speaks RESP (a TLS handshake sent to the clear-text
+/// server, for example) fails its handshake instead of hanging the test.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A loopback RESP2 server with in-memory strings and sets.
 pub(crate) struct FakeRedis {
@@ -32,12 +49,58 @@ impl Drop for FakeRedis {
     }
 }
 
+/// How accepted connections are served.
+enum Mode {
+    /// RESP2 over the plain TCP socket (`redis://`).
+    Plain,
+    /// RESP2 over a TLS session (`rediss://`).
+    Tls(TlsAcceptor),
+}
+
+impl Mode {
+    /// Returns a cheap copy of the mode so each connection task owns one.
+    fn clone_for_connection(&self) -> Self {
+        match self {
+            Self::Plain => Self::Plain,
+            Self::Tls(acceptor) => Self::Tls(acceptor.clone()),
+        }
+    }
+}
+
 impl FakeRedis {
-    /// Starts a server on `127.0.0.1:0` and returns its handle.
+    /// Starts a clear-text server on `127.0.0.1:0` and returns its handle.
     pub(crate) async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the fake redis listener");
+        Self::with_listener(listener, Mode::Plain)
+    }
+
+    /// Starts a TLS server on `127.0.0.1:0`, serving the DER fixtures from
+    /// `tests/fixtures/tls/` (`server.der` + `server.key.der`).
+    pub(crate) async fn start_tls() -> Self {
+        let certificate =
+            std::fs::read(fixture("server.der")).expect("read the server certificate");
+        let key = std::fs::read(fixture("server.key.der")).expect("read the server key");
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("build the server TLS versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(certificate)],
+            PrivateKeyDer::Pkcs8(key.into()),
+        )
+        .expect("install the fixture certificate and key");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the fake TLS redis listener");
+        Self::with_listener(listener, Mode::Tls(TlsAcceptor::from(Arc::new(config))))
+    }
+
+    /// Binds `listener` and serves it with `mode`.
+    fn with_listener(listener: TcpListener, mode: Mode) -> Self {
         let addr = listener
             .local_addr()
             .expect("read the fake redis address")
@@ -47,6 +110,7 @@ impl FakeRedis {
         let store = Arc::new(Mutex::new(Store::default()));
         let handle = tokio::spawn(serve(
             listener,
+            mode,
             store,
             Arc::clone(&commands),
             Arc::clone(&hang_up),
@@ -62,6 +126,11 @@ impl FakeRedis {
     /// Returns a `redis://host:port` URL for this server.
     pub(crate) fn url(&self) -> String {
         format!("redis://{}", self.addr)
+    }
+
+    /// Returns a `rediss://host:port` URL for this server.
+    pub(crate) fn url_tls(&self) -> String {
+        format!("rediss://{}", self.addr)
     }
 
     /// Returns a `redis://credentials@host:port[/db]` URL for this server.
@@ -113,6 +182,7 @@ struct Store {
 /// Accepts connections until the listener is dropped.
 async fn serve(
     listener: TcpListener,
+    mode: Mode,
     store: Arc<Mutex<Store>>,
     commands: Arc<Mutex<Vec<Vec<String>>>>,
     hang_up: Arc<AtomicBool>,
@@ -121,23 +191,39 @@ async fn serve(
         let Ok((stream, _)) = listener.accept().await else {
             return;
         };
+        let mode = mode.clone_for_connection();
         let store = Arc::clone(&store);
         let commands = Arc::clone(&commands);
         let hang_up = Arc::clone(&hang_up);
-        tokio::spawn(async move { handle_client(stream, store, commands, hang_up).await });
+        tokio::spawn(async move {
+            match mode {
+                Mode::Plain => handle_client(stream, store, commands, hang_up).await,
+                Mode::Tls(acceptor) => {
+                    // A failed handshake (a client that is not speaking TLS)
+                    // just drops the connection, like a real TLS server does.
+                    if let Ok(stream) = acceptor.accept(stream).await {
+                        handle_client(stream, store, commands, hang_up).await;
+                    }
+                }
+            }
+        });
     }
 }
 
 /// Serves one client connection until it closes.
-async fn handle_client(
-    stream: TcpStream,
+async fn handle_client<S>(
+    stream: S,
     store: Arc<Mutex<Store>>,
     commands: Arc<Mutex<Vec<Vec<String>>>>,
     hang_up: Arc<AtomicBool>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut reader = BufReader::new(stream);
     loop {
-        let Ok(Some(command)) = read_command(&mut reader).await else {
+        let Ok(Ok(Some(command))) =
+            tokio::time::timeout(IDLE_TIMEOUT, read_command(&mut reader)).await
+        else {
             return;
         };
         if command.is_empty() {
@@ -398,4 +484,11 @@ fn array(items: &[Vec<u8>]) -> Vec<u8> {
 /// Encodes the wrong-arity error reply.
 fn wrong_arity() -> Vec<u8> {
     error_reply("ERR wrong number of arguments for command")
+}
+
+/// Returns the absolute path of a fixture under `tests/fixtures/tls/`.
+pub(crate) fn fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/tls")
+        .join(name)
 }
