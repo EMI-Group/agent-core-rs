@@ -77,7 +77,8 @@ The history file is capped at `MAX_RUNS_PER_JOB` (20) records per job and `MAX_R
 - Clocks are injected: `Utc::now()` appears only in `Tool::invoke` (one call at the call site, documented); the parser, scheduler, history and `invoke_at` never read the wall clock.
 - No panics on user input, no `unwrap`/`expect` outside tests, no `unsafe`, no `println!`/`eprintln!`; every public item is documented.
 - Files stay under 1000 lines; shared helpers live in the owning module (`stamp` in `actions.rs`, `write_atomic` in `store.rs`).
-- Test modules live in separate `*_tests.rs` files wired with `#[path = "..."] mod tests;` so no implementation file carries the suite.
+- Test modules live in separate `*_tests.rs` files wired with `#[path = "..."] mod tests;`, except `history.rs`, which carries its own inline `mod tests`.
+- No cron source declares `Error::Unsupported`: deferred Python surface is documented in doc comments only, and an unknown action is a `success=false` validation payload (`invalid action: "<x>" …`), not a typed unsupported error.
 
 ## Deferred Python Actions
 
