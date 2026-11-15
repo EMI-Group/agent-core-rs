@@ -233,12 +233,24 @@ mod tests {
     #[tokio::test]
     async fn ttl_expires_on_read_and_allows_reacquire() {
         let store = InMemoryKvStore::new();
+        // A lease a minute from its deadline is live: the refusal below must not
+        // depend on how quickly the test thread reaches it.
+        assert!(store
+            .exclusive_set("held", KvValue::text("a"), Some(Duration::from_secs(60)))
+            .await
+            .unwrap());
+        assert!(store.exists("held").await.unwrap());
+        assert!(!store
+            .exclusive_set("held", KvValue::text("b"), None)
+            .await
+            .unwrap());
+
+        // The short lease is only inspected after the deadline has certainly passed:
+        // the sleep starts after the write, so no assertion races the TTL.
         assert!(store
             .exclusive_set("lock", KvValue::text("a"), Some(Duration::from_millis(20)))
             .await
             .unwrap());
-        assert!(store.exists("lock").await.unwrap());
-
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(store.get("lock").await.unwrap(), None);
         assert!(!store.exists("lock").await.unwrap());
@@ -256,7 +268,11 @@ mod tests {
             .exclusive_set("k", KvValue::text("a"), Some(Duration::from_millis(20)))
             .await
             .unwrap();
+        // `set` drops the TTL either way, so the outcome does not depend on whether
+        // the 20 ms lease was still live when it ran.
         store.set("k", KvValue::text("b")).await.unwrap();
+        // The sleep starts after the write, so the old deadline has certainly passed
+        // when it returns; no assertion here assumes the lease is still live.
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(store.get("k").await.unwrap(), Some(KvValue::text("b")));
     }
@@ -296,6 +312,8 @@ mod tests {
             )
             .await
             .unwrap();
+        // The sleep starts after the write, so the 20 ms deadline has certainly
+        // passed when it returns, whatever the test load.
         tokio::time::sleep(Duration::from_millis(80)).await;
 
         let entries = store.get_by_prefix("p/").await.unwrap();

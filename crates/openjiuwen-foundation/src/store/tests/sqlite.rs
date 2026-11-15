@@ -9,7 +9,7 @@
 //! Every test opens a fresh database, so the shared contract helpers run against
 //! an empty store exactly like the in-memory and local-filesystem suites.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
 
@@ -64,11 +64,14 @@ async fn sqlite_kv_reopens_a_file_database_and_shares_its_pool() {
             .set("bytes", KvValue::bytes(vec![0x00, 0xff, 0xfe]))
             .await
             .unwrap();
+        // A generous TTL keeps the lease live for the whole assertion sequence: a
+        // sub-second window could elapse between this write and the count below when
+        // the suite runs in parallel.
         assert!(store
             .exclusive_set(
                 "ttl",
                 KvValue::text("temporary"),
-                Some(Duration::from_millis(40))
+                Some(Duration::from_secs(60))
             )
             .await
             .unwrap());
@@ -82,6 +85,12 @@ async fn sqlite_kv_reopens_a_file_database_and_shares_its_pool() {
             Some(KvValue::text("hello"))
         );
         assert_eq!(shared.len().await.unwrap(), 3);
+
+        // Expire the row by backdating its absolute deadline instead of sleeping
+        // through a real-time TTL window: `pool()` is the documented companion-query
+        // hook and the elapsed-TTL path is identical once `expiry_ms` is in the past.
+        assert_eq!(backdate_expiry(&shared, "ttl").await, 1);
+        assert_eq!(shared.get("ttl").await.unwrap(), None);
     }
 
     let reopened = SqliteKvStore::connect(&url).await.unwrap();
@@ -93,9 +102,27 @@ async fn sqlite_kv_reopens_a_file_database_and_shares_its_pool() {
         reopened.get("bytes").await.unwrap(),
         Some(KvValue::bytes(vec![0x00, 0xff, 0xfe]))
     );
-    // The TTL is an absolute deadline stored in the database, so it still expires.
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    // The TTL is an absolute deadline stored in the database, so the backdated row is
+    // still expired after a reopen even though the lease was written moments ago.
     assert!(!reopened.exists("ttl").await.unwrap());
+}
+
+/// Moves one row's absolute TTL deadline into the past and returns the rows touched.
+///
+/// This is the deterministic stand-in for waiting out a real TTL: `expiry_ms` is
+/// stored in the database, so the expired-row path is the same either way.
+async fn backdate_expiry(store: &SqliteKvStore, key: &str) -> u64 {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    sqlx::query("UPDATE kv_store SET expiry_ms = ?1 WHERE k = ?2")
+        .bind(i64::try_from(now_ms).unwrap_or(i64::MAX) - 1_000)
+        .bind(key)
+        .execute(store.pool())
+        .await
+        .unwrap()
+        .rows_affected()
 }
 
 #[tokio::test]
