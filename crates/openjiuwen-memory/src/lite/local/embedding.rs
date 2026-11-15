@@ -18,6 +18,12 @@
 //! A fact that is edited gets new chunk text and is re-embedded; a deleted fact disappears
 //! because the rebuild drops documents that are no longer in the store.
 //!
+//! The index records the document version it was built from (see `LocalState::version`), so
+//! a document changed outside the store — an editor, another process, the watcher — is
+//! re-embedded before the next semantic recall instead of being scored with the vectors of
+//! the old text. A failed build is never installed: the previous index (or no index at all,
+//! when the first build failed) stays in place, so the next recall simply tries again.
+//!
 //! Nothing here holds the document guard across a model call: the facts are snapshotted
 //! first, then the embedding index (under its own lock) is rebuilt, so a slow model never
 //! blocks a concurrent read of the Markdown document.
@@ -32,7 +38,7 @@ use crate::lite::embed::{ChunkingConfig, EmbeddingIndex, EmbeddingStats};
 use crate::lite::fact::CodingFact;
 use crate::lite::markdown::MarkdownMemory;
 
-use super::state::LocalCodingMemory;
+use super::state::{EmbeddingIndexState, LocalCodingMemory};
 
 impl LocalCodingMemory {
     /// The embedding model backing semantic recall, or `None` for a keyword-only store.
@@ -63,7 +69,7 @@ impl LocalCodingMemory {
             .lock()
             .await
             .as_ref()
-            .map_or(0, EmbeddingIndex::len)
+            .map_or(0, |indexed| indexed.index.len())
     }
 
     /// Rebuilds the chunk index from the current facts and returns what the pass did.
@@ -71,6 +77,10 @@ impl LocalCodingMemory {
     /// Only chunks whose text is missing from the content-hash cache are embedded, so a
     /// refresh after an unchanged document makes no model call. Without an embedding model
     /// there is nothing to index and the returned stats are zeroed.
+    ///
+    /// The new index is built off to the side and installed only when the pass succeeds, so
+    /// a model or cache failure leaves the previous index (or no index, after a failed first
+    /// build) in place and the next refresh retries.
     ///
     /// # Errors
     ///
@@ -80,22 +90,21 @@ impl LocalCodingMemory {
         let Some(embedding) = self.inner.embedding.clone() else {
             return Ok(EmbeddingStats::default());
         };
-        let documents = {
+        let (version, documents) = {
             let mut state = self.inner.state.lock().await;
             self.ensure_fresh(&mut state).await?;
-            document_pairs(&state.document)
+            (state.version(), document_pairs(&state.document))
         };
-        let mut guard = self.inner.embeddings.lock().await;
-        let index = match guard.as_mut() {
-            Some(index) => index,
-            None => guard.insert(EmbeddingIndex::new(
-                embedding.model_name(),
-                self.inner.cache.clone(),
-            )),
-        };
-        index
+        let mut built = EmbeddingIndex::new(embedding.model_name(), self.inner.cache.clone());
+        let stats = built
             .reindex(embedding.as_ref(), &documents, &self.inner.chunking)
-            .await
+            .await?;
+        let mut guard = self.inner.embeddings.lock().await;
+        *guard = Some(EmbeddingIndexState {
+            index: built,
+            version,
+        });
+        Ok(stats)
     }
 
     /// The number of vectors in the content-hash embedding cache.
@@ -114,7 +123,9 @@ impl LocalCodingMemory {
     ///
     /// A fact with no indexed chunk (or with a chunk whose vector is unknown) is absent
     /// from the map, which the caller reads as `0.0`. The index is built from the current
-    /// facts when it has not been built yet.
+    /// facts when it has not been built yet, and rebuilt first when the document changed
+    /// since it was built, so an externally edited or newly written fact is scored with its
+    /// current text instead of a stale vector (or `0.0`).
     pub(super) async fn semantic_scores(
         &self,
         query: &str,
@@ -123,15 +134,28 @@ impl LocalCodingMemory {
         let Some(embedding) = self.inner.embedding.clone() else {
             return Ok(BTreeMap::new());
         };
-        let needs_build = { self.inner.embeddings.lock().await.is_none() };
+        let version = {
+            let mut state = self.inner.state.lock().await;
+            self.ensure_fresh(&mut state).await?;
+            state.version()
+        };
+        let needs_build = {
+            let guard = self.inner.embeddings.lock().await;
+            guard
+                .as_ref()
+                .is_none_or(|indexed| indexed.version != version)
+        };
         if needs_build {
             let _stats = self.refresh_embeddings().await?;
         }
         let guard = self.inner.embeddings.lock().await;
-        let Some(index) = guard.as_ref() else {
+        let Some(indexed) = guard.as_ref() else {
             return Ok(BTreeMap::new());
         };
-        let hits = index.search(embedding.as_ref(), query, limit).await?;
+        let hits = indexed
+            .index
+            .search(embedding.as_ref(), query, limit)
+            .await?;
         let mut scores: BTreeMap<String, f32> = BTreeMap::new();
         for hit in hits {
             let best = scores.entry(hit.document).or_insert(0.0);

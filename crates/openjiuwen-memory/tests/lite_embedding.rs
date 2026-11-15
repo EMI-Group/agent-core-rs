@@ -32,7 +32,7 @@ use openjiuwen_memory::lite::embed::{blend, EmbeddingStats};
 use openjiuwen_memory::lite::facts::{file_name_for, parse_level, render_level, IndexLevel};
 use openjiuwen_memory::lite::local::LocalCodingMemory;
 use openjiuwen_memory::lite::markdown::MarkdownMemory;
-use openjiuwen_memory::lite::session::{SessionRecord, SessionStore};
+use openjiuwen_memory::lite::session::{sanitize_session_id, SessionRecord, SessionStore};
 use openjiuwen_memory::lite::sync::SyncTrigger;
 use openjiuwen_memory::lite::write::{WriteMode, WritePolicy};
 use openjiuwen_memory::lite::{CodingFact, CodingFactType};
@@ -110,6 +110,67 @@ async fn open_embedded_with(temp: &TempDir, counter: &Arc<CountingEmbedding>) ->
         .open()
         .await
         .expect("open the embedded store")
+}
+
+/// Opens a store rooted at `temp` whose semantic recall is backed by `model`.
+async fn open_with_model(temp: &TempDir, model: Arc<dyn Embedding>) -> LocalCodingMemory {
+    LocalCodingMemory::builder(temp.path(), CodingMemoryConfig::default())
+        .scope(scope())
+        .embedding(model)
+        .open()
+        .await
+        .expect("open the embedded store")
+}
+
+/// A [`HashEmbedding`] that fails its first `embed_documents` call.
+///
+/// The failure models a model or transport error during the very first index build: the
+/// store must not install the empty index it started from.
+struct FailingOnceEmbedding {
+    /// The real embedder the retry delegates to.
+    inner: HashEmbedding,
+    /// Number of `embed_documents` calls attempted so far.
+    attempts: AtomicUsize,
+}
+
+impl FailingOnceEmbedding {
+    /// Creates an embedder over a `dimension`-sized hash embedder that fails once.
+    fn new(dimension: usize) -> Self {
+        Self {
+            inner: HashEmbedding::new(dimension),
+            attempts: AtomicUsize::new(0),
+        }
+    }
+
+    /// The number of `embed_documents` calls attempted.
+    fn attempts(&self) -> usize {
+        self.attempts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Embedding for FailingOnceEmbedding {
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+    fn dimension_hint(&self) -> Option<usize> {
+        self.inner.dimension_hint()
+    }
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.inner.embed_query(text).await
+    }
+    async fn embed_documents(
+        &self,
+        texts: &[String],
+        batch_size: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(Error::unsupported(
+                "the embedding model is unavailable for this test",
+            ));
+        }
+        self.inner.embed_documents(texts, batch_size).await
+    }
 }
 
 /// Opens a store rooted at `temp` plus its counting embedding model.
@@ -735,10 +796,10 @@ async fn jsonl_sessions_append_number_and_rank_in_path_and_line_order() {
 
 /// A hostile session id is sanitized into the day directory, and a blank one is rejected.
 ///
-/// `sanitize_session_id` keeps ASCII alphanumerics plus `-`, `_`, and `.` and folds every
-/// other character to `-`, so `"../x"` becomes the file name `..-x.jsonl` inside
-/// `sessions/<date>/` rather than a traversal; only an id that sanitizes to nothing is
-/// [`Error::Validation`].
+/// `sanitize_session_id` keeps ASCII alphanumerics plus `-`, `_`, and `.`, folds every
+/// other character to `-`, and appends an eight-hex-digit discriminator, so `"../x"` becomes
+/// the file name `..-x-<hash>.jsonl` inside `sessions/<date>/` rather than a traversal; only
+/// an id that sanitizes to nothing is [`Error::Validation`].
 #[tokio::test]
 async fn hostile_session_ids_are_sanitized_and_blank_ids_are_rejected() {
     let temp = TempDir::new().expect("temp dir");
@@ -747,12 +808,14 @@ async fn hostile_session_ids_are_sanitized_and_blank_ids_are_rejected() {
         .append_session("../x", day(), &[SessionRecord::new("traversal attempt")])
         .await
         .expect("the id is sanitized instead of rejected");
+    let sanitized = sanitize_session_id("../x").expect("the id sanitizes");
+    assert!(sanitized.starts_with("..-x-"), "{sanitized}");
     assert_eq!(
         path,
         temp.path()
             .join("sessions")
             .join("2026-01-02")
-            .join("..-x.jsonl")
+            .join(format!("{sanitized}.jsonl"))
     );
     assert!(
         path.starts_with(store.sessions_dir()),
@@ -1080,4 +1143,104 @@ async fn sync_triggers_report_counters_and_own_the_interval_task() {
         .expect_err("a zero interval is rejected");
     assert!(matches!(error, Error::Validation(_)), "{error:?}");
     assert!(!store.is_interval_sync_running().await);
+}
+
+/// An external edit is re-embedded before the next semantic recall.
+///
+/// The chunk index is derived state keyed to the document version it was built from, so an
+/// editor (or another process) that rewrites `MEMORY.md` must not leave the old vectors in
+/// place: an edited fact has to be recalled by its new text, and a hand-added fact must not
+/// score `0.0`.
+#[tokio::test]
+async fn an_external_edit_is_reembedded_before_the_next_semantic_recall() {
+    let temp = TempDir::new().expect("temp dir");
+    let (store, _counter) = open_embedded(&temp).await;
+    store
+        .write(fact("build", "cargo build"))
+        .await
+        .expect("the first fact is written");
+    let options = SearchOptions::default().with_mode(SearchMode::Semantic);
+    let hits = store
+        .search("cargo build", &options)
+        .await
+        .expect("the search");
+    assert!(
+        hits.iter()
+            .any(|hit| hit_name(hit) == "build" && hit.similarity > 0.99),
+        "{hits:?}"
+    );
+
+    // An external edit: nothing calls `refresh_embeddings`, and the stamp is what the store
+    // sees on its next read.
+    write_markdown(&store, &[fact("build", "cargo build --release")]);
+    let hits = store
+        .search("cargo build --release", &options)
+        .await
+        .expect("the search");
+    let edited = hits
+        .iter()
+        .find(|hit| hit_name(hit) == "build")
+        .expect("the edited fact is recalled by its new text");
+    assert!(
+        edited.similarity > 0.99,
+        "the edited body must be re-embedded, got {}",
+        edited.similarity
+    );
+
+    // A fact added by hand outside the store is scored too, instead of falling below the
+    // threshold with a `0.0` semantic component.
+    write_markdown(
+        &store,
+        &[
+            fact("build", "cargo build --release"),
+            fact("test", "cargo test --workspace"),
+        ],
+    );
+    let hits = store
+        .search("cargo test --workspace", &options)
+        .await
+        .expect("the search");
+    let added = hits
+        .iter()
+        .find(|hit| hit_name(hit) == "test")
+        .expect("the hand-added fact is recalled");
+    assert!(added.similarity > 0.99, "{added:?}");
+}
+
+/// A failed embedding pass never installs the empty index it started from.
+///
+/// The first build of a store whose model fails must leave the index unbuilt, so the next
+/// recall retries instead of answering `Ok([])` for ever.
+#[tokio::test]
+async fn a_failed_embedding_pass_does_not_install_an_empty_index() {
+    let temp = TempDir::new().expect("temp dir");
+    let model = Arc::new(FailingOnceEmbedding::new(DIMENSION));
+    let store = open_with_model(&temp, model.clone()).await;
+    assert_eq!(store.embedding_chunks().await, 0);
+
+    let error = store
+        .write(fact("build", "cargo build"))
+        .await
+        .expect_err("the first embedding pass fails");
+    assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+    assert_eq!(model.attempts(), 1);
+    assert_eq!(
+        store.embedding_chunks().await,
+        0,
+        "the failed pass installs no index"
+    );
+
+    // The fact itself was stored, and the next recall retries the build.
+    let options = SearchOptions::default().with_mode(SearchMode::Semantic);
+    let hits = store
+        .search("cargo build", &options)
+        .await
+        .expect("the search");
+    let hit = hits
+        .iter()
+        .find(|hit| hit_name(hit) == "build")
+        .expect("the retry indexes the stored fact");
+    assert!(hit.similarity > 0.99, "{hit:?}");
+    assert_eq!(model.attempts(), 2, "exactly one retry");
+    assert_eq!(store.embedding_chunks().await, 1);
 }

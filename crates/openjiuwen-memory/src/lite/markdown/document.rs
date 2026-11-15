@@ -12,6 +12,8 @@
 //! The document carries the [`MemoryScope`] its facts belong to. The scope is never
 //! written to the file: one file holds one scope, and `parse` returns a document bound
 //! to the default scope for the caller to rebind.
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use openjiuwen_common::error::Result;
 
@@ -21,6 +23,9 @@ use super::front_matter::{
 use crate::lite::fact::{CodingFact, CodingFactType};
 use crate::lite::index::type_label;
 use crate::record::MemoryScope;
+
+/// The tracing target of the document diagnostics.
+const TARGET: &str = "openjiuwen_memory::lite::markdown";
 
 /// Default document title (the text after `# `).
 const DEFAULT_TITLE: &str = "Memory";
@@ -34,6 +39,8 @@ const ATTR_TAGS: &str = "tags";
 const ATTR_PATH: &str = "path";
 /// Entry attribute holding the last modification timestamp.
 const ATTR_UPDATED_AT: &str = "updated_at";
+/// Prefix of a list item inside an entry's attribute block.
+const BULLET_PREFIX: &str = "- ";
 
 /// One fact together with the entry attributes this crate does not interpret.
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +49,17 @@ struct FactEntry {
     fact: CodingFact,
     /// Ordered unknown attributes, preserved across edits.
     extra: Vec<(String, String)>,
+    /// Lines of the attribute block that are not `key: value` pairs, kept verbatim.
+    ///
+    /// A hand-written bullet such as `- see also notes.md` must not end the attribute
+    /// block (the attributes after it would become body text), so it is collected here and
+    /// rendered back after the recognized attributes.
+    stray: Vec<String>,
+    /// The verbatim `updated_at` value when it is not a valid RFC 3339 timestamp.
+    ///
+    /// The fact itself falls back to the Unix epoch (a deterministic, documented default),
+    /// while the original text is rendered back unchanged instead of being replaced.
+    updated_at_raw: Option<String>,
 }
 
 /// One top-level block of the document.
@@ -161,9 +179,17 @@ impl MarkdownMemory {
             }
             let raw = trim_blank_edges(&lines[start..index]);
             if !raw.is_empty() {
+                if raw.lines().any(|line| line.starts_with("### ")) {
+                    tracing::warn!(
+                        target: TARGET,
+                        "an unrecognized section heading keeps its `###` entries verbatim; \
+                         they are plain text, not coding facts, and are not imported"
+                    );
+                }
                 document.blocks.push(Block::Raw { text: raw });
             }
         }
+        Self::dedupe_fact_names(&mut document.blocks);
         if document.front_matter.is_empty()
             && document.title.is_none()
             && document.blocks.is_empty()
@@ -171,6 +197,44 @@ impl MarkdownMemory {
             return Ok(Self::new());
         }
         Ok(document)
+    }
+
+    /// Drops every duplicate entry of a fact name, keeping the last occurrence.
+    ///
+    /// A hand edit can repeat a `### name` entry (a copy-paste, or an append instead of an
+    /// edit). A document cannot hold two entries for one name: a delete would remove only
+    /// one copy (so the next render would resurrect the other) and a read could return the
+    /// stale one. The later occurrence therefore wins — it is the caller's latest text —
+    /// and every dropped copy is reported.
+    fn dedupe_fact_names(blocks: &mut [Block]) {
+        let mut last: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for (block_index, block) in blocks.iter().enumerate() {
+            if let Block::Facts { entries, .. } = block {
+                for (entry_index, entry) in entries.iter().enumerate() {
+                    let _previous =
+                        last.insert(entry.fact.name.clone(), (block_index, entry_index));
+                }
+            }
+        }
+        for (block_index, block) in blocks.iter_mut().enumerate() {
+            let Block::Facts { entries, .. } = block else {
+                continue;
+            };
+            let mut kept = Vec::with_capacity(entries.len());
+            for (entry_index, entry) in std::mem::take(entries).into_iter().enumerate() {
+                if last.get(&entry.fact.name).copied() == Some((block_index, entry_index)) {
+                    kept.push(entry);
+                } else {
+                    tracing::warn!(
+                        target: TARGET,
+                        name = %entry.fact.name,
+                        "a fact name appears more than once in the document; the last \
+                         occurrence wins and this copy is dropped"
+                    );
+                }
+            }
+            *entries = kept;
+        }
     }
 
     /// Parses the entries of one recognized section, starting after its heading.
@@ -207,16 +271,38 @@ impl MarkdownMemory {
     ) -> (FactEntry, usize) {
         let mut index = start;
         let mut attributes: Vec<(String, String)> = Vec::new();
+        let mut stray: Vec<String> = Vec::new();
+        // The canonical entry has a blank line between its heading and its attribute block,
+        // so blank lines only close the block once a line of it has been seen.
+        let mut block_open = true;
         while index < lines.len()
             && !is_section_boundary(lines[index])
             && entry_name(lines[index]).is_none()
         {
             let trimmed = lines[index].trim();
             if trimmed.is_empty() {
+                if !attributes.is_empty() || !stray.is_empty() {
+                    block_open = false;
+                }
                 index += 1;
                 continue;
             }
             let Some((key, value)) = attribute_of(lines[index]) else {
+                // A bullet of the attribute block that is not `key: value` must not end the
+                // block: the attributes after it would silently become body text. It is
+                // kept verbatim instead. Any other line — and any bullet after a blank line
+                // that closed the block, which is where a free-form body starts — begins
+                // the body.
+                if block_open && trimmed.starts_with(BULLET_PREFIX) {
+                    tracing::warn!(
+                        target: TARGET,
+                        line = %trimmed,
+                        "an entry attribute line is not `- key: value`; keeping it verbatim"
+                    );
+                    stray.push(trimmed.to_owned());
+                    index += 1;
+                    continue;
+                }
                 break;
             };
             attributes.push((key, value));
@@ -243,6 +329,7 @@ impl MarkdownMemory {
             CodingFact::new(&MemoryScope::default(), name, body.join("\n")).with_type(fact_type);
         fact.updated_at = DateTime::<Utc>::default();
         let mut extra = Vec::new();
+        let mut updated_at_raw = None;
         for (key, value) in attributes {
             match key.as_str() {
                 ATTR_DESCRIPTION => fact.description = value,
@@ -252,15 +339,31 @@ impl MarkdownMemory {
                         fact.path = Some(value);
                     }
                 }
-                ATTR_UPDATED_AT => {
-                    if let Ok(timestamp) = DateTime::parse_from_rfc3339(&value) {
-                        fact.updated_at = timestamp.with_timezone(&Utc);
+                ATTR_UPDATED_AT => match DateTime::parse_from_rfc3339(&value) {
+                    Ok(timestamp) => fact.updated_at = timestamp.with_timezone(&Utc),
+                    Err(_error) => {
+                        tracing::warn!(
+                            target: TARGET,
+                            name = %fact.name,
+                            value = %value,
+                            "an entry `updated_at` is not an RFC 3339 timestamp; the fact \
+                             uses the Unix epoch and the original text is kept"
+                        );
+                        updated_at_raw = Some(value);
                     }
-                }
+                },
                 _ => extra.push((key, value)),
             }
         }
-        (FactEntry { fact, extra }, index)
+        (
+            FactEntry {
+                fact,
+                extra,
+                stray,
+                updated_at_raw,
+            },
+            index,
+        )
     }
 
     /// Renders the document, ending with exactly one newline.
@@ -378,7 +481,12 @@ impl MarkdownMemory {
         let rank = type_rank(fact.fact_type);
         let block = self.section_slot(rank);
         if let Block::Facts { entries, .. } = block {
-            entries.push(FactEntry { fact, extra });
+            entries.push(FactEntry {
+                fact,
+                extra,
+                stray: Vec::new(),
+                updated_at_raw: None,
+            });
         }
         replaced
     }
@@ -429,16 +537,29 @@ impl MarkdownMemory {
             .find(|entry| entry.fact.name == name)
     }
 
-    /// Removes (and returns) the entry named `name` from whichever section holds it.
+    /// Removes (and returns) every entry named `name`, from whichever sections hold it.
+    ///
+    /// All copies are drained, not just the first: a document that somehow holds the same
+    /// name twice must not resurrect the leftover copy on the next render. When several
+    /// copies exist the last one is returned, matching the parse rule that the last
+    /// occurrence wins.
     fn take_fact(&mut self, name: &str) -> Option<FactEntry> {
+        let mut taken: Option<FactEntry> = None;
         for block in &mut self.blocks {
-            if let Block::Facts { entries, .. } = block {
-                if let Some(position) = entries.iter().position(|entry| entry.fact.name == name) {
-                    return Some(entries.remove(position));
+            let Block::Facts { entries, .. } = block else {
+                continue;
+            };
+            let mut kept = Vec::with_capacity(entries.len());
+            for entry in std::mem::take(entries) {
+                if entry.fact.name == name {
+                    taken = Some(entry);
+                } else {
+                    kept.push(entry);
                 }
             }
+            *entries = kept;
         }
-        None
+        taken
     }
 
     /// Mutable access to every fact, for scope rebinding.
@@ -495,15 +616,21 @@ fn render_entry(entry: &FactEntry) -> String {
     if let Some(path) = &entry.fact.path {
         lines.push(format!("{ATTR_PREFIX}{ATTR_PATH}: {}", one_line(path)));
     }
-    lines.push(format!(
-        "{ATTR_PREFIX}{ATTR_UPDATED_AT}: {}",
-        entry
-            .fact
-            .updated_at
-            .to_rfc3339_opts(SecondsFormat::Secs, true)
-    ));
+    match &entry.updated_at_raw {
+        Some(raw) => lines.push(format!("{ATTR_PREFIX}{ATTR_UPDATED_AT}: {raw}")),
+        None => lines.push(format!(
+            "{ATTR_PREFIX}{ATTR_UPDATED_AT}: {}",
+            entry
+                .fact
+                .updated_at
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        )),
+    }
     for (key, value) in &entry.extra {
         lines.push(format!("{ATTR_PREFIX}{key}: {value}"));
+    }
+    for line in &entry.stray {
+        lines.push(line.clone());
     }
     if !entry.fact.content.is_empty() {
         lines.push(String::new());
@@ -525,6 +652,11 @@ fn one_line(value: &str) -> String {
 }
 
 /// Parses a tag attribute: JSON array first, comma-separated fallback.
+///
+/// A hand-written list may keep the brackets of a JSON array without its quotes
+/// (`[one, two]`). One surrounding pair of brackets is stripped before the comma split, so
+/// the brackets never become part of a tag; the fallback is reported because the document
+/// is rewritten in the JSON form on the next render.
 fn parse_tags(value: &str) -> Vec<String> {
     if let Ok(tags) = serde_json::from_str::<Vec<String>>(value) {
         return tags
@@ -533,7 +665,20 @@ fn parse_tags(value: &str) -> Vec<String> {
             .filter(|tag| !tag.is_empty())
             .collect();
     }
-    value
+    let trimmed = value.trim();
+    let inner = match trimmed.strip_prefix('[') {
+        Some(rest) => rest.strip_suffix(']').unwrap_or(rest),
+        None => trimmed,
+    };
+    if inner != trimmed {
+        tracing::warn!(
+            target: TARGET,
+            value = %value,
+            "a `tags` attribute is not a JSON array; reading the bracketed value as a \
+             comma-separated list"
+        );
+    }
+    inner
         .split(',')
         .map(str::trim)
         .filter(|tag| !tag.is_empty())
@@ -541,18 +686,26 @@ fn parse_tags(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Escapes a body line that would otherwise parse as a heading.
+/// Escapes a body line so the parse cannot mistake it for a heading or an escape.
+///
+/// A line that starts a heading, a `###` entry, or a backslash is prefixed with one
+/// backslash; [`unescape_body_line`] removes exactly that prefix, so the two are inverses
+/// for every input (including text the user already escaped by hand).
 fn escape_body_line(line: &str) -> String {
-    if is_section_boundary(line) || line.starts_with("### ") || line == "###" {
+    if is_section_boundary(line)
+        || line.starts_with("### ")
+        || line == "###"
+        || line.starts_with('\\')
+    {
         return format!("\\{line}");
     }
     line.to_owned()
 }
 
-/// Reverses [`escape_body_line`].
+/// Reverses [`escape_body_line`] by dropping exactly one leading backslash.
 fn unescape_body_line(line: &str) -> String {
-    match line.strip_prefix("\\#") {
-        Some(rest) => format!("#{rest}"),
+    match line.strip_prefix('\\') {
+        Some(rest) => rest.to_owned(),
         None => line.to_owned(),
     }
 }
