@@ -12,7 +12,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 - `src/lib.rs` — marker module (`crate_name()`); the crate has no runtime API.
 - `tests/support/mod.rs` — the cross-scenario helper contract: `BOUND` (10 s per-await deadline), `within(what, future)`, `collect_bounded(stream, max)`. Scenario-specific fixtures stay in `openjiuwen-test-support` or beside the scenario.
 - Test binaries (each `tests/*.rs` is its own binary; no `[[test]]` entries), 26 of them:
-  `kernel_flow`, `workflow_components`, `context_engine`, `context_tokenizers`, `retrieval_pipeline`, `memory_recall`, `memory_dreaming`, `team_memory`, `deep_agent`, `harness_cli_tools`, `watcher_reload`, `persistent_agent_journal`, `provider_native`, `team_flow`, `team_backend`, `runner_subprocess`, `runner_hosting`, `federation_transports`, `a2a_roundtrip`, `symphony_plan`, `symphony_artifacts`, `self_improvement`, `evaluation_ledger`, `plugin_observability`, `cli_binary`.
+  `kernel_flow`, `workflow_components`, `context_engine`, `context_tokenizers`, `retrieval_pipeline`, `memory_recall`, `memory_dreaming`, `team_memory`, `deep_agent`, `harness_cli_tools`, `watcher_reload`, `persistent_agent_journal`, `provider_native`, `team_flow`, `team_backend`, `runner_subprocess`, `runner_hosting`, `federation_transports`, `a2a_roundtrip`, `symphony_plan`, `symphony_artifacts`, `self_improvement`, `evaluation_ledger`, `agent_usage_events`, `plugin_observability`, `cli_binary`.
 - Features: `default = []`;
   `a2a` (enables `openjiuwen/a2a` + `openjiuwen-extensions/a2a`, gates `a2a_roundtrip.rs`);
   `otel` (enables `openjiuwen/otel` + `openjiuwen-extensions/otel` + `openjiuwen-agent-teams/otlp`, gates `plugin_observability.rs`);
@@ -25,7 +25,8 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 
 ## Scenario Matrix
 
-125 test functions across 26 scenario binaries: 124 pass with `--features sqlite,a2a,otel` (114 with default features), and exactly 1 documented `#[ignore]`.
+125 test functions across 26 scenario binaries: 125 are collected with `--features sqlite,a2a,otel` (124 pass plus the one documented `#[ignore]`), and 115 with default features (114 pass plus the ignored one), because the `a2a` binary (4), the `otel` binary (4) and two `sqlite`-gated tests are compiled out.
+All four `plugin_observability.rs` scenarios use `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` (the span flush blocks its calling thread), so a plain `#[tokio::test]` grep or count misses them entirely.
 Counts per binary are the compiled functions; the `sqlite`/`a2a`/`otel` markers name the gate on the extra ones.
 
 | Binary | Scenarios and pinned facts | Crates / seams exercised |
