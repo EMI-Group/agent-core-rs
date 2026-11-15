@@ -58,10 +58,10 @@ pub mod initial_input;
 pub mod leader;
 /// Process-wide and local runtime management.
 pub mod manager;
-/// Team-memory resolution and the lifecycle hooks the runtime drives.
-pub(crate) mod memory_bind;
 /// Role capabilities: which roles own a local harness and which cannot be spawned.
 pub(crate) mod member_roles;
+/// Team-memory resolution and the lifecycle hooks the runtime drives.
+pub(crate) mod memory_bind;
 /// Observability hooks and the optional monitor sink, fanned out from one place.
 pub mod observability_bind;
 /// The member observer that drives status, rounds, chunks and signals.

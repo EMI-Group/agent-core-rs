@@ -2,7 +2,7 @@ use super::test_support::{blueprint, built, deps, ScriptedFactory};
 use super::{ensure_leader_role, SpecBuild, TeamAgentSpec};
 use crate::interaction::{ExternalTeamEvent, HumanAgentMessage, InteractPayload, OperatorMessage};
 use crate::member::MemberLifetime;
-use crate::schema::{MemberStatus, TaskGraphSpec, TeamRole};
+use crate::schema::{MemberSpecBase, MemberStatus, PredefinedMemberSpec, TaskGraphSpec, TeamRole};
 use openjiuwen_common::error::ErrorKind;
 use openjiuwen_harness_protocol::HarnessState;
 use serde_json::Value;
@@ -10,6 +10,19 @@ use serde_json::Value;
 /// Builds a two-teammate blueprint for the shared tests.
 fn two_teammates() -> TeamAgentSpec {
     blueprint("alpha", "boss", &["dev-1", "dev-2"])
+}
+
+/// A blueprint pairing `dev-1` with a predefined `alice` in `role`'s shape.
+///
+/// `alice` also keeps an agent blueprint, so the human-agent case has a `DeepAgentSpec` to build
+/// its harness from; the predefined entry is what fixes the role.
+fn alice_roster(role: fn(MemberSpecBase) -> PredefinedMemberSpec) -> TeamAgentSpec {
+    let mut spec = blueprint("alpha", "boss", &["dev-1", "alice"]);
+    spec.predefined_members = vec![role(MemberSpecBase {
+        member_name: "alice".to_owned(),
+        ..MemberSpecBase::default()
+    })];
+    spec
 }
 
 #[tokio::test]
@@ -170,6 +183,85 @@ async fn a_failed_spawn_keeps_the_row_unstarted() {
         MemberStatus::Unstarted
     );
     assert!(agent.backend().member("dev-1").unwrap().runtime().is_none());
+}
+
+#[tokio::test]
+async fn spawning_a_passive_human_is_unsupported() {
+    let (agent, factory, workspace) =
+        built(&alice_roster(PredefinedMemberSpec::PassiveHuman)).await;
+
+    let error = agent.spawn_member("alice").await.unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(error.to_string().contains("passive_human"), "{error}");
+    assert!(
+        error.to_string().contains("no local harness"),
+        "the message names the Python rule: {error}"
+    );
+    assert_eq!(
+        agent.backend().member("alice").unwrap().status(),
+        MemberStatus::Unstarted,
+        "the roster row the build materialized stays unstarted"
+    );
+    assert_eq!(
+        workspace.requests().len(),
+        1,
+        "the refusal happens before a workspace is allocated (only the leader's request)"
+    );
+    assert!(
+        factory
+            .calls()
+            .iter()
+            .all(|context| context.member_name != "alice"),
+        "no harness is built for a passive human"
+    );
+}
+
+#[tokio::test]
+async fn spawning_a_human_agent_builds_and_starts_its_harness() {
+    let (agent, factory, _workspace) = built(&alice_roster(PredefinedMemberSpec::HumanAgent)).await;
+
+    agent.spawn_member("alice").await.unwrap();
+
+    let member = agent.backend().member("alice").unwrap();
+    assert_eq!(member.role(), TeamRole::HumanAgent);
+    assert_eq!(member.status(), MemberStatus::Ready);
+    assert!(member.runtime().is_some(), "the avatar owns a runtime");
+    assert!(
+        factory
+            .calls()
+            .iter()
+            .any(|context| context.member_name == "alice"),
+        "the factory built the human agent's harness"
+    );
+}
+
+#[tokio::test]
+async fn auto_start_all_skips_a_member_without_a_local_harness() {
+    let (agent, factory, _workspace) =
+        built(&alice_roster(PredefinedMemberSpec::PassiveHuman)).await;
+
+    agent
+        .auto_start_all()
+        .await
+        .expect("a harness-less member is skipped instead of failing the sweep");
+
+    assert_eq!(
+        agent.backend().member("dev-1").unwrap().status(),
+        MemberStatus::Ready
+    );
+    assert_eq!(
+        agent.backend().member("alice").unwrap().status(),
+        MemberStatus::Unstarted,
+        "a passive human is never started"
+    );
+    assert!(
+        factory
+            .calls()
+            .iter()
+            .all(|context| context.member_name != "alice"),
+        "no harness is built for a passive human"
+    );
 }
 
 #[tokio::test]

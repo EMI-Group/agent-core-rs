@@ -10,6 +10,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tracing::{debug, warn};
 
 use super::super::build::teammate_record;
+use super::super::member_roles;
 use super::super::memory_bind;
 use super::super::observer::MemberStreamObserver;
 use super::{ensure_leader_role, TeamAgent};
@@ -91,8 +92,10 @@ impl TeamAgent {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] for a name on no roster, [`Error::Unsupported`] for a role that cannot
-    /// run in-process, [`Error::Validation`] when the team leader is not running, and the
+    /// [`Error::NotFound`] for a name on no roster, [`Error::Unsupported`] for an unsupported role
+    /// (one with no local harness, e.g. `passive_human`; Python's `TeamRole.PASSIVE_HUMAN` has no
+    /// harness, so no startup, restart or recovery path may spawn a runtime for it),
+    /// [`Error::Validation`] when the team leader is not running, and the
     /// workspace/factory/runtime errors of the spawn itself.
     pub async fn spawn_member(&self, name: &str) -> Result<()> {
         if name == self.leader_member_name() {
@@ -110,11 +113,11 @@ impl TeamAgent {
                 self.team_name()
             )));
         };
-        if member_spec.role_type != TeamRole::Teammate {
-            return Err(Error::unsupported(format!(
-                "member '{name}' has role '{}'; only teammate members can be spawned in-process",
-                member_spec.role_type.as_str()
-            )));
+        if !member_roles::has_local_harness(member_spec.role_type) {
+            return Err(member_roles::in_process_refusal(
+                name,
+                member_spec.role_type,
+            ));
         }
         if let Some(existing) = self.inner.backend.member(name) {
             if matches!(
@@ -303,7 +306,11 @@ impl TeamAgent {
         Ok(status)
     }
 
-    /// Spawns every `unstarted` non-leader member, returning the first error after the loop.
+    /// Spawns every spawnable `unstarted` non-leader member, returning the first error after the
+    /// loop.
+    ///
+    /// The leader is never started here, and a member without a local harness (e.g. a passive
+    /// human, which Python gives no harness at all) is skipped instead of failing the sweep.
     ///
     /// # Errors
     ///
@@ -311,7 +318,10 @@ impl TeamAgent {
     pub async fn auto_start_all(&self) -> Result<()> {
         let mut first_error = None;
         for member in self.inner.backend.members() {
-            if member.role() == TeamRole::Leader || member.status() != MemberStatus::Unstarted {
+            if member.role() == TeamRole::Leader
+                || member.status() != MemberStatus::Unstarted
+                || !member_roles::has_local_harness(member.role())
+            {
                 continue;
             }
             if let Err(error) = self.spawn_member(member.member_name()).await {
