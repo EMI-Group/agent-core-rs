@@ -16,9 +16,9 @@
 //! claimed, not the assignee, not under review) is a successful answer carrying `ok = false` and the
 //! board's stable reason, exactly like [`crate::skill`]'s client.
 //!
-//! The entry points carry `#[allow(dead_code)]` because their callers live in sibling leaves that
-//! land separately: `TeamAgent::deliver` (a relayed passive-human tool call) and the attach
-//! handler's `invoke_tool` op.
+//! Two callers use it: [`TeamAgent::deliver`](crate::runtime::team_agent::TeamAgent::deliver) for a
+//! relayed passive-human tool call and the attach handler's `InvokeTool` op, both of which pass the
+//! acting member name in.
 
 use serde_json::{json, Value};
 
@@ -29,7 +29,6 @@ use crate::schema::{TaskFilter, TaskStatus, TaskSummary, Verdict};
 use super::backend::TeamBackend;
 
 /// Member-facing team tool names this dispatcher serves.
-#[allow(dead_code)] // read through `is_supported_tool`; the callers land in sibling leaves
 pub(crate) const TEAM_TOOL_NAMES: [&str; 4] =
     ["view_task", "claim_task", "verify_task", "send_message"];
 
@@ -38,7 +37,6 @@ const DEFAULT_VIEW_ACTION: &str = "list";
 
 /// Returns whether `name` is one of the team tools this dispatcher serves.
 #[must_use]
-#[allow(dead_code)] // the callers land in sibling leaves
 pub(crate) fn is_supported_tool(name: &str) -> bool {
     TEAM_TOOL_NAMES.contains(&name)
 }
@@ -55,7 +53,6 @@ pub(crate) fn is_supported_tool(name: &str) -> bool {
 /// * [`Error::Validation`] for a malformed argument (missing key, unknown action/status/verdict, a
 ///   task detail that cannot be serialized).
 /// * Whatever the board, the store or the transport fails with while applying the tool.
-#[allow(dead_code)] // the callers land in sibling leaves
 pub(crate) async fn dispatch_tool(
     backend: &TeamBackend,
     member: &str,
@@ -76,7 +73,6 @@ pub(crate) async fn dispatch_tool(
 /// A JSON string is passed through verbatim (the answer is already text); every other value is
 /// rendered as compact JSON, the same shape the harness shows a model.
 #[must_use]
-#[allow(dead_code)] // the callers land in sibling leaves
 pub(crate) fn render_tool_output(value: &Value) -> Value {
     match value {
         Value::String(text) => Value::String(text.clone()),
@@ -317,6 +313,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one test drives every `view_task` action in order
     async fn view_task_lists_filters_and_projects_rows() {
         let (_agent, backend) = fixture().await;
         create_task(&backend, "t-1", &[]).await;
