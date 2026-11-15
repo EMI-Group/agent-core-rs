@@ -5,8 +5,8 @@ Twenty-six runnable programs that tour the Rust SDK. They mirror the Python refe
 stores are not ported), and every one of them runs **offline** out of the box.
 
 ```bash
-# list them
-cargo metadata --no-deps --format-version 1 -p openjiuwen-examples | grep example
+# list them (one file per `[[example]]` target)
+ls crates/openjiuwen-examples/examples/*.rs
 
 # run one
 cargo run -p openjiuwen-examples --example 01_hello_agent
@@ -21,7 +21,7 @@ cargo run -p openjiuwen-examples --example 11_a2a_server_client --features a2a
 | --- | --- | --- | --- |
 | `01_hello_agent.rs` | build a model + `ReActAgent`, one `invoke`, print the answer | `examples/react_agent/build_react_agent.ipynb` (no plain hello-world script exists) | `ScriptedModel` |
 | `02_react_with_tools.rs` | two function tools (`#[tool]` macro + `FunctionTool`), one tool round | `examples/rl_calculator/tools.py` | scripted tool call |
-| `03_sessions_and_resume.rs` | `AgentSession` + checkpointer, interrupt and resume | `examples/client_tool/client_tool_demo.py` | in-memory |
+| `03_sessions_and_resume.rs` | `AgentSession` + checkpointer, interrupt and resume | `examples/client_tool/client_tool_demo.py` | temp file (`FileCheckpointer`) |
 | `04_workflow_pipeline.rs` | workflow with a conditional edge and `${node.field}` references | `examples/intelli_router/intelliRouter_demo.py` | in-process |
 | `05_context_and_memory.rs` | context windowing/compression, long-term memory write + recall | `examples/context_evolver/quickstart.py`, `examples/graph_memory/showcase_graph_memory.py` | in-memory |
 | `06_retrieval.rs` | chunk → embed → store → search | `examples/retrieval/showcase_text_embedding.py` | `HashEmbedding` |
@@ -52,16 +52,16 @@ Nothing here needs a network. Examples that talk to a model use
 `openjiuwen-test-support`:
 
 - `ScriptedModel` — an in-process `Model` with an ordered response script (the default for
-  01–03, 08, 12, 13, 22, 25).
+  01–03, 07, 08, 13, 22, 25).
 - `MockLlmServer` — a real loopback OpenAI-compatible HTTP server, used where the wire path
   matters (09, 10: the harness provider and the team runtime build their own clients from a
   base URL).
 
 Examples with no model seam use in-memory or generated data instead: `HashEmbedding` and
-`Bm25Index` (06, 15), `ScriptedPromptRunner` + `DeterministicEvaluator` (20), generated
-tokenizer artefacts (21), a temp SQLite dream queue (23), pipes and an in-process handler
-(24), a file journal (25), and in-memory stores, temp files, a Unix socket, or a temp
-SQLite database (14, 16–19, 26).
+`Bm25Index` (06, 15), a scripted harness runner and fake target (12), `ScriptedPromptRunner`
++ `DeterministicEvaluator` (20), generated tokenizer artefacts (21), a temp SQLite dream
+queue (23), pipes and an in-process handler (24), a file journal (25), and in-memory
+stores, temp files, a Unix socket, or a temp SQLite database (14, 16–19, 26).
 
 To run an example against a real provider instead, set the live switch and credentials:
 
@@ -102,13 +102,14 @@ lines.
 cargo test -p openjiuwen-examples --offline
 ```
 
-runs the support-library unit tests (run-mode detection, subscriber installation, banner
-formatting) and the offline smoke suite in `tests/examples_offline.rs`, which executes
-every example binary the test profile builds in a clean environment — live variables
-removed, a temp working directory, a per-example timeout, and captured output — and asserts
-exit code 0 with non-empty stdout. `11_a2a_server_client` joins that run only under
-`cargo test -p openjiuwen-examples --features a2a`; with the feature off its example target
-is not built.
+runs the support-library unit tests (15 of them: run-mode detection, subscriber
+installation, banner formatting) and the offline smoke suite in
+`tests/examples_offline.rs`, whose single test executes every example binary the test
+profile builds in a clean environment — live variables removed, a temp working directory,
+a per-example timeout, and captured output — and asserts exit code 0 with non-empty stdout.
+That is 25 examples with default features, and 26 under `--features a2a`:
+`11_a2a_server_client` joins the run only then, because with the feature off its example
+target is not built.
 
 The three SQLite-backed examples (`16` memory FTS index, `17` team store, `23` dream queue)
 need no setup: the backend is compiled in through the crate's dev-dependencies, so the
