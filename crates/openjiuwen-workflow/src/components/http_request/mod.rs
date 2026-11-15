@@ -6,6 +6,11 @@
 //! [`openjiuwen_common::http::HttpClient`], and projects the response into Python's
 //! `statusCode` / `headers` / `body` / `url` / `ok` wire object.
 //!
+//! The implementation is split by responsibility: [`config`] holds the configuration tree,
+//! [`template`] the `{{key}}`/`${path}` templating, [`body`] and [`multipart`] the request
+//! bodies, [`auth`] with [`digest`] and [`sigv4`] the authentication schemes, [`response`]
+//! the response projection, and [`rate_limit`] the sliding-window limiter.
+//!
 //! # Behaviour
 //!
 //! - **Inputs** are merged with the configuration the way Python's `process_inputs`
@@ -23,9 +28,32 @@
 //!   through untouched, exactly like Python.
 //! - **Retries** live in [`HttpClientConfig`]: `retry_config.enabled` maps to
 //!   `max_retries` / `retry_statuses` / `retry_initial_backoff`, plus a backoff cap.
-//! - **HTTP failures are data**: a 4xx/5xx response is returned as an ordinary output
-//!   with `ok = false`. Only transport, timeout, cancellation, size, and client-build
-//!   failures become [`component_tool_execution_error`] (`[102000]`).
+//! - **HTTP failures** are returned as data (`ok = false`) when
+//!   `response_handling.throw_on_http_error` is `false`, and as a coded
+//!   [`COMPONENT_HTTP_ERROR`] (`[102002]`) error otherwise. `ok` and the status code are
+//!   part of that error's message. Transport, timeout, cancellation, size, and
+//!   client-build failures are always [`component_tool_execution_error`] (`[102000]`).
+//! - **Bodies**: a body whose encoded size exceeds `advanced_options.max_body_length`
+//!   (default 1 MiB, `0` = unlimited) is rejected with a typed input-parameter error
+//!   naming both sizes. The limit covers JSON, text, form, binary and multipart bodies.
+//! - **Multipart**: `content_type = multipart_form` encodes the form (boundary, parts,
+//!   CRLF framing) into bytes and sends it as a binary body, so retries, cancellation and
+//!   the response cap keep applying. A `{"filename": …, "content_base64": …}` value is a
+//!   file part (`data`/`content` are accepted aliases); other objects are JSON text.
+//! - **Digest authentication** is challenge-driven: the request is sent unauthenticated,
+//!   and a `401` carrying `WWW-Authenticate: Digest …` is answered by replaying the
+//!   identical request once with an `Authorization: Digest …` header (MD5, MD5-sess,
+//!   SHA-256, SHA-256-sess; `qop=auth` when offered, otherwise the legacy form). A missing
+//!   `username`/`password` pair is a typed input-parameter error.
+//! - **AWS `SigV4` authentication** signs in pre-flight, after the body bytes are known:
+//!   credentials come from `authentication.username`/`password` or
+//!   `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, the region from `AWS_REGION`/
+//!   `AWS_DEFAULT_REGION` (default `us-east-1`), and the service from `AWS_SERVICE`
+//!   (default `execute-api`). `X-Amz-Date`, `X-Amz-Content-Sha256`, the session token of
+//!   `AWS_SESSION_TOKEN`, and every sent header are signed.
+//! - **Rate limiting**: `rate_limit_config.enabled` installs one sliding-window limiter per
+//!   component instance (no process-global state); the delay it requires is awaited
+//!   before each send, honouring the run's cancellation token.
 //!
 //! # Deviations from Python
 //!
@@ -45,25 +73,23 @@
 //!   `fixed` caps the backoff at `retry_delay` (constant delay) and `linear` is
 //!   approximated by `fixed`; `exponential` caps at `retry_delay * 2^max_retries`.
 //!   Transport errors are retried too while enabled — Python does the same.
-//! - **Multipart bodies** are not supported: the shared transport has no multipart
-//!   request body, so `content_type = multipart_form` returns [`Error::Unsupported`].
 //! - **Binary responses** are base64-encoded (`BASE64_STANDARD`) because JSON has no
-//!   bytes type; Python returns `bytes`. `binary_data` requests are base64-decoded.
+//!   bytes type; Python returns `bytes`. `response_format = buffer` projects the bytes as
+//!   `{"type": "Buffer", "data": [..u8..], "length": n}` instead (lossless, Node-style).
+//!   `binary_data` requests are base64-decoded.
 //! - **JSON string bodies** are parsed with `serde_json` instead of Python's
 //!   `ast.literal_eval`, so single-quoted Python dict literals are rejected; a parse
 //!   failure sends the resolved text as a text body (Python substitutes `{}`).
 //! - **Bodies** are sent for every method (Python sends them only for POST/PUT/PATCH),
 //!   and a body `content-type` is only added when the header is still absent (Python
 //!   overwrites `Content-Type`).
-//! - **Digest / AWS authentication** are unimplemented ([`Error::Unsupported`]); Python
-//!   never implemented them either. An API-key `in_location = body` is ignored, as in
-//!   Python.
-//! - `throw_on_http_error` is parsed but never applied (Python never raises there
-//!   either), `rate_limit_config` is parsed and preserved but not enforced, and
-//!   `advanced_options.use_stream` is accepted but ignored (responses are buffered).
-//! - `advanced_options.max_body_length` is accepted but not enforced; the enforced cap is
-//!   `max_response_byte_size` (both Python fields are independent, and only the latter is
-//!   used by Python's request loop).
+//! - **Digest / AWS authentication** are implemented here while Python only declares the
+//!   configuration (`# Note: Digest and AWS authentication would require additional
+//!   implementation`). A digest challenge the component cannot answer (another scheme,
+//!   an unsupported algorithm, or a replay that is still `401`) is returned as ordinary
+//!   response data. An API-key `in_location = body` is ignored, as in Python.
+//! - `advanced_options.use_stream` is accepted but ignored (responses are buffered), as
+//!   is `advanced_options.disable_compression` (it is not part of the Rust config).
 //! - Python's `response_handling.max_redirects` is not modelled; redirect handling
 //!   follows `advanced_options.follow_redirect`.
 //! - `timeout` is clamped into `1.0..=300.0` seconds at use time (Python validates the
@@ -73,12 +99,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine as _;
-use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use openjiuwen_common::error::{Error, Result};
@@ -88,9 +111,16 @@ use crate::ability::ComponentAbility;
 use crate::component::{Component, ComponentCard};
 use crate::context::ComponentContext;
 use crate::error::{component_tool_execution_error, component_tool_input_param_error};
-use crate::reference;
 
+mod auth;
+mod body;
 mod config;
+mod digest;
+mod multipart;
+mod rate_limit;
+mod response;
+mod sigv4;
+mod template;
 
 pub use config::{
     HttpAdvancedOptionsConfig, HttpAuthConfig, HttpAuthIn, HttpAuthType, HttpBackoffType,
@@ -99,14 +129,21 @@ pub use config::{
     HttpResponseHandlingConfig, HttpResponseMode, HttpRetryConfig,
 };
 
-/// The `Content-Type` used for JSON request bodies.
-const APPLICATION_JSON: &str = "application/json";
-/// The `Content-Type` used for text request bodies.
-const TEXT_PLAIN: &str = "text/plain";
-/// The `Content-Type` used for form request bodies.
-const FORM_URLENCODED: &str = "application/x-www-form-urlencoded";
-/// The `Content-Type` used for binary request bodies.
-const APPLICATION_OCTET_STREAM: &str = "application/octet-stream";
+pub(crate) use template::{resolve_template, stringify};
+
+use body::RequestBody;
+use rate_limit::RateLimiter;
+use response::handle_response;
+
+/// The component-local status code of a response that `throw_on_http_error` turns into an
+/// error (`102002`).
+///
+/// The numeric slot is shared with Python's `COMPONENT_TOOL_INIT_FAILED`: the Python
+/// component never raises on an HTTP status, so no status code was ever allocated for it.
+/// Keeping the constant here (instead of in [`crate::error`]) documents that the meaning is
+/// local to this component.
+pub const COMPONENT_HTTP_ERROR: u32 = 102_002;
+
 /// The timeout applied when the configured value is not a finite number.
 const DEFAULT_TIMEOUT_SECONDS: f64 = 60.0;
 /// The Python range for `request_params.timeout`, in seconds.
@@ -117,23 +154,89 @@ const MAX_TIMEOUT_SECONDS: f64 = 300.0;
 /// The built-in `http_request` component.
 ///
 /// `invoke` resolves the request from the component inputs and executes it; failures are
-/// reported as `[102000]`/`[102001]` errors and non-2xx responses are ordinary outputs.
+/// reported as `[102000]`/`[102001]`/`[102002]` errors and non-2xx responses are ordinary
+/// outputs unless `response_handling.throw_on_http_error` says otherwise.
 #[derive(Debug, Clone)]
 pub struct HttpRequestComponent {
     config: HttpComponentConfig,
+    /// The sliding-window limiter, shared by every clone of this component.
+    limiter: Option<Arc<RateLimiter>>,
 }
 
 impl HttpRequestComponent {
     /// Creates a component from `config`.
     #[must_use]
     pub fn new(config: HttpComponentConfig) -> Self {
-        Self { config }
+        let limiter = RateLimiter::new(&config.request_params.rate_limit_config);
+        Self { config, limiter }
     }
 
     /// The component configuration (Python's `config` property).
     #[must_use]
     pub fn config(&self) -> &HttpComponentConfig {
         &self.config
+    }
+
+    /// Sends one request, waiting for the rate limiter and honouring cancellation.
+    async fn send(
+        &self,
+        client: &HttpClient,
+        request: HttpRequest,
+        ctx: &ComponentContext,
+    ) -> Result<HttpResponse> {
+        if let Some(limiter) = &self.limiter {
+            limiter.acquire(ctx.cancellation()).await?;
+        }
+        client
+            .execute_cancellable(request, ctx.cancellation().clone())
+            .await
+            .map_err(|error| request_failed(&error.message()))
+    }
+
+    /// Replays `request` once with a digest `Authorization` header when `response` is a
+    /// `401` challenge this component can answer.
+    async fn replay_digest(
+        &self,
+        params: &HttpRequestParamConfig,
+        prepared: &PreparedRequest,
+        response: HttpResponse,
+        client: &HttpClient,
+        ctx: &ComponentContext,
+    ) -> Result<HttpResponse> {
+        if response.status != 401 {
+            return Ok(response);
+        }
+        let Some(auth) = params
+            .authentication
+            .as_ref()
+            .filter(|auth| auth.auth_type == HttpAuthType::Digest)
+        else {
+            return Ok(response);
+        };
+        let Some(header) = response
+            .headers
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok())
+        else {
+            return Ok(response);
+        };
+        let Some(challenge) = digest::DigestChallenge::parse(header) else {
+            // Another scheme or an unsupported algorithm: the 401 stays ordinary data.
+            return Ok(response);
+        };
+        let (username, password) = auth::digest_credentials(auth)?;
+        let authorization = digest::authorization(
+            &challenge,
+            username,
+            password,
+            prepared.request.method().as_str(),
+            &prepared.digest_uri,
+        );
+        let replay = prepared
+            .request
+            .clone()
+            .header("Authorization", authorization);
+        self.send(client, replay, ctx).await
     }
 }
 
@@ -154,14 +257,14 @@ impl Component for HttpRequestComponent {
 
     async fn invoke(&self, inputs: Value, ctx: &ComponentContext) -> Result<Value> {
         let params = &self.config.request_params;
-        let request = build_request(params, &inputs, ctx.cancellation().clone())?;
+        let prepared = build_request(params, &inputs, ctx.cancellation().clone())?;
         let client = HttpClient::new(client_config(params))
             .map_err(|error| request_failed(&error.message()))?;
-        let response = client
-            .execute_cancellable(request, ctx.cancellation().clone())
-            .await
-            .map_err(|error| request_failed(&error.message()))?;
-        Ok(handle_response(params, &response))
+        let response = self.send(&client, prepared.request.clone(), ctx).await?;
+        let response = self
+            .replay_digest(params, &prepared, response, &client, ctx)
+            .await?;
+        handle_response(params, &response)
     }
 
     fn stream(
@@ -190,73 +293,13 @@ fn request_failed(message: &str) -> Error {
     component_tool_execution_error(&format!("HTTP request failed: {message}"))
 }
 
-/// The body kinds the shared transport can send.
+/// A built request plus the request-target a digest challenge must echo.
 #[derive(Debug)]
-enum RequestBody {
-    /// A JSON value, serialized by the transport.
-    Json(Value),
-    /// A pre-rendered text body.
-    Text(String),
-    /// Raw request bytes.
-    Bytes(Bytes),
-}
-
-/// Which body field an `auto` content type selected.
-enum BodyField {
-    /// `json_data`.
-    Json,
-    /// `text_data`.
-    Text,
-    /// `form_data`.
-    Form,
-}
-
-/// Resolves `${path}` references embedded in `template`; unresolvable ones stay literal.
-fn resolve_embedded_refs(template: &str, inputs: &Value) -> String {
-    let mut rendered = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(start) = rest.find("${") {
-        let (before, candidate) = rest.split_at(start);
-        rendered.push_str(before);
-        let Some(end) = candidate.find('}') else {
-            rendered.push_str(candidate);
-            return rendered;
-        };
-        let path = &candidate[2..end];
-        match reference::resolve_path(inputs, path) {
-            Some(value) if !path.is_empty() => rendered.push_str(&stringify(&value)),
-            _ => rendered.push_str(&candidate[..=end]),
-        }
-        rest = &candidate[end + 1..];
-    }
-    rendered.push_str(rest);
-    rendered
-}
-
-/// Replaces `{{key}}` placeholders with the top-level input values (Python parity).
-fn resolve_placeholders(template: &str, inputs: &Value) -> String {
-    let Value::Object(map) = inputs else {
-        return template.to_owned();
-    };
-    let mut rendered = template.to_owned();
-    for (key, value) in map {
-        rendered = rendered.replace(&format!("{{{{{key}}}}}"), &stringify(value));
-    }
-    rendered
-}
-
-/// Resolves `${path}` references first, then `{{key}}` placeholders.
-fn resolve_template(template: &str, inputs: &Value) -> String {
-    resolve_placeholders(&resolve_embedded_refs(template, inputs), inputs)
-}
-
-/// Renders a value as text: strings verbatim, everything else compact JSON.
-fn stringify(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        // Serializing a `Value` cannot fail; the fallback keeps the path panic-free.
-        other => serde_json::to_string(other).unwrap_or_default(),
-    }
+struct PreparedRequest {
+    /// The request to send.
+    request: HttpRequest,
+    /// The `uri` parameter of a digest `Authorization` header.
+    digest_uri: String,
 }
 
 /// The timeout applied to the request and the client, clamped into Python's range.
@@ -307,12 +350,13 @@ fn client_config(params: &HttpRequestParamConfig) -> HttpClientConfig {
         ..base
     }
 }
+
 /// Builds the request, merging the component inputs with the configuration.
 fn build_request(
     params: &HttpRequestParamConfig,
     inputs: &Value,
     cancellation: CancellationToken,
-) -> Result<HttpRequest> {
+) -> Result<PreparedRequest> {
     let url = resolve_template(&params.url, inputs);
     if url.trim().is_empty() {
         return Err(component_tool_input_param_error("url is required"));
@@ -326,27 +370,69 @@ fn build_request(
     let mut headers = params.headers.resolved(inputs);
     merge_input_headers(&mut headers, inputs)?;
     let mut query = resolved_query_parameters(params, inputs)?;
-    apply_authentication(params.authentication.as_ref(), &mut headers, &mut query)?;
 
-    let (body, content_type) = prepare_body(params, inputs)?;
+    let (body, content_type) = body::prepare_body(params, inputs)?;
+    body::enforce_max_body_length(params.advanced_options.max_body_length, body.as_ref())?;
     if let Some(content_type) = content_type {
-        set_header_if_absent(&mut headers, "content-type", content_type);
+        set_header_if_absent(&mut headers, "content-type", &content_type);
     }
 
+    auth::apply_authentication(params.authentication.as_ref(), &mut headers, &mut query)?;
+    if auth::is_aws(params.authentication.as_ref()) {
+        let payload = body
+            .as_ref()
+            .map_or_else(|| Ok(bytes::Bytes::new()), RequestBody::payload)?;
+        auth::sign_aws(
+            params.authentication.as_ref(),
+            &method_text,
+            &url,
+            &query,
+            &mut headers,
+            &payload,
+        )?;
+    }
+
+    let digest_uri = digest_uri(&url, &query);
     let request = HttpRequest::new(method, url)
         .with_headers(headers)
         .queries(query)
         .timeout(request_timeout(params))
         .cancel(cancellation);
 
-    match body {
+    let request = match body {
         Some(RequestBody::Json(value)) => request.json(&value).map_err(|error| {
             component_tool_input_param_error(&format!("request body is invalid, {error}"))
-        }),
-        Some(RequestBody::Text(text)) => Ok(request.text(text)),
-        Some(RequestBody::Bytes(bytes)) => Ok(request.bytes(bytes)),
-        None => Ok(request),
+        })?,
+        Some(RequestBody::Text(text)) => request.text(text),
+        Some(RequestBody::Bytes(bytes)) => request.bytes(bytes),
+        None => request,
+    };
+    Ok(PreparedRequest {
+        request,
+        digest_uri,
+    })
+}
+
+/// The request-target a digest `Authorization` header echoes: path plus query parameters.
+fn digest_uri(url: &str, query: &[(String, String)]) -> String {
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    let after_scheme = without_fragment
+        .split_once("://")
+        .map_or(without_fragment, |(_, rest)| rest);
+    let mut uri = after_scheme
+        .find('/')
+        .map_or_else(|| "/".to_owned(), |index| after_scheme[index..].to_owned());
+    for (index, (key, value)) in query.iter().enumerate() {
+        uri.push(if index == 0 && !uri.contains('?') {
+            '?'
+        } else {
+            '&'
+        });
+        uri.push_str(&sigv4::rfc3986_encode(key));
+        uri.push('=');
+        uri.push_str(&sigv4::rfc3986_encode(value));
     }
+    uri
 }
 
 /// The request method: `inputs["method"]` wins, is templated, and is upper-cased.
@@ -424,304 +510,39 @@ fn set_header_if_absent(headers: &mut BTreeMap<String, String>, name: &str, valu
     }
 }
 
-/// Applies the authentication configuration to the headers and query parameters.
-fn apply_authentication(
-    authentication: Option<&HttpAuthConfig>,
-    headers: &mut BTreeMap<String, String>,
-    query: &mut Vec<(String, String)>,
-) -> Result<()> {
-    let Some(auth) = authentication else {
-        return Ok(());
-    };
-    match auth.auth_type {
-        HttpAuthType::None => {}
-        HttpAuthType::Basic => {
-            // Python only applies basic auth when both values are truthy.
-            if let (Some(username), Some(password)) = (
-                auth.username.as_deref().filter(|value| !value.is_empty()),
-                auth.password.as_deref().filter(|value| !value.is_empty()),
-            ) {
-                let encoded = BASE64_STANDARD.encode(format!("{username}:{password}"));
-                let _ = headers.insert("Authorization".to_owned(), format!("Basic {encoded}"));
-            }
-        }
-        HttpAuthType::Bearer => {
-            if let Some(token) = auth.token.as_deref().filter(|value| !value.is_empty()) {
-                let _ = headers.insert("Authorization".to_owned(), format!("Bearer {token}"));
-            }
-        }
-        HttpAuthType::ApiKey => {
-            if let Some(api_key) = auth.api_key.as_deref().filter(|value| !value.is_empty()) {
-                match auth.in_location {
-                    HttpAuthIn::Header => {
-                        let _ = headers.insert(auth.name.clone(), api_key.to_owned());
-                    }
-                    HttpAuthIn::Query => query.push((auth.name.clone(), api_key.to_owned())),
-                    // Python ignores the body location as well.
-                    HttpAuthIn::Body => {}
-                }
-            }
-        }
-        HttpAuthType::Digest => {
-            return Err(Error::unsupported(
-                "digest HTTP authentication is not supported by the shared HTTP transport",
-            ));
-        }
-        HttpAuthType::Aws => {
-            return Err(Error::unsupported(
-                "aws HTTP authentication is not supported by the shared HTTP transport",
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Selects the body fields an `auto` content type may use.
-fn auto_body_field(body: &HttpRequestBodyConfig) -> Option<BodyField> {
-    if body.json_data.is_some() {
-        Some(BodyField::Json)
-    } else if body.text_data.is_some() {
-        Some(BodyField::Text)
-    } else if body.form_data.is_some() {
-        Some(BodyField::Form)
-    } else {
-        None
-    }
-}
-
-/// Builds the request body and the `Content-Type` it implies.
-fn prepare_body(
-    params: &HttpRequestParamConfig,
-    inputs: &Value,
-) -> Result<(Option<RequestBody>, Option<&'static str>)> {
-    let Some(body) = params.body.as_ref() else {
-        // Python sends no body here; sending `inputs["body"]` as JSON is a Rust extension.
-        return Ok(match inputs.get("body") {
-            Some(value) if !value.is_null() => (
-                Some(RequestBody::Json(value.clone())),
-                Some(APPLICATION_JSON),
-            ),
-            _ => (None, None),
-        });
-    };
-
-    let field = match body.content_type {
-        HttpContentType::Auto => auto_body_field(body),
-        HttpContentType::Json => Some(BodyField::Json),
-        HttpContentType::Text => Some(BodyField::Text),
-        HttpContentType::Form => Some(BodyField::Form),
-        HttpContentType::Binary => return decode_binary_body(body, inputs),
-        HttpContentType::MultipartForm => {
-            return Err(Error::unsupported(
-                "multipart/form-data request bodies are not supported by the shared HTTP transport",
-            ));
-        }
-    };
-
-    match field {
-        Some(BodyField::Json) => Ok(json_body(body.json_data.as_ref(), inputs)),
-        Some(BodyField::Text) => Ok(text_body(body.text_data.as_deref(), inputs)),
-        Some(BodyField::Form) => Ok(form_body(body.form_data.as_ref(), inputs)),
-        None => Ok((None, None)),
-    }
-}
-
-/// A JSON body: a string field is templated and parsed, object values are sent as-is.
-fn json_body(data: Option<&Value>, inputs: &Value) -> (Option<RequestBody>, Option<&'static str>) {
-    let Some(data) = data else {
-        return (None, None);
-    };
-    match data {
-        Value::String(template) => {
-            let resolved = resolve_template(template, inputs);
-            let body = serde_json::from_str::<Value>(&resolved)
-                .map_or_else(|_| RequestBody::Text(resolved), RequestBody::Json);
-            (Some(body), Some(APPLICATION_JSON))
-        }
-        other => (
-            Some(RequestBody::Json(other.clone())),
-            Some(APPLICATION_JSON),
-        ),
-    }
-}
-
-/// A text body.
-fn text_body(data: Option<&str>, inputs: &Value) -> (Option<RequestBody>, Option<&'static str>) {
-    data.map_or((None, None), |text| {
-        (
-            Some(RequestBody::Text(resolve_template(text, inputs))),
-            Some(TEXT_PLAIN),
-        )
-    })
-}
-
-/// A URL-encoded form body.
-fn form_body(
-    fields: Option<&BTreeMap<String, Value>>,
-    inputs: &Value,
-) -> (Option<RequestBody>, Option<&'static str>) {
-    fields.map_or((None, None), |fields| {
-        let encoded = fields
-            .iter()
-            .map(|(key, value)| {
-                let rendered = resolve_template(&stringify(value), inputs);
-                format!("{}={}", form_encode(key), form_encode(&rendered))
-            })
-            .collect::<Vec<String>>()
-            .join("&");
-        (Some(RequestBody::Text(encoded)), Some(FORM_URLENCODED))
-    })
-}
-
-/// A base64-decoded binary body.
-fn decode_binary_body(
-    body: &HttpRequestBodyConfig,
-    inputs: &Value,
-) -> Result<(Option<RequestBody>, Option<&'static str>)> {
-    let Some(encoded) = body.binary_data.as_deref() else {
-        return Ok((None, None));
-    };
-    let resolved = resolve_template(encoded, inputs);
-    let decoded = BASE64_STANDARD
-        .decode(resolved.as_bytes())
-        .map_err(|error| {
-            component_tool_input_param_error(&format!("binary_data is not valid base64, {error}"))
-        })?;
-    Ok((
-        Some(RequestBody::Bytes(Bytes::from(decoded))),
-        Some(APPLICATION_OCTET_STREAM),
-    ))
-}
-
-/// Percent-encodes one `application/x-www-form-urlencoded` component.
-fn form_encode(text: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut encoded = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => {
-                encoded.push(char::from(byte));
-            }
-            b' ' => encoded.push('+'),
-            other => {
-                encoded.push('%');
-                encoded.push(char::from(HEX[usize::from(other >> 4)]));
-                encoded.push(char::from(HEX[usize::from(other & 0x0f)]));
-            }
-        }
-    }
-    encoded
-}
-
-/// The response format after `autodetect` has been resolved.
-enum ResolvedFormat {
-    /// Parse the body as JSON.
-    Json,
-    /// Decode the body as text.
-    Text,
-    /// Base64-encode the raw body bytes.
-    Binary,
-}
-
-/// Resolves `autodetect` against the response `content-type`.
-fn resolved_format(format: HttpResponseFormat, content_type: &str) -> ResolvedFormat {
-    match format {
-        HttpResponseFormat::Json => ResolvedFormat::Json,
-        HttpResponseFormat::Text => ResolvedFormat::Text,
-        HttpResponseFormat::Binary | HttpResponseFormat::Buffer => ResolvedFormat::Binary,
-        HttpResponseFormat::Autodetect => {
-            let lowered = content_type.to_lowercase();
-            if lowered.contains("application/json") {
-                ResolvedFormat::Json
-            } else if lowered.contains("text/") {
-                ResolvedFormat::Text
-            } else {
-                ResolvedFormat::Binary
-            }
-        }
-    }
-}
-
-/// Projects an [`HttpResponse`] into Python's wire object.
-fn handle_response(params: &HttpRequestParamConfig, response: &HttpResponse) -> Value {
-    let handling = &params.response_handling;
-    let status = response.status;
-    let headers: BTreeMap<String, String> = response
-        .headers
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_ascii_lowercase(),
-                value.to_str().unwrap_or_default().to_owned(),
-            )
-        })
-        .collect();
-
-    let is_success = handling.response_code_success_codes.contains(&status)
-        || (handling.response_code_failure_codes.is_empty() && (200..300).contains(&status));
-    let is_failure = handling.response_code_failure_codes.contains(&status) || status >= 400;
-    let ok = is_success && !is_failure;
-
-    let content_type = headers.get("content-type").cloned().unwrap_or_default();
-    let text = response.text();
-    let mut body = match resolved_format(handling.response_format, &content_type) {
-        ResolvedFormat::Json => serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
-        ResolvedFormat::Text => Value::String(text),
-        ResolvedFormat::Binary => Value::String(BASE64_STANDARD.encode(response.bytes())),
-    };
-
-    if let Some(property) = handling.response_data_property.as_deref() {
-        if let Value::Object(map) = &body {
-            if let Some(extracted) = map.get(property) {
-                body = extracted.clone();
-            }
-        }
-    }
-
-    match handling.response_mode {
-        HttpResponseMode::OnSuccess if !is_success => json!({}),
-        HttpResponseMode::OnError if is_success => json!({}),
-        _ => json!({
-            "statusCode": status,
-            "headers": headers,
-            "body": body,
-            "url": response.url,
-            "ok": ok,
-        }),
-    }
-}
-
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
     use openjiuwen_session::{Session, WorkflowSession};
     use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    use openjiuwen_common::http::HttpBody;
 
     use super::*;
+    use crate::components::http_request::{
+        HttpAuthConfig, HttpAuthType, HttpContentType, HttpRequestBodyConfig,
+    };
 
     fn context() -> ComponentContext {
         let session: Arc<dyn Session> = Arc::new(WorkflowSession::new("http-tests"));
         ComponentContext::new(session, "http", "wf")
     }
 
-    #[test]
-    fn templating_resolves_braces_and_embedded_references() {
-        let inputs = json!({"url": "https://example.com", "n": 3, "flag": true});
-        assert_eq!(
-            resolve_template("{{url}}/items/{{n}}?f={{flag}}", &inputs),
-            "https://example.com/items/3?f=true"
-        );
-        assert_eq!(
-            resolve_template("{{url}}/${n}/${missing}", &inputs),
-            "https://example.com/3/${missing}"
-        );
-        // Text that looks like a placeholder but has no matching key stays literal.
-        assert_eq!(resolve_template("{{nope}}", &inputs), "{{nope}}");
-        // A scalar input object leaves the template untouched.
-        assert_eq!(resolve_template("{{a}}", &json!("x")), "{{a}}");
+    /// Request params with `body` and `authentication` filled in.
+    fn params(
+        body: Option<HttpRequestBodyConfig>,
+        authentication: Option<HttpAuthConfig>,
+    ) -> HttpRequestParamConfig {
+        HttpRequestParamConfig {
+            url: "https://example.com/x".to_owned(),
+            body,
+            authentication,
+            ..HttpRequestParamConfig::default()
+        }
     }
 
     #[test]
@@ -774,11 +595,6 @@ mod tests {
     }
 
     #[test]
-    fn form_encoding_uses_the_urlencoded_alphabet() {
-        assert_eq!(form_encode("a b&c=d/é"), "a+b%26c%3Dd%2F%C3%A9");
-    }
-
-    #[test]
     fn abilities_and_card_advertise_invoke_only() {
         let component = HttpRequestComponent::new(HttpComponentConfig::default());
         assert_eq!(component.component_type(), "http_request");
@@ -798,16 +614,42 @@ mod tests {
             json!("full")
         );
         assert_eq!(wire["metadata"], Value::Null);
+        assert!(
+            component.limiter.is_none(),
+            "rate limiting is off by default"
+        );
+    }
+
+    #[test]
+    fn a_rate_limited_component_holds_one_shared_limiter() {
+        let config: HttpComponentConfig = serde_json::from_value(json!({
+            "request_params": {
+                "rate_limit_config": {
+                    "enabled": true,
+                    "requests_per_unit": 2,
+                    "unit": "minute"
+                }
+            }
+        }))
+        .unwrap();
+        let component = HttpRequestComponent::new(config);
+        let limiter = component.limiter.clone().expect("the limiter is installed");
+        assert!(Arc::ptr_eq(
+            &limiter,
+            component.limiter.as_ref().expect("still installed")
+        ));
+        // A clone shares the same window.
+        let clone = component.clone();
+        let cloned_limiter = clone.limiter.clone().expect("clones share it");
+        assert!(Arc::ptr_eq(&limiter, &cloned_limiter));
     }
 
     #[tokio::test]
     async fn stream_yields_exactly_one_frame() {
         // An empty URL fails before any network access, so the frame is the single error.
         let component = Arc::new(HttpRequestComponent::new(HttpComponentConfig::default()));
-        let frames: Vec<_> = component
-            .stream(json!({}), Arc::new(context()))
-            .collect()
-            .await;
+        let ctx = Arc::new(context());
+        let frames: Vec<_> = component.stream(json!({}), ctx).collect().await;
         assert_eq!(frames.len(), 1);
         let error = frames.into_iter().next().unwrap().unwrap_err();
         assert!(error.message().contains("[102001]"));
@@ -821,83 +663,176 @@ mod tests {
     }
 
     #[test]
-    fn missing_body_config_uses_the_input_body_as_json() {
-        let params = HttpRequestParamConfig::default();
-        let (body, content_type) = prepare_body(&params, &json!({"body": {"a": 1}})).unwrap();
-        assert_eq!(content_type, Some(APPLICATION_JSON));
-        assert!(matches!(body, Some(RequestBody::Json(Value::Object(_)))));
-        // A null input body sends nothing at all.
-        assert!(prepare_body(&params, &json!({})).unwrap().0.is_none());
-    }
-
-    #[test]
-    fn multipart_bodies_are_unsupported() {
-        let params = HttpRequestParamConfig {
-            body: Some(HttpRequestBodyConfig {
+    fn a_multipart_body_becomes_a_binary_request_with_its_boundary() {
+        let params = params(
+            Some(HttpRequestBodyConfig {
                 content_type: HttpContentType::MultipartForm,
                 multipart_form: Some(BTreeMap::from([("f".to_owned(), json!("v"))])),
                 ..HttpRequestBodyConfig::default()
             }),
+            None,
+        );
+        let prepared = build_request(&params, &json!({}), CancellationToken::new()).unwrap();
+        let content_type = prepared
+            .request
+            .headers()
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert!(
+            content_type.starts_with("multipart/form-data; boundary="),
+            "unexpected content type: {content_type}"
+        );
+        let boundary = content_type
+            .strip_prefix("multipart/form-data; boundary=")
+            .unwrap();
+        assert!(matches!(
+            prepared.request.body(),
+            Some(HttpBody::Bytes(bytes)) if bytes.starts_with(format!("--{boundary}\r\n").as_bytes())
+        ));
+    }
+
+    #[test]
+    fn a_body_over_the_configured_limit_is_rejected() {
+        let params = HttpRequestParamConfig {
+            url: "https://example.com/x".to_owned(),
+            body: Some(HttpRequestBodyConfig {
+                content_type: HttpContentType::Text,
+                text_data: Some("0123456789".to_owned()),
+                ..HttpRequestBodyConfig::default()
+            }),
+            advanced_options: HttpAdvancedOptionsConfig {
+                max_body_length: 4,
+                ..HttpAdvancedOptionsConfig::default()
+            },
             ..HttpRequestParamConfig::default()
         };
-        let error = prepare_body(&params, &json!({})).unwrap_err();
-        assert_eq!(
-            error.kind(),
-            openjiuwen_common::error::ErrorKind::Unsupported
+        let error = build_request(&params, &json!({}), CancellationToken::new()).unwrap_err();
+        assert!(error.message().contains("[102001]"), "{}", error.message());
+        assert!(error.message().contains("10 bytes"));
+        assert!(error.message().contains("max_body_length of 4"));
+    }
+
+    #[test]
+    fn digest_credentials_are_validated_but_not_applied() {
+        let with_credentials = params(
+            None,
+            Some(HttpAuthConfig {
+                auth_type: HttpAuthType::Digest,
+                username: Some("u".to_owned()),
+                password: Some("p".to_owned()),
+                ..HttpAuthConfig::default()
+            }),
+        );
+        let prepared =
+            build_request(&with_credentials, &json!({}), CancellationToken::new()).unwrap();
+        assert!(!prepared
+            .request
+            .headers()
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("authorization")));
+
+        let without_credentials = params(
+            None,
+            Some(HttpAuthConfig {
+                auth_type: HttpAuthType::Digest,
+                ..HttpAuthConfig::default()
+            }),
+        );
+        let error =
+            build_request(&without_credentials, &json!({}), CancellationToken::new()).unwrap_err();
+        assert!(error.message().contains("[102001]"), "{}", error.message());
+    }
+
+    #[test]
+    fn aws_authentication_signs_the_request_in_pre_flight() {
+        let params = params(
+            Some(HttpRequestBodyConfig {
+                content_type: HttpContentType::Json,
+                json_data: Some(json!({"a": 1})),
+                ..HttpRequestBodyConfig::default()
+            }),
+            Some(HttpAuthConfig {
+                auth_type: HttpAuthType::Aws,
+                username: Some("AKIDEXAMPLE".to_owned()),
+                password: Some("secret".to_owned()),
+                ..HttpAuthConfig::default()
+            }),
+        );
+        let prepared = build_request(&params, &json!({}), CancellationToken::new()).unwrap();
+        let authorization = prepared
+            .request
+            .headers()
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.clone())
+            .expect("the request is signed");
+        assert!(authorization.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"));
+        assert!(
+            authorization
+                .contains("SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date"),
+            "unexpected authorization: {authorization}"
+        );
+        let content_hash = prepared
+            .request
+            .headers()
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-amz-content-sha256"))
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert_eq!(content_hash, sigv4::sha256_hex(br#"{"a":1}"#));
+    }
+
+    #[test]
+    fn a_missing_aws_credential_pair_is_an_input_parameter_error() {
+        let params = params(
+            None,
+            Some(HttpAuthConfig {
+                auth_type: HttpAuthType::Aws,
+                // `auth::aws_credentials` falls back to the environment; an empty
+                // configuration cannot name a pair, and the process is not expected to
+                // have AWS credentials exported in the test environment.
+                username: None,
+                password: None,
+                ..HttpAuthConfig::default()
+            }),
+        );
+        if std::env::var(auth::ACCESS_KEY_ENV).is_ok()
+            && std::env::var(auth::SECRET_KEY_ENV).is_ok()
+        {
+            // A developer machine with real credentials still signs; nothing to assert.
+            assert!(build_request(&params, &json!({}), CancellationToken::new()).is_ok());
+            return;
+        }
+        let error = build_request(&params, &json!({}), CancellationToken::new()).unwrap_err();
+        assert!(
+            error.message().contains(auth::ACCESS_KEY_ENV),
+            "{}",
+            error.message()
         );
     }
 
     #[test]
-    fn digest_and_aws_authentication_are_unsupported() {
-        for (auth_type, needle) in [(HttpAuthType::Digest, "digest"), (HttpAuthType::Aws, "aws")] {
-            let auth = HttpAuthConfig {
-                auth_type,
-                ..HttpAuthConfig::default()
-            };
-            let mut headers = BTreeMap::new();
-            let mut query = Vec::new();
-            let error = apply_authentication(Some(&auth), &mut headers, &mut query).unwrap_err();
-            assert_eq!(
-                error.kind(),
-                openjiuwen_common::error::ErrorKind::Unsupported
-            );
-            assert!(error.message().contains(needle));
-        }
-    }
-
-    #[test]
-    fn authentication_places_credentials_like_python() {
-        let auth = HttpAuthConfig {
-            auth_type: HttpAuthType::Basic,
-            username: Some("user".to_owned()),
-            password: Some("pass".to_owned()),
-            ..HttpAuthConfig::default()
-        };
-        let mut headers = BTreeMap::new();
-        let mut query = Vec::new();
-        apply_authentication(Some(&auth), &mut headers, &mut query).unwrap();
-        assert_eq!(headers.get("Authorization").unwrap(), "Basic dXNlcjpwYXNz");
-
-        let auth = HttpAuthConfig {
-            auth_type: HttpAuthType::ApiKey,
-            api_key: Some("k".to_owned()),
-            name: "X-Key".to_owned(),
-            in_location: HttpAuthIn::Query,
-            ..HttpAuthConfig::default()
-        };
-        let mut headers = BTreeMap::new();
-        let mut query = Vec::new();
-        apply_authentication(Some(&auth), &mut headers, &mut query).unwrap();
-        assert_eq!(query, vec![("X-Key".to_owned(), "k".to_owned())]);
-        assert!(headers.is_empty());
-
-        // `in_location = body` is ignored, as in Python.
-        let auth = HttpAuthConfig {
-            in_location: HttpAuthIn::Body,
-            ..auth
-        };
-        let mut query = Vec::new();
-        apply_authentication(Some(&auth), &mut BTreeMap::new(), &mut query).unwrap();
-        assert!(query.is_empty());
+    fn the_digest_uri_carries_the_query_parameters() {
+        assert_eq!(digest_uri("https://example.com/a/b", &[]), "/a/b");
+        assert_eq!(digest_uri("https://example.com", &[]), "/");
+        assert_eq!(
+            digest_uri(
+                "https://example.com/a?x=1",
+                &[("y".to_owned(), "a b".to_owned())]
+            ),
+            "/a?x=1&y=a%20b"
+        );
+        assert_eq!(
+            digest_uri(
+                "https://example.com/a",
+                &[
+                    ("y".to_owned(), "1".to_owned()),
+                    ("z".to_owned(), "2".to_owned())
+                ]
+            ),
+            "/a?y=1&z=2"
+        );
     }
 }

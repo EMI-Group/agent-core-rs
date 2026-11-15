@@ -28,7 +28,7 @@ pub enum HttpContentType {
     Json,
     /// URL-encoded form body from `form_data`.
     Form,
-    /// Multipart form body from `multipart_form` (unsupported by the shared transport).
+    /// Multipart form body from `multipart_form`, encoded in-crate into bytes.
     MultipartForm,
     /// Raw bytes from base64-encoded `binary_data`.
     Binary,
@@ -51,9 +51,9 @@ pub enum HttpAuthType {
     Bearer,
     /// An API key placed in a header or query parameter.
     ApiKey,
-    /// HTTP digest authentication (unimplemented, like Python).
+    /// HTTP digest authentication, answered from the server's challenge.
     Digest,
-    /// AWS signature authentication (unimplemented, like Python).
+    /// AWS Signature Version 4, signed in pre-flight.
     Aws,
 }
 
@@ -83,7 +83,8 @@ pub enum HttpResponseFormat {
     Text,
     /// Base64-encode the raw bytes.
     Binary,
-    /// Buffered bytes; behaves like [`Self::Binary`] in Rust.
+    /// Raw bytes as a Node-style buffer object
+    /// (`{"type": "Buffer", "data": [..u8..], "length": n}`).
     Buffer,
 }
 
@@ -180,7 +181,10 @@ pub struct HttpRequestBodyConfig {
     pub json_data: Option<Value>,
     /// URL-encoded form fields (`application/x-www-form-urlencoded`).
     pub form_data: Option<BTreeMap<String, Value>>,
-    /// Multipart form fields; the shared transport cannot send them.
+    /// Multipart form fields, encoded in-crate into a `multipart/form-data` body.
+    ///
+    /// A value that is an object with a `filename` plus a base64 `content_base64` (or the
+    /// `data`/`content` aliases) becomes a file part; every other value is a text part.
     pub multipart_form: Option<BTreeMap<String, Value>>,
     /// Base64-encoded request bytes (`application/octet-stream`).
     pub binary_data: Option<String>,
@@ -240,7 +244,8 @@ pub struct HttpResponseHandlingConfig {
     pub response_mode: HttpResponseMode,
     /// Object property extracted from the parsed body, when present.
     pub response_data_property: Option<String>,
-    /// Parsed for parity; Python never raises on an HTTP error either.
+    /// Return a coded [`super::COMPONENT_HTTP_ERROR`] error for a failed status instead
+    /// of the `statusCode`/`ok = false` data object (Python default `true`).
     pub throw_on_http_error: bool,
 }
 
@@ -267,7 +272,10 @@ pub struct HttpAdvancedOptionsConfig {
     pub ignore_ssl_issues: bool,
     /// Explicit proxy URL.
     pub proxy: Option<String>,
-    /// Accepted but not enforced; `max_response_byte_size` is the enforced cap.
+    /// Largest accepted request body in bytes (Python default 1 MiB); `0` is unlimited.
+    ///
+    /// Enforced for every body kind (JSON, text, form, binary, multipart) with a typed
+    /// input-parameter error naming the limit and the actual size.
     pub max_body_length: u64,
     /// Accepted but ignored; responses are always buffered.
     pub use_stream: bool,
@@ -315,8 +323,10 @@ impl Default for HttpRetryConfig {
 
 /// Rate-limit configuration (`HttpRateLimitConfig`).
 ///
-/// Parsed and preserved for parity but never enforced: no process-global limiter is
-/// ported.
+/// Enforced by a per-component sliding-window limiter (`super::rate_limit`): one limiter
+/// per component instance, never process-global, and the required delay is awaited before
+/// each send while honouring the run's cancellation token. `requests_per_unit = 0`
+/// disables the limiter even when `enabled` is set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct HttpRateLimitConfig {
@@ -360,7 +370,7 @@ pub struct HttpRequestParamConfig {
     pub advanced_options: HttpAdvancedOptionsConfig,
     /// Retry configuration.
     pub retry_config: HttpRetryConfig,
-    /// Parsed and preserved, never enforced.
+    /// Sliding-window rate limiting of the sends this component performs.
     pub rate_limit_config: HttpRateLimitConfig,
     /// Request timeout in seconds, clamped into `1.0..=300.0` at use time.
     pub timeout: f64,

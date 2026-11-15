@@ -13,8 +13,14 @@
 //!
 //! The component is exercised end to end against a loopback `wiremock` server, so the
 //! real request encoding, response projection, and retry loop run — no transport stub is
-//! involved. Only HTTP failures are data (`statusCode`, `ok = false`); transport failures
-//! become the coded `[102000]` workflow error.
+//! involved. An HTTP failure is data (`statusCode`, `ok = false`) when
+//! `response_handling.throw_on_http_error` is `false` and a coded `[102002]` error
+//! otherwise; transport failures become the coded `[102000]` workflow error.
+//!
+//! The suite also covers the body encodings (JSON, form, multipart), the authentication
+//! schemes (basic, API key, digest challenge/replay, AWS `SigV4`), `max_body_length`,
+//! `rate_limit_config` (including cancellation), and the difference between the `binary`
+//! and `buffer` response formats.
 //!
 //! Ports of `tests/unit_tests/core/component/test_http_component.py` and
 //! `…/test_http_component_comprehensive.py`, rewritten against `openjiuwen_workflow`'s
@@ -23,9 +29,12 @@
 mod common;
 
 use openjiuwen_common::error::ErrorKind;
-use openjiuwen_test_support::wiremock::matchers::{body_json, method, path, query_param};
+use openjiuwen_test_support::wiremock::matchers::{
+    body_json, body_string_contains, header_regex, method, path, query_param,
+};
 use openjiuwen_test_support::wiremock::{Mock, MockServer, ResponseTemplate};
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 
 use openjiuwen_workflow::components::{HttpComponentConfig, HttpRequestComponent};
 use openjiuwen_workflow::{
@@ -176,7 +185,7 @@ async fn a_post_sends_the_configured_json_body() {
 // port of tests/unit_tests/core/component/test_http_component.py::test_retry_count_and_timeout_session_handling
 // (Python returns the 500 response body instead of raising)
 #[tokio::test]
-async fn a_server_error_is_data_not_an_error() {
+async fn a_server_error_is_data_when_throwing_is_disabled() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/broken"))
@@ -184,14 +193,44 @@ async fn a_server_error_is_data_not_an_error() {
         .mount(&server)
         .await;
 
-    let output = component_at(&server, "/broken", &json!({}))
-        .invoke(json!({}), &context())
-        .await
-        .unwrap();
+    let output = component_at(
+        &server,
+        "/broken",
+        &json!({"response_handling": {"throw_on_http_error": false}}),
+    )
+    .invoke(json!({}), &context())
+    .await
+    .unwrap();
 
     assert_eq!(output["statusCode"], json!(500));
     assert_eq!(output["ok"], json!(false));
     assert_eq!(output["body"], json!({"error": "boom"}));
+}
+
+// `throw_on_http_error` defaults to `true`, so a failed status becomes the component-local
+// `[102002]` error naming the status and `ok`.
+#[tokio::test]
+async fn a_server_error_throws_by_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/broken"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error": "boom"})))
+        .mount(&server)
+        .await;
+
+    let error = component_at(&server, "/broken", &json!({}))
+        .invoke(json!({}), &context())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Workflow);
+    let text = error.to_string();
+    assert!(text.contains("[102002]"), "unexpected error text: {text}");
+    assert!(
+        text.contains("statusCode=503"),
+        "unexpected error text: {text}"
+    );
+    assert!(text.contains("ok=false"), "unexpected error text: {text}");
 }
 
 // port of tests/unit_tests/core/component/test_http_component_comprehensive.py::test_response_handling
@@ -238,7 +277,9 @@ async fn response_data_property_and_response_mode_project_the_output() {
     let success_only_error = component_at(
         &server,
         "/server-error",
-        &json!({"response_handling": {"response_mode": "on-success"}}),
+        &json!({
+            "response_handling": {"response_mode": "on-success", "throw_on_http_error": false}
+        }),
     )
     .invoke(json!({}), &context())
     .await
@@ -258,7 +299,9 @@ async fn response_data_property_and_response_mode_project_the_output() {
     let error_only_failure = component_at(
         &server,
         "/forbidden",
-        &json!({"response_handling": {"response_mode": "on-error"}}),
+        &json!({
+            "response_handling": {"response_mode": "on-error", "throw_on_http_error": false}
+        }),
     )
     .invoke(json!({}), &context())
     .await
@@ -401,4 +444,423 @@ fn the_registry_builds_http_request_components() {
         "unexpected error text: {}",
         error.message()
     );
+}
+
+// The multipart encoder builds the whole form itself and sends it as bytes, so the server
+// sees a well-formed `multipart/form-data` body with a generated boundary.
+#[tokio::test]
+async fn a_multipart_body_reaches_the_server_with_a_boundary() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/upload"))
+        .and(header_regex(
+            "content-type",
+            r"^multipart/form-data; boundary=----openjiuwen-[0-9a-f]+$",
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"stored": true})))
+        .mount(&server)
+        .await;
+
+    let output = component_at(
+        &server,
+        "/upload",
+        &json!({
+            "method": "post",
+            "body": {
+                "content_type": "multipart_form",
+                "multipart_form": {
+                    "note": "hello {{who}}",
+                    "upload": {"filename": "a.bin", "content_base64": "AAEC+g=="},
+                    "meta": {"n": 1}
+                }
+            }
+        }),
+    )
+    .invoke(json!({"who": "ada"}), &context())
+    .await
+    .unwrap();
+
+    assert_eq!(output["statusCode"], json!(201));
+    assert_eq!(output["body"], json!({"stored": true}));
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1);
+    let boundary = requests[0]
+        .headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("multipart/form-data; boundary="))
+        .expect("the request carries a multipart content type")
+        .to_owned();
+    let body = String::from_utf8_lossy(&requests[0].body).into_owned();
+    assert!(
+        body.starts_with(&format!("--{boundary}\r\n")),
+        "unexpected body: {body}"
+    );
+    assert!(
+        body.ends_with(&format!("--{boundary}--\r\n")),
+        "the body is closed by the boundary: {body}"
+    );
+    assert!(body.contains("Content-Disposition: form-data; name=\"note\"\r\n\r\nhello ada\r\n"));
+    assert!(body.contains("Content-Disposition: form-data; name=\"meta\"\r\n\r\n{\"n\":1}\r\n"));
+    assert!(body.contains(
+        "Content-Disposition: form-data; name=\"upload\"; filename=\"a.bin\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n"
+    ));
+    assert!(
+        requests[0]
+            .body
+            .windows(4)
+            .any(|window| window == [0_u8, 1, 2, 250]),
+        "the decoded file bytes are sent verbatim"
+    );
+}
+
+// Digest authentication is challenge-driven: an unauthenticated request, then exactly one
+// replay carrying the computed `Authorization` header.
+#[tokio::test]
+async fn digest_authentication_answers_the_challenge_and_replays_once() {
+    let server = MockServer::start().await;
+    // The `cnonce` and therefore the `response` are freshly generated per run, so the
+    // replay is matched on the shape of the header rather than a fixed digest.
+    let expected_authorization = concat!(
+        "^Digest username=\"mufasa\", realm=\"testrealm@host\\.com\", ",
+        r#"nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", uri="/protected", "#,
+        r#"qop=auth, nc=00000001, cnonce="[0-9a-f]{32}", "#,
+        r#"response="[0-9a-f]{32}", algorithm=MD5, "#,
+        r#"opaque="5ccc069c403ebaf9f0171e9517f40e41"$"#,
+    );
+    Mock::given(method("GET"))
+        .and(path("/protected"))
+        .respond_with(ResponseTemplate::new(401).insert_header(
+            "www-authenticate",
+            r#"Digest realm="testrealm@host.com", qop="auth,auth-int", "#.to_owned()
+                + r#"nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", "#
+                + r#"opaque="5ccc069c403ebaf9f0171e9517f40e41", algorithm=MD5"#,
+        ))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/protected"))
+        .and(header_regex("authorization", expected_authorization))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"secret": 42})))
+        .mount(&server)
+        .await;
+
+    let output = component_at(
+        &server,
+        "/protected",
+        &json!({
+            "authentication": {"type": "digest", "username": "mufasa", "password": "pw"}
+        }),
+    )
+    .invoke(json!({}), &context())
+    .await
+    .unwrap();
+    assert_eq!(output["statusCode"], json!(200));
+    assert_eq!(output["body"], json!({"secret": 42}));
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 2, "the challenge is answered exactly once");
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "the first attempt is unauthenticated"
+    );
+    let authorization = requests[1]
+        .headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .expect("the replay carries the digest header");
+    assert!(authorization.starts_with("Digest username=\"mufasa\""));
+}
+
+// A `401` this component cannot answer (no digest challenge) stays ordinary data.
+#[tokio::test]
+async fn a_401_without_a_digest_challenge_is_data() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/protected"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .insert_header("www-authenticate", "Basic realm=\"x\"")
+                .set_body_json(json!({"error": "unauthorized"})),
+        )
+        .mount(&server)
+        .await;
+
+    let output = component_at(
+        &server,
+        "/protected",
+        &json!({
+            "authentication": {"type": "digest", "username": "u", "password": "p"},
+            "response_handling": {"throw_on_http_error": false}
+        }),
+    )
+    .invoke(json!({}), &context())
+    .await
+    .unwrap();
+    assert_eq!(output["statusCode"], json!(401));
+    assert_eq!(output["ok"], json!(false));
+    assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+}
+
+/// The lower-case hexadecimal SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::new(), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+// AWS SigV4 is computed in pre-flight, so every header the signature covers is on the wire.
+#[tokio::test]
+async fn aws_sigv4_signs_the_request_before_sending() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/signed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"signed": true})))
+        .mount(&server)
+        .await;
+
+    let output = component_at(
+        &server,
+        "/signed",
+        &json!({
+            "method": "post",
+            "body": {"content_type": "json", "json_data": {"a": 1}},
+            "authentication": {
+                "type": "aws",
+                "username": "AKIDEXAMPLE",
+                "password": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+            }
+        }),
+    )
+    .invoke(json!({}), &context())
+    .await
+    .unwrap();
+    assert_eq!(output["statusCode"], json!(200));
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1);
+    let authorization = requests[0]
+        .headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .expect("the request is signed");
+    assert!(
+        authorization.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"),
+        "unexpected authorization: {authorization}"
+    );
+    assert!(
+        authorization.contains("SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date"),
+        "unexpected authorization: {authorization}"
+    );
+    assert!(
+        authorization.contains(", Signature="),
+        "unexpected authorization: {authorization}"
+    );
+    let payload_hash = requests[0]
+        .headers
+        .get("x-amz-content-sha256")
+        .and_then(|value| value.to_str().ok())
+        .expect("the payload hash header is sent");
+    assert_eq!(payload_hash, sha256_hex(&requests[0].body));
+    assert!(
+        requests[0].headers.get("x-amz-date").is_some(),
+        "the timestamp header is sent"
+    );
+}
+
+// `advanced_options.max_body_length` rejects an oversized body before anything is sent.
+#[tokio::test]
+async fn a_body_over_the_configured_limit_is_rejected_before_sending() {
+    let server = MockServer::start().await;
+
+    let error = component_at(
+        &server,
+        "/upload",
+        &json!({
+            "method": "post",
+            "body": {"content_type": "text", "text_data": "0123456789"},
+            "advanced_options": {"max_body_length": 4}
+        }),
+    )
+    .invoke(json!({}), &context())
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Workflow);
+    let text = error.to_string();
+    assert!(text.contains("[102001]"), "unexpected error text: {text}");
+    assert!(text.contains("10 bytes"), "unexpected error text: {text}");
+    assert!(
+        text.contains("max_body_length of 4"),
+        "unexpected error text: {text}"
+    );
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .len(),
+        0,
+        "the request never reaches the server"
+    );
+}
+
+// The limiter is per component instance and honours the run's cancellation token, so a
+// cancelled run stops waiting instead of sleeping through the window.
+#[tokio::test]
+async fn the_rate_limiter_delays_sends_and_honours_cancellation() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/limited"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    let http = component(&json!({
+        "url": format!("{}/limited", server.uri()),
+        "rate_limit_config": {"enabled": true, "requests_per_unit": 1, "unit": "second"}
+    }));
+    let cancellation = CancellationToken::new();
+    let ctx = context().with_cancellation(cancellation.clone());
+
+    // The first send is immediate and consumes the window.
+    let output = http.invoke(json!({}), &ctx).await.unwrap();
+    assert_eq!(output["statusCode"], json!(200));
+
+    // The second send would wait a second; a cancelled run stops immediately instead.
+    cancellation.cancel();
+    let error = http.invoke(json!({}), &ctx).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .len(),
+        1,
+        "the cancelled send never reaches the server"
+    );
+}
+
+// A generous window keeps ordinary traffic unthrottled.
+#[tokio::test]
+async fn a_generous_rate_limit_still_serves_every_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/burst"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    let http = component(&json!({
+        "url": format!("{}/burst", server.uri()),
+        "rate_limit_config": {"enabled": true, "requests_per_unit": 100, "unit": "minute"}
+    }));
+    for _ in 0..3 {
+        let output = http.invoke(json!({}), &context()).await.unwrap();
+        assert_eq!(output["statusCode"], json!(200));
+    }
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .len(),
+        3
+    );
+}
+
+// `buffer` is lossless (byte array + length); `binary` keeps Python's base64 string.
+#[tokio::test]
+async fn buffer_and_binary_response_formats_differ() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/raw"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/octet-stream")
+                .set_body_bytes(vec![0_u8, 1, 2, 250]),
+        )
+        .mount(&server)
+        .await;
+
+    let buffered = component_at(
+        &server,
+        "/raw",
+        &json!({"response_handling": {"response_format": "buffer"}}),
+    )
+    .invoke(json!({}), &context())
+    .await
+    .unwrap();
+    assert_eq!(buffered["body"]["type"], json!("Buffer"));
+    assert_eq!(buffered["body"]["data"], json!([0, 1, 2, 250]));
+    assert_eq!(buffered["body"]["length"], json!(4));
+
+    let binary = component_at(
+        &server,
+        "/raw",
+        &json!({"response_handling": {"response_format": "binary"}}),
+    )
+    .invoke(json!({}), &context())
+    .await
+    .unwrap();
+    assert_eq!(binary["body"], json!("AAEC+g=="));
+
+    // `response_data_property` works on the buffer object's own keys.
+    let length_only = component_at(
+        &server,
+        "/raw",
+        &json!({"response_handling": {"response_format": "buffer", "response_data_property": "length"}}),
+    )
+    .invoke(json!({}), &context())
+    .await
+    .unwrap();
+    assert_eq!(length_only["body"], json!(4));
+}
+
+// The form body stays URL-encoded (the multipart encoder is opt-in through content_type).
+#[tokio::test]
+async fn a_form_body_is_url_encoded_and_the_multipart_body_is_not() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/form"))
+        .and(header_regex(
+            "content-type",
+            "^application/x-www-form-urlencoded$",
+        ))
+        .and(body_string_contains("a=b+c&d=%C3%A9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    let output = component_at(
+        &server,
+        "/form",
+        &json!({
+            "method": "post",
+            "body": {"content_type": "form", "form_data": {"a": "b c", "d": "é"}}
+        }),
+    )
+    .invoke(json!({}), &context())
+    .await
+    .unwrap();
+    assert_eq!(output["statusCode"], json!(200));
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-www-form-urlencoded")
+    );
+    assert_eq!(requests[0].body, b"a=b+c&d=%C3%A9".to_vec());
 }
