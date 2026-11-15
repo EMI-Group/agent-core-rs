@@ -485,6 +485,8 @@ API-shaped stubs, all documented and all returning `Err(Error::Unsupported("<sur
 - `evaluators::LlmJudgeEvaluator` — guarded judge-model plumbing and judge prompt construction live in the harness layer.
 - `runtime::RuntimeExtensionLoader` — synthetic `sys.modules` hot-loading of Python runtime extensions has no Rust analogue.
 
+These three are the only places the crate constructs `Error::Unsupported` (`rg Unsupported src` matches only `src/deferred/` plus the `lib.rs` doc); every other gap listed under `## Deferred Scope` is a trait seam, caller-owned orchestration, or a module that does not exist in Rust.
+
 ## Constraints
 
 - Errors: `openjiuwen_common::error::{Error, Result}` only; Python category names preserved (`Error::config` for bad config/spawn, `Error::validation` for bad input/limits, `Error::unsupported` for deferred surfaces, `Error::cancelled` for cancellation, `Error::session` for checkpoint/ledger/state failures, `Error::tool` for process failures). No `unwrap`/`expect`/`panic` outside `#[cfg(test)]`.
@@ -578,6 +580,8 @@ API-shaped stubs, all documented and all returning `Err(Error::Unsupported("<sur
 - `tests/crate_surface.rs` — every implemented flat re-export resolves and works offline (command/git/CI/Python/subprocess, ledger, evaluator and benchmark runtimes, paper/member optimisers, single-harness types, core protocol).
 - Unit tests beside modules for budget warning thresholds, stop-condition ordering, rounding, config parsing, and small helpers.
 - All tests offline and deterministic; no network, no Docker, no real model, no `#[ignore]`.
+- Sizes: 19 integration binaries with 306 `#[test]`/`#[tokio::test]` functions, plus 186 in-module unit tests; `src/` is 63 files / ~24.7k lines, largest `artifact_rsi/program_opt/tree.rs` at 975 lines.
+- The only cross-crate scenario coverage is `openjiuwen-e2e/tests/self_improvement.rs` (4 scenarios, 2 of them rsi: orchestrator convergence and checkpoint resume through `openjiuwen::rsi`).
 - Definition of done: `cargo fmt -p openjiuwen-rsi`, `cargo test -p openjiuwen-rsi --offline`, `cargo clippy -p openjiuwen-rsi --all-targets --offline -- -D warnings`, `cargo doc -p openjiuwen-rsi --no-deps` all clean.
 
 ## Design Decisions
