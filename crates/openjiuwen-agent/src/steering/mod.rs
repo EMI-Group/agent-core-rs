@@ -8,8 +8,10 @@
 //!
 //! The queue is a plain, infallible, thread-safe FIFO behind an [`Arc`], so a
 //! host thread, a rail, or a tool can push while the loop is awaiting a model
-//! call. The loop itself is wired elsewhere; [`SteeringQueue::drain_prompt`] is
-//! the safe-point helper that renders the drained backlog into one text block.
+//! call. The loop itself is wired elsewhere; it drains the backlog through
+//! [`SteeringQueue::drain_limit`] at its steering-drain point, so a
+//! rail-supplied cap is honoured. [`SteeringQueue::drain_prompt`] remains the
+//! standalone helper that renders a drained backlog into one text block.
 //!
 //! ```
 //! use openjiuwen_agent::steering::{SteeringMessage, SteeringQueue};
@@ -154,6 +156,32 @@ impl SteeringQueue {
             .collect()
     }
 
+    /// Removes and returns at most `limit` queued messages, oldest first.
+    ///
+    /// `None` drains the whole backlog, exactly like [`SteeringQueue::drain`].
+    /// `Some(n)` takes at most `max(1, n)` messages, so `Some(0)` still takes one
+    /// and a non-empty queue always makes progress (Python's
+    /// `drain_steering(limit)` computes `take = max(1, limit)`).
+    ///
+    /// Blank messages ([`SteeringMessage::is_empty`]) are skipped and do not
+    /// count against the limit. Any message beyond the cap stays queued, in
+    /// order, for the next [`SteeringQueue::drain`] or `drain_limit` call.
+    #[must_use]
+    pub fn drain_limit(&self, limit: Option<usize>) -> Vec<SteeringMessage> {
+        let take = limit.map_or(usize::MAX, |n| n.max(1));
+        let mut queue = self.inner.lock();
+        let mut drained = Vec::new();
+        while drained.len() < take {
+            let Some(message) = queue.pop_front() else {
+                break;
+            };
+            if !message.is_empty() {
+                drained.push(message);
+            }
+        }
+        drained
+    }
+
     /// Drains the backlog as [`BaseMessage`]s ready to append to the window.
     #[must_use]
     pub fn drain_messages(&self) -> Vec<BaseMessage> {
@@ -190,8 +218,9 @@ impl SteeringQueue {
     ///
     /// Messages are rendered oldest first, one per line, joined by a blank line
     /// (`"\n\n"`); blank messages are ignored. Returns `None` when nothing was
-    /// queued, so the caller can skip the injection entirely. This is the safe
-    /// point the `ReAct` loop calls between steps.
+    /// queued, so the caller can skip the injection entirely. This is a
+    /// standalone render helper over [`SteeringQueue::drain`]; the `ReAct` loop
+    /// drains through [`SteeringQueue::drain_limit`] instead.
     #[must_use]
     pub fn drain_prompt(&self) -> Option<String> {
         let texts: Vec<String> = self
@@ -348,6 +377,105 @@ mod tests {
         );
         assert!(queue.is_empty());
         assert_eq!(queue.drain_prompt(), None);
+    }
+
+    #[test]
+    fn drain_limit_none_takes_the_whole_backlog() {
+        let queue = SteeringQueue::new();
+        queue.push_text("first");
+        queue.push_text("second");
+        queue.push_text("third");
+
+        let drained: Vec<String> = queue
+            .drain_limit(None)
+            .into_iter()
+            .map(|m| m.text)
+            .collect();
+        assert_eq!(drained, vec!["first", "second", "third"]);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn drain_limit_zero_still_takes_one() {
+        let queue = SteeringQueue::new();
+        queue.push_text("oldest");
+        queue.push_text("second");
+        queue.push_text("third");
+
+        let drained: Vec<String> = queue
+            .drain_limit(Some(0))
+            .into_iter()
+            .map(|m| m.text)
+            .collect();
+        assert_eq!(drained, vec!["oldest"]);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(
+            queue
+                .snapshot()
+                .into_iter()
+                .map(|m| m.text)
+                .collect::<Vec<_>>(),
+            vec!["second", "third"]
+        );
+    }
+
+    #[test]
+    fn drain_limit_caps_and_keeps_the_rest_in_order() {
+        let queue = SteeringQueue::new();
+        queue.push_text("first");
+        queue.push_text("second");
+        queue.push_text("third");
+
+        let first: Vec<String> = queue
+            .drain_limit(Some(2))
+            .into_iter()
+            .map(|m| m.text)
+            .collect();
+        assert_eq!(first, vec!["first", "second"]);
+        assert_eq!(queue.len(), 1);
+
+        let second: Vec<String> = queue
+            .drain_limit(Some(2))
+            .into_iter()
+            .map(|m| m.text)
+            .collect();
+        assert_eq!(second, vec!["third"]);
+        assert!(queue.is_empty());
+        assert_eq!(queue.drain_limit(Some(2)).len(), 0);
+    }
+
+    #[test]
+    fn drain_limit_oversized_takes_everything() {
+        let queue = SteeringQueue::new();
+        queue.push_text("a");
+        queue.push_text("b");
+
+        let drained: Vec<String> = queue
+            .drain_limit(Some(10))
+            .into_iter()
+            .map(|m| m.text)
+            .collect();
+        assert_eq!(drained, vec!["a", "b"]);
+        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn drain_limit_skips_blanks_without_consuming_the_limit() {
+        let queue = SteeringQueue::new();
+        // Blank messages never enter the backlog, so they cannot consume the cap.
+        assert_eq!(queue.push_text("   "), 0);
+        queue.push_text("first");
+        queue.push(SteeringMessage::default());
+        queue.push_text("second");
+
+        let drained: Vec<String> = queue
+            .drain_limit(Some(2))
+            .into_iter()
+            .map(|m| m.text)
+            .collect();
+        assert_eq!(drained, vec!["first", "second"]);
+        assert!(queue.is_empty());
     }
 
     #[test]
