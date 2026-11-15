@@ -1,9 +1,11 @@
 //! Pure-Rust decoding of native tokenizer artifacts.
 //!
 //! Two artifact kinds are supported: a `HuggingFace` `tokenizer.json` document and a `tiktoken` `.model` BPE vocabulary.
-//! A `tokenizer.json` is read with `serde_json` and decoded into a model (`BPE`, `WordPiece`, a Unigram-lite branch, `WordLevel`) plus the normalizer, pre-tokenizer, added-token and decoder pipelines, so encoding needs neither the `tokenizers` runtime nor any network access.
+//! A `tokenizer.json` is read with `serde_json` and decoded into a model (`BPE`, `WordPiece`, a Unigram-lite branch, `WordLevel`) plus the normalizer, pre-tokenizer, added-token, post-processor and decoder pipelines, so encoding needs neither the `tokenizers` runtime nor any network access.
 //! A `.model` vocabulary is decoded with `base64` by [`tiktoken_model::TiktokenModel`] (see [`NativeTokenizer::from_tiktoken_model`]) and shares the same [`NativeTokenizer`] surface.
 //! Loading happens once per context/model binding; every later [`NativeTokenizer::encode`] is pure computation over the in-memory tables.
+//! A declared post-processor adds its framing tokens on encode — `BERT`'s `[CLS] … [SEP]`, for instance — so a count includes the tokens the model really receives; with no post-processor declared, nothing is added.
+//! Decoding prefers the declared decoder node and falls back to the model's own concatenation for a `BPE`, `Unigram` or `WordLevel` model that declares none (or only `Plain`), so an artifact with no decoder node still round-trips.
 //! Shapes this crate cannot reproduce exactly (regex splits, the Unicode-normalization families, unsupported pipeline nodes) are recorded in [`NativeTokenizer::warnings`] and degrade to a coarser but working behaviour instead of failing the load.
 //! A model type this crate does not know is refused with [`Error::Unsupported`], because guessing a vocabulary layout would silently bias every budget decision.
 
@@ -26,6 +28,8 @@ use std::path::Path;
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::prompt::TokenCounter;
+use serde::Deserialize as _;
+use serde_json::Value;
 
 /// The 256-entry byte↔unicode alphabet of byte-level vocabularies.
 ///
@@ -68,7 +72,8 @@ impl NativeTokenizerKind {
 /// A tokenizer decoded from a native artifact.
 ///
 /// The type is immutable, `Send` and `Sync`, so one instance can be shared by every context bound to the same model.
-/// Encoding runs the artifact's own pipeline: normalize, cut out added tokens, pre-tokenize, then encode each piece with the model.
+/// Encoding runs the artifact's own pipeline: normalize, cut out added tokens, pre-tokenize, encode each piece with the model, then apply the declared post-processor.
+/// Decoding runs the other way: the declared decoder node, or the model's own concatenation when the artifact declares none.
 /// A `tiktoken` `.model` vocabulary bypasses that pipeline and uses its own pre-tokenization and merge loop.
 pub struct NativeTokenizer {
     /// The decoding model and its vocabularies, for a `tokenizer.json` artifact.
@@ -79,6 +84,8 @@ pub struct NativeTokenizer {
     pretokenizer: pretokenizer::Pretokenizer,
     /// The decoding pipeline.
     decoder: decoder::Decoder,
+    /// The post-processing pipeline that frames an encoding.
+    post_processor: post_processing::PostProcessor,
     /// Added and special tokens.
     added: added_tokens::AddedTokens,
     /// The `tiktoken` vocabulary, for a `.model` artifact.
@@ -98,9 +105,12 @@ impl NativeTokenizer {
     ///
     /// Returns [`Error::Validation`] when the document is not valid JSON or declares no model or vocabulary, and [`Error::Unsupported`] when the model type is not one this loader decodes.
     pub fn from_json_str(json: &str) -> Result<Self> {
-        let document: hf_json::TokenizerJson = serde_json::from_str(json)
+        let value: Value = serde_json::from_str(json)
             .map_err(|error| Error::Validation(format!("tokenizer.json is malformed: {error}")))?;
-        Self::from_document(document)
+        // `hf_json::TokenizerJson` types only the sections this loader reads, so the post-processor is taken from the raw value.
+        let document = hf_json::TokenizerJson::deserialize(&value)
+            .map_err(|error| Error::Validation(format!("tokenizer.json is malformed: {error}")))?;
+        Self::from_document(document, value.get("post_processor"))
     }
 
     /// Reads and decodes a `tokenizer.json` file.
@@ -129,7 +139,10 @@ impl NativeTokenizer {
     }
 
     /// Builds the tokenizer from a decoded document.
-    fn from_document(document: hf_json::TokenizerJson) -> Result<Self> {
+    fn from_document(
+        document: hf_json::TokenizerJson,
+        post_processor_json: Option<&Value>,
+    ) -> Result<Self> {
         let hf_json::TokenizerJson {
             name,
             model_id,
@@ -148,6 +161,8 @@ impl NativeTokenizer {
         let pretokenizer =
             pretokenizer::Pretokenizer::from_json(pre_tokenizer.as_ref(), &mut warnings);
         let decoder = decoder::Decoder::from_json(decoder_json.as_ref(), &mut warnings);
+        let post_processor =
+            post_processing::PostProcessor::from_json(post_processor_json, &mut warnings);
         let added = added_tokens::AddedTokens::new(added_tokens.unwrap_or_default(), &mut warnings);
         for warning in &warnings {
             tracing::warn!(
@@ -162,6 +177,7 @@ impl NativeTokenizer {
             normalizer,
             pretokenizer,
             decoder,
+            post_processor,
             added,
             tiktoken: None,
             tokenizer_id: name.or(model_id),
@@ -236,6 +252,7 @@ impl NativeTokenizer {
             normalizer,
             pretokenizer,
             decoder,
+            post_processor: post_processing::PostProcessor::None,
             added: added_tokens::AddedTokens::default(),
             tiktoken: Some(model),
             tokenizer_id: None,
@@ -246,6 +263,7 @@ impl NativeTokenizer {
     /// Encodes `text` into token ids.
     ///
     /// Added tokens are matched first, so a special token always becomes exactly one id.
+    /// The declared post-processor then frames the result, which is why `count_text` includes `[CLS]`/`[SEP]`-style tokens; an empty string produces no ids and therefore no framing either.
     /// A `tiktoken` vocabulary runs its own special-token split, pre-tokenization and merge loop.
     #[must_use]
     pub fn encode(&self, text: &str) -> Vec<u32> {
@@ -270,12 +288,14 @@ impl NativeTokenizer {
                 }
             }
         }
-        ids
+        self.post_processor.apply(&ids)
     }
 
     /// Decodes token ids back into text.
     ///
     /// Ids the artifact does not declare are skipped; special tokens are included, unlike `HuggingFace`'s `skip_special_tokens = true` default.
+    /// The declared decoder node always wins; when the artifact declares none (or only `Plain`), a `BPE`, `Unigram` or `WordLevel` model decodes with its own rules, so continuation prefixes, byte fallback and whole-piece concatenation survive a round trip.
+    /// A `WordPiece` model keeps the plain space join in that case, because its continuation prefix only becomes unambiguous through the declared decoder node.
     #[must_use]
     pub fn decode(&self, ids: &[u32]) -> String {
         if let Some(tiktoken) = &self.tiktoken {
@@ -293,6 +313,11 @@ impl NativeTokenizer {
                     .map(str::to_owned)
             })
             .collect();
+        if matches!(self.decoder, decoder::Decoder::Plain) {
+            if let Some(text) = model.decode(&tokens) {
+                return text;
+            }
+        }
         self.decoder.decode(&tokens)
     }
 
@@ -366,6 +391,181 @@ impl TokenCounter for NativeTokenizer {
     }
 }
 
+/// The framing tokens an artifact adds around an encoded sequence.
+///
+/// Only the single-sequence path is reproduced, because an encoding here is one flat id list: the pair templates and the per-token type ids have nowhere to live.
+/// `TemplateProcessing` contributes its declared `single` template, `BertProcessing`/`RobertaProcessing` contribute their `[CLS] … [SEP]` pair, `ByteLevel` contributes nothing (it only trims offsets in the reference), and `Sequence` chains stages in order.
+/// A shape this module does not reproduce, and a template piece whose special token declares no ids, is reported as a warning and left out, so a count stays comparable instead of silently gaining framing.
+/// Nothing is declared means nothing is added, which keeps the artifact in charge of its own framing.
+mod post_processing {
+    use serde_json::Value;
+
+    use super::hf_json::{bool_of, kind_of};
+
+    /// A post-processing pipeline.
+    #[derive(Debug, Clone, Default)]
+    pub(crate) enum PostProcessor {
+        /// Add nothing.
+        #[default]
+        None,
+        /// Pieces assembled around the encoded sequence, in declaration order.
+        Template(Vec<Piece>),
+        /// Stages applied in order.
+        Sequence(Vec<Self>),
+    }
+
+    /// One piece of a post-processing template.
+    #[derive(Debug, Clone)]
+    pub(crate) enum Piece {
+        /// The encoded ids, in place.
+        Sequence,
+        /// Literal framing ids, such as the id of `[CLS]`.
+        Ids(Vec<u32>),
+    }
+
+    impl PostProcessor {
+        /// Decodes a `post_processor` section.
+        pub(crate) fn from_json(value: Option<&Value>, warnings: &mut Vec<String>) -> Self {
+            let Some(value) = value.filter(|value| !value.is_null()) else {
+                return Self::None;
+            };
+            let Some(kind) = kind_of(value) else {
+                warnings.push(
+                    "post-processor declares no type; no framing tokens are added".to_owned(),
+                );
+                return Self::None;
+            };
+            match kind {
+                "TemplateProcessing" => Self::template(value, warnings),
+                "BertProcessing" | "RobertaProcessing" => Self::pair(value, kind, warnings),
+                "ByteLevel" => Self::None,
+                "Sequence" => Self::Sequence(
+                    value
+                        .get("processors")
+                        .and_then(Value::as_array)
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .map(|entry| Self::from_json(Some(entry), warnings))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ),
+                other => {
+                    warnings.push(format!(
+                        "post-processor `{other}` is not implemented; no framing tokens are added"
+                    ));
+                    Self::None
+                }
+            }
+        }
+
+        /// Applies the framing to `ids`.
+        pub(crate) fn apply(&self, ids: &[u32]) -> Vec<u32> {
+            match self {
+                Self::None => ids.to_vec(),
+                Self::Template(pieces) => {
+                    let mut out = Vec::with_capacity(ids.len() + pieces.len());
+                    for piece in pieces {
+                        match piece {
+                            Piece::Sequence => out.extend_from_slice(ids),
+                            Piece::Ids(framing) => out.extend_from_slice(framing),
+                        }
+                    }
+                    out
+                }
+                Self::Sequence(stages) => stages
+                    .iter()
+                    .fold(ids.to_vec(), |current, stage| stage.apply(&current)),
+            }
+        }
+
+        /// Decodes a `TemplateProcessing` node's single-sequence template.
+        fn template(value: &Value, warnings: &mut Vec<String>) -> Self {
+            if !bool_of(value, "add_special_tokens", true) {
+                return Self::None;
+            }
+            let Some(entries) = value.get("single").and_then(Value::as_array) else {
+                warnings.push(
+                    "TemplateProcessing declares no single-sequence template; no framing tokens are added"
+                        .to_owned(),
+                );
+                return Self::None;
+            };
+            let specials = value.get("special_tokens");
+            let mut pieces = Vec::new();
+            for entry in entries {
+                if entry.get("Sequence").is_some() {
+                    pieces.push(Piece::Sequence);
+                    continue;
+                }
+                let Some(name) = entry
+                    .get("SpecialToken")
+                    .and_then(|special| special.get("id"))
+                    .and_then(Value::as_str)
+                else {
+                    warnings.push(
+                        "TemplateProcessing declares a template piece that is neither a `Sequence` nor a `SpecialToken`; it is skipped"
+                            .to_owned(),
+                    );
+                    continue;
+                };
+                match special_ids(specials, name) {
+                    Some(ids) => pieces.push(Piece::Ids(ids)),
+                    None => warnings.push(format!(
+                        "TemplateProcessing special token `{name}` declares no ids; it is skipped"
+                    )),
+                }
+            }
+            if pieces.is_empty() {
+                Self::None
+            } else {
+                Self::Template(pieces)
+            }
+        }
+
+        /// Decodes a `BertProcessing`/`RobertaProcessing` node, whose single-sequence form wraps the sequence in the declared cls/sep pair.
+        fn pair(value: &Value, kind: &str, warnings: &mut Vec<String>) -> Self {
+            // The offsets these nodes also carry (`trim_offsets`, `add_prefix_space`) never change an id.
+            let (Some(cls), Some(sep)) = (framing_id(value, "cls"), framing_id(value, "sep"))
+            else {
+                warnings.push(format!(
+                    "post-processor `{kind}` does not declare both `cls` and `sep`; no framing tokens are added"
+                ));
+                return Self::None;
+            };
+            Self::Template(vec![
+                Piece::Ids(vec![cls]),
+                Piece::Sequence,
+                Piece::Ids(vec![sep]),
+            ])
+        }
+    }
+
+    /// The id of a `[token, id]` framing pair.
+    fn framing_id(value: &Value, key: &str) -> Option<u32> {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .and_then(|pair| pair.get(1))
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+    }
+
+    /// The ids a `TemplateProcessing` special token declares.
+    fn special_ids(specials: Option<&Value>, name: &str) -> Option<Vec<u32>> {
+        let ids: Vec<u32> = specials?
+            .get(name)?
+            .get("ids")?
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_u64)
+            .filter_map(|id| u32::try_from(id).ok())
+            .collect();
+        (!ids.is_empty()).then_some(ids)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +597,172 @@ mod tests {
     fn malformed_json_is_a_validation_error() {
         let error = NativeTokenizer::from_json_str("not json").expect_err("malformed");
         assert!(matches!(error, Error::Validation(_)));
+    }
+
+    fn parse(json: serde_json::Value) -> NativeTokenizer {
+        NativeTokenizer::from_json_str(&json.to_string()).expect("fixture loads")
+    }
+
+    #[test]
+    fn a_model_decodes_when_the_artifact_declares_no_decoder() {
+        let tokenizer = parse(serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {"a": 0, "b": 1, "##b": 2},
+                "merges": [],
+                "continuing_subword_prefix": "##"
+            },
+            "pre_tokenizer": {"type": "Whitespace"}
+        }));
+        // Without the fallback this would be the plain space join `a ##b`.
+        assert_eq!(tokenizer.decode(&[0, 2]), "ab");
+        assert_eq!(tokenizer.decode(&tokenizer.encode("a b")), "ab");
+    }
+
+    #[test]
+    fn a_declared_decoder_wins_over_the_model() {
+        let tokenizer = parse(serde_json::json!({
+            "model": {"type": "BPE", "vocab": {"a": 0, "b": 1}, "merges": []},
+            "decoder": {"type": "Replace", "pattern": {"String": "b"}, "content": "B"}
+        }));
+        assert_eq!(tokenizer.decode(&[0, 1]), "a B");
+    }
+
+    #[test]
+    fn word_level_decodes_by_concatenation_without_a_decoder() {
+        let tokenizer = parse(serde_json::json!({
+            "model": {"type": "WordLevel", "vocab": {"hello": 0, "world": 1}, "unk_token": "hello"},
+            "pre_tokenizer": {"type": "Whitespace"}
+        }));
+        assert_eq!(tokenizer.decode(&[0, 1]), "helloworld");
+    }
+
+    #[test]
+    fn word_piece_keeps_the_plain_join_without_a_decoder() {
+        let tokenizer = parse(serde_json::json!({
+            "model": {"type": "WordPiece", "vocab": {"h": 0, "##i": 1}, "unk_token": "h"},
+            "pre_tokenizer": {"type": "Whitespace"}
+        }));
+        // The continuation prefix is only unambiguous through the decoder node, so the model contributes nothing.
+        assert_eq!(tokenizer.decode(&[0, 1]), "h ##i");
+    }
+
+    #[test]
+    fn a_template_post_processor_frames_the_encoding() {
+        let tokenizer = parse(serde_json::json!({
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"[CLS]": 0, "[SEP]": 1, "hello": 2, "world": 3},
+                "unk_token": "[CLS]"
+            },
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "single": [
+                    {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"SpecialToken": {"id": "[SEP]", "type_id": 0}}
+                ],
+                "pair": [],
+                "special_tokens": {
+                    "[CLS]": {"id": "[CLS]", "ids": [0], "tokens": ["[CLS]"]},
+                    "[SEP]": {"id": "[SEP]", "ids": [1], "tokens": ["[SEP]"]}
+                }
+            }
+        }));
+        assert_eq!(tokenizer.encode("hello world"), vec![0, 2, 3, 1]);
+        // The count includes the framing, because the model would receive those ids.
+        assert_eq!(tokenizer.count_text("hello world"), 4);
+        // An empty string produces no ids, so no framing is added either.
+        assert_eq!(tokenizer.encode(""), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn a_template_can_decline_to_add_special_tokens() {
+        let tokenizer = parse(serde_json::json!({
+            "model": {"type": "WordLevel", "vocab": {"hello": 0}, "unk_token": "hello"},
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "add_special_tokens": false,
+                "single": [
+                    {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}}
+                ],
+                "special_tokens": {"[CLS]": {"id": "[CLS]", "ids": [9], "tokens": ["[CLS]"]}}
+            }
+        }));
+        assert_eq!(tokenizer.encode("hello"), vec![0]);
+        assert_eq!(tokenizer.warnings().len(), 0);
+    }
+
+    #[test]
+    fn a_template_special_token_without_ids_is_skipped_with_a_warning() {
+        let tokenizer = parse(serde_json::json!({
+            "model": {"type": "WordLevel", "vocab": {"hello": 0}, "unk_token": "hello"},
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "single": [
+                    {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}}
+                ],
+                "special_tokens": {}
+            }
+        }));
+        assert_eq!(tokenizer.encode("hello"), vec![0]);
+        assert!(
+            tokenizer
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("[CLS]")),
+            "the warning should name the token: {:?}",
+            tokenizer.warnings()
+        );
+    }
+
+    #[test]
+    fn bert_and_roberta_post_processors_wrap_the_sequence() {
+        let bert = parse(serde_json::json!({
+            "model": {"type": "WordPiece", "vocab": {"[UNK]": 0, "[CLS]": 1, "[SEP]": 2, "hello": 3}, "unk_token": "[UNK]"},
+            "normalizer": {"type": "Lowercase"},
+            "pre_tokenizer": {"type": "Whitespace"},
+            "decoder": {"type": "WordPiece", "prefix": "##"},
+            "post_processor": {"type": "BertProcessing", "cls": ["[CLS]", 1], "sep": ["[SEP]", 2]}
+        }));
+        assert_eq!(bert.encode("hello"), vec![1, 3, 2]);
+        assert_eq!(bert.decode(&bert.encode("hello")), "[CLS] hello [SEP]");
+
+        let roberta = parse(serde_json::json!({
+            "model": {"type": "WordLevel", "vocab": {"<s>": 0, "</s>": 1, "hi": 2}, "unk_token": "<s>"},
+            "pre_tokenizer": {"type": "Whitespace"},
+            "decoder": {"type": "Fuse"},
+            "post_processor": {
+                "type": "RobertaProcessing",
+                "cls": ["<s>", 0],
+                "sep": ["</s>", 1],
+                "trim_offsets": true,
+                "add_prefix_space": true
+            }
+        }));
+        assert_eq!(roberta.encode("hi"), vec![0, 2, 1]);
+        assert_eq!(roberta.decode(&roberta.encode("hi")), "<s>hi</s>");
+    }
+
+    #[test]
+    fn an_unsupported_post_processor_warns_instead_of_framing() {
+        let tokenizer = parse(serde_json::json!({
+            "model": {"type": "WordLevel", "vocab": {"a": 0}, "unk_token": "a"},
+            "post_processor": {"type": "DialogFraming"}
+        }));
+        assert_eq!(tokenizer.encode("a"), vec![0]);
+        assert!(
+            tokenizer
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("DialogFraming")),
+            "the warning should name the node: {:?}",
+            tokenizer.warnings()
+        );
     }
 }
