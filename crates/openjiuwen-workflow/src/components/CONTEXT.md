@@ -4,7 +4,7 @@
 
 Built-in `Component` implementations that the workflow engine drives for control flow and leaf work.
 Each module ports one Python `openjiuwen.core.workflow.components` area onto `crate::component::Component`.
-The control-flow components (`start`, `end`, `branch`, `loop`, `http_request`) have no runtime collaborators and are offline-testable.
+The control-flow components (`start`, `end`, `branch`, `loop`, `loop_group`, `advanced_loop`, `loop_break`, `loop_set_variable`, `http_request`) have no runtime collaborators and are offline-testable.
 The leaf components take their collaborators through constructors: a `Model`, an `Arc<dyn Tool>`, a `SimpleKnowledgeBase`, the memory trait seams, or (for ReAct) an injected `AgentRunner`.
 The `questioner` and `intent_detection` components persist their state and conversation in the session lanes, not in the component.
 
@@ -46,6 +46,44 @@ Each iteration starts from the input object overlaid with `{"index": <u64>, "ite
 `Array` takes `loop_array` as an input key or a whole-string `${...}` reference, fails with `101040` `loop_array is not an array` for a non-array, and applies the same exceeded-limit error for a longer array.
 `Condition` parses `bool_expression` once, re-evaluates it before every iteration against that iteration's inputs, stops on the first `false`, and fails with the exceeded-limit error when it would run past the cap.
 The body runs sequentially per iteration, each later component receives the previous component's output, and the last output becomes both the iteration result and the next `previous`; an empty body echoes the iteration inputs.
+The plan, cap, iteration inputs and body driver come from `loop_driver.rs`, so a `loop_break` request stops the loop without recording the interrupted round; missing or contradictory configuration is rejected by `validate_config` (`101030`) before any run.
+
+### `loop_driver.rs` — `LoopBound` and the shared iteration driver
+
+`LoopBound { Number, Array, Condition, UntilBreak }` is serde snake_case (`Default = Number`, `always_true` accepted as an `UntilBreak` alias) with `as_str()`/`Display` returning `"number"`, `"array"`, `"condition"`, `"until_break"`, `needs_break()`, and a `From<LoopType>` conversion; it is the `loop_type` field of the three container configurations.
+The driver is `pub(crate)` and owns what all three containers share: `plan` (bound → `IterationPlan` plus a parsed condition, failing `101040` on a bad bound), `effective_limit` (`min(configured limit, session.config().loop_number_max_limit)`), `object_inputs` (object or `null`, any other JSON is `101040`), `resolve_variables` (initial loop variables templated against the inputs), `iteration_inputs`/`overlay_variables`, `run_spec` (body execution, marker folding, break handling, cancellation), and `container_output`.
+`validate_bound` is the run-free check (`101030`): a zero limit, a missing/zero `loop_number`, a count above the limit, a blank `loop_array`, or a missing/unparsable `bool_expression`; `no_terminator` is the same code for a loop nothing can end.
+The container wrapper is `{"loop_results": [<round output>, …], "loop_variables": {<name>: <value>}, "loop_count": <completed rounds>, "broken": <bool>}`; an interrupted round is not recorded, so `loop_count` is always `loop_results.len()`.
+
+### `loop_group.rs` — `LoopGroupComponent`
+
+`LoopGroupConfig { loop_type, loop_number_max_limit, loop_number, loop_array, bool_expression, loop_variables }` is serde snake_case with defaults (`max_iterations` alias for `loop_number_max_limit` — default 1000, `loop_condition` alias for `bool_expression`) and chainable builders (`with_loop_type`, `with_loop_number`, `with_loop_array`, `with_bool_expression`/`with_loop_condition`, `with_max_iterations`, `with_loop_variables`/`with_variable`).
+`LoopGroupComponent::new(LoopGroupConfig, Vec<Arc<dyn Component>>)` with manual `Debug`, `config()`, `body_len()`, `has_break_component()` (immediate body scan); `component_type()` = `"loop_group"`; abilities `[Invoke]`.
+`invoke` reports the container wrapper; `loop_variables` are exposed to the body and to a closing condition on every round and updated by `LoopSetVariableComponent`; `until_break` ignores the count/array/condition bound and runs until a `loop_break` asks to stop; reaching the cap without one is `101040`.
+`validate_config` runs `validate_bound` and rejects an `until_break` group with no break component in its body.
+
+### `advanced_loop.rs` — `AdvancedLoopComponent`
+
+`AdvancedLoopConfig { max_iterations, loop_number, loop_array, bool_expression, loop_variables }` is serde snake_case with defaults (`loop_number_max_limit` alias for `max_iterations`, `loop_condition` alias for `bool_expression`) and the same chainable builders; `bound()` picks the active kind (`loop_number` > `loop_array` > condition-only > `until_break`).
+`AdvancedLoopComponent::new(AdvancedLoopConfig, Vec<Arc<dyn Component>>)` with manual `Debug`, `config()`, `body_len()`, `has_break_component()`; `component_type()` = `"advanced_loop"`; abilities `[Invoke]`.
+It re-evaluates termination before **every** round — the cap, the count, the array, the condition and the body's break signal each end the loop, per-iteration variable updates land before the next decision, and reaching the cap with no other terminator is `101040`.
+`validate_config` applies `validate_bound` and rejects an unterminated configuration (no count, array, or condition, and no break component).
+
+### `loop_control.rs` — `LoopBreakComponent` / `LoopSetVariableComponent`
+
+`LOOP_BREAK_MARKER` = `"__loop_break__"` and `LOOP_SET_VARIABLES_MARKER` = `"__loop_set_variables__"` are the data markers that replace Python's injected `LoopController` and sibling-node output writes.
+`LoopBreakConfig { condition: Option<String> }` is serde snake_case; `LoopBreakComponent::new()`, `with_config(LoopBreakConfig)`, `with_condition(expr)`, `config()`, `should_break(inputs) -> Result<bool>`; `component_type()` = `"loop_break"`; abilities `[Invoke]`.
+`invoke` returns `{"__loop_break__": <bool>}` — `true` when no condition is configured or the condition holds against the node inputs, `false` when a configured condition does not hold.
+`validate_config` rejects a blank or unparsable break condition (`101030`).
+`LoopSetVariableConfig { variable_mapping: BTreeMap<String, Value> }` is serde snake_case; `LoopSetVariableComponent::new(mapping)`, `with_config(..)`, `config()`, `mapping()`, `assignments(inputs) -> Result<Map<String, Value>>`; `component_type()` = `"loop_set_variable"`; abilities `[Invoke]`.
+`invoke` returns `{"__loop_set_variables__": {<name>: <value>}}` with every value resolved against the node inputs and every name normalized (`${loop.x}`, `loop.x`, `${x}` and `x` all name `x`).
+`validate_config` rejects an empty mapping and an invalid variable name (`101031`); standalone use returns the marker as the component's whole output.
+
+### Build-time configuration validation
+
+`Component::validate_config` (default `Ok(())`) is called by `crate::engine::validate` for every registered component while a workflow is compiled, so a component's own configuration problem is reported with its status code before any run instead of surfacing mid-run.
+The loop components are its first users: `loop`, `loop_group` and `advanced_loop` report a missing, zero, or out-of-range bound and an unterminatable container (`101030`), and the loop-body components report an unparsable break condition (`101030`) and an empty or invalid variable mapping (`101031`).
+The check runs for every component registered as a node, so a container's bad bound fails `Workflow::build` with that coded message joined into the same compile error as every other build problem; a body component's check is reached through its own `validate_config` because a loop body is a plain component list, not a registered node.
 
 ### `llm/` — `LlmComponent`
 
@@ -77,11 +115,18 @@ The child still starts from a fresh session, so its own checkpoint snapshot and 
 ### `http_request/` — `HttpRequestComponent`
 
 `config.rs` ports Python's configuration tree: `HttpComponentConfig`, `HttpRequestParamConfig`, `HttpHeadersConfig` (map or JSON template string), `HttpRequestBodyConfig`, `HttpAuthConfig` with `HttpAuthType`/`HttpAuthIn`, `HttpResponseHandlingConfig` with `HttpResponseFormat` (`autodetect`/`json`/`text`/`binary`/`buffer`) and `HttpResponseMode` (`full`/`on-success`/`on-error`), `HttpAdvancedOptionsConfig`, `HttpRetryConfig` with `HttpBackoffType` (`fixed`/`exponential`/`linear`), `HttpRateLimitConfig` with `HttpRateLimitUnit`, and `HttpContentType`.
+The module is composed by responsibility beside `mod.rs` (the component, input merge, request build and send/replay flow): `config.rs` the configuration tree, `template.rs` the `{{key}}`/`${path}` templating, `body.rs` the request bodies and `multipart.rs` the `multipart/form-data` encoder, `auth.rs` with `digest.rs` and `sigv4.rs` the authentication schemes, `response.rs` the response projection, and `rate_limit.rs` the sliding-window limiter; `CONTEXT.md` in this directory owns the per-submodule API and wire details.
 `HttpRequestComponent::new(HttpComponentConfig)`; `config() -> &HttpComponentConfig`; `component_type()` = `"http_request"`; abilities `[Invoke]` only (it still implements `stream`/`collect`/`transform` as single-result frames) so a plain node is never driven as `Transform`.
 Requests run through `openjiuwen_common::http::HttpClient`.
 `invoke` merges `inputs.method`/`headers`/`query_parameters` over the configuration and a non-null `inputs.body` into a JSON body, then templates `{{key}}` over `url`, `method`, header values, string query-parameter values, `body.json_data` (string form) and `body.text_data`; embedded `${path}` references resolve against the node inputs first (a Rust extension; auth secrets are left untouched).
 The output is `{statusCode, headers, body, url, ok}` with Python's success logic, `response_data_property` narrowing, and `response_mode` gating the object.
-4xx/5xx responses are ordinary data (`ok = false`); transport, timeout, cancellation, size and client-build failures become `[102000]`.
+`response_handling.throw_on_http_error` (default `true`) turns a failed status into a coded `COMPONENT_HTTP_ERROR` (`[102002]`) naming the status, `ok`, URL and a body preview; when `false` the 4xx/5xx response is ordinary data with `ok = false`.
+`advanced_options.max_body_length` (default 1 MiB, `0` = unlimited) rejects an encoded body over the limit before sending with `[102001]`, naming both sizes.
+`rate_limit_config.enabled` installs one sliding-window limiter per component instance whose delay is awaited before each send, honouring the run's cancellation token; `advanced_options.use_stream` is accepted and ignored (responses are buffered).
+Body kinds: JSON, text, URL-encoded form, binary (base64-decoded), and `multipart_form` (boundary, CRLF-framed parts, `filename`/`content_type` on file parts), all sent through `HttpClient`.
+Authentication: `basic`/`bearer`/`api_key` headers, challenge-driven `digest` replay (MD5/MD5-sess/SHA-256/SHA-256-sess, `qop=auth` when offered) and pre-flight AWS `SigV4` signing; an unanswerable challenge is ordinary response data with `ok = false`.
+`response_format = binary` base64-encodes the bytes, and `response_format = buffer` uses the lossless Node-style `{"type": "Buffer", "data": [..u8..], "length": n}` wire object.
+Transport, timeout, cancellation, size and client-build failures become `[102000]`.
 Retries are enabled by `retry_config.enabled` and run inside `HttpClient` (`fixed` caps at `retry_delay`, `exponential` at `retry_delay * 2^max_retries`, `linear` is approximated by `fixed`).
 Registered as the builtin `"http_request"` factory.
 
@@ -150,9 +195,13 @@ Local seams `MemoryRecall { async fn recall(&self, query, scope_id, user_id) -> 
 - `./end.rs` → `EndComponent`/`EndConfig`, the exit node with flat and template output modes
 - `./branch.rs` → `BranchComponent`/`BranchRouterAdapter`, condition-driven routing to successor ids
 - `./loop_.rs` → `LoopComponent`/`LoopConfig`/`LoopType`, bounded number/array/condition iteration over a body list
+- `./loop_driver.rs` → `LoopBound` and the shared iteration driver (plan, cap, iteration inputs, variable/break folding, container wrapper, build-time bound validation)
+- `./loop_group.rs` → `LoopGroupComponent`/`LoopGroupConfig`, variables plus the unbounded `until_break` container
+- `./advanced_loop.rs` → `AdvancedLoopComponent`/`AdvancedLoopConfig`, per-iteration termination re-evaluation
+- `./loop_control.rs` → `LoopBreakComponent`/`LoopBreakConfig` and `LoopSetVariableComponent`/`LoopSetVariableConfig` with their output markers
 - `./llm/` → `mod.rs` (component + abilities + invoke/stream), `format.rs` (instruction rewrite, schema generation, output shaping), `messages.rs` (prompt assembly + history insertion)
 - `./sub_workflow.rs` → `SubWorkflowComponent`, a compiled child workflow as one node
-- `./http_request/` → `HttpRequestComponent` and its Python configuration tree
+- `./http_request/` → `HttpRequestComponent` and its Python configuration tree (`CONTEXT.md` in that directory details every submodule)
 - `./questioner/` → `QuestionerComponent`, `QuestionerConfig`/`FieldInfo`, the zh/en extraction prompts
 - `./intent_detection.rs` → `IntentDetectionComponent`/`IntentDetectionCompConfig`/`IntentRouter`; `./intent_detection/` → local codes and the inline test suite
 - `./react_agent.rs` → `ReActAgentComponent`, the `AgentRunner` seam, `ModelReActRunner`
@@ -166,10 +215,15 @@ Unit tests live beside each module and use `WorkflowSession` plus a plain `Compo
 `start` covers identity and pass-through of objects, `null`, and scalars.
 `end` covers template segmentation (literals, adjacent variables, unclosed braces), flat filtering and null/scalar inputs, batch JSON-text stringification, missing variables, frame order and array expansion, `transform` parity with `stream`, nested flattening, the `responseTemplate` alias, and abilities.
 `branch` covers first-match delegation, the `101021` no-match error, the empty invoke output, and adapter naming/`Arc` sharing; the adapter's `RouterContext` path is exercised by engine integration tests because `RouterContext` has no public constructor.
-`loop_` covers number/array/condition plans, reference-path arrays, `previous` propagation, empty and multi-component bodies, the `1001` and session-tightened caps, a zero cap, every missing parameter, non-object inputs, and `LoopConfig` JSON round-trip/defaults.
+`loop_` covers number/array/condition plans, reference-path arrays, `previous` propagation, empty and multi-component bodies, the `1001` and session-tightened caps, a zero cap, every missing parameter, non-object inputs, break and loop-variable markers, and `LoopConfig` JSON round-trip/defaults.
+`loop_driver` covers the bound plan for every `LoopBound`, `validate_bound`'s missing/zero/out-of-range/blank/unparsable cases, `no_terminator`, `object_inputs`, variable resolution, `iteration_inputs`/`overlay_variables`, marker folding, and the `container_output` wrapper.
+`loop_group` covers the number/array/condition/`until_break` bounds, variable accumulation across rounds, break handling (including the first round), the session-tightened cap, non-object inputs, `validate_config`'s three rejections, `has_break_component`, alias parsing and the JSON round-trip.
+`advanced_loop` covers condition-decided termination, the cap, variable updates before the next decision, break handling, the unterminated configuration, non-object inputs, `validate_config`, and the JSON round-trip.
+`loop_control` covers `should_break` gating, the markers' exact shape, template resolution and name normalization, marker stripping, empty/invalid mappings, and every `validate_config` rejection.
 `llm/format` covers instruction rewriting, `generate_json_schema`, fence stripping, required-field errors, and output projection; `llm/messages` covers template precedence, history splicing, and turn recording.
-`start`, `end`, `branch`, `loop_`, `llm/mod`, `llm/format`, `llm/messages`, `tool`, `retrieval`, `memory`, `http_request/mod`, `http_request/config`, `intent_detection`, `react_agent` and `sub_workflow` (card identity, nesting default, opt-in cache, cache merging, interaction-wire parsing) carry inline suites.
+`start`, `end`, `branch`, `loop_`, `loop_driver`, `loop_group`, `advanced_loop`, `loop_control`, `llm/mod`, `llm/format`, `llm/messages`, `tool`, `retrieval`, `memory`, `http_request/mod`, `http_request/config`, `intent_detection`, `react_agent` and `sub_workflow` (card identity, nesting default, opt-in cache, cache merging, interaction-wire parsing) carry inline suites.
 `questioner` has no inline suite: its state machine, `question_content` rendering and chat-history window are covered by `../tests/questioner_component.rs`.
+The `http_request` submodules carry their own inline suites listed in `http_request/CONTEXT.md`'s test strategy.
 Crate-level suites in `../tests/` (listed in `tests/CONTEXT.md`) exercise the same components inside real workflows.
 
 ## Notes for Agents
@@ -183,7 +237,9 @@ Crate-level suites in `../tests/` (listed in `tests/CONTEXT.md`) exercise the sa
 - The body runs in-process: component errors propagate unchanged, while loop configuration, array-shape, and cap problems use `crate::error::loop_execution_error` (`101040`).
 - `SubWorkflowComponent` builds a fresh child `WorkflowSession` (shared checkpointer, own state store) for every run, so a parent `resume` replays the child from scratch and only the answers recorded under `sub_workflow_answers` carry over; child-side state such as questioner rounds, and any stored child snapshot, does not.
 - `HttpRequestComponent` declares only `Invoke` on purpose: the engine's ability priority would otherwise drive a plain node as `Transform`.
-- `HttpRequestComponent` deviations: multipart bodies and digest/AWS authentication return `Error::Unsupported`; `throw_on_http_error`, `rate_limit_config`, `use_stream` and `max_body_length` are parsed but not enforced; binary bodies are base64; JSON string bodies use `serde_json` instead of `ast.literal_eval`.
+- `HttpRequestComponent` deviations: digest and SigV4 authentication are implemented here while Python only declares the configuration; binary bodies/responses use base64 through JSON (`buffer` is the lossless form); JSON string bodies use `serde_json` instead of `ast.literal_eval`; Python's `response_handling.max_redirects` is not modelled; `advanced_options.disable_compression` and `use_stream` are accepted but not acted on; an API-key `in_location = body` is ignored, as in Python.
+- The loop containers report the same documented wrapper (`loop_results`, `loop_variables`, `loop_count`, `broken`) and represent body intent as data (`__loop_break__`, `__loop_set_variables__`) instead of Python's injected `LoopController` and sibling-node writes; `LoopComponent` keeps its narrower `{"loop_results": …}` output.
+- A loop body is a plain component list, so a body component's `validate_config` is not reached by `Workflow::build`; only a container registered as a node has its own configuration checked at build time.
 - `QuestionerComponent` deviations: the model is injected via `with_model` (no `model_id` runner lookup), chat history lives in the session `__messages__` lane instead of Python's `ModelContext` window (so every history-enabled component on one session shares one conversation, entries are text only through `BaseMessage::text`, and a leading system turn is dropped when the window is trimmed), `chat_history_max_rounds` of `0` is clamped to one round (Python requires `> 0`), the completing assistant turn is compact JSON rather than `json.dumps` with separators, a `question_content` round writes no assistant turn, there is no `QuestionerExecutable` layer, and the state reset writes `null`s because the session lane deep-merges.
 - `IntentDetectionComponent` deviations: the model is injected, history lives in `__messages__`, and JSON parsing is strict (`{'class': 'x'}` is rejected).
 - `ReActAgentComponent` deviations: interrupts become `result_type: "interrupt"` data (the run completes), `on_max_iterations` policies return plain values instead of Python's rich dict, and the agent runtime (context engine, rails, skills, KV cache) is deferred to `AgentRunner` implementations.

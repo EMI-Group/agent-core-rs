@@ -371,3 +371,74 @@ fn id_limits_and_frame_helpers_are_exported() {
         openjiuwen_workflow::output::frame_to_wire(&frame)
     );
 }
+
+/// The loop-coordination and history-corruption surfaces are reachable at the crate root,
+/// with the same identity as their module paths and the documented wire strings.
+#[test]
+fn loop_coordination_and_history_types_are_exported() {
+    use openjiuwen_workflow::{
+        history_corrupt_error, AdvancedLoopComponent, AdvancedLoopConfig, Component,
+        HistoryCorruption, HistoryCorruptionReason, LoopBound, LoopBreakComponent, LoopBreakConfig,
+        LoopGroupComponent, LoopGroupConfig, LoopSetVariableComponent, LoopSetVariableConfig,
+        StreamDelivery, LOOP_BREAK_MARKER, LOOP_SET_VARIABLES_MARKER, WORKFLOW_HISTORY_CORRUPT,
+    };
+
+    // Type identity: the root path and the module path name the same items.
+    let group: LoopGroupComponent =
+        openjiuwen_workflow::components::LoopGroupComponent::new(LoopGroupConfig::new(), vec![]);
+    assert_eq!(group.component_type(), "loop_group");
+    let advanced: AdvancedLoopComponent =
+        openjiuwen_workflow::components::AdvancedLoopComponent::new(
+            AdvancedLoopConfig::new(),
+            vec![],
+        );
+    assert_eq!(advanced.component_type(), "advanced_loop");
+    let break_component: LoopBreakComponent =
+        openjiuwen_workflow::components::loop_control::LoopBreakComponent::new();
+    assert_eq!(break_component.component_type(), "loop_break");
+    let set_variable: LoopSetVariableComponent =
+        openjiuwen_workflow::components::LoopSetVariableComponent::with_config(
+            LoopSetVariableConfig::new().with_variable("", json!("")),
+        );
+    assert_eq!(set_variable.component_type(), "loop_set_variable");
+    let _ = LoopBreakConfig::new();
+
+    // The markers and the bound wire names Python-shaped specs use.
+    assert_eq!(LOOP_BREAK_MARKER, "__loop_break__");
+    assert_eq!(LOOP_SET_VARIABLES_MARKER, "__loop_set_variables__");
+    for (bound, expected) in [
+        (LoopBound::Number, "number"),
+        (LoopBound::Array, "array"),
+        (LoopBound::Condition, "condition"),
+        (LoopBound::UntilBreak, "until_break"),
+    ] {
+        assert_eq!(bound.as_str(), expected);
+        assert_eq!(serde_json::to_value(bound).unwrap(), json!(expected));
+    }
+    assert_eq!(
+        serde_json::from_value::<LoopBound>(json!("always_true")).unwrap(),
+        LoopBound::UntilBreak
+    );
+
+    // `StreamDelivery` is part of the same root surface, with its run-option default.
+    assert_eq!(StreamDelivery::default(), StreamDelivery::Buffered);
+    assert_eq!(StreamDelivery::Buffered.as_str(), "buffered");
+    assert_eq!(StreamDelivery::Interleaved.as_str(), "interleaved");
+    assert!(StreamDelivery::Buffered.is_supported());
+    assert!(!StreamDelivery::Interleaved.is_supported());
+
+    // The history-corruption record and its coded error.
+    assert_eq!(WORKFLOW_HISTORY_CORRUPT, 100_060);
+    let corruption = HistoryCorruption::new(
+        HistoryCorruptionReason::NotAnArray,
+        "lane holds a JSON number",
+    );
+    assert_eq!(corruption.reason.as_str(), "not_an_array");
+    let error = history_corrupt_error(&corruption);
+    assert!(error.message().contains("[100060]"), "{error}");
+    assert!(error.message().contains("reason=not_an_array"), "{error}");
+    assert_eq!(
+        error.message(),
+        openjiuwen_workflow::context::history::history_corrupt_error(&corruption).message()
+    );
+}
