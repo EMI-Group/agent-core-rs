@@ -109,15 +109,15 @@ pub use identity::{
     canonical_json, endpoint_sha256, graph_identity_sha256, sanitize_metadata,
     stable_metadata_sha256, ModelIdentity, IDENTITY_VERSION, MAX_METADATA_DEPTH,
 };
-pub use judge::{LlmJudgeMetric, DEFAULT_JUDGE_NAME, DEFAULT_RUBRIC};
+pub use judge::{JudgeVerdict, LlmJudgeMetric, DEFAULT_JUDGE_NAME, DEFAULT_RUBRIC};
 pub use ontology::{
-    MatchOptions, OntologyConfig, OntologyMatch, OntologyMatcher, MATCHER_VERSION,
+    MatchOptions, MatchedVerdict, OntologyConfig, OntologyMatch, OntologyMatcher, MATCHER_VERSION,
     MATCH_SCHEMA_VERSION, PROMPT_VERSION,
 };
 pub use scoring::{DeterministicScorer, LlmSemanticScorer, SemanticScores};
 pub use tree::{
     LlmTreeRetriever, RetrieverItem, RetrieverNode, TreeRetriever, TreeRetrieverConfig,
-    TreeSearchRequest, TreeSearchResult,
+    TreeSearchOutcome, TreeSearchRequest, TreeSearchResult,
 };
 
 /// Chooses what a stage does when the configured model fails or answers unusably.

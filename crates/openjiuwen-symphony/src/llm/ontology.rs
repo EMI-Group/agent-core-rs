@@ -57,7 +57,7 @@
 //!
 //! A matcher wraps an optional model and silently answers from the candidate rule when no
 //! model is wired, so a bare [`OntologyMatch`] cannot tell a caller which path produced it.
-//! [`MatchedVerdict`](crate::llm::ontology::MatchedVerdict) pairs the verdict with the
+//! [`MatchedVerdict`] pairs the verdict with the
 //! [`StageProvenance`] that produced it, and the two detailed
 //! entry points — [`OntologyMatcher::match_candidates_detailed`] and
 //! [`OntologyMatcher::match_candidates_with_detailed`] — return it.
@@ -1149,12 +1149,12 @@ mod tests {
         assert!(!verdicts[1].accepted(), "0.2 is below the threshold");
 
         // The verdict-only entry points return the same matches.
-        let matches = matcher
+        let plain = matcher
             .match_candidates(&[candidate(MatchStrategy::ExactIo, 1.0)])
             .await
             .unwrap();
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].method, METHOD_DETERMINISTIC);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].method, METHOD_DETERMINISTIC);
     }
 
     #[tokio::test]

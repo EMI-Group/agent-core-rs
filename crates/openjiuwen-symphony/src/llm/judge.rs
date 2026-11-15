@@ -30,7 +30,7 @@
 //! A bare [`MetricScore`](crate::evaluation::MetricScore) cannot tell "no model was
 //! configured" from "the model was unusable twice": both carry the
 //! `deterministic_fallback:` `detail`. [`LlmJudgeMetric::evaluate_with_provenance`] therefore
-//! returns a [`JudgeVerdict`](crate::llm::judge::JudgeVerdict) — the score plus the
+//! returns a [`JudgeVerdict`] — the score plus the
 //! [`StageProvenance`] it came from:
 //!
 //! | Path | Provenance | Log record |
@@ -46,7 +46,7 @@
 //! [`MetricScore`](crate::evaluation::MetricScore) that
 //! [`crate::evaluation::LlmJudgedMetric`] and the suites consuming it already expect —
 //! they keep reading the marker through `detail`, while a caller that needs the exact
-//! provenance reads it off the [`JudgeVerdict`](crate::llm::judge::JudgeVerdict).
+//! provenance reads it off the [`JudgeVerdict`].
 use std::fmt;
 use std::sync::Arc;
 
