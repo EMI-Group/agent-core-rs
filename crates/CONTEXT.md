@@ -37,7 +37,7 @@ Python package `openjiuwen.<pkg>` maps to crate `openjiuwen-<pkg>`; `openjiuwen-
 | `openjiuwen-auto-harness` | 6 | pure facade over `openjiuwen-rsi::auto_harness` | Implemented |
 | `openjiuwen-agent-teams` | 6 | leader/teammate runtime, task board, mailbox, HITL, SQLite team store, process/external-CLI/SSH members with checkpoint env vars, org layer, Unix-socket attach, team-memory wiring and OTLP memory observer, skill CLI + MCP server | Subset |
 | `openjiuwen` | 7 | top-level umbrella: module aliases for every public tree plus a curated `prelude` | Implemented |
-| `openjiuwen-cli` | 7 | binary `openjiuwen` (`run`, `chat`, `lsp`, `cron`, `team`, `watch`, `auto-harness`) — thin process boundary over `openjiuwen-harness` | Implemented |
+| `openjiuwen-cli` | 7 | binary `openjiuwen` (`run`, `chat`, `lsp`, `cron`, `team`, `watch`, `sessions`, `auto-harness`, with `run`/`chat` `--resume`/`--continue`) — thin process boundary over `openjiuwen-harness` | Implemented |
 | `openjiuwen-test-support` | dev | loopback mock LLM server, scripted model, fixtures, JSON/eventual helpers | Implemented |
 | `openjiuwen-e2e` | dev | cross-crate scenario suite (26 test binaries, 125 scenarios) | Implemented |
 | `openjiuwen-examples` | dev | 26 runnable examples plus the offline smoke test that executes them | Implemented |
@@ -76,7 +76,7 @@ Deferred areas per crate, condensed from each crate's own `CONTEXT.md` gap secti
 | `openjiuwen-multiagent` | the Pulsar transport, Redis cluster/Sentinel topologies, stream housekeeping (`XTRIM`)/`XPENDING` fallback, Python's `drunner`/`RemoteAgent` factories and reply-topic routing, and the distributed team event bus |
 | `openjiuwen-runner` | distributed mode (Pulsar/ZeroMQ/MQ envelopes/`RemoteAgent`, `RemoteProtocol::A2a`), Python's `python -m` child bootstrap and the process pool, team-pool extras (OS-process/external-CLI/SSH members, cross-process attach, monitor TUI, org layer), in-loop HITL gate enforcement and answering auth, monitor persistence/exports, resource-manager and callback-framework extras, `ReadWriteLockManager`, and spawner introspection/live deadline re-tuning |
 | `openjiuwen-macros` | sync and generator tool handlers and `Args:` doc-block parameter descriptions (handlers are async-only; `schemars` owns descriptions) |
-| `openjiuwen-cli` | non-dry `auto-harness run` and `verify-ext` (no RSI evaluation runner or extension loader), persistent-agent resume, `team`'s `invoke_tool` op, and MCP/OTel-backed harness surfaces |
+| `openjiuwen-cli` | non-dry `auto-harness run` and `verify-ext` (no RSI evaluation runner or extension loader), `team`'s `invoke_tool` op, MCP/OTel-backed harness surfaces, and execution-journal resume for the interactive REPL (it seeds history but cannot adopt the persisted session id) |
 
 ## Dependency Layers
 
@@ -238,7 +238,7 @@ Note: nothing in the workspace enables `vendor`, so a consumer wanting vendor pr
 
 ### Tooling and CLI
 
-- `./openjiuwen-cli/` → binary `openjiuwen` (`run`, `chat`, `lsp`, `cron`, `team`, `watch`, `auto-harness`)
+- `./openjiuwen-cli/` → binary `openjiuwen` (`run`, `chat`, `lsp`, `cron`, `team`, `watch`, `sessions`, `auto-harness`, with `run`/`chat` `--resume`/`--continue`)
 - `./openjiuwen-dev-tools/` → prompt builder, skill creator/evaluator, agent builder, tune optimizers
 
 ### Test infrastructure
