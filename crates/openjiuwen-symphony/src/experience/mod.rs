@@ -85,7 +85,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub use bank::{AddOutcome, ExperienceBank};
-pub use cluster::{cluster_traces, ClusteredQuery, CLUSTER_SIMILARITY_THRESHOLD};
+pub use cluster::{cluster_traces, cluster_traces_with_embedding, ClusterConfig, ClusteredQuery};
 pub use collector::{
     CollectorStats, ExperienceCollector, ExperienceSink, PATTERN_MERGE_THRESHOLD,
     PENDING_FLUSH_THRESHOLD, QUERY_EXAMPLES_COUNT,
