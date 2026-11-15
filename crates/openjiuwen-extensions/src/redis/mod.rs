@@ -2,15 +2,15 @@
 //!
 //! `openjiuwen-extensions` cannot depend on a Redis driver: the workspace builds
 //! offline and no such crate is vendored. The client in this module speaks the
-//! Redis serialization protocol directly over [`tokio::net::TcpStream`], covering
-//! the single-node command surface the Redis checkpointer and key-value store use
-//! (`GET`/`SET`/`EXISTS`/`DEL`/`UNLINK`/`MGET`/`SCAN`/`EXPIRE`, sets, sorted sets,
-//! and pipelined batches).
+//! Redis serialization protocol directly over `tokio`, covering the command surface
+//! the Redis checkpointer and store adapters use (`GET`/`SET`/`EXISTS`/`DEL`/
+//! `UNLINK`/`MGET`/`SCAN`/`EXPIRE`, sets, sorted sets, and pipelined batches).
 //!
-//! Supported transport: `redis://` and `redis+cluster://` (single-node connect, with
-//! [`ConnectionOptions::cluster_mode`] recorded). `rediss://` needs a TLS stack the
-//! workspace does not vendor, and cluster slot routing is not implemented; both
-//! return [`openjiuwen_common::error::Error::Unsupported`] with a reason.
+//! Supported transports: `redis://` over TCP, `rediss://` over TLS (verified against
+//! the web PKI through `rustls` and `webpki-roots`), and `redis[s]+cluster://`, which
+//! verifies the seed as a cluster node and follows `MOVED`/`ASK` redirections.
+//! [`ConnectionOptions::tls`] and [`ConnectionOptions::cluster_mode`] record those
+//! choices.
 //!
 //! ```no_run
 //! use openjiuwen_extensions::redis::{Client, Reply};

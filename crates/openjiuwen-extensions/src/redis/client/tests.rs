@@ -1,8 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+use super::cluster::{self, NodeAddr, RedirectKind};
 use super::*;
 use crate::redis::testsupport::{FakeOptions, FakeRedis};
 use openjiuwen_common::error::ErrorKind;
 use serde_json::json;
+use std::net::SocketAddr;
 use std::time::Duration;
 fn args(value: serde_json::Value) -> BTreeMap<String, serde_json::Value> {
     serde_json::from_value(value).expect("test JSON is an object")
@@ -15,6 +17,7 @@ fn default_options_target_local_redis() {
     assert_eq!(options.db, None);
     assert_eq!(options.timeout, Duration::from_secs(10));
     assert!(!options.cluster_mode);
+    assert!(!options.tls);
 }
 #[test]
 fn parses_minimal_url() {
@@ -57,12 +60,21 @@ fn cluster_scheme_sets_cluster_mode() {
     assert_eq!(options.port, 7000);
 }
 #[test]
-fn tls_scheme_is_unsupported() {
-    for url in ["rediss://example.com", "rediss+cluster://example.com"] {
-        let error = ConnectionOptions::from_url(url).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported, "url {url}");
-        assert!(error.to_string().contains("TLS"), "url {url}");
-    }
+fn tls_schemes_record_the_tls_flag() {
+    let tls = ConnectionOptions::from_url("rediss://example.com:6380/2").unwrap();
+    assert!(tls.tls, "rediss:// selects TLS");
+    assert!(!tls.cluster_mode);
+    assert_eq!(tls.port, 6380);
+    assert_eq!(tls.db, Some(2));
+    let cluster = ConnectionOptions::from_url("rediss+cluster://example.com:7000").unwrap();
+    assert!(cluster.tls, "rediss+cluster:// selects TLS");
+    assert!(
+        cluster.cluster_mode,
+        "rediss+cluster:// selects cluster mode"
+    );
+    let plain = ConnectionOptions::from_url("redis://example.com").unwrap();
+    assert!(!plain.tls);
+    assert!(!plain.cluster_mode);
 }
 #[test]
 fn other_schemes_and_bad_databases_are_validation_errors() {
@@ -329,13 +341,235 @@ async fn wrong_type_replies_are_validation_errors() {
     fake.shutdown().await;
 }
 #[tokio::test]
-async fn moved_replies_are_unsupported() {
-    let fake = FakeRedis::start_with(FakeOptions::moved_everything()).await;
-    let client = Client::from_url(&fake.url()).await.unwrap();
+async fn moved_is_followed_once_and_caches_the_slot() {
+    // `12739` is the hash slot of the key `123456789`.
+    let owner = FakeRedis::start().await;
+    let owner_client = Client::from_url(&owner.url()).await.unwrap();
+    owner_client
+        .command_str(&["SET", "123456789", "ada"])
+        .await
+        .unwrap();
+    let seed = FakeRedis::start_with(FakeOptions::moved_to(12739, owner.addr())).await;
+    let client = Client::from_url(&seed.url()).await.unwrap();
+    assert_eq!(
+        client.command_str(&["GET", "123456789"]).await.unwrap(),
+        Reply::Bulk(b"ada".to_vec())
+    );
+    assert_eq!(seed.state().commands(), ["SELECT", "GET"]);
+    // The owner sees the test client's own `SELECT`/`SET` plus the redirected
+    // connection's handshake and `GET`.
+    assert_eq!(owner.state().commands(), ["SELECT", "SET", "SELECT", "GET"]);
+    // The slot is cached, so an equivalent hash tag goes straight to the owner node.
+    assert_eq!(
+        client
+            .command_str(&["GET", "{123456789}other"])
+            .await
+            .unwrap(),
+        Reply::Null
+    );
+    assert_eq!(
+        seed.state().commands(),
+        ["SELECT", "GET"],
+        "the cached slot must not go back to the seed"
+    );
+    assert_eq!(
+        owner.state().commands(),
+        ["SELECT", "SET", "SELECT", "GET", "GET"]
+    );
+    seed.shutdown().await;
+    owner.shutdown().await;
+}
+#[tokio::test]
+async fn a_second_consecutive_moved_is_a_transport_error() {
+    let dead = closed_address().await;
+    let hop = FakeRedis::start_with(FakeOptions::moved_to(3999, dead)).await;
+    let seed = FakeRedis::start_with(FakeOptions::moved_to(3999, hop.addr())).await;
+    let client = Client::from_url(&seed.url()).await.unwrap();
     let error = client.command_str(&["GET", "key"]).await.unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert!(error.to_string().contains("MOVED/ASK"));
+    assert_eq!(error.kind(), ErrorKind::Transport);
+    let message = error.to_string();
+    assert!(
+        message.contains("second consecutive redirection"),
+        "{message}"
+    );
+    assert!(message.contains("MOVED 3999"), "{message}");
+    // The redirection was followed exactly once: one `MOVED` command, no loop.
+    assert_eq!(seed.state().commands(), ["SELECT", "GET"]);
+    assert_eq!(hop.state().commands(), ["SELECT", "GET"]);
+    seed.shutdown().await;
+    hop.shutdown().await;
+}
+#[tokio::test]
+async fn ask_sends_asking_before_the_command_and_is_not_cached() {
+    let owner = FakeRedis::start().await;
+    let seed = FakeRedis::start_with(FakeOptions::ask_to(3999, owner.addr())).await;
+    let client = Client::from_url(&seed.url()).await.unwrap();
+    assert_eq!(
+        client.command_str(&["GET", "k"]).await.unwrap(),
+        Reply::Null
+    );
+    assert_eq!(
+        owner.state().first_connection_commands(),
+        ["SELECT", "ASKING", "GET"],
+        "ASKING must precede the redirected command on the same connection"
+    );
+    assert_eq!(owner.state().connection_count(), 1);
+    // `ASK` is a one-shot redirection, so the next command starts at the seed again.
+    assert_eq!(
+        client.command_str(&["GET", "k"]).await.unwrap(),
+        Reply::Null
+    );
+    assert_eq!(seed.state().commands(), ["SELECT", "GET", "GET"]);
+    assert_eq!(
+        owner.state().commands(),
+        ["SELECT", "ASKING", "GET", "ASKING", "GET"]
+    );
+    seed.shutdown().await;
+    owner.shutdown().await;
+}
+#[tokio::test]
+async fn a_pipeline_follows_redirects_and_keeps_positions() {
+    let owner = FakeRedis::start().await;
+    let seed = FakeRedis::start_with(FakeOptions::moved_to(3999, owner.addr())).await;
+    let client = Client::from_url(&seed.url()).await.unwrap();
+    let replies = client
+        .pipeline(&[
+            vec![b"SET".to_vec(), b"a".to_vec(), b"1".to_vec()],
+            vec![b"GET".to_vec(), b"missing".to_vec()],
+            vec![b"EXISTS".to_vec(), b"a".to_vec()],
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        replies,
+        vec![
+            Reply::Simple("OK".to_owned()),
+            Reply::Null,
+            Reply::Integer(1),
+        ]
+    );
+    assert_eq!(seed.state().commands(), ["SELECT", "SET", "GET", "EXISTS"]);
+    assert_eq!(owner.state().commands(), ["SELECT", "SET", "GET", "EXISTS"]);
+    seed.shutdown().await;
+    owner.shutdown().await;
+}
+#[tokio::test]
+async fn cluster_mode_against_a_standalone_node_is_rejected() {
+    let fake = FakeRedis::start().await;
+    let url = format!("redis+cluster://{}/0", fake.addr());
+    let error = Client::from_url(&url).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let message = error.to_string();
+    assert!(message.contains("cluster_enabled:1"), "{message}");
+    assert!(message.contains("not a cluster node"), "{message}");
     fake.shutdown().await;
+}
+#[tokio::test]
+async fn cluster_mode_against_a_cluster_node_connects() {
+    let fake = FakeRedis::start_with(FakeOptions::cluster()).await;
+    let url = format!("redis+cluster://{}/0", fake.addr());
+    let client = Client::from_url(&url).await.unwrap();
+    assert!(client.options().cluster_mode);
+    client.ping().await.unwrap();
+    // The node was verified and its slot map read before the first command.
+    assert_eq!(
+        fake.state().commands(),
+        ["SELECT", "CLUSTER", "CLUSTER", "PING"]
+    );
+    fake.shutdown().await;
+}
+#[tokio::test]
+async fn cluster_mode_presees_slots_from_cluster_slots() {
+    let owner = FakeRedis::start().await;
+    let owner_client = Client::from_url(&owner.url()).await.unwrap();
+    owner_client.command_str(&["SET", "k", "v"]).await.unwrap();
+    let seed = FakeRedis::start_with(FakeOptions::cluster_owned_by(
+        "127.0.0.1",
+        owner.addr().port(),
+    ))
+    .await;
+    let url = format!("redis+cluster://{}/0", seed.addr());
+    let client = Client::from_url(&url).await.unwrap();
+    assert_eq!(
+        client.command_str(&["GET", "k"]).await.unwrap(),
+        Reply::Bulk(b"v".to_vec())
+    );
+    assert_eq!(seed.state().commands(), ["SELECT", "CLUSTER", "CLUSTER"]);
+    assert_eq!(owner.state().commands(), ["SELECT", "SET", "SELECT", "GET"]);
+    seed.shutdown().await;
+    owner.shutdown().await;
+}
+#[tokio::test]
+async fn a_rediss_url_against_a_plain_listener_fails_the_handshake() {
+    // No certificate fixture is available offline, so a successful handshake is not
+    // exercised here; what matters is that TLS is attempted (never `Unsupported`)
+    // and that a peer that does not speak TLS surfaces as a transport error.
+    let fake = FakeRedis::start().await;
+    let url = format!("rediss://{}/0", fake.addr());
+    let error = Client::from_url(&url).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Transport);
+    let message = error.to_string();
+    assert!(message.contains("TLS"), "{message}");
+    assert!(!message.contains("Unsupported"), "{message}");
+    fake.shutdown().await;
+}
+#[test]
+fn redirection_messages_parse_slots_and_nodes() {
+    let moved = cluster::parse_redirect("MOVED 3999 127.0.0.1:7000").unwrap();
+    assert_eq!(moved.kind, RedirectKind::Moved);
+    assert_eq!(moved.slot, 3999);
+    assert_eq!(moved.addr, NodeAddr::new("127.0.0.1", 7000));
+    assert_eq!(moved.raw, "MOVED 3999 127.0.0.1:7000");
+    let ask = cluster::parse_redirect("ASK 12 [::1]:7001").unwrap();
+    assert_eq!(ask.kind, RedirectKind::Ask);
+    assert_eq!(ask.slot, 12);
+    assert_eq!(ask.addr, NodeAddr::new("::1", 7001));
+    for other in [
+        "ERR unknown command",
+        "WRONGTYPE Operation against a key",
+        "MOVED not-a-slot 127.0.0.1:7000",
+        "MOVED 1 missing-port",
+        "MOVED 1 host:0",
+        "MOVED 1 :7000",
+        "MOVED 70000 127.0.0.1:7000",
+    ] {
+        assert!(cluster::parse_redirect(other).is_none(), "message {other}");
+    }
+}
+#[test]
+fn hash_slots_match_redis_and_honour_hash_tags() {
+    // Reference values from `CLUSTER KEYSLOT`.
+    assert_eq!(cluster::hash_slot(b"123456789"), 12_739);
+    assert_eq!(cluster::hash_slot(b"foo"), 12_182);
+    assert_eq!(cluster::hash_slot(b"bar"), 5_061);
+    // A `{tag}` restricts hashing to the tagged substring.
+    assert_eq!(cluster::hash_slot(b"{user1000}.following"), 3_443);
+    assert_eq!(cluster::hash_slot(b"{user1000}.followers"), 3_443);
+    // An empty tag and an unterminated tag both hash the whole key.
+    assert_eq!(cluster::hash_slot(b"{}foo"), 9_500);
+    assert_ne!(cluster::hash_slot(b"{}foo"), cluster::hash_slot(b"foo"));
+    assert_eq!(cluster::hash_slot(b"{unclosed"), 470);
+    assert_ne!(
+        cluster::hash_slot(b"{user1000}.following"),
+        cluster::hash_slot(b"{user1001}.following")
+    );
+}
+#[test]
+fn only_single_key_commands_consult_the_slot_cache() {
+    assert_eq!(cluster::command_slot(&[b"GET", b"123456789"]), Some(12_739));
+    assert_eq!(
+        cluster::command_slot(&[b"get", b"123456789"]),
+        Some(12_739),
+        "command names are matched case-insensitively"
+    );
+    // Keyless, multi-key, and unknown commands always start at the seed node.
+    assert_eq!(cluster::command_slot(&[b"PING"]), None);
+    assert_eq!(cluster::command_slot(&[b"MGET", b"123456789"]), None);
+    assert_eq!(
+        cluster::command_slot(&[b"SCAN", b"0", b"MATCH", b"*"]),
+        None
+    );
+    assert_eq!(cluster::command_slot(&[]), None);
 }
 #[tokio::test]
 async fn timeouts_name_the_command_but_never_the_arguments() {
@@ -356,14 +590,16 @@ async fn timeouts_name_the_command_but_never_the_arguments() {
     assert!(!message.contains("top-secret-key"), "message {message}");
     fake.shutdown().await;
 }
-#[tokio::test]
-async fn cluster_url_connects_as_a_single_node() {
-    let fake = FakeRedis::start().await;
-    let url = format!("redis+cluster://{}/0", fake.addr());
-    let client = Client::from_url(&url).await.unwrap();
-    assert!(client.options().cluster_mode);
-    client.ping().await.unwrap();
-    fake.shutdown().await;
+/// A loopback address with nothing listening on it.
+async fn closed_address() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("loopback listener binds");
+    let addr = listener
+        .local_addr()
+        .expect("bound listener has an address");
+    drop(listener);
+    addr
 }
 #[tokio::test]
 async fn empty_commands_are_rejected_before_io() {

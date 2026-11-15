@@ -17,7 +17,8 @@
 //! The `redis` backend stores every value as a one-byte kind tag followed by the
 //! payload so a [`KvValue`] keeps its `Text`/`Bytes` variant across a round trip;
 //! that is an intentional deviation from Python's `RedisStore`, which writes the
-//! bare payload. TLS (`rediss://`) and cluster slot routing stay deferred.
+//! bare payload. The Redis adapters accept `rediss://` (TLS) and
+//! `redis[s]+cluster://` (cluster redirection) through the crate's own `redis` client.
 //!
 //! Every factory takes a [`StoreBackend`] so callers can select a backend from
 //! configuration (see [`StoreBackend::from_json`]) and hand it to

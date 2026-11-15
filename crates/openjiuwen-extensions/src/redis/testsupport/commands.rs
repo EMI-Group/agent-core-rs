@@ -16,17 +16,19 @@ use super::support::{
     parse_f64, parse_i64, protocol_error, relative_expiry, syntax_error, ttl_reply, upper,
     wrong_arity, wrong_type,
 };
-use super::{ConnState, Data, FakeOptions, ServerState};
+use super::{ClusterMode, ConnState, Data, FakeOptions, ServerState};
 use crate::redis::codec::Reply;
 
 impl ServerState {
-    pub(super) fn new(options: FakeOptions) -> Self {
+    pub(super) fn new(options: FakeOptions, addr: std::net::SocketAddr) -> Self {
         Self {
             options,
+            addr,
             data: StdMutex::new(Data::default()),
             connections: AtomicUsize::new(0),
             auth_attempts: AtomicUsize::new(0),
             commands: StdMutex::new(Vec::new()),
+            connection_commands: StdMutex::new(Vec::new()),
         }
     }
     pub(super) fn data(&self) -> MutexGuard<'_, Data> {
@@ -45,15 +47,31 @@ impl ServerState {
             .lock()
             .expect("fake redis command log mutex is not poisoned")
             .push(name.clone());
+        if let Ok(mut logs) = self.connection_commands.lock() {
+            if let Some(log) = logs.get_mut(connection.index) {
+                log.push(name.clone());
+            }
+        }
         if self.options.require_auth.is_some() && !connection.authed && name != "AUTH" {
             return Reply::Error("NOAUTH Authentication required.".to_owned());
         }
-        if self.options.moved_everything && !matches!(name.as_str(), "AUTH" | "SELECT" | "HELLO") {
-            return Reply::Error("MOVED 3999 127.0.0.1:7000".to_owned());
+        if name == "CLUSTER" {
+            return self.cluster_reply(args);
+        }
+        if let Some(redirect) = self.options.redirect.as_ref() {
+            if !matches!(name.as_str(), "AUTH" | "SELECT" | "HELLO" | "ASKING") {
+                return Reply::Error(format!(
+                    "{} {} {}",
+                    if redirect.ask { "ASK" } else { "MOVED" },
+                    redirect.slot,
+                    redirect.target
+                ));
+            }
         }
         let mut data = self.data();
         data.purge();
         match name.as_str() {
+            "ASKING" => Reply::Simple("OK".to_owned()),
             "PING" => match args.len() {
                 1 => Reply::Simple("PONG".to_owned()),
                 2 => Reply::Bulk(args[1].clone()),
@@ -407,6 +425,38 @@ impl ServerState {
             data.expiries.remove(&key);
         }
         Reply::Simple("OK".to_owned())
+    }
+    /// Handles `CLUSTER INFO` / `CLUSTER SLOTS` for the scripted cluster modes.
+    ///
+    /// A node without a [`ClusterMode`] answers like a standalone server: `INFO`
+    /// reports `cluster_enabled:0` and `SLOTS` is an error.
+    fn cluster_reply(&self, args: &[Vec<u8>]) -> Reply {
+        let subcommand = args.get(1).map(|arg| upper(arg)).unwrap_or_default();
+        match (subcommand.as_str(), self.options.cluster.as_ref()) {
+            ("INFO", Some(_)) => Reply::Bulk(
+                b"cluster_enabled:1\r\ncluster_state:ok\r\ncluster_slots_assigned:16384\r\n"
+                    .to_vec(),
+            ),
+            ("INFO", None) => Reply::Bulk(b"cluster_enabled:0\r\ncluster_state:fail\r\n".to_vec()),
+            ("SLOTS", Some(mode)) => {
+                let (host, port) = match mode {
+                    ClusterMode::SelfOwned => (self.addr.ip().to_string(), self.addr.port()),
+                    ClusterMode::OwnedBy(host, port) => (host.clone(), *port),
+                };
+                Reply::Array(vec![Reply::Array(vec![
+                    Reply::Integer(0),
+                    Reply::Integer(16383),
+                    Reply::Array(vec![
+                        Reply::Bulk(host.into_bytes()),
+                        Reply::Integer(i64::from(port)),
+                    ]),
+                ])])
+            }
+            ("SLOTS", None) => {
+                Reply::Error("ERR This instance has cluster support disabled".to_owned())
+            }
+            _ => Reply::Error(format!("ERR Unknown CLUSTER subcommand '{subcommand}'")),
+        }
     }
     /// Handles `ZRANGE key start stop [WITHSCORES]`.
     fn zrange(data: &Data, args: &[Vec<u8>]) -> Reply {

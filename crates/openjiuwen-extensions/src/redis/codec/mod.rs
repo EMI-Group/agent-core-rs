@@ -11,6 +11,12 @@
 //! `MAX_BULK_LEN` are rejected with [`openjiuwen_common::error::ErrorKind::Transport`]
 //! instead of allocating or recursing without bound.
 //!
+//! `RESP3` attributes (`|N`) are metadata: the parser consumes the `N` key/value
+//! pairs and returns the reply that follows them, so a request/response client
+//! sees the value and never the attribute bag.
+//! `RESP3` streamed strings (`;N`) are decoded by concatenating their chunks into
+//! one binary-safe [`Reply::Bulk`] up to the `;0` terminator.
+//!
 //! Server error replies (`-...`) are returned as [`Reply::Error`], including
 //! `-MOVED`/`-ASK` redirections; mapping those to typed errors is the
 //! [`crate::redis::client`] layer's job.
@@ -230,14 +236,17 @@ pub fn encode_command(args: &[&[u8]]) -> Vec<u8> {
 /// Returns `Ok(None)` when `input` does not yet hold a complete reply, and
 /// `Ok(Some((reply, consumed)))` otherwise, where `consumed` is the number of
 /// bytes belonging to that reply (any trailing bytes are preserved for the next
-/// call). Invalid framing, oversized headers, and unsupported `RESP3` constructs
-/// are reported as errors; this function never panics.
+/// call). Invalid framing and oversized headers are reported as errors; this
+/// function never panics.
+///
+/// A `RESP3` attribute (`|N`) is consumed as metadata and the reply that follows
+/// it is returned in its place. A `RESP3` streamed string (`;N`) is returned as
+/// the concatenation of its chunks in one [`Reply::Bulk`].
 ///
 /// # Errors
 ///
 /// Returns [`openjiuwen_common::error::ErrorKind::Transport`] for malformed or
-/// truncated framing and [`openjiuwen_common::error::ErrorKind::Unsupported`] for
-/// `RESP3` attributes (`|`) and streamed strings (`;`).
+/// truncated framing and for a chunked aggregate that exceeds the parser bounds.
 pub fn parse_reply(input: &[u8]) -> Result<Option<(Reply, usize)>> {
     parse_at(input, 0)
 }
@@ -320,15 +329,99 @@ fn parse_at(input: &[u8], depth: usize) -> Result<Option<(Reply, usize)>> {
                 consumed,
             )))
         }
-        b'|' => Err(Error::unsupported(
-            "RESP3 attribute replies ('|') are not supported",
-        )),
-        b';' => Err(Error::unsupported(
-            "RESP3 streamed strings (';') are not supported",
-        )),
+        b'|' => parse_attribute(input, depth),
+        b';' => parse_streamed_string(input),
         other => Err(Error::transport(format!(
             "invalid RESP reply type byte 0x{other:02x}"
         ))),
+    }
+}
+/// Parses a `RESP3` attribute (`|N` key/value pairs) and the reply that follows.
+///
+/// Attributes are metadata about the next reply, so the parser projects them
+/// away: the returned value is the reply after the pairs, and `consumed` covers
+/// both. A trailing attribute chain (`|1 ... |1 ... value`) resolves the same way
+/// because the following reply is parsed with the normal grammar one level deeper,
+/// which keeps the recursion inside [`MAX_DEPTH`].
+fn parse_attribute(input: &[u8], depth: usize) -> Result<Option<(Reply, usize)>> {
+    let Some((count, mut consumed)) = parse_i64_line(input, 1)? else {
+        return Ok(None);
+    };
+    if !(0..=MAX_ELEMENTS).contains(&count) {
+        return Err(Error::transport(format!(
+            "invalid RESP attribute length {count}"
+        )));
+    }
+    let count = usize::try_from(count)
+        .map_err(|_| Error::transport(format!("invalid RESP attribute length {count}")))?;
+    for _ in 0..count {
+        let Some((_, used)) = parse_at(&input[consumed..], depth + 1)? else {
+            return Ok(None);
+        };
+        consumed += used;
+        let Some((_, used)) = parse_at(&input[consumed..], depth + 1)? else {
+            return Ok(None);
+        };
+        consumed += used;
+    }
+    let Some((reply, used)) = parse_at(&input[consumed..], depth + 1)? else {
+        return Ok(None);
+    };
+    Ok(Some((reply, consumed + used)))
+}
+/// Parses a `RESP3` streamed (chunked) string into one binary-safe [`Reply::Bulk`].
+///
+/// Every chunk is `;N\r\n<N bytes>\r\n`; a zero length chunk is the terminator, so
+/// `;0\r\n` decodes to an empty bulk string. Both a single chunk and the total
+/// payload are bounded by [`MAX_BULK_LEN`]. Chunks are scalar values, so they add
+/// no nesting depth; the `;` type byte itself is already bounded by the [`MAX_DEPTH`]
+/// check in [`parse_at`].
+fn parse_streamed_string(input: &[u8]) -> Result<Option<(Reply, usize)>> {
+    let mut consumed = 0;
+    let mut payload: Vec<u8> = Vec::new();
+    loop {
+        let Some((length, header_end)) = parse_i64_line(&input[consumed..], 1)? else {
+            return Ok(None);
+        };
+        let length = usize::try_from(length).map_err(|_| {
+            Error::transport(format!(
+                "invalid RESP streamed string chunk length {length}"
+            ))
+        })?;
+        if length > MAX_BULK_LEN {
+            return Err(Error::transport(format!(
+                "RESP streamed string chunk length {length} exceeds the {MAX_BULK_LEN}-byte limit"
+            )));
+        }
+        let payload_start = consumed
+            .checked_add(header_end)
+            .ok_or_else(|| Error::transport("RESP chunk length overflows the input offset"))?;
+        // The zero-length chunk is the terminator: `;0\r\n` carries no payload, so the
+        // header is all that is left to consume.
+        if length == 0 {
+            return Ok(Some((Reply::Bulk(payload), payload_start)));
+        }
+        let payload_end = payload_start
+            .checked_add(length)
+            .ok_or_else(|| Error::transport("RESP chunk length overflows the input offset"))?;
+        let total = payload_end
+            .checked_add(2)
+            .ok_or_else(|| Error::transport("RESP chunk length overflows the input offset"))?;
+        if input.len() < total {
+            return Ok(None);
+        }
+        if &input[payload_end..total] != b"\r\n" {
+            return Err(Error::transport(
+                "invalid RESP streamed string framing: chunk not terminated by CRLF",
+            ));
+        }
+        consumed = total;
+        if payload.len().saturating_add(length) > MAX_BULK_LEN {
+            return Err(Error::transport(format!(
+                "RESP streamed string exceeds the {MAX_BULK_LEN}-byte limit"
+            )));
+        }
+        payload.extend_from_slice(&input[payload_start..payload_end]);
     }
 }
 /// Parses a `RESP` bulk string (or a `RESP3` verbatim string when `verbatim`).
