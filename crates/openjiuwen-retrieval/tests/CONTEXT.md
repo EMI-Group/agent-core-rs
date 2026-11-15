@@ -19,7 +19,10 @@ All tests are offline and deterministic.
 - `multimodal.rs` → `MultimodalDocument`/`ContentPart` JSON, data-URI round trips, `content()` shapes, `add_file`, `ImageLoader` metadata/errors, Markdown table round trip, row/column documents and table chunks.
 - `parsing_zip.rs` → the ZIP container reader against archives assembled byte by byte (stored/deflated entries, CRC and size failures, unsupported method/encryption/ZIP64, `read_text`, `open`).
 - `parsing_documents.rs` → DOCX/XLSX/PDF parsers against byte-built stored ZIP fixtures and `zlib_stored` PDF streams (blocks/headings/tables/title, sheets and row/column documents, content-stream operators, `FlateDecode`, unsupported variants, `parse_path`).
+- `parsing_pdf_filters.rs` → the PDF stream filter pipeline against hand-built `ASCIIHex`/`ASCII85`/`RunLength`/`FlateDecode` streams and `Predictor` 2/PNG row predictors, plus the `incomplete`/`skipped_filters`/`skipped_streams` reporting of image payloads, unknown filters, and undecodable chains.
 - `retrievers.rs` → vector/hybrid/graph/agentic retrievers with `HashEmbedding`, `InMemoryVectorStore`, `Bm25Index`, `InMemoryGraphStore`, scripted rewriters, and `StaticCompletionModel`.
+- `ranking_configs.rs` → `RankConfig`/`WeightedRankConfig`/`RrfRankConfig` defaults, serde wire shape and validation, `weighted_fusion`/`rrf_fusion_weighted`/`rrf_fusion_channels`, and the hybrid retriever's default-RRF regression versus weighted fusion ordering.
+- `strictness_losses.rs` → the three former silent-loss sites: `InMemoryVectorStore::search` rejecting a query/record width mismatch, `GraphRetriever` reporting its degradations and flagging the hits with `GRAPH_DEGRADED_FIELD`, and the reporting/strict multi-KB variants.
 - `surface_parity.rs` → Python-parity contract for `RetrieveMode` wire names, `SparseRetriever` mode rejection, `AgenticConfig` and `TypoFix` JSON shapes, `RewriteOutput` required fields, and RRF with a non-default `k`; only assertions absent from `sparse.rs`/`rewrite.rs`/`retrievers.rs`/`graph.rs` live here.
 
 ## Constraints
@@ -44,5 +47,8 @@ All tests are offline and deterministic.
 - `./multimodal.rs` → multimodal documents, image loading, table conversion
 - `./parsing_zip.rs` → ZIP container reader (`openjiuwen_retrieval::parsing::ZipArchive`)
 - `./parsing_documents.rs` → DOCX/XLSX/PDF document parsers
+- `./parsing_pdf_filters.rs` → PDF stream filter pipeline and partial-extraction reporting
 - `./retrievers.rs` → the five retriever implementations, rank fusion, graph expansion, and the agentic loop
+- `./ranking_configs.rs` → result-ranking configs, weighted/RRF/channel fusion, hybrid rank-config selection
+- `./strictness_losses.rs` → vector-store width validation, graph degradation reporting, multi-KB strictness
 - `./surface_parity.rs` → Python-parity assertions for the sparse/rewrite/graph-retriever surface

@@ -40,8 +40,13 @@ Retrievers are offline by default: the agentic loop uses deterministic heuristic
 
 ### `graph.rs`
 - `GraphRetriever { chunk_retriever, graph_store, max_hops: usize /*2*/, expansion_limit: usize /*5*/, triple_mode: RetrieveMode /*Sparse*/ }` with `new`, `with_max_hops`, `with_expansion_limit` (0 disables expansion), `with_triple_mode`, and accessors.
+- `retrieve_with_report` and `retrieve_search_results_with_report` return the hits alongside a `GraphExpansionReport`; the `Retriever` trait methods delegate to them and drop the report.
 - Flow: chunk retrieval in the requested mode → entity candidates from the query plus the top `ENTITY_CHUNK_LIMIT` chunk texts via `RuleTripleExtractor::entities_in_text` → `neighbors(entity, max_hops)` triples deduplicated by normalized key and bounded to `MAX_TRIPLES` (32) → chunk query per triple text (bounded to `expansion_limit`) → `rrf_fusion(vec![expanded, chunks])` truncated to `top_k`.
-- Empty entity candidates, an empty graph, or a failing graph/chunk lookup degrade to the original chunk results with a `tracing` debug log; a failing *initial* chunk retrieval still propagates.
+- `GraphExpansionReport { entities, triple_count, expanded_queries, degradations }` with `is_degraded()`; `GraphDegradation { stage, subject, error }`; `GraphStage { EntityLookup, NeighborExpansion, ChunkQuery }` — all serde snake_case, and `EntityLookup` has no producer yet because the rule extractor is infallible.
+- Real failures (`NeighborExpansion`, `ChunkQuery`) log at `warn!`, are recorded in `GraphExpansionReport::degradations`, and never fail the call: the walk continues with the remaining entities/triples and the chunk hits are kept.
+- When the report holds degradations, every returned hit carries `metadata["graph_degraded"] = true` (`GRAPH_DEGRADED_FIELD`), applied after truncation on the exact vector returned, so a clean run never grows the key.
+- Genuine emptiness — no entity candidates, no triples around the candidates, no new chunks, expansion disabled, or `top_k == 0` — stays `debug!` and is a clean run with empty `degradations`.
+- A failing *initial* chunk retrieval still propagates as a typed error.
 
 ### `agentic.rs`
 - `AgenticConfig { max_iter /*2*/, sufficiency_threshold /*0.6*/, passages_per_iteration /*5*/ }` with builders and `validate()` (`max_iter == 0`, `passages_per_iteration == 0`, and a threshold outside `[0, 1]` are `Error::Validation`; Python silently resets instead).
@@ -66,18 +71,19 @@ Retrievers are offline by default: the agentic loop uses deterministic heuristic
 - No panics on user input: unsupported modes and invalid arguments surface as typed errors.
 - Deterministic output: stable sorts, insertion-order tie-breaks, no wall-clock or random input.
 - `Debug` is implemented manually where the wrapped trait objects are not `Debug`.
-- Logging goes through `openjiuwen_common::logging`; failed graph steps log at debug and never fail the call.
+- Logging goes through `openjiuwen_common::logging`; failed graph steps log at `warn`, empty expansions at `debug`, and no graph step ever fails the call.
 
 ## Test Strategy
 - Unit tests beside each module cover mode serde/defaults, result projection, mode rejection, thresholds, RRF scores, hybrid fusion/over-fetch/fallback, graph expansion and degradation, agentic config validation, trace serde, triple parsing, and sufficiency arithmetic.
 - `tests/retrievers.rs` exercises all five retrievers end to end with `HashEmbedding`, `InMemoryVectorStore`, `Bm25Index`, and `InMemoryGraphStore`, plus scripted rewriters and `StaticCompletionModel`; everything runs offline.
 - `tests/ranking_configs.rs` covers the ranking configs (defaults, serde wire shape, validation, zero-weight normalisation, RRF masks, `k = 40` vs `DEFAULT_RRF_K = 60`), both fusion formulas, and the hybrid retriever's default-RRF regression plus the weighted-vs-RRF ordering difference on a fixed-channel corpus.
+- `tests/strictness_losses.rs` covers the graph half of that suite: a failing `neighbors` lookup and a failing triple chunk query are recorded as `NeighborExpansion`/`ChunkQuery` degradations, flag the hits with `GRAPH_DEGRADED_FIELD`, and still return the chunk hits.
 
 ## Routing Table
 - `./mod.rs` → `RetrieveMode`, the `Retriever` trait, query validation, and result projection
 - `./vector.rs` → `VectorRetriever`
 - `./sparse.rs` → `SparseRetriever`
 - `./hybrid.rs` → `HybridRetriever`
-- `./graph.rs` → `GraphRetriever`
+- `./graph.rs` → `GraphRetriever`, `GraphExpansionReport`, `GraphDegradation`, `GraphStage`, `GRAPH_DEGRADED_FIELD`
 - `./agentic.rs` → `AgenticRetriever`, `AgenticConfig`, `AgenticTrace`, prompts
 - `./fusion.rs` → reciprocal rank fusion, weighted fusion, channel-masked RRF, and deduplication

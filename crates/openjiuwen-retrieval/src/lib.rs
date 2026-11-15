@@ -22,7 +22,9 @@
 //! [`Bm25Config`], [`Bm25Query`]) so sparse search works without an external
 //! engine, and [`retriever`] exposes the [`Retriever`] trait with dense,
 //! sparse, hybrid, graph, and agentic implementations plus reciprocal rank
-//! fusion ([`rrf_fusion`]). [`rewrite`] turns a conversation into a standalone
+//! fusion ([`rrf_fusion`]); [`RankConfig`] selects the weighted or RRF ranker
+//! those fused lists can be scored with ([`HybridRetriever::with_rank_config`]).
+//! [`rewrite`] turns a conversation into a standalone
 //! query, either heuristically ([`HeuristicQueryRewriter`]) or through the
 //! model seam ([`ModelQueryRewriter`]).
 //!
@@ -35,7 +37,10 @@
 //! Graph retrieval lives in [`graph`]: the [`Triple`]/[`Entity`] data models,
 //! the [`GraphStore`] trait with the adjacency-indexed [`InMemoryGraphStore`],
 //! and the deterministic, model-free [`RuleTripleExtractor`] behind the
-//! [`TripleExtractor`] seam.
+//! [`TripleExtractor`] seam. A graph run reports what it did through
+//! [`GraphExpansionReport`]: failed steps are recordable degradations that also
+//! flag the hits with [`GRAPH_DEGRADED_FIELD`], while genuine emptiness is a
+//! clean run.
 //!
 //! Multimodal ingestion lives in [`multimodal`]: [`MultimodalDocument`] with
 //! typed [`ContentPart`]s and [`Modality`]s, [`ImageLoader`] with the offline
@@ -95,10 +100,17 @@ pub use common::{
     DEFAULT_DISTANCE_METRIC, DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_TIMEOUT,
     DEFAULT_TOP_K, INDEX_TYPE_BM25, INDEX_TYPE_HYBRID, INDEX_TYPE_VECTOR,
 };
-// Chunking strategies and the chunker registry.
+// Result-ranking configs and the fixed channel layout they index.
+pub use common::{
+    RankConfig, RankMethod, RankerArgs, RrfRankConfig, WeightedRankConfig, CONTENT_DENSE,
+    CONTENT_SPARSE, DEFAULT_RRF_RANK_K, NAME_DENSE, RANK_CHANNEL_COUNT,
+};
+// Chunking strategies, optional text preprocessing, and the chunker registry.
 pub use chunking::{
-    validate_params, CharChunker, Chunker, ChunkerFactory, ChunkerRegistry, RecursiveCharChunker,
-    TokenChunker, TokenCounter, WhitespaceTokenCounter,
+    default_no_split, validate_params, CharChunker, ChunkUnit, Chunker, ChunkerFactory,
+    ChunkerRegistry, HybridChunker, NoSplitPredicate, PreprocessingPipeline, RecursiveCharChunker,
+    SpecialCharacterNormalizer, TextChunker, TextPreprocessor, TokenChunker, TokenCounter,
+    URLEmailRemover, WhitespaceNormalizer, WhitespaceTokenCounter,
 };
 // Document loaders and the extension-based dispatch registry.
 pub use loaders::{
@@ -117,9 +129,14 @@ pub use vector_store::{
 pub use sparse::{tokenize, Bm25Config, Bm25Index, Bm25Query, Bm25Statistics, SparseVector};
 // Retrievers (dense/sparse/hybrid/graph/agentic) and rank fusion.
 pub use retriever::{
-    deduplicate, rrf_fusion, rrf_fusion_default, AgenticConfig, AgenticRetriever,
-    AgenticStopReason, AgenticTrace, GraphRetriever, HybridRetriever, RetrieveMode, Retriever,
-    SparseRetriever, VectorRetriever, DEFAULT_RRF_K,
+    deduplicate, rrf_fusion, rrf_fusion_channels, rrf_fusion_default, rrf_fusion_weighted,
+    weighted_fusion, AgenticConfig, AgenticRetriever, AgenticStopReason, AgenticTrace,
+    GraphRetriever, HybridRetriever, RetrieveMode, Retriever, SparseRetriever, VectorRetriever,
+    DEFAULT_RRF_K,
+};
+// Graph-expansion diagnostics: what an expansion did, and which steps failed.
+pub use retriever::graph::{
+    GraphDegradation, GraphExpansionReport, GraphStage, GRAPH_DEGRADED_FIELD,
 };
 // Query rewriting: deterministic heuristics and the model-backed rewriter.
 pub use rewrite::{
@@ -149,7 +166,10 @@ pub use parsing::{
 pub use reranker::{DashScopeReranker, LlmReranker, LlmScorer, Reranker, ScoreReranker};
 // The ingestion/retrieval pipeline and multi-KB retrieval.
 pub use knowledge_base::{
-    retrieve_multi_kb, retrieve_multi_kb_with_source, KnowledgeBaseStatistics, SimpleKnowledgeBase,
+    retrieve_multi_kb, retrieve_multi_kb_reporting, retrieve_multi_kb_strict,
+    retrieve_multi_kb_with_source, retrieve_multi_kb_with_source_reporting,
+    retrieve_multi_kb_with_source_strict, KnowledgeBaseStatistics, MultiKbFailure, MultiKbReport,
+    MultiKbSourceReport, SimpleKnowledgeBase,
 };
 
 /// The most commonly used retrieval types, traits, and default implementations.
@@ -162,8 +182,8 @@ pub mod prelude {
     pub use crate::{
         AutoLoader, CharChunker, Chunker, Document, DocumentLoader, Embedding, GraphStore,
         HashEmbedding, InMemoryGraphStore, InMemoryVectorStore, Metadata, MetadataFilter, Reranker,
-        RetrievalResult, RetrieveMode, Retriever, ScoreReranker, SearchResult, TextChunk, Triple,
-        VectorStore,
+        RetrievalResult, RetrieveMode, Retriever, ScoreReranker, SearchResult, TextChunk,
+        TextChunker, Triple, VectorStore,
     };
 }
 
