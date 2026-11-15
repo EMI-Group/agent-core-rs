@@ -39,6 +39,7 @@ Exactly the canonical surface, re-exported at the crate root; no new items excep
 - `../openjiuwen-rsi/src/harness_rsi/auto_harness/` → canonical implementation (`config.rs`, `budget.rs`, `task.rs`, `event.rs`, `runner.rs`, `checkpoint.rs`, `builder.rs`, `orchestrator.rs`)
 - `../openjiuwen-rsi/CONTEXT.md` → authoritative field-level surface documentation for the re-exported items
 - `./src/lib.rs` → the entire facade (glob + explicit re-exports + `crate_name()`)
+- `./Cargo.toml` → manifest: one `openjiuwen-rsi` dependency, empty default features, workspace lints
 - `./tests/reexports.rs` → identity and value-interop tests against the canonical crate
 
 ## Test Strategy
