@@ -9,7 +9,7 @@ Python has no default/no-op reranker and does not wire rerankers into knowledge 
 
 ### `mod.rs`
 - `#[async_trait] pub trait Reranker: Send + Sync { async fn rerank(&self, query: &str, documents: Vec<SearchResult>, top_n: Option<usize>) -> Result<Vec<SearchResult>>; }`
-- Re-exports `ScoreReranker`, `LlmReranker`, `LlmScorer`.
+- Re-exports `ScoreReranker`, `LlmReranker`, `LlmScorer`, `DashScopeReranker`, `DASHSCOPE_RERANK_PATH`.
 - The trait is public, unsealed and object-safe (no generics/`Self` returns); `knowledge_base` holds `Option<Arc<dyn Reranker>>`, so external crates can implement it with public API only.
 
 ### `score.rs`
@@ -21,6 +21,11 @@ Python has no default/no-op reranker and does not wire rerankers into knowledge 
 - `LlmReranker { scorer: Arc<dyn LlmScorer>, top_n: Option<usize> }`; `new(scorer, top_n)`.
 - Calls the scorer with document texts, requires exactly one finite score per document (`Error::Retrieval` otherwise), writes scores into results, sorts descending (stable), truncates.
 - Empty documents → no scorer call, empty output.
+### `dashscope.rs`
+- `DASHSCOPE_RERANK_PATH = "/api/v1/services/rerank/text-rerank/text-rerank"` (appended to `RerankerConfig::api_base`).
+- `DashScopeReranker { config: RerankerConfig }`; `new(config) -> Result<Self>` runs `RerankerConfig::validate()` and `require_api_key()` (both `Error::Config` when invalid, context `"DashScope reranker configuration"`), `config()`, `endpoint()`.
+- `Reranker::rerank` returns a typed `Error::Unsupported` naming the endpoint, model, and timeout: the hosted DashScope transport is deferred, so the configuration is never silently ignored.
+- Python reference: `core/retrieval/reranker/dashscope_reranker.py` `DashscopeReranker`; its HTTP transport is not ported (no vendor client, no credential store).
 
 ## Constraints
 
@@ -30,10 +35,11 @@ Python has no default/no-op reranker and does not wire rerankers into knowledge 
 
 ## Test Strategy
 
-ScoreReranker ordering/truncation/`top_n = 0`/empty; LlmReranker uses a fake scorer, verifies received query/doc texts and order, count mismatch error, empty input never calls the scorer.
+ScoreReranker ordering/truncation/`top_n = 0`/empty; LlmReranker uses a fake scorer, verifies received query/doc texts and order, count mismatch error, empty input never calls the scorer; DashScopeReranker validates each config field (api_key, api_base, model_name, timeout, temperature, top_p), exposes the endpoint, and rerank returns `Error::Unsupported`.
 
 ## Routing Table
 
 - `./mod.rs` → `Reranker` trait and re-exports
 - `./score.rs` → `ScoreReranker` default implementation
 - `./llm.rs` → `LlmScorer` seam and `LlmReranker`
+- `./dashscope.rs` → `DashScopeReranker` (validated config, deferred transport)
