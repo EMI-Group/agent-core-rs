@@ -13,6 +13,15 @@ The directory splits the format in three: `front_matter.rs` owns the `---` block
 - `mod.rs` re-exports both types and holds the module documentation (format, normalization rules).
 - `front_matter` is crate-internal: the four schema constants and `parse_lines`/`render` are `pub(super)`, so only code in `lite::markdown` (the document module and the tests) can reach them.
 
+## Known Issues
+
+- Duplicate `### name` entries (same section or across sections) are parsed as separate entries: `upsert_fact`/`remove` touch only the first copy, so a write can leave the stale copy first and `fact(name)` then returns it, while both calls still report `true`.
+- `unescape_body_line` is not the inverse of `escape_body_line`: a body line that literally starts with `\#` renders unescaped and loses its backslash on the next parse, and every mutation rewrites the whole file.
+- `parse_tags` falls back to comma splitting for anything that is not a JSON string array, so `- tags: [one, two]` (or a JSON array with a non-string element) silently yields bracket-fragment tags that are then written back in that form.
+- An unparsable `updated_at` decodes to the epoch and is re-rendered as `1970-01-01T00:00:00Z`, destroying the hand-written value on the next write; such a fact also sorts last and is excluded from daily rollups.
+- A malformed `- ` bullet with no colon ends the attribute block, so every later attribute silently becomes body text.
+- The unterminated-front-matter check only fires when a line contains `:` or parses as an attribute; a colon-less truncated block is accepted and its fence then becomes raw document text.
+
 ## Constraints
 
 - The document is the source of truth; the SQLite FTS5 index in `lite::fts` is derived and may be rebuilt from it at any time.
