@@ -53,6 +53,7 @@ The module mirrors `../openai/`: pure request projection, pure response parsing,
 ## Known Gaps
 
 - The non-streaming response parser (`parse_responses_response`) is public but no transport path uses it: `invoke` always streams, so a provider that ignores `stream: true` and answers one JSON object fails to decode.
+- That parser maps every `status` other than `"incomplete"` to `FinishReason::Stop`, so a `failed`/`cancelled`/`queued` payload parses into an empty assistant message with no error (only the streaming path turns `response.failed` into `Error::Llm`).
 - No support for `previous_response_id`/conversation state, `background` mode, `max_tool_calls`, built-in hosted tools (web search, file search, computer use), or structured `text.format` validation.
 - Reasoning replay of `reasoning.encrypted_content` is not implemented: `include` is written, but returned encrypted items are dropped and never sent back on the next turn.
 - Input parts other than text and images (`File`, `Audio`, unknown) are dropped rather than encoded, matching the Python projection.
