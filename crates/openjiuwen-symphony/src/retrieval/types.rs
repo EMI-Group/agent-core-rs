@@ -10,7 +10,9 @@
 //! - [`SearchCursor`] / [`CursorStep`] — a *resumable*, `serde`-serializable depth-first
 //!   traversal cursor. Python keeps its search cursor as an opaque object; making the
 //!   traversal state a plain value lets a caller stop mid-walk, persist the cursor, and
-//!   resume it on another task.
+//!   resume it on another task. The cursor records the tree's child ids itself (one
+//!   pre-order pass when it is created), so [`SearchCursor::advance`] takes no tree and a
+//!   full walk costs `O(n)` instead of one full-tree scan per step.
 //! - [`IndexManifest::content_hash`] — the SHA-256 of the rendered `catalog.jsonl`, so a
 //!   reader can detect a catalog that was rewritten without its manifest.
 //!
@@ -459,9 +461,12 @@ pub struct CursorStep {
 
 /// A resumable depth-first traversal cursor over a [`RetrieverNode`] tree.
 ///
-/// The cursor owns its own stack, so it is a plain value: a caller can stop mid-walk,
-/// serialize it, and resume it later (or on another task) as long as it passes the same
-/// tree to [`SearchCursor::advance`].
+/// The cursor owns its own traversal plan — the pending stack *and* every node's sorted
+/// child ids — so it is a self-contained plain value: a caller can stop mid-walk,
+/// serialize it, and resume it later (or on another task) without handing the tree back.
+/// [`SearchCursor::advance`] therefore takes no tree argument, and a full walk of an
+/// `n`-node tree costs `O(n)` (the child map is recorded once, by
+/// [`SearchCursor::new`]) instead of one [`RetrieverNode::find`] scan per step.
 ///
 /// # Ordering guarantee
 ///
@@ -470,49 +475,77 @@ pub struct CursorStep {
 /// [`RetrieverNode::children`] reports). Items are not steps — the walk yields nodes
 /// only, and a caller reads a yielded node's items itself.
 ///
-/// A step that no longer resolves in the tree (a stale cursor) is skipped; it still
-/// counts towards [`SearchCursor::visited`].
+/// A queued step whose id is not in the recorded child map (a stale cursor, or a step
+/// pushed by hand) is skipped; it still counts towards [`SearchCursor::visited`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]
 pub struct SearchCursor {
     /// The steps still to visit; the next step is popped from the end.
     pub pending: Vec<CursorStep>,
-    /// How many steps have been popped, resolved or not.
+    /// Every node id of the tree mapped to its sorted child ids, recorded in one
+    /// pre-order pass by [`SearchCursor::new`].
+    ///
+    /// A node with no children keeps an empty entry, so the map also answers "is this id
+    /// part of the tree?"; a serialized cursor carries the plan, which is what lets
+    /// [`SearchCursor::advance`] run without the tree.
+    pub children: BTreeMap<String, Vec<String>>,
+    /// How many steps were popped, resolved or skipped.
     pub visited: usize,
-    /// Whether the pending stack is empty and the walk is over.
+    /// Whether the last [`SearchCursor::advance`] found nothing left to visit.
+    ///
+    /// It is cleared again as soon as a step is yielded, so a cursor that receives a new
+    /// step (or is re-seeded) walks on instead of staying exhausted.
     pub exhausted: bool,
 }
 
 impl SearchCursor {
     /// Seeds a cursor at `root`, which is visited first.
+    ///
+    /// One pre-order pass records every node's child ids (sorted by `node_id`, in
+    /// [`RetrieverNode::children`] order) into [`SearchCursor::children`]. A duplicated
+    /// node id keeps its first-and-shallowest occurrence's children, matching
+    /// [`RetrieverNode::find`].
     #[must_use]
     pub fn new(root: &RetrieverNode) -> Self {
+        let mut children = BTreeMap::new();
+        record_children(root, &mut children);
         Self {
             pending: vec![CursorStep {
                 node_id: root.node_id.clone(),
                 depth: 0,
                 path: Vec::new(),
             }],
+            children,
             visited: 0,
             exhausted: false,
         }
     }
 
-    /// Pops the next step, queueing the resolved node's children for later visits.
+    /// Re-seeds this cursor from `root`, discarding its progress.
+    ///
+    /// Equivalent to assigning [`SearchCursor::new`]; it exists so a caller can reuse one
+    /// cursor value across trees without rebuilding its state by hand.
+    pub fn reset(&mut self, root: &RetrieverNode) {
+        *self = Self::new(root);
+    }
+
+    /// Pops the next step, queueing that node's children (from the recorded child map)
+    /// for later visits.
     ///
     /// Returns `None` once the walk is exhausted. See [`SearchCursor`] for the ordering
     /// guarantee.
-    pub fn advance(&mut self, tree: &RetrieverNode) -> Option<CursorStep> {
+    pub fn advance(&mut self) -> Option<CursorStep> {
         while let Some(step) = self.pending.pop() {
             self.visited += 1;
-            let Some(node) = tree.find(&step.node_id) else {
+            let Some(children) = self.children.get(&step.node_id).cloned() else {
                 continue;
             };
+            self.exhausted = false;
             let mut path = step.path.clone();
             path.push(step.node_id.clone());
-            for child in node.children().into_iter().rev() {
+            for child in children.into_iter().rev() {
                 self.pending.push(CursorStep {
-                    node_id: child.node_id.clone(),
+                    node_id: child,
                     depth: step.depth + 1,
                     path: path.clone(),
                 });
@@ -535,10 +568,23 @@ impl SearchCursor {
         self.pending.len()
     }
 
-    /// Whether the walk reached its end.
+    /// Whether the last [`SearchCursor::advance`] found the walk finished.
     #[must_use]
     pub fn is_exhausted(&self) -> bool {
         self.exhausted
+    }
+}
+
+/// Records `node`'s sorted child ids, then recurses into the subtree in pre-order.
+///
+/// A duplicated node id keeps the first occurrence's children, so the recorded map
+/// resolves an id exactly where [`RetrieverNode::find`] would.
+fn record_children(node: &RetrieverNode, children: &mut BTreeMap<String, Vec<String>>) {
+    let sorted = node.children();
+    let ids: Vec<String> = sorted.iter().map(|child| child.node_id.clone()).collect();
+    children.entry(node.node_id.clone()).or_insert(ids);
+    for child in sorted {
+        record_children(child, children);
     }
 }
 
@@ -999,7 +1045,7 @@ mod tests {
         let tree = tree();
         let mut cursor = SearchCursor::new(&tree);
         let mut visited = Vec::new();
-        while let Some(step) = cursor.advance(&tree) {
+        while let Some(step) = cursor.advance() {
             visited.push((step.node_id, step.depth, step.path));
         }
         let ids: Vec<&str> = visited.iter().map(|(id, _, _)| id.as_str()).collect();
@@ -1014,22 +1060,106 @@ mod tests {
         assert_eq!(cursor.visited(), 5);
         assert!(cursor.is_exhausted());
         assert_eq!(cursor.pending_len(), 0);
-        assert!(cursor.advance(&tree).is_none());
+        assert!(cursor.advance().is_none());
+    }
+
+    #[test]
+    fn cursor_records_the_child_plan_and_visits_every_node_once() {
+        let tree = tree();
+        let cursor = SearchCursor::new(&tree);
+        assert_eq!(
+            cursor.children.get(ROOT_NODE_ID),
+            Some(&vec!["A".to_string(), "B".to_string()])
+        );
+        assert_eq!(
+            cursor.children.get("B"),
+            Some(&vec!["B.a".to_string(), "B.z".to_string()])
+        );
+        assert_eq!(cursor.children.get("A"), Some(&Vec::<String>::new()));
+        assert_eq!(cursor.children.len(), tree.walk().len());
+
+        let expected: Vec<String> = tree
+            .walk()
+            .iter()
+            .map(|node| node.node_id.clone())
+            .collect();
+        let mut walked = SearchCursor::new(&tree);
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(step) = walked.advance() {
+            seen.push(step.node_id);
+        }
+        assert_eq!(seen, expected, "the walk is the tree's pre-order");
+        let unique: std::collections::BTreeSet<&String> = seen.iter().collect();
+        assert_eq!(unique.len(), seen.len(), "no node is visited twice");
+    }
+
+    #[test]
+    fn cursor_visits_children_in_node_id_order() {
+        let tree = RetrieverNode::new(ROOT_NODE_ID, ROOT_NODE_ID).with_children(vec![
+            RetrieverNode::new("c", "c"),
+            RetrieverNode::new("b", "b").with_children(vec![
+                RetrieverNode::new("b-z", "z"),
+                RetrieverNode::new("b-a", "a"),
+            ]),
+            RetrieverNode::new("a", "a"),
+        ]);
+        let mut cursor = SearchCursor::new(&tree);
+        let ids: Vec<String> = std::iter::from_fn(|| cursor.advance())
+            .map(|step| step.node_id)
+            .collect();
+        assert_eq!(ids, vec!["ROOT", "a", "b", "b-a", "b-z", "c"]);
+        assert_eq!(
+            cursor.children.get(ROOT_NODE_ID),
+            Some(&vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
     }
 
     #[test]
     fn cursor_resumes_from_its_serialized_state() {
         let tree = tree();
         let mut cursor = SearchCursor::new(&tree);
-        assert!(cursor.advance(&tree).is_some());
+        assert!(cursor.advance().is_some());
         let encoded = serde_json::to_string(&cursor).unwrap();
         let mut resumed: SearchCursor = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(resumed, cursor, "the serialized plan round-trips");
         let mut remaining = Vec::new();
-        while let Some(step) = resumed.advance(&tree) {
+        while let Some(step) = resumed.advance() {
             remaining.push(step.node_id);
         }
         assert_eq!(remaining, vec!["A", "B", "B.a", "B.z"]);
         assert_eq!(resumed.visited(), 5);
+    }
+
+    #[test]
+    fn cursor_clears_exhausted_when_a_step_remains() {
+        let tree = tree();
+        let mut cursor = SearchCursor::new(&tree);
+        assert_eq!(std::iter::from_fn(|| cursor.advance()).count(), 5);
+        assert!(cursor.is_exhausted());
+        cursor.pending.push(CursorStep {
+            node_id: "B".to_string(),
+            depth: 1,
+            path: vec![ROOT_NODE_ID.to_string()],
+        });
+        let step = cursor.advance().expect("the queued step is still walked");
+        assert_eq!(step.node_id, "B");
+        assert!(!cursor.is_exhausted(), "a yielded step clears the flag");
+    }
+
+    #[test]
+    fn cursor_reset_reseeds_the_plan_from_another_tree() {
+        let tree = tree();
+        let mut cursor = SearchCursor::new(&tree);
+        assert!(cursor.advance().is_some());
+        let other = RetrieverNode::new("other", "other")
+            .with_children(vec![RetrieverNode::new("other.a", "a")]);
+        cursor.reset(&other);
+        assert_eq!(cursor, SearchCursor::new(&other));
+        let ids: Vec<String> = std::iter::from_fn(|| cursor.advance())
+            .map(|step| step.node_id)
+            .collect();
+        assert_eq!(ids, vec!["other", "other.a"]);
+        assert_eq!(cursor.visited(), 2);
     }
 
     #[test]
@@ -1041,7 +1171,7 @@ mod tests {
             depth: 1,
             path: vec![ROOT_NODE_ID.to_string()],
         });
-        let steps: Vec<String> = std::iter::from_fn(|| cursor.advance(&tree))
+        let steps: Vec<String> = std::iter::from_fn(|| cursor.advance())
             .map(|step| step.node_id)
             .collect();
         assert_eq!(steps, vec![ROOT_NODE_ID.to_string()]);

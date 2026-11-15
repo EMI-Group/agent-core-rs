@@ -297,6 +297,22 @@ pub fn category_segments(item: &SourceItem, strategy: GroupingStrategy) -> Vec<S
     segments
 }
 
+/// The [`unsupported`] reason for a strategy this crate cannot run, or `None` for a
+/// strategy it can.
+///
+/// The wording names the machinery the strategy actually needs, so an `llm_grouping` build
+/// does not report a k-means deferral.
+fn deferral_reason(strategy: GroupingStrategy) -> Option<&'static str> {
+    match strategy {
+        GroupingStrategy::LlmGrouping => Some("LLM-guided tree grouping"),
+        GroupingStrategy::FaissKmeans => Some("faiss k-means tree grouping"),
+        GroupingStrategy::Kmeans => Some("k-means tree grouping"),
+        GroupingStrategy::Deterministic
+        | GroupingStrategy::CategoryPath
+        | GroupingStrategy::NameTokens => None,
+    }
+}
+
 /// Places every item under the root; deterministic, sorted by `worker_id`.
 ///
 /// The returned assignments are ordered by `worker_id` (ties keep the caller's item
@@ -304,13 +320,13 @@ pub fn category_segments(item: &SourceItem, strategy: GroupingStrategy) -> Vec<S
 ///
 /// # Errors
 ///
-/// [`GroupingStrategy::LlmGrouping`], [`GroupingStrategy::FaissKmeans`] and
-/// [`GroupingStrategy::Kmeans`] need a model or a faiss clusterer, so they return
-/// [`unsupported`] (an
-/// [`Error::Unsupported`](crate::error::Error)) instead of grouping.
+/// [`GroupingStrategy::LlmGrouping`] needs a completion model and
+/// [`GroupingStrategy::FaissKmeans`]/[`GroupingStrategy::Kmeans`] a faiss clusterer, so
+/// they return [`unsupported`] (an
+/// [`Error::Unsupported`](crate::error::Error)) naming that strategy instead of grouping.
 pub fn group_items(items: &[SourceItem], config: &GroupingConfig) -> Result<Vec<GroupAssignment>> {
-    if !config.strategy.is_supported() {
-        return Err(unsupported("LLM/faiss k-means tree grouping"));
+    if let Some(reason) = deferral_reason(config.strategy) {
+        return Err(unsupported(reason));
     }
     let limits = Limits::from_config(config);
     let mut ordered: Vec<&SourceItem> = items.iter().collect();
@@ -995,16 +1011,29 @@ mod tests {
     #[test]
     fn unsupported_strategies_report_the_deferral() {
         let items = vec![item("w", "Alpha", "docs", &[])];
-        for strategy in [
-            GroupingStrategy::LlmGrouping,
-            GroupingStrategy::FaissKmeans,
-            GroupingStrategy::Kmeans,
+        for (strategy, reason) in [
+            (GroupingStrategy::LlmGrouping, "LLM-guided tree grouping"),
+            (GroupingStrategy::FaissKmeans, "faiss k-means tree grouping"),
+            (GroupingStrategy::Kmeans, "k-means tree grouping"),
         ] {
             let config = GroupingConfig::default().with_strategy(strategy);
             let error = group_items(&items, &config).unwrap_err();
             assert!(is_unsupported(&error), "{strategy:?}: {error}");
-            assert!(error.message().contains("k-means"), "{error}");
+            assert!(error.message().starts_with(reason), "{strategy:?}: {error}");
+            assert!(
+                !error.message().contains("LLM/faiss"),
+                "{strategy:?} names one strategy: {error}"
+            );
         }
+        let llm = group_items(
+            &items,
+            &GroupingConfig::default().with_strategy(GroupingStrategy::LlmGrouping),
+        )
+        .unwrap_err();
+        assert!(
+            !llm.message().contains("k-means"),
+            "an LLM strategy is not a k-means deferral: {llm}"
+        );
     }
 
     #[test]

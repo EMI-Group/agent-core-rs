@@ -1,11 +1,17 @@
-//! Tree presets: caller-supplied taxonomies and persisted-tree rehydration.
+//! Tree presets: the persisted-or-caller-supplied taxonomy that steers a build.
 //!
-//! Ports Python `openjiuwen.symphony.retrieval.build.tree.presets` (the
-//! `SKILLSMP_ROOT_CATEGORIES` taxonomy) together with the persisted-preset reader of
-//! `build/io/tree.py`. Where Python hands the model a nested list of `dict`s, here the
-//! preset is a typed value object, `TreePreset`, that can be written by hand, read back
-//! from a persisted `tree_index.yaml`, or rebuilt from a flat
-//! `IndexNode` list.
+//! Ports the preset path of Python `openjiuwen.symphony.retrieval.build`: the nested
+//! `tree_index.yaml` document read by `build/io/tree.py`
+//! (`load_tree_preset` / `parse_simple_nodes_yaml`) and flattened by
+//! `build/tree/preset_writer.py`'s `flatten_capability_tree`. Where Python hands the model
+//! a nested list of `dict`s, here the preset is a typed value object, `TreePreset`, that
+//! can be written by hand, read back from a persisted `tree_index.yaml`, or rebuilt from a
+//! flat `IndexNode` list.
+//!
+//! Python's static `SKILLSMP_ROOT_CATEGORIES` taxonomy of `build/tree/presets.py` (`tools`,
+//! `business`, `development`, …) is **not** ported: it is a large example taxonomy that
+//! nothing in the Python package imports, and a preset here always comes from a caller or
+//! from a persisted tree document.
 //!
 //! # Override semantics
 //!
