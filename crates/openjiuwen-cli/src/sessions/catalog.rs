@@ -230,7 +230,7 @@ impl Catalog {
             .into_iter()
             .find(|summary| summary.session_id == id);
         if let Some(summary) = cli_summary {
-            if let Some(resolved) = self.resolve_cli(&cli, &summary, false)? {
+            if let Some(resolved) = Self::resolve_cli(&cli, &summary, false)? {
                 return Ok(resolved);
             }
         }
@@ -259,7 +259,7 @@ impl Catalog {
         }
         let cli = self.cli_store();
         if let Some(summary) = newest_cli(cli.list()?) {
-            if let Some(resolved) = self.resolve_cli(&cli, &summary, true)? {
+            if let Some(resolved) = Self::resolve_cli(&cli, &summary, true)? {
                 return Ok(resolved);
             }
         }
@@ -375,7 +375,6 @@ impl Catalog {
     ///
     /// `Ok(None)` means the record vanished between the listing and the load.
     fn resolve_cli(
-        &self,
         store: &SessionStore,
         summary: &SessionSummary,
         most_recent: bool,
@@ -559,6 +558,10 @@ async fn state_timestamp(summary: &StateSummary) -> Option<DateTime<Utc>> {
 }
 
 /// Returns `now - days`, the boundary an age filter compares against.
+///
+/// Fractional days are truncated to whole milliseconds; `--older-than` is a
+/// convenience threshold, not a precise clock.
+#[allow(clippy::cast_possible_truncation)] // whole milliseconds of a finite day count
 fn cutoff(days: f64) -> DateTime<Utc> {
     let millis = (days * 86_400_000.0) as i64;
     Utc::now() - chrono::Duration::milliseconds(millis)
@@ -645,7 +648,21 @@ async fn remove_dir(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use openjiuwen_harness::cli::MapEnv;
+    use openjiuwen_harness::{PersistentSessionRecord, RecordEnding, SessionBinding};
+    use openjiuwen_test_support::TempWorkspace;
+
     use super::*;
+    use clap::Parser;
+
+    /// Resolves the harness options of an isolated temp home and workspace.
+    fn options(fixtures: &TempWorkspace) -> CliOptions {
+        let env = MapEnv::from_pairs([("OPENJIUWEN_HOME", fixtures.home().display().to_string())]);
+        let cli = openjiuwen_harness::cli::Cli::parse_from(["openjiuwen"]);
+        CliOptions::resolve_with(&cli, &env, None, &fixtures.workspace()).expect("test options")
+    }
 
     fn row(id: &str, created_at: Option<&str>) -> Row {
         Row {
@@ -726,5 +743,122 @@ mod tests {
             non_empty("2024-01-01T00:00:00Z").as_deref(),
             Some("2024-01-01T00:00:00Z")
         );
+    }
+
+    #[tokio::test]
+    async fn a_persistent_state_record_lists_resolves_and_prunes() {
+        let fixtures = TempWorkspace::new().expect("temp workspace");
+        let options = options(&fixtures);
+        let layout =
+            PersistentAgentLayout::for_workspace(&Workspace::new(options.workspace.clone()));
+        let store = FileSessionStore::new(layout.sessions_root());
+        let binding = SessionBinding {
+            agent_id: "agent-one".to_owned(),
+            session_id: "sess-1".to_owned(),
+        };
+        let mut record = PersistentSessionRecord::new(&binding).expect("draft record");
+        record.messages = vec![BaseMessage::user("hi"), BaseMessage::assistant("hello")];
+        let record = record
+            .with_ending(RecordEnding {
+                outcome: "completed".to_owned(),
+                request_id: "req-1".to_owned(),
+                ..RecordEnding::default()
+            })
+            .expect("ended record");
+        store.save(&record).await.expect("save record");
+
+        let catalog = Catalog::for_options(&options, None);
+        let rows = catalog.list().await.expect("list");
+        let row = rows
+            .iter()
+            .find(|row| row.id == "sess-1")
+            .expect("state row");
+        assert_eq!(row.kind, KIND_STATE);
+        assert!(row.created_at.is_some());
+        assert_eq!(row.detail, "agent agent-one, waiting false, ending true");
+
+        let resolved = catalog
+            .resolve(ResumeRequest::Id("sess-1"))
+            .await
+            .expect("resolve id");
+        assert_eq!(resolved.kind, KIND_STATE);
+        assert_eq!(resolved.history.len(), 2);
+        assert!(resolved.plan.is_none());
+        assert_eq!(
+            resolved.summary,
+            "resuming session sess-1 from the persistent session record (2 messages restored)"
+        );
+
+        let continued = catalog
+            .resolve(ResumeRequest::Continue)
+            .await
+            .expect("resolve latest");
+        assert_eq!(continued.id, "sess-1");
+        assert!(continued
+            .summary
+            .starts_with("resuming the most recent session sess-1"));
+
+        let pruned = catalog.prune(None, true, false).await.expect("prune");
+        assert_eq!(pruned.len(), 1);
+        assert!(catalog.list().await.expect("list after prune").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cli_record_resolves_with_its_transcript() {
+        let fixtures = TempWorkspace::new().expect("temp workspace");
+        let options = options(&fixtures);
+        let store = SessionStore::new(&options.home);
+        store
+            .new_session("cli-1", "mock-model")
+            .expect("new session");
+        store
+            .append_message("cli-1", "user", "hi")
+            .expect("append user");
+        store
+            .append_message("cli-1", "assistant", "hello")
+            .expect("append assistant");
+
+        let catalog = Catalog::for_options(&options, None);
+        let resolved = catalog
+            .resolve(ResumeRequest::Id("cli-1"))
+            .await
+            .expect("resolve id");
+        assert_eq!(resolved.kind, KIND_CLI);
+        assert_eq!(resolved.history.len(), 2);
+        assert_eq!(resolved.history[0].role.as_str(), "user");
+        assert_eq!(
+            resolved.summary,
+            "resuming session cli-1 from the CLI session record (2 messages)"
+        );
+        assert_eq!(
+            resolved.record.expect("cli record").model,
+            "mock-model".to_owned()
+        );
+
+        let (row, shown) = catalog.show("cli-1").await.expect("show");
+        assert_eq!(row.kind, KIND_CLI);
+        assert_eq!(shown.id, "cli-1");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_id_and_an_empty_store_are_typed_not_found() {
+        let fixtures = TempWorkspace::new().expect("temp workspace");
+        let options = options(&fixtures);
+        let catalog = Catalog::for_options(&options, None);
+        let missing = catalog
+            .resolve(ResumeRequest::Id("nope"))
+            .await
+            .expect_err("unknown id");
+        assert!(missing.to_string().contains("unknown session: nope"));
+        let empty = catalog
+            .resolve(ResumeRequest::Continue)
+            .await
+            .expect_err("nothing to continue");
+        assert!(empty.to_string().contains("no resumable session found"));
+        let invalid = catalog
+            .prune(None, false, false)
+            .await
+            .expect_err("no selector");
+        assert!(invalid.to_string().contains("--older-than"));
     }
 }

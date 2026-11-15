@@ -4,12 +4,14 @@
 
 The `openjiuwen` executable: the product entry point a user runs.
 It is a thin process boundary that owns the outer clap grammar and dispatches every command group.
-`run`/`chat` are forwarded to `openjiuwen_harness::cli::run_cli`; `auto-harness`, `lsp`, `cron`, `team` and `watch` are dispatched here.
-The harness-surface commands are terminal ends of ports the harness already owns: its language-server client, its cron scheduler, the `openjiuwen-agent-teams` attach protocol, and its workspace watcher.
-`run`/`chat` additionally accept two flags the harness grammar has no words for (`--worktree`, and `--watch` on `chat`).
+`run`/`chat` are forwarded to `openjiuwen_harness::cli::run_cli`; `auto-harness`, `lsp`, `cron`, `team`, `watch` and `sessions` are dispatched here.
+The harness-surface commands are terminal ends of ports the harness already owns: its language-server client, its cron scheduler, the `openjiuwen-agent-teams` attach protocol, its workspace watcher, and its persistent-agent stores.
+`run`/`chat` additionally accept the flags the harness grammar has no words for (`--worktree`, `--watch` on `chat`, and `--resume <ID>`/`--continue` on both).
+`--resume`/`--continue` are resolved by the session catalogue in `src/sessions/catalog.rs`, which merges the CLI session records, the persistent-agent execution journals and the persistent-agent session records; the resume note goes to stderr so stdout keeps the run's output format.
+`sessions` exposes that same catalogue: list, show and prune.
 The operating-system concerns also live here: `.env` loading, `tracing` installation on stderr, clap's exit codes, and the stderr diagnostic for a failed run.
 Everything about `run`/`chat` behaviour — option resolution, the one-shot runner, the REPL, permission prompts, session storage — belongs to the harness.
-Python parity: the `openjiuwen` console script and `openjiuwen/harness/cli/cli.py`'s `main` plus its `auto-harness` Click group; `lsp`, `cron`, `team`, `watch` and the two `run`/`chat` flags are Rust-side surfaces over harness ports.
+Python parity: the `openjiuwen` console script and `openjiuwen/harness/cli/cli.py`'s `main` plus its `auto-harness` Click group; `lsp`, `cron`, `team`, `watch`, the two `run`/`chat` flags and the `--resume`/`--continue` pair are Rust-side surfaces over harness ports.
 
 ## API Surface
 
@@ -22,12 +24,14 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 
 - `Cli { global: GlobalArgs, command: Option<Command> }`, `#[command(name = "openjiuwen", version, about = "openJiuwen agent CLI")]`.
 - `GlobalArgs` mirrors the harness globals flag-for-flag and all are `global = true`: `-m/--model`, `--provider`, `--api-key`, `--api-base`, `-w/--workspace`, `-v/--verbose`, `--no-color`.
-- `Command::{Run(RunCliArgs), Chat(ChatCliArgs), Lsp(lsp::LspCli), Cron(cron::CronCli), Team(team::TeamCli), Watch(watch::WatchCli), AutoHarness(AutoHarnessArgs)}`.
-- `RunCliArgs { base: RunArgs, worktree: Option<String> }` and `ChatCliArgs { base: ChatArgs, watch: bool, worktree: Option<String> }`: the harness types are flattened verbatim, the extra fields are this crate's (`--worktree` takes `value_name = "NAME"`).
+- `Command::{Run(RunCliArgs), Chat(ChatCliArgs), Lsp(lsp::LspCli), Cron(cron::CronCli), Team(team::TeamCli), Watch(watch::WatchCli), Sessions(sessions::SessionsCli), AutoHarness(AutoHarnessArgs)}`.
+- `RunCliArgs { base: RunArgs, worktree: Option<String>, resume: Option<String>, continue_: bool }` and `ChatCliArgs { base: ChatArgs, watch: bool, worktree: Option<String>, resume: Option<String>, continue_: bool }`: the harness types are flattened verbatim, the extra fields are this crate's (`--worktree` takes `value_name = "NAME"`, `--resume` takes `value_name = "ID"`, and the `continue_` field parses `--continue`).
+- `--resume` and `--continue` are `conflicts_with` each other (the clap ids are `resume` and `continue_`), so the pair is a usage error (exit `2`).
 - `Cli::to_harness()` forwards every global (including `--no-color`) and maps `Run`/`Chat` onto the harness `Command`.
-- `to_harness` drops `--worktree`/`--watch`; `Lsp`, `Cron`, `Team`, `Watch`, `AutoHarness` and "no subcommand" become `command: None`, so the harness only reads the globals there.
-- `cli::run` dispatches `auto-harness`, `lsp`, `cron`, `team` and `watch` to their modules, `run`/`chat` to `extras::run_run`/`extras::run_chat`, and "no subcommand" to `openjiuwen_harness::cli::run_cli`.
+- `to_harness` drops `--worktree`/`--watch`/`--resume`/`--continue`; `Lsp`, `Cron`, `Team`, `Watch`, `Sessions`, `AutoHarness` and "no subcommand" become `command: None`, so the harness only reads the globals there.
+- `cli::run` dispatches `auto-harness`, `lsp`, `cron`, `team`, `watch` and `sessions` to their modules, `run`/`chat` to `extras::run_run`/`extras::run_chat`, and "no subcommand" to `openjiuwen_harness::cli::run_cli`.
 - Nine unit tests guard the wiring: `--no-color` before and after a subcommand, global forwarding plus `run`/`chat` mapping, `--worktree` and `chat --watch` staying in this crate, every harness-surface command mapping to `command: None`, "no subcommand" staying `None`, and the drift checks that every harness global flag and subcommand exists in this grammar.
+- The resume flags are asserted where they are resolved: the catalogue's own inline tests, not the grammar tests.
 
 ### `auto-harness` (`src/auto_harness/`)
 
@@ -88,10 +92,28 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 - The handle is shut down before `run` returns, so nothing is printed after the last rendered line.
 - An empty plan is a typed `Error::config` ("… requires at least one watch target") from the backend instead of a permanently idle process.
 
+### `sessions` (`src/sessions/`)
+
+- `SessionsCli { data_dir: Option<PathBuf> (global, `value_name = "DIR"`), json: bool (global), command: SessionsCommand }`; `--data-dir` replaces the default `<workspace>/persistent_agent` base with `PersistentAgentLayout::new(dir)`.
+- `SessionsCommand::{List { kind: Option<KindArg>, limit: usize (default 20, 0 = all) }, Show { id }, Prune { older_than: Option<f64> (`--older-than DAYS`, conflicts with `--all`), all: bool, dry_run: bool }}`.
+- `KindArg` is a kebab-case `ValueEnum` over `cli`, `execution` and `state`; it is serde-free because the rows carry the tag string.
+- `catalog::Catalog::for_options(&CliOptions, data_dir)` is the one value holding `OpenJiuwenHome` plus `PersistentAgentLayout`; it never creates a directory, so `sessions list` works on a home and workspace that were never materialised (`CliOptions::ensure_workspace` is never called here).
+- `Catalog::list` merges three sources into `Row { id, kind, created_at, detail, data }` (`data` is `#[serde(skip)]`): the CLI records of `<home>/sessions` (`<n> messages, model <model>`), the journals of `ExecutionCatalog` (`<entries> entries, session <id>, usable <bool>`), and the records of `FileSessionStore` (`agent <id>, waiting <bool>, ending <bool>`, `created_at` from the `state.json` mtime).
+- Ordering is newest-first by parsed RFC 3339 `created_at`, rows without a timestamp last, ties by id ascending; `--kind` filters before `--limit` truncates.
+- `Catalog::resolve` takes `ResumeRequest::{Id(&str), Continue}` and yields `Resolved { id, kind, summary, history, state, plan, record }`; a persistent state record wins over a CLI record, which wins over an execution journal.
+- A state record resumes through `openjiuwen_harness::persistent_agent::resume` when its `ending`/`checkpoint`/`continuation` names an execution, seeding `plan.seed_history()` plus the plan's `deepagent_state` object; without an execution ref it seeds `record.messages` and leaves `plan: None`.
+- A CLI record maps `user`/`assistant`/`system` messages onto `BaseMessage` (other roles are skipped) and keeps the `SessionRecord`.
+- An execution journal is opened, read, and reassembled with `WindowAssembler::new(Capacity::default()).assemble(&snapshot.entries)`; the resumed id is the journal's `session_id`, falling back to the execution id.
+- `ResumeRequest::Continue` picks the newest usable execution, else the newest `state.json` mtime, else the newest CLI record, then resolves it with the same rules.
+- The summary strings are fixed: `resuming session <id> from the CLI session record (<n> messages)`, `… from the persistent session record via execution <exec> (<n> messages restored)`, `… from the persistent session record (<n> messages restored)`, `… from execution <exec> (<n> messages restored)`; `Continue` says `resuming the most recent session <id>` instead of `resuming session <id>`.
+- `Catalog::show` returns the row plus the resolution; `Catalog::prune` selects by `--all` or by age (`created_at < now - days`, timestamp-less rows only via `--all`), deletes the CLI file / the journal directory / the `state.json` directory, and without either selector is `Error::validation("prune needs --older-than <DAYS> or --all")`.
+- `list` text is `<id>\t<created_at or ->\t<kind>\t<detail>` (or `no sessions`); `show` text is `session <id>`, `kind <kind>`, `created <ts or ->`, the detail, `messages <n>`, one `<role>: <content>` line per seeded message (newlines flattened), plus `plan execution <ref or -> resume-seq <n>` when a plan resolved; `prune` text is `would prune <kind>\t<id>` / `pruned <kind>\t<id>` / `nothing to prune`.
+- `--json` prints one pretty document: the row array, the `show` object (`id`, `kind`, `created_at`, `detail`, `messages: [{role, content}]`, `plan`, `record`), or `{"dry_run", "pruned", "entries"}`.
 ### `extras` (`src/extras.rs`)
 
-- `run_run(args, base)` applies `--worktree` and hands the resulting harness `Cli` to `run_cli`.
-- `run_chat(args, base)` applies `--worktree`, then `--watch`: start the stderr watch session, run the REPL, stop the session; the REPL's own error wins over a stop failure.
+- `run_run(args, base)` applies `--worktree` and hands the resulting harness `Cli` to `run_cli`; with `--resume`/`--continue` it instead resolves the catalogue, prints the one-line summary on stderr, and runs `run_once_resumed(&options, &args.base, &CliIo::stdio_non_interactive(), ResumedTurn::new(id).with_history(history) [.with_state(state)])`, mirroring `run_cli`'s `Dispatch::Run` branch (uncoloured and non-interactive, so permission prompts fail closed).
+- `run_chat(args, base)` applies `--worktree`, then `--watch` around one `chat_entry` call: start the stderr watch session, run the REPL (fresh or resumed), stop the session; the REPL's own error wins over a stop failure.
+- The resumed chat path mirrors `run_cli`'s chat branch (`CliOptions::resolve`, `paths::color_enabled`, `CliIo::stdio().with_color`, `onboarding::maybe_run`, `build_model`, `build_agent`), then seeds `Repl::seed_history`, prints `<summary>; the REPL continues as <new id>` on stderr, and runs the REPL.
 - `prepare_worktree` resolves `CliOptions`, ensures the workspace, discovers the repository with `find_git_root`/`ProcessGitRunner`, and creates (or reuses) the worktree through `WorktreeManager::new(repo)`.
 - The worktree lives at `<repo-root>/.worktrees/<slug>` on branch `worktree-<slug>`; the announcement `worktree: <slug> -> <path> (branch <branch>)` goes to stderr and the returned harness `Cli` points `-w` at the worktree path.
 - A workspace outside a git repository (or a host without git) is a typed `Error::config` before any model is built.
@@ -100,16 +122,18 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 
 - `0` success, `--help`/`--version`, and a `watch` that stopped at `--max-events`.
 - `1` a runtime failure from any command, printed by `main` as `error: <kind>: <cause>` on stderr (for example `error: unsupported: …`, `error: not_found: cron job not found: …`).
-- `2` usage errors from clap's `parse()`: unknown subcommand or flag, missing value, invalid enum value (`lsp bogus`, `--pipeline bogus`).
-- stdout is the result stream; `run -f json`/`-f stream-json`, `auto-harness --json`, `lsp --json`, `cron --json`, `team --json`, `watch --json`, `watch --list` and the dry-run task array write there.
-- Human notices go to stderr: logs, permission prompts, the `error:` diagnostic, the `[dry-run]` note, the `worktree:` announcement, `watching N target(s)` and the `chat --watch` reload notices.
+- `2` usage errors from clap's `parse()`: unknown subcommand or flag, missing value, invalid enum value (`lsp bogus`, `--pipeline bogus`), and `--resume` together with `--continue`.
+- stdout is the result stream; `run -f json`/`-f stream-json`, `auto-harness --json`, `lsp --json`, `cron --json`, `team --json`, `watch --json`, `watch --list`, `sessions list|show|prune --json` and the dry-run task array write there.
+- Human notices go to stderr: logs, permission prompts, the `error:` diagnostic, the `[dry-run]` note, the `worktree:` announcement, the `resuming …` note of `--resume`/`--continue`, `watching N target(s)` and the `chat --watch` reload notices.
 
 ## Constraints
 
 - Only the harness defines `run`/`chat` behaviour; this crate must not re-implement parsing, option precedence, rendering or exit-code classification it already owns.
-- `lsp`, `cron`, `team` and `watch` are translations, not re-implementations: the harness owns the LSP client and server table, the cron scheduler and its JSON types, the attach protocol and its schema, and the watcher with its reload handlers.
+- `lsp`, `cron`, `team`, `watch` and `sessions` are translations, not re-implementations: the harness owns the LSP client and server table, the cron scheduler and its JSON types, the attach protocol and its schema, the watcher with its reload handlers, and the persistent-agent layout, catalogues and `resume` plan.
+- The session catalogue is read-only apart from `prune`: it never creates a directory and never calls `CliOptions::ensure_workspace` (resume does, because it is about to run).
+- Resume never re-implements the harness: `run --resume` goes through `run_once_resumed` and `chat --resume` through `Repl::seed_history`, so rendering and session-record writes stay in the harness.
 - The duplicated globals are held in sync by the drift unit tests in `src/cli.rs` against `openjiuwen_harness::cli::Cli::command()`, not by convention.
-- stdout stays machine-readable in `--json`/`stream-json` modes; logs, permission prompts, the `error:` diagnostic, the `[dry-run]` note, the `worktree:` line, the `watching` readiness line and the `chat --watch` notices go to stderr.
+- stdout stays machine-readable in `--json`/`stream-json` modes; logs, permission prompts, the `error:` diagnostic, the `[dry-run]` note, the `worktree:` line, the `resuming …` note, the `watching` readiness line and the `chat --watch` notices go to stderr.
 - No panics on user input — parsing is delegated to clap and command functions return `openjiuwen_common::error::Error`; `unwrap`/`expect`/indexing on input are forbidden in `src/`.
 - `println!`/`eprintln!` are allowed here (binary crate) for user-facing results and diagnostics only; libraries log through `tracing`.
 - No new crates.io dependencies: these surfaces need only `chrono` (the cron clock and timestamp rendering) and the `openjiuwen-harness` `notify` feature (the watcher), both already in the manifest; the crate builds offline with the workspace-pinned set, and `openjiuwen-test-support` is a dev-dependency only.
@@ -133,6 +157,10 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 - `--max-events` exists so scripts and tests can stop the watcher; it counts rendered updates (of any kind) and exits `0`.
 - Worktree creation prints to stderr (`worktree: <slug> -> <path> (branch <branch>)`), so `run -f json --worktree …` keeps a clean JSON document on stdout.
 - `chat --watch` reload notices are diagnostics only: the running REPL keeps the instructions, skills and MCP configuration it started with, and a restart applies the change.
+- `--resume` and `--continue` conflict in clap (the ids are `resume` and `continue_`), so the pair is a usage error (exit `2`) before any store is read.
+- `sessions list` never creates the home or the workspace, so it is the safe way to inspect a fresh install; `sessions show` runs the same resolution `--resume` does, so its `messages <n>` is exactly what the resumed turn seeds (a CLI row's detail can count more records than that: `tool` rows are skipped when the transcript is mapped).
+- `sessions prune --all` deletes the CLI record, the journal directory or the `state.json` directory of every row it lists, so it is the one destructive command here; `--dry-run` prints the same selection without deleting.
+- `--resume`/`--continue` require the resolved workspace to exist (the catalogue reads the workspace's `persistent_agent` node), so a run in a path that does not exist yet fails in `ensure_workspace`, not in the lookup.
 - The watcher needs the `openjiuwen-harness` `notify` feature, which this crate enables unconditionally, so `watch` and `chat --watch` are always compiled in.
 - The `auto-harness` dry run writes before it prints: a failed write is a `Config` error and nothing reaches stdout.
 
@@ -140,7 +168,8 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 
 - The harness `Cli` has no `auto-harness`, `lsp`, `cron`, `team` or `watch` command, which is why the outer grammar and its globals are duplicated here; adding harness command groups would let this crate drop the copies.
 - `openjiuwen-rsi` ships no harness evaluation runner and no experience store, so a non-dry `auto-harness run` and `verify-ext` return typed `Error::Unsupported` and the experience commands read the documented JSONL directly instead of a Rust store.
-- Persistent-agent resume is unreachable from the CLI: `openjiuwen_harness::persistent_agent` has `resume`/`ResumePlan`, but no enumeration helper for persisted executions, no `Serialize` on the plan, and no seam feeding its window back into `run_once`, `Repl` or `DeepAgent`, so there is no `--resume`, no execution listing and no way to reopen a stored session (`chat`'s `/sessions` only lists them).
+- `chat --resume` cannot adopt the persisted session id: `Repl` always mints a fresh `cli-*` id (its `session_id` field is private and `Repl::build`/`with_io_and_signals` take no id), so the restored transcript is seeded into a new REPL session and the stderr note names both ids. `run --resume` does continue the id (`run_once_resumed` creates a kernel session with it and appends to that record).
+- The resume summary uses `openjiuwen_harness::cli::session_id()` as the request id for `resume`, so a state-record resume is a *new* request id rather than the persisted one; the plan settles only its own waiting scene.
 - `lsp` needs an installed language server: the built-in table is not probed against `PATH`, so a missing program surfaces as a typed launch failure (`error: tool: …`) on first use rather than a fallback to another server.
 - `team`'s `invoke_tool` op is not exposed as a command: the client supports it, but the in-repo attach host always answers `unsupported`, so a command would only surface that error.
 - `openjiuwen-e2e/tests/cli_binary.rs` (outside this node) builds the harness `Cli` as a struct literal including `no_color`, so any new harness global must be added there as well; the crate currently compiles.
@@ -150,7 +179,9 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 
 - `./src/main.rs` → process boundary: startup order, logging installation, clap parse, `cli::run` dispatch, exit-code mapping.
 - `./src/cli.rs` → outer grammar (`Cli`, `GlobalArgs`, `Command`, `RunCliArgs`, `ChatCliArgs`), `to_harness`, dispatch into the harness or the binary's own commands, and the grammar/drift unit tests.
-- `./src/extras.rs` → `run`/`chat` wiring for `--worktree` (worktree creation and workspace redirection) and `chat --watch`.
+- `./src/extras.rs` → `run`/`chat` wiring for `--worktree` (worktree creation and workspace redirection), `chat --watch`, and `--resume`/`--continue` (the resumed run and the seeded REPL).
+- `./src/sessions/mod.rs` → `sessions`: the grammar, dispatch, and the list/show/prune text and JSON renderings.
+- `./src/sessions/catalog.rs` → the catalogue behind both `sessions` and `--resume`: the three-store merge and ordering, id/`Continue` resolution, the resume-plan probing, and prune selection/deletion.
 - `./src/lsp.rs` → `lsp`: action enum, server selection, `--file` pre-check, and payload rendering.
 - `./src/cron.rs` → `cron`: the `CronScheduler` call per subcommand and its text/JSON output.
 - `./src/team/mod.rs` → `team`: socket resolution, the attach client calls, and the roster/task/message renderings.
@@ -187,6 +218,7 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 - `tests/lsp.rs` (6 tests) pins the action/flag help, an unknown action as exit `2` with empty stdout, a missing `--file` as `error: not_found:` naming the path (also under `--json`), `/bin/false` as `error: tool:` (Unix only), and an unspawnable `--server-command` as `error: tool:`.
 - `tests/team.rs` (18 tests, `#![cfg(unix)]`) drives the real binary against a stub attach host: the grammar, exactly one request per command with the documented args (`list_tasks` status, `task_detail` id, `send_member`, `create_task`, `complete_task`), the member/task/message/outcome renderings and empty markers, one pretty JSON document per command, a remote `not_found`, an unknown `--status` reaching no request, and the missing-socket validation error.
 - `tests/watch.rs` (4 tests) pins `--list` text (instruction/MCP/skill targets plus `skipped` rows) and JSON (`targets`/`skipped`), an empty plan as `error: config:` naming the missing targets, and a live change after the readiness line reported as exactly one JSON `event` with `--max-events 1` exiting `0`.
+- The `sessions` module's inline tests cover the pure helpers (sort order with mixed timestamps, role mapping, resume-note prefixes, kind tags) plus three async tests against real stores in a temp home/workspace: a persistent state record listing/resolving/pruning, a CLI record resolving with its transcript, and the typed `not_found`/`validation` failures.
 - Hermeticity is enforced by `tests/support/mod.rs`: every child gets a fresh temp cwd, a temp `OPENJIUWEN_HOME` and a temp `-w` workspace; ambient `OPENJIUWEN_*`/`OPENAI_*`/`API_KEY`/`API_BASE`/`MODEL_*`/`NO_COLOR`/`RUST_LOG` are removed; stdin is `/dev/null`; and every spawn is bounded by a 120 s async timeout that kills the child instead of hanging the run.
 - Nothing here needs the network, credentials or a terminal: the mock server binds loopback, the team suite binds its own Unix socket, and the `run`/`cli_features` suites are the only ones that build a model.
 - In-process CLI behaviour (streaming render, REPL transcripts, permissions, onboarding) is covered by `crates/openjiuwen-harness/tests/cli.rs` and `src/cli/tests.rs`; do not duplicate it here.

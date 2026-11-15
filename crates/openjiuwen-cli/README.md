@@ -7,10 +7,10 @@ The binary is a thin process boundary. It owns the operating-system concerns
 (`.env` loading, `tracing` installation, clap's exit codes, the stderr
 diagnostic for a failed run), the outer command grammar, the `auto-harness`
 command group, which the harness has no words for, and the harness-surface
-commands `lsp`, `cron`, `team` and `watch`, which drive the harness tools and
-protocols from a terminal. Everything else — option resolution, the one-shot
-runner, the interactive REPL, permission prompts and session storage — lives in
-`openjiuwen_harness::cli`.
+commands `lsp`, `cron`, `team`, `watch` and `sessions`, which drive the harness
+tools, protocols and persistent-agent stores from a terminal. Everything else —
+option resolution, the one-shot runner, the interactive REPL, permission
+prompts and session storage — lives in `openjiuwen_harness::cli`.
 
 ```console
 $ openjiuwen run "summarise src/lib.rs"
@@ -20,6 +20,8 @@ $ openjiuwen lsp diagnostics --file src/lib.rs
 $ openjiuwen cron list
 $ openjiuwen team --socket /tmp/team.sock members
 $ openjiuwen watch --list
+$ openjiuwen sessions list
+$ openjiuwen run "and now?" --continue
 ```
 
 ## Build and run
@@ -57,7 +59,7 @@ Without a command the binary chooses one from the terminal: an interactive
 terminal starts `chat`, anything else behaves like `run` with the prompt read
 from stdin. That dispatch belongs to the harness.
 
-### `run [PROMPT] [-f|--output-format <FORMAT>] [--worktree <NAME>]`
+### `run [PROMPT] [-f|--output-format <FORMAT>] [--worktree <NAME>] [--resume <ID>|--continue]`
 
 Runs a single prompt and exits.
 
@@ -66,6 +68,8 @@ Runs a single prompt and exits.
 | `PROMPT` | Prompt text. Omitted or `-` reads stdin to end of input and joins the lines. |
 | `-f`, `--output-format` | `text` (default), `json` or `stream-json`. |
 | `--worktree <NAME>` | Create (or reuse) a git worktree of the workspace's repository and run the prompt inside it. |
+| `--resume <ID>` | Continue the session `ID` (a CLI session id, a persistent session id or an execution id) instead of starting a new one. |
+| `--continue` | Continue the most recent resumable session; conflicts with `--resume`. |
 
 Output shapes:
 
@@ -92,15 +96,17 @@ announced on stderr as one line, `worktree: <slug> -> <path> (branch <branch>)`,
 so stdout stays the result stream. A workspace outside a git repository, or a
 host without git, is a typed `config` error before any model is built.
 
-### `chat [--watch] [--worktree <NAME>]`
+### `chat [--watch] [--worktree <NAME>] [--resume <ID>|--continue]`
 
 Starts the interactive REPL on a terminal. Beyond the global options it takes
-two flags of its own; without them the REPL behaves exactly as before.
+flags of its own; without them the REPL behaves exactly as before.
 
 | Flag | Meaning |
 | --- | --- |
 | `--watch` | Watch the workspace and report skill, spec, instruction and MCP reloads on stderr while the REPL runs. |
 | `--worktree <NAME>` | Create (or reuse) a worktree as `run --worktree` does and chat inside it. |
+| `--resume <ID>` | Seed the REPL with the transcript of session `ID` (the same ids `run --resume` accepts). |
+| `--continue` | Seed the REPL with the most recent resumable session; conflicts with `--resume`. |
 
 The REPL is wired by the harness and provides the in-session slash commands
 `/exit` (`/quit`), `/new`, `/clear`, `/mode`, `/help`, `/status`, `/cost`,
@@ -114,6 +120,35 @@ dropped-notification notice or a watcher error), preceded by a `watching N
 target(s)` readiness line. The notices are diagnostics only — the running REPL
 keeps the instructions, skills and MCP configuration it started with; a restart
 applies the change. The conversation on stdout is untouched.
+
+### Resuming a session (`--resume <ID>` / `--continue`)
+
+Both flags resolve their id through the same catalogue `openjiuwen sessions`
+lists: the CLI session records under `<home>/sessions`, the persistent-agent
+execution journals under the workspace's `persistent_agent/logs`, and the
+persistent-agent session records under `persistent_agent/sessions`. A
+persistent session record wins over a CLI record, which wins over an execution
+journal. `--continue` picks the newest usable execution, else the newest
+persistent session record, else the newest CLI record.
+
+The restored history is seeded into the turn and one note goes to **stderr**, so
+stdout keeps the run's output format:
+
+```text
+resuming session cli-1a2b3c4d from the CLI session record (4 messages)
+resuming session sess-1 from the persistent session record via execution exec-7 (9 messages restored)
+resuming the most recent session exec-7 from execution exec-7 (9 messages restored)
+```
+
+`run --resume` continues the resolved session id: the kernel session and the CLI
+session record keep that id and the new turns are appended to it. `chat
+--resume` cannot adopt it — the harness REPL always mints a fresh `cli-*` id — so
+the transcript is seeded into a new REPL session and the note says so:
+`… ; the REPL continues as cli-….`
+
+An id no store knows is `error: not_found: unknown session: <id>`; an empty
+catalogue is `error: not_found: no resumable session found`; giving both flags at
+once is a usage error (exit `2`).
 
 ### `auto-harness <COMMAND>`
 
@@ -382,6 +417,43 @@ update on stdout:
 a typed `error: config:` (`… requires at least one watch target`) instead of a
 silently idle process.
 
+### `sessions <COMMAND>`
+
+The read-only catalogue behind `--resume`/`--continue`: it merges the CLI
+session records, the persistent-agent execution journals and the persistent-agent
+session records into one list, newest first. Listing creates nothing, so it works
+on a home and a workspace that were never materialised.
+
+| Flag | Meaning |
+| --- | --- |
+| `--data-dir <DIR>` | Group-global: base directory holding the persistent-agent state (`logs/`, `sessions/`, `links/`). Defaults to the workspace's `persistent_agent` node. |
+| `--json` | Group-global: print one pretty JSON document instead of text. |
+
+| Command | Meaning |
+| --- | --- |
+| `sessions list [--kind <KIND>] [--limit <N>]` | List the persisted rows, newest first. `--kind` is `cli`, `execution` or `state`; `--limit` defaults to `20` and `0` means all (the kind filter applies before the limit). |
+| `sessions show <ID>` | Show one row and exactly what resuming it would seed. |
+| `sessions prune [--older-than <DAYS>] [--all] [--dry-run]` | Delete rows older than `DAYS` (fractional days allowed) or every row with `--all`; one of the two is required. `--dry-run` prints the selection without deleting. |
+
+Row lines are `<id>\t<created_at or ->\t<kind>\t<detail>`, where the detail names
+the store: `<n> messages, model <model>` (cli), `<n> entries, session <id>, usable
+<bool>` (execution), or `agent <id>, waiting <bool>, ending <bool>` (state, with
+`created_at` taken from the `state.json` modification time). An empty selection is
+`no sessions`.
+
+`sessions show` prints `session <id>`, `kind <kind>`, `created <ts or ->`, the
+detail line, `messages <n>` (the seeded window), one `<role>: <content>` line per
+seeded message, and — when a persistent session record was traced through its
+journal — `plan execution <ref or -> resume-seq <n>`. With `--json` it is one
+object with the keys `id`, `kind`, `created_at`, `detail`,
+`messages: [{"role", "content"}]`, `plan` and `record`.
+
+`prune` prints `would prune <kind>\t<id>` for a dry run, `pruned <kind>\t<id>`
+otherwise, and `nothing to prune` when the selector matches nothing; `--json`
+prints `{"dry_run", "pruned", "entries"}`. Deleting a `cli` row removes
+`<home>/sessions/<id>.json`, an `execution` row removes its journal directory, and
+a `state` row removes its `<agent>/<session>/` directory.
+
 ## Global options
 
 | Flag | Meaning |
@@ -460,7 +532,7 @@ off.
 ~/.openjiuwen/                     (or $OPENJIUWEN_HOME)
   settings.json                    provider/model defaults written by onboarding
   permissions.yaml                 permanent "always allow" tool answers
-  sessions/                        append-only session records
+  sessions/                        append-only session records (read by sessions list/prune)
   mcp.json                         MCP server declarations (optional)
   .openjiuwen_history              REPL input history
   auto_harness/                    auto-harness state when no -w is given
@@ -469,6 +541,7 @@ off.
     experience/experiences.jsonl   experience records (read-only in Rust)
 
 <workspace>/                       -w, OPENJIUWEN_WORKSPACE or <home>/workspace
+  persistent_agent/                execution journals, session records and links (sessions list/show/prune)
   cron/jobs.json                   the cron schedule written by cron create/toggle/cancel/run
   cron/runs.json                   the bounded run history written by cron run, read by cron runs
   .openjiuwen/mcp.json             workspace MCP configuration (a watch target)
@@ -523,24 +596,22 @@ is explicit where it cannot:
   REPL keeps the instructions, skills and MCP servers it started with — a
   restart applies them. Only `openjiuwen watch` is a pure observer, and
   `--max-events` exists so scripts can stop it deterministically.
-- **Persistent-agent resume is not exposed.** `openjiuwen_harness::persistent_agent`
-  ships `resume` and a `ResumePlan` (journalled replay, a rebuilt window, a
-  continuation prompt, share bundles), but nothing in the harness CLI consumes
-  it: there is no helper that enumerates persisted executions
-  (`FileSessionStore` exposes only `path_for`, `RootLogSource` opens one
-  execution id at a time), `ResumePlan` is not `Serialize`, and no seam feeds its
-  window back into `run_once`, `Repl` or `DeepAgent`. This binary therefore has
-  no `--resume`, no execution listing and no session picker: `run`/`chat` always
-  start a new execution, and `chat`'s `/sessions` only *lists* stored session
-  records (id, model, creation time, message count) — there is no way to reopen
-  one.
+- **`chat --resume` starts a new REPL session.** The harness `Repl` always mints
+  a fresh `cli-*` id (its `session_id` field is private and the constructors take
+  no id), so a resumed chat seeds the restored transcript into a new session and
+  the stderr note names both ids. `run --resume` does continue the resolved id:
+  the kernel session and the CLI session record keep it and the new turns are
+  appended. The resume summary uses the CLI's fresh request id for the
+  persistent-agent `resume` call, so a state-record resume settles only its own
+  waiting scene.
 - **No remote mode.** Python's client/server (`OPENJIUWEN_SERVER_URL`) path is
   not exposed by this binary: `run` and `chat` always drive an in-process agent.
-- **Rust additions.** `--json` on the `auto-harness`, `cron`, `team` and `lsp`
-  groups and on `watch`, `--max-events`/`--debounce-ms` on `watch`,
-  `--worktree`/`--watch` on `run`/`chat`, the stderr dry-run note (Python prints
-  it on stdout), English user-facing messages, and the `error: <kind>: <cause>`
-  diagnostic on stderr with exit `1`.
+- **Rust additions.** `--json` on the `auto-harness`, `cron`, `team`, `lsp` and
+  `sessions` groups and on `watch`, `--max-events`/`--debounce-ms` on `watch`,
+  `--worktree`/`--watch` on `run`/`chat`, `--resume`/`--continue` on `run`/`chat`
+  and the whole `sessions` group, the stderr dry-run note and resume note
+  (Python prints the former on stdout), English user-facing messages, and the
+  `error: <kind>: <cause>` diagnostic on stderr with exit `1`.
 - **Deferred harness features** are documented in `../openjiuwen-harness/` and
   `../../docs/PARITY.md`: the browser/CUA/mobile presets, MCP resource tools that
   need a host backend, and OTel export.
@@ -563,6 +634,13 @@ terminal.
 | `tests/lsp.rs` | The action and flag help, an unknown action as a usage error, a missing `--file` as `not_found` (also with `--json`), and a failing or unspawnable `--server-command` as a typed `tool` error. |
 | `tests/team.rs` | A stub attach host behind a Unix socket: the grammar, one request per command with the documented arguments, the member/task/message/outcome renderings and empty markers, the JSON documents, a remote `not_found`, an unknown `--status`, and the missing-socket validation error. |
 | `tests/watch.rs` | `watch --list` text and JSON plans (targets plus skipped roots), an empty plan as a typed `config` error, and a live change reported as one JSON event with `--max-events 1` shutting the watcher down. |
+
+The session catalogue is covered in-crate by the `sessions` module's inline
+tests: the pure helpers (row ordering with mixed timestamps, role mapping,
+resume-note prefixes, kind tags) plus async tests that drive real stores in a
+temporary home and workspace — a persistent session record listing, resolving
+and pruning, a CLI record resolving with its transcript, and the typed
+`not_found`/`validation` failures.
 
 In-process CLI behaviour (streaming render, REPL transcripts, permissions) is
 covered by the harness suites; nothing here duplicates it.

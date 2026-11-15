@@ -90,6 +90,17 @@ pub(crate) struct RunCliArgs {
     /// directory), and the run's workspace becomes the worktree path.
     #[arg(long, value_name = "NAME")]
     pub(crate) worktree: Option<String>,
+    /// Continue an earlier session instead of starting a new one.
+    ///
+    /// The id is looked up in the CLI session records, the persistent-agent
+    /// session records and the execution journals (see `openjiuwen sessions`);
+    /// the restored history is seeded into this run. The note naming what was
+    /// resumed goes to stderr, so stdout keeps its output format.
+    #[arg(long, value_name = "ID", conflicts_with = "continue_")]
+    pub(crate) resume: Option<String>,
+    /// Continue the most recent resumable session.
+    #[arg(long = "continue", conflicts_with = "resume")]
+    pub(crate) continue_: bool,
 }
 
 /// `chat`: the harness arguments plus the binary's own additions.
@@ -108,13 +119,22 @@ pub(crate) struct ChatCliArgs {
     /// Create (or reuse) a git worktree of the workspace repository and chat in it.
     #[arg(long, value_name = "NAME")]
     pub(crate) worktree: Option<String>,
+    /// Continue an earlier session instead of starting a new one.
+    ///
+    /// The restored transcript is seeded into the REPL, which then continues
+    /// under a fresh session id (the note on stderr names both).
+    #[arg(long, value_name = "ID", conflicts_with = "continue_")]
+    pub(crate) resume: Option<String>,
+    /// Continue the most recent resumable session.
+    #[arg(long = "continue", conflicts_with = "resume")]
+    pub(crate) continue_: bool,
 }
 
 /// Subcommands of the `openjiuwen` binary.
 ///
 /// `run` and `chat` wrap the harness argument types so their parsing is the
-/// harness's own; `auto-harness`, `lsp`, `cron`, `team` and `watch` are new here
-/// and dispatched by this crate.
+/// harness's own; `auto-harness`, `lsp`, `cron`, `team`, `watch` and `sessions`
+/// are new here and dispatched by this crate.
 #[derive(Debug, Clone, clap::Subcommand)]
 pub(crate) enum Command {
     /// Run a single prompt and exit.
