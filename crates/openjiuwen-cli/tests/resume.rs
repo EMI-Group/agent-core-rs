@@ -5,27 +5,28 @@
 //! takes: option resolution, the catalogue lookup, the kernel seed, the HTTP
 //! request and the rendering of the chosen `-f` format.
 //!
-//! The three resumable sources are covered in the order the catalogue documents:
+//! The resumable sources are covered in the order the catalogue documents them:
 //!
-//! 1. a **CLI session record** written by an earlier `run` — plain resume,
-//!    `--continue`, and the ordering of the restored transcript inside the model
-//!    request;
-//! 2. a **persistent-agent session record** whose ending names an execution, so
-//!    the resume traces the journal into a [`ResumePlan`] and seeds its history;
+//! 1. a **persistent-agent session record** — what the CLI's own runs write, so
+//!    a plain `run` followed by `run --resume <id>` continues the record and its
+//!    `ending` traces the journal of the first turn;
+//! 2. a **CLI session record** written by an earlier `run` — `--continue`, and
+//!    the ordering of the restored transcript inside the model request;
 //! 3. an **execution journal** resolved by its own id, which also creates the CLI
 //!    record of the session it belongs to.
 //!
-//! The persistent-agent fixtures are written with the harness API in the test
-//! process ([`seed_persistent_state`]), because nothing in the CLI writes
-//! journals: they are what *another* host persists.
+//! The persistent-agent fixtures used by the journal cases are written with the
+//! harness API in the test process ([`seed_persistent_state`]), because they
+//! model what *another* host persists.
 //!
 //! Typed failures close the suite: an unknown id, and a `--continue` on a home
-//! with no session at all. `chat --resume` is covered through the REPL's stdin
-//! EOF path, with the note that names both session ids.
+//! with no session at all. `chat --resume` is covered by piping one line into
+//! the REPL, which continues the persisted session id instead of minting a
+//! fresh one.
 //!
 //! Nothing needs the network, credentials or a terminal: the mock server binds
 //! loopback, every child runs in a temporary cwd/home/workspace and stdin is
-//! `/dev/null`.
+//! `/dev/null` — or, for the REPL case, exactly the piped line.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod support;
@@ -38,7 +39,7 @@ use openjiuwen_harness::{
 };
 use openjiuwen_test_support::{MockLlmServer, ScriptedResponse, TEST_API_KEY};
 use serde_json::Value;
-use support::{assert_exit, assert_no_ansi, assert_success, parse_json, stderr, Sandbox};
+use support::{assert_exit, assert_no_ansi, assert_success, parse_json, stderr, stdout, Sandbox};
 
 /// The answer the scripted model returns for every request.
 const ANSWER: &str = "hello from the scripted model";
@@ -133,6 +134,24 @@ fn shown_messages(value: &Value) -> Vec<(String, String)> {
                 message["content"].as_str().unwrap_or_default().to_owned(),
             )
         })
+        .collect()
+}
+
+/// Reads the CLI session record of `id` from the sandbox home.
+///
+/// The transcript lives at `<home>/sessions/<id>.json` (the sandbox home is
+/// `<root>/home`). It is read as JSON instead of through `sessions show`,
+/// because the catalogue's view of a session may be a richer persistent plan
+/// whose seeded window carries synthetic summary/replay decorations.
+fn cli_record(sandbox: &Sandbox, id: &str) -> Value {
+    parse_json(&sandbox.read(format!("home/sessions/{id}.json")))
+}
+
+/// Returns every `cli-*` session id mentioned in `text`.
+fn cli_ids(text: &str) -> Vec<String> {
+    text.split(|character: char| !(character.is_ascii_alphanumeric() || character == '-'))
+        .filter(|token| token.starts_with("cli-") && token.len() > "cli-".len())
+        .map(str::to_owned)
         .collect()
 }
 
@@ -233,15 +252,16 @@ async fn a_fresh_run_then_resume_by_id_continues_the_record() {
         "a fresh run mints a `cli-` session: {session_id}"
     );
 
-    let shown = parse_json(&assert_success(
-        &sandbox
-            .run(&sessions_args(&sandbox, &["show", id, "--json"]))
-            .await,
-    ));
+    // A run is recorded twice: a persistent session record (which the resume
+    // resolves) and the CLI record this suite reads directly.
+    let record = cli_record(&sandbox, id);
     assert_eq!(
-        shown_messages(&shown).len(),
-        2,
-        "the first turn persisted exactly its question and answer: {shown}"
+        shown_messages(&record),
+        vec![
+            ("user".to_owned(), FIRST_QUESTION.to_owned()),
+            ("assistant".to_owned(), ANSWER.to_owned()),
+        ],
+        "the first turn persisted exactly its question and answer: {record}"
     );
 
     let output = sandbox
@@ -263,25 +283,27 @@ async fn a_fresh_run_then_resume_by_id_continues_the_record() {
     let note = stderr(&output);
     assert!(
         note.contains(&format!(
-            "resuming session {session_id} from the CLI session record (2 messages)"
+            "resuming session {session_id} from the persistent session record via execution"
         )),
-        "got {note:?}"
+        "the note names the record the run wrote: {note:?}"
+    );
+    assert!(
+        note.contains("messages restored"),
+        "the note counts the restored messages: {note:?}"
     );
 
-    let shown = parse_json(&assert_success(
-        &sandbox
-            .run(&sessions_args(&sandbox, &["show", id, "--json"]))
-            .await,
-    ));
+    // The CLI record continues the transcript; the resumed plan's synthetic
+    // window decorations stay out of it.
+    let record = cli_record(&sandbox, id);
     assert_eq!(
-        shown_messages(&shown),
+        shown_messages(&record),
         vec![
             ("user".to_owned(), FIRST_QUESTION.to_owned()),
             ("assistant".to_owned(), ANSWER.to_owned()),
             ("user".to_owned(), SECOND_QUESTION.to_owned()),
             ("assistant".to_owned(), ANSWER.to_owned()),
         ],
-        "the record continues both turns in order: {shown}"
+        "the record continues both turns in order: {record}"
     );
 
     let requests = server.requests();
@@ -292,7 +314,11 @@ async fn a_fresh_run_then_resume_by_id_continues_the_record() {
     server.shutdown().await;
 }
 
-/// `--continue` picks the newest CLI record and keeps extending it.
+/// `--continue` picks the most recent session and keeps extending it.
+///
+/// Which store the pickup resolves through is left open on purpose: the
+/// catalogue decides that precedence, and the suite only asserts the session the
+/// user sees continued.
 #[tokio::test]
 async fn continue_picks_the_most_recent_session() {
     let sandbox = Sandbox::new();
@@ -309,6 +335,7 @@ async fn continue_picks_the_most_recent_session() {
     );
     let session_id = session_id_of(&parse_json(&first));
     let id = session_id.as_str();
+    let heading = format!("resuming the most recent session {session_id}");
 
     let output = sandbox
         .run(&cli_args(
@@ -321,10 +348,12 @@ async fn continue_picks_the_most_recent_session() {
     assert_eq!(session_id_of(&parse_json(&text)), session_id);
     let note = stderr(&output);
     assert!(
-        note.contains(&format!(
-            "resuming the most recent session {session_id} from the CLI session record (2 messages)"
-        )),
-        "got {note:?}"
+        note.lines().any(|line| line.starts_with(&heading)),
+        "the `--continue` note names the picked session: {note:?}"
+    );
+    assert!(
+        note.contains("messages restored"),
+        "the note counts the restored messages: {note:?}"
     );
 
     let output = sandbox
@@ -338,16 +367,12 @@ async fn continue_picks_the_most_recent_session() {
     assert_eq!(session_id_of(&parse_json(&text)), session_id);
     let note = stderr(&output);
     assert!(
-        note.contains("resuming the most recent session cli-"),
-        "the `--continue` note names the picked session: {note:?}"
+        note.lines().any(|line| line.starts_with(&heading)),
+        "the second `--continue` keeps picking the same session: {note:?}"
     );
 
-    let shown = parse_json(&assert_success(
-        &sandbox
-            .run(&sessions_args(&sandbox, &["show", id, "--json"]))
-            .await,
-    ));
-    let messages = shown_messages(&shown);
+    let record = cli_record(&sandbox, id);
+    let messages = shown_messages(&record);
     assert_eq!(
         messages.len(),
         6,
@@ -486,20 +511,22 @@ async fn an_execution_id_resumes_its_journal_and_creates_the_cli_record() {
     ));
     let rows = rows.as_array().expect("a JSON array of rows");
     assert!(
-        rows.iter().any(|row| row["kind"] == "cli"),
-        "the resumed execution leaves a CLI record behind: {rows:?}"
+        rows.iter().any(|row| row["id"] == STATE_SESSION),
+        "the resumed execution's session is listed: {rows:?}"
     );
+    let messages = shown_messages(&cli_record(&sandbox, STATE_SESSION));
     assert!(
-        rows.iter()
-            .any(|row| row["kind"] == "cli" && row["id"] == STATE_SESSION),
-        "the CLI record belongs to the execution's session: {rows:?}"
+        messages
+            .iter()
+            .any(|(role, content)| role == "user" && content == NEXT_QUESTION),
+        "the resumed execution left a CLI record behind: {messages:?}"
     );
     server.shutdown().await;
 }
 
-/// `chat --resume` seeds the restored transcript into a fresh REPL session.
+/// `chat --resume` continues the persisted session instead of minting a new one.
 #[tokio::test]
-async fn chat_resume_seeds_the_transcript_into_a_fresh_repl() {
+async fn chat_resume_continues_the_persisted_session() {
     let sandbox = Sandbox::new();
     let server = scripted_server().await;
 
@@ -514,21 +541,64 @@ async fn chat_resume_seeds_the_transcript_into_a_fresh_repl() {
     );
     let session_id = session_id_of(&parse_json(&first));
     let id = session_id.as_str();
+    assert_eq!(
+        shown_messages(&cli_record(&sandbox, id)).len(),
+        2,
+        "the first turn left a two-message record"
+    );
 
-    // stdin is `/dev/null`, so the REPL sees EOF right after the note and exits.
+    // One piped line drives one REPL turn; closing stdin then ends the loop.
+    // The home is marked as configured first, so the line reaches the REPL
+    // instead of being eaten by the interactive onboarding wizard.
+    sandbox.write("home/settings.json", "{}");
     let output = sandbox
-        .run(&cli_args(&sandbox, &server, &["chat", "--resume", id]))
+        .run_with_stdin(
+            &cli_args(&sandbox, &server, &["chat", "--resume", id]),
+            &format!("{THIRD_QUESTION}\n"),
+        )
         .await;
-    let text = assert_success(&output);
-    assert_no_ansi(&text);
+    assert_success(&output);
+    assert_no_ansi(&stdout(&output));
     let note = stderr(&output);
     assert!(
         note.contains(&format!("resuming session {session_id}")),
         "the note names the resumed session: {note:?}"
     );
     assert!(
-        note.contains("the REPL continues as cli-"),
-        "the note names the fresh REPL session: {note:?}"
+        !note.contains("the REPL continues as"),
+        "the note announces no second, fresh session: {note:?}"
+    );
+    assert_eq!(
+        cli_ids(&note),
+        vec![session_id.clone()],
+        "the note mentions no session id but the resumed one: {note:?}"
+    );
+
+    let record = cli_record(&sandbox, id);
+    let messages = shown_messages(&record);
+    assert_eq!(
+        messages.len(),
+        4,
+        "the REPL turn was appended to the persisted record: {messages:?}"
+    );
+    assert_eq!(messages[2], ("user".to_owned(), THIRD_QUESTION.to_owned()));
+    assert_eq!(messages[3], ("assistant".to_owned(), ANSWER.to_owned()));
+
+    let mut names: Vec<String> = std::fs::read_dir(sandbox.path("home/sessions"))
+        .expect("the sessions directory")
+        .map(|entry| {
+            entry
+                .expect("a sessions directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![format!("{id}.json")],
+        "no fresh `cli-*` record appeared"
     );
     server.shutdown().await;
 }

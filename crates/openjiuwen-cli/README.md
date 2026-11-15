@@ -68,8 +68,8 @@ Runs a single prompt and exits.
 | `PROMPT` | Prompt text. Omitted or `-` reads stdin to end of input and joins the lines. |
 | `-f`, `--output-format` | `text` (default), `json` or `stream-json`. |
 | `--worktree <NAME>` | Create (or reuse) a git worktree of the workspace's repository and run the prompt inside it. |
-| `--resume <ID>` | Continue the session `ID` (a CLI session id, a persistent session id or an execution id) instead of starting a new one. |
-| `--continue` | Continue the most recent resumable session; conflicts with `--resume`. |
+| `--resume <ID>` | Continue the session `ID` (a CLI session id, a persistent session id or an execution id) instead of starting a new one; the new turns append to that session's own CLI record. |
+| `--continue` | Continue the most recent resumable session the same way; conflicts with `--resume`. |
 
 Output shapes:
 
@@ -105,8 +105,8 @@ flags of its own; without them the REPL behaves exactly as before.
 | --- | --- |
 | `--watch` | Watch the workspace and report skill, spec, instruction and MCP reloads on stderr while the REPL runs. |
 | `--worktree <NAME>` | Create (or reuse) a worktree as `run --worktree` does and chat inside it. |
-| `--resume <ID>` | Seed the REPL with the transcript of session `ID` (the same ids `run --resume` accepts). |
-| `--continue` | Seed the REPL with the most recent resumable session; conflicts with `--resume`. |
+| `--resume <ID>` | Continue the session `ID` in the REPL (the same ids `run --resume` accepts): the REPL adopts that id and appends every turn to its record. |
+| `--continue` | Continue the most recent resumable session the same way; conflicts with `--resume`. |
 
 The REPL is wired by the harness and provides the in-session slash commands
 `/exit` (`/quit`), `/new`, `/clear`, `/mode`, `/help`, `/status`, `/cost`,
@@ -125,28 +125,41 @@ applies the change. The conversation on stdout is untouched.
 
 Both flags resolve their id through the same catalogue `openjiuwen sessions`
 lists: the CLI session records under `<home>/sessions`, the persistent-agent
-execution journals under the workspace's `persistent_agent/logs`, and the
-persistent-agent session records under `persistent_agent/sessions`. A
-persistent session record wins over a CLI record, which wins over an execution
-journal. `--continue` picks the newest usable execution, else the newest
-persistent session record, else the newest CLI record.
+session records under the workspace's `persistent_agent/sessions`, and the
+persistent-agent execution journals under `persistent_agent/logs`. An id
+resolves through one precedence — a persistent session record wins over a CLI
+record, which wins over an execution journal. `--continue` first picks the
+newest resumable session (the catalogue's newest-first rows, ties broken by id,
+skipping a session whose only source is an unusable journal) and then resolves
+that session the same way.
 
-The restored history is seeded into the turn and one note goes to **stderr**, so
-stdout keeps the run's output format:
+Every CLI turn is journalled, so a run's own persistent session record is
+usually the richest source: `run --resume <cli-id>` normally reports
+`from the persistent session record via execution <exec>`, the execution its
+`ending` names. The restored history is seeded into the turn and one note goes
+to **stderr**, so stdout keeps the run's output format:
 
 ```text
+resuming session cli-1a2b3c4d from the persistent session record via execution exec-7 (9 messages restored)
+resuming session cli-1a2b3c4d from the persistent session record (9 messages restored)
 resuming session cli-1a2b3c4d from the CLI session record (4 messages)
-resuming session sess-1 from the persistent session record via execution exec-7 (9 messages restored)
-resuming session sess-1 from the persistent session record (9 messages restored)
-resuming session cli-1a2b3c4d from execution exec-7 (9 messages restored)
-resuming the most recent session cli-1a2b3c4d from the CLI session record (4 messages)
+resuming session sess-1 from execution exec-7 (2 messages restored)
+resuming the most recent session cli-1a2b3c4d from the persistent session record via execution exec-7 (9 messages restored)
 ```
 
-`run --resume` continues the resolved session id: the kernel session and the CLI
-session record keep that id and the new turns are appended to it. `chat
---resume` cannot adopt it — the harness REPL always mints a fresh `cli-*` id — so
-the transcript is seeded into a new REPL session and the note says so:
-`… ; the REPL continues as cli-….`
+Both commands continue the resolved session id. `run --resume` hands the restored
+window and the persisted `deepagent` state to the harness's resumed-turn seam,
+which continues that id's kernel session and appends to that id's CLI record.
+`chat --resume` makes the REPL adopt the same id before the transcript is seeded,
+so every following REPL turn appends to the persisted
+`<home>/sessions/<id>.json` record; the note on stderr is the catalogue summary
+and names no second id.
+
+A window rebuilt from a journal carries the harness's replay decorations as
+messages: `【窗口摘要】…` for elided entries and `【本次执行】<question>` for the
+execution's goal. The CLI record stays the clean `user`/`assistant` transcript,
+so `sessions show` reports the decorated window while the record file reports
+the conversation.
 
 An id no store knows is `error: not_found: unknown session: <id>`; an empty
 catalogue is `error: not_found: no resumable session found`; giving both flags at
@@ -421,10 +434,15 @@ silently idle process.
 
 ### `sessions <COMMAND>`
 
-The read-only catalogue behind `--resume`/`--continue`: it merges the CLI
-session records, the persistent-agent execution journals and the persistent-agent
-session records into one list, newest first. Listing creates nothing, so it works
-on a home and a workspace that were never materialised.
+The read-only catalogue behind `--resume`/`--continue`: it reads the CLI session
+records, the persistent-agent session records and the persistent-agent execution
+journals and reports **one row per session**, newest first. One `run` writes to
+all three stores, so the entries sharing an `(agent id, session id)` pair are
+folded into one row reported from the richest source (`state`, then `cli`, then
+`execution`), with the newest timestamp of the group when the kept source has
+none; the other sources are kept only as prune targets. The row count and
+`--limit` therefore count sessions, not store entries. Listing creates nothing,
+so it works on a home and a workspace that were never materialised.
 
 | Flag | Meaning |
 | --- | --- |
@@ -433,28 +451,37 @@ on a home and a workspace that were never materialised.
 
 | Command | Meaning |
 | --- | --- |
-| `sessions list [--kind <KIND>] [--limit <N>]` | List the persisted rows, newest first. `--kind` is `cli`, `execution` or `state`; `--limit` defaults to `20` and `0` means all (the kind filter applies before the limit). |
-| `sessions show <ID>` | Show one row and exactly what resuming it would seed. |
-| `sessions prune [--older-than <DAYS>] [--all] [--dry-run]` | Delete rows older than `DAYS` (fractional days allowed) or every row with `--all`; one of the two is required. `--dry-run` prints the selection without deleting. |
+| `sessions list [--kind <KIND>] [--limit <N>]` | List the persisted sessions, newest first. `--limit` defaults to `20` and `0` means all; the kind filter applies before the limit. |
+| `sessions show <ID>` | Show one session and exactly what resuming it would seed. |
+| `sessions prune [--older-than <DAYS>] [--all] [--dry-run]` | Delete sessions older than `DAYS` (fractional days allowed) or every session with `--all`; one of the two is required. `--dry-run` prints the selection without deleting. |
+
+`--kind` is `cli`, `execution` or `state`. The kind a row reports is the richest
+source it was listed from — a CLI run normally reports `state` — while the filter
+matches a session when **any** of its sources has that kind: `--kind cli` still
+lists a CLI run, and `--kind execution` lists it through its journal.
 
 Row lines are `<id>\t<created_at or ->\t<kind>\t<detail>`, where the detail names
-the store: `<n> messages, model <model>` (cli), `<n> entries, session <id>, usable
-<bool>` (execution), or `agent <id>, waiting <bool>, ending <bool>` (state, with
-`created_at` taken from the `state.json` modification time). An empty selection is
-`no sessions`.
+the kept store: `<n> messages, model <model>` (cli), `<n> entries, session <id>,
+usable <bool>` (execution), or `agent <id>, waiting <bool>, ending <bool>` (state,
+with `created_at` taken from the `state.json` modification time). An empty
+selection is `no sessions`.
 
-`sessions show` prints `session <id>`, `kind <kind>`, `created <ts or ->`, the
-detail line, `messages <n>` (the seeded window), one `<role>: <content>` line per
-seeded message, and — when a persistent session record was traced through its
-journal — `plan execution <ref or -> resume-seq <n>`. With `--json` it is one
-object with the keys `id`, `kind`, `created_at`, `detail`,
-`messages: [{"role", "content"}]`, `plan` and `record`.
+`sessions show` resolves the id first and then prints the row that session is
+reported from, so an execution id shows the session the execution belongs to. It
+prints `session <id>`, `kind <kind>`, `created <ts or ->`, the detail line,
+`messages <n>` (the seeded window), one `<role>: <content>` line per seeded
+message, and — when a persistent session record was traced through its journal —
+`plan execution <ref or -> resume-seq <n>`. With `--json` it is one object with
+the keys `id`, `kind`, `created_at`, `detail`, `messages: [{"role", "content"}]`,
+`plan` and `record`.
 
 `prune` prints `would prune <kind>\t<id>` for a dry run, `pruned <kind>\t<id>`
 otherwise, and `nothing to prune` when the selector matches nothing; `--json`
-prints `{"dry_run", "pruned", "entries"}`. Deleting a `cli` row removes
-`<home>/sessions/<id>.json`, an `execution` row removes its journal directory, and
-a `state` row removes its `<agent>/<session>/` directory.
+prints `{"dry_run", "pruned", "entries"}`. Deleting a session removes **every**
+source it has — the `<home>/sessions/<id>.json` CLI record, each
+`persistent_agent/logs/<exec>/` journal directory and the
+`persistent_agent/sessions/<agent>/<session>/` directory — so a pruned session
+cannot reappear from a leftover store.
 
 ## Global options
 
@@ -478,23 +505,25 @@ built-in default**, blank values skipped at every level.
 | Code | Meaning |
 | --- | --- |
 | `0` | Success, including `--help` and `--version`, and a `watch` that stopped at `--max-events`. |
-| `1` | A runtime failure from `run`, `chat`, `auto-harness`, `lsp`, `cron`, `team` or `watch`. Reported as `error: <kind>: <cause>` on stderr (for example `error: unsupported: …`, `error: not_found: cron job not found: …`, `error: validation: team socket is required: …`). |
+| `1` | A runtime failure from `run`, `chat`, `auto-harness`, `lsp`, `cron`, `team`, `watch` or `sessions`. Reported as `error: <kind>: <cause>` on stderr (for example `error: unsupported: …`, `error: not_found: cron job not found: …`, `error: validation: team socket is required: …`). |
 | `2` | A usage error, decided by clap before any command runs: unknown subcommand or flag, missing value, invalid enum value (`--pipeline bogus`, `--stage bogus`, `--output-format bogus`, `lsp definitely-not-an-action`). |
 
 ## Streams: logs on stderr, results on stdout
 
 - **stdout is the result stream.** `run -f json` prints exactly one JSON object;
   `run -f stream-json` prints one JSON object per line; `auto-harness --json`,
-  `lsp --json`, `cron --json`, `team --json` and `watch --list --json` print one
-  JSON document; `watch --json` prints one JSON object per reported update. A
+  `lsp --json`, `cron --json`, `team --json`, `sessions --json` and
+  `watch --list --json` print one JSON document; `watch --json` prints one JSON
+  object per reported update. A
   `watch --list` text plan and every text-mode command print their lines here
   too. `auto-harness run --dry-run` prints only the task array.
 - **stderr carries everything else**: the `tracing` log stream (always installed
   with a stderr writer), permission prompts, the `error: …` diagnostic,
   `warning: …` startup notes, the `[dry-run] task list -> …` note, the
-  `worktree: …` announcement, the `watching N target(s)` readiness line, and the
-  reload notices of `chat --watch`. Redirecting stderr therefore leaves a clean,
-  machine-readable stream on stdout.
+  `resuming …` note of `--resume`/`--continue`, the `worktree: …` announcement,
+  the `watching N target(s)` readiness line, and the reload notices of
+  `chat --watch`. Redirecting stderr therefore leaves a clean, machine-readable
+  stream on stdout.
 
 ## Environment variables
 
@@ -534,7 +563,8 @@ off.
 ~/.openjiuwen/                     (or $OPENJIUWEN_HOME)
   settings.json                    provider/model defaults written by onboarding
   permissions.yaml                 permanent "always allow" tool answers
-  sessions/                        append-only session records (read by sessions list/prune)
+  sessions/                        append-only CLI session records (written by run/chat and --resume,
+                                   read by sessions list/show/prune)
   mcp.json                         MCP server declarations (optional)
   .openjiuwen_history              REPL input history
   auto_harness/                    auto-harness state when no -w is given
@@ -543,7 +573,11 @@ off.
     experience/experiences.jsonl   experience records (read-only in Rust)
 
 <workspace>/                       -w, OPENJIUWEN_WORKSPACE or <home>/workspace
-  persistent_agent/                execution journals, session records and links (sessions list/show/prune)
+  persistent_agent/                this binary's own runs, as sessions list/show/prune read them
+    logs/<exec>/                   one execution journal per CLI turn
+    sessions/openjiuwen-cli/<id>/  a session record per CLI session; the agent id is pinned to
+                                   openjiuwen-cli, which is how the catalogue folds a run's stores
+    links/                         execution links, read when a resume traces a chain (the CLI writes none)
   cron/jobs.json                   the cron schedule written by cron create/toggle/cancel/run
   cron/runs.json                   the bounded run history written by cron run, read by cron runs
   .openjiuwen/mcp.json             workspace MCP configuration (a watch target)
@@ -598,14 +632,16 @@ is explicit where it cannot:
   REPL keeps the instructions, skills and MCP servers it started with — a
   restart applies them. Only `openjiuwen watch` is a pure observer, and
   `--max-events` exists so scripts can stop it deterministically.
-- **`chat --resume` starts a new REPL session.** The harness `Repl` always mints
-  a fresh `cli-*` id (its `session_id` field is private and the constructors take
-  no id), so a resumed chat seeds the restored transcript into a new session and
-  the stderr note names both ids. `run --resume` does continue the resolved id:
-  the kernel session and the CLI session record keep it and the new turns are
-  appended. The resume summary uses the CLI's fresh request id for the
-  persistent-agent `resume` call, so a state-record resume settles only its own
-  waiting scene.
+- **A CLI run is journal-backed.** Every `run`/`chat` turn is journalled under
+  the workspace's `persistent_agent/` node and bound to the pinned agent id
+  `openjiuwen-cli`, which is what lets `--resume`/`--continue` (and
+  `sessions list`) rebuild a window instead of replaying the CLI record alone.
+  The CLI writes no execution link, so tracing a chain past the run's own
+  execution stops with a stop note on the plan rather than an error; a restored
+  window also carries the harness's replay decorations (`【窗口摘要】…`,
+  `【本次执行】<question>`) while the CLI record keeps the clean transcript. The
+  persistent-agent `resume` call uses the CLI's fresh request id, so a
+  state-record resume settles only its own waiting scene.
 - **No remote mode.** Python's client/server (`OPENJIUWEN_SERVER_URL`) path is
   not exposed by this binary: `run` and `chat` always drive an in-process agent.
 - **Rust additions.** `--json` on the `auto-harness`, `cron`, `team`, `lsp` and
@@ -623,7 +659,7 @@ is explicit where it cannot:
 `tests/` holds the process-level suites, all offline and hermetic (temporary
 working directory, temporary `OPENJIUWEN_HOME`, ambient `OPENJIUWEN_*` /
 `OPENAI_*` / `API_KEY` / `API_BASE` / `MODEL_*` removed, bounded child waits).
-The ten suites hold 93 tests; no case needs the network, credentials or a
+The ten suites hold 95 tests; no case needs the network, credentials or a
 terminal.
 
 | Suite | Covers |
@@ -634,8 +670,8 @@ terminal.
 | `tests/cli_features.rs` | `run --worktree` end to end (worktree created, stderr announcement, run inside it), `--worktree` outside a repository as a typed `config` error, and `chat --watch` starting the watcher on stderr and exiting on stdin EOF. |
 | `tests/cron.rs` | The empty store, `create`/`list`/`get` persistence, `toggle` both ways, `preview --count`, `run` plus the `runs` receipt, `status` counts, `cancel`, and the `not_found`/`validation` failures. |
 | `tests/lsp.rs` | The action and flag help, an unknown action as a usage error, a missing `--file` as `not_found` (also with `--json`), and a failing or unspawnable `--server-command` as a typed `tool` error. |
-| `tests/sessions.rs` | The catalogue command on hand-written CLI records and a damaged journal tree: the empty listing (text and JSON), newest-first rows with `--limit` and `--kind`, `show` in both modes, a corrupt journal being skipped, the unknown-id `not_found`, `prune` dry run/`--all`/`--older-than`, the selector-less `validation` error and the `--all`/`--older-than` clap conflict, and the three help pages. |
-| `tests/resume.rs` | The resume surface against the loopback mock model: `run --resume <cli-id>` continuing the record and the request transcript, `--continue` picking the newest record, the unknown-id and empty-catalogue `not_found`s, a persistent-agent state record resuming through its journal plan, an execution id resuming its journal and creating the session's CLI record, and `chat --resume` seeding a fresh REPL. |
+| `tests/sessions.rs` | The catalogue command on hand-written CLI records and a damaged journal tree: the empty listing (text and JSON), newest-first rows with `--limit` and `--kind`, `show` in both modes, a corrupt journal being skipped, the unknown-id `not_found`, `prune` dry run/`--all`/`--older-than`, the selector-less `validation` error and the `--all`/`--older-than` clap conflict, and the three help pages; a session seeded into all three stores being listed once (`kind: state`, every `--kind` matching it, one prune line, every source deleted); and a real `run` being one row that `--continue` continues. |
+| `tests/resume.rs` | The resume surface against the loopback mock model: `run --resume <cli-id>` continuing the record and the request transcript through the run's own persistent session record, `--continue` picking the newest session twice in a row, the unknown-id and empty-catalogue `not_found`s, a persistent-agent state record resuming through its execution plan, an execution id resuming its journal and creating the session's CLI record, and `chat --resume` appending the REPL turn to the persisted record. |
 | `tests/team.rs` | A stub attach host behind a Unix socket: the grammar, one request per command with the documented arguments, the member/task/message/outcome renderings and empty markers, the JSON documents, a remote `not_found`, an unknown `--status`, and the missing-socket validation error. |
 | `tests/watch.rs` | `watch --list` text and JSON plans (targets plus skipped roots), an empty plan as a typed `config` error, and a live change reported as one JSON event with `--max-events 1` shutting the watcher down. |
 

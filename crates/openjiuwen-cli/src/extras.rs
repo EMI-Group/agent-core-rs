@@ -20,13 +20,15 @@
 //!   run's output format (`text`, `json`, `stream-json`) and the machine-readable
 //!   stream is untouched.
 //!
-//! `run --resume` mirrors the harness one-shot path with
-//! [`openjiuwen_harness::cli::run_once_resumed`], which seeds the restored
-//! history into a kernel session with the resumed id and continues that id's CLI
-//! session record. `chat --resume` cannot adopt the persisted id — the harness
-//! [`Repl`](openjiuwen_harness::cli::Repl) always mints a fresh `cli-*` session
-//! — so the transcript is seeded into a new REPL session and the note on stderr
-//! names both ids.
+//! Both commands continue the resolved session id. `run --resume` hands the
+//! restored turn to [`openjiuwen_harness::cli::run_with_model_resumed`], whose
+//! `ResumedTurn` seeds the history (and the persisted `deepagent` state) into a
+//! kernel session with that id and continues that id's CLI session record.
+//! `chat --resume` adopts the same id with
+//! [`Repl::with_session_id`](openjiuwen_harness::cli::Repl::with_session_id)
+//! before seeding the transcript, so every following REPL turn appends to the
+//! persisted `<home>/sessions/<id>.json` record instead of minting a new
+//! `cli-*` session; the note on stderr is the catalogue summary alone.
 //!
 //! Everything else defaults to today's behaviour: without these flags the calls
 //! here are a straight pass-through to
@@ -35,7 +37,7 @@ use std::time::Duration;
 
 use openjiuwen_common::error::Result;
 use openjiuwen_harness::cli::{
-    build_agent, onboarding, paths, run_once_resumed, stdout_is_tty, Cli, CliIo, CliOptions,
+    build_agent, onboarding, paths, run_with_model_resumed, stdout_is_tty, Cli, CliIo, CliOptions,
     ProcessEnv, Repl, ResumedTurn,
 };
 use openjiuwen_harness::worktree::{find_git_root, ProcessGitRunner, WorktreeManager};
@@ -128,9 +130,13 @@ pub(crate) async fn run_run(args: &RunCliArgs, base: &Cli) -> Result<()> {
         resumed = resumed.with_state(state);
     }
     // The one-shot run stays non-interactive and uncoloured, exactly as
-    // `run_cli`'s `Dispatch::Run` branch: permission prompts fail closed.
+    // `run_cli`'s `Dispatch::Run` branch: permission prompts fail closed. The
+    // model is built here so the turn goes through the harness's resumed-turn
+    // seam, which resolves the prompt once and seeds the restored history/state
+    // before streaming.
     let io = CliIo::stdio_non_interactive();
-    run_once_resumed(&options, &args.base, &io, resumed)
+    let model = options.build_model().await?;
+    run_with_model_resumed(&options, &args.base, &io, model, resumed)
         .await
         .map(|_| ())
 }
@@ -169,25 +175,30 @@ async fn chat_entry(args: &ChatCliArgs, cli: &Cli) -> Result<()> {
     }
 }
 
-/// Mirrors `run_cli`'s chat branch, seeding a persisted transcript.
+/// Mirrors `run_cli`'s chat branch, continuing a persisted session.
 ///
-/// The harness `Repl` cannot adopt a persisted session id, so the restored
-/// history is seeded into a fresh `cli-*` session; the note printed before the
-/// loop names both ids instead of pretending the record continues.
+/// The REPL adopts the resolved session id before the transcript is seeded, so
+/// the restored history lands in that kernel session and every following turn
+/// appends to the same `<home>/sessions/<id>.json` record. Only the catalogue
+/// summary is announced on stderr: there is no second, freshly minted id.
 async fn run_chat_resumed(request: ResumeRequest<'_>, cli: &Cli) -> Result<()> {
     let options = CliOptions::resolve(cli)?;
     let resolved = resolve_session(&options, request).await?;
+    let Resolved {
+        id,
+        summary,
+        history,
+        ..
+    } = resolved;
     let color = paths::color_enabled(cli.no_color, &ProcessEnv, stdout_is_tty());
     let io = CliIo::stdio().with_color(color);
     onboarding::maybe_run(&io, &options.home, &ProcessEnv).await?;
     let model = options.build_model().await?;
     let agent = build_agent(model, &options, &io).await?;
-    let mut repl = Repl::with_io_and_signals(agent, options, io);
-    repl.seed_history(resolved.history).await?;
-    eprintln!(
-        "{}; the REPL continues as {}",
-        resolved.summary,
-        repl.session_id()
-    );
+    // The setter rebuilds the kernel session, so it must precede the seed: an
+    // earlier seed would be dropped with the session it was written into.
+    let mut repl = Repl::with_io_and_signals(agent, options, io).with_session_id(id);
+    repl.seed_history(history).await?;
+    eprintln!("{summary}");
     repl.run().await
 }
