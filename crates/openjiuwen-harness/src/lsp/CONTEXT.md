@@ -62,8 +62,8 @@ Python parity target: tool name `lsp`, 1-based model positions, `Defined in path
 | `prepare_call_hierarchy` | `textDocument/prepareCallHierarchy` | `textDocument.uri`, `position` | `action`, `file_path`, `result`, `items` |
 | `incoming_calls` | `textDocument/prepareCallHierarchy` then `callHierarchy/incomingCalls` | `textDocument.uri`, `position`; `item` | `action`, `file_path`, `result`, `calls`, `item` |
 | `outgoing_calls` | `textDocument/prepareCallHierarchy` then `callHierarchy/outgoingCalls` | `textDocument.uri`, `position`; `item` | `action`, `file_path`, `result`, `calls`, `item` |
-| `diagnostics` (with path) | push registry, then `textDocument/diagnostic` | `textDocument.uri`, optional `previousResultId` | `action`, `file_path`, `result`, `diagnostics`, `source` (`push`/`pull`/`none`), plus `stale: true` when an `unchanged` answer had no baseline |
-| `diagnostics` (no path) | registry `drain` only | none | `action`, `result`, `files`, `count` |
+| `diagnostics` (with path) | push registry, then `textDocument/diagnostic` | `textDocument.uri`, optional `previousResultId` | `action`, `file_path`, `result`, `diagnostics`, `source` (`push`/`pull`/`none`), plus `stale: true` when an `unchanged` answer had no baseline; a missing capability, a `-32601` answer or an unresolved server never fabricates an empty list |
+| `diagnostics` (no path) | registry `drain` only | none | `action`, `result`, `files`, `count` (reports "nothing buffered" for an empty registry, with no capability verdict) |
 
 - Documents are synchronised before a position request (`didOpen`, then full-text `didChange`) and reads are gated by `max_file_size` (10 MiB default).
 - `incoming_calls`/`outgoing_calls` prepare the hierarchy and use the first returned item when several are offered.
@@ -100,6 +100,9 @@ Python parity target: tool name `lsp`, 1-based model positions, `Defined in path
 - `drain` mirrors Python `get_and_clear`: intra-round dedupe, cross-round suppression of delivered keys, per-file and global caps, local paths resolved from URIs.
 - The registry is an owned value per tool (shared through `LspTool::with_diagnostics`), not a process-global singleton; Python's `get_instance` singleton is deliberately not reproduced because the crate forbids undocumented global mutable state.
 - Push data wins over pull for a file; pull is attempted only when push is empty and the server advertises `diagnosticProvider`.
+- A pull therefore needs the capability: a server that does not advertise `textDocument/diagnostic`, or that answers `-32601`, produces a typed `success=false` failure naming the capability (`data.capability = "textDocument/diagnostic"`) and carrying no diagnostics list, so an unsupported server is never reported as a clean file.
+- A genuinely clean full report stays `success=true` with an empty `diagnostics` list and `source: "pull"`; with no server resolved for the file the payload is informational `success=true` with `source: "none"` and text stating that the diagnostics are unknown, while a supervisor failure is a typed failure.
+- The no-path drain reports "nothing buffered" for an empty registry and makes no capability claim.
 - An `unchanged` pull answer without a cached full report triggers exactly one extra pull without `previousResultId`; if the server still answers `unchanged`, the payload carries `stale: true` (never a silently empty "clean" list).
 
 ## Constraints
@@ -114,7 +117,7 @@ Python parity target: tool name `lsp`, 1-based model positions, `Defined in path
 - No new dependencies beyond the crate manifest (tokio, serde/serde_json, schemars, async-trait, parking_lot, tracing, sysop path helpers).
 - Files stay around ≤1000 lines; `tool.rs` delegates action execution to `tool_ops.rs`.
 - The module is compiled unconditionally (`pub mod lsp;` in `lib.rs`); nothing inside `src/lsp` is behind a `#[cfg(feature = ...)]` gate.
-- No path here returns `Error::Unsupported`: the only "unsupported" notions are the internal `PullOutcome::Unsupported` branch in `tool_ops.rs` (server does not advertise `diagnosticProvider`, so the payload is `success=true` with `source: "none"`) and `tool::map_client_error`, which turns a JSON-RPC `-32601` into `Operation not supported by this language server: <method>`.
+- No path here returns `Error::Unsupported`: a missing `diagnosticProvider` capability and a `-32601` diagnostics answer become typed `success=false` payloads naming `textDocument/diagnostic`, and `tool::map_client_error` turns every other JSON-RPC `-32601` into `Operation not supported by this language server: <method>`.
 
 ## Known Issues
 
@@ -131,14 +134,14 @@ Python parity target: tool name `lsp`, 1-based model positions, `Defined in path
 
 ## Test Strategy
 
-- `tests/fake_server.rs` drives every client and tool test over one `tokio::io::duplex` half: canned navigation/call-hierarchy/implementation/diagnostic responses, `publishDiagnostics` after `didOpen` (one warning) and after a `clean` `didChange` (empty), plus recorded messages for exact method/params assertions.
+- `tests/fake_server.rs` drives every client and tool test over one `tokio::io::duplex` half: canned navigation/call-hierarchy/implementation/diagnostic responses, `publishDiagnostics` after `didOpen` (one warning) and after a `clean` `didChange` (empty), plus recorded messages for exact method/params assertions; `spawn_with_capabilities(stream, capabilities)` overrides the advertised capabilities and the scripted `pristine` and `rejects_pull` answers model a clean full report and a `-32601` refusal.
 - `tests/framing.rs`, `tests/uri.rs`, `tests/transport.rs` cover byte-level framing, URI conversion and both transports (`/bin/cat` as an echo server when present).
 - `tests/client.rs` and `tests/client_ext.rs` cover initialize capability capture, server-initiated requests, notification dispatch (including panicking handlers), typed methods, versions, timeouts, malformed frames, EOF, liveness and shutdown reasons.
 - `tests/wire.rs` covers tolerant parsing of diagnostics, diagnostic reports and call hierarchy (flat vs nested items, string vs numeric codes).
 - `tests/diagnostics.rs` covers version awareness, clearing, caps, cross-round dedupe, the `max_files` bound on both the buffer and the delivered-key history, `subscribe`, and an end-to-end push through the client.
 - `tests/discovery.rs` covers extension matching, priority/order, language id, root markers, Cargo workspace roots, containment, builtin definitions, and the debug record left behind by an unreadable `Cargo.toml`.
 - `tests/retry.rs` covers one-retry recovery, delay recording, budget exhaustion, refused-start status, shutdown inhibition, concurrent `status()` reads during start/stop, and backoff doubling/capping.
-- `tests/tool.rs`, `tests/tool_ops.rs`, `tests/tool_lifecycle.rs` cover the 11-action card, every action payload, typed and message-fallback method-not-found mapping, diagnostics push→pull→unchanged (including the `stale` marker and the forced full re-pull when no snapshot exists), per-extension routing with two fake servers, crash retry, shutdown and status.
+- `tests/tool.rs`, `tests/tool_ops.rs`, `tests/tool_lifecycle.rs` cover the 11-action card, every action payload, typed and message-fallback method-not-found mapping, diagnostics push→pull→unchanged (including the `stale` marker and the forced full re-pull when no snapshot exists), a clean `pristine` report staying `success=true`, the typed capability failure for a server without `textDocument/diagnostic` and for a `rejects_pull` `-32601` answer, the `source: "none"` informational payload for an unresolved server, the no-path drain of an empty registry, per-extension routing with two fake servers, crash retry, shutdown and status.
 - `tests/parse.rs` covers `LspToolConfig::new`, every spec key, the duration/number suffixes, every spec error (unknown/duplicate/empty/malformed/bad value), `Display` round-trips, every action spelling (snake/kebab/upper), the `<action> [path][:line[:column]] [query...]` grammar including Windows paths, every `LspArgs` error (missing path, bad/zero/overflowing position, position on `diagnostics`, trailing token), `LspArgs`/`LspToolConfig` round-trips, and the unchanged serde names and card schema.
 - Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --offline` (default, `--no-default-features`, `--all-features`), `cargo clippy -p openjiuwen-harness --all-targets --all-features --offline -- -D warnings`, `cargo doc -p openjiuwen-harness --no-deps` all clean and offline.
 

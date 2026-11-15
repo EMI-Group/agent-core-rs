@@ -117,6 +117,9 @@ Every public item is re-exported from `crate::schema`; the child modules themsel
 - `StopEvaluationContext` also exposes read accessors (`iteration`, `token_usage`, `elapsed_seconds`, `last_result`, `extra`) because `CustomPredicate` closures receive `&StopEvaluationContext` and cannot move fields out.
 - `TaskPlan::to_markdown` joins its lines with `\n` (Python `"\n".join`): a plan with tasks ends on the last task line with no trailing newline, while a task-less plan still ends with one because of its blank second line.
 - `resolve_inner_react_max_iterations` is a `const fn`, so callers may use it in const context.
+- Every behavioural flag in `DeepAgentConfig` has an owner that reads it: `enable_task_planning` gates the `todo_*` tools and the TODO prompt section in `crate::agent::builder`, `enable_async_subagent`/`enable_subagent_runtime` are resolved by `crate::agent::subagent_factory::SubagentMode` (runtime wins over async, which wins over the synchronous `task_tool`), `enable_tool_resilience_rail` becomes the kernel retry policy in `crate::agent::resilience`, `project_root` is enforced by `ToolEnv` and `PermissionEngineConfig`, and `invocation_log_dir` drives `crate::agent::invocation_log`.
+- `enable_task_planning` defaults to `false` (the Python `TaskPlanningRail` default) and `enable_tool_resilience_rail` to `true`; `BuiltinTool::DEFAULT` stays the twenty-tool set either way, so the plan tools are filtered from the registry's cards at build time rather than removed from the registry.
+- `validate` is the single gate `DeepAgent::configure` runs before it installs a configuration, so an invalid `DeepAgentConfig` never reaches the prompt builder, the kernel config or the permission engine.
 
 ## Routing Table
 

@@ -51,10 +51,11 @@ Session state (`session`):
 Window assembly (`window`):
 - `Capacity { context_window, output_reserve, input_limit, safety_margin }` with `validate`, `available_input`, `rollover_threshold` (`context_window * 4 / 5`), `new_window_limit` (`context_window * 2 / 5`); the default is a `128_000`-token window.
 - `WindowPolicy { max_recent_groups, summary_max_chars, min_recent_groups, include_lifecycle_markers }` with `validate`.
-- `WindowAssembler::new(capacity)`, `with_counter`, `with_policy`, `with_summarizer`, `capacity()`, `policy()`, `assemble(entries)`, `assemble_with_budget(entries, budget)`.
-- `WindowAssembly { messages, tokens, budget, summary, elided, retained_seqs, over_budget }` with `elided_count`.
+- `WindowAssembler::new(capacity)`, `with_counter`, `with_policy`, `with_summarizer`, `capacity()`, `policy()`, `assemble(entries)`, `assemble_with_budget(entries, budget)`, `try_assemble(entries)`, `try_assemble_with_budget(entries, budget)`.
+- `WindowAssembly { messages, tokens, budget, summary, elided, retained_seqs, over_budget, summary_error }` with `elided_count`; `summary_error` is `Option<String>`, skipped when `None` and tolerated when absent from an older payload.
 - `ElidedEntry { seq, kind, reason }`, `ElisionReason { over_budget, counted_only, lifecycle_marker, retention_limit }`.
-- `WindowSummarizer` trait plus `ExtractiveSummarizer::new(max_chars)` (default) and `UnsupportedModelSummarizer` (typed `Unsupported`).
+- `WindowSummarizer` trait plus `ExtractiveSummarizer::new(max_chars)` (the default), `UnsupportedModelSummarizer` (typed `Unsupported` naming both injection options) and `CompletionSummarizer` over the caller-supplied `CompletionFn = dyn Fn(&str) -> Result<String> + Send + Sync`.
+- `CompletionSummarizer::new(complete)` (4096-char bound), `with_max_chars(complete, max_chars)`, `max_chars()`, `prompt(&[ExecutionEntry]) -> String`, `last_prompt() -> Option<String>`; the prompt is bounded by construction (per-kind counts, seq bounds, at most three excerpts of at most `SUMMARY_HINT_CHARS` characters), the answer is trimmed and bounded, an empty answer is a typed `Error::Validation` naming the seam, and `Debug` prints only `max_chars`/`last_prompt_chars`.
 - `WindowManager { assembler, capacity }` with `new`, `assemble`, `should_rollover`, `new_window_limit`, `plan`; `WindowPlan { assembly, rollover }`.
 
 Continuation and handoff (`continuation`, `handoff`):
@@ -160,7 +161,10 @@ Re-exports:
 - A tool call without an id cannot be answered, so `patch_stopped_calls` leaves it alone; the placeholder is appended after the contiguous result group so the group stays attached to its call.
 - `clear_stale_scene` drops only the interruption and the ending; the cursor, window and remembered confirmations stay, so a continuation can still resume the journal.
 - Window assembly is synchronous and pure: entries → message groups → newest-first budget fit, with an extractive count summary and a per-entry elision report; an LLM summariser is an injected `WindowSummarizer` seam.
-- The default summary is an extractive count summary (per-kind counts, first/last sequence, one hint); a summariser error falls back to a count-only sentence and logs the failure instead of failing the assembly.
+- The default summary is an extractive count summary (per-kind counts, first/last sequence, one hint).
+- A summariser failure never fails `assemble`/`assemble_with_budget`: the summary degrades to a visibly marked `摘要不可用` fallback and the failure is recorded in `WindowAssembly::summary_error`, while `try_assemble`/`try_assemble_with_budget` return that error to the caller; the summariser runs at most once per assembly.
+- A model-written summary needs no new dependency: `WindowAssembler::with_summarizer(Arc::new(CompletionSummarizer::new(seam)))` over a synchronous `Fn(&str) -> Result<String>` keeps assembly pure, and the host pays one completion call per budget-pass iteration.
+- `continuation::resume` never fails on a summariser error; it reports it through `plan.window.summary_error` and still yields a usable window.
 - The summary is rendered as a real first message and counted in `WindowAssembly::tokens`, so the budget covers what the model actually receives.
 - `min_recent_groups`/`max_recent_groups` are normalised defensively (`max(1)`/`clamp`) so an unvalidated policy cannot make the budget pass drop everything.
 - Assistant tool-call groups are indivisible: tool intents and their results are elided together, never split by message count.
@@ -192,7 +196,7 @@ Re-exports:
 
 ## Test Strategy
 
-- Inline unit tests per module: canonical JSON/digest/percent-encoding, entry serde round-trips and redaction, log append/rotation/replay/digest, hard-budget truncation at every boundary, digest and redaction serialization-failure fallbacks, log preview skipping unrenderable lines, 32 concurrent appends staying contiguous and replayable, session record round-trip with unknown fields, validation rules, window assembly under tight/loose budgets with elision reports, control flags, emitter sequencing and failure policy, share bundle round-trip and tamper rejection, handoff transfer, continuation links and resume.
+- Inline unit tests per module: canonical JSON/digest/percent-encoding, entry serde round-trips and redaction, log append/rotation/replay/digest, hard-budget truncation at every boundary, digest and redaction serialization-failure fallbacks, log preview skipping unrenderable lines, 32 concurrent appends staying contiguous and replayable, session record round-trip with unknown fields, validation rules, window assembly under tight/loose budgets with elision reports, `CompletionSummarizer` prompt bounds/answer trimming/empty-answer rejection/`Debug` shape, the one-call-per-assembly rule, the `summary_error` fallback versus `try_assemble`'s error and `summary_error` tolerance in an old payload, control flags, emitter sequencing and failure policy, share bundle round-trip and tamper rejection, handoff transfer, continuation links and resume.
 - Cross-module flows live in `src/persistent_agent/tests.rs` (an integration file under `crates/openjiuwen-harness/tests/` would also work but is outside this module's write scope): crash-and-reopen resume, in-process handoff, share-bundle round trip with tamper rejection, emitter-vs-journal sequence independence, the exact `Unsupported` messages, and the discovery recipe (layout roots → journal + record + link on disk → catalogue/session listing → `resume` → plan JSON round trip carrying the run's text).
 - All tests use `tempfile::TempDir`, `ManualClock`, file-backed stores and no sleeps; nothing opens a socket or reads the wall clock.
 - Definition of done: `cargo test -p openjiuwen-harness --offline` (default, `--no-default-features`, `--all-features`), `cargo fmt -p openjiuwen-harness`, `cargo clippy -p openjiuwen-harness --all-targets --all-features --offline -- -D warnings`, `cargo doc -p openjiuwen-harness --no-deps`.
@@ -201,7 +205,7 @@ Re-exports:
 
 - Remote handoff transport: `Error::unsupported("persistent agent handoff over a remote transport is not implemented; use an in-process HandoffTarget")`.
 - Distributed handoff transport: `Error::unsupported("persistent agent handoff over a distributed transport is not implemented; use an in-process HandoffTarget")`.
-- Model-backed window summarisation: `UnsupportedModelSummarizer` returns `Error::unsupported("persistent window summarisation requires an injected WindowSummarizer; the model-backed summariser is not implemented")`.
+- Model-backed window summarisation has no bundled model client: the crate ships the `CompletionFn` seam and `CompletionSummarizer` over it, and `UnsupportedModelSummarizer` returns `Error::unsupported` naming both `WindowAssembler::with_summarizer` and the two shipped summarisers.
 - Host KV / Redis / database session stores and distributed execution-log backends: only `FileSessionStore` and the filesystem/Root log source exist; hosts implement `SessionStateStore` / `ExecutionLogSource` / `ExecutionLinkSource`.
 - Group-chat participation, the budget admission service, permission/workspace rails, group-history readers and the `share_file` agent tool: host-owned in Python and not ported here.
 - Window archive KV layout and archive-index rebuild: the window manager plans rollovers; archival storage stays with the host `SessionStateStore`.
