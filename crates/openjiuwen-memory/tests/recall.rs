@@ -438,6 +438,11 @@ async fn search_all_returns_memories_and_graph_entities() {
     assert_eq!(combined.entities[0].entity.name, "RustLang");
     assert_eq!(combined.entities[0].depth, 0);
     assert!(combined.entities[0].score >= 0.3);
+    assert_eq!(
+        combined.graph_error, None,
+        "a healthy graph recall reports no degradation"
+    );
+    assert!(!combined.is_partial());
 }
 
 #[tokio::test]
