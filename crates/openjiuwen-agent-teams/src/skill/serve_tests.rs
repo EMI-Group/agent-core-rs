@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use openjiuwen_common::error::Error;
 use openjiuwen_harness_protocol::{
     AbortMode, DeliveryMode, EventBufferConfig, HarnessCard, HarnessContext, HarnessError,
     HarnessEvent, HarnessEventCursor, HarnessInput, HarnessProtocol, HarnessResult, OutputChannel,
@@ -545,6 +546,24 @@ async fn abort_pause_and_resume_are_forwarded_to_the_runtime() {
             "stop".to_owned(),
         ]
     );
+}
+
+/// Proves the platform-independent process streams fit the serving loop's bounds on every target.
+///
+/// The real process stdin/stdout cannot be driven from a unit test, so the case pins the types
+/// instead: if `tokio::io::Stdin`/`Stdout` ever stopped satisfying `serve_with`'s bounds this would
+/// stop compiling, which is exactly what `team-member serve` depends on.
+#[test]
+fn process_streams_fit_the_serving_loop() {
+    fn assert_serving_streams<R, W>()
+    where
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+    }
+    let streams: fn() -> (tokio::io::Stdin, tokio::io::Stdout) = process_streams;
+    let _ = streams;
+    assert_serving_streams::<tokio::io::Stdin, tokio::io::Stdout>();
 }
 
 #[test]
