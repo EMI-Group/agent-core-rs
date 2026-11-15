@@ -18,6 +18,7 @@
 //! - [`error_reporting`] — the `error_reason` priority chain behind an error span's message.
 //! - `file_exporter` (`otel` feature) — the collector-free OTLP-JSON WAL behind
 //!   [`ExporterType::File`](crate::otel::ExporterType::File).
+//! - [`deferred`] — the typed `Unsupported` seams for the SDK-only modules below.
 //! - `transforming` (`otel` feature) — export-time span projection, so a backend view never
 //!   consumes the collection-time attribute budget.
 //!
@@ -27,35 +28,40 @@
 //! | --- | --- |
 //! | `semconv.py`, `gen_ai_semconv.py` | [`project_semconv`] plus [`crate::otel::semconv`] |
 //! | `redaction.py` | [`redaction`] (error/credential half) and [`crate::otel::redaction`] (prompt/completion half) |
-//! | `content_addressing.py`, the id half of `otlp_codec.py` | [`content_addressing`]; the envelope encoding is [`crate::otel::otlp`] |
+//! | `content_addressing.py`, the id half of `otlp_codec.py` | [`content_addressing`]; the envelope encoding is `crate::otel::otlp` |
 //! | `tool_outcome.py`, the pure half of `error_reporting.py` | [`tool_outcome`], [`error_reporting`] |
 //! | `file_exporter.py` | `file_exporter` |
 //! | `exporters/transforming.py` | `transforming` |
 //! | `exporters/langfuse.py` | [`crate::otel::langfuse`] |
 //! | `config.py` | [`crate::otel::OtelTracerConfig`] (including `traces_dir` / `file_retention_days`) |
-//! | `callback_handler.py`, `span_context.py` | [`crate::otel::OtelAgentHandler`], [`crate::otel::OtelWorkflowHandler`], [`crate::otel::OtelAgentSpanManager`] |
+//! | `callback_handler.py`, `span_context.py` | `crate::otel::OtelAgentHandler`, `crate::otel::OtelWorkflowHandler`, `crate::otel::OtelAgentSpanManager` |
 //!
 //! # What is deferred
 //!
 //! The remaining Python modules describe a *process-global* SDK runtime or a research data plane,
-//! both of which this crate deliberately does not carry:
+//! both of which this crate deliberately does not carry.
+//! Each deferred capability keeps a typed entry point in [`deferred`] that answers
+//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) with the reason and the
+//! supported alternative, so a Python-parity caller never meets a missing symbol:
 //!
-//! - `setup.py`, `demand.py`, `runtime.py` — one process-wide `TracerProvider` with reference-counted
-//!   acquire/release. This crate keeps provider lifecycle in [`crate::otel::TracerHandle`], one
-//!   handle per ownership scope, and never installs a global exporter or spins up a background
-//!   runtime on the caller's thread.
-//! - `span_record_processor.py`, `trajectory_events.py`, `span_context.py` — the async span-record /
-//!   stream-frame fan-out and the contextvar span tracker. They need `ReadableSpan`-shaped frozen
-//!   spans plus a reader-side consumer registry; the pure parts (record field sets, key literals,
-//!   `@oj-seq` addressing) are ported in [`content_addressing`] and [`project_semconv`].
-//! - `instrumentation.py` — monkey-patching `httpx`/`requests`/`aiohttp`/`FastAPI`. Rust has no
-//!   equivalent hook surface; a consumer instruments its own transport.
-//! - `context_compression_handler.py` — the bridge from context-engine compaction to trajectory
-//!   events; it belongs with a trajectory data plane, which is deferred as a whole.
+//! - `setup.py`, `demand.py`, `runtime.py` → [`deferred::init_observability`] and the demand
+//!   acquire/release seam. One process-wide `TracerProvider` with reference-counted acquire is not
+//!   carried: this crate keeps provider lifecycle in [`crate::otel::TracerHandle`], one handle per
+//!   ownership scope, and never installs a global exporter or spins up a background runtime on the
+//!   caller's thread.
+//! - `span_record_processor.py`, `trajectory_events.py`, `span_context.py`,
+//!   `context_compression_handler.py` → [`deferred::publish_stream_frame`] and the trajectory
+//!   commit/consumer seams. They need `ReadableSpan`-shaped frozen spans plus a reader-side
+//!   consumer registry, which this workspace has no trajectory data plane for; the pure parts
+//!   (record field sets, key literals, `@oj-seq` addressing) are ported in [`content_addressing`]
+//!   and [`project_semconv`].
+//! - `instrumentation.py` → [`deferred::ensure_global_http_instrumentation`]. Monkey-patching
+//!   `httpx`/`requests`/`aiohttp`/`FastAPI` has no Rust equivalent hook surface; a consumer
+//!   instruments its own transport.
 //!
-//! Nothing here silently degrades: a deferred capability simply has no entry point, and every
-//! unimplemented backend elsewhere in the crate answers
-//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) with a reason.
+//! [`deferred::is_initialized`] is the one infallible answer (`false`) and
+//! [`deferred::instrumentation_env_flag`] the one portable constant, both documented as such.
+//! No deferred path is a silent no-op: nothing is initialized, exported, patched or replaced.
 
 pub mod content_addressing;
 pub mod deferred;
