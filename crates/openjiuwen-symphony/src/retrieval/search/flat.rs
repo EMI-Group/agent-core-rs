@@ -14,10 +14,10 @@
 //!    `description` = the choice's description), so the payload is the ranking identity and a
 //!    repeated payload collapses onto its first occurrence;
 //! 2. ranks them with the crate's field-weighted BM25
-//!    ([`LexicalIndex`](crate::retrieval::search::lexical::LexicalIndex)) using the same
+//!    ([`LexicalIndex`]) using the same
 //!    alternative expression the progressive selectors use;
 //! 3. optionally blends embedding similarity with
-//!    [`blend_scores`](crate::retrieval::search::embedding::blend_scores) — the same
+//!    [`blend_scores`] — the same
 //!    `(1 - w) * lex_norm + w * (cos + 1) / 2` formula and the same
 //!    [`EmbeddingScoringConfig::weight`](crate::retrieval::search::config::EmbeddingScoringConfig)
 //!    as the blend selector, so `weight == 0.0` reproduces the lexical order;

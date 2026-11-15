@@ -16,7 +16,7 @@
 //! | --- | --- |
 //! | [`CurrentSubtreeProvider`] | [`DefaultCurrentSubtreeProvider`] with the render-backed fragment builder |
 //! | [`SubtreeRenderer`] | [`DefaultSubtreeRenderer`] (renders the disclosure `PromptBundle`) |
-//! | [`TopKSelector`] | [`LexicalTopKSelector`] by default, [`EmbeddingBlendedTopKSelector`] after [`ProgressiveRetriever::with_embedding`], [`ModelTopKSelector`] after [`ProgressiveRetriever::with_model`] |
+//! | [`TopKSelector`] | [`LexicalTopKSelector`](crate::retrieval::search::selector::LexicalTopKSelector) by default, [`EmbeddingBlendedTopKSelector`] after [`ProgressiveRetriever::with_embedding`], [`ModelTopKSelector`] after [`ProgressiveRetriever::with_model`] |
 //! | [`TargetExpander`] | [`DefaultTargetExpander`] |
 //! | [`BranchReducer`] | [`DefaultBranchReducer`] |
 //!
@@ -29,13 +29,13 @@
 //! [`ModelTopKSelector`] is the async model-facing selector. Per call it
 //!
 //! 1. builds the prompt with
-//!    [`build_disclosure_messages`](crate::retrieval::search::render::build_disclosure_messages)
+//!    [`build_disclosure_messages`]
 //!    over the exposed fragment (preferring the messages the engine already rendered),
 //! 2. records `llm_request` (`model`, `node_id`, `depth`, `prompt_chars`, `messages`),
 //! 3. calls [`CompletionModel::complete`](crate::llm::CompletionModel) with the **single**
 //!    prompt that joins the rendered system and user contents with `"\n\n"`, and
 //! 4. records `llm_response` (`model`, `node_id`, `reply_chars`), then parses the reply with
-//!    [`parse_selected_codes`](crate::retrieval::search::render::parse_selected_codes).
+//!    [`parse_selected_codes`].
 //!
 //! Deviation from Python: Python sends the rendered messages as a chat request
 //! (`_complete(system_prompt=…, query_messages=[…])`); [`CompletionModel::complete`] takes one
@@ -47,7 +47,7 @@
 //! and keeps the fallback selector for the deterministic path.
 //!
 //! A model failure propagates to the selector, which honours
-//! [`FallbackMode`](crate::llm::FallbackMode): [`FallbackMode::Error`] surfaces it, while
+//! [`FallbackMode`]: [`FallbackMode::Error`] surfaces it, while
 //! [`FallbackMode::Deterministic`] warns and selects with the fallback selector instead.
 //!
 //! # Methods
@@ -60,7 +60,7 @@
 //! # Resumability
 //!
 //! [`ProgressiveRetriever::begin`] returns a serializable
-//! [`TraversalState`](crate::retrieval::search::engine::TraversalState);
+//! [`TraversalState`];
 //! [`ProgressiveRetriever::step`] advances it one node visit at a time. The state carries the
 //! query messages, so a caller can save it, restore it later and finish the walk with the same
 //! result an uninterrupted [`ProgressiveRetriever::search`] produces (that path additionally
@@ -289,6 +289,9 @@ impl ProgressiveRetriever {
     /// # Errors
     ///
     /// Whatever the provider or the renderer reports for a node.
+    // Kept `async` so every retriever entry point shares one awaitable shape and a future
+    // async provider seam does not change this signature.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn prepare_root(&self, top_k: Option<usize>) -> Result<usize> {
         let root = self.root();
         let top_k = self.resolve_top_k(top_k);
@@ -782,7 +785,7 @@ mod tests {
             async fn complete(&self, _prompt: &str) -> Result<String> {
                 Err(crate::error::Error::llm("model unavailable"))
             }
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "failing"
             }
         }

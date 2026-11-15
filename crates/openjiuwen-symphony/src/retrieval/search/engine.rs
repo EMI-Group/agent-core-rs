@@ -379,7 +379,7 @@ impl RecursiveSearchEngine {
                 continue;
             }
             if self.depth_refused(&cursor) {
-                self.complete_node(state, NodeSearchResult::default());
+                Self::complete_node(state, NodeSearchResult::default());
                 continue;
             }
             let step = self.visit_node(request, state, cursor).await?;
@@ -437,7 +437,7 @@ impl RecursiveSearchEngine {
                 branch_count: 0,
                 candidates_after: state.discovered.len(),
             };
-            self.complete_node(state, NodeSearchResult::default());
+            Self::complete_node(state, NodeSearchResult::default());
             return Ok(step);
         }
 
@@ -586,22 +586,21 @@ impl RecursiveSearchEngine {
             frame.cursor.depth,
             detail,
         );
-        self.complete_node(state, reduced);
+        Self::complete_node(state, reduced);
     }
 
     /// Pops the top frame and reports `result` to the parent frame, or installs it as the
     /// root's candidates when no frame is left.
-    fn complete_node(&self, state: &mut TraversalState, result: NodeSearchResult) {
+    fn complete_node(state: &mut TraversalState, result: NodeSearchResult) {
         state.frames.pop();
-        match state.frames.last_mut() {
-            Some(parent) => parent.child_results.push(result),
-            None => {
-                let mut candidates = result.candidates;
-                if state.root_top_k > 0 {
-                    candidates.truncate(state.root_top_k);
-                }
-                state.candidates = candidates;
+        if let Some(parent) = state.frames.last_mut() {
+            parent.child_results.push(result);
+        } else {
+            let mut candidates = result.candidates;
+            if state.root_top_k > 0 {
+                candidates.truncate(state.root_top_k);
             }
+            state.candidates = candidates;
         }
     }
 

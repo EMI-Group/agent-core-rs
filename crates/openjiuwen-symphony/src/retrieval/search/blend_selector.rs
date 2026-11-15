@@ -17,14 +17,15 @@
 //! blended  = (1 - w) * lex_norm + w * emb         // w = EmbeddingScoringConfig::weight
 //! ```
 //!
-//! [`blend_scores`](crate::retrieval::search::embedding::blend_scores) implements exactly that
+//! [`blend_scores`] implements exactly that
 //! over the union of both key sets, sorted by score descending with ties broken by key. With
 //! `w == 0.0` the formula degenerates to `lex_norm`, which is a monotone transform of the
 //! lexical score — so `weight == 0.0` reproduces the lexical selector's order exactly (and
 //! skips the embedder entirely).
 //!
 //! The blended list then passes through [`truncate_sorted_by_score`] with the config's
-//! [`ScoreTruncationConfig`], and is bounded by the cursor's `top_k` (`0` = unlimited).
+//! [`ScoreTruncationConfig`](crate::retrieval::search::truncation::ScoreTruncationConfig), and
+//! is bounded by the cursor's `top_k` (`0` = unlimited).
 //!
 //! # Trace
 //!
@@ -330,7 +331,7 @@ mod tests {
             subtree.selectable_targets.len(),
             "every target was embedded"
         );
-        assert!(!first.selected_targets.is_empty());
+        assert_ne!(first.selected_targets.len(), 0, "the blend selects targets");
         assert_eq!(
             EmbeddingBlendedTopKSelector::new(config, Arc::new(HashEmbedding::new(32))).weight(),
             1.0
@@ -360,7 +361,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!result.selected_targets.is_empty());
+        assert_ne!(
+            result.selected_targets.len(),
+            0,
+            "the blend selects targets"
+        );
         assert_eq!(trace.len(), 1);
         let event = trace.last().unwrap();
         assert_eq!(event.event_type, "fragment_selected");
@@ -385,21 +390,29 @@ mod tests {
         let config = config(0.5);
         let subtree = subtree(&tree, &config);
         let selector = EmbeddingBlendedTopKSelector::new(config, Arc::new(HashEmbedding::new(16)));
-        assert!(selector
-            .select(&subtree, "   ", 3)
-            .await
-            .unwrap()
-            .selected_targets
-            .is_empty());
+        assert_eq!(
+            selector
+                .select(&subtree, "   ", 3)
+                .await
+                .unwrap()
+                .selected_targets
+                .len(),
+            0,
+            "a blank query selects nothing"
+        );
         let empty = CurrentSubtree {
             selectable_targets: Vec::new(),
             ..subtree
         };
-        assert!(selector
-            .select(&empty, "alpha", 3)
-            .await
-            .unwrap()
-            .selected_targets
-            .is_empty());
+        assert_eq!(
+            selector
+                .select(&empty, "alpha", 3)
+                .await
+                .unwrap()
+                .selected_targets
+                .len(),
+            0,
+            "an empty subtree selects nothing"
+        );
     }
 }
