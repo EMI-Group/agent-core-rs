@@ -16,12 +16,9 @@ The directory splits the format in three: `front_matter.rs` owns the `---` block
 
 ## Known Issues
 
-- Duplicate `### name` entries (same section or across sections) are parsed as separate entries: `upsert_fact`/`remove` touch only the first copy, so a write can leave the stale copy first and `fact(name)` then returns it, while both calls still report `true`.
-- `unescape_body_line` is not the inverse of `escape_body_line`: a body line that literally starts with `\#` renders unescaped and loses its backslash on the next parse, and every mutation rewrites the whole file.
-- `parse_tags` falls back to comma splitting for anything that is not a JSON string array, so `- tags: [one, two]` (or a JSON array with a non-string element) silently yields bracket-fragment tags that are then written back in that form.
-- An unparsable `updated_at` decodes to the epoch and is re-rendered as `1970-01-01T00:00:00Z`, destroying the hand-written value on the next write; such a fact also sorts last and is excluded from daily rollups.
-- A malformed `- ` bullet with no colon ends the attribute block, so every later attribute silently becomes body text.
-- The unterminated-front-matter check only fires when a line contains `:` or parses as an attribute; a colon-less truncated block is accepted and its fence then becomes raw document text.
+- A fact whose `updated_at` text is unparsable keeps its hand-written text on render, but the value carried in memory is the epoch, so the fact sorts last in `updated_at`-ordered listings and falls outside a `daily_memory` rollup for its real date.
+- `upsert_fact` rebuilds the entry from the incoming fact, so a replaced entry loses the stray attribute bullets and the preserved raw `updated_at` text the parse had kept.
+- The unterminated-front-matter check only fires when a line of the truncated block contains `:` or parses as an attribute; a colon-less truncated block is accepted and its fence then becomes raw document text.
 
 ## Constraints
 
@@ -30,6 +27,11 @@ The directory splits the format in three: `front_matter.rs` owns the `---` block
 - Parsing never panics and never rejects hand-edited content except an unterminated front-matter block (`Error::Validation`).
 - `render` is the canonical shape (`# Memory` title by default, one blank line between blocks, LF, one trailing newline); `with_title`/`set_title` replace only the title line, and an empty title renders no title line.
 - Unknown front-matter keys, unknown sections, stray section text, and unknown entry attributes are preserved verbatim.
+- A fact name that appears more than once (in one section or across sections) keeps its last occurrence: every other copy is dropped at parse with a `tracing::warn!`, and `remove`/`upsert_fact` drain every copy of the name, so a read returns the latest text and a delete cannot resurrect a leftover.
+- A bullet line in an attribute block that is not `- key: value` is kept verbatim after the recognized attributes (with a warning) instead of ending the block, so the attributes that follow it still parse; a bullet after the blank line that closes the block starts the body.
+- `escape_body_line` and `unescape_body_line` are exact inverses: a line that starts a heading, a `###` entry, or a backslash gains one backslash on render, and the parse removes exactly one leading backslash, so escape-then-unescape reproduces every line.
+- `tags` accepts a JSON array, a comma-separated list, and a bracketed list without quotes (`[one, two]`); the surrounding brackets never become part of a tag, the fallback emits a warning, and the next render writes the canonical JSON array.
+- An unparsable `updated_at` keeps its original text verbatim on render while the fact's `updated_at` value decodes to the epoch, so a hand-written timestamp is not replaced.
 - No filesystem, network, or clock access: this module is pure string transformation.
 
 ## Routing Table
@@ -37,4 +39,4 @@ The directory splits the format in three: `front_matter.rs` owns the `---` block
 - `./mod.rs` → module documentation and the public re-exports
 - `./front_matter.rs` → `FrontMatter`, schema constants, fence parsing/rendering
 - `./document.rs` → `MarkdownMemory`, fact entries, blocks, parse/render, title accessors
-- `./tests.rs` → the 25 unit tests pinning the render/parse contract and the title accessors
+- `./tests.rs` → the 34 unit tests pinning the render/parse contract, the duplicate-name, escape-inverse, stray-bullet, bracketed-tag and verbatim-timestamp rules, and the title accessors

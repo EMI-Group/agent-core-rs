@@ -26,10 +26,12 @@ The module-level prose (layout, consistency model, search contract, module split
 ## Constraints
 
 - Lock order is file lock then state guard, everywhere; no state guard is held across an embedding call, a model call, or an embedding-cache await.
+- The cached document carries a `version` bumped on every change, and the embedding index records the version it was built from, so a semantic recall after an external edit rebuilds the index instead of scoring stale vectors.
+- A failed embedding rebuild is never installed: the new index is built off to the side and swapped in only on success, so the previous index (or none, after a failed first build) stays and the next recall retries.
 - Per-fact and index-document writes are atomic (temporary file plus rename).
 - The default layout stays the single-document layout (`MEMORY.md` plus `.memory/`); `tests/lite_local.rs` and `local/tests.rs` pin it.
 - No additional dependencies, no `unsafe`, `tracing` only, no `println!`, no `unwrap`/`expect` outside tests, every public item documented.
-- Filesystem failures are `Error::External` carrying the path; nothing is swallowed.
+- Filesystem failures are `Error::External` carrying the path; the documented exceptions are a missing file (read as absent) and a failed modification-time read in `FactFiles::stamp` (`newest_ms = 0`).
 
 ## Routing Table
 
@@ -50,14 +52,15 @@ The module-level prose (layout, consistency model, search contract, module split
 
 ## Known Issues
 
-- The chunk/vector index is only refreshed when it is absent or by a mutation, `refresh_embeddings`, `reindex`, `sync_now`, export/import or `open`; a reader-path reload (`ensure_fresh`/`refresh_facts`) leaves the old vectors in place, so `search` in `Semantic`/`Hybrid` mode ranks on stale text and gives an externally added fact `similarity = 0.0` (usually dropped by the threshold) with no error (`embedding.rs` `semantic_scores`, `search.rs`).
-- A cached chunk vector whose length differs from the query vector silently scores `0.0` (`lite::embed::EmbeddingIndex::search`), so a model whose dimension changed under the same `model_name` turns semantic recall into an empty, error-free result.
-- `refresh_facts` adopts the index documents wholesale when one of them changed, so facts that exist only in `facts/` (e.g. after a reader-path refresh left `projections_dirty`) are dropped from the document and then deleted from `facts/` by the next `export_locked`; only a `tracing::warn!` records it.
+- A cached chunk vector whose length differs from the query vector silently scores `0.0` (`lite::embed::EmbeddingIndex::search`), so a model whose dimension changed under the same `model_name` turns semantic recall into an empty, error-free result (`lite::embed` reports the same defect).
+- When the `facts/` directory is gone or every file in it fails to decode, `refresh_facts` adopts an empty fact set, so the next export re-renders both index documents empty while the undecodable files stay on disk; a `tracing::warn!` names the skipped files but nothing keeps the previous document.
+- "No information" is decided per index document by absence or whitespace-only content: a document that survives with its front matter or title but no `###` entry is authoritative-empty, so the fact files of that level are deleted by the next export.
 - `start_watching`'s reload task logs a failed `ensure_fresh` as a warning and continues, so `search`/`list` can stay stale with no observable signal, and `is_watching` reports `true` even if that reload task died (`ActiveWatch.task` is never polled).
 
 ## Test Strategy
 
-- 47 unit tests with default features and 48 with `--features sqlite`: `tests.rs` 13, `facts_mode.rs` 7, `session_mode.rs` 6, `write_mode.rs` 6, `search.rs` 5, `embedding.rs` 5 (one sqlite-gated), `sync_mode.rs` 3, `daily_mode.rs` 3.
+- 51 unit tests with default features and 52 with `--features sqlite`: `tests.rs` 13, `facts_mode.rs` 11, `session_mode.rs` 6, `write_mode.rs` 6, `search.rs` 5, `embedding.rs` 5 (one sqlite-gated), `sync_mode.rs` 3, `daily_mode.rs` 3.
+- `facts_mode.rs` pins the reconciliation rules: an export that removes only entries deleted from a non-empty document, an empty or missing index document keeping that level's fact files, an undecodable fact file surviving an export and a delete, the `USER.md` precedence rule, and the byte-for-byte hand-edit re-import.
 - Deterministic and offline: `tempfile` roots, `HashEmbedding` and counting wrappers, explicit `Instant` values for the scheduler, no network, bounded awaits in the watcher tests.
 - The sqlite-only assertions (persisted embedding cache, `indexed_count`) are gated with `#[cfg(feature = "sqlite")]`.
 - Gates: `cargo fmt -p openjiuwen-memory`, `cargo test -p openjiuwen-memory --offline --lib lite::local` with and without `--features sqlite`, `cargo clippy -p openjiuwen-memory --all-targets -- -D warnings` with and without the feature, and `cargo doc -p openjiuwen-memory --no-deps` warning-free.

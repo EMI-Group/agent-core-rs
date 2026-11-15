@@ -265,6 +265,7 @@ impl FactFiles {
     pub async fn write(&self, fact: &CodingFact) -> Result<PathBuf>;      // atomic temp file + rename
     pub async fn read(&self, name: &str) -> Result<Option<CodingFact>>;
     pub async fn read_all(&self) -> Result<Vec<CodingFact>>;              // sorted by name; non-fact Markdown skipped with a warn
+    pub async fn read_all_report(&self) -> Result<(Vec<CodingFact>, Vec<(PathBuf, Error)>)>;  // the skipped paths with their parse errors
     pub async fn remove(&self, name: &str) -> Result<bool>;
     pub async fn contains(&self, name: &str) -> Result<bool>;
     pub async fn stamp(&self) -> Result<DirStamp>;
@@ -435,8 +436,8 @@ Independent of the layout, three further surfaces live under the same root:
 - Staleness in the per-fact layout compares `MEMORY.md`/`USER.md` stamps and the `facts/` `DirStamp`; index-document changes trigger an import, fact-file changes trigger a re-render, and when both changed the index wins with a `tracing::warn!`.
 - Mutations are additionally serialized inside the process by an async mutex; the file lock alone would work but is a blocking system call.
 - A read path that observes a changed file without holding the file lock updates the cache and marks the projections dirty; every locked path flushes them, which preserves the file-lock-then-state-guard order.
-- That read-path reload rebuilds only the document and the FTS index (`store::ensure_fresh`); the chunk index is refreshed solely by mutations, `reindex`, `sync_now`, `export_index`/`import_index` and `open`, so a `search` after an external edit scores changed facts against stale vectors.
-- A failed `EmbeddingIndex::reindex` keeps the previously committed chunk list, but the first refresh after open inserts the empty index into its slot before reindexing, so a failure there leaves an empty index that later `search` calls read as `similarity = 0.0` with no error.
+- The cached document carries a `version` bumped on every change; the embedding index records the version it was built from, and a semantic recall (`local::embedding::semantic_scores`) rebuilds the index first when the two disagree, so an externally edited or newly written fact is scored with its current text.
+- A failed `EmbeddingIndex::reindex` installs nothing: the new index is built off to the side and swapped into its slot only on success, so the previous index (or none, after a failed first build) stays and the next recall retries.
 - `start_watching` reloads (and reindexes) on every debounced `.md` change; `reload_count` is the observable reload counter.
 - `write`/`edit`/`delete`/`reindex` refresh the chunk index after the state guard is dropped, so no guard is ever held across an embedding call.
 
@@ -447,9 +448,11 @@ Independent of the layout, three further surfaces live under the same root:
 - The title is the first `# …` line (`# Memory` in a fresh document, `# User` for `USER.md`); a document without one renders no title line.
 - Fact sections are `## <Type>` in canonical order (user, feedback, project, reference); an empty section renders nothing.
 - Each fact is a `### <name>` entry followed by a bullet attribute block and then the body.
-- Interpreted attributes: `- description:`, `- tags: ["a","b"]` (a comma-separated value is also accepted on parse), `- path:`, `- updated_at:` (RFC 3339).
+- Interpreted attributes: `- description:`, `- tags: ["a","b"]` (a comma-separated value and a bracketed list without quotes are accepted on parse too, and the brackets never become part of a tag), `- path:`, `- updated_at:` (RFC 3339).
+- A bullet line in the attribute block that is not `- key: value` is kept verbatim after the recognized attributes, so the attributes that follow it still parse; a bullet after the blank line that closes the block starts the body.
+- A fact name repeated in the document keeps its last occurrence: every other copy is dropped at parse with a `tracing::warn!`, and `remove`/`upsert_fact` drain every copy of a name so a delete cannot resurrect one.
 - Unknown entry attributes are preserved across an edit, and a replaced fact keeps them.
-- A missing or unparsable `updated_at` decodes to `DateTime<Utc>::default` (the Unix epoch), never "now".
+- A missing or unparsable `updated_at` decodes to `DateTime<Utc>::default` (the Unix epoch), never "now"; an unparsable value keeps its hand-written text verbatim on render instead of being replaced by the epoch.
 - Input is normalized to LF; `render` emits LF and exactly one trailing newline, with one blank line between blocks.
 - A body line that would look like a heading is escaped with a backslash on render (`\## note`) and unescaped on parse.
 - Body boundaries are normalized: leading/trailing blank lines are dropped, and blank lines between heading, attributes, and body are canonical.
@@ -465,8 +468,9 @@ Independent of the layout, three further surfaces live under the same root:
 - `IndexLevel::User` holds `CodingFactType::User`; every other type belongs to `IndexLevel::Memory`, which is rendered into `MEMORY.md`; `USER.md` renders the user level only.
 - `render_level` filters to the level, sorts by the fixed type order then name ascending, and renders through `MarkdownMemory::new().with_title(level.title())`, so output is byte-deterministic.
 - `parse_level` accepts hand-edited documents (unknown front-matter keys, extra sections, loose text) without error.
-- Import merges both documents; a name present in both keeps the `USER.md` entry and logs a warning.
-- `export_index` removes fact files whose fact no longer exists, so a delete propagates to disk.
+- Import merges both documents by name: a name present in both keeps the `USER.md` entry with a warning, and a level whose document is missing or whitespace-empty keeps the fact files it already has.
+- An index document is "no information" only when it is absent or whitespace-empty; a document that still holds its front matter or title but no `###` entry is authoritative-empty, so it expresses the removal of that level's facts.
+- `read_all_report` returns the decoded facts together with every skipped path and its parse error; `export_index` removes only fact files it decoded, so a delete propagates to disk but a file it cannot read is never deleted, because a deleted fact and an unparseable file are indistinguishable.
 - Unknown keys inside a *fact file's* front matter are preserved on parse into `FactDocument` but a rewrite re-renders the canonical key set; index-level unknown attributes are preserved by `MarkdownMemory`.
 
 ## FTS5 index
@@ -488,7 +492,7 @@ Independent of the layout, three further surfaces live under the same root:
 - `reindex` re-chunks every document, serves every cache hit, embeds all misses in ONE `embed_documents(&texts, None)` batch, and only then commits the new chunk list.
 - Query embeddings (`embed_query`) are never cached.
 - The in-memory cache is a `parking_lot` map (never held across `.await`); with the `sqlite` feature and an embedding configured, the store opens `EmbeddingCache::sqlite(fts.pool().clone())`, which persists vectors in `lite_embedding_cache(model, hash, dims, vector BLOB)` so a reopen embeds nothing.
-- Fact vectors live in memory per store handle (rebuilt on open and after every mutation); only the cache is durable.
+- Fact vectors live in memory per store handle; they are rebuilt on open, after every mutation, and before a semantic recall whose document version moved, while only the cache is durable.
 - `SearchMode::Keyword` never calls the model, not even for the query.
 
 ## Search scoring
@@ -548,8 +552,9 @@ Independent of the layout, three further surfaces live under the same root:
 ## Session log format
 
 - One JSON object per line at `<root>/sessions/<YYYY-MM-DD>/<sanitized id>.jsonl`; `sanitize_session_id` keeps ASCII alphanumerics plus `-`, `_`, `.`, folds everything else to `-`, and rejects an empty result (`Error::Validation`), so no separator survives and traversal is impossible.
+- A portable id (one the fold leaves unchanged) names its log verbatim; any other id gains `-<8 lowercase hex>` of an FNV-1a digest over the exact id, so `café` and `caf-` never share one file.
 - Decoding is tolerant per line: `content` from `content`/`text`/`message`/`output`, `role` from `role`/`type`, `timestamp` from `timestamp`/`ts`/`time` as RFC 3339 or an epoch number (values ≥ 1e11 are milliseconds); a malformed, non-object, or content-less line becomes a plain-text record of the raw line; a blank line is skipped.
-- `append` skips whitespace-only records and rejects a set with no non-empty record (`Error::Validation`).
+- `append` skips whitespace-only records and rejects a set with no non-empty record (`Error::Validation`); a log whose last byte is not a newline is repaired by writing one newline first, so a truncated tail is preserved as its own line.
 - `files` walks the tree recursively and sorts; `chunks` numbers lines 1-based with store-root-relative `/` paths.
 - Nothing in this workspace writes transcripts yet; the store exposes `append_session` for a caller that does.
 
@@ -595,10 +600,10 @@ Independent of the layout, three further surfaces live under the same root:
 - `CodingMemory::render_index`/`citation` write nothing; `LocalCodingMemory` owns the file and is the only writer of `MEMORY.md`, `USER.md`, `facts/`, `sessions/`, `daily_memory/`, and `.memory/`.
 - The derived indexes are never the source of truth: both may be dropped and rebuilt from the Markdown representation.
 - Default builds work without the `sqlite` feature: `LocalCodingMemory` then reloads and keyword-searches the Markdown document with no FTS index and keeps the embedding cache in memory only. Every new module compiles and is tested in both builds.
-- Every new feature is opt-in or additive: the default `open` keeps today's single-document, keyword-only behaviour, and `tests/lite.rs`/`tests/lite_local.rs` are unchanged.
+- Every new feature is opt-in or additive: the default `open` keeps the single-document, keyword-only behaviour, and `tests/lite.rs`/`tests/lite_local.rs` are unchanged.
 - No new dependencies: the workspace has no `sha2`, `sqlite_vec`, or ANN crate, so content hashing is FNV-1a and vector search is a brute-force cosine scan.
 - Errors follow the crate strategy; no panics.
-- File sizes: the two previously oversized files are gone (`markdown.rs` and `local.rs` are now directories). `embed/index.rs` (~895 lines) and `write.rs` (~845) sit above the ~800-line target because each carries its full in-file test module; their implementations are ~390 and ~490 lines.
+- File sizes: `markdown/` and `local/` are directories; `embed/index.rs` (~895 lines) and `write.rs` (~845) sit above the ~800-line target because each carries its full in-file test module, with implementations of ~390 and ~490 lines.
 
 ## Design Decisions
 
@@ -632,17 +637,17 @@ Independent of the layout, three further surfaces live under the same root:
 
 ## Test Strategy
 
-- Unit tests live beside each module; per-module counts (default build): `markdown` 25, `local` 47, `embed` 45, `facts` 51, `session` 36, `sync` 11, `daily` 14, `write` 17, plus 36 across `fact`/`index`/`lock`/`watch` — 282 in the `lite` subtree (359 with `--features sqlite`).
-- `markdown/`: parse/render idempotence, front-matter ordering/raw lines, section order, unknown attributes and raw blocks, body boundary normalization, heading escaping, tolerant hostile input, `with_title`.
+- Unit tests live beside each module; per-module counts (default build): `markdown` 34, `local` 51, `embed` 45, `facts` 52, `session` 39, `sync` 11, `daily` 14, `write` 17, plus 36 across `fact`/`index`/`lock`/`watch` — 299 in the `lite` subtree; a `sqlite` build adds `fts.rs` (15 tests) plus the gated cache and `indexed_count` cases.
+- `markdown/`: parse/render idempotence, front-matter ordering/raw lines, section order, unknown attributes and raw blocks, body boundary normalization, heading escaping, the duplicate-name and escape-inverse contracts, stray attribute bullets, bracketed tags, a verbatim unparsable timestamp, tolerant hostile input, `with_title`.
 - `embed/`: chunk boundaries and overlap, `estimate_tokens`, `content_hash` stability, cache get/put/clear/len, the sqlite round trip, cosine/similarity/blend edge cases, and a counting `Embedding` wrapper proving a second `reindex` makes zero `embed_documents` calls and that misses are one batch.
-- `facts/`: slug/file-name determinism, per-fact document round trip and hostile-input tolerance, `to_fact` validation, `FactFiles` write/read/read_all/remove/stamp, non-fact Markdown skipping, scope rebinding, and the three round trips (`facts → files → read_all`, `render_level → parse_level`, and a byte-for-byte hand-edit re-import).
-- `session/`: `parse_line`/`to_json_line` round trip, malformed-line tolerance, timestamp string and epoch decoding, id sanitization, `path_for` layout, append accumulation, recursive `files`, tolerant `load`, `chunks` numbering, keyword scoring.
+- `facts/`: slug/file-name determinism, per-fact document round trip and hostile-input tolerance, `to_fact` validation, `FactFiles` write/read/read_all/read_all_report/remove/stamp, non-fact Markdown skipping, scope rebinding, and the three round trips (`facts → files → read_all`, `render_level → parse_level`, and a byte-for-byte hand-edit re-import).
+- `session/`: `parse_line`/`to_json_line` round trip, malformed-line tolerance, timestamp string and epoch decoding, id sanitizing plus the folded-id discriminator, `path_for` layout, append accumulation and mid-line repair, recursive `files`, tolerant `load`, `chunks` numbering, keyword scoring.
 - `sync.rs`/`daily.rs`: scheduler due/not-due determinism from explicit `Instant`s, labels and report constructors; rollup shape, filters, ordering, truncation, and idempotent writes.
 - `write.rs`: serde/`FromStr` for every mode, policy validation, `backoff_for` capping, `plan` for every mode with and without an existing fact, and `run` first-attempt/retry/exhaustion/error-propagation behaviour.
 - `local/`: the original 13 store tests, plus the moved extras, plus the new suites — semantic vs keyword ordering, configured vs unconfigured `Semantic`, `RecallHit` components, cache hits across a refresh and a reopen, fact-file export/import, per-fact edits, the `USER.md` precedence rule, delete propagation, `sync_now` idempotency, trigger gating, the interval-task lifecycle, session recall in all three modes, rollup idempotency, and every write mode including retry exhaustion.
 - Integration binaries under `tests/`: `lite.rs` (10 tests, engine-backed `CodingMemory`) and `lite_local.rs` (8 tests, default `LocalCodingMemory`) are unchanged and must stay green.
 - Offline and deterministic: `tempfile` directories, `HashEmbedding` plus counting wrappers, explicit `Instant`s, no network, no credentials, bounded awaits (≲5 s in `watch.rs`).
-- Gates (all must be green): `cargo fmt -p openjiuwen-memory`, `cargo test -p openjiuwen-memory --offline` (971 tests), the same with `--all-features` (1048), `cargo clippy -p openjiuwen-memory --all-targets --all-features --offline -- -D warnings`, and `cargo doc -p openjiuwen-memory --no-deps` with and without the feature.
+- Gates (all must be green): `cargo fmt -p openjiuwen-memory`, `cargo test -p openjiuwen-memory --offline` (and the same with `--all-features`), `cargo clippy -p openjiuwen-memory --all-targets --all-features --offline -- -D warnings`, and `cargo doc -p openjiuwen-memory --no-deps` with and without the feature.
 - Module-level (`//!`) doc links in this directory must be absolute (`crate::lite::<module>::<Item>`): `//!` docs resolve in the parent module's scope.
 
 ## Known Issues
