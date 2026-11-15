@@ -7,13 +7,16 @@
 //! # Live client adapter
 //!
 //! The foundation [`openjiuwen_foundation::tool::mcp::McpClient`] trait exposes
-//! `list_resources`/`read_resource` (raw `rmcp` JSON) next to tool discovery and tool calls, so
+//! `list_resources`/`read_resource` (raw `rmcp` JSON) next to tool discovery, tool calls and the
+//! server-pushed notification stream (`take_notifications`/`supports_server_stream`), so
 //! [`McpClientResourceProvider`] adapts it to this seam: list and read are delegated and
-//! normalised, and every subscription entry point answers [`Error::Unsupported`] because the
-//! trait exposes no `resources/subscribe` (see [`super::mcp_subscriptions`] for the registry the
-//! deferred capability would feed). [`FakeMcpResourceProvider`] is the in-crate double tests
-//! (and upper layers) use, following the precedent of
-//! `openjiuwen_foundation::tool::mcp::FakeMcpClient`.
+//! normalised, [`McpClientResourceProvider::drain_notifications`] routes the pushed notifications
+//! into a [`super::mcp_subscriptions::McpResourceSubscriptions`] registry, and every subscription
+//! *request* answers [`Error::Unsupported`] with
+//! [`super::mcp_subscriptions::LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED`], because the trait exposes no
+//! `resources/subscribe` (see [`super::mcp_subscriptions`] for the registry that capability would
+//! feed). [`FakeMcpResourceProvider`] is the in-crate double tests (and upper layers) use,
+//! following the precedent of `openjiuwen_foundation::tool::mcp::FakeMcpClient`.
 //!
 //! # Model-facing contract
 //!
@@ -55,7 +58,10 @@ use openjiuwen_foundation::tool::mcp::McpClient;
 use openjiuwen_foundation::tool::{Tool, ToolCard, ToolContext};
 
 use super::descriptions::description;
-use super::mcp_subscriptions::McpResourceSubscriptionProvider;
+use super::mcp_subscriptions::{
+    McpResourceSink, McpResourceSubscriptionProvider, McpResourceSubscriptions,
+    NotificationOutcome, LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED, LIVE_CLIENT_UNSUBSCRIBE_UNSUPPORTED,
+};
 use super::support::{parse_args, schema_for, tool_card, ToolPayload};
 
 /// The failure reported when no MCP resource provider is wired into a tool.
@@ -233,11 +239,17 @@ impl McpResourceProvider for FakeMcpResourceProvider {
 /// without a usable `uri` are skipped with a `debug` log, exactly like Python's
 /// `getattr(r, "uri", str(r))` tolerance.
 ///
-/// The adapter also implements [`McpResourceSubscriptionProvider`], but only through that
-/// trait's defaults: the foundation client has no `resources/subscribe` call and no
-/// notification callback for `resources/updated`, so subscribing answers
-/// [`super::mcp_subscriptions::SUBSCRIBE_UNSUPPORTED`] instead of pretending. A transport that
-/// gains the capability implements the trait directly.
+/// The adapter also implements [`McpResourceSubscriptionProvider`]. Opening a subscription is the
+/// one thing it cannot do: the foundation client has no `resources/subscribe` request, so
+/// `subscribe`/`unsubscribe` answer [`LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED`]/[`LIVE_CLIENT_UNSUBSCRIBE_UNSUPPORTED`]
+/// — a typed reason naming exactly which trait method is missing, never a silent no-op — and
+/// [`McpResourceSubscriptionProvider::supports_subscriptions`] stays `false`.
+///
+/// The *push* half of the bridge needs no foundation change and is wired:
+/// [`McpClientResourceProvider::drain_notifications`] drains
+/// [`McpClient::take_notifications`] and routes each notification into a
+/// [`McpResourceSubscriptions`] registry, which updates the subscriptions a host opened through a
+/// provider that does support `resources/subscribe`.
 ///
 /// ```no_run
 /// # use std::sync::Arc;
@@ -275,6 +287,32 @@ impl McpClientResourceProvider {
     pub fn client(&self) -> &Arc<dyn McpClient> {
         &self.client
     }
+
+    /// Drains the server-pushed notifications the client buffered and routes the resource ones
+    /// into `subscriptions`.
+    ///
+    /// The foundation client already observes the server-initiated stream
+    /// ([`McpClient::take_notifications`] plus [`McpClient::supports_server_stream`]), so this is
+    /// the whole notification → subscription bridge: every drained notification goes through
+    /// [`McpResourceSubscriptions::ingest_notification`], and the per-notification
+    /// [`NotificationOutcome`] values come back in drain order, so a host can count what it
+    /// routed and what it ignored instead of assuming success. Notifications are consumed by the
+    /// call (`take_notifications` removes them).
+    ///
+    /// Only URIs the registry already has a subscription for receive events; an
+    /// `notifications/resources/updated` for any other URI is reported, never registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns the client's error when the notification buffer cannot be drained; the buffer is
+    /// left untouched in that case, so a retry sees the same notifications.
+    pub async fn drain_notifications(
+        &self,
+        subscriptions: &McpResourceSubscriptions,
+    ) -> Result<Vec<NotificationOutcome>> {
+        let notifications = self.client.take_notifications().await?;
+        Ok(subscriptions.ingest_notifications(&notifications))
+    }
 }
 
 #[async_trait]
@@ -303,7 +341,24 @@ impl McpResourceProvider for McpClientResourceProvider {
 }
 
 #[async_trait]
-impl McpResourceSubscriptionProvider for McpClientResourceProvider {}
+impl McpResourceSubscriptionProvider for McpClientResourceProvider {
+    async fn subscribe(&self, uri: &str, sink: &McpResourceSink) -> Result<()> {
+        let _ = (uri, sink);
+        Err(Error::unsupported(LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED))
+    }
+
+    async fn unsubscribe(&self, uri: &str) -> Result<()> {
+        let _ = uri;
+        Err(Error::unsupported(LIVE_CLIENT_UNSUBSCRIBE_UNSUPPORTED))
+    }
+
+    /// Always `false`: [`McpClient`] has no `resources/subscribe` request, so this adapter can
+    /// never open a subscription (see [`LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED`]). Stated explicitly
+    /// rather than inherited so the answer stays next to the reason.
+    fn supports_subscriptions(&self) -> bool {
+        false
+    }
+}
 
 /// Normalises one `rmcp` resource (`{"uri", "name", "mimeType", "description", …}`) — or a bare
 /// URI string, as Python tolerates — into [`McpResource`].
@@ -804,6 +859,10 @@ mod tests {
         read_failure: Option<String>,
         /// URIs passed to `read_resource`.
         read_calls: Mutex<Vec<String>>,
+        /// Notifications `take_notifications` drains (none when unset).
+        notifications: Option<Vec<openjiuwen_foundation::tool::mcp::McpNotification>>,
+        /// Failure `take_notifications` reports instead of `notifications`.
+        notifications_failure: Option<String>,
     }
 
     impl StubClient {
@@ -812,8 +871,7 @@ mod tests {
             Arc::new(Self {
                 resources: Some(resources),
                 read: Some(read),
-                read_failure: None,
-                read_calls: Mutex::new(Vec::new()),
+                ..Self::default()
             })
         }
     }
@@ -854,6 +912,15 @@ mod tests {
             self.resources
                 .clone()
                 .ok_or_else(|| Error::transport("socket closed"))
+        }
+
+        async fn take_notifications(
+            &self,
+        ) -> Result<Vec<openjiuwen_foundation::tool::mcp::McpNotification>> {
+            match self.notifications_failure.as_deref() {
+                Some(message) => Err(Error::transport(message.to_owned())),
+                None => Ok(self.notifications.clone().unwrap_or_default()),
+            }
         }
 
         async fn read_resource(&self, uri: &str) -> Result<Value> {
@@ -937,10 +1004,8 @@ mod tests {
         assert!(matches!(error, Error::Mcp(_)), "error: {error}");
 
         let failing = Arc::new(McpClientResourceProvider::new(Arc::new(StubClient {
-            resources: None,
             read: Some(json!({})),
-            read_failure: None,
-            read_calls: Mutex::new(Vec::new()),
+            ..StubClient::default()
         })));
         let error = failing.list_resources().await.unwrap_err();
         assert!(matches!(error, Error::Transport(_)), "error: {error}");
@@ -950,15 +1015,98 @@ mod tests {
     async fn the_live_client_adapter_cannot_subscribe() {
         let provider = McpClientResourceProvider::new(StubClient::new(Vec::new(), json!({})));
         assert!(!provider.supports_subscriptions());
-        let registry = crate::tools::mcp_subscriptions::McpResourceSubscriptions::new()
-            .with_provider(Arc::new(provider));
-        let error = registry.subscribe("mem://a").await.unwrap_err();
+        // The refusal names the missing foundation request, not just "not supported".
+        let error = provider.unsubscribe("mem://a").await.unwrap_err();
         assert!(matches!(error, Error::Unsupported(_)), "error: {error}");
+        assert_eq!(error.message(), LIVE_CLIENT_UNSUBSCRIBE_UNSUPPORTED);
         assert!(
             error.message().contains("resources/subscribe"),
             "error: {error}"
         );
+        assert!(
+            error
+                .message()
+                .contains("openjiuwen_foundation::tool::mcp::McpClient"),
+            "error: {error}"
+        );
+
+        let registry = crate::tools::mcp_subscriptions::McpResourceSubscriptions::new()
+            .with_provider(Arc::new(provider));
+        let error = registry.subscribe("mem://a").await.unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)), "error: {error}");
+        assert_eq!(error.message(), LIVE_CLIENT_SUBSCRIBE_UNSUPPORTED);
         assert!(!registry.is_subscribed("mem://a"));
+        assert_eq!(registry.list().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_live_client_adapter_routes_pushed_notifications_into_the_registry() {
+        use crate::tools::mcp_subscriptions::{
+            FakeMcpResourceSubscriptionProvider, McpResourceSubscriptions, NotificationOutcome,
+        };
+        use openjiuwen_foundation::tool::mcp::McpNotification;
+
+        let client = Arc::new(StubClient {
+            notifications: Some(vec![
+                McpNotification {
+                    method: "notifications/resources/updated".to_owned(),
+                    params: json!({"uri": "mem://a"}),
+                },
+                McpNotification {
+                    method: "notifications/tools/list_changed".to_owned(),
+                    params: Value::Null,
+                },
+                McpNotification {
+                    method: "notifications/resources/updated".to_owned(),
+                    params: json!({"uri": "mem://unknown"}),
+                },
+            ]),
+            ..StubClient::default()
+        });
+        let provider = McpClientResourceProvider::new(client);
+        let subscriptions = McpResourceSubscriptions::new()
+            .with_provider(Arc::new(FakeMcpResourceSubscriptionProvider::new()));
+        subscriptions.subscribe("mem://a").await.unwrap();
+
+        let outcomes = provider.drain_notifications(&subscriptions).await.unwrap();
+        assert_eq!(
+            outcomes,
+            vec![
+                NotificationOutcome::Published {
+                    uri: "mem://a".to_owned(),
+                    sequence: 1,
+                    reason: "notifications/resources/updated".to_owned(),
+                },
+                NotificationOutcome::IgnoredMethod {
+                    method: "notifications/tools/list_changed".to_owned(),
+                },
+                NotificationOutcome::NotSubscribed {
+                    uri: "mem://unknown".to_owned(),
+                },
+            ]
+        );
+        let events = subscriptions.poll("mem://a", 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].reason.as_deref(),
+            Some("notifications/resources/updated")
+        );
+        assert!(events[0].content.is_none());
+        // An update never registers a subscription of its own.
+        assert!(!subscriptions.is_subscribed("mem://unknown"));
+        assert_eq!(subscriptions.list().len(), 1);
+
+        // A drain that fails reports the client error and consumes nothing.
+        let failing = McpClientResourceProvider::new(Arc::new(StubClient {
+            notifications_failure: Some("socket closed".to_owned()),
+            ..StubClient::default()
+        }));
+        let error = failing
+            .drain_notifications(&subscriptions)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Transport(_)), "error: {error}");
+        assert_eq!(error.message(), "socket closed");
     }
 
     #[test]
