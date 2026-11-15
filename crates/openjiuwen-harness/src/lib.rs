@@ -49,7 +49,7 @@ pub mod worktree;
 // --- agent -----------------------------------------------------------------
 pub use agent::{
     apply_deep_agent_parts, clear_state, create_deep_agent, drain_rail_events, load_state,
-    resolve_deep_agent_parts, save_state, DeepAgent, DeepAgentBuilder, DeepAgentParts,
+    resolve_deep_agent_parts, save_state, seed_state, DeepAgent, DeepAgentBuilder, DeepAgentParts,
     DeepAgentSubAgentFactory, RailEventBus, RailEventDrain, DEFAULT_RAIL_EVENT_CAPACITY,
     RAIL_EVENTS_EXTRA_PREFIX, RAIL_EVENT_DRAIN_NAME, RAIL_EVENT_DRAIN_PRIORITY, SESSION_STATE_KEY,
 };
@@ -230,7 +230,10 @@ pub use protocol::{
 /// code should hand a parsed [`cli::Cli`] to [`cli::run_cli`] rather than
 /// parsing arguments itself.
 pub use clap;
-pub use cli::{run, run_cli, Cli, CliOptions, CliPermissionHost, Command, OutputFormat, Repl};
+pub use cli::{
+    run, run_cli, run_once_resumed, run_with_model_resumed, Cli, CliOptions, CliPermissionHost,
+    Command, OutputFormat, Repl, ResumedTurn,
+};
 
 // --- manifest --------------------------------------------------------------
 pub use manifest::{
@@ -262,26 +265,28 @@ pub use watcher::{
 pub use persistent_agent::{
     atomic_write, canonical_json, deterministic_model_call_id, digest_hex, hand_off,
     is_logical_path, is_read_only_tool, is_valid_identifier, patch_stopped_calls,
-    percent_encode_identifier, read_json, resume, sha256_hex_str, valid_caption, write_json_atomic,
-    AbortReason, Capacity, CheckpointKind, Continuation, ContinuationCursor, Control,
-    ControlSnapshot, DistributedHandoff, ElidedEntry, ElisionReason, EmittedEvent, Emitter,
-    EntryKind, EntryPayload, EventSink, EventType, ExecutionEntry, ExecutionIdentity,
-    ExecutionLink, ExecutionLinkSource, ExecutionLog, ExecutionLogSource, ExecutionRecordRail,
-    ExtractiveSummarizer, FileLinkStore, FileSessionStore, FinalStatus, HandoffReceipt,
-    HandoffTarget, HandoffTransfer, HandoffTransport, ImportedShareBundle, InMemorySink,
-    InterceptedCall, LinkRelation, LocalHandoff, LogCapacity, LogCursor, LogDigest, LogMeta,
-    LogPreview, LogSnapshot, ModelAdmission, ModelCallGate, ModelCallRail, ModelUsage,
-    ParticipationDecision, ParticipationState, PauseReason, PersistentEvent,
+    percent_decode_identifier, percent_encode_identifier, read_json, resume, sha256_hex_str,
+    valid_caption, write_json_atomic, AbortReason, Capacity, CheckpointKind, Continuation,
+    ContinuationCursor, Control, ControlSnapshot, DistributedHandoff, ElidedEntry, ElisionReason,
+    EmittedEvent, Emitter, EntryKind, EntryPayload, EventSink, EventType, ExecutionCatalog,
+    ExecutionEntry, ExecutionIdentity, ExecutionLink, ExecutionLinkSource, ExecutionLog,
+    ExecutionLogSource, ExecutionRecordRail, ExecutionSummary, ExtractiveSummarizer, FileLinkStore,
+    FileSessionStore, FinalStatus, HandoffReceipt, HandoffTarget, HandoffTransfer,
+    HandoffTransport, ImportedShareBundle, InMemorySink, InterceptedCall, LinkRelation,
+    LocalHandoff, LogCapacity, LogCursor, LogDigest, LogMeta, LogPreview, LogSnapshot,
+    ModelAdmission, ModelCallGate, ModelCallRail, ModelUsage, ParticipationDecision,
+    ParticipationState, PauseReason, PersistentAgentLayout, PersistentEvent,
     PersistentSessionRecord, RecordCheckpoint, RecordEnding, RecordRollover, RemoteHandoff, Replay,
-    ResumePlan, RolloverTrigger, RootLogSource, SessionBinding, SessionStateStore, ShareBundle,
-    ShareFile, ShareMode, SharedFileEntry, ToolRecordPolicy, ToolStatus,
+    ResumePlan, RolloverTrigger, RootLogSource, SessionBinding, SessionStateStore, SessionSummary,
+    ShareBundle, ShareFile, ShareMode, SharedFileEntry, ToolRecordPolicy, ToolStatus,
     UnsupportedModelSummarizer, UsageStatus, WaitingScene, WindowAssembler, WindowAssembly,
     WindowManager, WindowPlan, WindowPolicy, WindowSummarizer, BUNDLE_FILE, CAPTION_MAX_CHARS,
     CONTINUATION_RULES, DETAIL_LIMIT, ENTRY_SCHEMA_VERSION, FILE_PATH_MAX_CHARS,
-    HANDOFF_TEXT_PREFIX, IDENTIFIER_MAX_CHARS, LOG_ENCODING, LOG_ENTRY_FILE, LOG_META_FILE,
-    MAX_SHARED_FILES, MODEL_CALL_ID_EXTRA_KEY, PLACEHOLDER_TEXT, READ_ONLY_TOOLS,
-    RECORD_INVALID_PREFIX, SESSION_KEY_PREFIX, SESSION_RECORD_VERSION, SHARE_BUNDLE_SCHEMA_VERSION,
-    SHARE_FILE_MAX_BYTES, SHARE_MODES, SUMMARY_LIMIT,
+    HANDOFF_TEXT_PREFIX, IDENTIFIER_MAX_CHARS, LINKS_DIR, LOGS_DIR, LOG_ENCODING, LOG_ENTRY_FILE,
+    LOG_META_FILE, MAX_SHARED_FILES, MODEL_CALL_ID_EXTRA_KEY, PERSISTENT_AGENT_NODE,
+    PLACEHOLDER_TEXT, READ_ONLY_TOOLS, RECORD_INVALID_PREFIX, SESSIONS_DIR, SESSION_KEY_PREFIX,
+    SESSION_RECORD_VERSION, SHARE_BUNDLE_SCHEMA_VERSION, SHARE_FILE_MAX_BYTES, SHARE_MODES,
+    SUMMARY_LIMIT,
 };
 
 /// Returns the crate name.
