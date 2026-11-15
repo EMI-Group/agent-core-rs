@@ -93,7 +93,11 @@ pub use components::{
     LOOP_SET_VARIABLES_MARKER, SUB_WORKFLOW_COMPONENT,
 };
 pub use condition::{Branch, BranchRouter, Condition};
-pub use context::{ComponentContext, MessageHistory, SessionMessageHistory, MESSAGES_STATE_KEY};
+pub use context::history::{history_corrupt_error, WORKFLOW_HISTORY_CORRUPT};
+pub use context::{
+    ComponentContext, HistoryCorruption, HistoryCorruptionReason, MessageHistory,
+    SessionMessageHistory, MESSAGES_STATE_KEY,
+};
 pub use engine::{
     CompiledWorkflow, ConditionalSource, Edge, EdgeKind, Entry, NodeConfig, StreamDelivery,
     WorkflowDefinition, WorkflowRunOptions,

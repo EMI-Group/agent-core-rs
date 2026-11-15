@@ -6,10 +6,10 @@
 //! [`openjiuwen_common::http::HttpClient`], and projects the response into Python's
 //! `statusCode` / `headers` / `body` / `url` / `ok` wire object.
 //!
-//! The implementation is split by responsibility: [`config`] holds the configuration tree,
-//! [`template`] the `{{key}}`/`${path}` templating, [`body`] and [`multipart`] the request
-//! bodies, [`auth`] with [`digest`] and [`sigv4`] the authentication schemes, [`response`]
-//! the response projection, and [`rate_limit`] the sliding-window limiter.
+//! The implementation is split by responsibility: `config` holds the configuration tree,
+//! `template` the `{{key}}`/`${path}` templating, `body` and `multipart` the request
+//! bodies, `auth` with `digest` and `sigv4` the authentication schemes, `response` the
+//! response projection, and `rate_limit` the sliding-window limiter.
 //!
 //! # Behaviour
 //!

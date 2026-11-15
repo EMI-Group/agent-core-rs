@@ -390,12 +390,20 @@ async fn streaming_an_invalid_workflow_yields_one_compile_error() {
 }
 
 /// `start → loop → end` around `component`, the shape every loop build test uses.
+///
+/// The end node selects the loop node's value (`${loop}`), so `result["output"]` is the
+/// container wrapper itself rather than the whole workflow state, which is what an end
+/// node without an input schema receives.
 fn loop_shaped(id: &str, component: impl Component + 'static) -> Workflow {
     let mut workflow = Workflow::new(card(id));
     workflow
         .set_start_comp("start", StartComponent::new(), ComponentOptions::new())
         .add_workflow_comp("loop", component, ComponentOptions::new())
-        .set_end_comp("end", EndComponent::new(), ComponentOptions::new())
+        .set_end_comp(
+            "end",
+            EndComponent::new(),
+            ComponentOptions::new().with_inputs_schema(json!("${loop}")),
+        )
         .add_connection("start", "loop")
         .add_connection("loop", "end");
     workflow
@@ -477,5 +485,8 @@ async fn a_valid_bounded_group_compiles_and_runs() {
         .invoke(json!({"q": 1}), session("group-valid"))
         .await
         .expect("the run completes");
-    assert_eq!(output.result["output"]["loop_count"], json!(2));
+    let wrapper = &output.result["output"];
+    assert_eq!(wrapper["loop_count"], json!(2));
+    assert_eq!(wrapper["broken"], json!(false));
+    assert_eq!(wrapper["loop_results"].as_array().map(Vec::len), Some(2));
 }

@@ -156,8 +156,9 @@ impl LoopBreakComponent {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Workflow`] with code `101030` when the configured condition does
-    /// not parse or cannot be evaluated against `inputs`.
+    /// Returns [`Error::Workflow`](openjiuwen_common::error::Error::Workflow) with code
+    /// `101030` when the configured condition does not parse or cannot be evaluated
+    /// against `inputs`.
     pub fn should_break(&self, inputs: &Value) -> Result<bool> {
         let Some(expression) = self.config.condition.as_deref() else {
             return Ok(true);
@@ -286,8 +287,8 @@ impl LoopSetVariableComponent {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Workflow`] with code `101030` when the mapping is empty or a
-    /// variable name is not usable.
+    /// Returns [`Error::Workflow`](openjiuwen_common::error::Error::Workflow) with code
+    /// `101031` when the mapping is empty or a variable name is not usable.
     pub fn assignments(&self, inputs: &Value) -> Result<Map<String, Value>> {
         if self.config.variable_mapping.is_empty() {
             return Err(loop_set_var_param_invalid(
