@@ -159,6 +159,13 @@ pub enum ModelPoolStrategy {
     RoundRobin,
     /// Pick the endpoint whose `model_name` the member asked for.
     ByModelName,
+    /// Python's `intelli_router` strategy: a client-side reliable router chooses the endpoint.
+    ///
+    /// The router and the route-group service it talks to are not ported, so a team configured with
+    /// this strategy fails at allocation with a typed `Error::Unsupported`. The variant exists so
+    /// the Python wire value `intelli_router` round-trips instead of failing to deserialize.
+    #[serde(rename = "intelli_router")]
+    IntelliRouter,
 }
 
 /// Language of prompts, rail messages and generated text (Python `language`).
@@ -764,6 +771,7 @@ mod tests {
         round_trip(&BootstrapMode::Framework, "framework");
         round_trip(&ModelPoolStrategy::RoundRobin, "round_robin");
         round_trip(&ModelPoolStrategy::ByModelName, "by_model_name");
+        round_trip(&ModelPoolStrategy::IntelliRouter, "intelli_router");
         round_trip(&Language::Cn, "cn");
         round_trip(&Language::Cf, "cf");
         round_trip(&Language::En, "en");
@@ -771,6 +779,47 @@ mod tests {
         assert_eq!(Language::En.as_str(), "en");
         // Python writes `inprocess`, never the `snake_case` form of the variant name.
         assert!(serde_json::from_value::<SpawnMode>(json!("in_process")).is_err());
+    }
+
+    #[test]
+    fn intelli_router_model_pool_strategy_round_trips_through_the_spec() {
+        let spec: TeamAgentSpec = serde_json::from_value(json!({
+            "team_name": "demo",
+            "model_pool_strategy": "intelli_router",
+        }))
+        .unwrap();
+        assert_eq!(spec.model_pool_strategy, ModelPoolStrategy::IntelliRouter);
+
+        let reserialized = serde_json::to_value(&spec).unwrap();
+        assert_eq!(reserialized["model_pool_strategy"], json!("intelli_router"));
+        let reparsed: TeamAgentSpec = serde_json::from_value(reserialized).unwrap();
+        assert_eq!(reparsed, spec);
+    }
+
+    #[test]
+    fn model_pool_strategy_keeps_the_existing_wire_values_and_default() {
+        for (wire, expected) in [
+            ("round_robin", ModelPoolStrategy::RoundRobin),
+            ("by_model_name", ModelPoolStrategy::ByModelName),
+        ] {
+            let spec: TeamAgentSpec =
+                serde_json::from_value(json!({"model_pool_strategy": wire})).unwrap();
+            assert_eq!(spec.model_pool_strategy, expected);
+            assert_eq!(
+                serde_json::to_value(&spec).unwrap()["model_pool_strategy"],
+                json!(wire)
+            );
+        }
+
+        // An absent field keeps Python's default instead of failing to load.
+        let absent: TeamAgentSpec = serde_json::from_value(json!({"team_name": "demo"})).unwrap();
+        assert_eq!(absent.model_pool_strategy, ModelPoolStrategy::RoundRobin);
+        // The field is non-optional, so an explicit `null` is a shape error, not a silent default.
+        let null = serde_json::from_value::<TeamAgentSpec>(json!({"model_pool_strategy": null}));
+        let message = null
+            .expect_err("an explicit null is a shape error")
+            .to_string();
+        assert!(message.contains("null"), "{message}");
     }
 
     #[test]
