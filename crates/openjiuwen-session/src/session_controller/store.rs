@@ -13,6 +13,8 @@
 //!   (`{"meta": …, "data": <SessionSnapshot>}`).
 //! - `<base>/<agent_id>/sessions/<session_id>/history/` — version history, owned
 //!   by [`crate::vcs::SessionHistory`].
+//! - `<base>/<agent_id>/links.json` — the agent's session link graph
+//!   ([`SessionLinks`]), described in [`super::links`].
 //!
 //! Every write goes through a temporary file in the destination directory and a
 //! rename, so readers never observe a partially written document and a failed
@@ -33,6 +35,7 @@ use crate::checkpoint::validate_id;
 use crate::session::{Session, SessionSnapshot, SessionType};
 use crate::vcs::SessionHistory;
 
+use super::links::{links_path, read_links, update_links, write_links, SessionLinks};
 use super::schema::{
     now_seconds, ScopeSessionsMeta, SessionMeta, SessionRecord, SessionsIndex,
     DEFAULT_DATA_CONTAINER_TYPE, TIMESTAMP_EPSILON,
@@ -41,13 +44,17 @@ use super::scope::{SessionScope, SessionScopeKey};
 
 /// A session store rooted at a base directory.
 ///
-/// The store is cheap to clone: clones share the same base path and the same
-/// version-history commit lock, so concurrent writers coordinate through one
-/// mutex.
+/// The store is cheap to clone: clones share the same base path, the same
+/// version-history commit lock, and the same link-graph write lock, so
+/// concurrent writers coordinate through one mutex each.
+///
+/// Two stores constructed independently over the same base directory do not
+/// share those locks, so writers over one base must be store clones.
 #[derive(Debug, Clone)]
 pub struct DiskSessionStore {
     base: PathBuf,
     history_lock: Arc<AsyncMutex<()>>,
+    links_lock: Arc<AsyncMutex<()>>,
 }
 
 /// The file name of the per-agent session index.
@@ -66,6 +73,7 @@ impl DiskSessionStore {
         Self {
             base: base.into(),
             history_lock: Arc::new(AsyncMutex::new(())),
+            links_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -115,6 +123,12 @@ impl DiskSessionStore {
     #[must_use]
     pub fn history(&self) -> SessionHistory {
         SessionHistory::new(self.clone())
+    }
+
+    /// `<base>/<agent_id>/links.json`, the agent's session link graph.
+    #[must_use]
+    pub fn links_path(&self, agent_id: &str) -> PathBuf {
+        links_path(&self.base, agent_id)
     }
 
     /// The lock that serializes version-id allocation across store clones.
@@ -309,9 +323,14 @@ impl DiskSessionStore {
         }
     }
 
-    /// Deletes a session's directory and index entry.
+    /// Deletes a session's directory, its index entry, and its link entry.
     ///
-    /// Returns `false` when the session directory does not exist.
+    /// Returns `false` when the session directory does not exist; nothing is
+    /// changed in that case.
+    ///
+    /// Only that session's [`SessionLink`](super::links::SessionLink) is dropped:
+    /// its parent stops listing it as a child, its children lose the parent
+    /// pointer (see [`SessionLinks::remove`]), and every other entry survives.
     ///
     /// # Errors
     ///
@@ -345,6 +364,15 @@ impl DiskSessionStore {
             if changed {
                 index.updated_at = now_seconds().max(index.updated_at + TIMESTAMP_EPSILON);
                 self.write_index(agent_id, &index).await?;
+            }
+        }
+
+        let links_path = self.links_path(agent_id);
+        if tokio::fs::metadata(&links_path).await.is_ok() {
+            let _guard = self.links_lock.lock().await;
+            let mut links = self.read_links(agent_id).await?;
+            if links.remove(session_id).is_some() {
+                self.write_links(agent_id, &links).await?;
             }
         }
         Ok(true)
@@ -480,6 +508,119 @@ impl DiskSessionStore {
     async fn write_record(&self, agent_id: &str, record: &SessionRecord) -> Result<()> {
         write_json_atomic(&self.state_path(agent_id, &record.meta.session_id), record).await
     }
+
+    /// Reads the agent's session link graph; a missing document yields an empty
+    /// graph.
+    ///
+    /// The document is returned as stored, so a hand-written cycle surfaces when
+    /// it is traversed (see [`SessionLinks::chain`]) rather than on read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+    /// for a malformed agent id and
+    /// [`Error::Session`](openjiuwen_common::error::ErrorKind::Session) when
+    /// `links.json` is unreadable or malformed.
+    pub async fn read_links(&self, agent_id: &str) -> Result<SessionLinks> {
+        read_links(&self.base, agent_id).await
+    }
+
+    /// Atomically writes the agent's session link graph (`links.json`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+    /// for a malformed agent or session id and
+    /// [`Error::Session`](openjiuwen_common::error::ErrorKind::Session) for I/O
+    /// or serialization failures.
+    pub async fn write_links(&self, agent_id: &str, links: &SessionLinks) -> Result<()> {
+        write_links(&self.base, agent_id, links).await
+    }
+
+    /// Records `child` as created from `parent`, then persists the graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+    /// for a malformed id or a link that would create a cycle, and
+    /// [`Error::Session`](openjiuwen_common::error::ErrorKind::Session) for I/O
+    /// failures or a stored cycle.
+    pub async fn link_parent(&self, agent_id: &str, child: &str, parent: &str) -> Result<()> {
+        update_links(&self.base, &self.links_lock, agent_id, |links| {
+            links.record_parent(child, parent)
+        })
+        .await
+    }
+
+    /// Records `child` as forked from `origin`'s state, then persists the graph.
+    ///
+    /// # Errors
+    ///
+    /// See [`DiskSessionStore::link_parent`].
+    pub async fn link_fork(&self, agent_id: &str, child: &str, origin: &str) -> Result<()> {
+        update_links(&self.base, &self.links_lock, agent_id, |links| {
+            links.record_fork(child, origin)
+        })
+        .await
+    }
+
+    /// The session `session_id` was created from, or `None` when the graph has
+    /// no such parent link.
+    ///
+    /// # Errors
+    ///
+    /// See [`DiskSessionStore::read_links`].
+    pub async fn parent_of(&self, agent_id: &str, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .read_links(agent_id)
+            .await?
+            .parent_of(session_id)
+            .map(str::to_string))
+    }
+
+    /// The sessions created from `session_id`, in insertion order.
+    ///
+    /// # Errors
+    ///
+    /// See [`DiskSessionStore::read_links`].
+    pub async fn children_of(&self, agent_id: &str, session_id: &str) -> Result<Vec<String>> {
+        Ok(self
+            .read_links(agent_id)
+            .await?
+            .children_of(session_id)
+            .to_vec())
+    }
+
+    /// The root→parent path of `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// See [`DiskSessionStore::read_links`] and [`SessionLinks::ancestors`].
+    pub async fn ancestors(&self, agent_id: &str, session_id: &str) -> Result<Vec<String>> {
+        self.read_links(agent_id).await?.ancestors(session_id)
+    }
+
+    /// Every session downstream of `session_id`, breadth-first.
+    ///
+    /// # Errors
+    ///
+    /// See [`DiskSessionStore::read_links`] and [`SessionLinks::descendants`].
+    pub async fn descendants(&self, agent_id: &str, session_id: &str) -> Result<Vec<String>> {
+        self.read_links(agent_id).await?.descendants(session_id)
+    }
+
+    /// The full root→session path (inclusive) of `session_id`.
+    ///
+    /// This is the traversal a `ChainSession`-style caller needs: it names every
+    /// session between a root and the requested one, which is the order to
+    /// replay or inherit state in.
+    ///
+    /// # Errors
+    ///
+    /// See [`DiskSessionStore::read_links`] and [`SessionLinks::chain`].
+    pub async fn chain(&self, agent_id: &str, session_id: &str) -> Result<Vec<String>> {
+        self.read_links(agent_id).await?.chain(session_id)
+    }
 }
 
 /// An in-memory cache in front of one agent's [`DiskSessionStore`].
@@ -487,6 +628,12 @@ impl DiskSessionStore {
 /// Mirrors Python's per-agent `SessionController`: reads populate the cache,
 /// writes persist immediately, and [`SessionController::flush`] re-persists
 /// every cached record.
+///
+/// [`SessionController::upsert`] and [`SessionController::flush`] re-file a
+/// record in the scope the index already records for it, so they reject a
+/// session the index does not know; [`SessionController::upsert_in`],
+/// [`SessionController::save`] and [`SessionController::save_in`] take the scope
+/// explicitly.
 #[derive(Debug, Clone)]
 pub struct SessionController {
     store: DiskSessionStore,
@@ -534,18 +681,45 @@ impl SessionController {
         Ok(meta)
     }
 
-    /// Persists `record`, keeping it in the scope it already belongs to (or the
-    /// main scope for a new session), and caches it.
+    /// Persists `record` in the scope it already belongs to and caches it.
+    ///
+    /// The scope is read from the agent's index, so **the session must already be
+    /// stored**: a session the index does not know is
+    /// [`Error::Validation`](openjiuwen_common::error::ErrorKind::Validation),
+    /// because there is no scope to file it under. Use
+    /// [`SessionController::upsert_in`] when the scope is known.
+    ///
+    /// # Errors
+    ///
+    /// See [`DiskSessionStore::save`], plus
+    /// [`Error::Validation`](openjiuwen_common::error::ErrorKind::Validation) for
+    /// a session with no scope and
+    /// [`Error::Session`](openjiuwen_common::error::ErrorKind::Session) for an
+    /// unparseable scope key in the index.
+    pub async fn upsert(&self, record: SessionRecord) -> Result<SessionMeta> {
+        let session_id = record.meta.session_id.clone();
+        let scope = self.require_scope(&session_id).await?;
+        self.upsert_in(&scope, record).await
+    }
+
+    /// Persists `record` in `scope` and caches it.
+    ///
+    /// The explicit-scope spelling of [`SessionController::upsert`]: it works for
+    /// a session the index does not know yet, and a new session starts at
+    /// version 1 and becomes the scope's active session.
     ///
     /// # Errors
     ///
     /// See [`DiskSessionStore::save`].
-    pub async fn upsert(&self, record: SessionRecord) -> Result<SessionMeta> {
+    pub async fn upsert_in(
+        &self,
+        scope: &SessionScope,
+        record: SessionRecord,
+    ) -> Result<SessionMeta> {
         let session_id = record.meta.session_id.clone();
-        let scope = self.scope_of(&session_id).await?;
         let meta = self
             .store
-            .save(&self.agent_id, &scope, record.clone())
+            .save(&self.agent_id, scope, record.clone())
             .await?;
         self.cache.lock().insert(
             session_id,
@@ -574,10 +748,33 @@ impl SessionController {
 
     /// Snapshots `session`, persists it under `scope`, and caches the record.
     ///
+    /// This is the explicit-scope form used by
+    /// [`SessionController::save_in`]; unlike [`SessionController::flush`] it
+    /// needs no previously stored scope.
+    ///
     /// # Errors
     ///
     /// Propagates [`Session::snapshot`] and [`DiskSessionStore::save`] failures.
     pub async fn save(
+        &self,
+        session: &dyn Session,
+        scope: &SessionScope,
+        title: Option<&str>,
+    ) -> Result<SessionMeta> {
+        self.save_in(session, scope, title).await
+    }
+
+    /// Snapshots `session`, persists it under `scope`, and caches the record.
+    ///
+    /// The explicit-scope spelling of [`SessionController::save`], kept so the
+    /// "save this live session here" path is distinct from the
+    /// known-session-only [`SessionController::upsert`] / [`SessionController::flush`]
+    /// pair.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Session::snapshot`] and [`DiskSessionStore::save`] failures.
+    pub async fn save_in(
         &self,
         session: &dyn Session,
         scope: &SessionScope,
@@ -601,16 +798,25 @@ impl SessionController {
         Ok(meta)
     }
 
-    /// Re-persists every cached record.
+    /// Re-persists every cached record, each in the scope it already belongs to.
+    ///
+    /// Every cached session must already be stored: a cached record the index
+    /// does not know is
+    /// [`Error::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+    /// rather than a silent move into the main scope.
     ///
     /// # Errors
     ///
-    /// See [`DiskSessionStore::save`].
+    /// See [`DiskSessionStore::save`], plus
+    /// [`Error::Validation`](openjiuwen_common::error::ErrorKind::Validation) for
+    /// a session with no scope and
+    /// [`Error::Session`](openjiuwen_common::error::ErrorKind::Session) for an
+    /// unparseable scope key in the index.
     pub async fn flush(&self) -> Result<()> {
         let records: Vec<SessionRecord> = self.cache.lock().values().cloned().collect();
         for record in records {
             let session_id = record.meta.session_id.clone();
-            let scope = self.scope_of(&session_id).await?;
+            let scope = self.require_scope(&session_id).await?;
             let meta = self
                 .store
                 .save(&self.agent_id, &scope, record.clone())
@@ -662,21 +868,40 @@ impl SessionController {
         Ok(sessions)
     }
 
-    /// Finds the scope a session already belongs to, defaulting to the main
-    /// scope for a session the index does not know yet.
-    async fn scope_of(&self, session_id: &str) -> Result<SessionScope> {
+    /// Finds the scope a session already belongs to.
+    ///
+    /// Returns `Ok(None)` when the index does not know `session_id`. An index key
+    /// that cannot be parsed as a [`SessionScopeKey`] is a corrupt index and is
+    /// reported as [`Error::Session`] naming the key — never silently skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Session`](openjiuwen_common::error::ErrorKind::Session)
+    /// when the index is unreadable, malformed, or carries an unparseable scope
+    /// key for this session.
+    async fn scope_of(&self, session_id: &str) -> Result<Option<SessionScope>> {
         let index = self.store.read_index(&self.agent_id).await?;
         for (key, scope) in &index.scopes {
             if scope.get_session(session_id).is_some() {
-                match key.parse::<SessionScopeKey>() {
-                    Ok(parsed) => return Ok(parsed.scope),
-                    Err(error) => {
-                        tracing::warn!(%key, %error, "ignoring unparseable session scope key");
-                    }
-                }
+                let parsed = key.parse::<SessionScopeKey>().map_err(|error| {
+                    Error::session(format!(
+                        "invalid session scope key {key:?} in sessions.json: {error}"
+                    ))
+                })?;
+                return Ok(Some(parsed.scope));
             }
         }
-        Ok(SessionScope::main())
+        Ok(None)
+    }
+
+    /// The scope a session already belongs to, or a validation error naming the
+    /// session when the index does not know it.
+    async fn require_scope(&self, session_id: &str) -> Result<SessionScope> {
+        self.scope_of(session_id).await?.ok_or_else(|| {
+            Error::validation(format!(
+                "session {session_id} has no scope: save it with an explicit scope first"
+            ))
+        })
     }
 }
 
