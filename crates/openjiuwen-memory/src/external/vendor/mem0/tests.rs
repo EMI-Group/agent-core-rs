@@ -460,6 +460,173 @@ async fn the_rail_degrades_instead_of_raising_when_the_vendor_fails() {
     assert_eq!(handle.prefetch("q").await, "");
 }
 
+#[tokio::test]
+async fn list_follows_every_page_and_clear_deletes_every_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/memories/"))
+        .and(query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                { "id": "m-1", "memory": "one" },
+                { "id": "m-2", "memory": "two" },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/memories/"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{ "id": "m-3", "memory": "three" }],
+        })))
+        .mount(&server)
+        .await;
+    for id in ["m-1", "m-2", "m-3"] {
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v1/memories/{id}/")))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+    }
+
+    // A full first page is the only "there is more" signal mem0 gives, so a two-row page
+    // size makes the first page full and the second one short.
+    let handler =
+        Mem0MemoryProvider::new(&config(&server.uri()).with_option("page_size", json!(2)));
+    let filter = MemoryFilter::for_scope(&scope());
+
+    let records = handler.list(&filter).await.expect("paged list");
+    assert_eq!(records.len(), 3, "both pages are collected");
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["m-1", "m-2", "m-3"]
+    );
+
+    let removed = handler.clear(&filter).await.expect("clear");
+    assert_eq!(removed, 3, "every id of every page is deleted");
+
+    let requests = server.received_requests().await.expect("requests");
+    let pages: Vec<String> = requests
+        .iter()
+        .filter(|request| request.method == wiremock::http::Method::GET)
+        .filter_map(|request| {
+            request
+                .url
+                .query_pairs()
+                .find(|(key, _)| key == "page")
+                .map(|(_, page)| page.into_owned())
+        })
+        .collect();
+    assert_eq!(
+        pages,
+        vec!["1", "2", "1", "2"],
+        "list walked both pages, then clear walked them again to delete"
+    );
+
+    let deleted: Vec<String> = requests
+        .iter()
+        .filter(|request| request.method == wiremock::http::Method::DELETE)
+        .map(|request| request.url.path().to_owned())
+        .collect();
+    assert_eq!(
+        deleted,
+        vec![
+            "/v1/memories/m-1/",
+            "/v1/memories/m-2/",
+            "/v1/memories/m-3/"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn list_rejects_a_filter_field_mem0_cannot_express_without_a_request() {
+    let server = MockServer::start().await;
+    let handle = handle(&server.uri());
+
+    let cases: Vec<(MemoryFilter, &str)> = vec![
+        (
+            MemoryFilter {
+                session_id: Some("s-1".to_owned()),
+                ..MemoryFilter::for_scope(&scope())
+            },
+            "session_id",
+        ),
+        (
+            MemoryFilter {
+                ids: vec!["m-1".to_owned()],
+                ..MemoryFilter::for_scope(&scope())
+            },
+            "ids",
+        ),
+        (
+            MemoryFilter {
+                text_contains: Some("dark".to_owned()),
+                ..MemoryFilter::for_scope(&scope())
+            },
+            "text_contains",
+        ),
+    ];
+    for (filter, field) in cases {
+        let error = handle.list(&filter).await.expect_err("unsupported filter");
+        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains(field), "{message}");
+        assert!(message.contains("cannot filter a listing by"), "{message}");
+        assert!(
+            message.contains("`user_id` and `agent_id`"),
+            "the error names what mem0 can filter: {message}"
+        );
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty(),
+        "no unfiltered listing is sent"
+    );
+}
+
+#[tokio::test]
+async fn a_listing_body_without_a_row_array_is_a_typed_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/memories/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "payload": [{ "id": "m-1", "memory": "one" }],
+        })))
+        .mount(&server)
+        .await;
+
+    let handle = handle(&server.uri());
+    let filter = MemoryFilter::for_scope(&scope());
+
+    let error = handle.list(&filter).await.expect_err("shape drift");
+    assert!(matches!(error, Error::Validation(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("no recognised row array"), "{message}");
+    assert!(message.contains("payload"), "{message}");
+
+    let error = handle.clear(&filter).await.expect_err("shape drift");
+    assert!(
+        matches!(error, Error::Validation(_)),
+        "clear lists first and must not report an empty collection: {error:?}"
+    );
+
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 2, "one listing probe per call");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method == wiremock::http::Method::GET),
+        "nothing is deleted from a body that could not be read"
+    );
+}
+
 #[test]
 fn encode_segment_keeps_unreserved_bytes_and_encodes_the_rest() {
     assert_eq!(super::spec::encode_segment("abc-123_~."), "abc-123_~.");

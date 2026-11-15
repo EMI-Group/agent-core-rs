@@ -611,6 +611,15 @@ impl MemoryProvider for RestProvider {
         }
     }
 
+    /// Whether [`MemoryProvider::initialize`] has successfully probed the backend.
+    ///
+    /// The flag only ever reflects a *successful* probe: a handle that failed its
+    /// initialization — or was never initialized — reports `false`, so a caller can tell a
+    /// rejected credential from a healthy handle without sending a request.
+    fn is_initialized(&self) -> bool {
+        self.initialized.load(Ordering::SeqCst)
+    }
+
     /// Probes the backend and marks the handle initialized only when the probe succeeds.
     ///
     /// A spec with a health call is probed with it; that probe is the only verification a

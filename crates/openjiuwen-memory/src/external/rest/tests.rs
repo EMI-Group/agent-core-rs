@@ -713,6 +713,93 @@ async fn every_endpoint_failing_names_the_last_endpoint() {
 }
 
 #[tokio::test]
+async fn initialize_honours_the_probe_verdict() {
+    for status in [401, 403] {
+        let rejected = MockServer::start().await;
+        mount(&rejected, "GET", "/health", ResponseTemplate::new(status)).await;
+        let provider = provider(&rejected);
+        let error = provider
+            .initialize()
+            .await
+            .expect_err("rejected credentials");
+        assert!(matches!(error, Error::Security(_)), "{status}: {error:?}");
+        let message = error.to_string();
+        assert!(message.contains("rejected"), "{message}");
+        assert!(message.contains("credentials"), "{message}");
+        assert!(!provider.is_initialized(), "{status}: stays uninitialized");
+        assert_eq!(
+            rejected.received_requests().await.expect("requests").len(),
+            1,
+            "{status}: a definitive answer is never retried"
+        );
+    }
+
+    let healthy = MockServer::start().await;
+    mount(&healthy, "GET", "/health", ResponseTemplate::new(200)).await;
+    let provider = provider(&healthy);
+    assert!(!provider.is_initialized(), "nothing is initialized yet");
+    provider.initialize().await.expect("a healthy probe");
+    assert!(provider.is_initialized());
+    provider.initialize().await.expect("idempotent initialize");
+    assert!(provider.is_initialized());
+    assert_eq!(
+        healthy.received_requests().await.expect("requests").len(),
+        1,
+        "a second initialize does no I/O"
+    );
+
+    let failing = MockServer::start().await;
+    mount(&failing, "GET", "/health", ResponseTemplate::new(500)).await;
+    let provider = RestProvider::from_config(
+        spec(),
+        &ProviderConfig::new(ProviderKind::Mem0)
+            .with_endpoint(failing.uri())
+            .with_option("max_retries", json!(0)),
+    );
+    let error = provider.initialize().await.expect_err("a failing probe");
+    assert!(matches!(error, Error::Transport(_)), "{error:?}");
+    assert!(error.to_string().contains("500"), "{error}");
+    assert!(
+        !provider.is_initialized(),
+        "a failed probe is not initialized"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_probe_leaves_the_handle_uninitialized_for_a_later_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error": "starting up"})))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(&server, "GET", "/health", ResponseTemplate::new(200)).await;
+    let provider = RestProvider::from_config(
+        spec(),
+        &ProviderConfig::new(ProviderKind::Mem0)
+            .with_endpoint(server.uri())
+            .with_option("max_retries", json!(0)),
+    );
+
+    let error = provider.initialize().await.expect_err("degraded probe");
+    assert!(matches!(error, Error::Transport(_)), "{error:?}");
+    assert!(error.to_string().contains("starting up"), "{error}");
+    assert!(
+        !provider.is_initialized(),
+        "a degraded probe is not a setup"
+    );
+
+    provider.initialize().await.expect("the retried probe");
+    assert!(provider.is_initialized());
+    assert_eq!(
+        server.received_requests().await.expect("requests").len(),
+        2,
+        "the second initialize really probes again"
+    );
+}
+
+#[tokio::test]
 async fn clear_without_a_bulk_delete_removes_record_by_record() {
     let server = MockServer::start().await;
     mount(

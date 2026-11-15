@@ -230,6 +230,40 @@ async fn an_empty_add_answer_is_a_skip_not_a_failure() {
     assert!(!outcome.skipped[0].is_empty(), "a generated id is reported");
 }
 
+#[tokio::test]
+async fn a_non_json_add_answer_over_http_reports_the_accepted_write_as_added() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(ADD_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("<html>proxy</html>", "text/html"))
+        .mount(&server)
+        .await;
+
+    let outcome = handle(&server)
+        .add(
+            &scope(),
+            vec![NewMemory::semantic("fact")],
+            &AddOptions::default(),
+        )
+        .await
+        .expect("an accepted write is never a failure");
+
+    assert_eq!(
+        outcome.added.len(),
+        1,
+        "an unparseable answer is not a dedupe: {outcome:?}"
+    );
+    assert!(outcome.skipped.is_empty(), "{outcome:?}");
+    assert!(outcome.merged.is_empty(), "{outcome:?}");
+    assert_eq!(outcome.added[0].content, "fact");
+    assert_eq!(outcome.added[0].id.len(), 24, "a generated id is reported");
+
+    let received = server.received_requests().await.expect("received requests");
+    assert_eq!(received.len(), 1, "a write is never retried");
+    let body: Value = serde_json::from_slice(&received[0].body).expect("a JSON body");
+    assert_eq!(body["content"], json!("fact"));
+}
+
 #[test]
 fn an_unparseable_add_answer_reports_the_accepted_write_as_added() {
     let config = ProviderConfig::new(ProviderKind::Jiuwen).with_endpoint("https://jiuwen.invalid");
