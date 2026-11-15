@@ -9,66 +9,71 @@
     clippy::too_many_lines // scenarios read as one narrative, like the sibling suites
 )]
 #![cfg(feature = "otel")]
-//! Team-memory observability: lifecycle hook events projected onto OTLP spans.
+//! Team-memory observability: the shipped `otlp` bridge driven onto the wire.
 //!
-//! The Python SDK leaves team memory in the dark unless a host wires its own
-//! exporter. The Rust port splits the job in two, and this scenario drives both
-//! halves through their public seams:
+//! `openjiuwen-agent-teams` owns the bridge this scenario exercises. On the
+//! `otlp` feature the crate ships [`OtlpMemoryObserver`], a [`TeamMemoryObserver`]
+//! that turns every team-memory event into one `memory.{operation}` component
+//! frame and hands it to `openjiuwen-extensions`' [`OtelTraceSink`]. The sink
+//! maps the frame onto one `OTel` span and exports it through the provider it
+//! was built over — here OTLP/HTTP against a loopback collector.
 //!
-//! 1. **The events** — [`TeamMemory`] carries an optional
-//!    [`TeamMemoryObserver`], so a [`TeamMemoryHooks`] lifecycle (member join,
-//!    buffered turns, session-end flush) reports itself as
-//!    [`TeamMemoryEvent`]s with the operation, team, member, kind, record count,
-//!    and outcome. The test-owned [`RecordingObserver`] is that seam's consumer:
-//!    it clones every event so the assertions can read them back.
-//! 2. **The spans** — the project has no memory→span bridge (no
-//!    `openjiuwen-extensions` adapter subscribes to `TeamMemoryEvent`, and the
-//!    session tracer has no memory invoke type), so this scenario *hand-builds*
-//!    one: each recorded event becomes a session [`Tracer`] span carrying the
-//!    event's fields as span metadata and payloads, emitted into an
-//!    [`OtelTraceSink`] over an OTLP/HTTP [`TracerHandle`].
-//! 3. **The wire** — a loopback `wiremock` collector stands in for the OTLP
-//!    backend, and every assertion is made on the decoded OTLP/JSON body
-//!    (`resourceSpans → scopeSpans → spans`), never on the SDK's in-process
-//!    state.
+//! ```text
+//! TeamMemoryHooks ──event──> OtlpMemoryObserver ──frame──> OtelTraceSink ──> OTLP/HTTP
+//! ```
 //!
-//! What the file pins:
+//! The scenario supplies only the *collector*: it wires the bridge through the
+//! crate's own injection points — [`TeamMemoryWiring::open_with_observer`] on the
+//! metadata path and `TeamMemory::with_observer` on the bare facade — and
+//! asserts the decoded OTLP/JSON body (`resourceSpans → scopeSpans → spans`),
+//! never the SDK's in-process state.
 //!
-//! - one flush of the hook pipeline reaches the collector as a single
+//! What the file pins, all of it taken from the bridge's own code:
+//!
+//! - one flush of the hook lifecycle reaches the collector as a single
 //!   `POST /v1/traces` with `content-type: application/json`, the configured
 //!   `authorization` header, the `service.name`/`service.version` resource
-//!   attributes, one instrumentation scope, and one span per memory event whose
-//!   name, `openjiuwen.*` identity attributes, and JSON payloads carry the
-//!   event's team id, member id, and record count;
+//!   attributes and one instrumentation scope;
+//! - one span per event, named `component.memory.{operation}.{16 hex}` with
+//!   `openjiuwen.workflow.component.type = "MemoryOperation"`, the
+//!   `openjiuwen.workflow.component.{id,name}` identity, the derived 32-hex
+//!   `openjiuwen.trace.id` shared by the team's spans, `openjiuwen.status =
+//!   "finish"`, and the `openjiuwen.meta_data` blob carrying the event's team,
+//!   member, kind, count and outcome;
 //! - a collector that answers `500` is a *failed export*, not a panic and not a
-//!   retry loop: the batch is dropped, the pipeline stays usable, and the whole
-//!   run stays bounded;
-//! - two flushes produce two batches that keep the projection order, carry the
-//!   same session trace identity, and never invert their start timestamps.
+//!   retry loop: one POST per batch, the pipeline stays usable, the shutdown
+//!   stays bounded;
+//! - two flushes produce two batches in emission order that keep the derived
+//!   team trace identity, and `OtlpEncoding` fixes both the URL path and the
+//!   content type;
+//! - an untraced wiring (`trace: false`) exports nothing even though a bridge is
+//!   injected: the bridge is opt-in.
+//!
+//! Each exported memory span is its own `OTel` trace: the bridge's team trace is
+//! plain data, not an `OTel` span, so there is no parent span context to attach
+//! to and the derived trace id travels as `openjiuwen.trace.id` instead (see the
+//! bridge's own module docs). The observer over an OTLP handle also carries no
+//! session id, and the sink was built without a fallback, so no
+//! `openjiuwen.session_id` attribute is exported — that absence is pinned below.
 //!
 //! Everything is offline and deterministic: the only endpoint is `127.0.0.1`,
-//! the rule extractor is the deterministic Default extractor, turns are built
-//! through serde so no time-type crate is named, and every network await is
-//! bounded by [`support::within`].
+//! the extractor is the deterministic rule extractor, turns are built through
+//! serde so no time-type crate is named, and every network await is bounded.
 //!
-//! [`TeamMemory`]: openjiuwen::core::memory::team::store::TeamMemory
 //! [`TeamMemoryObserver`]: openjiuwen::core::memory::team::observe::TeamMemoryObserver
-//! [`TeamMemoryHooks`]: openjiuwen::core::memory::team::hooks::TeamMemoryHooks
-//! [`TeamMemoryEvent`]: openjiuwen::core::memory::team::observe::TeamMemoryEvent
+//! [`TeamMemoryWiring::open_with_observer`]: openjiuwen::agent_teams::TeamMemoryWiring::open_with_observer
 mod support;
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
+use openjiuwen::agent_teams::{MemoryConfig, OtlpMemoryObserver, TeamMemoryWiring};
 use openjiuwen::core::memory::record::CallOptions;
 use openjiuwen::core::memory::team::extractor::TeamTurn;
-use openjiuwen::core::memory::team::hooks::{TeamMemoryHookConfig, TeamMemoryHooks};
-use openjiuwen::core::memory::team::observe::{
-    TeamMemoryEvent, TeamMemoryObserver, TeamMemoryOperation, TeamMemoryOutcome,
-};
+use openjiuwen::core::memory::team::observe::TeamMemoryObserver;
 use openjiuwen::core::memory::team::store::TeamMemory;
-use openjiuwen::core::session::tracer::{InvokeType, TraceSink, Tracer};
+use openjiuwen::core::memory::team::{NewTeamMemory, TeamMemoryScope, TeamSearchOptions};
 use openjiuwen::extensions::otel::{
     init_otel_tracer, ExporterType, OtelTraceSink, OtelTracerConfig, OtlpEncoding,
     OtlpHttpExporter, OtlpProtocol, TracerHandle,
@@ -79,14 +84,11 @@ use serde_json::{json, Value};
 
 use support::{within, BOUND};
 
-/// The team the hook pipeline runs for.
+/// The team the hook lifecycle runs for.
 const TEAM: &str = "review-team";
 
 /// The coordination session bound by `on_session_start`.
 const SESSION: &str = "e2e-team-session";
-
-/// The trace id the projected spans share.
-const TRACE: &str = "e2e-team-trace";
 
 /// The `service.name` the exporter reports as a resource attribute.
 const SERVICE_NAME: &str = "openjiuwen-e2e-team-memory";
@@ -103,17 +105,23 @@ const DECISION: &str = "We decided to use SQLite for the shared store";
 /// The handoff record the rule extractor derives from the second turn.
 const LESSON: &str = "Next time we should run the migration first";
 
-/// The `openjiuwen.agent.name` attribute of the join/leave spans.
-const NAME: &str = "openjiuwen.agent.name";
+/// The `openjiuwen.workflow.component.type` the bridge stamps on every span.
+const COMPONENT_TYPE: &str = "openjiuwen.workflow.component.type";
 
-/// The `openjiuwen.agent.invoke_type` attribute.
-const INVOKE_TYPE: &str = "openjiuwen.agent.invoke_type";
+/// The `openjiuwen.workflow.component.name` attribute.
+const COMPONENT_NAME: &str = "openjiuwen.workflow.component.name";
 
-/// The `openjiuwen.agent.inputs` attribute (a JSON string).
-const INPUTS: &str = "openjiuwen.agent.inputs";
+/// The `openjiuwen.workflow.component.id` attribute.
+const COMPONENT_ID: &str = "openjiuwen.workflow.component.id";
 
-/// The `openjiuwen.agent.outputs` attribute (a JSON string).
-const OUTPUTS: &str = "openjiuwen.agent.outputs";
+/// The component type that keeps the sink on its generic component branch.
+const MEMORY_COMPONENT_TYPE: &str = "MemoryOperation";
+
+/// The `openjiuwen.invoke_id` attribute.
+const INVOKE_ID: &str = "openjiuwen.invoke_id";
+
+/// The `openjiuwen.parent_invoke_id` attribute.
+const PARENT_INVOKE_ID: &str = "openjiuwen.parent_invoke_id";
 
 /// The `openjiuwen.meta_data` attribute (a JSON string).
 const META_DATA: &str = "openjiuwen.meta_data";
@@ -127,37 +135,6 @@ const TRACE_ID: &str = "openjiuwen.trace.id";
 /// The `openjiuwen.status` attribute.
 const STATUS: &str = "openjiuwen.status";
 
-/// A `TeamMemoryObserver` that keeps every event it is handed.
-///
-/// This is the *only* recording seam the team-memory crate offers: the observer
-/// is synchronous and must not block, so it clones the event and does nothing
-/// else. A `std::sync::Mutex` is enough — nothing here awaits while holding it.
-#[derive(Debug, Default)]
-struct RecordingObserver {
-    /// The events seen so far, in emission order.
-    events: Mutex<Vec<TeamMemoryEvent>>,
-}
-
-impl RecordingObserver {
-    /// Removes and returns every event seen so far.
-    fn take(&self) -> Vec<TeamMemoryEvent> {
-        std::mem::take(&mut *lock(&self.events))
-    }
-}
-
-impl TeamMemoryObserver for RecordingObserver {
-    fn observe(&self, event: &TeamMemoryEvent) {
-        lock(&self.events).push(event.clone());
-    }
-}
-
-/// Locks a mutex, recovering the data when a previous holder panicked.
-///
-/// A poisoned lock must not turn an assertion helper into a second panic.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// A turn with the serde-default timestamp, so no time-type crate is named.
 fn turn(from_member: &str, content: &str) -> TeamTurn {
     serde_json::from_value(json!({
@@ -167,14 +144,36 @@ fn turn(from_member: &str, content: &str) -> TeamTurn {
     .expect("a team turn deserializes with its default timestamp")
 }
 
-/// Runs one deterministic team-memory lifecycle over the observed facade.
+/// Builds the shipped bridge over `handle`, plus the sink it forwards to.
+///
+/// This is exactly the wiring a host writes: the sink comes from the live OTLP
+/// handle, the bridge wraps it, and the facade or the wiring is handed the
+/// bridge as its observer.
+fn otlp_bridge(handle: &TracerHandle) -> (Arc<OtelTraceSink>, Arc<OtlpMemoryObserver>) {
+    let sink = OtelTraceSink::new(handle).expect("an active handle builds the OTLP sink");
+    assert!(sink.is_recording(), "an active OTLP handle records spans");
+    let observer = Arc::new(OtlpMemoryObserver::new(Arc::clone(&sink)));
+    assert_eq!(
+        observer.session_id(),
+        None,
+        "the bridge leaves the frame's session id empty for the sink's fallback",
+    );
+    (sink, observer)
+}
+
+/// An in-memory facade whose operations report to `observer`.
+fn observed_facade(observer: Arc<OtlpMemoryObserver>) -> Arc<TeamMemory> {
+    Arc::new(TeamMemory::in_memory().with_observer(observer))
+}
+
+/// Runs the deterministic hook lifecycle over a wired team.
 ///
 /// The sequence is the documented hook order: bind the session, join a member,
 /// buffer two turns, then flush at session end. The rule extractor is
 /// deterministic, so the flush stores exactly one decision record (from the
 /// first turn) and one handoff record (from the second).
-async fn run_team_session(memory: Arc<TeamMemory>) {
-    let hooks = TeamMemoryHooks::with_rule_extractor(TEAM, memory, TeamMemoryHookConfig::default());
+async fn run_hook_lifecycle(wiring: &TeamMemoryWiring) {
+    let hooks = wiring.hooks();
     let call = CallOptions::new();
 
     hooks
@@ -214,7 +213,7 @@ async fn run_team_session(memory: Arc<TeamMemory>) {
 ///
 /// Every knob the exporter resolves is set explicitly, so an ambient
 /// `OPENJIUWEN_OTEL_*`/`OTEL_*` variable cannot change what the scenario
-/// asserts.
+/// asserts. Redaction is off so the bridge's attribute values stay readable.
 fn otlp_config(server: &MockServer) -> OtelTracerConfig {
     OtelTracerConfig {
         exporter_type: ExporterType::Otlp,
@@ -229,46 +228,18 @@ fn otlp_config(server: &MockServer) -> OtelTracerConfig {
     }
 }
 
-/// Builds a session tracer whose sink is the OTLP-backed `OtelTraceSink`.
-fn span_tracer(handle: &TracerHandle) -> Tracer {
-    let sink: Arc<dyn TraceSink> =
-        OtelTraceSink::new(handle).expect("an active handle builds a trace sink");
-    Tracer::with_sink(SESSION, TRACE, sink)
-}
-
-/// Projects recorded team-memory events onto spans through the session sink.
-///
-/// This is the bridge the crate does not ship. The session tracer has no memory
-/// invoke type, so each event is emitted as a `Chain` span named
-/// `team_memory.{operation}` (the sink prefixes it, giving
-/// `chain.team_memory.{operation}`); the event's team, member, kind, count, and
-/// outcome travel as span metadata, the event as the span inputs, and the
-/// outcome plus count as the span outputs.
-fn project(tracer: &Tracer, events: &[TeamMemoryEvent]) {
-    for event in events {
-        let operation = event.operation.as_str();
-        let span = tracer.start_span(format!("team_memory.{operation}"), InvokeType::Chain);
-        span.set_metadata("team_id", json!(event.team_id.as_str()));
-        span.set_metadata("operation", json!(operation));
-        span.set_metadata("outcome", json!(event.outcome.as_str()));
-        span.set_metadata("count", json!(event.count));
-        if let Some(member_id) = &event.member_id {
-            span.set_metadata("member_id", json!(member_id.as_str()));
-        }
-        if let Some(kind) = &event.kind {
-            span.set_metadata("kind", json!(kind.as_str()));
-        }
-        span.set_inputs(json!({
-            "team_id": event.team_id.as_str(),
-            "operation": operation,
-            "member_id": event.member_id.as_deref(),
-            "count": event.count,
-        }));
-        span.finish(json!({
-            "count": event.count,
-            "outcome": event.outcome.as_str(),
-        }));
-    }
+/// A collector that accepts exactly `batches` well-formed exports.
+async fn accepting_collector(batches: u64) -> MockServer {
+    let server = MockServer::builder().start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/traces"))
+        .and(header("content-type", "application/json"))
+        .and(header("authorization", AUTHORIZATION))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(batches)
+        .mount(&server)
+        .await;
+    server
 }
 
 /// The spans of the single `scopeSpans` entry of one exported batch.
@@ -278,7 +249,7 @@ fn spans_of(body: &Value) -> &Vec<Value> {
         .unwrap_or_else(|| panic!("the batch carries no spans: {body}"))
 }
 
-/// The `stringValue` of one attribute of a bare attribute array.
+/// The `value` of one entry of a bare OTLP attribute array.
 fn attribute_in<'a>(attributes: &'a Value, key: &str) -> Option<&'a Value> {
     attributes
         .as_array()?
@@ -300,40 +271,18 @@ fn must_text(span: &Value, key: &str) -> String {
     text_attribute(span, key).unwrap_or_else(|| panic!("span attribute {key} is missing: {span}"))
 }
 
-/// One span attribute decoded as JSON (the sink serializes payloads as strings).
-fn json_attribute(span: &Value, key: &str) -> Value {
-    let text = must_text(span, key);
-    serde_json::from_str(&text)
-        .unwrap_or_else(|error| panic!("attribute {key} is not JSON ({error}): {text}"))
-}
-
-/// One span attribute decoded as JSON, or `Null` when the span has no such key.
-fn optional_json_attribute(span: &Value, key: &str) -> Value {
-    text_attribute(span, key).map_or(Value::Null, |text| {
-        serde_json::from_str(&text)
-            .unwrap_or_else(|error| panic!("attribute {key} is not JSON ({error}): {text}"))
-    })
-}
-
 /// The `openjiuwen.meta_data` of one span, decoded.
 fn metadata_of(span: &Value) -> Value {
-    optional_json_attribute(span, META_DATA)
+    text_attribute(span, META_DATA).map_or(Value::Null, |text| {
+        serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("openjiuwen.meta_data is not JSON ({error}): {text}"))
+    })
 }
 
 /// The single span matching `predicate`, described by `what` on failure.
 fn span_where<'a>(spans: &'a [Value], what: &str, predicate: impl Fn(&Value) -> bool) -> &'a Value {
     let found: Vec<&Value> = spans.iter().filter(|span| predicate(span)).collect();
     assert_eq!(found.len(), 1, "expected one {what}: {spans:?}");
-    found[0]
-}
-
-/// One span by name; the caller must know the name is unique in the batch.
-fn single_span<'a>(spans: &'a [Value], name: &str) -> &'a Value {
-    let found: Vec<&Value> = spans
-        .iter()
-        .filter(|span| span["name"] == json!(name))
-        .collect();
-    assert_eq!(found.len(), 1, "expected one span named {name}: {spans:?}");
     found[0]
 }
 
@@ -344,6 +293,16 @@ fn nanos(value: &Value) -> u128 {
         .unwrap_or_else(|| panic!("{value} is not a decimal timestamp string"));
     text.parse()
         .unwrap_or_else(|error| panic!("{text} is not a decimal timestamp: {error}"))
+}
+
+/// Asserts that `text` is a lowercase 32-hex-character `OTel` identifier.
+fn assert_trace_id_shape(text: &str) {
+    assert_eq!(text.len(), 32, "a trace id is 32 hex characters: {text}");
+    assert!(
+        text.chars()
+            .all(|char| char.is_ascii_digit() || ('a'..='f').contains(&char)),
+        "a trace id is lowercase hex: {text}",
+    );
 }
 
 /// The resource attribute `key` as text.
@@ -371,56 +330,90 @@ fn assert_resource_and_scope(body: &Value) {
     assert_eq!(scopes[0]["scope"]["name"], json!("openjiuwen.tracer.otel"));
 }
 
+/// Asserts the bridge-stamped identity of one exported memory span.
+///
+/// Every value comes from the bridge (`openjiuwen-agent-teams`'
+/// `observability::otlp`) or from the sink's generic component branch — nothing
+/// here is invented by the scenario. Returns the span's derived team trace id.
+fn assert_memory_span(span: &Value, operation: &str) -> String {
+    let invoke_id = must_text(span, INVOKE_ID);
+    let expected_prefix = format!("memory.{operation}.");
+    assert!(
+        invoke_id.starts_with(&expected_prefix),
+        "the invoke id is `memory.{{operation}}.{{16 hex}}`: {invoke_id}",
+    );
+    assert_eq!(must_text(span, COMPONENT_ID), invoke_id, "the bridge's id");
+    assert_eq!(must_text(span, COMPONENT_TYPE), MEMORY_COMPONENT_TYPE);
+    assert_eq!(
+        must_text(span, COMPONENT_NAME),
+        format!("memory.{operation}"),
+        "the frame name travels as the component name",
+    );
+    assert_eq!(
+        span["name"],
+        json!(format!("component.{invoke_id}")),
+        "the sink names a generic component span `component.{{invoke_id}}`",
+    );
+    assert_eq!(span["kind"], json!("SPAN_KIND_INTERNAL"));
+    assert_eq!(must_text(span, STATUS), "finish", "an ok event finishes");
+
+    // The bridge has no parent span: the frame is a trace root and the derived
+    // team trace id travels as `openjiuwen.trace.id`.
+    assert!(
+        text_attribute(span, PARENT_INVOKE_ID).is_none(),
+        "a memory span is a trace root: {span}",
+    );
+    let trace_id = must_text(span, TRACE_ID);
+    assert_trace_id_shape(&trace_id);
+
+    // Neither the observer nor this sink carries a session id, so the sink never
+    // invents one (the documented no-fallback case).
+    assert!(
+        text_attribute(span, SESSION_ID).is_none(),
+        "no session id is fabricated: {span}",
+    );
+
+    let span_id = span["spanId"].as_str().expect("a span id");
+    assert_eq!(span_id.len(), 16, "a span id is 16 hex characters");
+    assert!(
+        nanos(&span["startTimeUnixNano"]) <= nanos(&span["endTimeUnixNano"]),
+        "the span must not end before it starts: {span}",
+    );
+    trace_id
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn team_memory_hook_events_reach_the_collector_as_otlp_spans() {
+async fn the_otlp_bridge_forwards_the_hook_lifecycle_to_the_collector() {
     // Two workers on purpose: `TracerHandle::force_flush` blocks the thread that
     // calls it while the batch is posted, and the loopback collector still has
     // to be driven by the same runtime.
-    let server = MockServer::builder().start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/traces"))
-        .and(header("content-type", "application/json"))
-        .and(header("authorization", AUTHORIZATION))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server)
-        .await;
-
+    let server = accepting_collector(1).await;
     let handle = init_otel_tracer(otlp_config(&server)).expect("OTLP/HTTP initializes offline");
     assert!(handle.is_active(), "an OTLP/HTTP handle is active");
     assert!(
         handle.capture().is_none(),
         "the OTLP exporter exposes no capture API",
     );
-    let tracer = span_tracer(&handle);
 
-    // The observed hook lifecycle: join → two buffered turns → session-end flush.
-    let observer = Arc::new(RecordingObserver::default());
-    let memory = Arc::new(TeamMemory::in_memory().with_observer(observer.clone()));
-    run_team_session(Arc::clone(&memory)).await;
-    let events = observer.take();
-    assert_eq!(
-        events.len(),
-        3,
-        "join, flush write, and extract: {events:?}"
+    // The shipped bridge, attached through the crate's own injection point.
+    let (_sink, observer) = otlp_bridge(&handle);
+    let dir = tempfile::tempdir().expect("a temp workspace for the team document");
+    let wiring = TeamMemoryWiring::open_with_observer(
+        TEAM,
+        MemoryConfig::default(),
+        dir.path(),
+        Arc::clone(&observer) as Arc<dyn TeamMemoryObserver>,
+    )
+    .await
+    .expect("the traced wiring opens");
+    assert!(wiring.trace_enabled(), "the default configuration traces");
+    assert!(
+        wiring.observer().is_some(),
+        "the injected bridge replaced the built-in in-memory one",
     );
-    assert_eq!(events[0].operation, TeamMemoryOperation::Write);
-    assert_eq!(events[0].member_id.as_deref(), Some("alice"));
-    assert_eq!(events[0].count, 1);
-    assert_eq!(events[1].operation, TeamMemoryOperation::Write);
-    assert_eq!(
-        events[1].count, 2,
-        "the flush writes both records in one batch"
-    );
-    assert_eq!(events[2].operation, TeamMemoryOperation::Extract);
-    assert_eq!(events[2].count, 2);
-    for event in &events {
-        assert_eq!(event.team_id, TEAM);
-        assert_eq!(event.outcome, TeamMemoryOutcome::Ok);
-        assert!(event.error.is_none(), "no failure is reported: {event:?}");
-    }
 
-    project(&tracer, &events);
+    // Join → two buffered turns → session-end flush.
+    run_hook_lifecycle(&wiring).await;
     handle.force_flush();
 
     let requests = within(
@@ -454,55 +447,25 @@ async fn team_memory_hook_events_reach_the_collector_as_otlp_spans() {
 
     let body: Value = serde_json::from_slice(&request.body).expect("the body is OTLP/JSON");
     assert_resource_and_scope(&body);
-    let spans = spans_of(&body);
-    assert_eq!(spans.len(), 3, "one span per memory event");
 
+    let spans = spans_of(&body);
+    assert_eq!(spans.len(), 3, "one span per team-memory event: {spans:?}");
     let names: Vec<&str> = spans
         .iter()
         .filter_map(|span| span["name"].as_str())
         .collect();
-    assert_eq!(
-        names,
-        [
-            "chain.team_memory.write",
-            "chain.team_memory.write",
-            "chain.team_memory.extract",
-        ],
-        "the projection order is the event order",
+    let write = |index: usize| names[index].starts_with("component.memory.write.");
+    let is_extract = |index: usize| names[index].starts_with("component.memory.extract.");
+    assert!(
+        write(0) && write(1) && is_extract(2),
+        "the spans keep the event order (join write, flush write, extract): {names:?}",
     );
 
-    // The sink opens each frame's span without an ambient parent (the documented
-    // deviation from Python's context attach/detach), so every projected span is
-    // its own OTel trace. What the seam does keep is the session identity: the
-    // tracer's session and trace ids travel as `openjiuwen.*` attributes.
-    let trace_id = spans[0]["traceId"].as_str().expect("a trace id").to_owned();
-    assert_eq!(trace_id.len(), 32, "the trace id is hex-encoded");
-    let mut span_ids = Vec::new();
-    for span in spans {
-        assert_eq!(span["kind"], json!("SPAN_KIND_INTERNAL"));
-        assert_eq!(must_text(span, SESSION_ID), SESSION);
-        assert_eq!(must_text(span, TRACE_ID), TRACE);
-        assert_eq!(must_text(span, STATUS), "finish");
-        assert_eq!(must_text(span, INVOKE_TYPE), "chain");
-        assert!(
-            nanos(&span["startTimeUnixNano"]) <= nanos(&span["endTimeUnixNano"]),
-            "the span must not end before it starts: {span}",
-        );
-        let span_id = span["spanId"].as_str().expect("a span id").to_owned();
-        assert_eq!(span_id.len(), 16, "the span id is hex-encoded");
-        assert!(
-            !span_ids.contains(&span_id),
-            "each span id is unique: {span}"
-        );
-        span_ids.push(span_id);
-    }
-
-    // The member-join event: the only write that names a member.
+    // The join: the only write that names a member and a kind.
     let join = span_where(spans, "member-join write", |span| {
         metadata_of(span).get("member_id") == Some(&json!("alice"))
     });
-    assert_eq!(join["name"], json!("chain.team_memory.write"));
-    assert_eq!(must_text(join, NAME), "team_memory.write");
+    let trace_id = assert_memory_span(join, "write");
     let meta = metadata_of(join);
     assert_eq!(meta["team_id"], json!(TEAM));
     assert_eq!(meta["operation"], json!("write"));
@@ -514,32 +477,50 @@ async fn team_memory_hook_events_reach_the_collector_as_otlp_spans() {
         json!("member_profile"),
         "the join writes a member profile record",
     );
-    let inputs = json_attribute(join, INPUTS);
-    assert_eq!(inputs["team_id"], json!(TEAM));
-    assert_eq!(inputs["count"], json!(1));
-    let outputs = json_attribute(join, OUTPUTS);
-    assert_eq!(outputs["count"], json!(1));
-    assert_eq!(outputs["outcome"], json!("ok"));
 
-    // The flush's batch write: team-scoped, two records, no member.
+    // The flush's batch write: team-scoped, two records, no single kind.
     let batch = span_where(spans, "team-scoped flush write", |span| {
         let meta = metadata_of(span);
         meta["operation"] == json!("write") && meta.get("member_id").is_none()
     });
+    assert_eq!(assert_memory_span(batch, "write"), trace_id);
     let meta = metadata_of(batch);
     assert_eq!(meta["count"], json!(2));
     assert_eq!(meta["team_id"], json!(TEAM));
+    assert_eq!(meta["outcome"], json!("ok"));
     assert!(
         meta.get("kind").is_none(),
         "a multi-record write has no single kind: {meta}",
     );
 
     // The extraction that produced the batch.
-    let extract = single_span(spans, "chain.team_memory.extract");
+    let extract = spans
+        .iter()
+        .find(|span| {
+            span["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("component.memory.extract."))
+        })
+        .expect("the extract span");
+    assert_eq!(assert_memory_span(extract, "extract"), trace_id);
     let meta = metadata_of(extract);
     assert_eq!(meta["operation"], json!("extract"));
     assert_eq!(meta["count"], json!(2));
-    assert_eq!(json_attribute(extract, OUTPUTS)["count"], json!(2));
+    assert_eq!(meta["team_id"], json!(TEAM));
+
+    // Every span shares the derived team trace id, while each is its own OTel
+    // trace: the bridge has no parent span context to attach to.
+    let mut otel_traces = Vec::new();
+    for span in spans {
+        assert_eq!(must_text(span, TRACE_ID), trace_id);
+        let otel_trace = span["traceId"].as_str().expect("an OTel trace id");
+        assert_trace_id_shape(otel_trace);
+        assert!(
+            !otel_traces.contains(&otel_trace.to_owned()),
+            "each parentless frame starts its own OTel trace: {span}",
+        );
+        otel_traces.push(otel_trace.to_owned());
+    }
 
     handle.shutdown();
     assert!(!handle.is_active(), "shutdown deactivates the handle");
@@ -553,8 +534,8 @@ async fn a_rejected_batch_is_a_failed_export_that_never_retries() {
     // `OTelSdkError::InternalFailure`; a crate that cannot name
     // `opentelemetry_sdk` types cannot call it. What the public seam *does*
     // guarantee is the outward contract asserted here: a rejected batch is
-    // dropped (the handle logs at `warn` and returns `()`), it is posted exactly
-    // once, and the exporter keeps accepting later batches.
+    // dropped, it is posted exactly once, and the exporter keeps accepting later
+    // batches.
     let server = MockServer::builder().start().await;
     Mock::given(method("POST"))
         .and(path("/v1/traces"))
@@ -564,23 +545,30 @@ async fn a_rejected_batch_is_a_failed_export_that_never_retries() {
         .await;
 
     let handle = init_otel_tracer(otlp_config(&server)).expect("OTLP/HTTP initializes offline");
-    let tracer = span_tracer(&handle);
+    let (_sink, observer) = otlp_bridge(&handle);
+    let memory = observed_facade(observer);
+    let call = CallOptions::new();
 
-    let observer = Arc::new(RecordingObserver::default());
-    let memory = Arc::new(TeamMemory::in_memory().with_observer(observer.clone()));
-    run_team_session(Arc::clone(&memory)).await;
-    let events = observer.take();
-    assert_eq!(
-        events.len(),
-        3,
-        "join, flush write, and extract: {events:?}"
-    );
-
-    // First batch: rejected by the collector, dropped by the exporter.
-    project(&tracer, &events[..1]);
+    // First batch: one bridge span, rejected by the collector and dropped by the
+    // exporter.
+    memory
+        .remember(
+            NewTeamMemory::decision(TEAM, DECISION).with_member("alice"),
+            &call,
+        )
+        .await
+        .expect("the decision record is remembered");
     handle.force_flush();
+
     // Second batch: the pipeline is still alive after the rejection.
-    project(&tracer, &events[2..3]);
+    let hits = memory
+        .search(
+            &TeamMemoryScope::member(TEAM, "alice"),
+            "SQLite",
+            &TeamSearchOptions::default(),
+        )
+        .await
+        .expect("the search reads the stored record");
     handle.force_flush();
     handle.shutdown_with_timeout(BOUND);
 
@@ -595,7 +583,9 @@ async fn a_rejected_batch_is_a_failed_export_that_never_retries() {
         2,
         "one POST per flush: a rejection is never retried",
     );
-    let mut names = Vec::new();
+
+    let mut operations = Vec::new();
+    let mut counts = Vec::new();
     for request in &requests {
         assert_eq!(request.url.path(), "/v1/traces");
         assert_eq!(
@@ -611,13 +601,26 @@ async fn a_rejected_batch_is_a_failed_export_that_never_retries() {
         let body: Value = serde_json::from_slice(&request.body).expect("the body is OTLP/JSON");
         assert_resource_and_scope(&body);
         let spans = spans_of(&body);
-        assert_eq!(spans.len(), 1, "one span per batch");
-        names.push(spans[0]["name"].as_str().expect("a span name").to_owned());
+        assert_eq!(spans.len(), 1, "one span per batch: {spans:?}");
+        let name = spans[0]["name"].as_str().expect("a span name");
+        operations.push(if name.starts_with("component.memory.write.") {
+            "write"
+        } else if name.starts_with("component.memory.search.") {
+            "search"
+        } else {
+            panic!("unexpected memory span name: {name}");
+        });
+        counts.push(metadata_of(&spans[0])["count"].clone());
     }
     assert_eq!(
-        names,
-        ["chain.team_memory.write", "chain.team_memory.extract"],
-        "both batches were exported, in projection order",
+        operations,
+        ["write", "search"],
+        "both batches were exported, in emission order",
+    );
+    assert_eq!(
+        counts,
+        [json!(1), json!(hits.len())],
+        "the spans report the records the facade wrote and the hits it returned",
     );
     assert!(
         !handle.is_active(),
@@ -626,27 +629,31 @@ async fn a_rejected_batch_is_a_failed_export_that_never_retries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_flushes_export_two_ordered_batches_with_the_same_session_trace() {
-    let server = MockServer::builder().start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/traces"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(2)
-        .mount(&server)
-        .await;
-
+async fn two_flushes_export_two_ordered_batches_with_the_same_team_trace() {
+    let server = accepting_collector(2).await;
     let handle = init_otel_tracer(otlp_config(&server)).expect("OTLP/HTTP initializes offline");
-    let tracer = span_tracer(&handle);
+    let (_sink, observer) = otlp_bridge(&handle);
+    let memory = observed_facade(observer);
+    let call = CallOptions::new();
 
-    let observer = Arc::new(RecordingObserver::default());
-    let memory = Arc::new(TeamMemory::in_memory().with_observer(observer.clone()));
-    run_team_session(Arc::clone(&memory)).await;
-    let events = observer.take();
-
-    // One flush per event, so the batch processor drains a single span each time.
-    project(&tracer, &events[1..2]);
+    // One flush per operation, so the batch processor drains a single span each
+    // time and the two batches keep the emission order.
+    memory
+        .remember(
+            NewTeamMemory::decision(TEAM, DECISION).with_member("alice"),
+            &call,
+        )
+        .await
+        .expect("the decision record is remembered");
     handle.force_flush();
-    project(&tracer, &events[2..3]);
+    memory
+        .search(
+            &TeamMemoryScope::member(TEAM, "alice"),
+            "migration",
+            &TeamSearchOptions::default(),
+        )
+        .await
+        .expect("the search runs");
     handle.force_flush();
 
     let requests = within(
@@ -672,17 +679,19 @@ async fn two_flushes_export_two_ordered_batches_with_the_same_session_trace() {
 
     let earlier = &spans_of(&first)[0];
     let later = &spans_of(&second)[0];
-    assert_eq!(earlier["name"], json!("chain.team_memory.write"));
-    assert_eq!(later["name"], json!("chain.team_memory.extract"));
+    let team_trace = assert_memory_span(earlier, "write");
     assert_eq!(
-        must_text(earlier, TRACE_ID),
-        TRACE,
-        "both batches keep the tracer's session trace identity",
+        assert_memory_span(later, "search"),
+        team_trace,
+        "both batches keep the bridge's derived team trace identity",
     );
-    assert_eq!(must_text(later, TRACE_ID), TRACE);
+    assert_eq!(
+        metadata_of(earlier)["team_id"],
+        metadata_of(later)["team_id"],
+    );
     assert!(
         nanos(&later["startTimeUnixNano"]) >= nanos(&earlier["startTimeUnixNano"]),
-        "the projection order is preserved across batches: {earlier} then {later}",
+        "the emission order is preserved across batches: {earlier} then {later}",
     );
 
     // The encoding contract the exporter guarantees: the choice fixes both the
@@ -708,6 +717,60 @@ async fn two_flushes_export_two_ordered_batches_with_the_same_session_trace() {
     )
     .expect("the protobuf exporter builds without I/O");
     assert_eq!(protobuf.content_type(), "application/x-protobuf");
+
+    handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_untraced_wiring_never_reaches_the_collector() {
+    // A collector that would fail the test if anything arrived: zero requests is
+    // the assertion, so nothing is expected and nothing must be recorded.
+    let server = MockServer::builder().start().await;
+    let handle = init_otel_tracer(otlp_config(&server)).expect("OTLP/HTTP initializes offline");
+    let (_sink, observer) = otlp_bridge(&handle);
+
+    // `trace: false` is the last word: the bridge is supplied but never attached.
+    let dir = tempfile::tempdir().expect("a temp workspace for the team document");
+    let config = MemoryConfig {
+        trace: false,
+        ..MemoryConfig::default()
+    };
+    let wiring = TeamMemoryWiring::open_with_observer(TEAM, config, dir.path(), observer)
+        .await
+        .expect("the untraced wiring opens");
+    assert!(!wiring.trace_enabled(), "tracing is switched off");
+    assert!(
+        wiring.observer().is_none(),
+        "an untraced wiring attaches no observer, not even the supplied bridge",
+    );
+
+    // The operations themselves still run (and still store records); only the
+    // observation is gone.
+    run_hook_lifecycle(&wiring).await;
+    let hits = wiring
+        .memory()
+        .search(
+            &TeamMemoryScope::member(TEAM, "alice"),
+            "SQLite",
+            &TeamSearchOptions::default(),
+        )
+        .await
+        .expect("the untraced facade still serves a search");
+    assert_eq!(
+        hits.len(),
+        1,
+        "the flush stored the decision record: {hits:?}"
+    );
+
+    handle.force_flush();
+    let requests = within("the collector stays silent", server.received_requests())
+        .await
+        .expect("the mock records requests");
+    assert!(
+        requests.is_empty(),
+        "an observer-less run exports nothing: {} request(s)",
+        requests.len(),
+    );
 
     handle.shutdown();
 }

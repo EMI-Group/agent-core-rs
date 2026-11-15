@@ -25,7 +25,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 
 ## Scenario Matrix
 
-112 test functions across 24 scenario binaries: 111 pass with `--features sqlite,a2a,otel` (102 with default features), and exactly 1 documented `#[ignore]`.
+113 test functions across 24 scenario binaries: 112 pass with `--features sqlite,a2a,otel` (102 with default features), and exactly 1 documented `#[ignore]`.
 
 | Binary | Scenario | Crates / seams exercised |
 |---|---|---|
@@ -177,7 +177,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 - `./tests/evaluation_ledger.rs` → evaluator pipeline with a fake command runner, RSI ledger, progress events, event stream
 - `./tests/runner_subprocess.rs` → runner subprocess spawn seam: self-executing NDJSON child, request/reply, health, graceful shutdown, typed transport/validation errors
 - `./tests/agent_usage_events.rs` → `context.usage` / `llm_usage` frames, provider-usage normalization, session cache aggregation
-- `./tests/plugin_observability.rs` → team-memory events projected to OTLP/HTTP spans against a loopback collector (feature `otel`)
+- `./tests/plugin_observability.rs` → the shipped team-memory → OTel bridge (`OtlpMemoryObserver`) exporting to a loopback collector, failure handling, batch ordering and the `trace: false` opt-in (feature `otel`)
 - `./tests/cli_binary.rs` → harness CLI layer (one-shot output formats, pre-run validation, process boundary)
 - `./tests/support/mod.rs` → cross-scenario deadline and stream helpers (`BOUND`, `within`, `collect_bounded`)
 - `./Cargo.toml` → manifest, test-only dependency set, `a2a`/`otel`/`sqlite` features
@@ -188,7 +188,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 - Assert on recorded evidence, not timing: `ScriptedModel::calls()`/`call_count()`/`remaining()`, harness event sequences, collected frames, task board and mailbox state, store and file contents, `MockLlmServer::request_count`, `FakeCommandRunner::invocations()`, ledger `totals()`/`events()`, the fake servers' recorded commands and requests, exported OTLP payloads.
 - Fake only what a scenario cannot own: harness protocols, member factories, symphony capability runners, RSI harness runners, evolving targets, Docker (`FakeCommandRunner`), the subprocess child (the test binary itself), the Redis server, the object-storage APIs, the OTLP collector, and the dream consolidator (a per-scenario salience consolidator). Each fake is copied into the scenario that needs it, keeping every binary's contract explicit.
 - Fixtures that the library keeps private are rebuilt from public primitives inside the scenario (`build_zip` for the DOCX/XLSX fixtures uses `parsing::crc32`; the tokenizer fixture is a hand-written byte-level `tokenizer.json`), never by widening library visibility.
-- Gates: `cargo fmt -p openjiuwen-e2e -- --check`; `cargo test -p openjiuwen-e2e --offline`; `--features sqlite,a2a,otel`; `cargo clippy -p openjiuwen-e2e --all-targets [--all-features] --offline -- -D warnings`. Default features run 102 scenarios + 1 ignored, the feature set runs 111 + 1 ignored, and the whole suite finishes in seconds of test time (the subprocess, attach, federation and artifact scenarios included) and is stable across repeated runs.
+- Gates: `cargo fmt -p openjiuwen-e2e -- --check`; `cargo test -p openjiuwen-e2e --offline`; `--features sqlite,a2a,otel`; `cargo clippy -p openjiuwen-e2e --all-targets [--all-features] --offline -- -D warnings`. Default features run 102 scenarios + 1 ignored, the feature set runs 112 + 1 ignored, and the whole suite finishes in seconds of test time (the subprocess, attach, federation and artifact scenarios included) and is stable across repeated runs.
 
 ## Design Decisions
 
