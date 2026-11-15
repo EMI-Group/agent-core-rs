@@ -234,9 +234,9 @@ pub struct SkillIndexResult {
     pub next_cursor: Option<String>,
     /// The output budget the response was fitted into; `None` when truncation is off.
     pub effective_max_output_chars: Option<usize>,
-    /// The catalog layout; always [`LAYOUT_FLAT`].
+    /// The catalog layout; always `LAYOUT_FLAT`.
     pub skillfs_layout: String,
-    /// The index state; always [`INDEX_MISSING`].
+    /// The index state; always `INDEX_MISSING`.
     pub index_state: String,
     /// How many Skills the catalog holds.
     pub candidate_count: usize,
@@ -272,7 +272,7 @@ impl SkillIndexToolkit {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] naming `session_scope` when it is blank, naming
+    /// Returns [`Error::Validation`](crate::error::Error::Validation) naming `session_scope` when it is blank, naming
     /// `max_output_chars` when it is outside
     /// [`MIN_OUTPUT_CHARS`]`..=`[`MAX_OUTPUT_CHARS`], and naming
     /// `incremental_notice_max_chars` when it is zero.
@@ -349,7 +349,7 @@ impl SkillIndexToolkit {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] for an unknown argument key, a value of the wrong
+    /// Returns [`Error::Validation`](crate::error::Error::Validation) for an unknown argument key, a value of the wrong
     /// JSON type, an invalid request, or a cursor that cannot be resumed.
     pub fn invoke(&mut self, arguments: &Value) -> Result<SkillIndexResult> {
         let Value::Object(map) = arguments else {
@@ -435,7 +435,7 @@ unchanged.",
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] naming the first rejected field, or the operation's
+    /// Returns [`Error::Validation`](crate::error::Error::Validation) naming the first rejected field, or the operation's
     /// own error (an unknown category or Skill, an invalid pipeline).
     pub fn execute(&mut self, request: &SkillIndexRequest) -> Result<SkillIndexResult> {
         let validated = if is_simple(request) {

@@ -41,7 +41,7 @@
 //! - A chain deeper than [`MAX_CATEGORY_DEPTH`] is truncated (Python has no bound); this
 //!   keeps tree building and walking recursive over data the caller controls.
 //! - `casefold()` becomes `to_lowercase()`; see
-//!   [`matcher`](crate::discovery::directory_toolkit::matcher).
+//!   [`matcher`].
 //!
 //! ```
 //! # use openjiuwen_symphony::discovery::SkillFs;

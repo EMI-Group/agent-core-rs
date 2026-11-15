@@ -105,11 +105,11 @@ pub struct PipelineOutcome {
 /// The tree view ignores `recursive` and walks with
 /// [`SkillDirectoryView::tree_entries`]; every other view scopes with
 /// [`SkillDirectoryView::entries`]. Rows are rendered by
-/// [`list_row`](crate::discovery::directory_toolkit::render::list_row).
+/// [`list_row`].
 ///
 /// # Errors
 ///
-/// Returns [`Error::Validation`] for an unknown scope path.
+/// Returns [`Error::Validation`](crate::error::Error::Validation) for an unknown scope path.
 pub fn execute_list(
     view: &SkillDirectoryView,
     paths: &[String],
@@ -146,7 +146,7 @@ pub fn execute_list(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Validation`] for an unknown scope path or a query the matcher cannot
+/// Returns [`Error::Validation`](crate::error::Error::Validation) for an unknown scope path or a query the matcher cannot
 /// use, and propagates catalog search failures.
 #[allow(clippy::too_many_lines)]
 pub fn execute_search(
@@ -318,13 +318,13 @@ pub fn execute_search(
 /// Runs the `read` operation over resolved Skill ids.
 ///
 /// One row per Skill: `full` renders the whole
-/// [`metadata_card`](crate::discovery::directory_toolkit::render::metadata_card), `head`
+/// [`metadata_card`], `head`
 /// its first [`DEFAULT_READ_LINES`] lines (or `line_count`), and `range` the 1-based
 /// inclusive `start_line..=end_line` slice.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Validation`] `Unknown Skill: <id>` for an unknown id, or naming
+/// Returns [`Error::Validation`](crate::error::Error::Validation) `Unknown Skill: <id>` for an unknown id, or naming
 /// `end_line` when a `range` read asks for an inverted range.
 pub fn execute_read(
     view: &SkillDirectoryView,
@@ -384,7 +384,7 @@ pub fn execute_read(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Validation`] for a malformed stage: a missing or non-positive line
+/// Returns [`Error::Validation`](crate::error::Error::Validation) for a malformed stage: a missing or non-positive line
 /// count, a blank filter query, an inverted slice, or an unknown operation.
 pub fn apply_pipeline(
     rows: &[Row],
@@ -481,7 +481,7 @@ pub fn apply_pipeline(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Validation`] for an unknown scope path.
+/// Returns [`Error::Validation`](crate::error::Error::Validation) for an unknown scope path.
 pub fn search_categories(
     view: &SkillDirectoryView,
     paths: &[String],
@@ -537,7 +537,7 @@ pub fn search_categories(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Validation`] for an unusable query, and propagates a catalog search
+/// Returns [`Error::Validation`](crate::error::Error::Validation) for an unusable query, and propagates a catalog search
 /// failure.
 pub fn content_hits(
     catalog: &SkillFs,
@@ -680,7 +680,7 @@ pub fn matched_snippets(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Validation`] when both forms are supplied, when neither is, when a
+/// Returns [`Error::Validation`](crate::error::Error::Validation) when both forms are supplied, when neither is, when a
 /// path was never observed (`read accepts only Skills returned by an earlier skill_index
 /// result`), or when a listed value is malformed.
 pub fn resolve_read_skills(
@@ -952,7 +952,7 @@ impl TextMatcher {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] for a blank query or one longer than
+    /// Returns [`Error::Validation`](crate::error::Error::Validation) for a blank query or one longer than
     /// [`MAX_QUERY_CHARS`].
     fn new(query: &str, case_insensitive: bool, fixed_strings: bool) -> Result<Self> {
         let trimmed = query.trim();
@@ -1009,7 +1009,7 @@ fn matched_queries(queries: &[String], indexes: &[usize]) -> Vec<String> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Validation`] naming `pipeline.<field>` when the stage does not carry a
+/// Returns [`Error::Validation`](crate::error::Error::Validation) naming `pipeline.<field>` when the stage does not carry a
 /// positive value.
 fn positive(value: Option<i64>, field: &str) -> Result<usize> {
     match value.and_then(|value| usize::try_from(value).ok()) {
@@ -1069,10 +1069,12 @@ mod tests {
         assert_eq!(path[0].path, "/Data");
         let glob = entry_hits(&entries, &view, "*port", SearchMatch::Name, true);
         assert_eq!(glob.len(), 1);
-        assert!(entry_hits(&entries, &view, "missing", SearchMatch::Name, true).is_empty());
+        let none = entry_hits(&entries, &view, "missing", SearchMatch::Name, true);
+        assert!(none.is_empty(), "{none:?}");
         let sensitive = entry_hits(&entries, &view, "Export", SearchMatch::Name, false);
         assert_eq!(sensitive.len(), 1);
-        assert!(entry_hits(&entries, &view, "export", SearchMatch::Name, false).is_empty());
+        let strict = entry_hits(&entries, &view, "export", SearchMatch::Name, false);
+        assert!(strict.is_empty(), "{strict:?}");
     }
 
     #[test]
