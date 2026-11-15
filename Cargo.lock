@@ -2310,6 +2310,7 @@ dependencies = [
  "openjiuwen-graph",
  "openjiuwen-retrieval",
  "openjiuwen-session",
+ "rsa",
  "schemars",
  "serde",
  "serde_json",
