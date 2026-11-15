@@ -11,7 +11,8 @@
 //! `Reason`, and the scanned text never appear in `details`, logs, or errors;
 //! empty text is safe without a request. Requests use either a gateway `Bearer` token or the native
 //! `ACS3-HMAC-SHA256` signature over six headers, so the public endpoint
-//! accepts them without an SDK.
+//! accepts them without an SDK. A reply that does not carry the
+//! `TextModeration` envelope is a validation error rather than a safe verdict.
 //!
 //! The signature machinery lives in the private `signing` submodule and the
 //! suite exercising the adapter lives in `tests`.
@@ -72,6 +73,8 @@ const SERVICE: &str = "aliyun green";
 const ACTION: &str = "TextModeration";
 /// The label the vendor reports for benign content.
 const NON_LABEL: &str = "nonLabel";
+/// The envelope `Code` a successful moderation call reports.
+const SUCCESS_CODE: i64 = 200;
 /// Maximum vendor status-message characters quoted in an error.
 const ERROR_MESSAGE_CHARS: usize = 120;
 /// `Confidence` at or above this value reports [`RiskLevel::Critical`].
@@ -280,12 +283,15 @@ impl AliyunGreenBackend {
 
     /// Grades one `TextModeration` reply.
     ///
-    /// A non-`200` (or missing, or non-integer) `Code` is a transport failure.
-    /// The labels are the trimmed, de-duplicated union of the comma-separated
-    /// `Data.Labels` (first) and the `Data.Result[].Label` fields (`nonLabel`
-    /// dropped from both), because the RPC may omit `Labels` and report only
-    /// the per-label detail list. The reply is safe only when that union is
-    /// empty and no `Result` entry reports a positive `Confidence`; otherwise
+    /// A reply without the RPC envelope — no integer `Code`, or no `Data`
+    /// object carrying `Labels` or `Result` — is a validation failure rather
+    /// than a safe verdict, while an integer `Code` other than `200` is a
+    /// transport failure. The labels are the trimmed, de-duplicated union of
+    /// the comma-separated `Data.Labels` (first) and the `Data.Result[].Label`
+    /// fields (`nonLabel` dropped from both), because the RPC may omit
+    /// `Labels` and report only the per-label detail list. The reply is safe
+    /// only when that union is empty and no `Result` entry reports a positive
+    /// `Confidence`; otherwise
     /// the highest `Result[].Confidence` (`0..=100`) picks the severity (`>= 90`
     /// [`RiskLevel::Critical`], `>= 75` [`RiskLevel::High`], `>= 50`
     /// [`RiskLevel::Medium`], else [`RiskLevel::Low`]; labels without a usable
@@ -296,19 +302,29 @@ impl AliyunGreenBackend {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] when `Code` is absent, non-integer, or not
-    /// `200`.
+    /// Returns [`Error::Validation`] when the envelope is unrecognized and
+    /// [`Error::Transport`] when `Code` is an integer other than `200`; neither
+    /// message repeats any part of the payload.
     pub fn parse_response(&self, response: &Value) -> Result<RiskAssessment> {
-        if response.get("Code").and_then(Value::as_i64) != Some(200) {
-            return Err(code_error(response));
+        let Some(code) = response.get("Code").and_then(Value::as_i64) else {
+            return Err(unrecognized_reply());
+        };
+        if code != SUCCESS_CODE {
+            return Err(code_error(code, response));
         }
-        let data = response.get("Data");
+        let Some(data) = response
+            .get("Data")
+            .filter(|data| data.is_object())
+            .filter(|data| data.get("Labels").is_some() || data.get("Result").is_some())
+        else {
+            return Err(unrecognized_reply());
+        };
         let results = data
-            .and_then(|data| data.get("Result"))
+            .get("Result")
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let labels = response_labels(data, results);
+        let labels = response_labels(Some(data), results);
         let max_confidence = results
             .iter()
             .filter_map(|entry| entry.get("Confidence").and_then(Value::as_f64))
@@ -373,10 +389,11 @@ impl GuardrailBackend for AliyunGreenBackend {
     ///
     /// # Errors
     ///
-    /// [`Error::Validation`] when the endpoint carries no host,
-    /// [`Error::Transport`] for connection, status, business-code, and decoding
-    /// failures, and [`Error::Timeout`] when the deadline expires. Errors never
-    /// carry the scanned text.
+    /// [`Error::Validation`] when the endpoint carries no host or the reply
+    /// does not carry the `TextModeration` envelope, [`Error::Transport`] for
+    /// connection, status, business-code, and decoding failures, and
+    /// [`Error::Timeout`] when the deadline expires. Errors never carry the
+    /// scanned text.
     async fn analyze(&self, ctx: &GuardrailContext) -> Result<RiskAssessment> {
         let text = ctx.text_view();
         if text.trim().is_empty() {
@@ -533,15 +550,23 @@ fn round_confidence(confidence: f64) -> f64 {
     (confidence * CONFIDENCE_SCALE).round() / CONFIDENCE_SCALE
 }
 
+/// Builds the error reported when a `2xx` body does not carry the
+/// `TextModeration` envelope.
+///
+/// Naming the fields keeps the mismatch actionable without repeating any part
+/// of the payload, and the validation kind makes the pipeline block under the
+/// fail-closed default instead of treating the reply as a clean verdict.
+fn unrecognized_reply() -> Error {
+    Error::validation(
+        "aliyun green reply does not match the TextModeration envelope: expected an integer `Code` \
+         and a `Data` object carrying `Labels` or `Result`",
+    )
+}
+
 /// Builds the transport error for a non-`200` reply, quoting only the code and
 /// a truncated, whitespace-collapsed status message.
-fn code_error(response: &Value) -> Error {
-    let label = match response.get("Code") {
-        Some(Value::Number(number)) => number.to_string(),
-        Some(Value::Null) | None => "missing".to_owned(),
-        Some(_) => "invalid".to_owned(),
-    };
-    let mut message = format!("aliyun green returned code {label}");
+fn code_error(code: i64, response: &Value) -> Error {
+    let mut message = format!("aliyun green returned code {code}");
     if let Some(status) = response.get("Message").and_then(Value::as_str) {
         let collapsed = status.split_whitespace().collect::<Vec<_>>().join(" ");
         if !collapsed.is_empty() {
@@ -551,7 +576,7 @@ fn code_error(response: &Value) -> Error {
     }
     tracing::warn!(
         target: LOG_TARGET,
-        code = %label,
+        code,
         "aliyun green returned an error code"
     );
     Error::transport(message)

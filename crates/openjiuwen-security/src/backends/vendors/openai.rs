@@ -10,7 +10,9 @@
 //! and the severity band; the flagged category names, the reported model, and
 //! the request id travel in `details`. The scanned text, the credential, and
 //! every raw category payload stay out of `details`, logs, and errors.
-//! Empty text short-circuits to a safe assessment without any request.
+//! Empty text short-circuits to a safe assessment without any request, while a
+//! reply that does not carry the moderations schema is a validation error
+//! rather than a safe verdict.
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::BTreeSet;
@@ -208,8 +210,12 @@ impl OpenAiModerationBackend {
 
     /// Grades one `/v1/moderations` reply.
     ///
-    /// A response without a non-empty `results` array is a transport failure.
-    /// An unflagged result is a safe assessment. A flagged result reports
+    /// A result whose `flagged` is `false` is a safe assessment. A reply that
+    /// does not carry the moderations schema — no `results` array, an empty
+    /// one, a first entry that is not an object, or one without a boolean
+    /// `flagged` — is a validation failure rather than a safe verdict, so it
+    /// blocks under the fail-closed default instead of reading as clean. A
+    /// flagged result reports
     /// `has_risk = true`, the severity of its highest `category_scores` value
     /// (`>= 0.90` [`RiskLevel::Critical`], `>= 0.75` [`RiskLevel::High`],
     /// `>= 0.50` [`RiskLevel::Medium`], else [`RiskLevel::Low`]; flagged without
@@ -220,21 +226,22 @@ impl OpenAiModerationBackend {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] when `results` is missing or empty.
+    /// Returns [`Error::Validation`] naming the required fields when the reply
+    /// does not match the moderations schema; the message never repeats any
+    /// part of the payload.
     pub fn parse_response(&self, response: &Value) -> Result<RiskAssessment> {
-        let Some(result) = response
+        let result = response
             .get("results")
             .and_then(Value::as_array)
             .and_then(|results| results.first())
-        else {
-            return Err(Error::transport("openai moderation returned no results"));
-        };
+            .ok_or_else(unrecognized_reply)?;
 
-        if !result
+        let flagged = result
             .get("flagged")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+            .ok_or_else(unrecognized_reply)?;
+
+        if !flagged {
             return Ok(safe_assessment());
         }
 
@@ -318,8 +325,9 @@ impl GuardrailBackend for OpenAiModerationBackend {
     /// # Errors
     ///
     /// [`Error::Transport`] for connection, status, and decoding failures,
-    /// [`Error::Timeout`] when the deadline expires, and [`Error::Transport`]
-    /// for a reply without results. Errors never carry the scanned text.
+    /// [`Error::Timeout`] when the deadline expires, and [`Error::Validation`]
+    /// for a reply that does not match the moderations schema. Blank text is
+    /// safe without a request. Errors never carry the scanned text.
     async fn analyze(&self, ctx: &GuardrailContext) -> Result<RiskAssessment> {
         let text = ctx.text_view();
         if text.trim().is_empty() {
@@ -353,6 +361,19 @@ impl GuardrailBackend for OpenAiModerationBackend {
         let reply = json_body(response, SERVICE)?;
         self.parse_response(&reply)
     }
+}
+
+/// Builds the error reported when a `2xx` body does not match the
+/// `/v1/moderations` schema.
+///
+/// Naming the fields keeps the mismatch actionable without repeating any part
+/// of the payload, and the validation kind makes the pipeline block under the
+/// fail-closed default instead of treating the reply as a clean verdict.
+fn unrecognized_reply() -> Error {
+    Error::validation(
+        "openai moderation reply does not match the moderations schema: expected a non-empty \
+         `results` array whose first entry carries a boolean `flagged`",
+    )
 }
 
 /// Replaces blank URLs and models with their documented defaults and trims the
@@ -764,25 +785,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_results_is_a_transport_error() {
+    async fn unrecognized_reply_shapes_are_validation_errors() {
         for reply in [
+            json!({}),
             json!({"id": "modr-empty", "model": "omni-moderation-latest"}),
             json!({"results": []}),
             json!({"results": {}}),
+            json!({"results": [{}]}),
+            json!({"results": [null]}),
+            json!({"results": [{"flagged": "false"}]}),
+            json!({"results": [{"flagged": null, "category_scores": {"hate": 0.0}}]}),
         ] {
-            let server = server_with(reply).await;
+            let server = server_with(reply.clone()).await;
             let error = backend_for(&server)
                 .analyze(&ctx("scanned text"))
                 .await
                 .unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::Transport, "{error}");
-            assert!(error.to_string().contains("no results"), "{error}");
-        }
+            assert_eq!(
+                error.kind(),
+                ErrorKind::Validation,
+                "reply {reply}: {error}"
+            );
+            assert_schema_message(&error, &reply);
 
-        let error = default_backend()
-            .parse_response(&json!({"results": []}))
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Transport);
+            let error = default_backend().parse_response(&reply).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                ErrorKind::Validation,
+                "reply {reply}: {error}"
+            );
+            assert_schema_message(&error, &reply);
+        }
+    }
+
+    /// Asserts the schema error names the vendor and the required fields and
+    /// repeats no part of the payload.
+    fn assert_schema_message(error: &Error, reply: &Value) {
+        let message = error.to_string();
+        assert!(message.contains("openai moderation reply"), "{message}");
+        assert!(message.contains("`results`"), "{message}");
+        assert!(message.contains("`flagged`"), "{message}");
+        assert!(!message.contains("scanned text"), "{message}");
+        assert!(!message.contains(&reply.to_string()), "{message}");
+    }
+
+    #[test]
+    fn a_recognized_benign_reply_is_a_safe_assessment() {
+        let backend = default_backend();
+        for reply in [
+            json!({"results": [{"flagged": false}]}),
+            json!({"results": [{"flagged": false, "categories": {"hate": false}}]}),
+            json!({"id": "modr-benign-1", "results": [{"flagged": false}, {"flagged": true}]}),
+        ] {
+            let assessment = backend.parse_response(&reply).unwrap();
+            assert!(!assessment.has_risk, "reply {reply}");
+            assert_eq!(assessment.risk_level, RiskLevel::Safe, "reply {reply}");
+            assert_eq!(assessment.risk_type, None, "reply {reply}");
+            assert!((assessment.confidence - 1.0).abs() < f64::EPSILON);
+            assert_eq!(assessment.details, None, "reply {reply}");
+        }
     }
 
     #[tokio::test]
