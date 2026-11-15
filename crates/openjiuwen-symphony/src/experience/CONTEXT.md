@@ -11,7 +11,7 @@ Factory names are parsed by one grammar, and the `pq<m>` part of a name is recor
 Dedupe is an intentional difference from Python: Python appends blindly and keys on `id`, while this crate merges on the normalized query pattern plus the sorted skill set, so repeated observations reinforce one record instead of fragmenting the catalog.
 The input half is implemented too: `trace/` parses agent-runtime session exports into `TraceRecord`s and caches them incrementally, `cluster.rs` groups records by skill set and then by a deterministic k-means over the query embeddings, and `collector.rs` distils each cluster into an item and writes it through an `ExperienceSink` into a bank or the persisted index.
 Python's LLM distillation is replaced by the cluster's centroid query and a deterministic token-similarity merge, so ingestion works offline with no model configured and a caller with a model installs it on the collector.
-Three support modules complete the surface: `embed.rs` is a batching, cache-bounded client over the `Embedding` seam, `retriever.rs` answers a request over one or both catalogs with explicit ranking provenance, and `evaluator.rs` grades traces with a deterministic rubric plus an opt-in model-judged pass.
+Three support modules complete the surface: `embed.rs` is a batching, cache-bounded client over the `Embedding` seam, `retriever.rs` answers a request over one or both catalogs with skill filtering and explicit ranking provenance, and `evaluator.rs` grades traces with a deterministic rubric plus an opt-in model-judged pass.
 Everything here is offline, deterministic, and free of external services: ordering comes from scores, ids and centroids, never from a clock, an RNG or a hash-map iteration order.
 
 ## API Surface
@@ -264,11 +264,16 @@ impl ExperienceRetriever {
 }
 ```
 
-Each configured catalog is queried with its own ranking: the bank receives the request's `SearchOptions` (skill filters included), and the index receives an `ExperienceRanking` built from `top_k` and `require_all_skills`, because `ExperienceIndex::search` has no skill-id filter seam.
+A request's skill filters reach both catalogs by two routes: the bank applies them inside the `SearchOptions` it receives, and the retriever applies them to the index hits itself with the same predicate, because `ExperienceIndex::search` has no skill-id filter seam.
+That predicate rejects a hit listing any excluded skill first, then requires every required skill — or, with `require_all_skills` false, at least one of them — and keeps every hit when both filter lists are empty.
+Skill matching is the case-sensitive exact comparison of `ExperienceItem::has_skill`, and repeated required ids do not change the verdict.
+A request with any skill filter in effect queries the index with `top_k = 0` (unlimited), so filtering happens before the retriever's own `top_k` truncation and a rejected index hit never consumes the caller's budget.
+A request with no skill filter keeps one bounded index request at its own `top_k`.
+The index request is an `ExperienceRanking` built from that budget and `require_all_skills`.
 Hits are merged on `ExperienceItem::dedupe_key`: the highest score wins, an exact tie keeps the smaller item id, the `sources` of both hits are unioned in declaration order, and the winner's provenance travels with its score.
 The merged list is ordered by score descending then item id ascending, truncated to `top_k` (`0` = unlimited), and only then filtered by `min_score`.
 `RankingProvenance::Embedding` is reported per hit and for the report only when every contributing catalog scored with an embedder; the index always ranks with its own embedder, so a bank-only report is `Lexical` exactly when the bank has no configured embedding.
-`total_candidates` counts the catalog hits examined before merge, truncation and `min_score`.
+`total_candidates` counts the hits each configured catalog returned before the retriever's client-side index filter, the merge, the truncation and `min_score`, so a request that filters every index hit away still reports the index's hit count while the bank's contribution is already filtered.
 A blank `query` and a retriever with no catalog are both `Error::Validation`, naming `query` and `retriever` respectively.
 
 ### Trace grading (`evaluator.rs`)
@@ -485,7 +490,7 @@ Everything is clock-free: items keep `created_at`/`last_hit_at` at `0.0`.
 - `meta.json` carries `embeddings_sha256`, `scalar_sha256` and (for IVF) `ivf_sha256`; Python's `vector_sha256` has no counterpart because there is no separate faiss file, and `MANIFEST_VERSION` stays 1 so a flat manifest written before IVF support still parses.
 - Clustering replaces faiss K-Means with the crate's own k-means over the `Embedding` seam, and `ClusterConfig::centroid_merge_threshold` is a Rust-only post-pass that Python does not have.
 - `cluster_traces` is a synchronous convenience over `HashEmbedding` rather than a separate algorithm: the only difference from `cluster_traces_with_embedding` is the embedder, so there is no silent quality switch between the two.
-- `ExperienceRetriever` generalises Python's one-method retriever: it can query a bank, the persisted index, or both, and reports which catalogs contributed and whether the ranking was embedding-backed.
+- `ExperienceRetriever` generalises Python's one-method retriever: it can query a bank, the persisted index, or both, applies the request's skill filters to index hits itself because the index has no filter seam, and reports which catalogs contributed and whether the ranking was embedding-backed.
 - `TraceEvaluator` grades deterministically first and treats a model verdict as an opt-in blend, where Python asks a model and marks a trace `unevaluated` without one; a fallback verdict never moves a score.
 
 ## Constraints
@@ -509,7 +514,7 @@ Everything is clock-free: items keep `created_at`/`last_hit_at` at `0.0`.
 - `tests/experience_index.rs` — `ExperienceIndex` add/search/dedupe, `top_k`/threshold ordering, skill-id flattening, `exist`, digest/count/dimension corruption, empty-directory open, persist round-trip and idempotence, reopen id continuity, determinism, and the algorithm-name handling.
 - `tests/experience_trace.rs` — two-session fixture with exact records, idempotent re-parse and append order, malformed/missing/heartbeat session tolerance, single-quoted tool payloads, `clear`, skill-set/topic clustering and centroid ties, collector drops/auto-flush/similarity merge/stats, the end-to-end `TraceStore` → `cluster_traces` → collector → `ExperienceBank::search` run, and the persisted `ExperienceIndex` sink with `HashEmbedding`.
 - The algorithm grammar, the coarse quantiser and the persisted layout are pinned by their own module suites: canonical names and rejections, seeding/Lloyd/probe determinism and geometry validation, and the four-file write/read order with digests and loud corruption.
-- The support modules pin their own rules: batching/cache/FIFO stats for the embedder, multi-catalog merge order and provenance for the retriever, and every signal, penalty, window, summary and judged blend for the evaluator.
+- The support modules pin their own rules: batching/cache/FIFO stats for the embedder, client-side index skill filtering plus multi-catalog merge order and provenance for the retriever, and every signal, penalty, window, summary and judged blend for the evaluator.
 - Everything is offline and deterministic: `tempfile` roots, explicit numeric timestamps, `HashEmbedding`, no clock-dependent assertions, no hash-map iteration order in outputs.
 
 ## Routing Table
@@ -524,7 +529,7 @@ Everything is clock-free: items keep `created_at`/`last_hit_at` at `0.0`.
   - `./index/ivf.rs` → the deterministic coarse quantiser (`CoarseIndex`, `CoarseConfig`, seeding/Lloyd/probe)
   - `./index/persist.rs` → the directory layout, digests, `vector/ivf.json`, atomic writes and load validation
 - `./embed.rs` → `EmbeddingClient`, `EmbeddingClientStats`, batching, dedupe and the bounded FIFO vector cache
-- `./retriever.rs` → `ExperienceRetriever`, `RetrieveRequest`, `RetrieveSource`, `RankingProvenance`, merged hits and the report
+- `./retriever.rs` → `ExperienceRetriever`, `RetrieveRequest`, `RetrieveSource`, `RankingProvenance`, the index-side skill filter and index budget rule, merged hits and the report
 - `./evaluator.rs` → `TraceEvaluator`, `EvaluationConfig`, `QualitySignal`, `TraceGrade`, `EvaluationSummary`, the rubric and the judged pass
 - `./cluster.rs` → `ClusteredQuery`, `ClusterConfig`, `cluster_traces`, `cluster_traces_with_embedding`, deterministic k-means and centroid selection
 - `./collector.rs` → `ExperienceCollector`, `ExperienceSink`, `CollectorStats`, embedder/config wiring, buffer/merge/flush rules
