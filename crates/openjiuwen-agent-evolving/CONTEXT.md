@@ -84,6 +84,9 @@ Everything except those paths is offline and deterministic: no GPU, no model cal
 - Files stay under ~1000 lines; `src/trainer.rs` (1419 lines, test module from line 707) and `src/reward/check.rs` (1142 lines, test module from line 716) both exceed it.
 - `RlServiceState` always constructs a `MemoryOnlineStore`: `RlServiceConfig` has no store/Redis field, so the Redis backend (feature `redis`) is library-only — reachable by building `TaskRegistry`/`SampleLedger`/`TrainingRunner` directly, never through `build_router`/`serve`.
 - No HTTP route currently answers `501`: `OnlineError::Unsupported` maps to `503` (`service::ApiError::from_online`), a `ppo` executor only fails `/health` with `503`, and `ApiError::from_error`'s `Error::Unsupported` → `501` mapping has no caller.
+- The `501` surface is reachable only through `ApiError::unsupported` (its sole caller is the dead `from_error`); `service.rs`'s module header (`- unsupported — 501`) and the `lib.rs` re-export doc (`501 RL endpoints`) still advertise it.
+- The merged router registers 17 paths: `rl_router`'s 15 plus `/health` and `/v1/evaluate`; the catch-all `/internal/v1/rl/tasks/{*operation}` covers both `:finish` and `:abort`.
+- Under `executor = "ppo"` only `/health` answers `503`; `POST /v1/rl/training/runs` still claims and answers `201` with a `failed` run whose `failure_reason` names `torch` (`tests/online_service.rs`, `health_reports_executor_readiness`).
 - `POST /v1/evaluate` implements only `exact_match`; any other `metric` string (including a judge metric, although `evaluator::judge` exists) is `400 invalid_request`.
 - `POST /v1/rl/training/runs` runs the local executor inline and answers with the terminal record (`201` new / `200` reused active run), not a queued record.
 
