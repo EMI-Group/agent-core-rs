@@ -20,7 +20,9 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use openjiuwen_symphony::error::ErrorKind;
-use openjiuwen_symphony::retrieval::artifacts::{catalog_content_hash, load_index, write_index};
+use openjiuwen_symphony::retrieval::artifacts::{
+    catalog_content_hash, load_index, parse_tree_yaml, render_tree_yaml, write_index,
+};
 use openjiuwen_symphony::retrieval::build::scanner::ItemSources;
 use openjiuwen_symphony::retrieval::build::scanner::SourceItem;
 use openjiuwen_symphony::retrieval::build::workflows::{BuildConfig, IndexBuilder};
@@ -687,4 +689,146 @@ async fn a_tampered_manifest_count_is_a_validation() {
     assert_eq!(error.kind(), ErrorKind::Validation);
     assert!(error.message().contains(MANIFEST_FILENAME));
     assert!(error.message().contains("count"));
+}
+
+// --------------------------------------------------------------------------------------
+// 9. The empty index
+// --------------------------------------------------------------------------------------
+
+/// The SHA-256 of the empty catalog's rendering — the hash an empty manifest records.
+const EMPTY_CATALOG_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+#[tokio::test]
+async fn an_empty_item_source_builds_and_round_trips_through_load_index() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let report = IndexBuilder::build(ItemSources::new("skill"), dir.path(), BuildConfig::new())
+        .await
+        .unwrap();
+
+    assert_eq!(report.record_count, 0);
+    assert_eq!(report.manifest.count, 0);
+    assert_eq!(report.manifest.content_hash, EMPTY_CATALOG_HASH);
+    assert_eq!(
+        read_artifact(dir.path(), CATALOG_FILENAME),
+        "",
+        "an empty catalog renders as the empty document"
+    );
+
+    let loaded = load_index(dir.path()).await.unwrap();
+
+    assert_eq!(loaded.manifest.count, 0);
+    assert_eq!(loaded.manifest.content_hash, EMPTY_CATALOG_HASH);
+    assert!(loaded.records.is_empty());
+    assert!(
+        loaded.choices.is_empty(),
+        "an empty index offers no choices"
+    );
+    assert_eq!(loaded.root.node_id, ROOT_NODE_ID);
+    assert!(
+        loaded.root.children().is_empty(),
+        "the root branch keeps no child of an empty catalog"
+    );
+    assert!(loaded.item_paths.is_empty());
+}
+
+#[tokio::test]
+async fn a_zero_node_index_round_trips_through_write_and_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = IndexManifest {
+        mode: MODE_FULL.to_string(),
+        count: 0,
+        item_paths: Vec::new(),
+        worker_ids: Vec::new(),
+        item_type: DEFAULT_ITEM_TYPE.to_string(),
+        content_hash: catalog_content_hash(&[]),
+    };
+
+    write_index(dir.path(), &[], &[], &manifest).await.unwrap();
+
+    assert_eq!(
+        read_artifact(dir.path(), TREE_INDEX_FILENAME),
+        "nodes: []\n",
+        "a zero-node tree is published as the empty flow sequence"
+    );
+    assert_eq!(read_artifact(dir.path(), CATALOG_FILENAME), "");
+
+    let loaded = load_index(dir.path()).await.unwrap();
+
+    assert_eq!(loaded.manifest.count, 0);
+    assert_eq!(loaded.manifest.content_hash, EMPTY_CATALOG_HASH);
+    assert!(loaded.records.is_empty());
+    assert!(loaded.root.children().is_empty());
+    assert!(loaded.item_paths.is_empty());
+}
+
+#[tokio::test]
+async fn the_empty_index_manifest_count_and_hash_are_stable_across_builds() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    for dir in [first.path(), second.path()] {
+        IndexBuilder::build(ItemSources::new("skill"), dir, BuildConfig::new())
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        read_artifact(first.path(), MANIFEST_FILENAME),
+        read_artifact(second.path(), MANIFEST_FILENAME),
+        "an empty index's manifest bytes are build independent"
+    );
+    let manifest: Value =
+        serde_json::from_str(&read_artifact(first.path(), MANIFEST_FILENAME)).unwrap();
+    assert_eq!(manifest["count"], json!(0));
+    assert_eq!(manifest["worker_ids"], json!([]));
+    assert_eq!(manifest["content_hash"], json!(EMPTY_CATALOG_HASH));
+    assert_eq!(catalog_content_hash(&[]), EMPTY_CATALOG_HASH);
+}
+
+#[tokio::test]
+async fn a_published_bare_nodes_header_still_loads_as_an_empty_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = IndexManifest {
+        mode: MODE_FULL.to_string(),
+        count: 0,
+        item_paths: Vec::new(),
+        worker_ids: Vec::new(),
+        item_type: DEFAULT_ITEM_TYPE.to_string(),
+        content_hash: catalog_content_hash(&[]),
+    };
+    write_index(dir.path(), &[], &[], &manifest).await.unwrap();
+
+    fs::write(dir.path().join(TREE_INDEX_FILENAME), "nodes:\n").unwrap();
+
+    let loaded = load_index(dir.path()).await.unwrap();
+    assert!(
+        loaded.records.is_empty(),
+        "a valueless header is an empty tree"
+    );
+}
+
+#[test]
+fn a_non_empty_tree_index_keeps_its_pinned_layout() {
+    let nodes = vec![
+        IndexNode::branch("Skills").with_description("All skills"),
+        IndexNode::leaf("Skills.a", "alpha"),
+    ];
+
+    assert_eq!(
+        render_tree_yaml(&nodes),
+        concat!(
+            "nodes:\n",
+            "  - cid: \"Skills\"\n",
+            "    type: \"branch\"\n",
+            "    description: \"All skills\"\n",
+            "  - cid: \"Skills.a\"\n",
+            "    type: \"leaf\"\n",
+            "    worker_id: \"alpha\"\n",
+        ),
+        "a non-empty document still opens with a bare `nodes:` header"
+    );
+    assert_eq!(
+        parse_tree_yaml(&render_tree_yaml(&nodes)).unwrap().len(),
+        nodes.len()
+    );
 }

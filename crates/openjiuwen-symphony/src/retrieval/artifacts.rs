@@ -15,6 +15,14 @@
 //!   manifest.json     # pretty JSON: mode, count, item_paths, worker_ids, item_type, content_hash
 //! ```
 //!
+//! # The empty index
+//!
+//! A catalog with no records is a supported index, not a failure: a build over an empty
+//! item source publishes its root branch with `count: 0`, and a render of zero nodes writes
+//! the flow sequence `nodes: []`, which [`parse_tree_yaml`] reads back as an empty node
+//! list. The manifest then records `count: 0` and [`catalog_content_hash`]'s digest of the
+//! empty catalog, so `write_index` → `load_index` round-trips a zero-item index.
+//!
 //! # Determinism and atomicity
 //!
 //! The index is written in three steps — tree, catalog, manifest last — and every step
@@ -56,6 +64,13 @@ use crate::retrieval::types::{
     CATALOG_FILENAME, DEFAULT_ITEM_TYPE, MANIFEST_FILENAME, ROOT_NODE_ID, TREE_INDEX_FILENAME,
 };
 
+/// The `tree_index.yaml` document of a zero-node index.
+///
+/// A bare `nodes:` header would be a null `nodes` value, which
+/// [`parse_tree_yaml`] rejects, so the empty document spells the
+/// sequence out instead.
+const EMPTY_TREE_YAML: &str = "nodes: []\n";
+
 /// Writes the three index artifacts into `dir`, creating it when missing.
 ///
 /// The inputs are validated before anything touches the filesystem: a manifest whose
@@ -63,6 +78,9 @@ use crate::retrieval::types::{
 /// node `cid`, a duplicate record `cid`, or a record whose `cid` names no leaf node is an
 /// [`Error::Validation`] naming the offending field, so a
 /// failed write leaves the previous index untouched.
+///
+/// An empty node list with an empty record list and a `count` of `0` is a valid index: it
+/// renders `nodes: []` and publishes [`catalog_content_hash`]'s digest of the empty catalog.
 ///
 /// Files are written tree first, catalog second and manifest last, each through a
 /// same-directory `<name>.tmp` file followed by a `rename`.
@@ -187,6 +205,10 @@ pub async fn load_index(dir: impl AsRef<Path>) -> Result<LoadedIndex> {
 /// when non-empty, in that order. Scalars are JSON string literals, which YAML reads back
 /// as the same string; the document ends with one newline.
 ///
+/// An empty node list renders as the flow sequence `nodes: []`, so a zero-node index is a
+/// document [`parse_tree_yaml`] reads back
+/// as an empty node list instead of a null `nodes` value.
+///
 /// # Panics
 ///
 /// Never: a scalar renders through [`serde_json::Value`]'s infallible `Display`.
@@ -196,6 +218,9 @@ pub fn render_tree_yaml(nodes: &[IndexNode]) -> String {
     sorted.sort_by(|left, right| {
         (left.depth(), left.cid.as_str()).cmp(&(right.depth(), right.cid.as_str()))
     });
+    if sorted.is_empty() {
+        return EMPTY_TREE_YAML.to_string();
+    }
     let mut lines: Vec<String> = Vec::with_capacity(1 + sorted.len() * 4);
     lines.push("nodes:".to_string());
     for node in sorted {
@@ -226,10 +251,15 @@ pub fn render_tree_yaml(nodes: &[IndexNode]) -> String {
 /// spell the node type, with `type` winning when it is non-empty. A non-mapping entry is
 /// skipped with a warning rather than failing the whole tree.
 ///
+/// A `nodes` value of `[]` — what [`render_tree_yaml`]
+/// writes for a zero-node index — and a bare, valueless `nodes:` header both read as an
+/// empty node list.
+///
 /// # Errors
 ///
 /// [`Error::Validation`] naming `tree_index.yaml` when
-/// the YAML is unusable or the document has no `nodes` sequence.
+/// the YAML is unusable, the document has no `nodes` key, or `nodes` is neither a sequence
+/// nor empty.
 pub fn parse_tree_yaml(text: &str) -> Result<Vec<IndexNode>> {
     let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(text)
         .map_err(|error| validation(TREE_INDEX_FILENAME, format!("invalid YAML: {error}")))?;
@@ -242,6 +272,9 @@ pub fn parse_tree_yaml(text: &str) -> Result<Vec<IndexNode>> {
     let Some(raw_nodes) = document.get("nodes") else {
         return Err(validation(TREE_INDEX_FILENAME, "missing `nodes` sequence"));
     };
+    if raw_nodes.is_null() {
+        return Ok(Vec::new());
+    }
     let Some(entries) = raw_nodes.as_array() else {
         return Err(validation(TREE_INDEX_FILENAME, "`nodes` is not a sequence"));
     };
@@ -937,6 +970,19 @@ mod tests {
         }
         let error = parse_tree_yaml("nodes: [").expect_err("must reject");
         assert!(error.message().contains("invalid YAML"));
+    }
+
+    #[test]
+    fn empty_node_lists_render_and_parse_as_an_empty_sequence() {
+        let empty = Vec::<IndexNode>::new();
+        assert_eq!(render_tree_yaml(&[]), "nodes: []\n");
+        assert_eq!(parse_tree_yaml("nodes: []").unwrap(), empty);
+        assert_eq!(
+            parse_tree_yaml("nodes:\n").unwrap(),
+            empty,
+            "a preserved valueless header reads as an empty node list"
+        );
+        assert_eq!(parse_tree_yaml(&render_tree_yaml(&[])).unwrap(), empty);
     }
 
     #[test]
