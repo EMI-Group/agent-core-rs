@@ -674,6 +674,8 @@ impl Payload {
             title: self.title,
             importance: self.importance.unwrap_or(DEFAULT_IMPORTANCE),
             tags: self.tags,
+            // A document payload carries no vector: the embedding is derived state.
+            embedding: None,
             metadata: self
                 .metadata
                 .unwrap_or_else(|| Value::Object(serde_json::Map::new())),

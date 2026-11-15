@@ -16,29 +16,38 @@
 //!
 //! # Search ranking
 //!
-//! Team memory has no embedding column, so recall is keyword plus importance plus
-//! recency. The formula is fixed (and shared by every store implementation, so an
-//! in-memory search and a SQLite search cannot drift):
+//! Every backend scores with the crate's shared blend, so an in-memory search and a
+//! `SQLite` search cannot drift. The formula depends on whether the search has a query
+//! vector:
 //!
 //! ```text
 //! document   = title + " " + content + " " + tags.join(" ")
 //! keyword    = normalized_bm25_scores(query, documents)  // 0 when no overlap
 //! recency    = 0.5 ^ (age_secs(updated_at) / 30 days)
-//! ranking    = RankingConfig { similarity_weight: 0.0, ..Default::default() }  // no embeddings
-//! score      = blend(0.0, keyword, importance, recency, &ranking)
+//! similarity = (cosine(query_embedding, record.embedding) + 1) / 2   // 0 without vectors
+//! score      = blend(similarity, keyword, importance, recency, &ranking)
 //! ```
 //!
-//! With `similarity_weight = 0.0` the semantic group collapses to the keyword term, so
-//! the score is `(0.85 * keyword + 0.10 * importance + 0.05 * recency) / 1.0`. A
-//! candidate whose normalized keyword score is zero shares no term with the query and
-//! is dropped before ranking, so a search never returns an unrelated record just
-//! because it is recent or important.
+//! `TeamSearchOptions::ranking` supplies the weights and
+//! [`TeamSearchOptions::query_embedding`] the query vector. **Without a query vector the
+//! similarity weight is forced to `0.0`** (see [`keyword_only_ranking`]), so the semantic
+//! group collapses to the keyword term and the score is exactly
+//! `(0.85 * keyword + 0.10 * importance + 0.05 * recency) / 1.0` — bit-identical to a
+//! build without any embedding support. A caller that passes the default
+//! [`RankingConfig`] but no query vector therefore still gets the keyword-only formula.
+//!
+//! With a query vector the semantic group is real: `similarity` enters with the
+//! configured weight and a candidate whose normalized keyword score is zero is kept as
+//! long as it is semantically similar (its `similarity > 0.0`). A record written without
+//! an embedding (legacy rows, or rows written before an embedder was attached) scores
+//! `similarity = 0.0`, so it is still ranked, but only through its keyword term.
+use super::model::validate_embedding;
 use super::model::{
     TeamMemoryFilter, TeamMemoryKind, TeamMemoryRecord, TeamMemoryScope, TeamMemoryStats,
     TeamSearchHit,
 };
 use crate::config::RankingConfig;
-use crate::recall::{blend, normalized_bm25_scores, recency_score};
+use crate::recall::{blend, normalized_bm25_scores, normalized_similarity, recency_score};
 use crate::record::CallOptions;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -54,12 +63,27 @@ pub const DEFAULT_SEARCH_TOP_K: usize = 5;
 pub const DEFAULT_SEARCH_THRESHOLD: f32 = 0.3;
 /// Half-life of the recency term, in seconds (30 days).
 pub const SEARCH_RECENCY_HALF_LIFE_SECS: u64 = 30 * 24 * 60 * 60;
+/// The ranking weights used when a search carries no query embedding.
+///
+/// It is the shared [`RankingConfig::default`] with the similarity group switched off, so
+/// [`blend`] renormalizes the semantic group to the keyword term and the score stays
+/// `0.85 * keyword + 0.10 * importance + 0.05 * recency`. [`TeamSearchOptions::default`]
+/// uses it, and `rank_candidates` forces `similarity_weight: 0.0` whenever no query
+/// vector is available even if the caller passed other weights.
+#[must_use]
+pub fn keyword_only_ranking() -> RankingConfig {
+    RankingConfig {
+        similarity_weight: 0.0,
+        ..RankingConfig::default()
+    }
+}
 /// Options for one team memory search.
 ///
 /// Not `serde`-serializable because [`CallOptions`] carries a cancellation token; build
 /// it with the builders and hand it to [`TeamMemoryStore::search`]. The default is
-/// [`DEFAULT_SEARCH_TOP_K`], [`DEFAULT_SEARCH_THRESHOLD`], no kind or tag narrowing, and
-/// expired records hidden.
+/// [`DEFAULT_SEARCH_TOP_K`], [`DEFAULT_SEARCH_THRESHOLD`], no kind or tag narrowing,
+/// expired records hidden, no query embedding (so [`keyword_only_ranking`]), and no
+/// cancellation.
 #[derive(Debug, Clone)]
 pub struct TeamSearchOptions {
     /// Maximum number of hits returned; must be greater than zero.
@@ -72,12 +96,22 @@ pub struct TeamSearchOptions {
     pub tags: Vec<String>,
     /// Whether expired records may be returned; `false` hides them.
     pub include_expired: bool,
+    /// The query vector of the semantic group.
+    ///
+    /// `None` (the default) keeps the keyword-only formula. A
+    /// [`TeamMemory`](super::TeamMemory) facade with an embedder fills this in on
+    /// `search`; a caller embedding its own queries may set it directly.
+    pub query_embedding: Option<Vec<f32>>,
+    /// The weights of [`blend`]: the similarity/keyword group and the final
+    /// semantic/importance/recency group.
+    pub ranking: RankingConfig,
     /// Cancellation and deadline for the call.
     pub call: CallOptions,
 }
 impl Default for TeamSearchOptions {
     /// Returns the documented defaults (`top_k = 5`, `threshold = 0.3`, nothing
-    /// narrowed, expired records hidden, no cancellation).
+    /// narrowed, expired records hidden, no query embedding,
+    /// [`keyword_only_ranking`], no cancellation).
     fn default() -> Self {
         Self {
             top_k: DEFAULT_SEARCH_TOP_K,
@@ -85,6 +119,8 @@ impl Default for TeamSearchOptions {
             kinds: Vec::new(),
             tags: Vec::new(),
             include_expired: false,
+            query_embedding: None,
+            ranking: keyword_only_ranking(),
             call: CallOptions::new(),
         }
     }
@@ -140,14 +176,31 @@ impl TeamSearchOptions {
         self.include_expired = true;
         self
     }
+    /// Sets the query vector of the semantic group.
+    ///
+    /// Pair it with [`TeamSearchOptions::with_ranking`] to pick the similarity weight;
+    /// the builder default ([`keyword_only_ranking`]) keeps the keyword-only formula even
+    /// with a vector present.
+    #[must_use]
+    pub fn with_query_embedding(mut self, query_embedding: Vec<f32>) -> Self {
+        self.query_embedding = Some(query_embedding);
+        self
+    }
+    /// Sets the ranking weights.
+    #[must_use]
+    pub fn with_ranking(mut self, ranking: RankingConfig) -> Self {
+        self.ranking = ranking;
+        self
+    }
     /// Binds the search to a cancellation token.
     #[must_use]
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.call = self.call.with_cancellation(cancellation);
         self
     }
-    /// Validates the options: `top_k` must be greater than zero and `threshold` must be
-    /// finite and inside `0.0..=1.0`.
+    /// Validates the options: `top_k` must be greater than zero, `threshold` must be
+    /// finite and inside `0.0..=1.0`, the ranking weights must be valid, and a supplied
+    /// query vector must be non-empty with finite components.
     pub fn validate(&self) -> Result<()> {
         if self.top_k == 0 {
             return Err(Error::validation(
@@ -160,7 +213,18 @@ impl TeamSearchOptions {
                 self.threshold
             )));
         }
-        Ok(())
+        if let Some(query_embedding) = &self.query_embedding {
+            validate_embedding(query_embedding)
+                .map_err(|error| rename_embedding_field(error, "query_embedding"))?;
+        }
+        self.ranking.validate()
+    }
+}
+/// Rewrites the `embedding` field name of a validation error to `field`.
+fn rename_embedding_field(error: Error, field: &str) -> Error {
+    match error {
+        Error::Validation(message) => Error::validation(message.replace("`embedding`", field)),
+        other => other,
     }
 }
 /// Persistence seam for team memory records.
@@ -206,7 +270,8 @@ pub trait TeamMemoryStore: Send + Sync {
     /// The scope and the options are validated ([`Error::Validation`] on failure).
     /// Candidates are the records for which [`TeamMemoryScope::allows`] returns `true`,
     /// narrowed by `options.kinds`/`options.tags` and by expiry (`options.include_expired`
-    /// may keep expired rows). Candidates sharing no term with the query are dropped, the
+    /// may keep expired rows). A candidate that neither shares a term with the query nor
+    /// (when the options carry a query vector) is semantically similar is dropped, the
     /// survivors are scored with the module ranking formula, and the best `top_k` are
     /// returned.
     async fn search(
@@ -247,19 +312,26 @@ pub trait TeamMemoryStore: Send + Sync {
     /// Returns how many rows were removed. Records without an expiry are untouched.
     async fn prune_expired(&self, now: DateTime<Utc>) -> Result<usize>;
 }
-/// Ranks `records` against `query`.
+/// Ranks `records` against `query`, optionally with a query vector.
 ///
 /// Shared by every [`TeamMemoryStore`] implementation so the search semantics are
 /// identical everywhere. Filters out expired records (unless
 /// [`TeamSearchOptions::include_expired`]), the option kinds, and records missing one of
 /// the option tags; then scores the survivors with the module ranking formula, keeps only
-/// candidates with `keyword > 0.0` and `score >= options.threshold`, sorts by `score`
-/// descending, `updated_at` descending, and `id` ascending, and truncates to
-/// `options.top_k`. `now` is passed in so tests (and future batch callers) are
-/// deterministic.
+/// candidates that share a term with the query or are semantically similar, keeps those
+/// with `score >= options.threshold`, sorts by `score` descending, `updated_at`
+/// descending, and `id` ascending, and truncates to `options.top_k`.
+///
+/// `query_embedding` is the query vector of the semantic group and `ranking` the weights
+/// [`blend`] is called with (the stores pass [`TeamSearchOptions::query_embedding`] and
+/// [`TeamSearchOptions::ranking`]). A `None` query vector forces the similarity weight to
+/// zero, which makes the result identical to the keyword-only formula of a build without
+/// embeddings. `now` is passed in so tests (and future batch callers) are deterministic.
 pub(crate) fn rank_candidates(
     records: Vec<TeamMemoryRecord>,
     query: &str,
+    query_embedding: Option<&[f32]>,
+    ranking: &RankingConfig,
     options: &TeamSearchOptions,
     now: DateTime<Utc>,
 ) -> Vec<TeamSearchHit> {
@@ -275,24 +347,39 @@ pub(crate) fn rank_candidates(
     let documents: Vec<String> = candidates.iter().map(document_text).collect();
     let document_refs: Vec<&str> = documents.iter().map(String::as_str).collect();
     let keywords = normalized_bm25_scores(query, &document_refs);
-    let ranking = RankingConfig {
-        similarity_weight: 0.0,
-        ..RankingConfig::default()
+    // Without a query vector there is no semantic signal, so the similarity weight is
+    // meaningless: zero it out instead of trusting the caller's config. This is what keeps
+    // a search without an embedder byte-identical to the keyword-only formula.
+    let similarity_weight = if query_embedding.is_some() {
+        ranking.similarity_weight
+    } else {
+        0.0
+    };
+    let effective = RankingConfig {
+        similarity_weight,
+        ..ranking.clone()
     };
     let mut hits: Vec<TeamSearchHit> = Vec::with_capacity(candidates.len());
     for (record, keyword) in candidates.into_iter().zip(keywords) {
-        if keyword <= 0.0 {
+        let similarity = match (query_embedding, record.embedding.as_deref()) {
+            (Some(query), Some(document)) if similarity_weight > 0.0 => {
+                normalized_similarity(query, document)
+            }
+            _ => 0.0,
+        };
+        if keyword <= 0.0 && similarity <= 0.0 {
             continue;
         }
         let importance = record.importance;
         let recency = recency_score(record.updated_at, now, SEARCH_RECENCY_HALF_LIFE_SECS);
-        let score = blend(0.0, keyword, importance, recency, &ranking);
+        let score = blend(similarity, keyword, importance, recency, &effective);
         if score < options.threshold {
             continue;
         }
         hits.push(TeamSearchHit {
             record,
             score,
+            similarity,
             keyword,
             importance,
             recency,
@@ -309,7 +396,10 @@ pub(crate) fn rank_candidates(
     hits
 }
 /// The searchable text of one record: title, content, and tags.
-fn document_text(record: &TeamMemoryRecord) -> String {
+///
+/// This is also the text a [`TeamMemory`](super::TeamMemory) facade embeds when it
+/// derives a record's vector, so the two signals see the same document.
+pub(crate) fn document_text(record: &TeamMemoryRecord) -> String {
     format!(
         "{} {} {}",
         record.title.as_deref().unwrap_or_default(),
@@ -331,6 +421,15 @@ mod tests {
     use crate::team::model::{TeamMemoryScope, TeamVisibility};
     fn at(seconds: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(seconds, 0).unwrap()
+    }
+    /// Ranks without a query vector, i.e. with the keyword-only formula.
+    fn rank(
+        records: Vec<TeamMemoryRecord>,
+        query: &str,
+        options: &TeamSearchOptions,
+        now: DateTime<Utc>,
+    ) -> Vec<TeamSearchHit> {
+        rank_candidates(records, query, None, &options.ranking, options, now)
     }
     fn record(id: &str, content: &str, updated: i64, importance: f32) -> TeamMemoryRecord {
         let mut record = TeamMemoryRecord::new(
@@ -416,7 +515,7 @@ mod tests {
                 0.5,
             ),
         ];
-        let hits = rank_candidates(
+        let hits = rank(
             records,
             "sqlite storage decision",
             &TeamSearchOptions::default(),
@@ -434,16 +533,16 @@ mod tests {
     fn rank_excludes_zero_keyword_candidates() {
         let now = at(1_700_000_000);
         let records = vec![record("id-a", "gardening notes", now.timestamp(), 1.0)];
-        let hits = rank_candidates(records, "sqlite", &TeamSearchOptions::default(), now);
+        let hits = rank(records, "sqlite", &TeamSearchOptions::default(), now);
         assert!(hits.is_empty());
-        let hits = rank_candidates(Vec::new(), "sqlite", &TeamSearchOptions::default(), now);
+        let hits = rank(Vec::new(), "sqlite", &TeamSearchOptions::default(), now);
         assert!(hits.is_empty());
     }
     #[test]
     fn rank_applies_the_threshold() {
         let now = at(1_700_000_000);
         let record = record("id-a", "sqlite storage", now.timestamp(), 0.0);
-        let lenient = rank_candidates(
+        let lenient = rank(
             vec![record.clone()],
             "sqlite storage",
             &TeamSearchOptions::default(),
@@ -457,7 +556,7 @@ mod tests {
             lenient[0].score
         );
         let strict = TeamSearchOptions::default().with_threshold(0.95);
-        assert!(rank_candidates(vec![record], "sqlite storage", &strict, now).is_empty());
+        assert!(rank(vec![record], "sqlite storage", &strict, now).is_empty());
     }
     #[test]
     fn rank_truncates_to_top_k() {
@@ -473,7 +572,7 @@ mod tests {
             })
             .collect();
         let options = TeamSearchOptions::default().with_top_k(2);
-        let hits = rank_candidates(records, "sqlite storage decision", &options, now);
+        let hits = rank(records, "sqlite storage decision", &options, now);
         assert_eq!(hits.len(), 2);
         // Equal scores and timestamps fall back to ascending id order.
         assert_eq!(hits[0].record.id, "id-0");
@@ -491,7 +590,7 @@ mod tests {
             ),
             record("id-new", "sqlite storage decision", now.timestamp(), 0.5),
         ];
-        let hits = rank_candidates(
+        let hits = rank(
             records,
             "sqlite storage decision",
             &TeamSearchOptions::default(),
@@ -513,7 +612,7 @@ mod tests {
             record
         };
         let records = vec![tagged, expired, task];
-        let hits = rank_candidates(
+        let hits = rank(
             records.clone(),
             "sqlite storage",
             &TeamSearchOptions::default(),
@@ -521,15 +620,15 @@ mod tests {
         );
         assert_eq!(hits.len(), 2);
         let by_tag = TeamSearchOptions::default().with_tags(["STORAGE"]);
-        let hits = rank_candidates(records.clone(), "sqlite storage", &by_tag, now);
+        let hits = rank(records.clone(), "sqlite storage", &by_tag, now);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record.id, "id-tagged");
         let by_kind = TeamSearchOptions::default().with_kinds([TeamMemoryKind::Task]);
-        let hits = rank_candidates(records.clone(), "sqlite storage", &by_kind, now);
+        let hits = rank(records.clone(), "sqlite storage", &by_kind, now);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record.id, "id-task");
         let with_expired = TeamSearchOptions::default().include_expired();
-        let hits = rank_candidates(records, "sqlite storage", &with_expired, now);
+        let hits = rank(records, "sqlite storage", &with_expired, now);
         assert_eq!(hits.len(), 3);
     }
     #[test]
@@ -538,7 +637,7 @@ mod tests {
         let mut record = record("id-a", "body text", now.timestamp(), 0.5);
         record.title = Some("Storage choice".to_owned());
         record.visibility = TeamVisibility::Private;
-        let hits = rank_candidates(
+        let hits = rank(
             vec![record],
             "storage choice",
             &TeamSearchOptions::default(),
@@ -546,5 +645,92 @@ mod tests {
         );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record.id, "id-a");
+    }
+    #[test]
+    fn the_old_formula_is_unchanged_without_a_query_vector() {
+        let now = at(1_700_000_000);
+        let record = record("id-a", "sqlite storage", now.timestamp(), 0.0);
+        // A caller that passes the shared default weights but no query vector still gets
+        // the keyword-only formula, because the similarity weight is forced to zero.
+        let options = TeamSearchOptions::default().with_ranking(RankingConfig::default());
+        let hits = rank(vec![record.clone()], "sqlite storage", &options, now);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].similarity, 0.0);
+        // 0.85 * keyword(1.0) + 0.10 * importance(0.0) + 0.05 * recency(1.0).
+        assert!((hits[0].score - 0.90).abs() < 1e-6, "{}", hits[0].score);
+        // The zero-similarity formula holds for every hit of a mixed candidate set.
+        let mut embedded = record
+            .clone()
+            .with_id("id-b")
+            .with_embedding(vec![1.0, 0.0]);
+        embedded.updated_at = at(1_700_000_000 - 86_400);
+        let hits = rank(
+            vec![record, embedded],
+            "sqlite storage",
+            &TeamSearchOptions::default(),
+            now,
+        );
+        for hit in &hits {
+            assert_eq!(hit.similarity, 0.0);
+            let expected = 0.85 * hit.keyword + 0.10 * hit.importance + 0.05 * hit.recency;
+            assert!((hit.score - expected).abs() < 1e-6, "{}", hit.score);
+        }
+    }
+    #[test]
+    fn a_query_vector_ranks_lexically_disjoint_records_by_similarity() {
+        let now = at(1_700_000_000);
+        let related = record(
+            "id-related",
+            "gardening notes",
+            now.timestamp() - 90 * 86_400,
+            0.0,
+        )
+        .with_embedding(vec![1.0, 0.0]);
+        let unrelated = record("id-unrelated", "lunch order", now.timestamp(), 1.0)
+            .with_embedding(vec![0.0, 1.0]);
+        let options = TeamSearchOptions::default().with_ranking(RankingConfig::default());
+        // Without the query vector neither record shares a term with the query.
+        let hits = rank(
+            vec![related.clone(), unrelated.clone()],
+            "postgres schema",
+            &options,
+            now,
+        );
+        assert!(hits.is_empty());
+        // With it, the semantically related record wins despite being older and less
+        // important, and the weight of the semantic group is what does it.
+        let hits = rank_candidates(
+            vec![related, unrelated],
+            "postgres schema",
+            Some(&[1.0, 0.0]),
+            &RankingConfig::default(),
+            &options,
+            now,
+        );
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].record.id, "id-related");
+        assert!((hits[0].similarity - 1.0).abs() < 1e-6);
+        assert!((hits[1].similarity - 0.5).abs() < 1e-6);
+        assert_eq!(hits[0].keyword, 0.0);
+        assert!(hits[0].score > hits[1].score);
+    }
+    #[test]
+    fn validate_rejects_a_bad_query_vector() {
+        let err = TeamSearchOptions::default()
+            .with_query_embedding(Vec::new())
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("query_embedding"), "{err}");
+        let err = TeamSearchOptions::default()
+            .with_query_embedding(vec![0.0, f32::NAN])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("query_embedding"), "{err}");
+        assert!(TeamSearchOptions::default()
+            .with_query_embedding(vec![0.0, 1.0])
+            .validate()
+            .is_ok());
     }
 }

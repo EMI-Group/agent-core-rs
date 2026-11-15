@@ -20,13 +20,16 @@
 
 use chrono::{DateTime, Utc};
 use openjiuwen_common::error::Error;
+use openjiuwen_memory::config::RankingConfig;
 use openjiuwen_memory::record::{CallOptions, MemoryRecord, MemoryScope, MemoryType};
 use openjiuwen_memory::team::{
     NewTeamMemory, TeamMemory, TeamMemoryFilter, TeamMemoryKind, TeamMemoryRecord, TeamMemoryScope,
     TeamMemoryUpdate, TeamSearchHit, TeamSearchOptions, TeamVisibility, TEAM_MEMORY_METADATA_KEY,
     TEAM_WIDE_MEMBER_KEY,
 };
+use openjiuwen_retrieval::embedding::Embedding;
 use serde_json::json;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// The team every single-team test writes to.
@@ -1118,4 +1121,348 @@ async fn sqlite_keeps_two_teams_sharing_one_database_isolated() {
         1,
         "clearing one team leaves the other team's rows in place"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Embedding-based recall
+// ---------------------------------------------------------------------------
+
+/// A deterministic two-axis "topic" embedder.
+///
+/// Every text mentioning `postgres`/`schema`/`database` maps to the first axis and every
+/// text mentioning `pizza`/`lunch` to the second, so two texts about the same topic are
+/// similar even with no shared word, two texts about different topics are orthogonal
+/// (`similarity = 0.5`), and any other text maps to the zero vector, the documented "no
+/// semantic signal" value. Nothing here touches the network.
+#[derive(Debug)]
+struct TopicEmbedding;
+
+/// The vector [`TopicEmbedding`] returns for `text`.
+fn topic_vector(text: &str) -> Vec<f32> {
+    let lowered = text.to_lowercase();
+    if ["postgres", "schema", "database"]
+        .iter()
+        .any(|term| lowered.contains(term))
+    {
+        vec![1.0, 0.0]
+    } else if ["pizza", "lunch"].iter().any(|term| lowered.contains(term)) {
+        vec![0.0, 1.0]
+    } else {
+        vec![0.0, 0.0]
+    }
+}
+
+#[async_trait::async_trait]
+impl Embedding for TopicEmbedding {
+    fn model_name(&self) -> &'static str {
+        "topic-embedding"
+    }
+
+    fn dimension_hint(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>, Error> {
+        Ok(topic_vector(text))
+    }
+
+    async fn embed_documents(
+        &self,
+        texts: &[String],
+        _batch_size: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>, Error> {
+        Ok(texts.iter().map(|text| topic_vector(text)).collect())
+    }
+}
+
+/// An embedder whose every call fails, to prove failures are surfaced and not swallowed.
+#[derive(Debug)]
+struct FailingEmbedding;
+
+#[async_trait::async_trait]
+impl Embedding for FailingEmbedding {
+    fn model_name(&self) -> &'static str {
+        "failing-embedding"
+    }
+
+    async fn embed_query(&self, _text: &str) -> Result<Vec<f32>, Error> {
+        Err(Error::external(std::io::Error::other(
+            "embedding backend is down",
+        )))
+    }
+
+    async fn embed_documents(
+        &self,
+        _texts: &[String],
+        _batch_size: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>, Error> {
+        Err(Error::external(std::io::Error::other(
+            "embedding backend is down",
+        )))
+    }
+}
+
+/// A facade over the in-memory store with [`TopicEmbedding`] attached.
+fn semantic_memory() -> TeamMemory {
+    TeamMemory::in_memory().with_embedding(Arc::new(TopicEmbedding))
+}
+
+/// Seeds one record per topic through the facade: a semantically related decision that is
+/// old and unimportant, and an unrelated one that is brand new and important.
+async fn seeded_semantic_memory(memory: &TeamMemory) {
+    let call = CallOptions::new();
+    let related = memory
+        .remember(
+            NewTeamMemory::decision(TEAM, "postgres schema upgrade")
+                .with_member("alice")
+                .with_importance(0.1),
+            &call,
+        )
+        .await
+        .expect("remember the related decision");
+    let mut aged = related.clone();
+    aged.updated_at = Utc::now() - chrono::Duration::days(120);
+    memory
+        .store()
+        .upsert(&aged)
+        .await
+        .expect("age the related decision");
+    memory
+        .remember(
+            NewTeamMemory::decision(TEAM, "pizza for the sprint lunch")
+                .with_member("bob")
+                .with_importance(1.0),
+            &call,
+        )
+        .await
+        .expect("remember the unrelated decision");
+}
+
+#[tokio::test]
+async fn an_embedder_ranks_a_related_record_over_a_newer_important_one() {
+    let memory = semantic_memory();
+    seeded_semantic_memory(&memory).await;
+    let records = memory
+        .list(&TeamMemoryFilter::for_team(TEAM))
+        .await
+        .expect("list the seeded records");
+    let related = records
+        .iter()
+        .find(|record| record.content.contains("postgres"))
+        .expect("the related record");
+    assert_eq!(
+        related.embedding.as_deref(),
+        Some([1.0, 0.0].as_slice()),
+        "the facade embeds the record it writes"
+    );
+    assert!(
+        records.iter().all(|record| record
+            .embedding
+            .as_ref()
+            .is_some_and(|vector| vector.len() == 2)),
+        "every record written through the facade carries a vector"
+    );
+    // The query shares no term with either record, so only the semantic group can rank.
+    let hits = memory
+        .search(
+            &TeamMemoryScope::new(TEAM),
+            "database migration",
+            &TeamSearchOptions::default(),
+        )
+        .await
+        .expect("semantic search");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].record.id, related.id);
+    assert_eq!(hits[0].keyword, 0.0);
+    assert!((hits[0].similarity - 1.0).abs() < 1e-6);
+    assert!((hits[1].similarity - 0.5).abs() < 1e-6);
+    assert!(hits[0].score > hits[1].score);
+    // The score is the documented blend with the facade's default weights.
+    let expected = 0.85 * (0.70 * hits[0].similarity + 0.30 * hits[0].keyword)
+        + 0.10 * hits[0].importance
+        + 0.05 * hits[0].recency;
+    assert!((hits[0].score - expected).abs() < 1e-5, "{}", hits[0].score);
+}
+
+#[tokio::test]
+async fn the_similarity_weight_is_what_drives_the_semantic_ranking() {
+    let memory = semantic_memory().with_ranking(RankingConfig {
+        similarity_weight: 0.0,
+        ..RankingConfig::default()
+    });
+    seeded_semantic_memory(&memory).await;
+    let hits = memory
+        .search(
+            &TeamMemoryScope::new(TEAM),
+            "database migration",
+            &TeamSearchOptions::default(),
+        )
+        .await
+        .expect("semantic search");
+    assert!(
+        hits.is_empty(),
+        "with no similarity weight a lexically disjoint record has no score left: {hits:?}"
+    );
+}
+
+#[tokio::test]
+async fn without_an_embedder_scores_and_order_match_the_keyword_formula() {
+    let memory = TeamMemory::in_memory();
+    assert!(memory.embedding().is_none());
+    let call = CallOptions::new();
+    let decision = memory
+        .remember(NewTeamMemory::decision(TEAM, "sqlite storage"), &call)
+        .await
+        .expect("remember");
+    assert_eq!(
+        decision.embedding, None,
+        "a keyword-only facade stores no vector"
+    );
+    memory
+        .remember(
+            NewTeamMemory::decision(TEAM, "sqlite storage decision for the shared store"),
+            &call,
+        )
+        .await
+        .expect("remember the second record");
+    memory
+        .remember(NewTeamMemory::decision(TEAM, "gardening notes"), &call)
+        .await
+        .expect("remember the unrelated record");
+    let hits = memory
+        .search(
+            &TeamMemoryScope::new(TEAM),
+            "sqlite storage",
+            &TeamSearchOptions::default(),
+        )
+        .await
+        .expect("keyword search");
+    assert_eq!(hits.len(), 2, "the unrelated record is still dropped");
+    for hit in &hits {
+        assert_eq!(hit.similarity, 0.0);
+        // score = 0.85 * keyword + 0.10 * importance + 0.05 * recency, exactly as before
+        // the embedding seam existed.
+        let expected = 0.85 * hit.keyword + 0.10 * hit.importance + 0.05 * hit.recency;
+        assert!(
+            (hit.score - expected).abs() < 1e-6,
+            "{} != {expected}",
+            hit.score
+        );
+    }
+    // A single record whose text is the query: keyword 1.0, importance 0.5, recency 1.0.
+    let single = TeamMemory::in_memory();
+    single
+        .remember(
+            NewTeamMemory::decision(TEAM, "sqlite storage").with_importance(0.5),
+            &call,
+        )
+        .await
+        .expect("remember the only record");
+    let hits = single
+        .search(
+            &TeamMemoryScope::new(TEAM),
+            "sqlite storage",
+            &TeamSearchOptions::default(),
+        )
+        .await
+        .expect("keyword search");
+    assert_eq!(hits.len(), 1);
+    assert!((hits[0].keyword - 1.0).abs() < 1e-6);
+    assert!(
+        (hits[0].score - 0.95).abs() < 1e-4,
+        "expected the old 0.95 score, got {}",
+        hits[0].score
+    );
+}
+
+#[tokio::test]
+async fn a_failing_embedder_fails_the_write_and_the_search() {
+    let memory = TeamMemory::in_memory().with_embedding(Arc::new(FailingEmbedding));
+    let call = CallOptions::new();
+    let error = memory
+        .remember(NewTeamMemory::decision(TEAM, "sqlite storage"), &call)
+        .await
+        .expect_err("the write must fail");
+    assert!(
+        error.to_string().contains("embedding backend is down"),
+        "{error}"
+    );
+    assert!(
+        memory
+            .list(&TeamMemoryFilter::for_team(TEAM))
+            .await
+            .expect("list")
+            .is_empty(),
+        "a failed embedding stores nothing"
+    );
+    // Seed a record through the store so the search has a candidate.
+    seed(
+        &memory,
+        &[pinned_record(
+            TEAM,
+            None,
+            "id-a",
+            "sqlite storage",
+            TeamMemoryKind::Decision,
+        )],
+    )
+    .await;
+    let error = memory
+        .search(
+            &TeamMemoryScope::new(TEAM),
+            "sqlite storage",
+            &TeamSearchOptions::default(),
+        )
+        .await
+        .expect_err("the search must fail");
+    assert!(
+        error.to_string().contains("embedding backend is down"),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_round_trips_the_embedding_and_ranks_with_it() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("semantic.db");
+    let memory = TeamMemory::sqlite(&path)
+        .await
+        .expect("open the database")
+        .with_embedding(Arc::new(TopicEmbedding));
+    seeded_semantic_memory(&memory).await;
+    let reopened = TeamMemory::sqlite(&path)
+        .await
+        .expect("reopen the database")
+        .with_embedding(Arc::new(TopicEmbedding));
+    let records = reopened
+        .list(&TeamMemoryFilter::for_team(TEAM))
+        .await
+        .expect("list after the reopen");
+    let related = records
+        .iter()
+        .find(|record| record.content.contains("postgres"))
+        .expect("the related record");
+    assert_eq!(
+        related.embedding.as_deref(),
+        Some([1.0, 0.0].as_slice()),
+        "the vector survives the reopen"
+    );
+    let hits = reopened
+        .search(
+            &TeamMemoryScope::new(TEAM),
+            "database migration",
+            &TeamSearchOptions::default(),
+        )
+        .await
+        .expect("semantic search after the reopen");
+    assert_eq!(hits[0].record.id, related.id);
+    assert!((hits[0].similarity - 1.0).abs() < 1e-6);
+    // `get` returns the vector too, not just the listing.
+    let fetched = reopened
+        .get(TEAM, &related.id)
+        .await
+        .expect("get")
+        .expect("the related record");
+    assert_eq!(fetched.embedding, related.embedding);
 }

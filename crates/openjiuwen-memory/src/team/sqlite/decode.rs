@@ -16,12 +16,15 @@
 //!   becomes [`DEFAULT_IMPORTANCE`], and both log a warning.
 //! - `expires_at` that cannot be parsed is treated as "no expiry" (again with a warning),
 //!   which keeps the record visible instead of hiding it behind a broken deadline.
+//! - `embedding_json` that is not a JSON array of finite numbers, or is an empty array,
+//!   decodes as "no embedding" with a warning: a broken vector must never fail a listing,
+//!   and the keyword ranking still works without it.
 //! - A row whose `created_at` or `updated_at` cannot be parsed is skipped: those are the
 //!   sort keys of every listing, and inventing a timestamp would silently reorder rows.
 //!
 //! Every other column is required by the schema, so a read failure there is a real error
 //! and is propagated instead of degraded.
-use super::schema::parse_ts;
+use super::schema::{parse_ts, EMBEDDING_COLUMN};
 use crate::team::model::{TeamMemoryKind, TeamMemoryRecord, TeamVisibility, DEFAULT_IMPORTANCE};
 use openjiuwen_common::error::{Error, Result};
 use sqlx::sqlite::SqliteRow;
@@ -152,6 +155,7 @@ pub(super) fn decode_row(row: &SqliteRow) -> Result<Option<TeamMemoryRecord>> {
         importance: decode_importance(real(row, "importance")?, &id),
         tags: decode_tags(&text(row, "tags_json")?, &id),
         metadata: decode_metadata(&text(row, "metadata_json")?, &id),
+        embedding: decode_embedding(optional_text(row, EMBEDDING_COLUMN)?, &id),
         created_at,
         updated_at,
         source: optional_text(row, "source")?,
@@ -159,6 +163,39 @@ pub(super) fn decode_row(row: &SqliteRow) -> Result<Option<TeamMemoryRecord>> {
         expires_at,
     };
     Ok(Some(record))
+}
+/// Decodes the optional `embedding_json` column into a record embedding.
+///
+/// A `NULL` column means the row was written without a vector (the normal case for a
+/// store whose facade has no embedder). Anything else must be a non-empty JSON array of
+/// finite numbers; a malformed or degenerate vector degrades to `None` with a warning so
+/// the row stays readable and ranks on its keyword term alone.
+fn decode_embedding(raw: Option<String>, id: &str) -> Option<Vec<f32>> {
+    let raw = raw?;
+    let vector = serde_json::from_str::<Vec<f32>>(&raw);
+    match vector {
+        Ok(vector) if !vector.is_empty() && vector.iter().all(|value| value.is_finite()) => {
+            Some(vector)
+        }
+        Ok(vector) => {
+            warn!(
+                target: LOG_TARGET,
+                id = %id,
+                components = vector.len(),
+                "degenerate team memory `embedding_json`; treating the record as unembedded"
+            );
+            None
+        }
+        Err(error) => {
+            warn!(
+                target: LOG_TARGET,
+                id = %id,
+                error = %error,
+                "malformed team memory `embedding_json`; treating the record as unembedded"
+            );
+            None
+        }
+    }
 }
 /// Decodes the optional expiry column; an unparseable deadline becomes "no expiry".
 fn decode_expiry(raw: Option<String>, id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
