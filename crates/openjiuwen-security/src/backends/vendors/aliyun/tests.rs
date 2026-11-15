@@ -519,16 +519,14 @@ fn parse_response_safe_and_code_errors() {
         assert!(assessment.risk_type.is_none());
         assert!(assessment.details.is_none());
     }
-    for reply in [json!({"Code": 200, "Data": {"Result": []}})] {
-        let assessment = offline_backend().parse_response(&reply).unwrap();
-        assert!(!assessment.has_risk, "reply {reply}");
-        assert_eq!(assessment.risk_level, RiskLevel::Safe);
-    }
+    let reply = json!({"Code": 200, "Data": {"Result": []}});
+    let assessment = offline_backend().parse_response(&reply).unwrap();
+    assert!(!assessment.has_risk, "reply {reply}");
+    assert_eq!(assessment.risk_level, RiskLevel::Safe);
 
-    for reply in [json!({"Code": 500, "Message": "internal error"})] {
-        let error = offline_backend().parse_response(&reply).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Transport, "reply {reply}");
-    }
+    let reply = json!({"Code": 500, "Message": "internal error"});
+    let error = offline_backend().parse_response(&reply).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Transport, "reply {reply}");
     let error = offline_backend()
         .parse_response(&json!({"Code": 500, "Message": "bad\nrequest"}))
         .unwrap_err();
