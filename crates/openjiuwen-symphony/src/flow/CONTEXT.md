@@ -229,6 +229,7 @@ The `Reviewer` runs ten checks in order — `structure`, `dependencies`, `code_s
 A pack may not request `credential_access`, `filesystem_write`, `process`, or `shell`, and may only declare `Apache-2.0`, `BSD-3-Clause`, `MIT`, or `Proprietary`; `review_id` is `review_<12 hex>` over the identity fields, and `reviewed_at` is metadata only.
 
 `review_and_prepare_install`/`prepare_install` return structural rejections (unsupported target kind, unknown recipe, stale requested version, failed review) as `InstallPreparation::verdict` with reasons, not errors, and only I/O failures are `Err`.
+Python's `LLMPackageReviewAgent` is not ported: `Reviewer` is the only review path and no check calls a model or the network.
 
 ## Constraints
 
