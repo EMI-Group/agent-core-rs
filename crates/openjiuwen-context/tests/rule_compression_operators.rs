@@ -491,3 +491,335 @@ fn a_page_of_pure_chrome_still_yields_text() {
     // Whether the ladder keeps the region or falls back, text survives.
     assert!(result.content.contains("Short."));
 }
+
+// ---------------------------------------------------------------------------
+// Attribution: a decline, a pass-through or a skipped message names its reason
+// ---------------------------------------------------------------------------
+use openjiuwen_common::error::Error;
+use openjiuwen_context::processor::rule_compression::{
+    DiffCompressor, JsonArrayCompressor, LogCompressor, RuleCompressionPipeline,
+    RuleCompressionResult, RuleCompressor, SearchResultsCompressor, SourceFileCompressor, ADD_PASS,
+};
+use openjiuwen_foundation::prompt::{BaseMessage, ContentPart, MessageContent};
+use std::fmt;
+use std::sync::{Arc, Mutex};
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Level, Metadata, Subscriber};
+/// A thread-local capture of every tracing event, message and field rendered.
+#[derive(Clone, Default)]
+struct EventCapture {
+    /// The rendered events, in emission order.
+    events: Arc<Mutex<Vec<String>>>,
+}
+impl EventCapture {
+    /// An empty capture.
+    fn new() -> Self {
+        Self::default()
+    }
+    /// Every captured event whose rendering contains `needle`.
+    fn matching(&self, needle: &str) -> Vec<String> {
+        self.events
+            .lock()
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|event| event.contains(needle))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+impl Subscriber for EventCapture {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.level() <= &Level::DEBUG
+    }
+    fn new_span(&self, _span: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+    fn event(&self, event: &Event<'_>) {
+        let mut visitor = EventVisitor(String::new());
+        event.record(&mut visitor);
+        if let Ok(mut events) = self.events.lock() {
+            events.push(visitor.0);
+        }
+    }
+    fn enter(&self, _span: &Id) {}
+    fn exit(&self, _span: &Id) {}
+}
+/// Renders one event's message and fields as `key=value` pairs.
+struct EventVisitor(String);
+impl Visit for EventVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.push_str(&format!("{}={} ", field.name(), value));
+    }
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.0.push_str(&format!("{}={:?} ", field.name(), value));
+    }
+}
+#[test]
+fn invalid_utf8_bytes_are_reported_as_decode_damage() {
+    // `caf\xe9` is not UTF-8; the lossy decode substituted one `U+FFFD`, so the
+    // body is damaged text and never clean UTF-8.
+    let sniffed = sniff_bytes(b"caf\xe9 au lait");
+    assert_eq!(sniffed.kind, SniffKind::ReplacementHeavy);
+    assert_eq!(sniffed.decode_replacements, 1);
+    assert!(sniffed.is_passthrough());
+    let details = sniffed.details().expect("the decode damage is reported");
+    assert_eq!(details["content_kind"], "replacement_heavy");
+    assert_eq!(details["decode_replacement_characters"], 1);
+    // A payload that encoded `U+FFFD` itself is data, not damage.
+    let clean = sniff_bytes("a \u{fffd} byte".as_bytes());
+    assert_eq!(clean.kind, SniffKind::Utf8);
+    assert_eq!(clean.decode_replacements, 0);
+    assert!(clean.details().is_none());
+}
+#[test]
+fn a_truncated_utf16_payload_reports_its_dropped_byte_and_surrogate() {
+    // A LE BOM, one unpaired high surrogate and a trailing half unit.
+    let sniffed = sniff_bytes(b"\xFF\xFE\x00\xD8A");
+    assert_eq!(sniffed.kind, SniffKind::Utf16Le);
+    assert_eq!(sniffed.dropped_bytes, 1);
+    assert_eq!(sniffed.decode_replacements, 1);
+    let details = sniffed.details().expect("details");
+    assert_eq!(details["source_encoding"], "utf-16le");
+    assert_eq!(details["dropped_bytes"], 1);
+    assert_eq!(details["decode_replacement_characters"], 1);
+}
+#[test]
+fn a_utf16_surrogate_rides_the_compression_details() {
+    // The latin-1 projection of a UTF-16LE page with one unpaired surrogate.
+    let mut bytes = utf16_bytes(&article_page(), true);
+    bytes.extend([0x00, 0xD8]);
+    let projected: String = bytes.iter().map(|byte| char::from(*byte)).collect();
+    let result = router().compress(&projected, &ctx());
+    assert!(result.modified, "the page still compresses");
+    let details = result.details.expect("details");
+    assert_eq!(details["source_encoding"], "utf-16le");
+    assert_eq!(details["decode_replacement_characters"], 1);
+    assert_eq!(details["dropped_bytes"], 0);
+}
+#[test]
+fn a_latin1_projection_that_would_corrupt_a_character_is_refused() {
+    let capture = EventCapture::new();
+    // A character above `U+00FF` would have to become `?`.
+    let above = "\u{ff}\u{fe}a\u{4e00}";
+    let sniffed = tracing::subscriber::with_default(capture.clone(), || sniff_content(above));
+    assert_eq!(sniffed.kind, SniffKind::Utf8);
+    assert_eq!(sniffed.text, above);
+    assert!(sniffed.details().is_none());
+    assert_eq!(capture.matching("reason=character_above_latin1").len(), 1);
+    // An odd byte count cannot be UTF-16 either.
+    let odd = "\u{ff}\u{fe}h";
+    let sniffed = tracing::subscriber::with_default(capture.clone(), || sniff_content(odd));
+    assert_eq!(sniffed.kind, SniffKind::Utf8);
+    assert_eq!(sniffed.text, odd);
+    assert_eq!(capture.matching("reason=odd_byte_count").len(), 1);
+}
+#[test]
+fn detecting_a_binary_payload_reports_the_evidence() {
+    let capture = EventCapture::new();
+    let binary = "GIF89a\u{0}nul";
+    let content_type =
+        tracing::subscriber::with_default(capture.clone(), || router().detect(binary, &ctx()));
+    assert_eq!(content_type, ContentType::PlainText);
+    let events = capture.matching("payload through untouched");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(events[0].contains("content_kind=binary"));
+    assert!(events[0].contains("reason=binary_payload"));
+    // Replacement-heavy text names the other reason.
+    let mangled = "\u{fffd}".repeat(REPLACEMENT_CHAR_MIN);
+    let capture = EventCapture::new();
+    let content_type =
+        tracing::subscriber::with_default(capture.clone(), || router().detect(&mangled, &ctx()));
+    assert_eq!(content_type, ContentType::PlainText);
+    let events = capture.matching("payload through untouched");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(events[0].contains("content_kind=replacement_heavy"));
+    assert!(events[0].contains("reason=replacement_damaged"));
+}
+#[test]
+fn an_out_of_range_index_is_a_typed_error() {
+    let messages = vec![BaseMessage::user("hi"), BaseMessage::assistant("hello")];
+    let error = RuleCompressionPipeline::new()
+        .compress_in_messages(&messages, 9, ADD_PASS, 100, false)
+        .expect_err("an index the conversation does not own");
+    assert!(matches!(error, Error::Validation(_)), "{error}");
+    assert!(error.to_string().contains("index 9"), "{error}");
+    assert!(error.to_string().contains("2 messages"), "{error}");
+}
+#[test]
+fn a_message_without_text_reports_the_reason_it_was_skipped() {
+    let mut message = BaseMessage::tool("call_1", "");
+    message.content = MessageContent::Parts(vec![ContentPart::Text {
+        text: "x".repeat(400),
+    }]);
+    let messages = vec![message.clone()];
+    let capture = EventCapture::new();
+    let unchanged = tracing::subscriber::with_default(capture.clone(), || {
+        RuleCompressionPipeline::new().compress_in_messages(&messages, 0, ADD_PASS, 10, true)
+    })
+    .expect("an owned index");
+    assert!(unchanged.metadata.is_empty(), "nothing was stamped");
+    assert!(unchanged.content.as_text().is_none(), "content untouched");
+    let events = capture.matching("reason=non_text_content");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(events[0].contains("content_kind=parts"));
+    assert!(events[0].contains("message_index=0"));
+}
+#[test]
+fn an_empty_query_term_set_reports_which_case_it_was() {
+    let pipeline = RuleCompressionPipeline::new();
+    let capture = EventCapture::new();
+    let none = tracing::subscriber::with_default(capture.clone(), || {
+        pipeline.context_for(900, &[], None, None)
+    });
+    assert!(none.query_terms.is_empty());
+    assert_eq!(capture.matching("reason=no_user_message").len(), 1);
+    let empty = tracing::subscriber::with_default(capture.clone(), || {
+        pipeline.context_for(900, &[BaseMessage::user("   ")], None, None)
+    });
+    assert!(empty.query_terms.is_empty());
+    assert_eq!(capture.matching("reason=empty_user_message").len(), 1);
+    let mut user = BaseMessage::user("");
+    user.content = MessageContent::Parts(vec![ContentPart::Text {
+        text: "payout".to_owned(),
+    }]);
+    let non_text = tracing::subscriber::with_default(capture.clone(), || {
+        pipeline.context_for(900, &[user], None, None)
+    });
+    assert!(non_text.query_terms.is_empty());
+    assert_eq!(capture.matching("reason=non_text_user_message").len(), 1);
+}
+#[test]
+fn a_mid_pipeline_decline_is_logged_with_its_reason() {
+    // A small array the router types as JSON but the ladder cannot shrink.
+    let message = BaseMessage::tool("call_1", r#"[{"a":1},{"a":2}]"#);
+    let messages = vec![message];
+    let capture = EventCapture::new();
+    let unchanged = tracing::subscriber::with_default(capture.clone(), || {
+        RuleCompressionPipeline::new().compress_in_messages(&messages, 0, ADD_PASS, 300, true)
+    })
+    .expect("an owned index");
+    assert!(unchanged.metadata.is_empty());
+    let events = capture.matching("compressor declined the body");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(events[0].contains("content_type=JSON_ARRAY"));
+    assert!(events[0].contains("reason=candidate_does_not_fit"));
+    assert!(events[0].contains("message_index=0"));
+}
+#[test]
+fn a_short_log_reports_the_reason_it_was_declined() {
+    let result = LogCompressor.compress("line one\nline two", &ctx());
+    assert!(!result.modified);
+    let details = result.details.expect("the decline reports why");
+    assert_eq!(details["reason"], "below_min_lines");
+    assert_eq!(details["total_lines"], 2);
+    assert_eq!(details["min_lines"], 50);
+}
+#[test]
+fn a_truncated_stack_trace_reports_its_dropped_tail_lines() {
+    let mut lines = vec!["Traceback (most recent call last):".to_owned()];
+    for index in 0..40 {
+        lines.push(format!(
+            "  File \"mod{index}.py\", line {index}, in <module>"
+        ));
+    }
+    lines.push("ERROR: the pipeline failed".to_owned());
+    let mut log_ctx = ctx();
+    log_ctx.log_min_lines = 10;
+    log_ctx.log_stack_trace_max_lines = 5;
+    let result = LogCompressor.compress(&lines.join("\n"), &log_ctx);
+    assert!(result.modified);
+    let details = result.details.expect("details");
+    assert!(
+        details["stack_traces_truncated"].as_u64().unwrap_or(0) > 0,
+        "{details}"
+    );
+    assert!(
+        details["stack_trace_truncated_lines"].as_u64().unwrap_or(0) > 0,
+        "{details}"
+    );
+    assert!(
+        details["stack_trace_dropped_lines"].as_u64().unwrap_or(0) > 0,
+        "{details}"
+    );
+}
+#[test]
+fn every_json_array_decline_carries_a_reason() {
+    let small = RuleContext::new(100);
+    let unparsable = JsonArrayCompressor.compress("[{\"a\": oops}]", &small);
+    assert!(!unparsable.modified);
+    assert_eq!(
+        unparsable.details.expect("details")["reason"],
+        "unparsable_array"
+    );
+    let empty = JsonArrayCompressor.compress("[]", &small);
+    assert!(!empty.modified);
+    assert_eq!(empty.details.expect("details")["reason"], "empty_array");
+    let rows = serde_json::Value::Array(vec![serde_json::json!({"a": 1}); 2]);
+    let small_array = JsonArrayCompressor.compress(&array_text(&rows), &small);
+    assert!(!small_array.modified);
+    let details = small_array.details.expect("details");
+    assert_eq!(details["reason"], "candidate_does_not_fit");
+    assert_eq!(details["rows"], 2);
+}
+#[test]
+fn an_unmeasurable_json_row_is_attributed() {
+    let content =
+        serde_json::Value::Array((0..40).map(serde_json::Value::from).collect()).to_string();
+    // One token of budget: neither the compact nor the salient candidate fits.
+    let result = JsonArrayCompressor.compress(&content, &RuleContext::new(1));
+    assert!(!result.modified);
+    let details = result.details.expect("details");
+    assert_eq!(details["reason"], "candidate_does_not_fit");
+    // Every row parses as a number, so the unscoreable-row count is reported as
+    // zero instead of a row silently scored `0.0`.
+    assert_eq!(details["unmeasurable_rows"], 0);
+    assert_eq!(details["rows"], 40);
+}
+#[test]
+fn search_output_without_parsable_hits_reports_the_reason() {
+    let result = SearchResultsCompressor.compress("just prose\nno markers here", &ctx());
+    assert!(!result.modified);
+    let details = result.details.expect("the decline reports why");
+    assert_eq!(details["reason"], "no_parsable_hits");
+    assert_eq!(details["unparsed_line_count"], 2);
+}
+#[test]
+fn a_diff_without_a_file_header_reports_why_it_was_declined() {
+    let mut diff_ctx = ctx();
+    diff_ctx.diff_min_lines = 1;
+    let content = "@@ -1,2 +1,2 @@\n-a\n+b";
+    let result = DiffCompressor.compress(content, &diff_ctx);
+    assert!(!result.modified);
+    assert_eq!(result.content, content);
+    let details = result.details.expect("the decline reports why");
+    assert_eq!(details["reason"], "no_files_parsed");
+    assert_eq!(details["original_line_count"], 3);
+}
+#[test]
+fn a_blank_source_file_reports_its_digest_stage() {
+    let mut source_ctx = ctx();
+    source_ctx.file_path = Some("src/blank.rs".to_owned());
+    let result = SourceFileCompressor.compress("  \n\n", &source_ctx);
+    assert!(!result.modified);
+    let details = result.details.expect("the decline reports why");
+    assert_eq!(details["digest_stage"], "none");
+    assert_eq!(details["reason"], "blank_content");
+}
+#[test]
+fn an_unchanged_result_can_carry_a_reason() {
+    let bare = RuleCompressionResult::unchanged("body", ContentType::Log);
+    assert!(bare.details.is_none());
+    let attributed = bare.with_details(Some(serde_json::json!({"reason": "nothing_to_do"})));
+    assert!(!attributed.modified);
+    assert_eq!(attributed.content, "body");
+    assert_eq!(
+        attributed.details.expect("details")["reason"],
+        "nothing_to_do"
+    );
+}

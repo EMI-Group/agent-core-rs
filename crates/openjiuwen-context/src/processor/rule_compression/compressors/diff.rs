@@ -21,9 +21,10 @@
 //!
 //! `details` are computed for every parsed diff, including candidates the
 //! savings gate rejected, and `should_offload_original` is
-//! `compressed_line_count < 0.8 * original_line_count`. The two early exits (a
-//! diff shorter than `diff_min_lines`, and unparsable output) report no
-//! `details` at all, matching Python.
+//! `compressed_line_count < 0.8 * original_line_count`. A diff shorter than
+//! `diff_min_lines` reports no `details` at all, matching Python; output the
+//! router typed as a diff but no `diff --git`/`@@` parse produces is a decline
+//! carrying `reason: "no_files_parsed"`.
 use super::{RuleCompressionResult, RuleCompressor};
 use crate::processor::rule_compression::common::{contains_word, meets_savings_ratio};
 use crate::processor::rule_compression::types::{ContentType, RuleContext};
@@ -135,89 +136,45 @@ impl RuleCompressor for DiffCompressor {
         }
         let (preamble, files) = parse_diff(content);
         if files.is_empty() {
-            return RuleCompressionResult::unchanged(content, ContentType::GitDiff);
+            tracing::debug!(
+                reason = "no_files_parsed",
+                original_line_count,
+                preamble_line_count = preamble.len(),
+                "rule compression: diff declined, no file header parsed"
+            );
+            return RuleCompressionResult::declined(
+                content,
+                ContentType::GitDiff,
+                Some(json!({
+                    "reason": "no_files_parsed",
+                    "original_line_count": original_line_count,
+                    "preamble_line_count": preamble.len(),
+                })),
+            );
         }
 
-        let selected_files = select_files(&files, ctx);
-        let selected_file_count = selected_files.len();
-        let mut output: Vec<String> = preamble;
-        let mut hunks_retained = 0_usize;
-        let mut hunks_omitted = 0_usize;
-        let mut context_lines_retained = 0_usize;
-        let mut context_lines_omitted = 0_usize;
-        let mut changed_lines_retained = 0_usize;
-        let mut changed_lines_omitted = 0_usize;
-        let mut changed_lines_remaining = ctx.diff_max_changed_lines_total;
         let additions: usize = files.iter().map(DiffFile::additions).sum();
         let deletions: usize = files.iter().map(DiffFile::deletions).sum();
-
-        let mut ordered_files = selected_files;
-        ordered_files.sort_by_key(|file| file.position);
-        for file in &ordered_files {
-            output.extend(file.header.iter().cloned());
-            let selected_hunks = select_hunks(&file.hunks, ctx);
-            let selected_positions: BTreeSet<usize> =
-                selected_hunks.iter().map(|hunk| hunk.position).collect();
-            let omitted_for_file = file.hunks.len() - selected_hunks.len();
-            for hunk in &file.hunks {
-                if !selected_positions.contains(&hunk.position) {
-                    continue;
-                }
-                let changed_limit = ctx
-                    .diff_max_changed_lines_per_hunk
-                    .min(changed_lines_remaining);
-                let reduced =
-                    reduce_hunk_lines(&hunk.lines, ctx.diff_max_context_lines, changed_limit);
-                changed_lines_remaining =
-                    changed_lines_remaining.saturating_sub(reduced.changed_retained);
-                output.push(hunk.header.clone());
-                output.extend(reduced.lines);
-                if reduced.context_omitted > 0 {
-                    output.push(format!(
-                        "[{} unchanged/context diff lines omitted]",
-                        reduced.context_omitted
-                    ));
-                }
-                if reduced.changed_omitted > 0 {
-                    output.push(format!(
-                        "[{} changed diff lines omitted]",
-                        reduced.changed_omitted
-                    ));
-                }
-                hunks_retained += 1;
-                context_lines_retained += reduced.context_retained;
-                context_lines_omitted += reduced.context_omitted;
-                changed_lines_retained += reduced.changed_retained;
-                changed_lines_omitted += reduced.changed_omitted;
-            }
-            hunks_omitted += omitted_for_file;
-        }
-
-        let files_omitted = files.len() - selected_file_count;
-        output.push(format!(
-            "[{} files changed, +{additions} -{deletions} lines, {hunks_omitted} hunks omitted, \
-             {files_omitted} files omitted]",
-            files.len()
-        ));
-        let candidate = output.join("\n");
+        let rendered = render_diff(preamble, &files, ctx);
+        let candidate = rendered.output.join("\n");
         let compressed_line_count = candidate.lines().count();
-        let lossy = files_omitted > 0
-            || hunks_omitted > 0
-            || context_lines_omitted > 0
-            || changed_lines_omitted > 0;
+        let lossy = rendered.files_omitted > 0
+            || rendered.hunks_omitted > 0
+            || rendered.context_lines_omitted > 0
+            || rendered.changed_lines_omitted > 0;
         let details = json!({
             "files_affected": files.len(),
-            "files_retained": selected_file_count,
-            "files_omitted": files_omitted,
+            "files_retained": rendered.selected_file_count,
+            "files_omitted": rendered.files_omitted,
             "hunks_affected": files.iter().map(|file| file.hunks.len()).sum::<usize>(),
-            "hunks_retained": hunks_retained,
-            "hunks_omitted": hunks_omitted,
+            "hunks_retained": rendered.hunks_retained,
+            "hunks_omitted": rendered.hunks_omitted,
             "additions": additions,
             "deletions": deletions,
-            "context_lines_retained": context_lines_retained,
-            "context_lines_omitted": context_lines_omitted,
-            "changed_lines_retained": changed_lines_retained,
-            "changed_lines_omitted": changed_lines_omitted,
+            "context_lines_retained": rendered.context_lines_retained,
+            "context_lines_omitted": rendered.context_lines_omitted,
+            "changed_lines_retained": rendered.changed_lines_retained,
+            "changed_lines_omitted": rendered.changed_lines_omitted,
             "original_line_count": original_line_count,
             "compressed_line_count": compressed_line_count,
             "should_offload_original":
@@ -235,6 +192,90 @@ impl RuleCompressor for DiffCompressor {
     }
 }
 /// The files a compressed diff keeps.
+/// What rendering the selected files produced.
+#[derive(Debug, Default)]
+struct RenderedDiff {
+    /// The rendered lines: the preamble, the kept files and the closing footer.
+    output: Vec<String>,
+    /// How many files the selection kept.
+    selected_file_count: usize,
+    /// How many hunks were kept.
+    hunks_retained: usize,
+    /// How many hunks were dropped.
+    hunks_omitted: usize,
+    /// How many context lines were kept.
+    context_lines_retained: usize,
+    /// How many context lines were dropped.
+    context_lines_omitted: usize,
+    /// How many changed lines were kept.
+    changed_lines_retained: usize,
+    /// How many changed lines were dropped.
+    changed_lines_omitted: usize,
+    /// How many files were dropped.
+    files_omitted: usize,
+}
+
+/// Selects the files and hunks to keep and renders them after `preamble`.
+fn render_diff(preamble: Vec<String>, files: &[DiffFile], ctx: &RuleContext) -> RenderedDiff {
+    let selected_files = select_files(files, ctx);
+    let mut rendered = RenderedDiff {
+        output: preamble,
+        selected_file_count: selected_files.len(),
+        ..RenderedDiff::default()
+    };
+    let mut changed_lines_remaining = ctx.diff_max_changed_lines_total;
+    let mut ordered_files = selected_files;
+    ordered_files.sort_by_key(|file| file.position);
+    for file in &ordered_files {
+        rendered.output.extend(file.header.iter().cloned());
+        let selected_hunks = select_hunks(&file.hunks, ctx);
+        let selected_positions: BTreeSet<usize> =
+            selected_hunks.iter().map(|hunk| hunk.position).collect();
+        rendered.hunks_omitted += file.hunks.len() - selected_hunks.len();
+        for hunk in &file.hunks {
+            if !selected_positions.contains(&hunk.position) {
+                continue;
+            }
+            let changed_limit = ctx
+                .diff_max_changed_lines_per_hunk
+                .min(changed_lines_remaining);
+            let reduced = reduce_hunk_lines(&hunk.lines, ctx.diff_max_context_lines, changed_limit);
+            changed_lines_remaining =
+                changed_lines_remaining.saturating_sub(reduced.changed_retained);
+            rendered.output.push(hunk.header.clone());
+            rendered.output.extend(reduced.lines);
+            if reduced.context_omitted > 0 {
+                rendered.output.push(format!(
+                    "[{} unchanged/context diff lines omitted]",
+                    reduced.context_omitted
+                ));
+            }
+            if reduced.changed_omitted > 0 {
+                rendered.output.push(format!(
+                    "[{} changed diff lines omitted]",
+                    reduced.changed_omitted
+                ));
+            }
+            rendered.hunks_retained += 1;
+            rendered.context_lines_retained += reduced.context_retained;
+            rendered.context_lines_omitted += reduced.context_omitted;
+            rendered.changed_lines_retained += reduced.changed_retained;
+            rendered.changed_lines_omitted += reduced.changed_omitted;
+        }
+    }
+    rendered.files_omitted = files.len() - rendered.selected_file_count;
+    let additions: usize = files.iter().map(DiffFile::additions).sum();
+    let deletions: usize = files.iter().map(DiffFile::deletions).sum();
+    rendered.output.push(format!(
+        "[{} files changed, +{additions} -{deletions} lines, {} hunks omitted, \
+         {} files omitted]",
+        files.len(),
+        rendered.hunks_omitted,
+        rendered.files_omitted
+    ));
+    rendered
+}
+
 fn select_files(files: &[DiffFile], ctx: &RuleContext) -> Vec<DiffFile> {
     if files.len() <= ctx.diff_max_files {
         return files.to_vec();

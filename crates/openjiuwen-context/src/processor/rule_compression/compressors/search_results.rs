@@ -15,7 +15,9 @@
 //! and high-signal counts; the per-file limit is `search_max_matches_per_file`,
 //! keeping the first, the last and the top-scored matches. Non-match lines are
 //! preserved but hoisted directly after the header, omission markers close each
-//! omitted group, and `details` are reported for unchanged results too.
+//! omitted group, and `details` are reported for unchanged results too — a body
+//! with no parsable hit carries `reason: "no_parsable_hits"` and the
+//! `unparsed_line_count` the normal path reports.
 use super::{RuleCompressionResult, RuleCompressor};
 use crate::processor::rule_compression::common::{
     contains_word, meets_savings_ratio, strip_display_line_prefixes,
@@ -136,12 +138,14 @@ impl RuleCompressor for SearchResultsCompressor {
         RuleCompressionResult::applied(compressed, ContentType::SearchResults, lossy, details)
     }
 }
-/// Runs the grouping, scoring and selection, returning the candidate.
-fn run(content: &str, ctx: &RuleContext) -> (String, bool, Option<serde_json::Value>) {
-    let normalized_content = strip_display_line_prefixes(content);
+/// Parses every line, grouping the hits per file and collecting the rest.
+///
+/// Grouping is in first-seen order and the unparsed lines keep their order, so
+/// the rendered candidate reproduces Python's shape.
+fn group_hits(content: &str) -> (Vec<(String, Vec<SearchMatch>)>, Vec<String>) {
     let mut grouped: Vec<(String, Vec<SearchMatch>)> = Vec::new();
     let mut unparsed_lines: Vec<String> = Vec::new();
-    for (position, line) in normalized_content.lines().enumerate() {
+    for (position, line) in content.lines().enumerate() {
         match parse_search_match(line, position) {
             Some(found) => {
                 if let Some((_, matches)) = grouped
@@ -160,8 +164,29 @@ fn run(content: &str, ctx: &RuleContext) -> (String, bool, Option<serde_json::Va
             }
         }
     }
+    (grouped, unparsed_lines)
+}
+/// Runs the grouping, scoring and selection, returning the candidate.
+fn run(content: &str, ctx: &RuleContext) -> (String, bool, Option<serde_json::Value>) {
+    let normalized_content = strip_display_line_prefixes(content);
+    let (grouped, unparsed_lines) = group_hits(&normalized_content);
     if grouped.is_empty() {
-        return (content.to_owned(), false, None);
+        // Nothing parsed: keep the `unparsed_line_count` the normal path reports,
+        // so a body the router typed as search output is explainable.
+        tracing::debug!(
+            reason = "no_parsable_hits",
+            unparsed_line_count = unparsed_lines.len(),
+            "rule compression: search output declined, no line parsed as a hit"
+        );
+        return (
+            content.to_owned(),
+            false,
+            Some(json!({
+                "reason": "no_parsable_hits",
+                "unparsed_line_count": unparsed_lines.len(),
+                "line_count": normalized_content.lines().count(),
+            })),
+        );
     }
 
     let scored: Vec<(String, Vec<SearchMatch>)> = grouped
@@ -412,10 +437,13 @@ mod tests {
         assert_eq!(details["unparsed_line_count"], 0);
     }
     #[test]
-    fn non_search_output_is_declined() {
+    fn non_search_output_is_declined_with_the_reason() {
         let content = "one\ntwo\nthree";
         let result = SearchResultsCompressor.compress(content, &RuleContext::new(100));
         assert!(!result.modified);
-        assert!(result.details.is_none());
+        let details = result.details.expect("the decline reports why");
+        assert_eq!(details["reason"], "no_parsable_hits");
+        assert_eq!(details["unparsed_line_count"], 3);
+        assert_eq!(details["line_count"], 3);
     }
 }

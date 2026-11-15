@@ -2,7 +2,11 @@
 //!
 //! Ports `rule_compression/pipeline.py`. A pass runs on one tool message:
 //!
-//! 1. only `Role::Tool` messages with text content are considered,
+//! 1. only `Role::Tool` messages with text content are considered — a message
+//!    whose content is a part list is returned unchanged with one
+//!    `tracing::debug!` line naming the message index, the content kind and the
+//!    `non_text_content` reason, and an index the conversation does not own is
+//!    [`Error::Validation`] naming the index and the message count,
 //! 2. the message is skipped when its text is not longer than `max_chars`,
 //!    unless `force` is set (the TTL pass compresses regardless of size),
 //! 3. a [`RuleContext`] is derived from the character budget — `max_tokens =
@@ -227,6 +231,9 @@ impl RuleCompressionPipeline {
     /// may write carries no session or context id; use
     /// [`RuleCompressionPipeline::compress_in_messages_with_scope`] when the
     /// caller knows them.
+    ///
+    /// An `index` the conversation does not own is [`Error::Validation`] naming
+    /// the index and the message count, never a silent no-op.
     pub fn compress_in_messages(
         &self,
         messages: &[BaseMessage],
@@ -252,6 +259,10 @@ impl RuleCompressionPipeline {
     /// neither, the dump falls back to [`super::dump::UNKNOWN_SESSION_ID`] and
     /// [`super::dump::UNKNOWN_CONTEXT_ID`] (a processor always has a scope, so the
     /// placeholders only appear for a standalone caller).
+    ///
+    /// An `index` the conversation does not own is [`Error::Validation`] naming
+    /// the index and the message count: the pass never fabricates a message, so
+    /// a caller cannot mistake an out-of-range index for a declined body.
     pub fn compress_in_messages_with_scope(
         &self,
         messages: &[BaseMessage],
@@ -261,15 +272,26 @@ impl RuleCompressionPipeline {
         force: bool,
         scope: &OffloadScope,
     ) -> Result<BaseMessage> {
-        let message = messages
-            .get(index)
-            .cloned()
-            .unwrap_or_else(|| BaseMessage::user(""));
+        let Some(message) = messages.get(index) else {
+            return Err(Error::validation(format!(
+                "rule compression: message index {index} is out of range for a conversation \
+                 of {} messages",
+                messages.len()
+            )));
+        };
         let tool_call = resolve_tool_call(messages, index);
         let tool_name = tool_call.map(|call| call.name.as_str());
         let tool_arguments = tool_call.map(|call| call.arguments.as_str());
         let ctx = self.context_for(max_chars, messages, tool_name, tool_arguments);
-        self.compress_with_scope(&message, &ctx, pass_name, max_chars, force, scope)
+        Ok(self.compress_message(
+            message,
+            Some(index),
+            &ctx,
+            pass_name,
+            max_chars,
+            force,
+            scope,
+        ))
     }
 
     /// Compresses `message` with `ctx`, or returns it unchanged.
@@ -305,15 +327,48 @@ impl RuleCompressionPipeline {
         force: bool,
         scope: &OffloadScope,
     ) -> Result<BaseMessage> {
+        Ok(self.compress_message(message, None, ctx, pass_name, max_chars, force, scope))
+    }
+
+    /// The one compression body: `index` is the message's position when known.
+    ///
+    /// A tool message whose content is not text is returned unchanged, with one
+    /// `tracing::debug!` line naming the message index (or `unknown` for a
+    /// standalone [`RuleCompressionPipeline::compress_with_scope`] call), the
+    /// content kind and the `non_text_content` reason, because "nothing to do"
+    /// and "cannot do it" must not look identical.
+    fn compress_message(
+        &self,
+        message: &BaseMessage,
+        index: Option<usize>,
+        ctx: &RuleContext,
+        pass_name: &str,
+        max_chars: usize,
+        force: bool,
+        scope: &OffloadScope,
+    ) -> BaseMessage {
         if message.role != Role::Tool || !self.strategy.runs_rule_compression() {
-            return Ok(message.clone());
+            return message.clone();
         }
         let Some(text) = message.content.as_text() else {
-            return Ok(message.clone());
+            let content_kind = content_kind(&message.content);
+            let label = index.map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+            tracing::debug!(
+                reason = "non_text_content",
+                content_kind,
+                message_index = %label,
+                details = %json!({
+                    "reason": "non_text_content",
+                    "content_kind": content_kind,
+                    "message_index": index,
+                }),
+                "rule compression: message content is not text"
+            );
+            return message.clone();
         };
         let text = text.to_owned();
         if !force && text.chars().count() <= max_chars {
-            return Ok(message.clone());
+            return message.clone();
         }
         let mut budget = ctx.clone();
         budget.max_tokens = (max_chars / CHARACTERS_PER_TOKEN).max(1);
@@ -323,7 +378,25 @@ impl RuleCompressionPipeline {
 
         let result = self.router.compress(&text, &budget);
         if !result.modified {
-            return Ok(message.clone());
+            // The compressor's own `details` are the only record of why it
+            // declined, and an unchanged message carries no metadata, so the
+            // reason is logged here rather than dropped.
+            if let Some(reason) = result
+                .details
+                .as_ref()
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str)
+            {
+                let details = result.details.clone().unwrap_or(Value::Null);
+                tracing::debug!(
+                    content_type = result.content_type.as_str(),
+                    reason,
+                    message_index = %index.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                    details = %details,
+                    "rule compression: compressor declined the body"
+                );
+            }
+            return message.clone();
         }
         let tool_call_id = message.tool_call_id.as_deref().unwrap_or("unknown");
         let mut compressed = message.clone();
@@ -362,22 +435,49 @@ impl RuleCompressionPipeline {
             text.chars().count(),
             result.content.chars().count(),
         );
-        Ok(compressed)
+        compressed
     }
 
     /// Query terms of the latest user message plus the triggering tool call.
+    ///
+    /// An empty user contribution is attributed with one `tracing::debug!` line
+    /// naming which case it was (`no_user_message`, `non_text_user_message` or
+    /// `empty_user_message`), so a relevance-free pass is explainable.
     fn query_terms(
         messages: &[BaseMessage],
         tool_name: Option<&str>,
         tool_arguments: Option<&str>,
     ) -> BTreeSet<String> {
-        let latest_user = messages
+        let Some((index, message)) = messages
             .iter()
+            .enumerate()
             .rev()
-            .find(|message| message.role == Role::User)
-            .and_then(|message| message.content.as_text())
-            .unwrap_or_default();
-        extract_query_terms(latest_user, tool_name, tool_arguments)
+            .find(|(_, message)| message.role == Role::User)
+        else {
+            tracing::debug!(
+                reason = "no_user_message",
+                messages = messages.len(),
+                "rule compression: no query terms, the conversation has no user message"
+            );
+            return extract_query_terms("", tool_name, tool_arguments);
+        };
+        let Some(text) = message.content.as_text() else {
+            tracing::debug!(
+                reason = "non_text_user_message",
+                content_kind = content_kind(&message.content),
+                message_index = index,
+                "rule compression: no query terms, the latest user message is not text"
+            );
+            return extract_query_terms("", tool_name, tool_arguments);
+        };
+        if text.trim().is_empty() {
+            tracing::debug!(
+                reason = "empty_user_message",
+                message_index = index,
+                "rule compression: the latest user message is empty"
+            );
+        }
+        extract_query_terms(text, tool_name, tool_arguments)
     }
 
     /// Writes the dump of one application, returning its path on success.
@@ -451,6 +551,15 @@ impl RuleCompressionPipeline {
             dir.display()
         );
         *last = Some(key);
+    }
+}
+
+/// The kind of a message content, for attribution in a log line.
+fn content_kind(content: &MessageContent) -> &'static str {
+    match content {
+        MessageContent::Text(_) => "text",
+        MessageContent::Parts(parts) if parts.is_empty() => "empty_parts",
+        MessageContent::Parts(_) => "parts",
     }
 }
 

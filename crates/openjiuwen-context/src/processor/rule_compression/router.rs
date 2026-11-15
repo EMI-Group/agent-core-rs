@@ -31,7 +31,10 @@
 //!
 //! [`ContentType`] is the router's single routing label and has no binary
 //! variant, so a pass-through reports `PLAIN_TEXT`; the [`SniffKind`] names the
-//! reason in the result's `details` and in one `tracing::debug!` line.
+//! reason in the result's `details`, in one `tracing::debug!` line from
+//! [`RuleContentRouter::compress`], and in the `content_kind`/`reason` pair
+//! [`RuleContentRouter::detect`] logs, so a caller that only detects still sees
+//! why a payload was typed as plain text.
 use self::repair::strip_code_fence;
 use super::common::{
     find_word, is_source_file_path, strip_display_line_prefixes,
@@ -90,7 +93,9 @@ impl RuleContentRouter {
     ///
     /// The payload is sniffed first ([`sniff_content`]): a UTF-16 body is typed
     /// from its UTF-8 re-encoding, and a binary or replacement-heavy body is
-    /// typed as `PLAIN_TEXT` because no compressor may touch it.
+    /// typed as `PLAIN_TEXT` because no compressor may touch it. A pass-through
+    /// or a re-encoded body is reported through `log_sniff_evidence`, so
+    /// a caller that only detects is not blind to the reason.
     #[must_use]
     pub fn detect(&self, content: &str, ctx: &RuleContext) -> ContentType {
         if ctx
@@ -101,10 +106,48 @@ impl RuleContentRouter {
             return ContentType::SourceFile;
         }
         let sniffed = sniff_content(content);
+        Self::log_sniff_evidence(&sniffed, content.len());
         if sniffed.is_passthrough() {
             return ContentType::PlainText;
         }
         Self::detect_text(sniffed.text())
+    }
+
+    /// Records the evidence a sniff found, so detection alone reports its reason.
+    ///
+    /// A pass-through body names its `content_kind` and its `reason`
+    /// (`binary_payload` or `replacement_damaged`, the latter also raised by one
+    /// invalid UTF-8 byte); a re-encoded or damaged-in-decoding body names its
+    /// source encoding, its dropped UTF-16 bytes and its substituted `U+FFFD`
+    /// count. A clean UTF-8 body logs nothing.
+    fn log_sniff_evidence(sniffed: &SniffedContent, bytes: usize) {
+        if sniffed.is_passthrough() {
+            let reason = if sniffed.kind == SniffKind::Binary {
+                "binary_payload"
+            } else {
+                "replacement_damaged"
+            };
+            tracing::debug!(
+                content_kind = sniffed.kind.as_str(),
+                reason,
+                content_type = ContentType::PlainText.as_str(),
+                bytes,
+                nul_bytes = sniffed.nul_bytes,
+                control_ratio = sniffed.control_ratio,
+                replacement_characters = sniffed.replacement_characters,
+                decode_replacement_characters = sniffed.decode_replacements,
+                "rule compression: detection passes the payload through untouched"
+            );
+        } else if sniffed.converted || sniffed.dropped_bytes > 0 || sniffed.decode_replacements > 0
+        {
+            tracing::debug!(
+                content_kind = sniffed.kind.as_str(),
+                source_encoding = sniffed.source_encoding(),
+                dropped_bytes = sniffed.dropped_bytes,
+                decode_replacement_characters = sniffed.decode_replacements,
+                "rule compression: detection types a re-encoded body"
+            );
+        }
     }
 
     /// Types an already-sniffed UTF-8 body.
@@ -169,11 +212,17 @@ impl RuleContentRouter {
         let sniffed = sniff_content(content);
         if sniffed.is_passthrough() {
             tracing::debug!(
-                kind = sniffed.kind.as_str(),
+                content_kind = sniffed.kind.as_str(),
+                reason = if sniffed.kind == SniffKind::Binary {
+                    "binary_payload"
+                } else {
+                    "replacement_damaged"
+                },
                 bytes = content.len(),
                 nul_bytes = sniffed.nul_bytes,
                 control_ratio = sniffed.control_ratio,
                 replacement_characters = sniffed.replacement_characters,
+                decode_replacement_characters = sniffed.decode_replacements,
                 "rule compression: payload passed through untouched"
             );
             return RuleCompressionResult::declined(

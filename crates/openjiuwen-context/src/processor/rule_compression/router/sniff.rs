@@ -24,7 +24,16 @@
 //! byte slice handed to [`sniff_bytes`]) carries the BOM as the two characters
 //! `U+00FF U+00FE`; [`sniff_content`] recognises that spelling and reconstructs
 //! the bytes before re-decoding, so a latin-1 projection of a UTF-16 body is
-//! recovered too.
+//! recovered too — but only when that projection is faithful: an odd byte count
+//! or a character above `U+00FF` would have to be replaced with `?`, so the
+//! reinterpretation is refused and the text is sniffed as the text it is.
+//!
+//! Decoding damage is attributed rather than hidden: a UTF-8 decode that had to
+//! substitute `U+FFFD` for an invalid byte marks the body
+//! [`SniffKind::ReplacementHeavy`] however few bytes it replaced, and the count
+//! rides [`SniffedContent::decode_replacements`]; a UTF-16 decode reports its
+//! unpaired-surrogate count there and its trailing dropped byte count in
+//! [`SniffedContent::dropped_bytes`].
 use serde::{Deserialize, Serialize};
 
 /// How much of a body the binary scan looks at.
@@ -104,6 +113,13 @@ pub struct SniffedContent {
     pub control_ratio: f64,
     /// `U+FFFD` characters in the text.
     pub replacement_characters: usize,
+    /// `U+FFFD` characters decoding itself substituted for invalid UTF-8 bytes
+    /// or unpaired UTF-16 surrogates (`0` when the body decoded cleanly).
+    #[serde(default)]
+    pub decode_replacements: usize,
+    /// Bytes a UTF-16 decode dropped because the payload ended mid code unit.
+    #[serde(default)]
+    pub dropped_bytes: usize,
 }
 impl SniffedContent {
     /// The sniffed text.
@@ -122,9 +138,15 @@ impl SniffedContent {
         self.kind.source_encoding()
     }
     /// The `details` fragment a compressor may merge into its own report.
+    ///
+    /// Keys: `content_kind`, `source_encoding`, `recoded`, `nul_bytes`,
+    /// `control_ratio`, `replacement_characters`, `decode_replacement_characters`
+    /// (the `U+FFFD` count decoding had to substitute) and `dropped_bytes` (the
+    /// UTF-16 trailing bytes a decode dropped).
     #[must_use]
     pub fn details(&self) -> Option<serde_json::Value> {
-        if self.kind == SniffKind::Utf8 {
+        if self.kind == SniffKind::Utf8 && self.decode_replacements == 0 && self.dropped_bytes == 0
+        {
             return None;
         }
         Some(serde_json::json!({
@@ -134,16 +156,32 @@ impl SniffedContent {
             "nul_bytes": self.nul_bytes,
             "control_ratio": self.control_ratio,
             "replacement_characters": self.replacement_characters,
+            "decode_replacement_characters": self.decode_replacements,
+            "dropped_bytes": self.dropped_bytes,
         }))
     }
 }
 
 /// Sniffs a `&str` body, recovering a latin-1 projection of a UTF-16 payload.
+///
+/// The projection is only reinterpreted when it is faithful; otherwise the body
+/// is sniffed as the text it already is and one `tracing::debug!` line names the
+/// reason (`odd_byte_count` or `character_above_latin1`).
 #[must_use]
 pub fn sniff_content(content: &str) -> SniffedContent {
     match content.chars().take(2).collect::<Vec<_>>().as_slice() {
         // A UTF-16 BOM that an earlier decode turned into `ÿþ` or `þÿ`.
-        ['\u{ff}', '\u{fe}'] | ['\u{fe}', '\u{ff}'] => sniff_bytes(&latin1_bytes(content)),
+        ['\u{ff}', '\u{fe}'] | ['\u{fe}', '\u{ff}'] => match latin1_bytes(content) {
+            Ok(bytes) => sniff_bytes(&bytes),
+            Err(reason) => {
+                tracing::debug!(
+                    reason,
+                    characters = content.chars().count(),
+                    "rule compression: refusing to reinterpret a lossy latin-1 projection as UTF-16"
+                );
+                sniff_bytes(content.as_bytes())
+            }
+        },
         _ => sniff_bytes(content.as_bytes()),
     }
 }
@@ -154,47 +192,83 @@ pub fn sniff_bytes(bytes: &[u8]) -> SniffedContent {
     // UTF-16 wins over everything else: its BOM cannot occur at the start of a
     // UTF-8 document.
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        let text = decode_utf16(rest, true);
-        return finish(text, SniffKind::Utf16Le, true);
+        return finish(decode_utf16(rest, true), SniffKind::Utf16Le, true);
     }
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        let text = decode_utf16(rest, false);
-        return finish(text, SniffKind::Utf16Be, true);
+        return finish(decode_utf16(rest, false), SniffKind::Utf16Be, true);
     }
-    let (text, kind) = match bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        Some(rest) => (
-            String::from_utf8_lossy(rest).into_owned(),
-            SniffKind::Utf8Bom,
-        ),
-        None => (String::from_utf8_lossy(bytes).into_owned(), SniffKind::Utf8),
-    };
-    finish(text, kind, false)
+    match bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        Some(rest) => finish(decode_utf8(rest), SniffKind::Utf8Bom, false),
+        None => finish(decode_utf8(bytes), SniffKind::Utf8, false),
+    }
 }
 
-/// Fills in the binary, replacement and conversion facts of a sniffed body.
-fn finish(text: String, kind: SniffKind, converted: bool) -> SniffedContent {
-    let scan = scan_bytes(text.as_bytes());
-    let replacement_characters = text
+/// What one decode produced: the text plus the damage it had to absorb.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Decoded {
+    /// The decoded text.
+    text: String,
+    /// `U+FFFD` characters the decode substituted for invalid input.
+    replacements: usize,
+    /// Bytes dropped because the payload ended mid code unit.
+    dropped_bytes: usize,
+}
+
+/// Decodes UTF-8 lossily, counting the substitutions it had to make.
+///
+/// A `U+FFFD` the payload genuinely encoded (`EF BF BD`) is data, not damage, so
+/// it is subtracted from the decoded count.
+fn decode_utf8(bytes: &[u8]) -> Decoded {
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    let decoded = text
         .chars()
         .filter(|value| *value == REPLACEMENT_CHARACTER)
         .count();
-    let characters = text.chars().count().max(1);
-    let class = if scan.nul_bytes > 0 || scan.control_ratio > MAX_CONTROL_RATIO_PERCENT as f64 {
+    let encoded = bytes
+        .windows(3)
+        .filter(|window| *window == [0xEF, 0xBF, 0xBD])
+        .count();
+    Decoded {
+        text,
+        replacements: decoded.saturating_sub(encoded),
+        dropped_bytes: 0,
+    }
+}
+
+/// Fills in the binary, replacement and conversion facts of a sniffed body.
+fn finish(decoded: Decoded, kind: SniffKind, converted: bool) -> SniffedContent {
+    let scan = scan_bytes(decoded.text.as_bytes());
+    let replacement_characters = decoded
+        .text
+        .chars()
+        .filter(|value| *value == REPLACEMENT_CHARACTER)
+        .count();
+    let characters = decoded.text.chars().count().max(1);
+    let binary = scan.nul_bytes > 0 || scan.control_ratio > MAX_CONTROL_RATIO_PERCENT as f64;
+    let heavy = replacement_characters >= REPLACEMENT_CHAR_MIN
+        && replacement_characters * 100 >= characters * REPLACEMENT_CHAR_RATIO_PERCENT;
+    // A UTF-8 body whose decode already substituted `U+FFFD` is damaged however
+    // few bytes it replaced, so it is never rewritten as if it were clean text. A
+    // UTF-16 body keeps its kind (the re-encoding is still the best reading) and
+    // reports the same damage through `decode_replacements`.
+    let lossy_utf8 =
+        decoded.replacements > 0 && matches!(kind, SniffKind::Utf8 | SniffKind::Utf8Bom);
+    let class = if binary {
         SniffKind::Binary
-    } else if replacement_characters >= REPLACEMENT_CHAR_MIN
-        && replacement_characters * 100 >= characters * REPLACEMENT_CHAR_RATIO_PERCENT
-    {
+    } else if lossy_utf8 || heavy {
         SniffKind::ReplacementHeavy
     } else {
         kind
     };
     SniffedContent {
-        text,
+        text: decoded.text,
         kind: class,
         converted,
         nul_bytes: scan.nul_bytes,
         control_ratio: scan.control_ratio,
         replacement_characters,
+        decode_replacements: decoded.replacements,
+        dropped_bytes: decoded.dropped_bytes,
     }
 }
 
@@ -232,9 +306,11 @@ fn scan_bytes(bytes: &[u8]) -> ByteScan {
 
 /// Decodes UTF-16 code units into text, dropping a redundant leading BOM.
 ///
-/// A trailing odd byte is dropped, and an unpaired surrogate decodes to `U+FFFD`
-/// through `String::from_utf16_lossy`.
-fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
+/// A trailing odd byte is dropped and counted in [`Decoded::dropped_bytes`], and
+/// an unpaired surrogate decodes to `U+FFFD` through
+/// `String::from_utf16_lossy`, counted in [`Decoded::replacements`] (a `U+FFFD`
+/// the payload genuinely encoded is data and is subtracted).
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> Decoded {
     let units: Vec<u16> = bytes
         .chunks_exact(2)
         .map(|pair| {
@@ -246,16 +322,33 @@ fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
         })
         .collect();
     let decoded = String::from_utf16_lossy(&units);
-    match decoded.strip_prefix('\u{feff}') {
+    let replacements = decoded
+        .chars()
+        .filter(|value| *value == REPLACEMENT_CHARACTER)
+        .count()
+        .saturating_sub(units.iter().filter(|unit| **unit == 0xFFFD).count());
+    let text = match decoded.strip_prefix('\u{feff}') {
         Some(rest) => rest.to_owned(),
         None => decoded,
+    };
+    Decoded {
+        text,
+        replacements,
+        dropped_bytes: bytes.len() % 2,
     }
 }
 
 /// The latin-1 projection of `text`, one byte per character below `U+0100`.
-fn latin1_bytes(text: &str) -> Vec<u8> {
+///
+/// The projection is refused with a reason when it would not be faithful: an odd
+/// byte count cannot be UTF-16, and a character above `U+00FF` would have to be
+/// replaced with `?`.
+fn latin1_bytes(text: &str) -> std::result::Result<Vec<u8>, &'static str> {
+    if text.chars().count() % 2 != 0 {
+        return Err("odd_byte_count");
+    }
     text.chars()
-        .map(|value| u8::try_from(u32::from(value)).unwrap_or(b'?'))
+        .map(|value| u8::try_from(u32::from(value)).map_err(|_| "character_above_latin1"))
         .collect()
 }
 
@@ -324,6 +417,48 @@ mod tests {
         assert_eq!(sniffed.kind, SniffKind::ReplacementHeavy);
         assert_eq!(sniffed.replacement_characters, 10);
         assert!(sniffed.is_passthrough());
+    }
+
+    #[test]
+    fn invalid_utf8_bytes_are_counted_as_replacement_damage() {
+        let sniffed = sniff_bytes(b"caf\xe9 au lait");
+        assert_eq!(sniffed.decode_replacements, 1);
+        assert_eq!(sniffed.replacement_characters, 1);
+        assert_eq!(sniffed.kind, SniffKind::ReplacementHeavy);
+        assert!(sniffed.is_passthrough());
+        // A `U+FFFD` the payload encoded itself is data, not damage.
+        let clean = sniff_bytes("a \u{fffd} byte".as_bytes());
+        assert_eq!(clean.decode_replacements, 0);
+        assert_eq!(clean.kind, SniffKind::Utf8);
+        assert!(clean.details().is_none());
+    }
+
+    #[test]
+    fn a_truncated_utf16_payload_reports_its_damage() {
+        // `hi` plus a dropped trailing byte and an unpaired high surrogate.
+        let sniffed = sniff_bytes(b"\xFF\xFEh\x00i\x00\x00\xD8A");
+        assert_eq!(sniffed.kind, SniffKind::Utf16Le);
+        assert_eq!(sniffed.dropped_bytes, 1);
+        assert_eq!(sniffed.decode_replacements, 1);
+        let details = sniffed
+            .details()
+            .expect("a re-encoded body reports details");
+        assert_eq!(details["dropped_bytes"], 1);
+        assert_eq!(details["decode_replacement_characters"], 1);
+    }
+
+    #[test]
+    fn a_lossy_latin1_projection_is_not_reinterpreted() {
+        // Three characters: odd, so it cannot be a UTF-16 byte string.
+        let odd = sniff_content("\u{ff}\u{fe}h");
+        assert_eq!(odd.kind, SniffKind::Utf8);
+        assert_eq!(odd.text, "\u{ff}\u{fe}h");
+        // A character above `U+00FF` would be projected as `?`, so the body is
+        // sniffed as the text it is instead.
+        let wide = sniff_content("\u{ff}\u{fe}a\u{4e00}");
+        assert_eq!(wide.kind, SniffKind::Utf8);
+        assert_eq!(wide.text, "\u{ff}\u{fe}a\u{4e00}");
+        assert!(!wide.converted);
     }
 
     #[test]

@@ -279,6 +279,9 @@ pub struct RuleCompressionResult {
 }
 impl RuleCompressionResult {
     /// A result that leaves `content` untouched.
+    ///
+    /// `details` start empty; attach a reason with [`Self::with_details`] (or use
+    /// [`Self::declined`]) when the caller needs to know why nothing was done.
     #[must_use]
     pub fn unchanged(content: &str, content_type: ContentType) -> Self {
         Self {
@@ -288,6 +291,15 @@ impl RuleCompressionResult {
             lossy: false,
             details: None,
         }
+    }
+    /// The same result, carrying `details`; `None` keeps it bare.
+    ///
+    /// This is the attribution seam every constructor shares: a decline can name
+    /// its `reason` without changing what the compressor returned.
+    #[must_use]
+    pub fn with_details(mut self, details: Option<Value>) -> Self {
+        self.details = details;
+        self
     }
     /// A result that declined, carrying the `details` a caller may still read.
     #[must_use]
