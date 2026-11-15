@@ -26,6 +26,17 @@
 //! width of the widest column reference, and `A1`-style references (including
 //! `AA`, `AB`, …) place each cell in its own column.
 //!
+//! The shared-string table may legitimately be absent: a workbook that uses
+//! inline strings only needs no `xl/sharedStrings.xml` part, and such a sheet
+//! parses fine. A part that does exist must be readable, parsable, and rooted,
+//! and every `t="s"` cell must resolve to an entry in it — a missing or
+//! non-numeric index, or an index past the end of the table, is a typed
+//! [`Error::Retrieval`] naming the worksheet part and the cell rather than an
+//! empty string, so a broken shared-string table can never pass as a workbook
+//! whose text happens to be blank. The `<sst>` `count`/`uniqueCount`
+//! declarations are informational only and are never checked against the real
+//! `<si>` count.
+//!
 //! The first row that holds any text becomes the header, matching the
 //! reference's "first row is the header" rule for a normal sheet; rows after it
 //! are data rows, and the generated documents reuse
@@ -182,8 +193,10 @@ impl XlsxParser {
     ///
     /// Propagates the [`ZipArchive`] errors (a corrupt container) and returns
     /// [`Error::Retrieval`] when a required part is missing (the message names the
-    /// part). Malformed part XML is [`Error::Validation`]. A workbook with no
-    /// sheets is not an error.
+    /// part). Malformed worksheet or workbook XML is [`Error::Validation`]. A
+    /// shared-string part that exists but cannot be read, parsed, or rooted is
+    /// [`Error::Retrieval`], as is a `t="s"` cell whose index does not resolve to
+    /// an entry in the table. A workbook with no sheets is not an error.
     pub fn parse_bytes(&self, bytes: &[u8]) -> Result<XlsxWorkbook> {
         let archive = ZipArchive::from_bytes(bytes.to_vec())?;
         self.parse_archive(&archive)
@@ -210,8 +223,7 @@ impl XlsxParser {
                 .map_or_else(|| format!("Sheet{}", index + 1), str::to_owned);
             let target = sheet_target(archive, &relationships, element, index)?;
             let markup = read_part_text(archive, &target)?;
-            let table = build_table(&markup, &shared_strings)
-                .map_err(|error| error.with_context(&target))?;
+            let table = build_table(&markup, &target, &shared_strings)?;
             parsed.push(XlsxSheet { name, index, table });
         }
         Ok(XlsxWorkbook { sheets: parsed })
@@ -285,22 +297,80 @@ fn read_relationships(archive: &ZipArchive) -> HashMap<String, String> {
     relationships
 }
 
-/// Reads the shared-string table; an absent part means "no shared strings".
-fn read_shared_strings(archive: &ZipArchive) -> Result<Vec<String>> {
-    if !archive.has_entry(SHARED_STRINGS_PART) {
-        return Ok(Vec::new());
+/// The workbook's shared-string table plus whether the part exists at all.
+///
+/// The two states are genuinely different: a workbook that stores every string
+/// inline has no `xl/sharedStrings.xml` part (an absent table, no error), while
+/// a present but empty table means a `t="s"` cell can never resolve. `build_table`
+/// uses `present` to word the error message.
+#[derive(Debug, Default, Clone)]
+struct SharedStrings {
+    /// One decoded string per `<si>` entry, in declaration order.
+    values: Vec<String>,
+    /// `true` when `xl/sharedStrings.xml` exists in the archive.
+    present: bool,
+}
+
+impl SharedStrings {
+    /// The table of a workbook without a shared-string part.
+    fn absent() -> Self {
+        Self::default()
     }
-    let markup = archive.read_text(SHARED_STRINGS_PART)?;
-    let document = parse(&markup).map_err(|error| error.with_context(SHARED_STRINGS_PART))?;
-    Ok(document
-        .root()
-        .map(|root| {
-            root.find_all("si")
-                .iter()
-                .map(|entry| shared_string_text(entry))
-                .collect()
-        })
-        .unwrap_or_default())
+
+    /// A present table holding `values`.
+    fn new(values: Vec<String>) -> Self {
+        Self {
+            values,
+            present: true,
+        }
+    }
+
+    /// Number of entries in the table (`0` when the part is absent).
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Returns the entry at `index`, or `None` when the index is out of range.
+    fn get(&self, index: usize) -> Option<&str> {
+        self.values.get(index).map(String::as_str)
+    }
+}
+
+/// Re-kinds a shared-string failure as [`Error::Retrieval`] naming the part.
+///
+/// [`parse`] reports malformed XML as [`Error::Validation`]; the workbooks that
+/// depend on the table cannot be decoded either way, so the shared-string layer
+/// reports one kind and keeps the original message.
+fn shared_strings_failure(error: &Error, reason: &str) -> Error {
+    Error::Retrieval(format!("shared strings {reason}: {}", error.message()))
+        .with_context(SHARED_STRINGS_PART)
+}
+
+/// Reads the shared-string table.
+///
+/// An absent `xl/sharedStrings.xml` is legitimate (inline-string-only workbooks)
+/// and yields an absent table. A part that exists but cannot be read, parsed, or
+/// rooted is an [`Error::Retrieval`] naming the part, because every `t="s"` cell
+/// depends on it; see [`SharedStrings`].
+fn read_shared_strings(archive: &ZipArchive) -> Result<SharedStrings> {
+    if !archive.has_entry(SHARED_STRINGS_PART) {
+        return Ok(SharedStrings::absent());
+    }
+    let markup = archive
+        .read_text(SHARED_STRINGS_PART)
+        .map_err(|error| shared_strings_failure(&error, "cannot be read"))?;
+    let document =
+        parse(&markup).map_err(|error| shared_strings_failure(&error, "cannot be parsed"))?;
+    let Some(root) = document.root() else {
+        return Err(Error::Retrieval("the part has no root element".to_owned())
+            .with_context(SHARED_STRINGS_PART));
+    };
+    Ok(SharedStrings::new(
+        root.find_all("si")
+            .iter()
+            .map(|entry| shared_string_text(entry))
+            .collect(),
+    ))
 }
 
 /// Returns the archive path of `sheet`'s worksheet part.
@@ -349,8 +419,11 @@ fn normalize_part(path: &str) -> String {
 }
 
 /// Builds one sheet's table from its worksheet XML.
-fn build_table(markup: &str, shared_strings: &[String]) -> Result<TableData> {
-    let document = parse(markup)?;
+///
+/// `part` is the worksheet's archive path, used for error messages; the table's
+/// `t="s"` cells are resolved against `shared_strings`.
+fn build_table(markup: &str, part: &str, shared_strings: &SharedStrings) -> Result<TableData> {
+    let document = parse(markup).map_err(|error| error.with_context(part))?;
     let Some(root) = document.root() else {
         return Ok(TableData::default());
     };
@@ -377,7 +450,7 @@ fn build_table(markup: &str, shared_strings: &[String]) -> Result<TableData> {
             if cells.len() <= column {
                 cells.resize(column + 1, String::new());
             }
-            cells[column] = cell_value(cell, shared_strings);
+            cells[column] = cell_value(cell, column, part, row_number, shared_strings)?;
         }
         grid.push((row_number, cells));
     }
@@ -414,14 +487,46 @@ fn build_table(markup: &str, shared_strings: &[String]) -> Result<TableData> {
 }
 
 /// Returns the cell value of `c` in document text form.
-fn cell_value(cell: &XmlElement, shared_strings: &[String]) -> String {
+///
+/// `column` is the already-decoded zero-based column and `part` the worksheet's
+/// archive path; both only feed error messages. A `t="s"` cell whose index is
+/// missing, non-numeric, or outside [`SharedStrings`] is an
+/// [`Error::Retrieval`] rather than an empty string, so an unreadable
+/// shared-string table can never masquerade as a blank sheet. Every other cell
+/// kind is decoded exactly as before and never fails.
+fn cell_value(
+    cell: &XmlElement,
+    column: usize,
+    part: &str,
+    row_number: usize,
+    shared_strings: &SharedStrings,
+) -> Result<String> {
     let kind = cell.attr("t").unwrap_or("n").trim();
-    match kind {
-        "s" => cell
-            .find_first("v")
-            .and_then(|value| value.text_content().trim().parse::<usize>().ok())
-            .and_then(|index| shared_strings.get(index).cloned())
-            .unwrap_or_default(),
+    Ok(match kind {
+        "s" => {
+            let reference = cell_reference(cell, column, row_number);
+            let index = raw_value(cell).parse::<usize>().map_err(|_| {
+                Error::Retrieval(format!(
+                    "worksheet {part} cell {reference} has t=\"s\" but no numeric shared-string index"
+                ))
+            })?;
+            let Some(value) = shared_strings.get(index) else {
+                let reason = if shared_strings.present {
+                    format!(
+                        "the shared-string table has {} entries",
+                        shared_strings.len()
+                    )
+                } else {
+                    format!(
+                        "{SHARED_STRINGS_PART} is absent (the shared-string table has 0 entries)"
+                    )
+                };
+                return Err(Error::Retrieval(format!(
+                    "worksheet {part} cell {reference} references shared string {index} but {reason}"
+                )));
+            };
+            value.to_owned()
+        }
         "inlineStr" => cell
             .find_first("is")
             .map(shared_string_text)
@@ -433,7 +538,31 @@ fn cell_value(cell: &XmlElement, shared_strings: &[String]) -> String {
         },
         "n" | "" => normalize_number(&raw_value(cell)),
         _ => raw_value(cell),
+    })
+}
+
+/// Returns the `A1`-style reference of a cell for error messages.
+///
+/// The `r` attribute wins when present; a cell without one is addressed from its
+/// decoded column and row (`column` `1` of row `2` is `B2`), so the message still
+/// points at the offending cell.
+fn cell_reference(cell: &XmlElement, column: usize, row_number: usize) -> String {
+    match cell.attr("r").map(str::trim) {
+        Some(reference) if !reference.is_empty() => reference.to_owned(),
+        _ => format!("{}{row_number}", column_reference(column)),
     }
+}
+
+/// Encodes a zero-based column index as `A1`-style letters (`0` → `A`, `26` → `AA`).
+fn column_reference(index: usize) -> String {
+    let mut letters = String::new();
+    let mut value = index.saturating_add(1);
+    while value > 0 {
+        let remainder = (value - 1) % 26;
+        letters.push(char::from(b'A' + u8::try_from(remainder).unwrap_or(0)));
+        value = (value - 1) / 26;
+    }
+    letters.chars().rev().collect()
 }
 
 /// Returns the trimmed `<v>` text of a cell (`""` when absent).
@@ -530,6 +659,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::parsing::ZipWriter;
 
     const SHEET: &str = r#"<?xml version="1.0"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
@@ -540,10 +670,12 @@ mod tests {
   </sheetData>
 </worksheet>"#;
 
+    const SHEET_PART: &str = "xl/worksheets/sheet1.xml";
+
     #[test]
     fn builds_a_table_from_shared_inline_numeric_and_boolean_cells() {
-        let shared = vec!["Name".to_owned(), "alice".to_owned()];
-        let table = build_table(SHEET, &shared).unwrap();
+        let shared = SharedStrings::new(vec!["Name".to_owned(), "alice".to_owned()]);
+        let table = build_table(SHEET, SHEET_PART, &shared).unwrap();
         assert_eq!(table.headers, vec!["Name", "Price", ""]);
         assert_eq!(table.rows.len(), 3);
         assert_eq!(table.rows[0], vec!["alice", "12", "true"]);
@@ -565,6 +697,91 @@ mod tests {
         assert_eq!(column_index_from_reference("XFD1"), Some(16_383));
         assert_eq!(column_index_from_reference("1"), None);
         assert_eq!(column_index_from_reference(""), None);
+    }
+
+    #[test]
+    fn column_references_encode_a1_letters() {
+        assert_eq!(column_reference(0), "A");
+        assert_eq!(column_reference(25), "Z");
+        assert_eq!(column_reference(26), "AA");
+        assert_eq!(column_reference(27), "AB");
+        assert_eq!(column_reference(701), "ZZ");
+        assert_eq!(column_reference(702), "AAA");
+        assert_eq!(column_reference(16_383), "XFD");
+    }
+
+    /// Builds a table from `markup`, expecting a typed error.
+    fn table_error(markup: &str, shared_strings: &SharedStrings) -> Error {
+        build_table(markup, SHEET_PART, shared_strings).unwrap_err()
+    }
+
+    /// Asserts a [`Error::Retrieval`] whose message contains every fragment.
+    fn assert_retrieval(error: &Error, fragments: &[&str]) {
+        assert_eq!(error.kind(), ErrorKind::Retrieval, "{error}");
+        let message = error.to_string();
+        for fragment in fragments {
+            assert!(
+                message.contains(fragment),
+                "{fragment:?} missing from {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shared_string_reference_without_a_table_is_an_error() {
+        let markup = r#"<worksheet><sheetData>
+  <row r="1"><c r="A1" t="inlineStr"><is><t>Name</t></is></c></row>
+  <row r="2"><c r="B2" t="s"><v>3</v></c></row>
+</sheetData></worksheet>"#;
+        let error = table_error(markup, &SharedStrings::absent());
+        assert_retrieval(&error, &["B2", "shared string 3", "0 entries", SHEET_PART]);
+    }
+
+    #[test]
+    fn a_shared_string_index_past_the_end_of_the_table_is_an_error() {
+        let markup = r#"<worksheet><sheetData>
+  <row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>
+  <row r="2"><c r="B2" t="s"><v>5</v></c></row>
+</sheetData></worksheet>"#;
+        let shared = SharedStrings::new(vec!["Name".to_owned(), "alice".to_owned()]);
+        let error = table_error(markup, &shared);
+        assert_retrieval(&error, &["B2", "shared string 5", "2 entries"]);
+    }
+
+    #[test]
+    fn an_inline_string_sheet_needs_no_shared_string_table() {
+        let markup = r#"<worksheet><sheetData>
+  <row r="1"><c r="A1" t="inlineStr"><is><t>Name</t></is></c><c r="B1" t="inlineStr"><is><t>Price</t></is></c></row>
+  <row r="2"><c r="A2" t="inlineStr"><is><t>alice</t></is></c><c r="B2"><v>12.0</v></c></row>
+</sheetData></worksheet>"#;
+        let table = build_table(markup, SHEET_PART, &SharedStrings::absent()).unwrap();
+        assert_eq!(table.headers, vec!["Name", "Price"]);
+        assert_eq!(table.rows, vec![vec!["alice".to_owned(), "12".to_owned()]]);
+    }
+
+    #[test]
+    fn a_cell_without_a_reference_still_names_its_column_in_the_error() {
+        // The second cell has no `r` attribute, so its reference comes from the
+        // decoded column (B) and the row number.
+        let markup = r#"<worksheet><sheetData>
+  <row r="2"><c t="s"><v>0</v></c><c t="s"><v>7</v></c></row>
+</sheetData></worksheet>"#;
+        let shared = SharedStrings::new(vec!["only".to_owned()]);
+        assert_retrieval(&table_error(markup, &shared), &["cell B2"]);
+    }
+
+    #[test]
+    fn a_shared_string_cell_without_a_numeric_index_is_an_error() {
+        let shared = SharedStrings::new(vec!["first".to_owned(), "second".to_owned()]);
+        let non_numeric = r#"<worksheet><sheetData>
+  <row r="3"><c r="C3" t="s"><v>first</v></c></row>
+</sheetData></worksheet>"#;
+        let missing = r#"<worksheet><sheetData>
+  <row r="4"><c r="D4" t="s"><f>1+1</f></c></row>
+</sheetData></worksheet>"#;
+        let expected = "has t=\"s\" but no numeric shared-string index";
+        assert_retrieval(&table_error(non_numeric, &shared), &["cell C3", expected]);
+        assert_retrieval(&table_error(missing, &shared), &["cell D4", expected]);
     }
 
     #[test]
@@ -658,6 +875,15 @@ mod tests {
         assert_eq!(documents[1].id, "raw_s0_input_s3_c0");
     }
 
+    /// Builds an archive from stored `(name, contents)` parts.
+    fn archive(parts: &[(&str, &str)]) -> ZipArchive {
+        let mut writer = ZipWriter::new();
+        for (name, contents) in parts {
+            writer.add_stored(*name, contents.as_bytes()).unwrap();
+        }
+        ZipArchive::from_bytes(writer.finish().unwrap()).unwrap()
+    }
+
     #[test]
     fn missing_workbook_part_is_reported_as_retrieval() {
         let empty = vec![
@@ -665,7 +891,59 @@ mod tests {
         ];
         let archive = ZipArchive::from_bytes(empty).unwrap();
         let error = XlsxParser::new().parse_archive(&archive).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Retrieval);
-        assert!(error.to_string().contains(WORKBOOK_PART), "{error}");
+        assert_retrieval(&error, &[WORKBOOK_PART]);
+    }
+
+    #[test]
+    fn an_absent_shared_strings_part_is_not_an_error() {
+        let archive = archive(&[(WORKBOOK_PART, "<workbook/>")]);
+        let shared = read_shared_strings(&archive).unwrap();
+        assert!(!shared.present);
+        assert_eq!(shared.len(), 0);
+    }
+
+    #[test]
+    fn an_unreadable_shared_strings_part_is_retrieval() {
+        for contents in ["<sst><si><t>broken", "<!-- only a comment -->"] {
+            let archive = archive(&[(SHARED_STRINGS_PART, contents)]);
+            let error = read_shared_strings(&archive).unwrap_err();
+            assert_retrieval(&error, &[SHARED_STRINGS_PART]);
+        }
+    }
+
+    #[test]
+    fn shared_string_declarations_larger_than_the_table_are_tolerated() {
+        let archive = archive(&[(
+            SHARED_STRINGS_PART,
+            r#"<sst count="99" uniqueCount="99"><si><t>Name</t></si><si><t>alice</t></si></sst>"#,
+        )]);
+        let shared = read_shared_strings(&archive).unwrap();
+        assert!(shared.present);
+        assert_eq!(shared.len(), 2);
+        let markup = r#"<worksheet><sheetData>
+  <row r="1"><c r="A1" t="s"><v>0</v></c></row>
+  <row r="2"><c r="A2" t="s"><v>1</v></c></row>
+</sheetData></worksheet>"#;
+        let table = build_table(markup, SHEET_PART, &shared).unwrap();
+        assert_eq!(table.headers, vec!["Name"]);
+        assert_eq!(table.rows, vec![vec!["alice".to_owned()]]);
+    }
+
+    #[test]
+    fn an_unresolvable_shared_string_fails_the_parser() {
+        let archive = archive(&[
+            (
+                WORKBOOK_PART,
+                r#"<workbook><sheets><sheet name="Data"/></sheets></workbook>"#,
+            ),
+            (
+                SHEET_PART,
+                r#"<worksheet><sheetData>
+  <row r="1"><c r="A1" t="s"><v>0</v></c></row>
+</sheetData></worksheet>"#,
+            ),
+        ]);
+        let error = XlsxParser::new().parse_archive(&archive).unwrap_err();
+        assert_retrieval(&error, &[SHEET_PART, "cell A1", "shared string 0"]);
     }
 }
