@@ -20,14 +20,14 @@ Registry and factory (module `factory`, flat re-exports):
 - `HarnessContextOptions` (`new(host_session_id, system_prompt)` + public fields, `src/factory.rs:394`, `:431`) + `build_harness_context(provider, options) -> Result<HarnessContext>` — manifest-free variant of Python `build_harness_context` (defaults, capability injection, native MCP refusal).
 
 Providers (module `providers`, one directory or file per registry name):
-- `providers::native` — `provider() -> NativeHarnessProvider`, `card()`, `PROVIDER_NAME` (`"native"`); re-exports `NativeHarness`, `NativeHarnessProvider`, `NativeHarnessOptions` from `openjiuwen_harness`; gated by the `native` feature.
+- `providers::native` — `provider() -> NativeHarnessProvider`, `card()`, `PROVIDER_NAME` (`"native"`); re-exports `NativeHarness`, `NativeHarnessProvider`, `NativeHarnessOptions`, `PROVIDER_VERSION` from `openjiuwen_harness`; gated by the `native` feature.
 - `providers::native_v2` (`native-v2`) — `provider()`, `card()`, `PROVIDER_NAME` (`"native_v2"`), `CARD_NAME` (`"native_v2"`), `IMPLEMENTATION_VERSION` (`"0.2.0"`), `DEFAULT_EVENT_BUFFER_CAPACITY` (`1024`), `NativeV2Config { team, session_id, language, event_buffer_capacity }` (+ `from_json`, `event_buffer_config`), `NativeV2Driver` (+ `with_deps`).
 - `providers::claudecode` (`vendor`) — `ClaudeCodeHarnessProvider`, `ClaudeDriver`, `ClaudeCodeHarnessConfig`, `ClaudeModelConfig`, `ClaudePermissionMode`, `ClaudeSystemPromptMode`, `DEFAULT_CLAUDE_MAX_BUFFER_SIZE` (32 MiB), `PROVIDER_NAME`, `CARD_NAME` (`"claude-code"`), `IMPLEMENTATION_VERSION` (`"0.1.0"`), `card()`, `provider()`, `model_config`.
 - `providers::codex` (`vendor`) — `CodexHarnessProvider`, `CodexDriver`, `CodexHarnessConfig`, `CodexModelConfig`, `CodexApprovalMode`, `CodexSystemPromptMode`, `PROVIDER_NAME`, `CARD_NAME` (`"codex"`), `IMPLEMENTATION_VERSION` (`"0.1.0"`), `card()`, `provider()`, `model_config`.
 - `providers::dsh` (`vendor`) — `DshHarnessProvider`, `DshDriver`, `DshHarnessConfig`, `DshSystemPromptMode`, `PROVIDER_NAME` (`"dsh"`), `CARD_NAME` (`"deepseek-harness"`), `IMPLEMENTATION_VERSION` (`"0.3.0"`), `card()`, `provider()`, `model_config`.
 - `providers::vendor` (`vendor`) — `config_error_to_harness`, `model_fragment`, `nested_model_config`, `vendor_card` (crate-internal helpers only; no harness behavior).
 
-Shared vendor transport (module `vendor_cli`, re-exported flat from the crate root; details in `./src/vendor_cli/CONTEXT.md`):
+Shared vendor transport (module `vendor_cli`, most items also flat re-exported from the crate root; `LineWriter`/`StdinWriter`, the buffer constants and `TOOL_CALL_ITEM_TYPE`/`PROVIDER_SCHEMA_VERSION` stay module-scoped; details in `./src/vendor_cli/CONTEXT.md`):
 - `binary` — `BinarySpec`, `resolve_binary`, `is_available`.
 - `jsonl` — `parse_line`, `parse_line_labelled`, `encode_line`, `get_str`, `get_object`, `get_array`, `get_bool`, `get_u64`, `get_f64`, `string_list`, `snippet`.
 - `child` — `ChildProcessConfig`, `ChildProcess` (`spawn`, `write_json`, `write_line`, `writer`, `read_json`, `stderr_tail`, `close_stdin`, `kill`, `wait`, `pid`), `StdinWriter` / `LineWriter` (a cloneable writer that keeps a parked reader from blocking a control message), `DEFAULT_MAX_LINE_BYTES`, `STDERR_TAIL_LINES`, `STDERR_TAIL_CHARS`, `EXIT_TIMEOUT`.
