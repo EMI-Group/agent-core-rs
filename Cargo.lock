@@ -1986,6 +1986,7 @@ dependencies = [
  "futures-util",
  "indexmap",
  "jsonschema",
+ "nix",
  "once_cell",
  "openjiuwen-common",
  "openjiuwen-macros",
@@ -2003,11 +2004,13 @@ dependencies = [
  "thiserror",
  "tiktoken-rs",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tracing",
  "url",
  "uuid",
+ "webpki-roots",
  "wiremock",
 ]
 

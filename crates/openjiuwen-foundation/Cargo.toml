@@ -39,6 +39,15 @@ indexmap.workspace = true
 rmcp = { workspace = true, optional = true }
 tiktoken-rs = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
+# `rediss://` TLS stack. Pinned inline (like `tower`/`hyper` elsewhere) because the
+# workspace manifest is outside this crate's authority; both packages are already in
+# `Cargo.lock` through `reqwest`, so offline builds resolve them.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+
+[target.'cfg(unix)'.dependencies]
+# Advisory cross-process file lock for the OAuth token store (`nix::fcntl::flock`).
+nix = { workspace = true }
 
 [dev-dependencies]
 wiremock.workspace = true
