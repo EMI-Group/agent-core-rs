@@ -7,10 +7,20 @@
 //! operations are collected directly from the `paths` object and their tool
 //! schemas are flattened here.
 //!
-//! `$ref` resolution is deliberately **shallow**: a top-level `$ref` on a
-//! schema (or a parameter / request body object) is resolved, while nested
-//! references inside `properties` are left untouched so the emitted JSON Schema
-//! keeps its `components` pointers.
+//! `$ref` handling lives in [`refs`](super::refs): local `#/...` pointers, local
+//! files (relative to the declaring document) and `http(s)` URLs all resolve,
+//! while the *inline* constructors ([`OpenApiSpec::from_str`],
+//! [`OpenApiSpec::from_value`]) have no file or URL base and can therefore only
+//! follow local pointers. Resolution is deliberately **shallow**: the top-level
+//! `$ref` of a schema (or a parameter / request body / response object) is
+//! resolved, while nested references inside `properties` are left untouched so
+//! the emitted JSON Schema keeps its `components` pointers.
+//!
+//! Only an `application/json` request body is mapped onto tool arguments: an
+//! operation whose body is declared as `multipart/form-data` or
+//! `application/x-www-form-urlencoded` keeps `body_schema = None` and logs a
+//! `tracing::warn!` naming the ignored media types, so the omission is visible
+//! rather than silent.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -22,8 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use url::Url;
 
-/// Maximum number of hops followed through a chain of local `$ref`s.
-const MAX_REF_DEPTH: usize = 32;
+use super::refs::{DocumentBase, RefContext};
 
 /// Maximum length of a generated tool name, in characters.
 const MAX_TOOL_NAME_CHARS: usize = 64;
@@ -34,16 +43,17 @@ const OPERATION_METHODS: [&str; 7] = ["get", "put", "post", "delete", "patch", "
 /// Deadline applied when the spec is fetched from a URL.
 const SPEC_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One path/query/header parameter of an `OpenAPI` operation.
+/// One path/query/header/cookie parameter of an `OpenAPI` operation.
 ///
-/// Cookie parameters are dropped while collecting operations: they cannot be
-/// expressed through the HTTP request seam this crate uses.
+/// Every declared parameter is collected, including `in: cookie` ones: cookie
+/// values travel in one merged `Cookie` request header (see `call::cookie_header`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct OpenApiParameter {
     /// Parameter name, exactly as declared in the document.
     pub name: String,
-    /// Where the value travels: `path`, `query`, or `header` (lower-case).
+    /// Where the value travels: `path`, `query`, `header`, or `cookie`
+    /// (lower-case).
     pub location: String,
     /// Whether the caller must supply it.
     pub required: bool,
@@ -105,11 +115,13 @@ impl Default for OpenApiOperation {
 
 /// A parsed `OpenAPI` document together with its operations and base URL.
 ///
-/// Loading is side-effect free apart from one `GET` when the source is an
-/// `http://`/`https://` URL; a filesystem source is read once and never written.
+/// Loading is side-effect free apart from the `GET`s a URL source and the
+/// documents its `$ref`s reach need; a filesystem source is read and never
+/// written. Every referenced document is loaded eagerly, so a spec with a broken
+/// reference fails here instead of on its first call.
 #[derive(Debug, Clone)]
 pub struct OpenApiSpec {
-    document: Value,
+    refs: RefContext,
     base_url: String,
     operations: Vec<OpenApiOperation>,
     source_url: Option<String>,
@@ -154,6 +166,9 @@ impl OpenApiSpec {
     /// Loads a spec, letting `base_override` (`params.base_url`) win over
     /// `servers[0].url`.
     ///
+    /// Every document the spec references is loaded here (over `http` for URL
+    /// sources), so the returned spec resolves `$ref`s without further I/O.
+    ///
     /// # Errors
     ///
     /// Same as [`OpenApiSpec::load_with`].
@@ -166,7 +181,6 @@ impl OpenApiSpec {
         if source.is_empty() {
             return Err(Error::validation("openapi spec source is empty"));
         }
-        let hint = format_hint(source);
         if source.starts_with("http://") || source.starts_with("https://") {
             let request = HttpRequest::get(source).timeout(SPEC_FETCH_TIMEOUT);
             let response = http.execute(request).await?;
@@ -176,7 +190,10 @@ impl OpenApiSpec {
                     response.status
                 )));
             }
-            return Self::parse_text(&response.text(), hint, Some(source), base_override);
+            let document = parse_document(&response.text(), source)?;
+            let refs =
+                RefContext::load(document, DocumentBase::Url(source.to_owned()), http).await?;
+            return Self::assemble(refs, Some(source), base_override);
         }
 
         let metadata = std::fs::symlink_metadata(source).map_err(|error| {
@@ -195,10 +212,17 @@ impl OpenApiSpec {
         let text = tokio::fs::read_to_string(source).await.map_err(|error| {
             Error::validation(format!("reading openapi spec `{source}`: {error}"))
         })?;
-        Self::parse_text(&text, hint, None, base_override)
+        let document = parse_document(&text, source)?;
+        let refs =
+            RefContext::load(document, DocumentBase::File(Path::new(source).into()), http).await?;
+        Self::assemble(refs, None, base_override)
     }
 
     /// Parses an in-memory document, trying JSON first and YAML second.
+    ///
+    /// The document has no file or URL base, so only local `#/...` pointers
+    /// resolve; a `$ref` into another document is a validation error. Load the
+    /// spec with [`OpenApiSpec::load`] to resolve external references.
     ///
     /// # Errors
     ///
@@ -207,17 +231,19 @@ impl OpenApiSpec {
     /// usable server URL.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> Result<Self> {
-        Self::parse_text(text, FormatHint::Auto, None, None)
+        Self::assemble(RefContext::inline(parse_auto(text)?), None, None)
     }
 
     /// Builds a spec from an already-parsed document.
+    ///
+    /// As with [`OpenApiSpec::from_str`], only local `#/...` pointers resolve.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`] when `document` is not an object, has no
     /// usable server URL, or cannot be interpreted as an `OpenAPI` document.
     pub fn from_value(document: Value) -> Result<Self> {
-        Self::assemble(document, None, None)
+        Self::assemble(RefContext::inline(document), None, None)
     }
 
     /// Returns the base URL every request is addressed against (no trailing `/`).
@@ -235,7 +261,7 @@ impl OpenApiSpec {
     /// Returns the raw document, for callers that need the untouched spec.
     #[must_use]
     pub fn document(&self) -> &Value {
-        &self.document
+        self.refs.root_document()
     }
 
     /// Returns the URL the spec was fetched from, when it came over HTTP.
@@ -244,45 +270,42 @@ impl OpenApiSpec {
         self.source_url.as_deref()
     }
 
-    /// Parses `text` with `hint` and assembles the spec.
-    fn parse_text(
-        text: &str,
-        hint: FormatHint,
-        source_url: Option<&str>,
-        base_override: Option<&str>,
-    ) -> Result<Self> {
-        let document = match hint {
-            FormatHint::Json => serde_json::from_str::<Value>(text).map_err(|error| {
-                Error::validation(format!("openapi spec is not valid JSON: {error}"))
-            })?,
-            FormatHint::Yaml => serde_yaml_ng::from_str::<Value>(text).map_err(|error| {
-                Error::validation(format!("openapi spec is not valid YAML: {error}"))
-            })?,
-            FormatHint::Auto => parse_auto(text)?,
-        };
-        Self::assemble(document, source_url, base_override)
+    /// Resolves `reference` against this spec, following `$ref` chains.
+    ///
+    /// Local `#/...` pointers resolve inside [`OpenApiSpec::document`];
+    /// `common.yaml#/...` and `https://…#/...` references resolve inside the
+    /// documents the spec pulled in at load time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for a malformed reference, a document or
+    /// pointer that does not exist, a chain longer than the documented depth, or
+    /// a cycle; the `refs` module documents the resolution rules.
+    pub fn resolve(&self, reference: &str) -> Result<Value> {
+        self.refs.resolve(reference)
     }
 
-    /// Resolves the base URL and collects the operations of `document`.
+    /// Resolves the base URL and collects the operations of the root document.
     fn assemble(
-        document: Value,
+        refs: RefContext,
         source_url: Option<&str>,
         base_override: Option<&str>,
     ) -> Result<Self> {
+        let document = refs.root_document();
         if !document.is_object() {
             return Err(Error::validation(
                 "openapi spec must be a JSON/YAML object at the top level",
             ));
         }
-        let base_url = resolve_base_url(&document, source_url, base_override)?;
-        let operations = collect_operations(&document)?;
+        let base_url = resolve_base_url(document, source_url, base_override)?;
+        let operations = collect_operations(&refs)?;
         tracing::debug!(
             base_url = %base_url,
             operations = operations.len(),
             "parsed OpenAPI spec"
         );
         Ok(Self {
-            document,
+            refs,
             base_url,
             operations,
             source_url: source_url.map(ToOwned::to_owned),
@@ -299,6 +322,26 @@ fn parse_auto(text: &str) -> Result<Value> {
                 "openapi spec is neither valid JSON ({json_error}) nor valid YAML ({yaml_error})"
             ))
         }),
+    }
+}
+
+/// Parses one `OpenAPI` document, choosing the parser from `source`'s extension.
+///
+/// `.json` is parsed strictly, `.yaml`/`.yml` strictly as YAML, and every other
+/// source tries JSON first and YAML second.
+pub(super) fn parse_document(text: &str, source: &str) -> Result<Value> {
+    match format_hint(source) {
+        FormatHint::Json => serde_json::from_str::<Value>(text).map_err(|error| {
+            Error::validation(format!(
+                "openapi document `{source}` is not valid JSON: {error}"
+            ))
+        }),
+        FormatHint::Yaml => serde_yaml_ng::from_str::<Value>(text).map_err(|error| {
+            Error::validation(format!(
+                "openapi document `{source}` is not valid YAML: {error}"
+            ))
+        }),
+        FormatHint::Auto => parse_auto(text),
     }
 }
 
@@ -362,9 +405,9 @@ fn resolve_base_url(
     Ok(resolved.to_owned())
 }
 
-/// Collects every operation of `document`, de-duplicating names.
-fn collect_operations(document: &Value) -> Result<Vec<OpenApiOperation>> {
-    let Some(paths) = document.get("paths").and_then(Value::as_object) else {
+/// Collects every operation of the root document, de-duplicating names.
+fn collect_operations(refs: &RefContext) -> Result<Vec<OpenApiOperation>> {
+    let Some(paths) = refs.root_document().get("paths").and_then(Value::as_object) else {
         tracing::debug!("openapi spec declares no `paths` object");
         return Ok(Vec::new());
     };
@@ -387,8 +430,8 @@ fn collect_operations(document: &Value) -> Result<Vec<OpenApiOperation>> {
                 continue;
             }
             let method = lower_method.to_ascii_uppercase();
-            let parameters = merged_parameters(document, &path_parameters, operation)?;
-            let (body_schema, body_required) = request_body(document, operation)?;
+            let parameters = merged_parameters(refs, &path_parameters, operation)?;
+            let (body_schema, body_required) = request_body(refs, operation)?;
             let generated = generate_name(&method, path, operation);
             let name = unique_name(&mut used_names, generated);
             let description = describe(&method, path, operation, &parameters, body_schema.as_ref());
@@ -420,7 +463,7 @@ fn method_for(key: &str) -> Option<&'static str> {
 
 /// Builds the merged parameter list, letting operation entries win on `(in, name)`.
 fn merged_parameters(
-    document: &Value,
+    refs: &RefContext,
     path_parameters: &[Value],
     operation: &Value,
 ) -> Result<Vec<OpenApiParameter>> {
@@ -430,7 +473,7 @@ fn merged_parameters(
     }
     let mut merged: Vec<OpenApiParameter> = Vec::new();
     for entry in raw {
-        let Some(parameter) = parse_parameter(document, entry)? else {
+        let Some(parameter) = parse_parameter(refs, entry)? else {
             continue;
         };
         match merged.iter_mut().find(|existing| {
@@ -443,9 +486,9 @@ fn merged_parameters(
     Ok(merged)
 }
 
-/// Parses one parameter object; `None` for cookie parameters and nameless entries.
-fn parse_parameter(document: &Value, entry: &Value) -> Result<Option<OpenApiParameter>> {
-    let resolved = maybe_ref(document, entry)?;
+/// Parses one parameter object; `None` for nameless entries and unknown locations.
+fn parse_parameter(refs: &RefContext, entry: &Value) -> Result<Option<OpenApiParameter>> {
+    let resolved = refs.maybe_ref(entry)?;
     let Some(object) = resolved.as_object() else {
         return Ok(None);
     };
@@ -464,11 +507,7 @@ fn parse_parameter(document: &Value, entry: &Value) -> Result<Option<OpenApiPara
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    if location == "cookie" {
-        tracing::debug!(parameter = name, "skipping cookie parameter");
-        return Ok(None);
-    }
-    if !matches!(location.as_str(), "path" | "query" | "header") {
+    if !matches!(location.as_str(), "path" | "query" | "header" | "cookie") {
         tracing::debug!(
             parameter = name,
             location = %location,
@@ -477,7 +516,7 @@ fn parse_parameter(document: &Value, entry: &Value) -> Result<Option<OpenApiPara
         return Ok(None);
     }
     let schema = match object.get("schema") {
-        Some(schema) => resolve_schema(document, schema)?,
+        Some(schema) => refs.resolve_schema(schema)?,
         None => Value::Object(Map::new()),
     };
     let description = object
@@ -499,22 +538,36 @@ fn parse_parameter(document: &Value, entry: &Value) -> Result<Option<OpenApiPara
 }
 
 /// Resolves the JSON request-body schema and its required flag.
-fn request_body(document: &Value, operation: &Value) -> Result<(Option<Value>, bool)> {
+///
+/// Only `application/json` bodies are mapped onto tool arguments; any other
+/// declared media type (`multipart/form-data`, `application/x-www-form-urlencoded`,
+/// …) leaves `body_schema` at `None` and is reported once per operation with a
+/// `tracing::warn!`, so the omission is never silent.
+fn request_body(refs: &RefContext, operation: &Value) -> Result<(Option<Value>, bool)> {
     let Some(raw) = operation.get("requestBody") else {
         return Ok((None, false));
     };
-    let body = maybe_ref(document, raw)?;
+    let body = refs.maybe_ref(raw)?;
     let required = body
         .get("required")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let schema = body
-        .get("content")
-        .and_then(Value::as_object)
+    let content = body.get("content").and_then(Value::as_object);
+    let schema = content
         .and_then(|content| content.get("application/json"))
         .and_then(|media| media.get("schema"))
-        .map(|schema| resolve_schema(document, schema))
+        .map(|schema| refs.resolve_schema(schema))
         .transpose()?;
+    if schema.is_none() {
+        if let Some(content) = content.filter(|content| !content.is_empty()) {
+            let media_types = content.keys().cloned().collect::<Vec<_>>().join(", ");
+            tracing::warn!(
+                media_types = %media_types,
+                "ignoring the OpenAPI request body: only `application/json` is mapped onto \
+                 tool arguments"
+            );
+        }
+    }
     Ok((schema, required))
 }
 
@@ -646,95 +699,4 @@ fn flat_schema(parameters: &[OpenApiParameter], body_schema: Option<&Value>) -> 
         Value::Array(required.into_iter().map(Value::String).collect()),
     );
     Value::Object(schema)
-}
-
-/// Resolves `value` when it is a `$ref` object, otherwise clones it.
-fn maybe_ref(document: &Value, value: &Value) -> Result<Value> {
-    match value.get("$ref").and_then(Value::as_str) {
-        Some(reference) => resolve_ref(document, reference),
-        None => Ok(value.clone()),
-    }
-}
-
-/// Resolves a local `#/...` JSON-pointer reference, following `$ref` chains.
-///
-/// References that do not start with `#` (remote/file references) are rejected,
-/// and a chain longer than 32 hops or a reference that reaches itself is a
-/// validation error.
-pub(crate) fn resolve_ref(document: &Value, reference: &str) -> Result<Value> {
-    let mut visited: Vec<&str> = Vec::new();
-    let mut current = reference.trim();
-    for _ in 0..MAX_REF_DEPTH {
-        if visited.contains(&current) {
-            return Err(Error::validation(format!(
-                "cyclic $ref `{current}` in the OpenAPI spec"
-            )));
-        }
-        visited.push(current);
-        let target = pointer(document, current)?;
-        match target.get("$ref").and_then(Value::as_str) {
-            Some(next) => current = next,
-            None => return Ok(target.clone()),
-        }
-    }
-    Err(Error::validation(format!(
-        "$ref `{reference}` exceeds the maximum chain depth of {MAX_REF_DEPTH}"
-    )))
-}
-
-/// Resolves a schema whose top-level `$ref` must be inlined; sibling keys win.
-///
-/// Nested references inside `properties` are intentionally left in place.
-pub(crate) fn resolve_schema(document: &Value, schema: &Value) -> Result<Value> {
-    let Some(reference) = schema.get("$ref").and_then(Value::as_str) else {
-        return Ok(schema.clone());
-    };
-    let resolved = resolve_ref(document, reference)?;
-    let Some(siblings) = schema.as_object() else {
-        return Ok(resolved);
-    };
-    let Value::Object(mut merged) = resolved else {
-        return Ok(resolved);
-    };
-    for (key, value) in siblings {
-        if key != "$ref" {
-            merged.insert(key.clone(), value.clone());
-        }
-    }
-    Ok(Value::Object(merged))
-}
-
-/// Walks one `#/...` JSON pointer.
-fn pointer<'a>(document: &'a Value, reference: &str) -> Result<&'a Value> {
-    let Some(pointer) = reference.strip_prefix('#') else {
-        return Err(Error::validation(format!(
-            "unsupported $ref `{reference}`: only local `#/...` pointers are supported"
-        )));
-    };
-    if pointer.is_empty() {
-        return Ok(document);
-    }
-    let Some(pointer) = pointer.strip_prefix('/') else {
-        return Err(Error::validation(format!(
-            "malformed $ref `{reference}`: expected `#/...`"
-        )));
-    };
-    let mut current = document;
-    for token in pointer.split('/') {
-        let token = token.replace("~1", "/").replace("~0", "~");
-        current = match current {
-            Value::Object(map) => map.get(&token),
-            Value::Array(items) => token
-                .parse::<usize>()
-                .ok()
-                .and_then(|index| items.get(index)),
-            _ => None,
-        }
-        .ok_or_else(|| {
-            Error::validation(format!(
-                "$ref `{reference}` does not resolve: `{token}` is missing"
-            ))
-        })?;
-    }
-    Ok(current)
 }
