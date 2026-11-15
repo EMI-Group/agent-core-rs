@@ -356,7 +356,22 @@ mod tests {
         let ids: Vec<&str> = results.iter().map(|result| result.id.as_str()).collect();
         assert_eq!(ids, ["b", "a"]);
         // The request carried the configured model and the bearer token.
-        let requests = server.received_requests().await.unwrap();
+        //
+        // Only the rerank `POST`s are inspected: `wiremock`'s server pool is
+        // process-global, so this server may have been recycled from an earlier
+        // test, and a straggling request addressed to that earlier test's
+        // `base_url` (for example a sandbox teardown draining the process-global
+        // container cache) would otherwise make the count racy.
+        let requests: Vec<wiremock::Request> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| {
+                request.method.as_str() == "POST"
+                    && request.url.path() == "/services/rerank/text-rerank/text-rerank"
+            })
+            .collect();
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body["model"], DEFAULT_MODEL_NAME);

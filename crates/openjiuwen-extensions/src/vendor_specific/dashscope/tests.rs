@@ -80,17 +80,36 @@ async fn mock_status(server: &MockServer, status: u16, body: &str) {
         .await;
 }
 
-/// The single request `server` received, decoded as JSON.
-async fn received_body(server: &MockServer) -> Value {
-    let requests = server
+/// The rerank `POST`s `server` recorded, in arrival order.
+///
+/// A mock server's request log is not automatically this test's own traffic.
+/// `wiremock`'s server pool is process-global (a released server is handed to
+/// the next borrower), and `sys_operation`'s sandbox container cache is
+/// process-global too: a `SandboxSelector::all` teardown in another test
+/// deletes the environments cached by earlier tests, at their recorded
+/// `base_url`, which can be this very server once the pool has recycled the
+/// port. That straggler is a `DELETE` on the ADX management plane, never a
+/// `POST` on the rerank path, so filtering by the method and path this
+/// transport uses keeps the "exactly one rerank request" assertions
+/// deterministic without weakening them.
+async fn rerank_requests(server: &MockServer) -> Vec<wiremock::Request> {
+    server
         .received_requests()
         .await
-        .expect("the mock records requests");
-    assert_eq!(requests.len(), 1, "exactly one request was sent");
+        .expect("the mock records requests")
+        .into_iter()
+        .filter(|request| request.method.as_str() == "POST" && request.url.path() == END_POINT)
+        .collect()
+}
+
+/// The single rerank request `server` received, decoded as JSON.
+async fn received_body(server: &MockServer) -> Value {
+    let requests = rerank_requests(server).await;
+    assert_eq!(requests.len(), 1, "exactly one rerank request was sent");
     serde_json::from_slice(&requests[0].body).expect("the request body is JSON")
 }
 
-/// The `parameters.top_n` the single request carried.
+/// The `parameters.top_n` the single rerank request carried.
 async fn sent_top_n(server: &MockServer) -> usize {
     let body = received_body(server).await;
     usize::try_from(body["parameters"]["top_n"].as_u64().unwrap()).unwrap()
@@ -116,7 +135,7 @@ async fn request_carries_the_dashscope_body_and_bearer_token() {
         .await
         .expect("the rerank succeeds");
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = rerank_requests(&server).await;
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
     assert_eq!(request.method.as_str(), "POST");
@@ -298,7 +317,7 @@ async fn empty_documents_send_no_request() {
 
     assert!(results.is_empty());
     assert!(
-        server.received_requests().await.unwrap().is_empty(),
+        rerank_requests(&server).await.is_empty(),
         "no HTTP request was sent"
     );
 }
