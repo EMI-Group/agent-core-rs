@@ -461,6 +461,7 @@ async fn the_facade_pipeline_uses_the_resolved_override_model() {
         Some("scoped-model")
     );
     let staged = StagedAnalyzer::from_engine(ltm.config(), ltm.engine().model().cloned())
+        .expect("staged analyzer")
         .with_overrides(overrides);
     let result = staged
         .analyze(
