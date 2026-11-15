@@ -43,7 +43,9 @@
 
 use super::crc::crc32;
 use super::inflate::inflate;
-use super::{read_u16_le, read_u32_le, slice_at, validate_path, ArchiveEntry, CapTracker};
+use super::{
+    read_u16_le, read_u32_le, slice_at, validate_path, ArchiveEntry, ArchiveEntryKind, CapTracker,
+};
 use openjiuwen_common::error::{Error, Result};
 
 /// Signature of a local file header.
@@ -439,6 +441,8 @@ fn read_entry(bytes: &[u8], record: &CentralRecord, caps: &mut CapTracker) -> Re
             path,
             bytes: Vec::new(),
             is_dir: true,
+            kind: ArchiveEntryKind::Directory,
+            ..ArchiveEntry::default()
         });
     }
     if record.compressed_size == 0 && record.declared_size > 0 {
@@ -482,6 +486,8 @@ fn read_entry(bytes: &[u8], record: &CentralRecord, caps: &mut CapTracker) -> Re
         path,
         bytes: data,
         is_dir: false,
+        kind: ArchiveEntryKind::File,
+        ..ArchiveEntry::default()
     })
 }
 

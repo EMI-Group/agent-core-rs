@@ -278,9 +278,10 @@ fn skip_c_string(bytes: &[u8], start: usize, offset: usize, what: &str) -> Resul
 ///
 /// # Errors
 ///
-/// Returns [`Error::validation`] when the payload is neither a `tar` nor a `zip`
-/// archive, or is a nested gzip stream, plus everything the archive unpackers
-/// return.
+/// Returns [`Error::validation`] when the payload is neither an archive nor a
+/// nested gzip stream, [`Error::unsupported`] when the payload is a `bzip2`,
+/// `xz`, or `zstd` container this reader cannot decode, plus everything the
+/// archive unpackers return.
 fn unpack_payload(payload: &[u8]) -> Result<Vec<ArchiveEntry>> {
     match detect(payload) {
         Some(ArchiveFormat::Tar) => ArchiveUnpacker::unpack(ArchiveFormat::Tar, payload),
@@ -289,6 +290,9 @@ fn unpack_payload(payload: &[u8]) -> Result<Vec<ArchiveEntry>> {
             "gzip payload is a nested gzip stream: nested compression is not expanded ({} bytes)",
             payload.len()
         ))),
+        Some(format @ (ArchiveFormat::Bzip2 | ArchiveFormat::Xz | ArchiveFormat::Zstd)) => {
+            ArchiveUnpacker::unpack(format, payload)
+        }
         None => Err(Error::validation(format!(
             "gzip payload is not an archive: no tar, zip, or gzip signature in {} bytes",
             payload.len()

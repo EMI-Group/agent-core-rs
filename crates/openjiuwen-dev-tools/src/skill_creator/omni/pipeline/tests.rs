@@ -238,6 +238,7 @@ async fn zip_and_gzip_page_inputs_unpack() {
         path: "guide.md".to_owned(),
         bytes: b"# Zip Guide\n\nbody text\n".to_vec(),
         is_dir: false,
+        ..ArchiveEntry::default()
     }])
     .expect("writes the zip");
 
@@ -279,6 +280,39 @@ async fn zip_and_gzip_page_inputs_unpack() {
             openjiuwen_common::error::ErrorKind::Validation,
             "{url}: {error}"
         );
+    }
+}
+
+#[tokio::test]
+async fn undecodable_containers_surface_unsupported_with_the_codec() {
+    let xz_url = "https://example.com/skill.tar.xz";
+    let zstd_url = "https://example.com/skill.tar.zst";
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(
+        xz_url,
+        "application/x-xz",
+        b"\xFD7zXZ\x00xz-stream-body".to_vec(),
+    );
+    fetcher.with_page(
+        zstd_url,
+        "application/zstd",
+        vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00],
+    );
+    let creation = OmniCreation::new(Arc::new(fetcher));
+
+    for (url, codec) in [(xz_url, "xz"), (zstd_url, "zstd")] {
+        let error = creation
+            .scrape(url)
+            .await
+            .expect_err("no decoder is bundled for this codec");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Unsupported,
+            "{url}: {error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(codec), "{url}: {message}");
+        assert!(message.contains("decoder"), "{url}: {message}");
     }
 }
 

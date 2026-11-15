@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::skill_creator::omni::archive::{
-    detect, ArchiveFormat, ArchiveUnpacker, MAX_ENTRY_UNCOMPRESSED_BYTES,
+    detect, ArchiveEntryKind, ArchiveFormat, ArchiveUnpacker, MAX_ENTRY_UNCOMPRESSED_BYTES,
 };
 use openjiuwen_common::error::ErrorKind;
 
@@ -181,21 +181,26 @@ fn writer_round_trips_files_and_directories() {
             path: "readme.txt".to_owned(),
             bytes: b"hello zip\n".to_vec(),
             is_dir: false,
+            ..ArchiveEntry::default()
         },
         ArchiveEntry {
             path: "docs/".to_owned(),
             bytes: Vec::new(),
             is_dir: true,
+            kind: ArchiveEntryKind::Directory,
+            ..ArchiveEntry::default()
         },
         ArchiveEntry {
             path: "café/naïve.txt".to_owned(),
             bytes: b"accented".to_vec(),
             is_dir: false,
+            ..ArchiveEntry::default()
         },
         ArchiveEntry {
             path: "docs/nested/deep.txt".to_owned(),
             bytes: b"deep".to_vec(),
             is_dir: false,
+            ..ArchiveEntry::default()
         },
     ];
 
@@ -532,6 +537,8 @@ fn writer_rejects_invalid_entries() {
         path: "docs/".to_owned(),
         bytes: b"x".to_vec(),
         is_dir: true,
+        kind: ArchiveEntryKind::Directory,
+        ..ArchiveEntry::default()
     }];
     let error = ArchiveWriter::write_stored(&directory_with_content).expect_err("directory bytes");
     assert_eq!(error.kind(), ErrorKind::Validation);
@@ -541,6 +548,7 @@ fn writer_rejects_invalid_entries() {
         path: "docs/".to_owned(),
         bytes: Vec::new(),
         is_dir: false,
+        ..ArchiveEntry::default()
     }];
     let error = ArchiveWriter::write_stored(&file_with_slash).expect_err("trailing slash");
     assert_eq!(error.kind(), ErrorKind::Validation);
@@ -550,6 +558,7 @@ fn writer_rejects_invalid_entries() {
         path: "../escape.txt".to_owned(),
         bytes: Vec::new(),
         is_dir: false,
+        ..ArchiveEntry::default()
     }];
     let error = ArchiveWriter::write_stored(&unsafe_path).expect_err("unsafe path");
     assert_eq!(error.kind(), ErrorKind::Validation);

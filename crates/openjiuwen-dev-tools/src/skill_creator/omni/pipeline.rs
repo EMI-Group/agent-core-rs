@@ -400,8 +400,8 @@ impl OmniCreation {
     /// Returns [`Error::validation`](openjiuwen_common::error::Error::validation)
     /// for an invalid configuration or a page with no text, headings, links, or
     /// images; [`Error::unsupported`](openjiuwen_common::error::Error::unsupported)
-    /// for a `zip` or `gzip` page input (the message names the format); and
-    /// whatever the [`Fetcher`] reports.
+    /// for a `bzip2`, `xz`, or `zstd` page input, whose decoder is not bundled
+    /// (the message names the codec); and whatever the [`Fetcher`] reports.
     pub async fn scrape(&self, url: &str) -> Result<ScrapedPage> {
         self.config.validate()?;
         let resource = self.fetcher.fetch(url).await?;
@@ -411,9 +411,18 @@ impl OmniCreation {
             resource.final_url.clone()
         };
         let page = match archive::detect(&resource.body) {
-            // `tar` is unpacked in-process; `zip`/`gzip` propagate the typed
-            // `Unsupported` error naming the format from `unpack_auto`.
-            Some(ArchiveFormat::Tar | ArchiveFormat::Zip | ArchiveFormat::Gzip) => {
+            // `tar` is unpacked in-process; `zip`/`gzip` propagate their typed
+            // validation errors from `unpack_auto`, and `bzip2`/`xz`/`zstd`
+            // propagate its typed `Unsupported` error naming the codec instead
+            // of being read as plain text.
+            Some(
+                ArchiveFormat::Tar
+                | ArchiveFormat::Zip
+                | ArchiveFormat::Gzip
+                | ArchiveFormat::Bzip2
+                | ArchiveFormat::Xz
+                | ArchiveFormat::Zstd,
+            ) => {
                 let entries = ArchiveUnpacker::unpack_auto(&resource.body)?;
                 archive_page(&final_url, &entries)
             }

@@ -6,13 +6,18 @@
 //! [`ArchiveEntry`] values. [`ArchiveWriter`] produces deterministic stored
 //! `zip` bytes for tests and for callers that need to round-trip entries.
 //!
-//! Every format is parsed in-process with no compression dependency:
+//! Every decodable format is parsed in-process with no compression dependency:
 //!
 //! - `tar` (POSIX `ustar` and GNU flavors) in `tar`;
 //! - `zip` (stored and DEFLATE, plus a stored writer) in `zip`;
 //! - `gzip` (RFC 1952, including gzip-wrapped `tar`/`zip`) in `gzip`;
 //! - DEFLATE (RFC 1951) and CRC-32 (IEEE) live in the shared `inflate` and
 //!   `crc` modules.
+//!
+//! `bzip2`, `xz`, and `zstd` are recognized by [`detect`]/[`detect_named`] so a
+//! caller can name the container it was handed, but no bzip2, xz, or zstd crate
+//! is available offline, so [`ArchiveUnpacker::unpack`] answers them with
+//! [`Error::unsupported`] naming the codec instead of guessing.
 //!
 //! Every entry path is validated before it is returned: absolute paths, `..`
 //! components, and backslashes are rejected, so a caller can never write outside
@@ -38,7 +43,7 @@ pub const MAX_ENTRY_UNCOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 /// Largest number of bytes every entry of one archive may declare in total: 32 MiB.
 pub const MAX_ARCHIVE_UNCOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
 
-/// A container format recognized by [`detect`].
+/// A container format recognized by [`detect`] or [`detect_named`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArchiveFormat {
@@ -48,16 +53,26 @@ pub enum ArchiveFormat {
     Zip,
     /// A `gzip`-compressed stream.
     Gzip,
+    /// A `bzip2`-compressed stream, recognized but not decodable here.
+    Bzip2,
+    /// An `xz`/LZMA2-compressed stream, recognized but not decodable here.
+    Xz,
+    /// A `zstd` frame, recognized but not decodable here.
+    Zstd,
 }
 
 impl ArchiveFormat {
-    /// The lowercase wire name of the format: `"tar"`, `"zip"`, or `"gzip"`.
+    /// The lowercase wire name of the format: `"tar"`, `"zip"`, `"gzip"`,
+    /// `"bzip2"`, `"xz"`, or `"zstd"`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Tar => "tar",
             Self::Zip => "zip",
             Self::Gzip => "gzip",
+            Self::Bzip2 => "bzip2",
+            Self::Xz => "xz",
+            Self::Zstd => "zstd",
         }
     }
 }
@@ -68,19 +83,54 @@ impl fmt::Display for ArchiveFormat {
     }
 }
 
+/// What an [`ArchiveEntry`] describes.
+///
+/// [`ArchiveEntryKind::File`] is the default, so a decoded entry that carries
+/// contents is unambiguous and an older payload without a `kind` key still
+/// deserializes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveEntryKind {
+    /// A regular file entry; `bytes` holds its contents.
+    #[default]
+    File,
+    /// A directory entry; `is_dir` is `true` and `bytes` is empty.
+    Directory,
+    /// A symbolic link entry; its target is in `link_target` and `bytes` is empty.
+    Symlink,
+    /// A hard link entry; its target is in `link_target` and `bytes` is empty.
+    HardLink,
+}
+
 /// One entry read out of an archive.
 ///
 /// `path` is the archive-relative path with `/` separators; `bytes` holds the
-/// file contents and is empty for directories; `is_dir` marks directory entries.
+/// file contents and is empty for directories and links; `is_dir` marks
+/// directory entries and stays `true` exactly when `kind` is
+/// [`ArchiveEntryKind::Directory`]; `kind` names the entry shape; a symlink or
+/// hardlink entry carries its target in `link_target` with empty `bytes`; and
+/// `mode` is the permission bits the container declared, when it declares any.
+///
+/// `kind`, `link_target`, and `mode` all default, so a payload written before
+/// they existed still deserializes.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct ArchiveEntry {
     /// Archive-relative path of the entry.
     pub path: String,
-    /// File contents; empty for directory entries.
+    /// File contents; empty for directory, symlink, and hardlink entries.
     pub bytes: Vec<u8>,
-    /// Whether the entry is a directory.
+    /// Whether the entry is a directory; `true` exactly when `kind` is
+    /// [`ArchiveEntryKind::Directory`].
     pub is_dir: bool,
+    /// The entry shape: file, directory, symlink, or hardlink.
+    pub kind: ArchiveEntryKind,
+    /// Target path of a symlink or hardlink entry, `None` for every other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<String>,
+    /// Permission bits declared by the container, `None` when it declares none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 /// Associated functions for sniffing and unpacking archives.
@@ -94,17 +144,24 @@ pub struct ArchiveUnpacker;
 impl ArchiveUnpacker {
     /// Unpacks `bytes` as `format`, returning entries in archive order.
     ///
+    /// `tar`, `zip`, and `gzip` are decoded in-process. `bzip2`, `xz`, and
+    /// `zstd` are recognized containers this reader cannot decode.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::validation`] for malformed, truncated, unsafe, or
     /// oversized content, and [`Error::unsupported`] for capabilities this
     /// in-process implementation deliberately does not provide (ZIP64, encrypted
-    /// entries, and compression methods other than stored and DEFLATE).
+    /// entries, compression methods other than stored and DEFLATE, and the
+    /// `bzip2`, `xz`, and `zstd` codecs, which no bundled decoder handles).
     pub fn unpack(format: ArchiveFormat, bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
         match format {
             ArchiveFormat::Tar => tar::unpack(bytes),
             ArchiveFormat::Zip => zip::unpack(bytes),
             ArchiveFormat::Gzip => gzip::unpack(bytes),
+            ArchiveFormat::Bzip2 => Err(decoder_unavailable("bzip2")),
+            ArchiveFormat::Xz => Err(decoder_unavailable("xz")),
+            ArchiveFormat::Zstd => Err(decoder_unavailable("zstd")),
         }
     }
 
@@ -113,11 +170,13 @@ impl ArchiveUnpacker {
     /// # Errors
     ///
     /// Returns [`Error::validation`] when the bytes carry no recognized archive
-    /// signature, plus everything [`unpack`](Self::unpack) can return.
+    /// signature, plus everything [`unpack`](Self::unpack) can return — in
+    /// particular [`Error::unsupported`] naming `bzip2`, `xz`, or `zstd`.
     pub fn unpack_auto(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
         let format = detect(bytes).ok_or_else(|| {
             Error::validation(format!(
-                "unrecognized archive: no gzip, zip, or ustar signature in {} bytes",
+                "unrecognized archive: no gzip, zip, ustar, bzip2, xz, or zstd signature in {} \
+                 bytes",
                 bytes.len()
             ))
         })?;
@@ -125,10 +184,23 @@ impl ArchiveUnpacker {
     }
 }
 
+/// The [`Error::unsupported`] answer for a container this reader cannot decode.
+///
+/// No `bzip2`, `xz`, or `zstd` crate is available in this offline dependency
+/// set, so the message names the codec in the user's terms.
+fn decoder_unavailable(codec: &str) -> Error {
+    Error::unsupported(format!(
+        "{codec} archives are not supported: no {codec} decoder is bundled with this offline \
+         in-process reader"
+    ))
+}
+
 /// Sniffs the archive format of `bytes`, or `None` when nothing matches.
 ///
 /// Recognized signatures are `gzip` (`1f 8b`), `zip` (`PK\x03\x04` and the empty
-/// archive `PK\x05\x06`), and `tar` (`ustar` at byte offset 257).
+/// archive `PK\x05\x06`), `tar` (`ustar` at byte offset 257), `bzip2` (`BZh`
+/// followed by the block-size digit `1`–`9`), `xz` (`fd 37 7a 58 5a 00`), and
+/// `zstd` (`28 b5 2f fd`).
 #[must_use]
 pub fn detect(bytes: &[u8]) -> Option<ArchiveFormat> {
     if bytes.starts_with(&[0x1f, 0x8b]) {
@@ -137,6 +209,39 @@ pub fn detect(bytes: &[u8]) -> Option<ArchiveFormat> {
         Some(ArchiveFormat::Zip)
     } else if bytes.get(257..262) == Some(b"ustar".as_slice()) {
         Some(ArchiveFormat::Tar)
+    } else if bytes.starts_with(b"BZh") && matches!(bytes.get(3).copied(), Some(b'1'..=b'9')) {
+        Some(ArchiveFormat::Bzip2)
+    } else if bytes.starts_with(b"\xFD7zXZ\x00") {
+        Some(ArchiveFormat::Xz)
+    } else if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        Some(ArchiveFormat::Zstd)
+    } else {
+        None
+    }
+}
+
+/// Sniffs `bytes` with [`detect`], falling back to the filename `name`.
+///
+/// Magic bytes win, so a mislabelled file is classified by its content. When the
+/// content carries no recognized signature, the lowercase filename suffix
+/// decides: `.tar.bz2`/`.tbz2`/`.tbz` → [`ArchiveFormat::Bzip2`],
+/// `.tar.xz`/`.txz` → [`ArchiveFormat::Xz`], `.tar.zst`/`.tzst`/`.zstd` →
+/// [`ArchiveFormat::Zstd`], and anything else → `None`.
+#[must_use]
+pub fn detect_named(name: &str, bytes: &[u8]) -> Option<ArchiveFormat> {
+    if let Some(format) = detect(bytes) {
+        return Some(format);
+    }
+    // The name is lowercased first, so a suffix table keeps the comparison
+    // case-insensitive without a per-suffix literal.
+    let lower = name.to_ascii_lowercase();
+    let ends_with_any = |suffixes: &[&str]| suffixes.iter().any(|suffix| lower.ends_with(suffix));
+    if ends_with_any(&[".tar.bz2", ".tbz2", ".tbz"]) {
+        Some(ArchiveFormat::Bzip2)
+    } else if ends_with_any(&[".tar.xz", ".txz"]) {
+        Some(ArchiveFormat::Xz)
+    } else if ends_with_any(&[".tar.zst", ".tzst", ".zstd"]) {
+        Some(ArchiveFormat::Zstd)
     } else {
         None
     }
@@ -264,6 +369,171 @@ mod tests {
         assert_eq!(detect(b"plain text, not an archive"), None);
         assert_eq!(ArchiveFormat::Gzip.to_string(), "gzip");
         assert_eq!(ArchiveFormat::Tar.as_str(), "tar");
+    }
+
+    /// A minimal `bzip2` stream prefix: the signature plus the level digit.
+    const BZIP2_MAGIC: &[u8] = b"BZh9";
+    /// The `xz` stream magic.
+    const XZ_MAGIC: &[u8] = b"\xFD7zXZ\x00";
+    /// The `zstd` frame magic.
+    const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
+
+    #[test]
+    fn detect_recognizes_the_undecodable_codec_signatures() {
+        assert_eq!(detect(BZIP2_MAGIC), Some(ArchiveFormat::Bzip2));
+        assert_eq!(
+            detect(b"BZh1trailing payload"),
+            Some(ArchiveFormat::Bzip2),
+            "every block-size digit 1-9 is a valid bzip2 signature"
+        );
+        assert_eq!(detect(XZ_MAGIC), Some(ArchiveFormat::Xz));
+        assert_eq!(detect(ZSTD_MAGIC), Some(ArchiveFormat::Zstd));
+
+        // The bzip2 signature needs the level digit right after `BZh`.
+        assert_eq!(detect(b"BZh"), None);
+        assert_eq!(detect(b"BZh0"), None);
+        assert_eq!(detect(b"BZ"), None);
+        // The magics stay exact: no prefix or suffix match.
+        assert_eq!(detect(b"\xFD7zXZ"), None);
+        assert_eq!(detect(&[0x28, 0xB5, 0x2F]), None);
+    }
+
+    #[test]
+    fn the_undecodable_formats_report_their_wire_names() {
+        for (format, name) in [
+            (ArchiveFormat::Bzip2, "bzip2"),
+            (ArchiveFormat::Xz, "xz"),
+            (ArchiveFormat::Zstd, "zstd"),
+        ] {
+            assert_eq!(format.as_str(), name);
+            assert_eq!(format.to_string(), name);
+        }
+    }
+
+    #[test]
+    fn detect_named_prefers_magic_bytes_then_the_suffix() {
+        // Magic bytes win, so the name cannot mislead the classifier.
+        assert_eq!(detect_named("notes.txt", XZ_MAGIC), Some(ArchiveFormat::Xz));
+        assert_eq!(
+            detect_named("bundle.zip", BZIP2_MAGIC),
+            Some(ArchiveFormat::Bzip2)
+        );
+
+        // With no magic, the lowercase suffix decides, case-insensitively.
+        for name in [
+            "skill.tar.bz2",
+            "skill.tbz2",
+            "skill.tbz",
+            "SKILL.TAR.BZ2",
+            "Skill.TBZ2",
+        ] {
+            assert_eq!(
+                detect_named(name, b""),
+                Some(ArchiveFormat::Bzip2),
+                "{name}"
+            );
+        }
+        for name in ["skill.tar.xz", "skill.txz", "SKILL.TXZ"] {
+            assert_eq!(detect_named(name, b""), Some(ArchiveFormat::Xz), "{name}");
+        }
+        for name in ["skill.tar.zst", "skill.tzst", "skill.zstd", "SKILL.TAR.ZST"] {
+            assert_eq!(detect_named(name, b""), Some(ArchiveFormat::Zstd), "{name}");
+        }
+
+        // Plain text under an unknown or unsupported suffix stays unrecognized.
+        for name in ["skill.tar", "skill.zip", "skill.html", "", "bz2"] {
+            assert_eq!(detect_named(name, b"plain text"), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_undecodable_codecs_report_a_typed_unsupported_error() {
+        for (format, codec, magic) in [
+            (ArchiveFormat::Bzip2, "bzip2", BZIP2_MAGIC),
+            (ArchiveFormat::Xz, "xz", XZ_MAGIC),
+            (ArchiveFormat::Zstd, "zstd", ZSTD_MAGIC),
+        ] {
+            let error = ArchiveUnpacker::unpack(format, magic).expect_err(codec);
+            assert_eq!(
+                error.kind(),
+                openjiuwen_common::error::ErrorKind::Unsupported,
+                "{codec}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(codec), "{codec}: {message}");
+            assert!(message.contains("decoder"), "{codec}: {message}");
+
+            // Detection plus unpacking reaches the same typed answer.
+            let error = ArchiveUnpacker::unpack_auto(magic).expect_err(codec);
+            assert_eq!(
+                error.kind(),
+                openjiuwen_common::error::ErrorKind::Unsupported,
+                "{codec}"
+            );
+            assert!(error.to_string().contains(codec), "{codec}: {error}");
+        }
+    }
+
+    #[test]
+    fn entries_carry_kind_link_target_and_mode_through_json() {
+        let entry = ArchiveEntry {
+            path: "refs/latest.md".to_owned(),
+            bytes: Vec::new(),
+            is_dir: false,
+            kind: ArchiveEntryKind::Symlink,
+            link_target: Some("guide.md".to_owned()),
+            mode: Some(0o644),
+        };
+        let json = serde_json::to_value(&entry).expect("serializes");
+        assert_eq!(json["kind"], "symlink");
+        assert_eq!(json["link_target"], "guide.md");
+        assert_eq!(json["mode"], 0o644);
+        assert_eq!(json["is_dir"], false);
+
+        let decoded: ArchiveEntry = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(decoded, entry);
+
+        // Absent optional fields stay out of the payload rather than becoming
+        // `null`, so an unchanged entry serializes exactly as it used to.
+        let file = ArchiveEntry {
+            path: "a.txt".to_owned(),
+            bytes: b"a".to_vec(),
+            is_dir: false,
+            ..ArchiveEntry::default()
+        };
+        let json = serde_json::to_value(&file).expect("serializes");
+        assert!(json.get("link_target").is_none(), "{json}");
+        assert!(json.get("mode").is_none(), "{json}");
+        assert_eq!(json["kind"], "file");
+
+        // Every kind round-trips through the snake_case names.
+        for (kind, name) in [
+            (ArchiveEntryKind::File, "file"),
+            (ArchiveEntryKind::Directory, "directory"),
+            (ArchiveEntryKind::Symlink, "symlink"),
+            (ArchiveEntryKind::HardLink, "hard_link"),
+        ] {
+            let entry = ArchiveEntry {
+                kind,
+                ..ArchiveEntry::default()
+            };
+            let json = serde_json::to_value(&entry).expect("serializes");
+            assert_eq!(json["kind"], name);
+            let decoded: ArchiveEntry = serde_json::from_value(json).expect("deserializes");
+            assert_eq!(decoded.kind, kind);
+        }
+    }
+
+    #[test]
+    fn entries_without_the_new_fields_deserialize_with_defaults() {
+        let legacy = serde_json::json!({"path": "a.txt", "bytes": [], "is_dir": false});
+        let entry: ArchiveEntry = serde_json::from_value(legacy).expect("legacy payload");
+        assert_eq!(entry.path, "a.txt");
+        assert_eq!(entry.bytes, Vec::<u8>::new());
+        assert!(!entry.is_dir);
+        assert_eq!(entry.kind, ArchiveEntryKind::File);
+        assert_eq!(entry.link_target, None);
+        assert_eq!(entry.mode, None);
     }
 
     #[test]

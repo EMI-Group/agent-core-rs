@@ -7,6 +7,7 @@
 //! constant.
 
 use super::*;
+use crate::skill_creator::omni::archive::ArchiveEntryKind;
 use openjiuwen_common::error::ErrorKind;
 
 /// The size of one `tar` header or data block.
@@ -271,11 +272,14 @@ fn a_gzip_wrapped_zip_unpacks_through_detection() {
             path: "notes/readme.txt".to_owned(),
             bytes: b"hello zip\n".to_vec(),
             is_dir: false,
+            ..ArchiveEntry::default()
         },
         ArchiveEntry {
             path: "assets/".to_owned(),
             bytes: Vec::new(),
             is_dir: true,
+            kind: ArchiveEntryKind::Directory,
+            ..ArchiveEntry::default()
         },
     ];
     let zip = ArchiveWriter::write_stored(&entries).expect("writes a stored zip");

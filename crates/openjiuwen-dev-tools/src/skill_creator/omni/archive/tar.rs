@@ -15,7 +15,7 @@
 //! ignored. Every retained path goes through
 //! [`validate_path`](super::validate_path), and every declared size is charged
 //! to [`CapTracker`](super::CapTracker) before its data slice is copied.
-use super::{validate_path, ArchiveEntry, CapTracker};
+use super::{validate_path, ArchiveEntry, ArchiveEntryKind, CapTracker};
 use openjiuwen_common::error::{Error, Result};
 
 /// The size of one `tar` header or data block.
@@ -98,6 +98,8 @@ pub(crate) fn unpack(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
                     path,
                     bytes: data.to_vec(),
                     is_dir: false,
+                    kind: ArchiveEntryKind::File,
+                    ..ArchiveEntry::default()
                 });
             }
             b'5' => {
@@ -106,6 +108,8 @@ pub(crate) fn unpack(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
                     path,
                     bytes: Vec::new(),
                     is_dir: true,
+                    kind: ArchiveEntryKind::Directory,
+                    ..ArchiveEntry::default()
                 });
             }
             b'L' => {
