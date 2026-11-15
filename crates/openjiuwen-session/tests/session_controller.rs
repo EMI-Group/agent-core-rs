@@ -65,6 +65,9 @@ async fn workflow_session_round_trips_through_disk() {
         .update_component_state("comp.1", json!({"status": "ok"}))
         .await
         .unwrap();
+    // A session's stream sink reports only the frames a subscriber received, so
+    // subscribe before emitting the span whose trace position is persisted.
+    let _events = session.subscribe();
     {
         let tracer = session.tracer().expect("a workflow session owns a tracer");
         let span = tracer.start_span("run", InvokeType::Workflow);

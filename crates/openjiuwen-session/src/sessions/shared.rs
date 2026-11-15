@@ -195,12 +195,17 @@ impl SessionInner {
 
     /// Publishes `item` to the session stream.
     ///
+    /// The delivery outcome is deliberately discarded: a session write is
+    /// fire-and-forget, and an unobserved run (no subscriber) is a normal case.
+    /// Producers that must know whether a frame was consumed call
+    /// [`StreamWriterManager::write`] through [`Session::writers`] themselves.
+    ///
     /// # Errors
     ///
     /// Propagates [`StreamWriterManager::write`] errors (a `Null` payload is
     /// [`Error::Validation`]).
     pub(crate) async fn write_stream(&self, item: StreamItem) -> Result<()> {
-        self.writers.write(item).await
+        self.writers.write(item).await.map(|_outcome| ())
     }
 
     /// Publishes an interaction frame and awaits the matching response.

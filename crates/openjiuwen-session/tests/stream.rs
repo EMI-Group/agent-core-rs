@@ -13,8 +13,10 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use openjiuwen_common::error::{Error, ErrorKind, Result};
 use openjiuwen_session::constants::END_FRAME;
+use openjiuwen_session::session::Session;
+use openjiuwen_session::sessions::WorkflowSession;
 use openjiuwen_session::stream::{
-    StreamEvent, StreamHub, StreamItem, StreamMode, StreamWriterManager,
+    StreamEvent, StreamHub, StreamItem, StreamMode, StreamSendOutcome, StreamWriterManager,
 };
 use serde_json::{json, Value};
 
@@ -134,27 +136,36 @@ async fn late_subscriber_receives_exactly_one_end() {
 }
 
 #[tokio::test]
-async fn disabled_modes_are_dropped() {
+async fn disabled_modes_are_reported_and_dropped() {
     let hub = StreamHub::new();
     let manager = StreamWriterManager::with_modes(hub.clone(), vec![StreamMode::Output]);
     let mut stream = manager.subscribe();
 
-    manager
-        .write(StreamItem::trace("tracer_agent", json!({ "invoke": 1 })))
-        .await
-        .unwrap();
-    manager
-        .write(StreamItem::output_at(
-            "llm_output",
-            0,
-            json!({ "delta": "hi" }),
-        ))
-        .await
-        .unwrap();
-    manager
-        .write(StreamItem::custom(json!({ "k": "v" })))
-        .await
-        .unwrap();
+    assert_eq!(
+        manager
+            .write(StreamItem::trace("tracer_agent", json!({ "invoke": 1 })))
+            .await
+            .expect("a disabled mode is an outcome, not an error"),
+        StreamSendOutcome::ModeDisabled
+    );
+    assert_eq!(
+        manager
+            .write(StreamItem::output_at(
+                "llm_output",
+                0,
+                json!({ "delta": "hi" }),
+            ))
+            .await
+            .expect("an enabled mode forwards the hub outcome"),
+        StreamSendOutcome::Delivered { subscribers: 1 }
+    );
+    assert_eq!(
+        manager
+            .write(StreamItem::custom(json!({ "k": "v" })))
+            .await
+            .expect("a disabled mode is an outcome, not an error"),
+        StreamSendOutcome::ModeDisabled
+    );
     manager.close();
 
     match recv(&mut stream).await {
@@ -238,7 +249,7 @@ async fn end_sentinel_is_recognised() {
 }
 
 #[tokio::test]
-async fn send_without_subscribers_and_after_close_is_ok() {
+async fn send_reports_no_subscribers_delivered_and_closed() {
     let hub = StreamHub::new();
     assert_eq!(
         hub.capacity(),
@@ -247,25 +258,108 @@ async fn send_without_subscribers_and_after_close_is_ok() {
     assert_eq!(StreamHub::with_capacity(0).capacity(), 1);
     assert_eq!(StreamHub::with_capacity(16).capacity(), 16);
 
-    hub.send(StreamItem::output(
-        "llm_output",
-        Some(0),
-        json!({ "delta": "x" }),
-    ))
-    .await
-    .expect("an unobserved stream accepts frames");
+    // An unobserved stream accepts the frame and says so, instead of silently
+    // dropping it.
+    let outcome = hub
+        .send(StreamItem::output(
+            "llm_output",
+            Some(0),
+            json!({ "delta": "x" }),
+        ))
+        .await
+        .expect("an unobserved stream accepts frames");
+    assert_eq!(outcome, StreamSendOutcome::NoSubscribers);
+    assert!(!outcome.is_delivered());
 
+    // One subscriber.
+    let mut first = hub.subscribe();
+    assert_eq!(
+        hub.send(StreamItem::output(
+            "llm_output",
+            Some(1),
+            json!({ "delta": "y" }),
+        ))
+        .await
+        .expect("a subscribed hub delivers the frame"),
+        StreamSendOutcome::Delivered { subscribers: 1 }
+    );
+    match recv(&mut first).await {
+        StreamEvent::Item(item) => assert_eq!(item.index, Some(1)),
+        StreamEvent::End => panic!("the delivered frame must arrive before the end"),
+    }
+
+    // Two subscribers: both receive the same frame, and the count says so.
+    let mut second = hub.subscribe();
+    assert_eq!(
+        hub.send(StreamItem::output(
+            "llm_output",
+            Some(2),
+            json!({ "delta": "z" }),
+        ))
+        .await
+        .expect("both subscribers are counted"),
+        StreamSendOutcome::Delivered { subscribers: 2 }
+    );
+    for stream in [&mut first, &mut second] {
+        match recv(stream).await {
+            StreamEvent::Item(item) => assert_eq!(item.index, Some(2)),
+            StreamEvent::End => panic!("the delivered frame must arrive before the end"),
+        }
+    }
+
+    // After close the frame is not published, which is an outcome.
     hub.close();
     assert!(hub.is_closed());
-    hub.send(StreamItem::output(
-        "llm_output",
-        Some(1),
-        json!({ "delta": "y" }),
-    ))
-    .await
-    .expect("sending after close is a no-op");
+    assert_eq!(
+        hub.send(StreamItem::output(
+            "llm_output",
+            Some(3),
+            json!({ "delta": "w" }),
+        ))
+        .await
+        .expect("sending after close is an outcome, not an error"),
+        StreamSendOutcome::Closed
+    );
     hub.close();
     assert!(hub.is_closed(), "close is idempotent");
+
+    // Late-subscriber semantics are unchanged: exactly one end marker.
+    let mut late = hub.subscribe();
+    assert_eq!(recv(&mut late).await, StreamEvent::End);
+    assert!(
+        late.next().await.is_none(),
+        "a late subscriber does not receive a second end marker"
+    );
+}
+
+/// A session's default `StreamTraceSink` advances its position only for frames
+/// a subscriber actually received.
+#[tokio::test]
+async fn stream_trace_sink_advances_its_position_only_on_delivery() {
+    let session = WorkflowSession::new("s-trace-delivery");
+    let tracer = session.tracer().expect("a workflow session owns a tracer");
+
+    let span = tracer.start_span("unobserved", openjiuwen_session::InvokeType::Llm);
+    span.finish(json!({}));
+    assert_eq!(
+        session.trace().position(),
+        None,
+        "a frame no subscriber received must not advance the trace position"
+    );
+
+    // A subscriber appears: the next span's frame is delivered and counts.
+    let _events = session.subscribe();
+    let span = tracer.start_span("observed", openjiuwen_session::InvokeType::Llm);
+    span.finish(json!({}));
+    let position = session
+        .trace()
+        .position()
+        .expect("the delivered frame yields a trace position");
+    assert_eq!(
+        position.frame_count, 1,
+        "only the delivered frame counts, not the dropped one"
+    );
+    assert_eq!(position.last_invoke_id, Some(span.id()));
 }
 
 #[tokio::test]

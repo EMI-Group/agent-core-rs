@@ -278,6 +278,47 @@ async fn the_factory_configuration_carries_the_ca_file() {
         .unwrap()
         .is_some());
 
+    // The factory itself forwards the CA file: without the option the compiled-in
+    // roots reject the fixture server (asserted below), so a successful
+    // `create_checkpointer` proves the extra key reached the TLS client.
+    let factory = create_checkpointer(&config)
+        .await
+        .expect("the factory's tls_ca_file must reach the TLS client");
+    let factory_id = factory
+        .save(Checkpoint::new(
+            "session-factory-direct",
+            CheckpointNamespace::Agent,
+            "agent-1",
+        ))
+        .await
+        .unwrap();
+    assert!(factory
+        .load("session-factory-direct", &factory_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        server.count("SET"),
+        2,
+        "both the direct backend and the factory-built one wrote through TLS"
+    );
+    let written: Vec<String> = server
+        .commands()
+        .into_iter()
+        .filter(|command| {
+            command
+                .first()
+                .is_some_and(|name| name.eq_ignore_ascii_case("SET"))
+        })
+        .filter_map(|command| command.get(1).cloned())
+        .collect();
+    assert!(
+        written.contains(&format!(
+            "factory-tls:session:session-factory-direct:checkpoint:{factory_id}"
+        )),
+        "the prefix from the same extra map is applied too: {written:?}"
+    );
+
     // The hyphenated spelling is an alias for the same key.
     let mut hyphens = config.clone();
     hyphens.extra.remove("tls_ca_file");

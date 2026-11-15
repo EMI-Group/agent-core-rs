@@ -26,6 +26,15 @@
 //!   they exist for API symmetry with Python's `await writer.write(...)` and so
 //!   future backends can become genuinely asynchronous without a breaking
 //!   change.
+//! - Every publish reports what happened to the frame as a
+//!   [`StreamSendOutcome`]: `Delivered { subscribers }` when at least one
+//!   subscriber received it, `NoSubscribers` when the hub is open but nobody is
+//!   listening, `Closed` when the hub was already closed, and `ModeDisabled`
+//!   when the writer manager does not route that mode. An unobserved frame is
+//!   therefore an *observable* outcome rather than a silent drop, and a caller
+//!   that needs the frame to be consumed can react to it. The outcome is a
+//!   plain `Copy` value and deliberately not `#[must_use]`, so fire-and-forget
+//!   producers keep working unchanged.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -186,6 +195,43 @@ pub enum StreamEvent {
     End,
 }
 
+/// What happened to a frame handed to a [`StreamHub`] or a
+/// [`StreamWriterManager`].
+///
+/// Publishing is best-effort by design (a slow or absent observer must never
+/// stall a run), so these are outcomes rather than errors: only a malformed
+/// frame is [`Error::Validation`]. The enum is `Copy` and not `#[must_use]`, so
+/// fire-and-forget producers can ignore it with a plain statement while
+/// callers that care (the trace sink, for example) can inspect it.
+///
+/// Wire form is `snake_case`: `{"delivered": {"subscribers": 1}}`,
+/// `"no_subscribers"`, `"closed"`, and `"mode_disabled"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamSendOutcome {
+    /// The frame reached at least one subscriber; `subscribers` is the number
+    /// of receivers the transport handed it to (always `> 0`).
+    Delivered {
+        /// How many subscribers received the frame.
+        subscribers: usize,
+    },
+    /// The hub is open but has no subscriber, so nothing consumed the frame.
+    NoSubscribers,
+    /// The hub was already closed ([`StreamHub::close`]); nothing was published.
+    Closed,
+    /// The writer manager does not route this frame's mode; nothing was
+    /// published.
+    ModeDisabled,
+}
+
+impl StreamSendOutcome {
+    /// Whether the frame reached at least one subscriber.
+    #[must_use]
+    pub const fn is_delivered(&self) -> bool {
+        matches!(self, Self::Delivered { .. })
+    }
+}
+
 /// Bounded, multi-subscriber transport for [`StreamItem`] frames.
 ///
 /// A hub owns a `tokio` broadcast channel plus a closed flag. Producers call
@@ -194,8 +240,10 @@ pub enum StreamEvent {
 /// never block: a full per-subscriber buffer makes that subscriber skip its
 /// oldest frames with a warning, so a slow consumer cannot stall the workflow.
 ///
-/// A hub without subscribers accepts and drops frames; that is the normal case
-/// for workflows that are not being observed.
+/// A hub without subscribers accepts the frame and reports
+/// [`StreamSendOutcome::NoSubscribers`]; that is the normal case for workflows
+/// that are not being observed, and now an explicit outcome rather than a
+/// silent drop.
 #[derive(Debug)]
 pub struct StreamHub {
     sender: broadcast::Sender<StreamEvent>,
@@ -244,13 +292,18 @@ impl StreamHub {
     /// underlying transport is `tokio::sync::broadcast::Sender::send`, which is
     /// itself synchronous.
     ///
+    /// The returned [`StreamSendOutcome`] says what happened to the frame:
+    /// [`StreamSendOutcome::Delivered`] with the number of subscribers that
+    /// received it, [`StreamSendOutcome::NoSubscribers`] when the hub is open
+    /// but nobody is listening (the frame is dropped, which is the documented
+    /// behavior for an unobserved run), or [`StreamSendOutcome::Closed`] when
+    /// [`StreamHub::close`] already ran.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`] when the payload is [`Value::Null`]
-    /// (Python error 111132). Sending to a closed hub, or to a hub without
-    /// subscribers, is not an error: the frame is dropped and `Ok(())` is
-    /// returned.
-    pub fn send_now(&self, item: StreamItem) -> Result<()> {
+    /// (Python error 111132). An undelivered frame is an outcome, not an error.
+    pub fn send_now(&self, item: StreamItem) -> Result<StreamSendOutcome> {
         if item.payload.is_null() {
             return Err(Error::validation("stream payload is null"));
         }
@@ -259,14 +312,16 @@ impl StreamHub {
                 item_type = item.item_type.as_str(),
                 "dropping stream item: stream hub is closed"
             );
-            return Ok(());
+            return Ok(StreamSendOutcome::Closed);
         }
-        match self.sender.send(StreamEvent::Item(item)) {
-            // `tokio::sync::broadcast` reports exactly one failure mode: there
-            // were no active receivers. Dropping the frame is the documented
-            // behavior for an unobserved stream, not an error.
-            Ok(_receivers) => Ok(()),
-            Err(broadcast::error::SendError(_)) => Ok(()),
+        // `tokio::sync::broadcast` reports exactly one failure mode: there
+        // were no active receivers. That is an explicit outcome, so callers
+        // can tell an unobserved stream from a delivered frame.
+        if let Ok(subscribers) = self.sender.send(StreamEvent::Item(item)) {
+            Ok(StreamSendOutcome::Delivered { subscribers })
+        } else {
+            tracing::debug!("dropping stream item: no subscribers");
+            Ok(StreamSendOutcome::NoSubscribers)
         }
     }
 
@@ -281,11 +336,10 @@ impl StreamHub {
     /// # Errors
     ///
     /// Same as [`StreamHub::send_now`]: [`Error::Validation`] for a `Null`
-    /// payload; a closed hub or a hub without subscribers drops the frame and
-    /// returns `Ok(())`.
+    /// payload. An undelivered frame is reported as a [`StreamSendOutcome`].
     // The missing `.await` is intentional: the wrapper exists for API symmetry.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-    pub async fn send(&self, item: StreamItem) -> Result<()> {
+    pub async fn send(&self, item: StreamItem) -> Result<StreamSendOutcome> {
         self.send_now(item)
     }
 
@@ -403,18 +457,23 @@ impl StreamWriterManager {
     /// This is the canonical write path; see [`StreamHub::send_now`] for why it
     /// is safe to call from synchronous code.
     ///
+    /// A disabled mode reports [`StreamSendOutcome::ModeDisabled`]: the frame
+    /// was explicitly *not written*, which is different from a frame the hub
+    /// accepted but no subscriber consumed ([`StreamSendOutcome::NoSubscribers`]).
+    /// Every other case forwards the hub's outcome.
+    ///
     /// # Errors
     ///
     /// Propagates [`StreamHub::send_now`] errors (a `Null` payload is
-    /// [`Error::Validation`]). Writing a disabled mode is not an error: the
-    /// frame is dropped and `Ok(())` is returned.
-    pub fn write_now(&self, item: StreamItem) -> Result<()> {
+    /// [`Error::Validation`]). An undelivered frame is an outcome, not an
+    /// error.
+    pub fn write_now(&self, item: StreamItem) -> Result<StreamSendOutcome> {
         if !self.enables(item.mode) {
             tracing::debug!(
                 mode = item.mode.as_str(),
                 "dropping stream item: mode disabled"
             );
-            return Ok(());
+            return Ok(StreamSendOutcome::ModeDisabled);
         }
         self.hub.send_now(item)
     }
@@ -431,11 +490,11 @@ impl StreamWriterManager {
     /// # Errors
     ///
     /// Same as [`StreamWriterManager::write_now`]: [`Error::Validation`] for a
-    /// `Null` payload; a disabled mode, a closed hub, or a hub without
-    /// subscribers drops the frame and returns `Ok(())`.
+    /// `Null` payload. A disabled mode, a closed hub, and a hub without
+    /// subscribers are reported as a [`StreamSendOutcome`].
     // The missing `.await` is intentional: the wrapper exists for API symmetry.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-    pub async fn write(&self, item: StreamItem) -> Result<()> {
+    pub async fn write(&self, item: StreamItem) -> Result<StreamSendOutcome> {
         self.write_now(item)
     }
 
@@ -470,7 +529,9 @@ mod tests {
 
     use openjiuwen_common::error::{ErrorKind, Result};
 
-    use super::{StreamEvent, StreamHub, StreamItem, StreamMode, StreamWriterManager};
+    use super::{
+        StreamEvent, StreamHub, StreamItem, StreamMode, StreamSendOutcome, StreamWriterManager,
+    };
 
     /// Upper bound on how long a deterministic in-memory receive may take.
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
@@ -516,24 +577,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_now_drops_disabled_modes_and_rejects_null_payloads() {
+    async fn write_now_reports_disabled_modes_and_rejects_null_payloads() {
         let hub = StreamHub::new();
         let manager = StreamWriterManager::with_modes(hub.clone(), vec![StreamMode::Output]);
         let mut stream = manager.subscribe();
 
-        manager
-            .write_now(StreamItem::trace("tracer_agent", json!({ "invoke": 1 })))
-            .expect("a disabled trace mode is a no-op");
-        manager
-            .write_now(StreamItem::custom(json!({ "k": "v" })))
-            .expect("a disabled custom mode is a no-op");
-        manager
-            .write_now(StreamItem::output_at(
-                "llm_output",
-                0,
-                json!({ "delta": "hi" }),
-            ))
-            .expect("the enabled mode is written");
+        assert_eq!(
+            manager
+                .write_now(StreamItem::trace("tracer_agent", json!({ "invoke": 1 })))
+                .expect("a disabled trace mode is not an error"),
+            StreamSendOutcome::ModeDisabled
+        );
+        assert_eq!(
+            manager
+                .write_now(StreamItem::custom(json!({ "k": "v" })))
+                .expect("a disabled custom mode is not an error"),
+            StreamSendOutcome::ModeDisabled
+        );
+        assert_eq!(
+            manager
+                .write_now(StreamItem::output_at(
+                    "llm_output",
+                    0,
+                    json!({ "delta": "hi" }),
+                ))
+                .expect("the enabled mode is written"),
+            StreamSendOutcome::Delivered { subscribers: 1 }
+        );
         manager.close();
 
         // The disabled frames never reach the hub: the output frame is first.
@@ -552,5 +622,59 @@ mod tests {
             .expect_err("a null payload is rejected");
         assert_eq!(error.kind(), ErrorKind::Validation);
         assert_eq!(error.to_string(), "validation: stream payload is null");
+    }
+
+    #[tokio::test]
+    async fn send_now_reports_no_subscribers_and_closed() {
+        let hub = StreamHub::new();
+        assert_eq!(
+            hub.send_now(StreamItem::output("llm_output", None, json!({ "n": 0 })))
+                .expect("an unobserved hub still accepts the frame"),
+            StreamSendOutcome::NoSubscribers
+        );
+        assert!(!StreamSendOutcome::NoSubscribers.is_delivered());
+
+        let mut stream = hub.subscribe();
+        assert_eq!(
+            hub.send_now(StreamItem::output("llm_output", None, json!({ "n": 1 })))
+                .expect("a subscribed hub delivers the frame"),
+            StreamSendOutcome::Delivered { subscribers: 1 }
+        );
+        assert!(StreamSendOutcome::Delivered { subscribers: 1 }.is_delivered());
+        let _ = recv(&mut stream).await;
+
+        hub.close();
+        assert_eq!(
+            hub.send_now(StreamItem::output("llm_output", None, json!({ "n": 2 })))
+                .expect("a closed hub is an outcome, not an error"),
+            StreamSendOutcome::Closed
+        );
+    }
+
+    #[test]
+    fn send_outcome_wire_shape_is_snake_case() {
+        assert_eq!(
+            serde_json::to_value(StreamSendOutcome::Delivered { subscribers: 2 }).unwrap(),
+            json!({ "delivered": { "subscribers": 2 } })
+        );
+        assert_eq!(
+            serde_json::to_value(StreamSendOutcome::NoSubscribers).unwrap(),
+            json!("no_subscribers")
+        );
+        assert_eq!(
+            serde_json::to_value(StreamSendOutcome::Closed).unwrap(),
+            json!("closed")
+        );
+        assert_eq!(
+            serde_json::to_value(StreamSendOutcome::ModeDisabled).unwrap(),
+            json!("mode_disabled")
+        );
+        assert_eq!(
+            serde_json::from_value::<StreamSendOutcome>(
+                json!({ "delivered": { "subscribers": 1 } })
+            )
+            .unwrap(),
+            StreamSendOutcome::Delivered { subscribers: 1 }
+        );
     }
 }

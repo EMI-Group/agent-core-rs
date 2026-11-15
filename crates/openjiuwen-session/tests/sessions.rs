@@ -763,6 +763,9 @@ async fn workflow_trace_position_round_trips_through_a_checkpoint() {
     });
 
     let tracer = session.tracer().expect("concrete sessions own a tracer");
+    // The session's default sink is a `StreamTraceSink`, which counts only the
+    // frames a subscriber actually received.
+    let _events = session.subscribe();
     let trace_id = tracer.trace_id().to_string();
     let span = tracer.start_span("answer", InvokeType::Llm);
     span.set_inputs(json!({ "q": "hi" }));

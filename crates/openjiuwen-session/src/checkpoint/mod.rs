@@ -444,8 +444,11 @@ pub struct CheckpointerConfig {
     /// [`RedisCheckpointer`] reads `"url"` (required; the rendered
     /// [`CheckpointerConfig::path`] is the fallback URL), `"prefix"` (string,
     /// defaulting to [`redis::DEFAULT_REDIS_KEY_PREFIX`]), `"ttl_seconds"`
-    /// (unsigned integer, applied as `EXPIRE` per checkpoint document), and
-    /// `"database"` (unsigned integer, sent as `SELECT`).
+    /// (unsigned integer, applied as `EXPIRE` per checkpoint document),
+    /// `"database"` (unsigned integer, sent as `SELECT`), and `"tls_ca_file"`
+    /// (string: extra trust anchors for a `rediss://` URL; the hyphenated
+    /// `"tls-ca-file"` spelling is accepted as an alias, and `"tls_ca_file"`
+    /// wins when both are present).
     pub extra: BTreeMap<String, Value>,
 }
 
@@ -453,18 +456,19 @@ pub struct CheckpointerConfig {
 ///
 /// `redis` dials the server eagerly, so an unreachable server or a failed
 /// handshake surfaces here as [`openjiuwen_common::error::ErrorKind::Session`]
-/// rather than on the first save.
+/// rather than on the first save. A `rediss://` URL is supported: it dials over
+/// TLS, and [`CheckpointerConfig::extra`] `"tls_ca_file"` (or its
+/// `"tls-ca-file"` alias) supplies extra trust anchors for it.
 ///
 /// # Errors
 ///
 /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] when `file` or
 /// `sqlite` is requested without a `path`, when `redis` is requested without a
-/// URL, and for a malformed Redis URL;
+/// URL, for a malformed Redis URL, and for a `tls_ca_file` on a `redis://` URL;
 /// [`openjiuwen_common::error::ErrorKind::Unsupported`] when `sqlite` is
-/// requested but the crate was built without the `sqlite` feature, or when the
-/// Redis URL is `rediss://` (TLS); and
-/// [`openjiuwen_common::error::ErrorKind::Session`] when the Redis connection
-/// or its handshake fails.
+/// requested but the crate was built without the `sqlite` feature; and
+/// [`openjiuwen_common::error::ErrorKind::Session`] when the Redis connection,
+/// its TLS handshake, or its protocol handshake fails.
 pub async fn create_checkpointer(config: &CheckpointerConfig) -> Result<Arc<dyn Checkpointer>> {
     match config.kind {
         CheckpointerKind::InMemory => Ok(Arc::new(MemoryCheckpointer::new())),
@@ -501,38 +505,12 @@ async fn create_sqlite_checkpointer(config: &CheckpointerConfig) -> Result<Arc<d
 
 /// Builds a [`RedisCheckpointer`] from a [`CheckpointerConfig`].
 ///
-/// The URL is read from `extra["url"]`, falling back to the rendered
-/// `config.path`; the optional `extra` keys are `prefix` (string), `ttl_seconds`
-/// (unsigned integer), and `database` (unsigned integer).
+/// [`RedisOptions::from_config`](redis::RedisOptions::from_config) owns the
+/// reading of `extra` (URL with the `path` fallback, `prefix`, `ttl_seconds`,
+/// `database`, and `tls_ca_file`/`tls-ca-file`), so the factory never has to
+/// enumerate those keys itself.
 async fn create_redis_checkpointer(config: &CheckpointerConfig) -> Result<Arc<dyn Checkpointer>> {
-    let url = config
-        .extra
-        .get("url")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| config.path.as_ref().map(|path| path.display().to_string()))
-        .ok_or_else(|| {
-            Error::validation(
-                "redis checkpointer requires a `url` (extra.url or path) in the configuration",
-            )
-        })?;
-    let mut options = redis::RedisOptions {
-        url,
-        ..redis::RedisOptions::default()
-    };
-    if let Some(prefix) = config.extra.get("prefix").and_then(Value::as_str) {
-        options.prefix = prefix.to_string();
-    }
-    if let Some(seconds) = config.extra.get("ttl_seconds").and_then(Value::as_u64) {
-        options.ttl = Some(std::time::Duration::from_secs(seconds));
-    }
-    if let Some(database) = config.extra.get("database").and_then(Value::as_u64) {
-        options.database = Some(u32::try_from(database).map_err(|_| {
-            Error::validation(format!(
-                "redis database index {database} does not fit in a u32"
-            ))
-        })?);
-    }
+    let options = redis::RedisOptions::from_config(config)?;
     let checkpointer = redis::RedisCheckpointer::connect_with_options(options).await?;
     Ok(Arc::new(checkpointer))
 }
