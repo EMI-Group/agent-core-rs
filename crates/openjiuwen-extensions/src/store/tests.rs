@@ -598,11 +598,11 @@ async fn sqlite_factories_use_an_in_memory_database() {
         documents.list_collections().await.unwrap(),
         vec!["docs".to_string()]
     );
-    let error = build_vector_store(&backend)
-        .await
-        .err()
-        .expect("sqlite has no vector backend");
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let vectors = build_vector_store(&backend).await.unwrap();
+    assert_eq!(
+        vectors.list_collection_names().await.unwrap(),
+        Vec::<String>::new()
+    );
 }
 #[cfg(not(feature = "sqlite"))]
 #[tokio::test]
@@ -616,4 +616,20 @@ async fn sqlite_kv_store_requires_the_feature() {
         .expect("sqlite backend without the feature must fail");
     assert_eq!(error.kind(), ErrorKind::Unsupported);
     assert!(error.message().to_ascii_lowercase().contains("sqlite"));
+}
+// The vector backend is the one SQLite surface that only becomes available with
+// the feature, so a default build must keep reporting it as deferred.
+#[cfg(not(feature = "sqlite"))]
+#[tokio::test]
+async fn sqlite_vector_store_requires_the_feature() {
+    let backend = StoreBackend::Sqlite {
+        url: "sqlite::memory:".to_string(),
+    };
+    let error = build_vector_store(&backend)
+        .await
+        .err()
+        .expect("the sqlite vector backend needs the feature");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(error.message().to_ascii_lowercase().contains("sqlite"));
+    assert!(error.message().contains("vector"));
 }

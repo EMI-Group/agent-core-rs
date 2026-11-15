@@ -7,11 +7,20 @@
 //! same private provider, so several handles can coexist (tests, agents, and
 //! the observability stack) without touching process-global state.
 //!
-//! Two configurations share one API:
+//! Two configurations share one API, and the no-feature build is deliberately
+//! asymmetric at the exporter-type level:
 //!
 //! - without `feature = "otel"`, [`init_otel_tracer`] validates the
-//!   configuration and returns an inactive handle for *every*
-//!   [`ExporterType`]; nothing is built and nothing fails;
+//!   configuration first and then splits by exporter type.
+//!   [`ExporterType::Memory`], [`ExporterType::Console`] and
+//!   [`ExporterType::None`] return an inactive handle: that is the documented
+//!   no-op seam, and [`TracerHandle::is_active`] returning `false` is its
+//!   signal. [`ExporterType::Otlp`] and [`ExporterType::File`] answer
+//!   [the unsupported error](openjiuwen_common::error::Error::Unsupported)
+//!   instead, naming the missing `otel` cargo feature: a collector endpoint or
+//!   a traces directory is a request to export telemetry, and this build has
+//!   no provider and no exporter to serve it, so those two never degrade
+//!   silently into an inactive handle;
 //! - with `feature = "otel"`, every [`ExporterType`] builds a real private
 //!   provider: `Memory` keeps finished spans in memory, `Console` logs one
 //!   `tracing` line per span, `File` appends single-span OTLP JSON lines to a
@@ -35,6 +44,11 @@
 //! defaults described in [`super::env`].
 //!
 //! [`ExporterType`]: super::config::ExporterType
+//! [`ExporterType::Memory`]: super::config::ExporterType::Memory
+//! [`ExporterType::Console`]: super::config::ExporterType::Console
+//! [`ExporterType::None`]: super::config::ExporterType::None
+//! [`ExporterType::Otlp`]: super::config::ExporterType::Otlp
+//! [`ExporterType::File`]: super::config::ExporterType::File
 //! [`OtlpProtocol::Http`]: super::config::OtlpProtocol::Http
 //! [`OtlpProtocol::HttpProtobuf`]: super::config::OtlpProtocol::HttpProtobuf
 //! [`OtlpProtocol::Grpc`]: super::config::OtlpProtocol::Grpc
@@ -47,6 +61,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "otel")]
 use std::sync::Arc;
 
+#[cfg(not(feature = "otel"))]
+use openjiuwen_common::error::Error;
 use openjiuwen_common::error::Result;
 
 #[cfg(feature = "otel")]
@@ -54,9 +70,10 @@ use opentelemetry::trace::TracerProvider as _;
 #[cfg(feature = "otel")]
 use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider, SpanExporter};
 
+use super::config::ExporterType;
 use super::config::OtelTracerConfig;
 #[cfg(feature = "otel")]
-use super::config::{ExporterType, OtlpProtocol};
+use super::config::OtlpProtocol;
 #[cfg(feature = "otel")]
 use super::otlp::{OtlpEncoding, OtlpHttpExporter};
 #[cfg(feature = "otel")]
@@ -77,6 +94,17 @@ const OTLP_GRPC_UNSUPPORTED: &str = "OTLP/gRPC span export is unsupported: gRPC 
 /// `tracing` target for handle-level failures.
 #[cfg(feature = "otel")]
 const LOG_TARGET: &str = "openjiuwen_extensions::otel::handle";
+
+/// Why an exporter that only the SDK can implement is refused in a build
+/// without the `otel` feature.
+///
+/// Shared by [`ExporterType::Otlp`] and [`ExporterType::File`], whose request
+/// (a collector endpoint, a traces directory) cannot be served at all here, so
+/// the caller gets a typed failure instead of an inactive handle.
+#[cfg(not(feature = "otel"))]
+const OTEL_FEATURE_OFF_REASON: &str = "this build has the `otel` cargo feature off, so no \
+     OpenTelemetry provider or exporter exists; enable the `otel` feature or select \
+     ExporterType::Memory, ExporterType::Console or ExporterType::None";
 
 /// A private tracer provider plus the tracer and exporters built from one
 /// [`OtelTracerConfig`].
@@ -268,18 +296,41 @@ impl TracerHandle {
 
 /// Initializes the tracer, without the `otel` feature.
 ///
-/// The configuration is validated and kept in the returned handle, but no
-/// provider is built: [`TracerHandle::is_active`] is `false` for every
-/// [`ExporterType`](super::config::ExporterType).
+/// The configuration is validated first, so an invalid setting (for example a
+/// `sample_rate` outside `0.0..=1.0`) answers [`Error::Validation`] for every
+/// exporter type. The exporter type then decides:
+///
+/// - [`ExporterType::Memory`], [`ExporterType::Console`] and
+///   [`ExporterType::None`] return an inactive handle that keeps the
+///   configuration; [`TracerHandle::is_active`] is `false`, which is the
+///   documented no-op seam — without the SDK there is no in-process capture and
+///   no console sink to attach;
+/// - [`ExporterType::Otlp`] and [`ExporterType::File`] answer
+///   [`Error::Unsupported`], naming the missing `otel` cargo feature and the
+///   exporter types that do work here. Neither a collector endpoint nor a
+///   traces directory is ever accepted and silently ignored.
 ///
 /// # Errors
 ///
 /// Returns [`openjiuwen_common::error::Error::validation`] when the
-/// configuration is invalid (for example a `sample_rate` outside `0.0..=1.0`).
+/// configuration is invalid (checked before the exporter type, so it wins in
+/// both builds), and
+/// [`openjiuwen_common::error::Error::Unsupported`] for
+/// [`ExporterType::Otlp`] and [`ExporterType::File`].
 #[cfg(not(feature = "otel"))]
 pub fn init_otel_tracer(config: OtelTracerConfig) -> Result<TracerHandle> {
     config.validate()?;
-    Ok(TracerHandle::inactive(config))
+    match config.exporter_type {
+        ExporterType::Otlp => Err(Error::unsupported(format!(
+            "the OTLP/HTTP span exporter is unavailable: {OTEL_FEATURE_OFF_REASON}"
+        ))),
+        ExporterType::File => Err(Error::unsupported(format!(
+            "the JSONL trace-file exporter is unavailable: {OTEL_FEATURE_OFF_REASON}"
+        ))),
+        ExporterType::Memory | ExporterType::Console | ExporterType::None => {
+            Ok(TracerHandle::inactive(config))
+        }
+    }
 }
 
 /// Initializes the tracer and returns its private provider handle.
@@ -402,6 +453,8 @@ mod tests {
     use crate::otel::config::ExporterType;
     #[cfg(feature = "otel")]
     use crate::otel::config::OtlpProtocol;
+    #[cfg(not(feature = "otel"))]
+    use openjiuwen_common::error::ErrorKind;
 
     // port of tests/unit_tests/extensions/tracer_otel/test_setup.py
 
@@ -457,11 +510,12 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "otel")]
     #[test]
-    fn file_exporter_initializes_in_both_builds() {
-        // `ExporterType::File` exists in both builds; only the feature build
-        // owns a provider, and it never needs a collector. The directory stays
-        // inside a temporary dir so the test never writes into the workspace.
+    fn file_exporter_initializes_with_the_feature() {
+        // The feature build owns a real provider and never needs a collector.
+        // The directory stays inside a temporary dir so the test never writes
+        // into the workspace.
         let dir = tempfile::tempdir().unwrap();
         let config = OtelTracerConfig {
             traces_dir: dir.path().to_string_lossy().into_owned(),
@@ -470,7 +524,7 @@ mod tests {
         }
         .with_exporter_type(ExporterType::File);
         let handle = init_otel_tracer(config).unwrap();
-        assert_eq!(handle.is_active(), cfg!(feature = "otel"));
+        assert!(handle.is_active());
         assert_eq!(handle.config().exporter_type, ExporterType::File);
         handle.force_flush();
         handle.shutdown();
@@ -479,12 +533,64 @@ mod tests {
 
     #[cfg(not(feature = "otel"))]
     #[test]
-    fn otlp_returns_an_inactive_handle_without_the_feature() {
-        // The seam stays inert: the default `Otlp` + `Grpc` configuration is
-        // accepted because nothing is built without the SDK.
-        let handle = init_otel_tracer(OtelTracerConfig::default()).unwrap();
-        assert_eq!(handle.config().exporter_type, ExporterType::Otlp);
-        assert!(!handle.is_active());
+    fn otlp_and_file_are_unsupported_without_the_feature() {
+        // A collector endpoint and a traces directory are genuine requests to
+        // export telemetry, and this build has neither a provider nor an
+        // exporter, so both fail with the missing cargo feature instead of
+        // handing back an inactive handle that pretends export is on.
+        let dir = tempfile::tempdir().unwrap();
+        let file_config = OtelTracerConfig {
+            traces_dir: dir.path().to_string_lossy().into_owned(),
+            file_retention_days: 0,
+            ..OtelTracerConfig::default()
+        }
+        .with_exporter_type(ExporterType::File);
+        let otlp_config = OtelTracerConfig {
+            exporter_endpoint: Some("http://127.0.0.1:9".to_owned()),
+            ..OtelTracerConfig::default()
+        }
+        .with_exporter_type(ExporterType::Otlp);
+
+        for (exporter_type, config) in [
+            (ExporterType::Otlp, otlp_config),
+            (ExporterType::File, file_config),
+        ] {
+            let error = init_otel_tracer(config)
+                .expect_err("an SDK-only exporter must not initialize without the feature");
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{exporter_type:?}");
+            let message = error.to_string();
+            assert!(
+                message.contains("otel"),
+                "the reason must name the cargo feature: {message}"
+            );
+            assert!(
+                message.contains("cargo feature off"),
+                "the reason must say the feature is off: {message}"
+            );
+            assert!(
+                message.contains("enable the `otel` feature"),
+                "the reason must name the fix: {message}"
+            );
+        }
+        assert!(
+            dir.path().read_dir().unwrap().next().is_none(),
+            "a rejected File configuration must not create or write trace files"
+        );
+    }
+
+    #[cfg(not(feature = "otel"))]
+    #[test]
+    fn invalid_configuration_wins_over_the_missing_feature() {
+        // Validation runs before the exporter dispatch, so `Otlp` still reports
+        // the configuration error rather than `Unsupported`.
+        let config = OtelTracerConfig {
+            sample_rate: 1.5,
+            ..OtelTracerConfig::default()
+        }
+        .with_exporter_type(ExporterType::Otlp);
+        let error = init_otel_tracer(config).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.to_string().contains("sample_rate must be between"));
     }
 
     #[test]

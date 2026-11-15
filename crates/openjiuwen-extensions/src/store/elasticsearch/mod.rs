@@ -79,10 +79,12 @@ use url::Url;
 use uuid::Uuid;
 
 pub(crate) mod client;
+pub(crate) mod credentials;
 #[cfg(test)]
 mod tests;
 
 use client::RestClient;
+use credentials::{endpoint_without_userinfo, ElasticsearchCredentials};
 
 /// Default index prefix, matching Python's `index_prefix="agent_vector"`.
 const DEFAULT_INDEX_PREFIX: &str = "agent_vector";
@@ -91,9 +93,18 @@ const DEFAULT_DIMENSION: usize = 768;
 
 /// Configuration for an [`ElasticsearchVectorStore`].
 ///
-/// Mirrors the Python constructor's inputs: the endpoint, the index-name
-/// prefix, and the vector dimension. The defaults are Python's: an empty URL,
-/// the `"agent_vector"` prefix, and `768` dimensions.
+/// Mirrors the Python constructor's inputs — the endpoint, the index-name
+/// prefix, and the vector dimension — and adds the credential fields the kernel
+/// document store already accepts, so one backend description authenticates
+/// both adapters. The defaults are Python's: an empty URL, the `"agent_vector"`
+/// prefix, and `768` dimensions, with no credentials.
+///
+/// Credentials may come from the URL userinfo (`http://user:pass@host:9200`) or
+/// from the explicit [`username`](Self::username) /
+/// [`password`](Self::password) fields; when both are present the explicit
+/// fields win, field by field. An [`api_key`](Self::api_key) is sent as
+/// `Authorization: ApiKey <key>` when no basic-auth pair applies. See the
+/// `credentials` module for the exact rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct ElasticsearchVectorStoreConfig {
@@ -103,6 +114,15 @@ pub struct ElasticsearchVectorStoreConfig {
     pub index_prefix: String,
     /// Dimension of the stored dense vectors; must be greater than zero.
     pub dimension: usize,
+    /// Optional basic-auth user name, overriding the URL userinfo.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Optional basic-auth password, overriding the URL userinfo.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Optional API key, sent when no basic-auth pair applies.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 impl Default for ElasticsearchVectorStoreConfig {
@@ -111,6 +131,9 @@ impl Default for ElasticsearchVectorStoreConfig {
             url: String::new(),
             index_prefix: DEFAULT_INDEX_PREFIX.to_string(),
             dimension: DEFAULT_DIMENSION,
+            username: None,
+            password: None,
+            api_key: None,
         }
     }
 }
@@ -129,7 +152,8 @@ impl ElasticsearchVectorStore {
     /// Validates `config` and builds a store.
     ///
     /// No network I/O happens here: the endpoint is parsed, credentials are
-    /// taken from the URL userinfo, and the endpoint is stripped of userinfo,
+    /// resolved by `ElasticsearchCredentials::resolve` (URL userinfo plus the
+    /// explicit configuration fields), and the endpoint is stripped of userinfo,
     /// query, fragment, and trailing slash.
     ///
     /// # Errors
@@ -168,15 +192,13 @@ impl ElasticsearchVectorStore {
                 config.url
             )));
         }
-        let auth = if parsed.username().is_empty() {
-            None
-        } else {
-            Some((
-                parsed.username().to_string(),
-                parsed.password().unwrap_or_default().to_string(),
-            ))
-        };
-        let rest = RestClient::new(endpoint(&parsed), auth)?;
+        let credentials = ElasticsearchCredentials::resolve(
+            &parsed,
+            config.username.as_deref(),
+            config.password.as_deref(),
+            config.api_key.as_deref(),
+        );
+        let rest = RestClient::new(endpoint_without_userinfo(&parsed), credentials)?;
         Ok(Self { config, rest })
     }
 
@@ -215,16 +237,6 @@ impl ElasticsearchVectorStore {
             .await?
             .ok_or_else(|| Error::not_found(format!("vector collection {collection:?} not found")))
     }
-}
-
-/// The endpoint without userinfo, query, fragment, or trailing slash.
-fn endpoint(parsed: &Url) -> String {
-    let mut stripped = parsed.clone();
-    let _ = stripped.set_username("");
-    let _ = stripped.set_password(None);
-    stripped.set_query(None);
-    stripped.set_fragment(None);
-    stripped.as_str().trim_end_matches('/').to_string()
 }
 
 #[async_trait]
