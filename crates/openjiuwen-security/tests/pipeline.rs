@@ -6,11 +6,14 @@
 //! `tests/unit_tests/core/security/guardrail/test_guardrail_base.py` (only
 //! `CRITICAL` aborts, lower severities are recorded) and pins the aggregation,
 //! ordering, stage filtering, failure policy, scan helpers, and redacted
-//! reporting this crate adds on top.
+//! reporting this crate adds on top. Failures are fail-closed by default: a
+//! guardrail error and an unscannable payload both block the call, and only an
+//! explicit `FailurePolicy::FailOpen` records them and continues.
 //!
 //! Everything runs offline against an in-file `FakeGuardrail`; no backend,
 //! network, or wall clock is involved.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -18,8 +21,9 @@ use openjiuwen_common::error::{Error, ErrorKind, Result};
 use openjiuwen_foundation::prompt::BaseMessage;
 use openjiuwen_security::finding::finding_message;
 use openjiuwen_security::{
-    FailurePolicy, Guardrail, GuardrailContext, GuardrailPipeline, GuardrailResult,
-    RedactedOutcome, RiskLevel, ScanStage, SecurityDecision, SecurityPolicy,
+    FailurePolicy, Guardrail, GuardrailContentType, GuardrailContext, GuardrailPipeline,
+    GuardrailResult, RedactedOutcome, RiskLevel, ScanStage, SecurityDecision, SecurityPolicy,
+    EVENT_LLM_INVOKE_INPUT,
 };
 use serde_json::{json, Value};
 
@@ -386,10 +390,15 @@ async fn a_lowered_block_level_blocks_high_but_still_records_medium() {
     );
 }
 
+// ports tests/unit_tests/core/security/guardrail/test_guardrail_base.py
+// (`FailOpen` is Python's behavior, here an explicit opt-in, never the default)
 #[tokio::test]
 async fn fail_open_records_the_error_and_continues() {
     let calls = call_log();
-    let mut pipeline = GuardrailPipeline::new();
+    let mut pipeline = GuardrailPipeline::new().with_policy(SecurityPolicy {
+        failure_policy: FailurePolicy::FailOpen,
+        ..Default::default()
+    });
     pipeline.add(
         FakeGuardrail::new("broken", 200, Outcome::Fail("boom".to_owned()))
             .recording_calls(calls.clone()),
@@ -419,11 +428,13 @@ async fn fail_open_records_the_error_and_continues() {
 }
 
 #[tokio::test]
-async fn fail_closed_turns_the_error_into_a_blocking_finding() {
-    let mut pipeline = GuardrailPipeline::new().with_policy(SecurityPolicy {
-        failure_policy: FailurePolicy::FailClosed,
-        ..Default::default()
-    });
+async fn fail_closed_is_the_default_and_turns_the_error_into_a_blocking_finding() {
+    let mut pipeline = GuardrailPipeline::new();
+    assert_eq!(
+        pipeline.policy().failure_policy,
+        FailurePolicy::FailClosed,
+        "a failing detector must never read as safe by default"
+    );
     pipeline.add(FakeGuardrail::new(
         "broken",
         100,
@@ -436,9 +447,13 @@ async fn fail_closed_turns_the_error_into_a_blocking_finding() {
     assert_eq!(outcome.blocked_by.as_deref(), Some("broken"));
     assert_eq!(outcome.risk_level, RiskLevel::Critical);
     assert_eq!(outcome.errors.len(), 1);
+    assert_eq!(outcome.errors[0], "broken: security: boom");
     assert_eq!(outcome.evaluations.len(), 1);
     assert_eq!(outcome.evaluations[0].result, None);
-    assert!(outcome.evaluations[0].error.is_some());
+    assert_eq!(
+        outcome.evaluations[0].error.as_deref(),
+        Some("broken: security: boom")
+    );
     assert_eq!(outcome.findings.len(), 1);
 
     let finding = &outcome.findings[0];
@@ -448,15 +463,177 @@ async fn fail_closed_turns_the_error_into_a_blocking_finding() {
     assert!(finding.blocking);
     assert_eq!(
         finding.message,
-        "Critical security risk detected: guardrail_error"
+        "Guardrail blocked: guardrail_error risk detected (security: boom)"
     );
+    assert_eq!(finding.details, Some(json!({"error": "security: boom"})));
 
     let error = outcome.enforce().unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Security);
     assert_eq!(
         error.to_string(),
-        "security: Critical security risk detected: guardrail_error"
+        "security: Guardrail blocked: guardrail_error risk detected (security: boom)"
     );
+}
+
+#[tokio::test]
+async fn an_unscannable_context_blocks_by_default() {
+    let recorder = FakeGuardrail::new("detector", 100, Outcome::Pass);
+    let calls = recorder.calls.clone();
+    let mut pipeline = GuardrailPipeline::new();
+    pipeline.add(recorder);
+
+    let outcome = pipeline
+        .run(&GuardrailContext::raw("user_input", Value::Null))
+        .await;
+
+    assert_eq!(outcome.decision, SecurityDecision::Block);
+    assert!(outcome.is_blocked());
+    assert_eq!(outcome.blocked_by.as_deref(), Some("context"));
+    assert_eq!(outcome.risk_level, RiskLevel::Critical);
+    assert_eq!(outcome.findings.len(), 1);
+
+    let finding = &outcome.findings[0];
+    assert_eq!(finding.guardrail, "context");
+    assert_eq!(finding.risk_type, "unscannable_content");
+    assert_eq!(finding.risk_level, RiskLevel::Critical);
+    assert!(finding.blocking);
+    assert_eq!(
+        finding.message,
+        "Guardrail blocked: unscannable_content risk detected (validation: unscannable content: \
+         content_type raw expects a non-null JSON value, got null)"
+    );
+    assert_eq!(outcome.evaluations.len(), 1);
+    assert_eq!(outcome.evaluations[0].guardrail, "context");
+    assert_eq!(outcome.evaluations[0].result, None);
+    assert_eq!(outcome.errors.len(), 1);
+    assert!(
+        outcome.errors[0].contains("unscannable content"),
+        "{:?}",
+        outcome.errors
+    );
+
+    // The default `stop_on_block` skips the detectors: the payload was never
+    // readable, so no detector was asked to read it.
+    assert_eq!(call_order(&calls), Vec::<String>::new());
+
+    let error = outcome.enforce().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Security);
+    assert!(error.to_string().contains("unscannable content"), "{error}");
+}
+
+#[tokio::test]
+async fn fail_open_allows_an_unscannable_context_and_still_scans_it() {
+    let recorder = FakeGuardrail::new("detector", 100, Outcome::Pass);
+    let calls = recorder.calls.clone();
+    let mut pipeline = GuardrailPipeline::new().with_policy(SecurityPolicy {
+        failure_policy: FailurePolicy::FailOpen,
+        ..Default::default()
+    });
+    pipeline.add(recorder);
+
+    let outcome = pipeline
+        .run(&GuardrailContext::raw("user_input", Value::Null))
+        .await;
+
+    assert_eq!(outcome.decision, SecurityDecision::Allow);
+    assert!(outcome.is_safe());
+    assert_eq!(outcome.blocked_by, None);
+    assert_eq!(outcome.findings.len(), 0);
+    assert_eq!(outcome.errors.len(), 1);
+    assert_eq!(
+        outcome.errors[0],
+        "context: validation: unscannable content: content_type raw expects a non-null JSON \
+         value, got null"
+    );
+
+    // The failure is recorded, not fatal: the registered guardrail still runs.
+    assert_eq!(call_order(&calls), ["detector"]);
+    assert_eq!(outcome.evaluations.len(), 2);
+    assert_eq!(outcome.evaluations[0].guardrail, "context");
+    assert_eq!(outcome.evaluations[0].result, None);
+    assert_eq!(outcome.evaluations[1].guardrail, "detector");
+    assert!(outcome.evaluations[1].result.is_some());
+    assert!(outcome.enforce().is_ok());
+}
+
+#[tokio::test]
+async fn stop_on_block_applies_to_fail_closed_failures() {
+    let stopping_calls = call_log();
+    let mut stopping = GuardrailPipeline::new();
+    stopping.add(
+        FakeGuardrail::new("broken", 200, Outcome::Fail("boom".to_owned()))
+            .recording_calls(stopping_calls.clone()),
+    );
+    stopping.add(
+        FakeGuardrail::new("healthy", 100, Outcome::Pass).recording_calls(stopping_calls.clone()),
+    );
+
+    let outcome = stopping.scan_user_input("x").await;
+    assert_eq!(call_order(&stopping_calls), ["broken"]);
+    assert!(outcome.is_blocked());
+    assert_eq!(outcome.blocked_by.as_deref(), Some("broken"));
+    assert_eq!(outcome.evaluations.len(), 1);
+    assert_eq!(outcome.errors.len(), 1);
+
+    let continuing_calls = call_log();
+    let mut continuing = GuardrailPipeline::new().with_policy(SecurityPolicy {
+        stop_on_block: false,
+        ..Default::default()
+    });
+    continuing.add(
+        FakeGuardrail::new("broken", 200, Outcome::Fail("boom".to_owned()))
+            .recording_calls(continuing_calls.clone()),
+    );
+    continuing.add(
+        FakeGuardrail::new("healthy", 100, Outcome::Pass).recording_calls(continuing_calls.clone()),
+    );
+
+    let outcome = continuing.scan_user_input("x").await;
+    assert_eq!(call_order(&continuing_calls), ["broken", "healthy"]);
+    assert!(outcome.is_blocked());
+    assert_eq!(outcome.blocked_by.as_deref(), Some("broken"));
+    assert_eq!(outcome.findings.len(), 1);
+    assert_eq!(outcome.errors.len(), 1);
+    assert_eq!(outcome.evaluations.len(), 2);
+    assert!(outcome.evaluations[1].result.is_some());
+}
+
+#[tokio::test]
+async fn a_multimodal_only_messages_context_blocks_as_unscannable() {
+    let mut pipeline = GuardrailPipeline::new();
+    pipeline.add(FakeGuardrail::new("detector", 100, Outcome::Pass));
+
+    let ctx = GuardrailContext {
+        content_type: GuardrailContentType::Messages,
+        content: json!([{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": "https://example.test/x.png"}
+            }]
+        }]),
+        event: EVENT_LLM_INVOKE_INPUT.to_owned(),
+        metadata: BTreeMap::new(),
+    };
+    let outcome = pipeline.run(&ctx).await;
+
+    assert_eq!(outcome.decision, SecurityDecision::Block);
+    assert_eq!(outcome.blocked_by.as_deref(), Some("context"));
+    assert_eq!(outcome.findings.len(), 1);
+    let finding = &outcome.findings[0];
+    assert_eq!(finding.guardrail, "context");
+    assert_eq!(finding.risk_type, "unscannable_content");
+    assert_eq!(finding.risk_level, RiskLevel::Critical);
+    assert!(finding.blocking);
+    assert!(
+        finding
+            .message
+            .contains("carries no text and no tool-call arguments"),
+        "{finding:?}"
+    );
+    let error = outcome.enforce().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Security);
+    assert!(error.to_string().contains("unscannable content"), "{error}");
 }
 
 // ports tests/unit_tests/core/security/guardrail/test_guardrail_base.py
@@ -572,7 +749,7 @@ async fn an_empty_pipeline_allows_the_scan() {
     let policy = pipeline.policy();
     assert_eq!(policy, &SecurityPolicy::default());
     assert_eq!(policy.block_level, RiskLevel::Critical);
-    assert_eq!(policy.failure_policy, FailurePolicy::FailOpen);
+    assert_eq!(policy.failure_policy, FailurePolicy::FailClosed);
     assert!(policy.stop_on_block);
 
     let mut registered = GuardrailPipeline::new();

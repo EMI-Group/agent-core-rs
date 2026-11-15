@@ -9,11 +9,14 @@
 //! `"Critical security risk detected: <risk_type>"`, every lower severity is
 //! only recorded and execution continues. The scan-helper context shapes,
 //! the merged `modified_data`, and the redacted view are additions this crate
-//! makes on top of the Python callback model.
+//! makes on top of the Python callback model, and a payload the checked
+//! projection cannot read blocks by default (`unscannable_content`) instead of
+//! passing silently.
 //!
 //! Everything drives the public `openjiuwen_security` API against small
 //! in-file guardrails: offline, deterministic, no network, no wall clock.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -24,7 +27,7 @@ use openjiuwen_security::{
     RiskLevel, ScanStage, EVENT_LLM_INVOKE_INPUT, EVENT_LLM_INVOKE_OUTPUT, EVENT_TOOL_INVOKE_INPUT,
     EVENT_TOOL_INVOKE_OUTPUT, EVENT_USER_INPUT,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// A guardrail that records every context it sees and always passes.
 #[derive(Default)]
@@ -361,4 +364,122 @@ async fn violation_carries_the_stage_event_and_converts_to_a_security_error() {
         error.to_string(),
         format!("security: {}", violation.message)
     );
+}
+
+// The checked projection is the scan entry point: a payload no detector can
+// read is a failure, and the default policy turns a failure into a block.
+#[tokio::test]
+async fn unscannable_payloads_block_every_scan_helper_by_default() {
+    let recorder = Recorder::default();
+    let seen = Arc::clone(&recorder.seen);
+    let mut pipeline = GuardrailPipeline::new();
+    pipeline.add(recorder);
+
+    let outcome = pipeline
+        .run(&GuardrailContext::raw("user_input", Value::Null))
+        .await;
+    assert!(outcome.is_blocked(), "an unreadable payload is never safe");
+    assert_eq!(outcome.blocked_by.as_deref(), Some("context"));
+    assert_eq!(outcome.risk_level, RiskLevel::Critical);
+    assert_eq!(outcome.findings.len(), 1);
+    assert_eq!(outcome.findings[0].guardrail, "context");
+    assert_eq!(outcome.findings[0].risk_type, "unscannable_content");
+    assert_eq!(outcome.findings[0].risk_level, RiskLevel::Critical);
+    assert!(outcome.findings[0].blocking);
+    assert_eq!(outcome.errors.len(), 1);
+    assert!(
+        outcome.errors[0].starts_with("context: validation: unscannable content:"),
+        "{:?}",
+        outcome.errors
+    );
+    assert_eq!(outcome.evaluations.len(), 1);
+    assert_eq!(outcome.evaluations[0].guardrail, "context");
+    assert_eq!(outcome.evaluations[0].result, None);
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        0,
+        "the default stop_on_block skips detectors that were never readable"
+    );
+
+    let error = outcome.enforce().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Security);
+    assert!(error.to_string().contains("unscannable content"), "{error}");
+
+    // `scan_tool_input` with JSON `null` arguments is the same failure through
+    // the tool-call helper.
+    let outcome = pipeline.scan_tool_input("search", &json!(null)).await;
+    assert!(outcome.is_blocked());
+    assert_eq!(outcome.blocked_by.as_deref(), Some("context"));
+    assert_eq!(outcome.findings.len(), 1);
+    assert_eq!(outcome.findings[0].risk_type, "unscannable_content");
+    assert!(
+        outcome.errors[0].contains("content_type tool_call expects a non-null JSON value"),
+        "{:?}",
+        outcome.errors
+    );
+    assert!(outcome
+        .enforce()
+        .unwrap_err()
+        .to_string()
+        .contains("unscannable content"));
+}
+
+#[tokio::test]
+async fn a_redacted_unscannable_outcome_keeps_the_reason_and_drops_the_payload() {
+    const SECRET: &str = "sk-live-9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+
+    let ctx = GuardrailContext {
+        content_type: GuardrailContentType::Text,
+        content: json!({"prompt": SECRET}),
+        event: EVENT_USER_INPUT.to_owned(),
+        metadata: BTreeMap::new(),
+    };
+    let mut pipeline = GuardrailPipeline::new();
+    pipeline.add(Recorder::default());
+
+    let outcome = pipeline.run(&ctx).await;
+    assert!(outcome.is_blocked());
+    assert_eq!(outcome.findings[0].risk_type, "unscannable_content");
+
+    let redacted = outcome.redacted();
+    assert_eq!(redacted.errors.len(), 1);
+    assert!(
+        redacted.errors[0].contains("unscannable content"),
+        "{:?}",
+        redacted.errors
+    );
+    assert_eq!(
+        redacted.guardrails,
+        vec!["context".to_owned()],
+        "no detector read the payload"
+    );
+
+    let display = redacted.to_string();
+    assert!(display.contains("decision=block"), "{display}");
+    assert!(display.contains("risk_level=CRITICAL"), "{display}");
+    assert!(!display.contains(SECRET), "{display}");
+
+    let debug = format!("{outcome:?}");
+    assert!(!debug.contains(SECRET), "{debug}");
+    assert!(debug.contains("decision=block"), "{debug}");
+    assert!(debug.contains("guardrails=context"), "{debug}");
+
+    let serialized = serde_json::to_string(&redacted).unwrap();
+    assert!(!serialized.contains(SECRET), "{serialized}");
+    assert!(serialized.contains("unscannable content"), "{serialized}");
+}
+
+#[tokio::test]
+async fn an_empty_pipeline_allows_an_unscannable_context() {
+    let outcome = GuardrailPipeline::new()
+        .run(&GuardrailContext::raw("user_input", Value::Null))
+        .await;
+
+    assert!(outcome.is_safe());
+    assert_eq!(outcome.stage, ScanStage::UserInput);
+    assert_eq!(outcome.evaluations.len(), 0);
+    assert_eq!(outcome.findings.len(), 0);
+    assert_eq!(outcome.errors.len(), 0);
+    assert_eq!(outcome.blocked_by, None);
+    assert!(outcome.enforce().is_ok());
 }
