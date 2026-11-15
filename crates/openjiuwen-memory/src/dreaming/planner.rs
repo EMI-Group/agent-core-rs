@@ -196,7 +196,11 @@ impl DreamPlanner {
     ///
     /// A repository error from `claim_next`/`complete`/`fail` is returned to the caller
     /// and aborts the sweep; transitions that already committed stay committed, so the
-    /// remaining jobs are simply left for the next sweep.
+    /// remaining jobs are simply left for the next sweep. A failed transition write never
+    /// strands the claimed job: before the error propagates the planner requeues it through
+    /// [`DreamRepository::fail`] (best effort, logged), so it is `Pending` again — or
+    /// terminally `Failed` when the attempt budget is spent — and a later sweep can claim
+    /// it.
     pub async fn run(
         &self,
         now: DateTime<Utc>,
@@ -320,7 +324,19 @@ impl DreamPlanner {
                 )
                 .await;
         }
-        let stored = self.repository.complete(&job.id, outcome.clone()).await?;
+        let stored = match self.repository.complete(&job.id, outcome.clone()).await {
+            Ok(stored) => stored,
+            Err(error) => {
+                // The claim already committed and no transition did: requeue the job before
+                // the error escapes, so it is not stranded in `running` forever.
+                self.rescue_claimed(
+                    job,
+                    format!("the dream sweep could not record the transition: {error}"),
+                )
+                .await;
+                return Err(error);
+            }
+        };
         tracing::debug!(
             target: "openjiuwen_memory::dreaming::planner",
             job_id = %job.id,
@@ -340,7 +356,14 @@ impl DreamPlanner {
     ) -> Result<bool> {
         if matches!(error, Error::Cancelled) {
             let outcome = DreamOutcome::cancelled(job.id.clone());
-            self.repository.complete(&job.id, outcome.clone()).await?;
+            if let Err(storage_error) = self.repository.complete(&job.id, outcome.clone()).await {
+                self.rescue_claimed(
+                    job,
+                    format!("the dream sweep could not record the cancellation: {storage_error}"),
+                )
+                .await;
+                return Err(storage_error);
+            }
             tracing::debug!(
                 target: "openjiuwen_memory::dreaming::planner",
                 job_id = %job.id,
@@ -349,7 +372,24 @@ impl DreamPlanner {
             summary.record(outcome);
             return Ok(true);
         }
-        let stored = self.repository.fail(&job.id, &error.to_string()).await?;
+        let stored = match self.repository.fail(&job.id, &error.to_string()).await {
+            Ok(stored) => stored,
+            Err(storage_error) => {
+                // A second, best-effort `fail` is the retry: a transient write failure is
+                // repaired here, a permanent one is logged and still propagates. The note
+                // keeps the attempt's own error, so the requeued job still says what went
+                // wrong with the consolidation itself.
+                self.rescue_claimed(
+                    job,
+                    format!(
+                        "{error}; the dream sweep could not record the failed attempt: \
+                         {storage_error}"
+                    ),
+                )
+                .await;
+                return Err(storage_error);
+            }
+        };
         let note = format!("{error}; {}", retry_note(&stored));
         tracing::debug!(
             target: "openjiuwen_memory::dreaming::planner",
@@ -365,6 +405,44 @@ impl DreamPlanner {
             notes: vec![note],
         });
         Ok(false)
+    }
+}
+
+/// Returns a claimed job to the runnable path after a storage error, best effort.
+///
+/// A `complete`/`fail` write can fail *after* the claim committed, which leaves the row
+/// `Running`. Nothing would ever claim it again: the claim predicate only matches
+/// `state = 'pending'`, and the leased takeover needs a live lease row that the sweep
+/// releases. Requeueing through [`DreamRepository::fail`] restores the job — `Pending`
+/// while the attempt budget lasts, terminally `Failed` once it is spent — so a later sweep
+/// picks it up instead of leaving it stuck.
+///
+/// The rescue is deliberately best effort: the caller still receives the original storage
+/// error, and a repository that cannot write at all cannot be repaired from here. Both
+/// outcomes are logged, and nothing from the rescue replaces the propagated error.
+impl DreamPlanner {
+    /// Requeues `job` with `note` as the recorded attempt error.
+    ///
+    /// `note` describes why the transition was lost; it becomes the job's `last_error` when
+    /// the requeue succeeds, which is the only durable trace of the failure.
+    async fn rescue_claimed(&self, job: &DreamJob, note: String) {
+        match self.repository.fail(&job.id, &note).await {
+            Ok(stored) => tracing::warn!(
+                target: "openjiuwen_memory::dreaming::planner",
+                job_id = %job.id,
+                state = stored.state.as_str(),
+                attempts = stored.attempts,
+                %note,
+                "the transition write failed; requeued the claimed job"
+            ),
+            Err(rescue_error) => tracing::error!(
+                target: "openjiuwen_memory::dreaming::planner",
+                job_id = %job.id,
+                %note,
+                %rescue_error,
+                "the transition write failed and the job could not be requeued"
+            ),
+        }
     }
 }
 
