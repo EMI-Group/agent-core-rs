@@ -61,6 +61,7 @@ fn help_lists_every_command_group() {
         "cron",
         "team",
         "watch",
+        "sessions",
         "auto-harness",
     ] {
         assert!(has_row(&text, row), "no `{row}` command in {text:?}");
