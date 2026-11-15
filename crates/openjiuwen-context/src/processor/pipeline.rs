@@ -566,7 +566,10 @@ impl ContextPipeline {
     /// percentages are measured against, the before/after metrics and
     /// [`ContextStats`](crate::stats::ContextStats), the pass duration, the
     /// model usage the pass reported, and the event summary when the processor
-    /// produced one. The compression trigger threshold is not part of the
+    /// produced one. The statistic carries the recorder's declared token
+    /// provenance as its `estimated` flag, so a per-role count is never
+    /// published as exact when the counter behind it only estimates.
+    /// The compression trigger threshold is not part of the
     /// record's wire schema, so it is not reported. Recording never fails a
     /// pass: a sink or stream error is logged and swallowed by the recorder.
     ///
@@ -635,12 +638,19 @@ impl ContextPipeline {
     ) -> Result<()> {
         let context_max = context_max(cx);
         let model = cx.model.map(|model| model.model_name().to_owned());
+        // The recorder owns the only self-description available for the counts
+        // this pass publishes: the engine installs the counter and its
+        // provenance together, and a caller may declare its own. The per-role
+        // statistic is measured with the pipeline's counter, so it carries the
+        // same honesty flag as the record's `before`/`after` metrics instead of
+        // defaulting to "exact".
+        let estimated = recorder.token_provenance().is_estimated();
         for processor in &self.processors {
             if cx.cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
             let before = messages.clone();
-            let stats_before = compute_stats(&before, cx.counter);
+            let stats_before = compute_stats(&before, cx.counter).with_estimated(estimated);
             let operation_id = uuid::Uuid::new_v4().simple().to_string();
             let started_at = SystemTime::now();
             let started = ContextProcessorStateInput::new(
@@ -664,7 +674,7 @@ impl ContextPipeline {
             )
             .await;
             let ended_at = SystemTime::now();
-            let stats_after = compute_stats(messages, cx.counter);
+            let stats_after = compute_stats(messages, cx.counter).with_estimated(estimated);
             let status = match &outcome {
                 Ok(event) => finished_status(event.as_ref(), &before, messages),
                 Err(Error::Cancelled) => CompressionStateStatus::Cancelled,

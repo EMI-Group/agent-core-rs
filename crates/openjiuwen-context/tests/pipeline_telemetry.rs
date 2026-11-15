@@ -27,13 +27,14 @@ use futures::stream::BoxStream;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_context::processor::summarize;
 use openjiuwen_context::telemetry::{
-    self, CompressionStatePhase, CompressionStateStatus, ContextProcessorStateRecorder,
-    RecordingSink,
+    self, CompressionStatePhase, CompressionStateSink, CompressionStateStatus,
+    ContextProcessorStateRecorder, RecordingSink,
 };
+use openjiuwen_context::tokenizers::NativeTokenizer;
 use openjiuwen_context::{
-    compute_stats, stamp_message_id, ContextConfig, ContextEvent, ContextEventKind,
+    compute_stats, count_messages, stamp_message_id, ContextConfig, ContextEvent, ContextEventKind,
     ContextPipeline, ContextProcessor, InMemoryOffloadStore, OffloadScope, PipelineDeps,
-    ProcessorConfig, ProcessorContext, TruncationConfig,
+    ProcessorConfig, ProcessorContext, SelectedTokenizer, TokenProvenance, TruncationConfig,
 };
 use openjiuwen_foundation::llm::{ChatResponse, Choice, Model, ModelRequestConfig, StreamChunk};
 use openjiuwen_foundation::prompt::{
@@ -379,9 +380,12 @@ async fn every_pass_records_started_then_its_outcome_in_order() {
         completed.saved.as_ref().unwrap().tokens,
         i64::try_from(before_tokens - after_tokens).unwrap()
     );
+    // The counts are the pipeline's own; the honesty flag is the recorder's
+    // declared provenance, and this recorder only had a counter set (which
+    // declares nothing), so the statistic is published as an estimate.
     assert_eq!(
         completed.statistic,
-        compute_stats(&messages, fixture.counter.as_ref())
+        compute_stats(&messages, fixture.counter.as_ref()).with_estimated(true)
     );
     assert!(completed.duration_ms.is_some());
     assert_eq!(completed.modified_messages.len(), 1);
@@ -674,4 +678,93 @@ async fn pipeline_deps_wire_the_recorder_into_the_built_pipeline() {
     );
     assert_eq!(states[0].processor, "truncation");
     assert_eq!(states[1].phase, CompressionStatePhase::GetContextWindow);
+}
+
+// ---------------------------------------------------------------------------
+// Token provenance of the pipeline-supplied statistic
+// ---------------------------------------------------------------------------
+
+/// A tiny native BPE artifact: `a`, `b`, `c` merge into `abc`, nothing else.
+const BPE_FIXTURE: &str = r#"{
+    "name": "tiny-bpe",
+    "model": {"type": "BPE", "vocab": {"a": 0, "b": 1, "c": 2, "ab": 3, "abc": 4}, "merges": ["a b", "ab c"]},
+    "pre_tokenizer": {"type": "Whitespace"}
+}"#;
+
+/// The native, artifact-backed selection an exact count uses.
+fn native_selection() -> SelectedTokenizer {
+    SelectedTokenizer::from_native(
+        Arc::new(NativeTokenizer::from_json_str(BPE_FIXTURE).expect("the fixture loads")),
+        Some("tiny-bpe".to_owned()),
+        Some("tiny-bpe".to_owned()),
+    )
+}
+
+#[tokio::test]
+async fn the_statistic_of_an_undeclared_counter_is_an_estimate() {
+    let fixture = Fixture::new();
+    // `with_token_counter` declares no provenance, so the recorder cannot vouch
+    // for exactness and neither may the statistic it publishes.
+    let (recorder, sink) = recorder(&fixture.counter);
+    let pipeline = ContextPipeline::new(vec![Arc::new(Noop)]).with_recorder(Some(recorder));
+    let mut messages = vec![BaseMessage::user("hi"), BaseMessage::assistant("hello")];
+
+    pipeline
+        .run(&mut messages, &fixture.context())
+        .await
+        .unwrap();
+
+    let started = &sink.states()[0];
+    assert!(started.statistic.estimated);
+    assert_eq!(
+        started.statistic.total_tokens,
+        count_messages(fixture.counter.as_ref(), &messages)
+    );
+}
+
+#[tokio::test]
+async fn the_statistic_of_a_declared_native_counter_is_exact() {
+    let selected = native_selection();
+    let provenance = TokenProvenance::of_selected(&selected);
+    let sink = Arc::new(RecordingSink::new());
+    let sink_handle: Arc<dyn CompressionStateSink> = sink.clone();
+    let recorder = Arc::new(
+        ContextProcessorStateRecorder::new("session", "main")
+            .with_sink(sink_handle)
+            .with_token_counter_provenance(Arc::new(selected.clone()), provenance),
+    );
+    let pipeline = ContextPipeline::new(vec![Arc::new(Noop)]).with_recorder(Some(recorder));
+    let config = ContextConfig::default();
+    let offload = InMemoryOffloadStore::new();
+    let scope = OffloadScope::new("session", "main");
+    let cancellation = CancellationToken::new();
+    let cx = ProcessorContext {
+        config: &config,
+        counter: &selected,
+        model: None,
+        offload: &offload,
+        scope: &scope,
+        budget: 1_000,
+        trigger_tokens: 800,
+        manual: false,
+        cancellation: &cancellation,
+        recall: None,
+        session_memory: None,
+        session_memory_agent: None,
+    };
+    let mut messages = vec![BaseMessage::user("hi"), BaseMessage::assistant("hello")];
+
+    pipeline.run(&mut messages, &cx).await.unwrap();
+
+    // The pipeline measured with its own counter, but the honesty flag comes
+    // from the declared provenance, so the statistic and the record's
+    // `before`/`after` metrics agree.
+    let started = &sink.states()[0];
+    assert!(!started.statistic.estimated);
+    assert!(!started.before.estimated);
+    assert_eq!(
+        started.statistic.total_tokens,
+        count_messages(&selected, &messages)
+    );
+    assert_eq!(started.statistic.total_tokens, started.before.tokens);
 }

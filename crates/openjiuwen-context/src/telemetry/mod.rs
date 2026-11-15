@@ -11,7 +11,9 @@
 //! - [`recorder`] — [`ContextProcessorStateRecorder`], which turns a
 //!   [`ContextProcessorStateInput`] into a record, keeps the last
 //!   [`DEFAULT_HISTORY_LIMIT`] of them, and fans them out to a
-//!   [`CompressionStateSink`] and to the session stream.
+//!   [`CompressionStateSink`] and to the session stream. Every number it
+//!   publishes carries a [`TokenProvenance`], so a reader can tell a count from
+//!   an estimate.
 //! - [`scope`] — [`with_operation`], the task-local binding that makes the model
 //!   calls of a compaction pass attributable, plus the request stamping helpers.
 //!
@@ -45,7 +47,7 @@ pub mod state;
 
 pub use recorder::{
     format_timestamp, modified_messages, CompressionStateSink, ContextProcessorStateInput,
-    ContextProcessorStateRecorder, RecordingSink, DEFAULT_HISTORY_LIMIT,
+    ContextProcessorStateRecorder, RecordingSink, TokenProvenance, DEFAULT_HISTORY_LIMIT,
 };
 pub use scope::{
     apply_operation, current_compression_operation, current_compression_operation_id,

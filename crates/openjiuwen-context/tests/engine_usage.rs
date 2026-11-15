@@ -32,16 +32,17 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use openjiuwen_common::error::{Error, Result};
+use openjiuwen_context::tokenizers::NativeTokenizer;
 use openjiuwen_context::{
-    telemetry, CacheAggregationKey, CompressionStatePhase, CompressionStateSink,
+    count_messages, telemetry, CacheAggregationKey, CompressionStatePhase, CompressionStateSink,
     CompressionStateStatus, ContextCategory, ContextConfig, ContextEngine, ContextOptions,
     ContextProcessorStateRecorder, ContextUsageAnalyzer, ContextUsageSnapshot, ContextWindowChange,
     ContextWindowPolicy, ContextWindowSource, PrepareOptions, ProcessorConfig, RecordingSink,
-    SummarizationConfig, CONTEXT_USAGE_EVENT_TYPE, DEFAULT_CONTEXT_TOKENS, DEFAULT_SESSION_ID,
-    SOURCE_PROVIDER_USAGE,
+    SelectedTokenizer, SummarizationConfig, TokenCounterConfig, TokenCounterKind, TokenProvenance,
+    CONTEXT_USAGE_EVENT_TYPE, DEFAULT_CONTEXT_TOKENS, DEFAULT_SESSION_ID, SOURCE_PROVIDER_USAGE,
 };
 use openjiuwen_foundation::llm::{ChatResponse, Choice, Model, ModelRequestConfig, StreamChunk};
-use openjiuwen_foundation::prompt::{BaseMessage, Usage};
+use openjiuwen_foundation::prompt::{BaseMessage, TokenCounter, Usage};
 
 /// A model that records the request configuration of every call and answers
 /// with `usage`.
@@ -759,4 +760,116 @@ async fn recorded_compression_states_carry_the_usage_the_model_reports() {
     let terminal = sink.states().last().cloned().expect("a terminal record");
     assert_eq!(terminal.status, CompressionStateStatus::Completed);
     assert!(terminal.compression_usage.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// 8. Token-count provenance of the published totals
+// ---------------------------------------------------------------------------
+
+/// A tiny native BPE artifact: `a`, `b`, `c` merge into `abc`, nothing else.
+const BPE_FIXTURE: &str = r#"{
+    "name": "tiny-bpe",
+    "model": {"type": "BPE", "vocab": {"a": 0, "b": 1, "c": 2, "ab": 3, "abc": 4}, "merges": ["a b", "ab c"]},
+    "pre_tokenizer": {"type": "Whitespace"}
+}"#;
+
+/// The native, artifact-backed selection every exact count uses.
+fn native_selection() -> SelectedTokenizer {
+    SelectedTokenizer::from_native(
+        Arc::new(NativeTokenizer::from_json_str(BPE_FIXTURE).expect("the fixture loads")),
+        Some("tiny-bpe".to_owned()),
+        Some("tiny-bpe".to_owned()),
+    )
+}
+
+#[tokio::test]
+async fn prepared_stats_report_an_approximate_counter_as_estimated() {
+    let sink = Arc::new(RecordingSink::new());
+    let recorder = attach_recorder(DEFAULT_SESSION_ID, "main", &sink);
+    // The characters counter is exact about characters and only estimates the
+    // model's tokens.
+    let config = ContextConfig {
+        token_counter: TokenCounterConfig {
+            kind: TokenCounterKind::Characters,
+            chars_per_token: 1,
+        },
+        ..ContextConfig::default()
+    };
+    let engine = ContextEngine::new(config).with_recorder(Some(recorder));
+    let context = engine
+        .create_context_with(
+            "main",
+            ContextOptions {
+                history: two_round_history(),
+                ..ContextOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let prepared = engine
+        .prepare(&context, &PrepareOptions::default())
+        .await
+        .unwrap();
+
+    // The prepared window is the crate's most-read total, so it never claims an
+    // exactness the counter cannot back.
+    assert!(prepared.stats.estimated);
+    assert_eq!(prepared.token_count, prepared.stats.total_tokens);
+    assert_eq!(prepared.stats.total_messages, 4);
+
+    // The pipeline-supplied statistic of the pass says the same, and counts the
+    // same history the window was assembled from.
+    let states = sink.states();
+    let terminal = states.last().expect("the pass emitted a terminal record");
+    assert!(terminal.statistic.estimated);
+    assert_eq!(terminal.statistic.total_tokens, prepared.stats.total_tokens);
+}
+
+#[tokio::test]
+async fn prepared_stats_report_a_declared_native_counter_as_exact() {
+    let selected = native_selection();
+    let provenance = TokenProvenance::of_selected(&selected);
+    assert!(!provenance.is_estimated());
+    assert_eq!(provenance.source(), Some("native_tokenizer"));
+    let counter: Arc<dyn TokenCounter + Send + Sync> = Arc::new(selected.clone());
+    let sink = Arc::new(RecordingSink::new());
+    let sink_handle: Arc<dyn CompressionStateSink> = sink.clone();
+    // A caller-declared counter and provenance win over the engine's own, which
+    // is what makes the exactness claim reachable at all.
+    let recorder = Arc::new(
+        ContextProcessorStateRecorder::new(DEFAULT_SESSION_ID, "main")
+            .with_sink(sink_handle)
+            .with_token_counter_provenance(Arc::clone(&counter), provenance),
+    );
+    let engine = ContextEngine::new(ContextConfig::default()).with_recorder(Some(recorder));
+    let history = two_round_history();
+    let context = engine
+        .create_context_with(
+            "main",
+            ContextOptions {
+                history: history.clone(),
+                token_counter: Some(counter),
+                ..ContextOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let prepared = engine
+        .prepare(&context, &PrepareOptions::default())
+        .await
+        .unwrap();
+
+    // A declared native tokenizer is the only strategy that may publish an
+    // exact count.
+    assert!(!prepared.stats.estimated);
+    assert_eq!(prepared.token_count, prepared.stats.total_tokens);
+    assert_eq!(
+        prepared.stats.total_tokens,
+        count_messages(&selected, &history)
+    );
+    let terminal = sink.states().last().cloned().expect("a terminal record");
+    assert!(!terminal.statistic.estimated);
+    assert_eq!(terminal.statistic.total_tokens, prepared.stats.total_tokens);
 }
