@@ -289,111 +289,41 @@ Relation candidates, bounded planning, plan execution over `openjiuwen-graph`, a
 #[serde(rename_all = "snake_case")] pub enum PlanStatus { Ready, NeedsInput, NoPlan }
 #[serde(rename_all = "snake_case")] pub enum MatchStrategy { ExactIo, SemanticOverlap, TextualCoercion }
 #[serde(rename_all = "snake_case")] pub enum PlanMode { Fast, Beam }          // default Fast
-
-pub struct RelationCandidate { pub source: String, pub target: String, pub relation: String /* can_feed */,
-                               pub confidence: f64, pub strategy: MatchStrategy,
-                               pub matched_input: Option<String>, pub matched_output: Option<String> }
-pub struct CandidateConfig { pub min_confidence: f64 /*0.7*/, pub min_token_overlap: f64 /*0.6*/,
-                             pub max_candidates_per_source: usize /*32*/ }
-pub struct CandidateGenerator;
-impl CandidateGenerator {
-    pub fn new(config: CandidateConfig) -> Self;
-    pub fn generate(&self, capabilities: &[CapabilityDescriptor]) -> Vec<RelationCandidate>;
-    pub fn edges(&self, candidates: &[RelationCandidate]) -> Vec<CapabilityEdge>;
-}
-
-pub struct PlanStep { pub step_id: String /* qualified id */, pub capability_type: String, pub name: String,
-                      pub inputs: Vec<CapabilityIo>, pub outputs: Vec<CapabilityIo>,
-                      pub missing_inputs: Vec<String>, pub filled_inputs: Vec<String>, pub score: f64 }
-pub struct OrchestrationPlan { pub plan_id: String, pub query: String, pub language: String /* "cn" | "en" */,
-                               pub status: PlanStatus, pub title: String, pub message: Option<String>,
-                               pub steps: Vec<PlanStep>, pub edges: Vec<PlanEdge>, pub score: f64 }
-impl OrchestrationPlan { pub fn planned_graph(&self) -> Value; pub fn to_value(&self) -> Value;
-                         pub fn from_value(value: &Value) -> Result<Self>;
-                         pub fn stages(&self) -> Result<Vec<Vec<String>>>; pub fn is_empty(&self) -> bool; }
-
-pub struct PlanConfig { pub mode: PlanMode, pub top_k: usize /*3*/, pub max_depth: usize /*4*/,
-                        pub min_edge_confidence: f64 /*0.7*/, pub max_expansions: usize /*128*/,
-                        pub max_plans: usize /*256*/, pub dynamic_graph_enabled: bool /*false*/ }
-pub struct PlanRequest { pub query: String, pub candidate_ids: Option<Vec<String>>, pub disabled_ids: Vec<String>,
-                         pub provided_inputs: Vec<String>, pub language: String /*"cn"*/,
-                         pub top_k: Option<usize>, pub max_depth: Option<usize> }
-#[async_trait] pub trait SemanticScorer: Send + Sync {
-    async fn score(&self, query: &str, capabilities: &[CapabilityDescriptor]) -> Result<BTreeMap<String, f64>>;
-}
-pub struct LexicalSemanticScorer;                                             // deterministic default
-impl Planner { pub fn new(config: PlanConfig) -> Self;
-               pub fn with_scorer(config: PlanConfig, scorer: Arc<dyn SemanticScorer>) -> Self;
-               pub async fn plan(&self, request: &PlanRequest, graph: &CapabilityGraph,
-                                 capabilities: &[CapabilityDescriptor]) -> Result<OrchestrationPlan>; }
-pub fn normalize_language(raw: &str) -> String;                              // zh|cn|zh_cn -> "cn"; en -> "en"
-pub fn plan_title(query: &str, language: &str) -> String;                    // "计划：{query}" / "Plan: {query}"
-
-pub struct RunnerContext { pub step_id: String, pub session_id: Option<String>, pub cancellation: CancellationToken }
-#[async_trait] pub trait CapabilityRunner: Send + Sync {
-    async fn invoke(&self, capability: &CapabilityDescriptor, inputs: Value, context: &RunnerContext) -> Result<Value>;
-}
-pub struct UnsupportedRunner;                                                // invoke -> Error::Unsupported
-pub struct ExecutorConfig { pub max_steps: usize /*32*/, pub node_timeout_ms: Option<u64>, pub fail_fast: bool /*true*/ }
-pub struct StepOutcome { pub step_id: String, pub capability_type: String, pub success: bool,
-                         pub output: Value, pub error: Option<String>, pub duration_ms: u64 }
-pub struct PlanExecution { pub plan_id: String, pub graph_id: String, pub steps: BTreeMap<String, StepOutcome>,
-                           pub outputs: BTreeMap<String, Value>, pub state: Value }
-impl PlanExecutor {
-    pub fn new(runner: Arc<dyn CapabilityRunner>) -> Self;
-    pub fn compile(&self, plan: &OrchestrationPlan, capabilities: &[CapabilityDescriptor]) -> Result<CompiledGraph>;
-    pub async fn execute(&self, plan: &OrchestrationPlan, capabilities: &[CapabilityDescriptor], session: Option<Arc<dyn Session>>) -> Result<PlanExecution>;
-    pub async fn execute_with_inputs(&self, plan: &OrchestrationPlan, capabilities: &[CapabilityDescriptor], inputs: Value, session: Option<Arc<dyn Session>>) -> Result<PlanExecution>;
-}
-
-pub struct MutationRequest { pub request_id: String, pub operation: MutationOperation,
-                             pub source_revision: Option<String>, pub changed_skill_ids: Vec<String> }
-pub fn request_digest(request: &MutationRequest) -> String;
-pub fn validate_mutation_against_inventory(request: &MutationRequest, changed: &[String], inventory_ids: &[String]) -> Result<()>;
-pub struct JournalRecord { pub digest: String, pub operation: MutationOperation, pub revision: String,
-                           pub inserted_at: String, pub result: Option<Value> }
-pub struct MutationJournal;   // new/open/path/len/is_empty/contains/request_ids/lookup/record/clear
+pub struct RelationCandidate;  pub struct CandidateConfig;  pub struct CandidateGenerator;
+pub struct PlanStep;  pub struct OrchestrationPlan { plan_id, query, language, status, title,
+                                                     message, steps, edges, score }
+pub struct PlanConfig;  pub struct PlanRequest;
+pub struct Planner;                          // new / with_scorer / plan
+#[async_trait] pub trait SemanticScorer;     pub struct LexicalSemanticScorer;
+pub struct RunnerContext;  pub trait CapabilityRunner;  pub struct UnsupportedRunner;
+pub struct ExecutorConfig;  pub struct StepOutcome;  pub struct PlanExecution;  pub struct PlanExecutor;
+pub struct MutationRequest;  pub fn request_digest(&MutationRequest) -> String;
+pub fn validate_mutation_against_inventory(...) -> Result<()>;
+pub struct JournalRecord;  pub struct MutationJournal;
 ```
 
-Candidate rules: `ExactIo` (same normalized name and type, confidence `1.0`), `SemanticOverlap` (output/input token Jaccard `>= min_token_overlap`, confidence `0.70 + 0.25 * overlap`), `TextualCoercion` (`can_feed` plus a shared name token, confidence `0.75`); sorted by strategy rank, confidence, source, target; below `min_confidence` dropped; per-source cap.
-Plan score: `0.45*mean(semantic) + 0.25*mean(edge_confidence) + 0.20*input_coverage - 0.03*(steps - 1)`, ranked by `(-score, missing_inputs, step_count, step_ids, edge_weights)`; expansion is bounded by `max_depth`/`max_expansions`/`max_plans` (`Fast` greedy, `Beam` `top_k`), and `status` is `Ready`/`NeedsInput`/`NoPlan` from the best plan's root inputs.
-Execution maps each step to an `openjiuwen_graph` node writing `state[step_id] = {"success", "output", "error", "duration_ms"}`; `fail_fast` aborts with `Error::Graph`, while `Cancelled`/`Unsupported` keep their own `ErrorKind`.
-Mutations: `MutationRequest::prepare` trims/sorts/rejects, the digest is SHA-256 over canonical JSON of `{schema_version, request_id, operation, source_revision, changed_skill_ids}` (declared ids, not payloads), the inventory check requires the applied change set to equal the declared batch, and `MutationJournal` is a `BTreeMap`-ordered JSON document written through atomically (`inserted_at` is metadata; the malformed-envelope case names the file).
-See [`orchestration`](src/orchestration/CONTEXT.md) for the full rules, formulas, bounds and journal semantics.
+Candidate rules are `ExactIo` (same normalized name and type, confidence `1.0`), `SemanticOverlap` (output/input token Jaccard at least `0.6`) and `TextualCoercion` (`can_feed` plus a shared name token); results are ranked and capped per source.
+Plans are ranked by `0.45*mean(semantic) + 0.25*mean(edge_confidence) + 0.20*input_coverage - 0.03*(steps - 1)` under `max_depth`/`max_expansions`/`max_plans`, and `status` follows the best plan's root inputs.
+Execution compiles a plan into an `openjiuwen_graph` node per step, and the mutation contract adds a SHA-256 request digest over the declared id batch, a durable replay journal, source-revision CAS and change-set validation.
+See [`orchestration`](src/orchestration/CONTEXT.md) for the full surface, formulas, bounds and journal semantics.
 
 ### `evaluation` (`src/evaluation/`)
 
 Fail-soft evaluation over capability cards and recorded traces: static card metrics, trace metrics, event-time case windows, status-aware aggregation, and the LLM judge.
 
 ```rust
-pub struct EvaluationInput { pub capability: CapabilityDescriptor, pub target: Option<String>,
-                             pub trace: Option<EvaluationTrace>, pub window: Option<EvaluationWindow> }
-pub struct MetricScore { pub metric: String, pub score: Option<f64>, pub passed: bool,
-                         pub detail: Option<String>, pub status: MetricStatus }
+pub struct EvaluationInput { capability, target: Option<String>, trace: Option<EvaluationTrace>,
+                             window: Option<EvaluationWindow> }
+pub struct MetricScore { metric, score: Option<f64>, passed, detail: Option<String>, status: MetricStatus }
 #[serde(rename_all = "snake_case")] pub enum MetricStatus { Pass, Fail, NotApplicable, Error, Observed }
-#[async_trait] pub trait Metric: Send + Sync {
-    fn name(&self) -> &str; fn scope(&self) -> MetricScope; fn cache_key(&self) -> Option<String>;
-    async fn evaluate(&self, input: &EvaluationInput) -> Result<MetricScore>;
-}
-// static: CompletenessMetric, SchemaValidityMetric, StructureConformanceMetric,
-//         DescriptionQualityMetric, ClassificationConsistencyMetric, LlmJudgedMetric
-// trace:  SuccessRateMetric, LatencyMetric, AccuracyMetric, CapabilitySelectionMetric,
-//         CompositionEffectivenessMetric
-pub struct QualityResult { pub confidence: QualityConfidence, pub score: Option<f64>, pub aggregation: String,
-                           pub per_metric: BTreeMap<String, MetricScore> }
-pub fn percentile(values: &[f64], fraction: f64) -> f64;   pub fn latency_statistics(samples_ms: &[f64]) -> LatencyStatistics;
-pub fn select_cases(cases: &[EvaluationCase], window: Option<&EvaluationWindow>) -> Vec<&EvaluationCase>;
-pub fn aggregate_metric(scores: &[MetricScore]) -> MetricScore;
-
-impl EvaluationSuite {
-    pub fn default_suite() -> Self;                                  // completeness + schema validity
-    pub fn with_llm_judge(self) -> Self;   pub fn with_llm_judge_model(self, model: Arc<dyn CompletionModel>) -> Self;
-    pub async fn evaluate(&self, input: &EvaluationInput) -> EvaluationReport;
-    pub async fn evaluate_static(&self, input: &EvaluationInput) -> EvaluationReport;
-    pub async fn evaluate_case(&self, input: &EvaluationInput) -> EvaluationReport;
-    pub async fn evaluate_quality(&self, input: &EvaluationInput) -> QualityResult;
-    pub fn cache_signature(&self) -> Option<String>;   pub fn aggregate(&self, reports: &[EvaluationReport]) -> EvaluationReport;
-}
+#[async_trait] pub trait Metric;   // name / scope / cache_key / evaluate
+// static: Completeness, SchemaValidity, StructureConformance, DescriptionQuality,
+//         ClassificationConsistency, LlmJudged
+// trace:  SuccessRate, Latency, Accuracy, CapabilitySelection, CompositionEffectiveness
+pub struct QualityResult;  pub struct EvaluationSuite;   // default_suite / with_llm_judge / evaluate*
+pub fn percentile(&[f64], f64) -> f64;   pub fn latency_statistics(&[f64]) -> LatencyStatistics;
+pub fn select_cases(&[EvaluationCase], Option<&EvaluationWindow>) -> Vec<&EvaluationCase>;
+pub fn aggregate_metric(&[MetricScore]) -> MetricScore;
 pub const SYMPHONY_EVALUATION_PROTOCOL: &str = "symphony-evaluation-suite-v5";
 ```
 
