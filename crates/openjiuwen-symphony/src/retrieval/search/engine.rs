@@ -125,7 +125,7 @@ pub struct EngineRequest<'a> {
 ///
 /// A frame is pushed when a child cursor is expanded and popped once the node (and every
 /// child pushed above it) has finished, so the stack is a depth-first traversal plan.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]
 struct Frame {
     /// The cursor this frame points at.
@@ -144,7 +144,7 @@ struct Frame {
 /// and the trace — so the state round-trips through `serde_json` and a traversal can be
 /// saved after any number of [`RecursiveSearchEngine::step`] calls and resumed with an
 /// equivalent result.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]
 pub struct TraversalState {
     /// The cursor the walk started at; the root's `top_k` bounds the final list.

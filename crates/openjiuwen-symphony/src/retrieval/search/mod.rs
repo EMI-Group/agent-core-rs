@@ -70,6 +70,7 @@ pub mod expand;
 pub mod flat;
 pub mod flow;
 pub mod lexical;
+pub mod progressive;
 pub mod reduce;
 pub mod render;
 pub mod selector;
@@ -100,6 +101,10 @@ pub use flow::{
 pub use lexical::{
     compile_matcher, tokenize, LexicalDocument, LexicalHit, LexicalIndex, QueryMatcher, BM25_B,
     BM25_K1, FIELD_WEIGHTS, IDENTITY_BONUS, PHRASE_FIELD_WEIGHTS,
+};
+pub use progressive::{
+    validate_query, ModelTopKSelector, ProgressiveRetriever, ProgressiveSearchResult,
+    LLM_REQUEST_EVENT, LLM_RESPONSE_EVENT, METHOD_LEXICAL_FALLBACK, METHOD_PROGRESSIVE,
 };
 pub use reduce::DefaultBranchReducer;
 pub use render::{
