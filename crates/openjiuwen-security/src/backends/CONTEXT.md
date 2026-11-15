@@ -113,7 +113,7 @@ For a risky verdict an unknown/missing `risk_level` maps to the fail-safe `RiskL
 An injected transport always wins, in either call order; the parser (default `BertBinaryParser`) is independent of the transport choice.
 `analyze` builds `ModerationRequest { url: api_url, api_key, text, timeout }` (configured timeout, or 30 s for unusable values) and grades the reply with the parser.
 `ModelOutputParser::parse` is fallible: an unrecognized model-output dialect is `Error::validation` naming the parser and its accepted dialects, so a mis-pointed endpoint surfaces as a guardrail failure instead of a clean verdict.
-Recognized shapes keep the parsers' own fail-safe defaults (for example `QwenGuardParser::default_risk_level`); a *recognized* dialect is never an error even when it grades `Safe`.
+A *recognized* dialect is never an error: a genuine safe verdict grades `Safe`, while a recognized shape whose verdict is unmappable or missing takes `QwenGuardParser::default_risk_level` (default `RiskLevel::Critical`, so it blocks rather than grading `Safe`).
 
 **HTTP moderation transport**: posts `{"<text_field>": "<text>"}` with the static headers and one credential.
 The per-call `ModerationRequest::url` wins when non-blank (else the configured URL; both blank is `Error::Validation`) and a non-zero per-call `timeout` wins over the configured one.

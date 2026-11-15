@@ -11,11 +11,11 @@
 //! [`GuardrailOutcome::enforce`](crate::GuardrailOutcome::enforce).
 //!
 //! Failures are **fail-closed by default**
-//! ([`FailurePolicy::FailClosed`](crate::FailurePolicy::FailClosed)): a guardrail
+//! (`FailurePolicy::FailClosed`): a guardrail
 //! that errors, and a payload [`GuardrailContext::text_view_checked`] cannot
 //! project, both become a blocking [`RiskLevel::Critical`] finding whose message
 //! carries the reason, so an unusable detector can never read as "safe".
-//! [`FailurePolicy::FailOpen`](crate::FailurePolicy::FailOpen) is the explicit
+//! `FailurePolicy::FailOpen` is the explicit
 //! opt-in that records the failure and lets the call continue.
 
 use std::sync::Arc;
@@ -98,8 +98,8 @@ impl GuardrailPipeline {
     ///
     /// Never fails: guardrail errors and an unscannable context are recorded and
     /// resolved by the policy — blocking under the default
-    /// [`FailurePolicy::FailClosed`](crate::FailurePolicy::FailClosed), recorded
-    /// only under the opt-in [`FailurePolicy::FailOpen`](crate::FailurePolicy::FailOpen).
+    /// `FailurePolicy::FailClosed`, recorded
+    /// only under the opt-in `FailurePolicy::FailOpen`.
     pub async fn run(&self, ctx: &GuardrailContext) -> GuardrailOutcome {
         let stage = ctx.stage();
         let mut selected: Vec<&Arc<dyn Guardrail>> = self
