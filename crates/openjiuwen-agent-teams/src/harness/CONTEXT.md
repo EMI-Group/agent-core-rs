@@ -68,8 +68,14 @@ impl MemberCheckpointPolicy {
     pub fn captures_on_turn(&self) -> bool;  pub fn captures_on_state(&self) -> bool;
     pub fn captures_on_stop(&self) -> bool;
 }
-pub struct MemberCheckpointRecord { pub checkpoint: NativeCheckpoint, pub protocol: Option<HarnessCheckpoint> }
-impl MemberCheckpointRecord { pub fn new(checkpoint: NativeCheckpoint) -> Self; pub fn with_protocol(self, protocol) -> Self; }
+pub struct MemberCheckpointRecord { pub checkpoint: NativeCheckpoint, pub protocol: Option<HarnessCheckpoint>,
+                                    pub unrecognised_state: Option<String> }   // serde: skip when None
+impl MemberCheckpointRecord {
+    pub fn new(checkpoint: NativeCheckpoint) -> Self;
+    pub fn with_protocol(self, protocol) -> Self;
+    pub fn with_unrecognised_state(self, raw: impl Into<String>) -> Self;
+    pub fn has_unrecognised_state(&self) -> bool;
+}
 
 #[async_trait] pub trait MemberCheckpointStore: Send + Sync {
     fn name(&self) -> &'static str;                                  // "memory" / "file"
@@ -121,6 +127,11 @@ Runtime behaviour:
 - Restore is opportunistic: a record for another session/card (`NativeCheckpoint::validate_compatible`), a record without an envelope, or an unreadable store logs `warn!` and starts cold; `start` never fails because of checkpoint state.
 - Capture is best effort in the pump and in `stop` (failures logged, never failing the command or ending the pump); the recorded payload is cached so `latest_checkpoint()` reports it.
 - A record always carries the portable payload; `protocol` is `Some` only when `HarnessProtocol::export_checkpoint` returned an envelope — a payload-only record is still a valid snapshot.
+- The sink decodes the payload's state from the envelope's `state` key: a known value is used verbatim, and an absent `state` is `Idle` with no flag, because it is not a degradation.
+- A `state` value this build does not know (a foreign provider, a newer format, a wrong type) still records `Idle` so the restore stays tolerant, but the sink logs one `warn!` naming `member`, `card`, `provider`, `checkpoint_id` and the raw value.
+- That degradation is persisted on the record as `MemberCheckpointRecord::unrecognised_state` (`Some(raw)`, `has_unrecognised_state()`), so a caller can tell a fresh idle member from one restored out of a corrupt or foreign record.
+- `unrecognised_state` is snake_case, `#[serde(default, skip_serializing_if = "Option::is_none")]` and tolerates unknown fields, so a healthy record's document is unchanged and an older document decodes to `None`.
+- `restore_into` re-logs the same fact with the member identity when a loaded record carries `unrecognised_state`, and still restores the envelope and payload unchanged.
 - Identity convention: records are keyed on `(member session id, card id)`, where the member session is `MemberHarnessContext::member_session_id(team_session, member_name)` (`"<team_session>:<member_name>"`) and the card id is the effective spec's card id, else the member name.
 - Every member starts through `start(None)`, so that derived id is also the harness `HarnessContext::host_session_id`; the team session is never forwarded into a live cycle.
 - The runtime wires every in-process member through `runtime::checkpoints::wire_runtime` — `build_with` for the leader, `TeamMemberSpawner::build_harness_runtime` for each teammate — with the derived session id, the effective card id, the policy from `metadata["checkpoint"]`, the member workspace root as `cwd` and the resolved store.
@@ -216,7 +227,8 @@ A fake-LLM member is also possible without a fake protocol: `NativeMemberFactory
 - Unit tests live beside each module (`#[cfg(test)]`), all offline and deterministic; no real model is constructed.
 - `mapping.rs` pins every `HarnessState` for both status tables and every `TurnEventKind` for rounds/terminality, plus output/tool chunk shapes.
 - `checkpoint.rs` covers JSON round-trip, unknown-field tolerance, missing identity fields, and the session/card incompatibility messages.
-- `checkpoint_store/` (22 tests) pins policy defaults/`disabled()`/serde/unknown fields/wire strings/resume mapping; memory round-trip, newest-wins, identity independence, revisions; file round-trip, sanitised `path_for` containment, missing file, malformed JSON; sink payload/cwd/state/outputs/envelope/receipt projection and store-failure mapping.
+- `checkpoint_store/` (27 tests) pins policy defaults/`disabled()`/serde/unknown fields/wire strings/resume mapping; memory round-trip, newest-wins, identity independence, revisions; file round-trip, sanitised `path_for` containment, missing file, malformed JSON; sink payload/cwd/state/outputs/envelope/receipt projection and store-failure mapping.
+- The sink's state projection is pinned separately: a known state round-trips, an absent state stays unflagged, an unknown string and a wrong-typed value both restore as `Idle` with the raw value on `unrecognised_state`, the flag survives memory and file round-trips, and a record document with (or without) the field still deserialises.
 - `adapter.rs` drives `HarnessMemberRuntime` with a local `FakeHarness` (command recording, recorded `HarnessContext`s, channel-backed cursor, fixed state, scriptable `export_checkpoint`/failure): start publishes `Ready`, delivery/abort/pause/resume argument mapping, observer callback order, cursor drain/close, pump cancellation on `stop`, error translation, sink/restore/capture/stop wiring, a disabled policy writing nothing, and an export error leaving the pump alive. Waits are bounded `yield_now`/1 ms polls.
 - `native.rs` covers factory identity, resolver error propagation, the spec → `DeepAgentConfig` mapping (plan mode, card/language overrides), and model-identity propagation: a spec name/provider wins over the resolved one, a resolver-supplied default name reaches `NativeHarness::agent().config()`, and blank resolved names/providers neither erase a spec name nor invent a provider.
 - `native.rs` also drives one scripted turn per mounting case and reads the tool names the model request carried (the mounted tools' only observable surface): a context without a toolkit mounts no `team_memory_*` tool, a context with one mounts all four next to the built-in coding tools, and the built-in tools survive the mount.

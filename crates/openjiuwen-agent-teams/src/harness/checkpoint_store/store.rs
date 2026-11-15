@@ -41,6 +41,11 @@ type CheckpointKey = (String, String);
 /// ([`protocol`](Self::protocol), an opaque [`HarnessCheckpoint`]) while a team-level restore or an
 /// operator inspection reads the portable payload ([`checkpoint`](Self::checkpoint)). `protocol`
 /// defaults to `None`, so a record written before envelopes were captured still decodes.
+///
+/// [`unrecognised_state`](Self::unrecognised_state) reports a degraded projection rather than a
+/// failure: the sink always writes a decodable [`HarnessState`](openjiuwen_harness_protocol::HarnessState)
+/// into the payload, and names the raw value it could not decode here so a caller can tell a
+/// fresh idle member from one restored out of a corrupt or newer-format record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct MemberCheckpointRecord {
@@ -49,6 +54,14 @@ pub struct MemberCheckpointRecord {
     /// Provider envelope the native harness resumes from, when one was captured.
     #[serde(default)]
     pub protocol: Option<HarnessCheckpoint>,
+    /// Raw `state` value of the envelope when it was not a harness state this build knows.
+    ///
+    /// `None` on every healthy record, including one whose envelope carried no state at all; a
+    /// JSON string is kept verbatim, any other JSON value as its compact text. The payload's
+    /// [`state`](NativeCheckpoint::state) is [`Idle`](openjiuwen_harness_protocol::HarnessState::Idle)
+    /// on that path, so restoring stays tolerant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrecognised_state: Option<String>,
 }
 
 impl MemberCheckpointRecord {
@@ -58,6 +71,7 @@ impl MemberCheckpointRecord {
         Self {
             checkpoint,
             protocol: None,
+            unrecognised_state: None,
         }
     }
 
@@ -66,6 +80,19 @@ impl MemberCheckpointRecord {
     pub fn with_protocol(mut self, protocol: HarnessCheckpoint) -> Self {
         self.protocol = Some(protocol);
         self
+    }
+
+    /// Records that the envelope's state was unreadable and its raw value, kept verbatim.
+    #[must_use]
+    pub fn with_unrecognised_state(mut self, raw: impl Into<String>) -> Self {
+        self.unrecognised_state = Some(raw.into());
+        self
+    }
+
+    /// Whether the payload's state is a tolerant projection rather than the stored value.
+    #[must_use]
+    pub fn has_unrecognised_state(&self) -> bool {
+        self.unrecognised_state.is_some()
     }
 }
 
@@ -526,6 +553,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(text, serde_json::to_string(&saved).unwrap());
+    }
+
+    #[tokio::test]
+    async fn unrecognised_state_survives_the_file_backend() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileMemberCheckpointStore::new(directory.path());
+        let saved = MemberCheckpointRecord::new(NativeCheckpoint::new("team:dev-1", "card-1"))
+            .with_unrecognised_state("frozen");
+        assert!(saved.has_unrecognised_state());
+
+        store.save(saved.clone()).await.unwrap();
+
+        let path = store.path_for("team:dev-1", "card-1");
+        let text = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            text.contains("\"unrecognised_state\":\"frozen\""),
+            "the degradation is persisted: {text}"
+        );
+        assert_eq!(
+            store.load("team:dev-1", "card-1").await.unwrap(),
+            Some(saved)
+        );
     }
 
     #[test]

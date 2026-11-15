@@ -8,14 +8,42 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde_json::Value;
+use tracing::warn;
 
 use openjiuwen_harness_protocol::{
     json_object_to_value, CheckpointReason, CheckpointSaveReceipt, HarnessCheckpoint,
-    HarnessCheckpointSink, HarnessError, HarnessResult, HarnessState,
+    HarnessCheckpointSink, HarnessError, HarnessResult, HarnessState, JsonObject,
 };
 
 use super::store::{MemberCheckpointRecord, MemberCheckpointStore};
 use crate::harness::checkpoint::NativeCheckpoint;
+
+/// The state key read from the envelope's opaque payload.
+const STATE_KEY: &str = "state";
+
+/// Projects the envelope's `state` value onto a harness state.
+///
+/// The first half is always a decodable state, so a restore never fails on checkpoint contents; the
+/// second half names the raw value when it was not one this build knows (an absent state is not a
+/// degradation and yields `None`), which the caller logs and records on the saved record.
+fn decode_state(data: &JsonObject) -> (HarnessState, Option<String>) {
+    let Some(value) = data.get(STATE_KEY) else {
+        return (HarnessState::Idle, None);
+    };
+    match serde_json::from_value::<HarnessState>(value.clone()) {
+        Ok(state) => (state, None),
+        Err(_) => (HarnessState::Idle, Some(render_raw_state(value))),
+    }
+}
+
+/// Renders an undecodable `state` value: a JSON string verbatim, anything else as its JSON text.
+fn render_raw_state(value: &Value) -> String {
+    match value.as_str() {
+        Some(text) => text.to_owned(),
+        None => value.to_string(),
+    }
+}
 
 /// Adapts a [`MemberCheckpointStore`] plus a member identity to the harness-protocol sink SPI.
 ///
@@ -71,8 +99,11 @@ impl HarnessCheckpointSink for MemberCheckpointSink {
     ///
     /// `_reason` and `_expected_storage_revision` are accepted and ignored: the store is
     /// last-write-wins, not compare-and-set. The payload's state is decoded from
-    /// `checkpoint.data["state"]` and falls back to [`HarnessState::Idle`] when absent or
-    /// unreadable, and its output is the whole `data` object.
+    /// `checkpoint.data["state"]` and its output is the whole `data` object. An absent state is
+    /// [`HarnessState::Idle`]; a state this build does not know is also recorded as `Idle` so the
+    /// restore stays tolerant, but it is logged with the member and checkpoint identity and its raw
+    /// value lands in [`MemberCheckpointRecord::unrecognised_state`] so the degradation is
+    /// observable instead of looking like a fresh idle member.
     ///
     /// # Errors
     ///
@@ -84,18 +115,27 @@ impl HarnessCheckpointSink for MemberCheckpointSink {
         _reason: CheckpointReason,
         _expected_storage_revision: Option<&str>,
     ) -> HarnessResult<CheckpointSaveReceipt> {
-        let state = checkpoint
-            .data
-            .get("state")
-            .and_then(|value| serde_json::from_value::<HarnessState>(value.clone()).ok())
-            .unwrap_or(HarnessState::Idle);
+        let (state, unrecognised_state) = decode_state(&checkpoint.data);
+        if let Some(raw) = &unrecognised_state {
+            warn!(
+                member = %self.session_id,
+                card = %self.card_id,
+                provider = %checkpoint.provider,
+                checkpoint_id = %checkpoint.checkpoint_id,
+                state = %raw,
+                "checkpoint state is not a state this build knows; recording it as idle"
+            );
+        }
         let mut payload = NativeCheckpoint::new(self.session_id.clone(), self.card_id.clone())
             .with_state(state)
             .with_outputs(json_object_to_value(&checkpoint.data));
         if let Some(cwd) = &self.cwd {
             payload = payload.with_cwd(cwd.clone());
         }
-        let record = MemberCheckpointRecord::new(payload).with_protocol(checkpoint.clone());
+        let mut record = MemberCheckpointRecord::new(payload).with_protocol(checkpoint.clone());
+        if let Some(raw) = unrecognised_state {
+            record = record.with_unrecognised_state(raw);
+        }
         let storage_revision = self
             .store
             .save(record)
@@ -109,14 +149,10 @@ impl HarnessCheckpointSink for MemberCheckpointSink {
     }
 }
 
-/// The state key read from the envelope's opaque payload.
-#[cfg(test)]
-const STATE_KEY: &str = "state";
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{MemberCheckpointSink, STATE_KEY};
+    use super::{decode_state, MemberCheckpointSink, STATE_KEY};
     use crate::harness::checkpoint_store::{
         InMemoryMemberCheckpointStore, MemberCheckpointRecord, MemberCheckpointStore,
     };
@@ -237,6 +273,8 @@ mod tests {
             json!({"answer": "hi", "state": "paused"})
         );
         assert_eq!(record.protocol, Some(checkpoint));
+        assert_eq!(record.unrecognised_state, None);
+        assert!(!record.has_unrecognised_state());
     }
 
     #[tokio::test]
@@ -254,10 +292,14 @@ mod tests {
         assert_eq!(saved[0].checkpoint.state, HarnessState::Idle);
         assert_eq!(saved[0].checkpoint.cwd, None);
         assert_eq!(saved[0].checkpoint.outputs, json!({"answer": "hi"}));
+        assert_eq!(
+            saved[0].unrecognised_state, None,
+            "an absent state is not a degradation"
+        );
     }
 
     #[tokio::test]
-    async fn unreadable_state_falls_back_to_idle() {
+    async fn unreadable_state_falls_back_to_idle_and_names_the_raw_value() {
         let store = Arc::new(RecordingStore::new("rev-1"));
         let sink = MemberCheckpointSink::new(store.clone(), "team:dev-1", "card-1");
         let mut data = JsonObject::new();
@@ -267,7 +309,120 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(store.saved()[0].checkpoint.state, HarnessState::Idle);
+        let saved = store.saved();
+        assert_eq!(saved[0].checkpoint.state, HarnessState::Idle);
+        assert!(saved[0].has_unrecognised_state());
+        assert_eq!(saved[0].unrecognised_state.as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn unknown_state_string_stays_idle_and_is_flagged() {
+        let store = Arc::new(RecordingStore::new("rev-1"));
+        let sink = MemberCheckpointSink::new(store.clone(), "team:dev-1", "card-1");
+
+        sink.save(
+            &envelope(payload("frozen")),
+            CheckpointReason::TurnCompleted,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let saved = store.saved();
+        assert_eq!(
+            saved[0].checkpoint.state,
+            HarnessState::Idle,
+            "a foreign state must not fail the restore"
+        );
+        assert_eq!(
+            saved[0].unrecognised_state.as_deref(),
+            Some("frozen"),
+            "the raw value stays observable"
+        );
+        assert_eq!(
+            saved[0].protocol.as_ref().map(|c| c.checkpoint_id.as_str()),
+            Some("cp-7")
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_state_survives_a_store_round_trip() {
+        let store = InMemoryMemberCheckpointStore::shared();
+        let sink = MemberCheckpointSink::new(store.clone(), "team:dev-1", "card-1");
+
+        sink.save(
+            &envelope(payload("hibernating")),
+            CheckpointReason::Periodic,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let loaded = store.load("team:dev-1", "card-1").await.unwrap().unwrap();
+        assert_eq!(loaded.checkpoint.state, HarnessState::Idle);
+        assert_eq!(loaded.unrecognised_state.as_deref(), Some("hibernating"));
+        assert!(loaded.has_unrecognised_state());
+    }
+
+    #[test]
+    fn decode_state_reports_known_absent_and_foreign_values() {
+        let mut known = JsonObject::new();
+        known.insert(STATE_KEY.to_owned(), json!("pausing"));
+        assert_eq!(decode_state(&known), (HarnessState::Pausing, None));
+
+        assert_eq!(decode_state(&JsonObject::new()), (HarnessState::Idle, None));
+
+        let mut foreign = JsonObject::new();
+        foreign.insert(STATE_KEY.to_owned(), json!({"state": "running"}));
+        assert_eq!(
+            decode_state(&foreign),
+            (
+                HarnessState::Idle,
+                Some("{\"state\":\"running\"}".to_owned())
+            )
+        );
+
+        let mut null = JsonObject::new();
+        null.insert(STATE_KEY.to_owned(), json!(null));
+        assert_eq!(
+            decode_state(&null),
+            (HarnessState::Idle, Some("null".to_owned()))
+        );
+    }
+
+    #[test]
+    fn record_with_an_unrecognised_state_deserialises() {
+        let record = MemberCheckpointRecord::new(
+            crate::harness::checkpoint::NativeCheckpoint::new("team:dev-1", "card-1"),
+        )
+        .with_unrecognised_state("frozen");
+        let encoded = serde_json::to_value(&record).unwrap();
+        assert_eq!(encoded["unrecognised_state"], json!("frozen"));
+        assert_eq!(encoded["checkpoint"]["state"], json!("idle"));
+        let decoded: MemberCheckpointRecord = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, record);
+
+        let legacy: MemberCheckpointRecord =
+            serde_json::from_value(json!({"checkpoint": {"session_id": "s", "card_id": "c"}}))
+                .unwrap();
+        assert_eq!(legacy.unrecognised_state, None);
+
+        let tolerant: MemberCheckpointRecord = serde_json::from_value(json!({
+            "checkpoint": {"session_id": "s", "card_id": "c"},
+            "unrecognised_state": "frozen",
+            "future_knob": true,
+        }))
+        .unwrap();
+        assert_eq!(tolerant.unrecognised_state.as_deref(), Some("frozen"));
+        assert_eq!(
+            serde_json::to_value(MemberCheckpointRecord::new(
+                crate::harness::checkpoint::NativeCheckpoint::new("s", "c")
+            ))
+            .unwrap()
+            .get("unrecognised_state"),
+            None,
+            "a healthy record omits the flag entirely"
+        );
     }
 
     #[tokio::test]
@@ -301,6 +456,7 @@ mod tests {
         let loaded = store.load("team:dev-1", "card-1").await.unwrap().unwrap();
         assert_eq!(loaded.protocol, Some(checkpoint));
         assert_eq!(loaded.checkpoint.state, HarnessState::Running);
+        assert_eq!(loaded.unrecognised_state, None);
         assert_eq!(
             loaded.checkpoint.outputs,
             json!({"answer": "hi", "state": "running"})
