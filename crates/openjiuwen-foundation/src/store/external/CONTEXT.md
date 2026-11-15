@@ -66,7 +66,8 @@ Only `RedisConfig::from_env` and `S3Config::from_env` read the environment; the 
 - Redis has no TLS: a `rediss://` URL returns `Unsupported` instead of being silently downgraded.
   There is no connection pool either — commands are serialized behind one connection mutex, so a single store is a single logical connection.
 - Chroma stores one embedding per record, so a schema with more than one `FloatVector` field is rejected, and JSON/array metadata is rejected because Chroma metadata is scalar-only.
-  The `CollectionSchema` is recovered only from the reserved `schema_metadata_key`; a collection created elsewhere yields `Unsupported`.
+  The `CollectionSchema` is recovered only from the reserved `schema_metadata_key` (`openjiuwen:schema`); a collection created elsewhere yields `Unsupported`.
+  Python writes the same information under the metadata keys `schema`/`fields` (plus `field_mapping`, `vector_field`, `distance_metric` — `foundation/store/vector/chroma_vector_store.py:130`), so collections are not interchangeable between the two implementations: neither reads the other's key, and Python falls back to `field_mapping` while this store returns `Unsupported`.
 - S3 cannot distinguish a missing bucket from a missing key on `GET`, `HEAD` and `DELETE`, so both read as "absent"; `list_buckets` lists what the credentials can see, not this store's buckets.
 - Deferred backends: `pgvector`, `postgres` and `gauss`/`gaussvector` parse as names but construction returns `Unsupported` (no PostgreSQL or `GaussDB` driver offline).
   No external graph backend exists at all: the `Graph` family registers only `memory`, `file`/`local`.
