@@ -235,6 +235,7 @@ impl DeepAgentBuilder {
             registry = registry.with_user_asker(asker);
         }
         registry = registry.with_language(language.clone());
+        registry = registry.with_workspace_memory();
 
         let mut tools = registry.build();
         let mut cards = registry.cards(&language);

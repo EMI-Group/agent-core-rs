@@ -112,11 +112,17 @@ pub trait MemoryToolBackend: Send + Sync {
         append: bool,
     ) -> Result<MemoryWriteData>;
 
-    /// Replaces every `old_text` occurrence in `path` with `new_text`.
+    /// Replaces **one** occurrence of `old_text` in `path` with `new_text`.
+    ///
+    /// Python parity: `edit_memory` replaces exactly one occurrence, and rejects an ambiguous
+    /// edit instead of guessing, so a backend must fail when `old_text` appears more than once
+    /// with `"old_text appears N times in file. Be more specific."` and when it appears not at
+    /// all with `"old_text not found in file. Use read_memory tool to check exact content."`.
     ///
     /// # Errors
     ///
-    /// Returns [`Error`](openjiuwen_common::error::Error) when the file cannot be read or written.
+    /// Returns [`Error`](openjiuwen_common::error::Error) when the file cannot be read or written,
+    /// when `old_text` is absent, or when it occurs more than once.
     async fn edit(
         &self,
         scope: MemoryScope,

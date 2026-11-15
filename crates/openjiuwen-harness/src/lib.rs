@@ -97,7 +97,7 @@ pub use tools::{
     McpSubscriptionInfo, MediaKind, MemoryToolBackend, ReadMcpResourceArgs, ReadMcpResourceTool,
     ReqwestFetcher, SearchBackend, SearchResult, SubmitGoalReportArgs, SubmitGoalReportTool,
     SubscriptionAction, TokenUsage, ToolIndex, ToolRegistry, ToolSearchArgs, ToolSearchHit,
-    ToolSearchTool, UserAsker, WebSearchArgs, WebSearchTool,
+    ToolSearchTool, UserAsker, WebSearchArgs, WebSearchTool, WorkspaceMemoryBackend,
 };
 
 // --- rails -----------------------------------------------------------------

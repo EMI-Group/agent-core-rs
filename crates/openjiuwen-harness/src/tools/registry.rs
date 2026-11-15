@@ -22,7 +22,8 @@ use super::{
     cron, discovery, goal, mcp_resources, mcp_subscription_tool, mcp_subscriptions, media, web,
     AskUserTool, BashTool, BuiltinTool, EditFileTool, GlobTool, GrepTool, ListDirTool, MemoryTool,
     MemoryToolBackend, MemoryToolKind, ReadFileTool, ReadStateRegistry, TodoCreateTool,
-    TodoGetTool, TodoListTool, TodoModifyTool, TodoStore, ToolEnv, UserAsker, WriteFileTool,
+    TodoGetTool, TodoListTool, TodoModifyTool, TodoStore, ToolEnv, UserAsker,
+    WorkspaceMemoryBackend, WriteFileTool,
 };
 
 /// Maps a memory [`BuiltinTool`] variant to its [`MemoryToolKind`].
@@ -199,6 +200,18 @@ impl ToolRegistry {
     #[must_use]
     pub fn with_memory(mut self, backend: Arc<dyn MemoryToolBackend>) -> Self {
         self.memory_backend = Some(backend);
+        self
+    }
+    /// Wires the file-backed [`WorkspaceMemoryBackend`] over this registry's workspace.
+    ///
+    /// [`DeepAgentBuilder`](crate::agent::DeepAgentBuilder) calls this by default, so the eight
+    /// memory tools work out of the box; [`Self::with_memory`] still replaces the backend when a
+    /// host has a richer one (for example an embedding-backed store).
+    #[must_use]
+    pub fn with_workspace_memory(mut self) -> Self {
+        self.memory_backend = Some(Arc::new(WorkspaceMemoryBackend::new(
+            self.env.workspace().clone(),
+        )));
         self
     }
 

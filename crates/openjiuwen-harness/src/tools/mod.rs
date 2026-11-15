@@ -83,7 +83,7 @@ pub use media::{
 };
 pub use memory::{
     MemoryEditData, MemoryReadData, MemoryScope, MemorySearchRequest, MemoryTool,
-    MemoryToolBackend, MemoryToolKind, MemoryWriteData,
+    MemoryToolBackend, MemoryToolKind, MemoryWriteData, WorkspaceMemoryBackend,
 };
 pub use read::{ReadFileArgs, ReadFileTool};
 pub use search::{
