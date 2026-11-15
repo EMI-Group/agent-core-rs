@@ -58,6 +58,7 @@
 //! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) with a reason.
 
 pub mod content_addressing;
+pub mod deferred;
 pub mod error_reporting;
 pub mod project_semconv;
 pub mod redaction;
@@ -73,6 +74,15 @@ pub use content_addressing::{
     address_payload, addressable_attributes, build_sequence, content_hash,
     parse_sequence_reference, rebuild_value, sequence_reference, split_elements, AddressedSequence,
     SequenceNode, ADDRESSED_ATTRIBUTE_KEYS, SEQUENCE_REFERENCE_PREFIX, SEQUENCE_REFERENCE_VERSION,
+};
+pub use deferred::{
+    acquire_observability_demand, emit_compaction_window_commit, emit_context_window_commit,
+    ensure_global_http_instrumentation, force_flush_provider, init_observability,
+    instrumentation_env_flag, is_initialized, publish_span_snapshot, publish_stream_frame,
+    register_span_consumer, release_observability_demand,
+    reset_global_http_instrumentation_for_tests, shutdown_observability, tracer,
+    ObservabilityDemand, INSTRUMENTATION_DEFERRED_REASON, PROVIDER_LIFECYCLE_DEFERRED_REASON,
+    TRAJECTORY_DATA_PLANE_DEFERRED_REASON,
 };
 pub use error_reporting::error_reason;
 pub use redaction::{
