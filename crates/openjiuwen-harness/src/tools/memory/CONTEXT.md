@@ -18,6 +18,8 @@ Storage and retrieval sit behind `MemoryToolBackend` (the SQLite/embedding hybri
 - Tool names, JSON schemas, payload shapes and message text are unchanged from the pre-split module.
 - No backend configured → `success=false` with `memory tool backend is not configured` (`tool.rs::NO_BACKEND_MESSAGE`; checked after the required-argument validation, so a missing argument is reported first).
 - No production `MemoryToolBackend` implementation exists in the crate or anywhere in the workspace — only the unit-test `FakeBackend` in `tests.rs`; a real adapter over `openjiuwen_memory` is the host's job, wired through `ToolRegistry::with_memory`. The crate's other memory seam, `rails::memory::LongTermMemoryAdapter`, implements `MemoryRecall`/`MemoryWriteBack` (not this trait) over `openjiuwen_memory::LongTermMemory`.
+- The Python reference for a file-backed backend is `openjiuwen/core/memory/lite/memory_tool_ops.py` (`memory_search/get/read/write/edit_with_context`): read/write/edit are plain file operations under the workspace `memory` node, while search goes through the lite manager and yields `path`/`start_line`/`end_line`/`score`/`snippet` hits (the tool's renderer reads `results[].citation|score|snippet`).
+- `openjiuwen-memory` does not port `memory_tool_ops`/`MemoryToolContext`; its closest stores are `lite::local::LocalCodingMemory` (root-scoped `MEMORY.md`/`USER.md`/`facts/`/`sessions/`/`daily_memory/` tree with add/search/list/get/delete + `WriteMode::Append`) and `LongTermMemory` (id-addressed records).
 - `MemoryToolKind` is the only selector of card/scope/render shape; per-kind arg structs stay private to `tool.rs`.
 - Files ≤1000 lines; no duplicated card/payload scaffolding between kinds.
 
