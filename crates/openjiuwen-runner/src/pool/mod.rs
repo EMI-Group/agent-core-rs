@@ -12,7 +12,8 @@
 //! `openjiuwen/agent_teams/runtime/`: `_TeamRunnerMixin.stop_agent_team` /
 //! `pause_agent_team` / `list_active_teams` /
 //! `_maybe_release_team_session` (as [`TeamPool::stop`], [`TeamPool::pause`],
-//! [`TeamPool::list_active`], and [`TeamPool::stop_all`]), the
+//! [`TeamPool::list_active`], and [`TeamPool::stop_all`]; `pause` keeps Python's
+//! entry point but refuses, see *Pause/resume are refused* below), the
 //! `TeamRuntimeManager.activate` / `finalize` run cycle (as [`TeamPool::start`]
 //! and the worker's exactly-once finalisation), the `TeamRuntimePool`
 //! ([`ActiveTeamInfo`] is a read-only snapshot, like Python's), the
@@ -39,9 +40,15 @@
 //! pooled run.
 //!
 //! **Best-effort observation.** The frame channel is a `tokio::sync::broadcast`:
-//! a slow subscriber sees `Lagged` and never a replay. Status mirroring,
-//! pause/resume signals, and hub unregistration are all logged and never turned
-//! into control flow.
+//! a slow subscriber sees `Lagged` and never a replay. Status mirroring and hub
+//! unregistration are all logged and never turned into control flow.
+//!
+//! **Pause/resume are refused.** [`TeamPool::pause`] and [`TeamPool::resume`]
+//! answer [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) for
+//! a live run: an in-process strategy owns no mid-flight suspension seam, so the
+//! pool cannot suspend or restart the invocation and publishes no frame for it.
+//! Stopping a pooled run is [`TeamPool::stop`] (or [`PoolRun::cancel`]), which
+//! trips the run's cancellation token.
 
 mod entry;
 mod error;

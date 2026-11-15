@@ -107,7 +107,9 @@ impl ActiveRunSpec {
 /// The host-facing snapshot of one registered run.
 ///
 /// `state` is the hub's own coordination state (it starts at
-/// [`RunPhase::Queued`] and `pause`/`resume`/`cancel` advance it), not a query of
+/// [`RunPhase::Queued`] and `cancel` advances it to [`RunPhase::Cancelled`]; a
+/// `pause`/`resume` is refused with `Error::Unsupported` and changes nothing), not
+/// a query of
 /// the run itself. `queued` counts the interaction request ids the hub has
 /// observed on the run's session but not yet answered; it is not the same as the
 /// inbox depth (the inbox holds inbound human payloads). Serialized with
@@ -126,7 +128,7 @@ pub struct ActiveRunInfo {
     pub session_id: Option<String>,
     /// The hub's coordination state.
     pub state: RunPhase,
-    /// Whether the hub's interaction gate is closed (paused or cancelled).
+    /// Whether the hub's interaction gate is closed (cancelled, or finished).
     pub gate_closed: bool,
     /// Number of interaction request ids awaiting an answer.
     pub queued: usize,

@@ -55,6 +55,7 @@ impl Drop for RunStatusGuard // unfinished -> finish as Cancelled with detail {"
 ```
 ## Semantics
 - One event per transition: `begin`/`track` publish the `Queued` event, `update` publishes the phase it was given, `finish` publishes the outcome phase; the per-run history append and the channel publish happen in the same lock step.
+- `RunPhase::Paused` is part of the phase vocabulary and a host may still `RunMonitor::update` a run into it, but nothing in this crate produces it: there is no suspension seam here, and the hub and the team pool refuse `pause`/`resume` with `Error::Unsupported` instead of reporting a paused run.
 - `track` on an already-tracked id publishes nothing and returns the existing status unchanged; on an unknown id it behaves like `begin` under that id.
 - `update` on an unknown id is `Error::NotFound("run '<id>' is not tracked")`; on a run whose current phase is terminal, and on a request for a terminal phase, it is `Error::Validation` — terminal phases go through `finish` so `finished_at` is stamped and the run is retained.
 - `finish` on an unknown id uses the same `NotFound` wording; a second `finish` is the same `Validation` wording; the outcome's phase is recorded as given.

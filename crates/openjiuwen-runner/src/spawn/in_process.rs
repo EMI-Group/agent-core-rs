@@ -19,11 +19,27 @@
 //! An in-process handler is *stopped*, not signalled: [`SpawnedAgent::shutdown`]
 //! and [`SpawnedAgent::force_kill`] both call [`InProcessHandler::shutdown`], and
 //! there is no OS process to report (`pid` is always `None`).
+//!
+//! **Cancellation is correlated by a request id.** [`InProcessAgent`] has no child
+//! to send a `cancel` frame to, so the correlation happens in the hosted agent
+//! instead: [`InProcessHandler::send_with_request_id`] starts one invocation under
+//! a caller-known id and [`InProcessHandler::cancel_request`] cancels exactly that
+//! invocation, leaving the handler's other in-flight calls running. The handle's
+//! [`SpawnedAgent::cancel_task_with_request_id`] (and its plain
+//! [`SpawnedAgent::cancel_task`] convenience form) forwards to
+//! [`InProcessHandler::cancel_request`]; a handler that does not track its
+//! requests keeps the default and answers `false`, which the handle reports as
+//! [`openjiuwen_common::error::Error::NotFound`] for an unknown id — an id that
+//! matches nothing is never a silent success.
+//!
+//! **No probe, only liveness.** An in-process agent has no health command, so
+//! [`crate::spawn::MonitoredSpawnedAgent`]'s supervised cadence observes
+//! liveness (`is_alive`/`pid`) for this backend rather than a fabricated probe.
 use crate::spawn::{AgentSpawner, SpawnBackend, SpawnSpec, SpawnedAgent};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use openjiuwen_agent::output::{AgentChunk, AgentOutput};
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::utils::id::uuid_v4;
 use serde_json::{json, Value};
 use std::fmt;
@@ -52,6 +68,41 @@ pub trait InProcessHandler: Send + Sync {
     /// Whatever the hosted agent reports: a validation error for unusable
     /// inputs, a cancellation, or an agent-level failure.
     async fn send(&self, inputs: Value) -> Result<AgentOutput>;
+
+    /// Handles one invocation identified by `request_id`.
+    ///
+    /// This is the correlating form of [`Self::send`]: a handler that serves
+    /// several calls at once keeps the ids apart (a `request_id`-keyed registry of
+    /// [`tokio_util::sync::CancellationToken`]s, say) so
+    /// [`Self::cancel_request`] can cancel exactly one of them.
+    ///
+    /// Defaults to [`Self::send`], which is correct for a handler that serves one
+    /// call at a time and therefore has nothing to correlate: the id is accepted
+    /// and ignored rather than rejected, because the handle — not the caller —
+    /// decides whether a backend can use it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::send`] reports.
+    async fn send_with_request_id(&self, _request_id: &str, inputs: Value) -> Result<AgentOutput> {
+        self.send(inputs).await
+    }
+
+    /// Cancels the in-flight request named `request_id`, returning whether a
+    /// matching call was found and cancelled.
+    ///
+    /// `reason` is informational: an in-process call is not `kill`ed, its
+    /// `CancellationToken` is tripped (or its own cancellation logic runs), so the
+    /// reason is for logging and for the handler's own bookkeeping.
+    ///
+    /// Defaults to `false`: a handler that does not track its requests cannot
+    /// cancel one, and `false` is that honest answer — the handle turns it into
+    /// [`openjiuwen_common::error::Error::NotFound`] instead of pretending the
+    /// request was cancelled. It is synchronous on purpose, so a handle can cancel
+    /// from any context without awaiting the hosted agent.
+    fn cancel_request(&self, _request_id: &str, _reason: Option<&str>) -> bool {
+        false
+    }
 
     /// Handles one invocation as a stream of [`AgentChunk`] frames.
     ///
@@ -168,9 +219,42 @@ impl InProcessAgent {
         &self.handler
     }
 
+    /// Runs one invocation under `request_id`, so
+    /// [`SpawnedAgent::cancel_task_with_request_id`] can address it later.
+    ///
+    /// The caller owns the id: whatever it passes here is what it must pass to
+    /// cancel. A handler that does not override
+    /// [`InProcessHandler::send_with_request_id`] serves the call exactly as
+    /// [`SpawnedAgent::send`] would.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the hosted handler reports.
+    pub async fn send_with_request_id(
+        &self,
+        request_id: &str,
+        inputs: Value,
+    ) -> Result<AgentOutput> {
+        self.handler.send_with_request_id(request_id, inputs).await
+    }
+
     /// Marks the handle dead; shared by `shutdown` and `force_kill`.
     fn mark_dead(&self) {
         self.alive.store(false, Ordering::SeqCst);
+    }
+
+    /// The one cancel path: validate the id, forward it to the handler, and turn
+    /// "no such request" into a typed `NotFound`.
+    fn cancel(&self, request_id: &str, reason: Option<&str>) -> Result<()> {
+        if request_id.trim().is_empty() {
+            return Err(Error::validation(
+                "an in-process cancel needs a non-blank request_id",
+            ));
+        }
+        if self.handler.cancel_request(request_id, reason) {
+            return Ok(());
+        }
+        Err(crate::error::not_found("in-process request", request_id))
     }
 }
 
@@ -239,6 +323,40 @@ impl SpawnedAgent for InProcessAgent {
     async fn health(&self) -> Result<bool> {
         Ok(self.is_alive())
     }
+
+    /// Cancels the in-flight request named `task_id`, with no reason.
+    ///
+    /// The convenience form of
+    /// [`SpawnedAgent::cancel_task_with_request_id`]: the id *is* the request id
+    /// here, so an in-process handle has nothing to cancel wholesale.
+    ///
+    /// # Errors
+    ///
+    /// [`openjiuwen_common::error::Error::NotFound`] when no request with that id
+    /// is in flight, [`openjiuwen_common::error::Error::Validation`] for a blank
+    /// id.
+    async fn cancel_task(&self, task_id: &str) -> Result<()> {
+        self.cancel(task_id, None)
+    }
+
+    /// Cancels exactly the in-flight request named `request_id`.
+    ///
+    /// Forwarded to [`InProcessHandler::cancel_request`], so the handler's other
+    /// in-flight calls keep running; `reason` travels with the cancel for the
+    /// handler's own logging.
+    ///
+    /// # Errors
+    ///
+    /// [`openjiuwen_common::error::Error::NotFound`] when the handler has no such
+    /// request in flight (including when the handler cannot track requests at
+    /// all), [`openjiuwen_common::error::Error::Validation`] for a blank id.
+    async fn cancel_task_with_request_id(
+        &self,
+        request_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.cancel(request_id, reason)
+    }
 }
 
 #[cfg(test)]
@@ -249,7 +367,9 @@ mod tests {
     use openjiuwen_common::error::{Error, ErrorKind};
     use parking_lot::Mutex;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
+    use tokio_util::sync::CancellationToken;
 
     /// A handler that records the calls it served.
     struct RecordingHandler {
@@ -463,6 +583,213 @@ mod tests {
         let rendered = format!("{agent:?}");
         assert!(rendered.contains("InProcessAgent"), "{rendered}");
         assert!(rendered.contains("in-process-test"), "{rendered}");
+    }
+
+    /// A handler that tracks its in-flight requests by id, so a cancel can
+    /// address exactly one of them.
+    struct TrackingHandler {
+        in_flight: Mutex<HashMap<String, CancellationToken>>,
+        cancels: Mutex<Vec<(String, Option<String>)>>,
+        release: CancellationToken,
+    }
+
+    impl TrackingHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                in_flight: Mutex::new(HashMap::new()),
+                cancels: Mutex::new(Vec::new()),
+                release: CancellationToken::new(),
+            })
+        }
+
+        fn in_flight(&self) -> Vec<String> {
+            let mut ids: Vec<String> = self.in_flight.lock().keys().cloned().collect();
+            ids.sort();
+            ids
+        }
+
+        fn cancels(&self) -> Vec<(String, Option<String>)> {
+            self.cancels.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl InProcessHandler for TrackingHandler {
+        async fn send(&self, inputs: Value) -> Result<AgentOutput> {
+            let request_id = uuid_v4();
+            self.send_with_request_id(&request_id, inputs).await
+        }
+
+        async fn send_with_request_id(
+            &self,
+            request_id: &str,
+            inputs: Value,
+        ) -> Result<AgentOutput> {
+            let token = CancellationToken::new();
+            self.in_flight
+                .lock()
+                .insert(request_id.to_owned(), token.clone());
+            let outcome = tokio::select! {
+                () = token.cancelled() => Err(Error::cancelled()),
+                () = self.release.cancelled() => Ok(AgentOutput::answer(format!("done: {inputs}"))),
+            };
+            self.in_flight.lock().remove(request_id);
+            outcome
+        }
+
+        fn cancel_request(&self, request_id: &str, reason: Option<&str>) -> bool {
+            let Some(token) = self.in_flight.lock().get(request_id).cloned() else {
+                return false;
+            };
+            self.cancels
+                .lock()
+                .push((request_id.to_owned(), reason.map(str::to_owned)));
+            token.cancel();
+            true
+        }
+
+        fn stream(&self, _inputs: Value) -> BoxStream<'static, Result<AgentChunk>> {
+            Box::pin(futures::stream::empty())
+        }
+
+        async fn shutdown(&self) -> Result<()> {
+            self.release.cancel();
+            Ok(())
+        }
+    }
+
+    /// A live handle over `handler`, built the way a spawner builds one.
+    fn tracking_agent(handler: &Arc<TrackingHandler>) -> Arc<InProcessAgent> {
+        Arc::new(InProcessAgent {
+            id: "in-process-tracking".to_owned(),
+            spec: SpawnSpec::class_agent("mod", "A"),
+            handler: Arc::clone(handler) as Arc<dyn InProcessHandler>,
+            alive: AtomicBool::new(true),
+        })
+    }
+
+    /// Waits (bounded) until `handler` reports `want` in-flight requests.
+    async fn wait_in_flight(handler: &TrackingHandler, want: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while handler.in_flight().len() != want {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected {want} in-flight requests, saw {:?}",
+                handler.in_flight()
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_request_by_id_leaves_the_other_running() {
+        let handler = TrackingHandler::new();
+        let agent = tracking_agent(&handler);
+        let first = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move { agent.send_with_request_id("req-a", json!({"n": 1})).await })
+        };
+        let second = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move { agent.send_with_request_id("req-b", json!({"n": 2})).await })
+        };
+        wait_in_flight(&handler, 2).await;
+        agent
+            .cancel_task_with_request_id("req-b", Some("operator stop"))
+            .await
+            .expect("the matching in-flight request is cancelled");
+        assert_eq!(
+            handler.cancels(),
+            vec![("req-b".to_owned(), Some("operator stop".to_owned()))],
+            "the reason travels with the cancel"
+        );
+        // Exactly one request is gone; the other is still being served.
+        wait_in_flight(&handler, 1).await;
+        assert_eq!(handler.in_flight(), vec!["req-a".to_owned()]);
+        handler.release.cancel();
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the cancelled request must not hang")
+            .expect("the task ran");
+        assert_eq!(
+            cancelled.expect_err("the cancelled request fails").kind(),
+            ErrorKind::Cancelled
+        );
+        let completed = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the surviving request must not hang")
+            .expect("the task ran")
+            .expect("the other request completes");
+        assert_eq!(
+            completed.output, "done: {\"n\":1}",
+            "the surviving request is the one that was not cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_task_is_the_convenience_form_of_the_correlated_cancel() {
+        let handler = TrackingHandler::new();
+        let agent = tracking_agent(&handler);
+        let request = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move { agent.send_with_request_id("req-c", json!({})).await })
+        };
+        wait_in_flight(&handler, 1).await;
+        agent
+            .cancel_task("req-c")
+            .await
+            .expect("cancel_task uses the id as the request id");
+        assert_eq!(
+            handler.cancels(),
+            vec![("req-c".to_owned(), None)],
+            "the convenience form carries no reason"
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .expect("the cancel must end the request")
+            .expect("the task ran");
+        assert_eq!(
+            outcome.expect_err("the request was cancelled").kind(),
+            ErrorKind::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_or_blank_in_process_request_id_is_typed() {
+        let handler = TrackingHandler::new();
+        let agent = tracking_agent(&handler);
+        let missing = agent
+            .cancel_task_with_request_id("never-started", Some("x"))
+            .await
+            .expect_err("nothing is in flight under that id");
+        assert_eq!(missing.kind(), ErrorKind::NotFound);
+        assert!(missing.to_string().contains("never-started"), "{missing}");
+        assert_eq!(
+            agent
+                .cancel_task("")
+                .await
+                .expect_err("a blank id names nothing")
+                .kind(),
+            ErrorKind::Validation
+        );
+        assert!(
+            handler.cancels().is_empty(),
+            "a refused cancel never reaches the handler"
+        );
+        // A handler that cannot track its requests answers `false`, which the
+        // handle reports as NotFound rather than pretending to cancel.
+        let recording: Arc<dyn InProcessHandler> = RecordingHandler::new();
+        let plain = InProcessAgent {
+            id: "in-process-plain".to_owned(),
+            spec: SpawnSpec::class_agent("mod", "A"),
+            handler: recording,
+            alive: AtomicBool::new(true),
+        };
+        let untracked = plain
+            .cancel_task("anything")
+            .await
+            .expect_err("the handler tracks nothing");
+        assert_eq!(untracked.kind(), ErrorKind::NotFound);
     }
 
     #[test]

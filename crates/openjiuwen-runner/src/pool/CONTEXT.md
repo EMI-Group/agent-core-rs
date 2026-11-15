@@ -3,7 +3,7 @@
 ## Intent
 
 The in-process team runtime pool: a bounded set of live team runs keyed by `(team_name, session_id)`, each with a monitor entry, a HITL binding, an inbound-payload buffer, a cancellation token, and a broadcast frame stream.
-Ports the in-process part of `openjiuwen/core/runner/team_runner.py`'s `TeamRuntimeManager` pool: admission/reject, the active-team listing, pause/resume/stop, orphan reclaim, and single-run-per-key.
+Ports the in-process part of `openjiuwen/core/runner/team_runner.py`'s `TeamRuntimeManager` pool: admission/reject, the active-team listing, stop, the typed pause/resume refusals, orphan reclaim, and single-run-per-key.
 Every run in the pool is driven by `crate::run::stream_team`; the pool never re-implements the execution path, it only owns the *observation* seams (monitor + HITL) and the lifecycle around it.
 
 ## API Surface
@@ -12,8 +12,8 @@ Every run in the pool is driven by `crate::run::stream_team`; the pool never re-
 - `PoolKey` (`src/pool/key.rs`) — `{ team_name, session_id }`, `new`, `for_team`, `Display` as `team@session`.
 - `PoolRequest` (`src/pool/request.rs`) — runtime-only request (`team`, `inputs`, `session_id`, `label`, `options`) with `new`, `with_session_id`, `with_label`, `with_options`, `with_cancellation`, `with_timeout`, and a `key(&RunnerConfig)` derivation.
 - `PoolRun` — `run_id`, `key`, `team_name`, `session_id`, `state`, `subscribe`, `wait`, `output`, `cancel`, `payloads`, `is_finished`.
-- `PoolLease` — `key`, `run`, `wait`, `pause`, `resume`, `release`, `is_released`, `run_id`, `state`; `Drop` releases an unreleased lease.
-- `PoolFrame` (`src/pool/entry.rs`) — `Started`, `Paused`, `Resumed`, `Payload`, `Output`, `Completed`, `Failed`, `Cancelled`, serde-tagged by `kind`.
+- `PoolLease` — `key`, `run`, `wait`, `pause`, `resume` (both refuse), `release`, `is_released`, `run_id`, `state`; `Drop` releases an unreleased lease.
+- `PoolFrame` (`src/pool/entry.rs`) — `Started`, `Payload`, `Output`, `Completed`, `Failed`, `Cancelled`, serde-tagged by `kind` (no pause/resume frame: nothing suspends a run).
 - `ActiveTeamInfo` — read-only snapshot: `run_id`, `team_name`, `session_id`, `label`, `state`, `gate_closed`, `running`, `leases`, `queued`.
 - `PoolError` (`src/pool/error.rs`) — `AtCapacity`, `Busy`, `NotFound`, `Closed`, `Cancelled`, with `kind()`, `into_error()`, `From<PoolError> for Error`.
 - `PoolShutdown` — `{ stopped, first_error }` with `is_ok`, `into_result`; `stopped` counts only the live runs the sweep stopped, and retained finished entries are removed from the pool but not counted.
@@ -36,7 +36,7 @@ Every run in the pool is driven by `crate::run::stream_team`; the pool never re-
 - **`acquire` joins, `start` rejects.** Python's `REJECT_RUNNING` is a rejection for a *new* run; a caller that wants "the run for this key, whoever owns it" uses `acquire` and gets a lease that keeps the entry out of idle eviction.
 - **Finalisation order**: state written → monitor finished → terminal frame emitted → hub binding dropped → permit released → `wait()` woken → retention pruned.
 - **Retention is best-effort**: terminal entries stay (so `get`/`wait` keep working) until `retain_finished` newer terminal entries exist, and an entry with a live lease is never pruned.
-- **Pause/resume are coordination signals**, not a suspended team loop: they set the entry phase and gate flag, mirror best-effort into the hub and monitor, and emit a frame.
+- **Pause/resume refuse instead of pretending.** `TeamPool::pause`/`resume` keep their signatures and negative answers (unknown key or finished entry → `PoolError::NotFound`) but a live run answers `Error::Unsupported` from `crate::error::no_suspension_seam`: an in-process strategy owns no mid-flight suspension seam, so the pool cannot suspend or restart the invocation. The refusal changes nothing (no phase, gate, frame, or monitor transition); `stop`/`PoolRun::cancel` trip the token for a host that must stop the run.
 - **Payloads, not gates**: the pool registers the run on the hub and drains its inbox into a bounded `VecDeque` (`payload_capacity`, oldest dropped on overflow), so a host re-invokes the strategy with the drained payloads. No session is attached to the hub entry, so `InteractionHub::answer` cannot resolve in-flight interaction requests of a pooled run.
 - **Idle eviction is one lazy task per pool** (`src/pool/reaper.rs`), started by the first admission when `idle_timeout()` is `Some`; it uses only `tokio::time` so an embedding process that enables tokio's `test-util` can pause and advance it deterministically. An idle *live* orphan is cancelled and removed (Python's orphan reclaim), never a leased entry.
 - **Errors are `openjiuwen_common::error::Error`**; `PoolError` only exists to name the pool's failure vocabulary and map it onto `ErrorKind` (`AtCapacity`/`Closed` → `Config`, `Busy` → `Validation`, `NotFound` → `NotFound`, `Cancelled` → `Cancelled`). Because `Error` is not `Clone`, an entry stores a `PoolFailure { kind, message }` and rebuilds the error on demand.

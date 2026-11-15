@@ -20,7 +20,8 @@
 //! - [`RunMonitor`] — bounded per-run phase/outcome tracking with a broadcast
 //!   event stream ([`RunEvent`]);
 //! - [`InteractionHub`] — runner-level human-in-the-loop delivery, interaction
-//!   answering, and pause/resume/cancel signals for live runs;
+//!   answering, and cancellation for live runs (pause/resume answer a typed
+//!   `Error::Unsupported`, because nothing can suspend an in-flight invocation);
 //! - [`TeamPool`] — the in-process team runtime pool with admission, leases,
 //!   bounded concurrency, idle eviction, and payload buffering;
 //! - the spawn seam ([`AgentSpawner`], [`SpawnSpec`], [`SpawnMessage`]), with
@@ -75,6 +76,7 @@ mod runner_dreaming;
 mod runner_seams;
 mod runner_spawn;
 pub mod spawn;
+pub mod stop;
 
 // ------------------------------------------------------- flat re-exports --
 
@@ -142,6 +144,8 @@ pub use run::{
     AgentRef, RunOptions, RunServices, TeamRef, WorkflowRef,
 };
 pub use runner::Runner;
+// --- shutdown report ---
+pub use stop::{ComponentStop, StopComponent, StopReport, StopStatus};
 // --- dreaming driver ---
 pub use dreaming::{DreamService, DreamServiceStatus, DEFAULT_DREAMING_STOP_TIMEOUT};
 /// The memory-crate dreaming types a host needs to build and inspect a

@@ -365,7 +365,11 @@ async fn cancel_task_posts_the_task_id_and_needs_a_cancel_path() {
     let received = recorded(&server, |path| path == "/agents/echo/cancel").await;
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].url.path(), "/agents/echo/cancel");
-    assert_eq!(body_json(&received[0]), json!({"task_id": "task-1"}));
+    assert_eq!(
+        body_json(&received[0]),
+        json!({"task_id": "task-1", "request_id": "task-1", "reason": null}),
+        "the id travels under its original key and its correlation name"
+    );
 
     let disabled = RemoteAgent::new(config_for(&server, "echo").with_cancel_path(None));
     let error = disabled.cancel_task("task-2").await.unwrap_err();

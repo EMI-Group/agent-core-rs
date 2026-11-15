@@ -64,13 +64,19 @@
 //! - **Dreaming** — [`DreamService`] via [`Runner::set_dreaming_service`], driven by
 //!   [`Runner::start_dreaming`]/[`Runner::stop_dreaming`] and read through
 //!   [`Runner::dreaming_status`]; it has a lifecycle of its own, so [`Runner::start`]
-//!   never starts it, while [`Runner::stop`] does stop a running service (bounded and
-//!   log-only on failure, so the runner's shutdown result stays the queue's). The
-//!   accessors live in the crate's `runner_dreaming` module, beside this file.
+//!   never starts it, while [`Runner::stop`] does stop a running service (bounded by
+//!   the configured shutdown grace period) and reports it as one component of the
+//!   shutdown report. The accessors live in the crate's `runner_dreaming` module,
+//!   beside this file.
 //! - **Team transports** — `openjiuwen_multiagent::{TeamTransport, TransportKind,
 //!   build_transport}`, reached through the `Team` seam only: `Pulsar` is
-//!   `Error::Unsupported`, `RunnerConfig::distributed_mode` is refused by
-//!   [`Runner::start`], and `RemoteProtocol::{Mq, A2a}` are deferred.
+//!   `Error::Unsupported`, `RemoteProtocol::{Mq, A2a}` are deferred, and a
+//!   `RunnerConfig::distributed_mode` runner is refused by [`Runner::start`], by
+//!   every execution entry point, and by pool admission — one guard
+//!   ([`RunnerConfig::require_local`] via [`RunServices::require_local`]) with one
+//!   message, so nothing runs in-process under a distributed name. The spawn seam
+//!   is deliberately exempt: a spawned child is backend-selected, not
+//!   mode-selected.
 use crate::callback::{bind_guardrails, CallbackFramework, CallbackId};
 use crate::config::RunnerConfig;
 use crate::dreaming::DreamService;
@@ -78,13 +84,16 @@ use crate::error;
 use crate::hitl::{DeliverResult, InteractPayload, InteractionHub, RunTarget};
 use crate::monitor::{RunMonitor, RunStatus};
 use crate::mq::{self, MessageQueue};
-use crate::pool::{ActiveTeamInfo, PoolKey, PoolLease, PoolRequest, PoolRun, TeamPool};
+use crate::pool::{
+    ActiveTeamInfo, PoolKey, PoolLease, PoolRequest, PoolRun, PoolShutdown, TeamPool,
+};
 use crate::resources::ResourceMgr;
 use crate::run::{
     invoke_agent, invoke_team, invoke_workflow, stream_agent, stream_team, stream_workflow,
     AgentRef, RunOptions, RunServices, TeamRef, WorkflowRef,
 };
 use crate::spawn::{AgentSpawner, SpawnerRegistry, UnsupportedSpawner};
+use crate::stop::{ComponentStop, StopComponent, StopReport};
 use futures::stream::BoxStream;
 use openjiuwen_agent::output::{AgentChunk, AgentOutput};
 use openjiuwen_common::error::Result;
@@ -219,8 +228,9 @@ impl Runner {
     /// backend with [`Runner::set_spawner`] or [`Runner::set_spawner_registry`].
     ///
     /// `config.distributed_mode` is accepted and preserved, but a distributed
-    /// runner cannot start: [`Runner::start`] refuses it until a distributed
-    /// transport lands.
+    /// runner executes nothing: [`Runner::start`], the six execution entry
+    /// points, and pool admission all refuse it with the shared
+    /// [`RunnerConfig::require_local`] guard until a distributed transport lands.
     #[must_use]
     pub fn with_config(config: RunnerConfig) -> Arc<Self> {
         let queue: Arc<dyn MessageQueue> = mq::build_message_queue(&config.message_queue);
@@ -360,11 +370,16 @@ impl Runner {
     /// The human-in-the-loop hub every execution path registers on.
     ///
     /// The returned `Arc` is a cheap snapshot of the currently installed seam.
-    /// Use it to list the live runs, pause/resume/cancel a registered run, and
-    /// answer the interaction requests a run published; the facade shortcuts over
-    /// it are [`Runner::interact_agent_team`] and [`Runner::answer_interaction`].
-    /// [`Runner::set_hitl`] replaces the installed hub (a snapshot taken earlier
-    /// keeps addressing the retired one).
+    /// Use it to list the live runs, answer their interactions, and cancel a
+    /// registered run; the facade shortcuts over it are
+    /// [`Runner::interact_agent_team`] and [`Runner::answer_interaction`].
+    /// Pausing and resuming are **not** available: a live invocation owns no
+    /// suspension seam, so [`InteractionHub::pause`] and [`InteractionHub::resume`]
+    /// (and the [`Runner::pause_agent_team`]/[`Runner::resume_agent_team`]
+    /// shortcuts) answer a typed `Error::Unsupported` instead of flipping a state
+    /// Python's deferred `InteractGate` would honour. [`Runner::set_hitl`] replaces
+    /// the installed hub (a snapshot taken earlier keeps addressing the retired
+    /// one).
     #[must_use]
     pub fn hitl(&self) -> Arc<InteractionHub> {
         Arc::clone(&self.hitl.read())
@@ -414,11 +429,12 @@ impl Runner {
     /// `Error::Unsupported` when the live configuration selects
     /// `distributed_mode` — the distributed transports are deferred, so a
     /// distributed runner refuses to start rather than running in-process under a
-    /// distributed name (see [`RunnerConfig::distributed_mode`]) — or when
-    /// `create_message_queue` rejects the configured kind (`Error::Unsupported`
-    /// for the deferred broker backends) or the checkpointer cannot be built
-    /// (`Error::Validation` / `Error::Unsupported`). The runner stays stopped on
-    /// any error.
+    /// distributed name (see [`RunnerConfig::distributed_mode`]; the message comes
+    /// from [`RunnerConfig::require_local`], the guard every entry point shares) —
+    /// or when `create_message_queue` rejects the configured kind
+    /// (`Error::Unsupported` for the deferred broker backends) or the checkpointer
+    /// cannot be built (`Error::Validation` / `Error::Unsupported`). The runner
+    /// stays stopped on any error.
     pub async fn start(&self) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().await;
         if self.is_started() {
@@ -426,18 +442,13 @@ impl Runner {
             return Ok(());
         }
         let config = self.config();
-        if config.distributed_mode {
+        if let Err(error) = config.require_local() {
             tracing::warn!(
                 target: LOG_TARGET,
                 runner_id = %self.runner_id,
                 "refusing to start a distributed runner; the transports are deferred"
             );
-            return Err(error::unsupported(
-                "distributed runner mode (`drunner`)",
-                "the distributed transports are deferred (Pulsar/ZeroMQ reply-topic \
-                 routing, `RemoteProtocol::Mq`/`A2a`, cross-process attach); run \
-                 in-process or enable distributed execution once a transport lands",
-            ));
+            return Err(error);
         }
         let queue = match mq::create_message_queue(&config.message_queue).await {
             Ok(queue) => queue,
@@ -464,58 +475,91 @@ impl Runner {
         Ok(())
     }
 
+    /// Stops the runner and returns the per-component report.
+    ///
+    /// This is the whole truth of a shutdown: every component is attempted, and
+    /// each one's outcome is recorded in the returned [`StopReport`] —
+    ///
+    /// - **dreaming**: skipped when no [`DreamService`] is installed; otherwise
+    ///   joined with the configured shutdown grace period (capped at
+    ///   [`DEFAULT_DREAMING_STOP_TIMEOUT`](crate::DEFAULT_DREAMING_STOP_TIMEOUT)),
+    ///   and failed when the service reports a `last_stop_error` (a loop that
+    ///   ignored its cancellation and was aborted, or a task that failed);
+    /// - **pool**: every pooled team run is stopped ([`TeamPool::stop_all`]); a
+    ///   sweep failure is reported instead of only logged, and a fresh open pool
+    ///   built from the live configuration replaces the swept one **even when the
+    ///   sweep failed**, so a later [`Runner::start_agent_team`] can admit runs
+    ///   again;
+    /// - **queue**: stopped and bounded by [`RunnerConfig::shutdown_timeout`]; a
+    ///   backend error is failed with its own message, and a stop that exceeds the
+    ///   bound is failed with a message naming the bound (the queue is left to its
+    ///   own shutdown either way). A runner that was never started (or is already
+    ///   stopped) reports the queue as `skipped` and does not stop it.
+    ///
+    /// The pool is swept **before** the started check, so a runner that never
+    /// started (but admitted pooled runs, which do not require `start`) does not
+    /// leak them. When the runner was started, the checkpointer is dropped and
+    /// every registry entry released, which `registries_released` records.
+    ///
+    /// Idempotent: a second call stops nothing new, reports the queue as
+    /// `skipped`, and installs another fresh open pool. A recorded dreaming
+    /// failure is a fact about the *last* dreaming shutdown: it stays in the
+    /// service status — and therefore in the report — until the service's next
+    /// `start` clears it. See `crate::stop` for the wire shape.
+    pub async fn stop_with_report(&self) -> StopReport {
+        let _lifecycle = self.lifecycle.lock().await;
+        let dreaming = self.stop_dreaming_component().await;
+        let pool = self.sweep_team_pool().await;
+        let started = self.started.swap(false, Ordering::AcqRel);
+        let mut report = StopReport::new(started)
+            .with_pool(pool)
+            .with_dreaming(dreaming);
+        if !started {
+            tracing::debug!(target: LOG_TARGET, runner_id = %self.runner_id, "runner already stopped");
+            return report;
+        }
+        let queue = self.stop_queue_component().await;
+        *self.checkpointer.write() = None;
+        self.resources.release();
+        tracing::info!(target: LOG_TARGET, runner_id = %self.runner_id, "runner stopped");
+        report = report.with_queue(queue).with_registries_released(true);
+        report
+    }
+
     /// Stops the runner: stops every pooled team run, stops the queue (bounded by
     /// [`RunnerConfig::shutdown_timeout`]), drops the checkpointer, and releases
     /// every registry entry (Python `Runner.stop`).
     ///
+    /// Every component is attempted, and the result is the aggregate of all of
+    /// them: `Ok(())` only when the report
+    /// ([`Runner::stop_with_report`]) is clean. Nothing is swallowed — a queue that
+    /// fails or misses its grace period, a pool sweep that fails, and a dreaming
+    /// loop that could not be joined each make this an `Err`, and the message
+    /// names **every** failed component with its own reason.
+    ///
     /// The pool is swept **before** the started check, so a runner that never
     /// started (but admitted pooled runs, which do not require `start`) does not
-    /// leak them. A fresh open pool built from the live configuration replaces the
-    /// swept one, so a later [`Runner::start_agent_team`] — or a restart — can
-    /// admit runs again.
-    ///
-    /// Idempotent; stopping a runner that was never started is `Ok(())`. A queue
-    /// that does not stop within the grace period is logged and left to its own
-    /// shutdown rather than failing the whole stop; a pool sweep failure is
-    /// reported through `tracing` only, so the queue's result stays the return
-    /// value.
-    ///
-    /// The installed dreaming service is stopped too, before the pool sweep and
-    /// before the started early return — best effort, never affecting the result
-    /// — while [`Runner::start`] never starts one: consolidation has a lifecycle
-    /// of its own. The service stays installed, so a later
-    /// [`Runner::start_dreaming`] runs it again.
+    /// leak them, and the fresh open pool that replaces it lets a later
+    /// [`Runner::start_agent_team`] — or a restart — admit runs again, even when
+    /// the sweep itself failed. A running dreaming service is stopped too and
+    /// stays installed for a later [`Runner::start_dreaming`], while
+    /// [`Runner::start`] never starts one: consolidation has a lifecycle of its
+    /// own. Idempotent; stopping a never-started runner stops the pool and
+    /// dreaming as above and reports the queue as `skipped`.
     ///
     /// # Errors
     ///
-    /// Returns the queue's error when it fails to stop.
+    /// `Error::Config` — the closest existing kind, documented in
+    /// [`crate::error::shutdown_incomplete`] — with every failed component and its
+    /// message when the report is not clean. Call
+    /// [`Runner::stop_with_report`] instead to inspect the components without an
+    /// error.
     pub async fn stop(&self) -> Result<()> {
-        let _lifecycle = self.lifecycle.lock().await;
-        self.stop_dreaming_quietly().await;
-        self.sweep_team_pool().await;
-        if !self.started.swap(false, Ordering::AcqRel) {
-            tracing::debug!(target: LOG_TARGET, runner_id = %self.runner_id, "runner already stopped");
-            return Ok(());
+        let report = self.stop_with_report().await;
+        match report.failure_summary() {
+            Some(details) => Err(error::shutdown_incomplete(details)),
+            None => Ok(()),
         }
-        let queue = Arc::clone(&self.queue.read());
-        let timeout = self.config().shutdown_timeout();
-        let stopped = if timeout.is_zero() {
-            queue.stop().await
-        } else if let Ok(result) = tokio::time::timeout(timeout, queue.stop()).await {
-            result
-        } else {
-            tracing::warn!(
-                target: LOG_TARGET,
-                runner_id = %self.runner_id,
-                timeout_ms = timeout.as_millis(),
-                "message queue did not stop within the shutdown grace period"
-            );
-            Ok(())
-        };
-        *self.checkpointer.write() = None;
-        self.resources.release();
-        tracing::info!(target: LOG_TARGET, runner_id = %self.runner_id, "runner stopped");
-        stopped
     }
 
     /// Releases the state stored for `session_id` in the runner's checkpointer.
@@ -550,8 +594,11 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// Returns `Error::NotFound` for an unregistered id, the abort error of a
-    /// blocking callback, `Error::Cancelled`, or `Error::Timeout`.
+    /// `Error::Unsupported` when the runner is configured for distributed mode
+    /// (the guard is shared with every other entry point: no transport is
+    /// available, so nothing runs in-process under a distributed name), then
+    /// `Error::NotFound` for an unregistered id, the abort error of a blocking
+    /// callback, `Error::Cancelled`, or `Error::Timeout`.
     pub async fn run_agent(
         &self,
         agent: impl Into<AgentRef>,
@@ -563,7 +610,9 @@ impl Runner {
 
     /// Runs an agent and yields its frames as they arrive.
     ///
-    /// Delegates to [`crate::run::stream_agent`].
+    /// Delegates to [`crate::run::stream_agent`]. A distributed-configured runner
+    /// refuses as the stream's single terminal `Err` frame
+    /// (`Error::Unsupported`), before any work starts.
     pub fn run_agent_streaming(
         &self,
         agent: impl Into<AgentRef>,
@@ -579,7 +628,8 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// Returns `Error::NotFound` for an unregistered id, or the workflow
+    /// `Error::Unsupported` when the runner is configured for distributed mode,
+    /// then `Error::NotFound` for an unregistered id, or the workflow
     /// engine's error.
     pub async fn run_workflow(
         &self,
@@ -592,7 +642,9 @@ impl Runner {
 
     /// Runs a workflow and yields its frames as they arrive.
     ///
-    /// Delegates to [`crate::run::stream_workflow`].
+    /// Delegates to [`crate::run::stream_workflow`]. A distributed-configured
+    /// runner refuses as the stream's single terminal `Err` frame
+    /// (`Error::Unsupported`), before any work starts.
     pub fn run_workflow_streaming(
         &self,
         workflow: impl Into<WorkflowRef>,
@@ -609,8 +661,9 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// Returns `Error::NotFound` for an unregistered id, `Error::Cancelled` when
-    /// the run's cancellation token fires, `Error::Timeout` when the run deadline
+    /// `Error::Unsupported` when the runner is configured for distributed mode,
+    /// then `Error::NotFound` for an unregistered id, `Error::Cancelled` when the
+    /// run's cancellation token fires, `Error::Timeout` when the run deadline
     /// expires, or the team's error.
     pub async fn run_agent_team(
         &self,
@@ -623,7 +676,9 @@ impl Runner {
 
     /// Runs an agent team and yields its frames as they arrive.
     ///
-    /// Delegates to [`crate::run::stream_team`].
+    /// Delegates to [`crate::run::stream_team`]. A distributed-configured runner
+    /// refuses as the stream's single terminal `Err` frame
+    /// (`Error::Unsupported`), before any work starts.
     pub fn run_agent_team_streaming(
         &self,
         team: impl Into<TeamRef>,
@@ -642,8 +697,8 @@ impl Runner {
     /// [`crate::pool::TeamPool::start`], which keys it by
     /// `(team name, session id)`, bounds how many runs are in flight, owns the
     /// monitor and hub registration for it, and returns before the worker's first
-    /// poll. The handle can be awaited ([`PoolRun::wait`]), subscribed to, paused,
-    /// or cancelled; [`Runner::list_active_teams`] lists the live ones.
+    /// poll. The handle can be awaited ([`PoolRun::wait`]), subscribed to, or
+    /// cancelled; [`Runner::list_active_teams`] lists the live ones.
     ///
     /// The session id is derived by the pool from `inputs["conversation_id"]`,
     /// then [`RunOptions::session_id`], then
@@ -652,9 +707,11 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// `Error::Validation` when the key already has a live run
-    /// ([`crate::pool::PoolError::Busy`]), `Error::Config` when the pool was
-    /// closed or the call is made outside a tokio runtime, and
+    /// `Error::Unsupported` when the runner is configured for distributed mode —
+    /// pool admission consults the shared guard first, so nothing is queued,
+    /// created, or observed — then `Error::Validation` when the key already has a
+    /// live run ([`crate::pool::PoolError::Busy`]), `Error::Config` when the pool
+    /// was closed or the call is made outside a tokio runtime, and
     /// `Error::Cancelled` when the run was cancelled while queued.
     pub async fn start_agent_team(
         &self,
@@ -681,9 +738,11 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// `Error::Validation` when the key already has a live run, `Error::Config`
-    /// when no permit is available, when the pool was closed, or when the call is
-    /// made outside a tokio runtime.
+    /// `Error::Unsupported` when the runner is configured for distributed mode
+    /// (checked ahead of every other admission outcome), `Error::Validation` when
+    /// the key already has a live run, `Error::Config` when no permit is
+    /// available, when the pool was closed, or when the call is made outside a
+    /// tokio runtime.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // deliberate: see the doc comment
     pub async fn try_start_agent_team(
         &self,
@@ -708,6 +767,8 @@ impl Runner {
     ///
     /// # Errors
     ///
+    /// `Error::Unsupported` when the runner is configured for distributed mode —
+    /// a distributed runner creates nothing and joins nothing — then
     /// `Error::Config` when the pool was closed or the call is made outside a
     /// tokio runtime, and `Error::Cancelled` when a run was cancelled while queued
     /// for a permit.
@@ -758,30 +819,35 @@ impl Runner {
         self.team_pool().stop(&key).await
     }
 
-    /// Pauses the pooled team run bound to `(team_name, session_id)`.
+    /// Refuses to pause the pooled team run bound to `(team_name, session_id)`.
     ///
-    /// A coordination signal, not a scheduler: it closes the run's interaction
-    /// gate and reports the run as paused, but does not suspend the team loop
-    /// (Python's live `InteractGate` wake-up is deferred).
+    /// A live run answers `Error::Unsupported`: the in-process team strategy owns
+    /// no mid-flight suspension seam, so nothing can suspend the invocation
+    /// (Python's live `InteractGate` wake-up is deferred) and reporting the run as
+    /// paused would describe a run that keeps running. The refusal changes
+    /// nothing — no phase, no gate, no frame, no monitor transition — and
+    /// [`Runner::stop_agent_team`] cancels the run for real.
     ///
     /// Kept `async` so the facade's team controls share one shape and a future
     /// gate-aware pause can await without an API change.
     ///
     /// # Errors
     ///
-    /// `Error::NotFound` when no live run is pooled under the key.
+    /// `Error::NotFound` when no live run is pooled under the key, and
+    /// `Error::Unsupported` for a live one.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // deliberate: see the doc comment
     pub async fn pause_agent_team(&self, team_name: &str, session_id: &str) -> Result<()> {
         self.team_pool().pause(&PoolKey::new(team_name, session_id))
     }
 
-    /// Resumes a paused pooled team run bound to `(team_name, session_id)`.
+    /// Refuses to resume the pooled team run bound to `(team_name, session_id)`.
     ///
-    /// A coordination signal; see [`Runner::pause_agent_team`].
+    /// Same refusal as [`Runner::pause_agent_team`].
     ///
     /// # Errors
     ///
-    /// `Error::NotFound` when no live run is pooled under the key.
+    /// `Error::NotFound` when no live run is pooled under the key, and
+    /// `Error::Unsupported` for a live one.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // deliberate: see `pause_agent_team`
     pub async fn resume_agent_team(&self, team_name: &str, session_id: &str) -> Result<()> {
         self.team_pool()
@@ -925,7 +991,10 @@ impl Runner {
             let mut slot = self.team_pool.write();
             std::mem::replace(&mut *slot, TeamPool::from_runner_config(config))
         };
-        sweep_pool(&previous, self.runner_id()).await;
+        // The sweep of the retired pool is a restart boundary, not a stop: its
+        // first failure is already logged by `sweep_pool`, and a `start` keeps
+        // reporting through its own `Result`.
+        let _retired = sweep_pool(&previous, self.runner_id()).await;
         tracing::debug!(
             target: LOG_TARGET,
             runner_id = %self.runner_id,
@@ -934,22 +1003,65 @@ impl Runner {
         );
     }
 
-    /// Stops every pooled team run and installs a fresh open pool.
+    /// Stops every pooled team run, installs a fresh open pool, and reports the
+    /// sweep.
     ///
-    /// The logs are the only report: [`Runner::stop`]'s return value stays the
-    /// queue's, exactly as before the pool existed.
-    async fn sweep_team_pool(&self) {
+    /// The fresh pool is installed **before** the failure is judged, so a sweep
+    /// failure still leaves a usable pool behind (a restart or a later
+    /// [`Runner::start_agent_team`] must not be blocked by a member that refused
+    /// to stop). The first sweep failure becomes the component's message.
+    async fn sweep_team_pool(&self) -> ComponentStop {
         let previous = self.team_pool();
-        sweep_pool(&previous, self.runner_id()).await;
+        let shutdown = sweep_pool(&previous, self.runner_id()).await;
         *self.team_pool.write() = TeamPool::from_runner_config(&self.config());
+        match shutdown.into_result() {
+            Ok(_stopped) => ComponentStop::stopped(StopComponent::Pool),
+            Err(error) => ComponentStop::failed(StopComponent::Pool, error.to_string()),
+        }
+    }
+
+    /// Stops the installed message queue and reports the outcome.
+    ///
+    /// A zero [`RunnerConfig::shutdown_timeout`] waits without a bound (as
+    /// before); otherwise the stop is bounded and an expired bound is a failure
+    /// naming it — the queue is left to its own shutdown, but the Runner no
+    /// longer claims the stop succeeded.
+    async fn stop_queue_component(&self) -> ComponentStop {
+        let queue = Arc::clone(&self.queue.read());
+        let timeout = self.config().shutdown_timeout();
+        if timeout.is_zero() {
+            return match queue.stop().await {
+                Ok(()) => ComponentStop::stopped(StopComponent::Queue),
+                Err(error) => ComponentStop::failed(StopComponent::Queue, error.to_string()),
+            };
+        }
+        match tokio::time::timeout(timeout, queue.stop()).await {
+            Ok(Ok(())) => ComponentStop::stopped(StopComponent::Queue),
+            Ok(Err(error)) => ComponentStop::failed(StopComponent::Queue, error.to_string()),
+            Err(_elapsed) => {
+                let message = format!(
+                    "the message queue did not stop within the {}ms shutdown grace period \
+                     (`RunnerConfig::shutdown_timeout_secs`); it was left to its own shutdown",
+                    timeout.as_millis()
+                );
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    runner_id = %self.runner_id,
+                    timeout_ms = timeout.as_millis(),
+                    "message queue did not stop within the shutdown grace period"
+                );
+                ComponentStop::failed(StopComponent::Queue, message)
+            }
+        }
     }
 }
 
-/// Stops every run of `pool` (awaited outside any lock) and logs the sweep.
-async fn sweep_pool(pool: &TeamPool, runner_id: &str) {
+/// Stops every run of `pool` (awaited outside any lock) and logs the sweep,
+/// returning it so the caller can report a failure instead of only logging it.
+async fn sweep_pool(pool: &TeamPool, runner_id: &str) -> PoolShutdown {
     let shutdown = pool.stop_all().await;
     let stopped = shutdown.stopped;
-    if let Some(error) = shutdown.first_error {
+    if let Some(error) = &shutdown.first_error {
         tracing::warn!(
             target: LOG_TARGET,
             runner_id,
@@ -965,6 +1077,7 @@ async fn sweep_pool(pool: &TeamPool, runner_id: &str) {
             "stopped pooled team runs"
         );
     }
+    shutdown
 }
 
 #[cfg(test)]

@@ -42,7 +42,8 @@ pub struct RunServices {
     pub hitl: Option<Arc<crate::hitl::InteractionHub>>,    // None: no run is registered
 }
 impl RunServices { pub fn new(resources, callbacks, config, checkpointer) -> Self; pub fn with_guardrails(self, pipeline) -> Self;
-                  pub fn with_monitor(self, monitor) -> Self; pub fn with_hitl(self, hub) -> Self; }
+                  pub fn with_monitor(self, monitor) -> Self; pub fn with_hitl(self, hub) -> Self;
+                  pub fn require_local(&self) -> Result<()>; }  // delegates to RunnerConfig::require_local
 
 // run/agent.rs — public free functions; `Runner::run_agent*` are one-line delegates
 pub async fn invoke_agent(services: RunServices, agent: AgentRef, inputs: Value, options: RunOptions) -> Result<AgentOutput>;
@@ -60,6 +61,12 @@ pub fn stream_team(services: RunServices, team: TeamRef, inputs: Value, options:
 ```
 
 ## Behaviour (the contract)
+
+**Distributed-mode guard (first, always).** Every path calls `RunServices::require_local()` before anything else — `Ok(())` for a local runner, and the crate's single `Error::Unsupported` (from `RunnerConfig::require_local` → `error::distributed_mode`) naming distributed runner mode and the reason: this build ships no distributed transport (Pulsar, ZeroMQ, and A2A reply-topic transports are deferred).
+For the three `invoke_*` functions the refusal is the awaited `Err`, before a ref is resolved, a session is created, a callback fires, or a monitor/hub status exists.
+For the three `stream_*` functions the refusal is the stream's **single terminal `Err` frame** — the guard is the first statement inside the `async_stream::stream!` body, yielding that error and returning — so nothing else happens and no frame follows it.
+Pool admission applies the same guard before creating or queueing an entry (see `../pool/CONTEXT.md`).
+The spawn seam is deliberately exempt: a spawned child is backend-selected, not mode-selected.
 
 **Reference resolution.** `Id(_)` looks the resource up in `ResourceMgr` and a miss is `Error::NotFound("agent '<id>' is not registered")` (same wording for workflow/team) **before** any session is created. `Agent(..)`/`Workflow(..)`/`Team(..)` are used as-is. Python's `str | instance` union maps to these enums.
 
@@ -111,6 +118,7 @@ Before that frame is yielded, the span, the trace event, the run status, the hub
 
 ## Constraints
 
+- The distributed-mode guard runs first on every path; no session is created before the reference resolves; no callback fires when resolution fails; no stream emits anything but the refusal frame for a distributed runner.
 - No session is created before the reference resolves; no callback fires when resolution fails.
 - A caller-provided session is never committed, closed, or ended by the runner (documented on each method).
 - Teardown is idempotent and never panics; `Drop` spawns it on the current runtime and logs when no runtime exists.
@@ -121,7 +129,7 @@ Before that frame is yielded, the span, the trace event, the run status, the hub
 
 ## Routing Table
 
-- `./src/run/mod.rs` → `RunServices` (including the `monitor`/`hitl` seams), `RunOptions`, `AgentRef`/`WorkflowRef`/`TeamRef`, session resolution, `RunSpan`, `Teardown`
+- `./src/run/mod.rs` → `RunServices` (including the `monitor`/`hitl` seams and `require_local`), `RunOptions`, `AgentRef`/`WorkflowRef`/`TeamRef`, session resolution, `RunSpan`, `Teardown`
 - `./src/run/agent.rs` → agent invoke + streaming
 - `./src/run/workflow.rs` → workflow invoke + streaming
 - `./src/run/team.rs` → team invoke + streaming over `SessionLease`

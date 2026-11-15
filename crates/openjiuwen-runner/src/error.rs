@@ -62,6 +62,40 @@ pub fn unsupported(feature: &str, hint: &str) -> Error {
     Error::Unsupported(format!("{feature} is not supported: {hint}"))
 }
 
+/// A distributed-configured runner reaching an entry point that would need a
+/// distributed transport: `Error::Unsupported`, naming the mode and the reason.
+///
+/// This is the ONE message every such path reports — [`crate::Runner::start`],
+/// the six execution entry points, and pool admission all go through
+/// [`crate::config::RunnerConfig::require_local`], which builds it here — so a
+/// caller reads the same wording wherever the refusal surfaces. The feature name
+/// keeps Python's `drunner` spelling so the deferred area stays greppable.
+pub fn distributed_mode() -> Error {
+    unsupported(
+        "distributed runner mode (`drunner`)",
+        "this build ships no distributed transport (Pulsar, ZeroMQ, and A2A \
+         reply-topic transports are deferred); run in-process with \
+         `distributed_mode = false`",
+    )
+}
+
+/// A pause or resume of a live run: `Error::Unsupported`, naming what is missing.
+///
+/// Nothing in this build can suspend an in-flight invocation: the in-process team
+/// strategy owns no mid-flight suspension seam and Python's in-loop `InteractGate`
+/// is deferred, so a pause that reported `Ok` would have paused nothing. `action`
+/// is the refused verb (`"pause"` / `"resume"`) and `run_id` the run it addressed,
+/// so the message says exactly which call was refused. The hint names `cancel`,
+/// which really does stop a run by tripping its `CancellationToken`.
+pub fn no_suspension_seam(action: &str, run_id: &str) -> Error {
+    unsupported(
+        &format!("`{action}` on live run '{run_id}'"),
+        "this build has no mid-flight suspension seam (an in-loop `InteractGate` is \
+         deferred), so nothing can suspend or restart the invocation; call `cancel` \
+         (it trips the run's `CancellationToken`) when a run must stop",
+    )
+}
+
 /// A session of the wrong kind for an operation: `Error::Validation`.
 pub fn invalid_session(message: impl Into<String>) -> Error {
     Error::Validation(message.into())
@@ -85,6 +119,31 @@ pub fn no_dreaming_service() -> Error {
 /// A transport-level failure: `Error::Transport`.
 pub fn transport(message: impl Into<String>) -> Error {
     Error::Transport(message.into())
+}
+
+/// A shutdown that did not complete every component: `Error::Config`.
+///
+/// `details` is [`StopReport::failure_summary`](crate::StopReport::failure_summary),
+/// so the message names each failed component (`queue: …; dreaming: …`) with its
+/// own reason.
+///
+/// The kind is `Config` because a runner shutdown is a lifecycle step whose
+/// bounds and collaborators come from [`RunnerConfig`](crate::RunnerConfig) —
+/// the queue's `shutdown_timeout`, the pool's `TeamPoolConfig::stop_timeout`, and
+/// the dreaming stop bound — and the failure is "the configured shutdown could
+/// not be carried out": a grace period that expired, a backend that refused to
+/// stop, or a dream loop that ignored its cancellation. The original failure is
+/// not rewrapped into a new error kind, because the runner has no error enum of
+/// its own: the typed per-component reasons stay readable in the report
+/// ([`Runner::stop_with_report`](crate::Runner::stop_with_report)) and in this
+/// message. Inventing a `Timeout`/`Unsupported` kind here would misreport a
+/// mid-shutdown failure as a deadline or a missing capability.
+pub fn shutdown_incomplete(details: impl Into<String>) -> Error {
+    Error::Config(format!(
+        "runner shutdown did not complete every component: {}; call `Runner::stop_with_report` \
+         for the per-component report",
+        details.into()
+    ))
 }
 
 #[cfg(test)]
@@ -136,6 +195,38 @@ mod tests {
             error.to_string(),
             "unsupported: pulsar message queue is not supported: use `in_memory`"
         );
+    }
+
+    #[test]
+    fn distributed_mode_names_the_mode_and_the_missing_transports() {
+        let error = distributed_mode();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.to_string();
+        for expected in [
+            "distributed runner mode",
+            "Pulsar",
+            "ZeroMQ",
+            "A2A",
+            "deferred",
+        ] {
+            assert!(
+                message.contains(expected),
+                "`{message}` should name {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_run_pause_names_the_missing_seam_and_the_alternative() {
+        let error = no_suspension_seam("pause", "run-1");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.to_string();
+        for expected in ["`pause`", "run-1", "InteractGate", "cancel", "deferred"] {
+            assert!(
+                message.contains(expected),
+                "`{message}` should name {expected}"
+            );
+        }
     }
 
     #[test]
