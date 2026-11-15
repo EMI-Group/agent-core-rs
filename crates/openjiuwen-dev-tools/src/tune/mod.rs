@@ -26,7 +26,12 @@
 //!   [`Trainer`] (train/validation with early stop) share [`OptimizerConfig`] and
 //!   the tuning constants ([`DEFAULT_ITERATION_NUM`], [`MAX_PARALLEL_NUM`], …).
 //!   A [`Trainer`] can also report its evaluation as an [`EvaluationSummary`],
-//!   which adds the per-case tool usage to the mean score and results.
+//!   which adds the per-case tool usage to the mean score and results. Tagged
+//!   splits keep their provenance: a [`SplitDataset`] pair carries its
+//!   [`CaseSplit`] tags into [`Trainer::train_split`], which runs the same
+//!   train/validate discipline and reports the winner's in-sample `train_score`,
+//!   its held-out `val_score`, and the `selected_on` split on the returned
+//!   [`OptimizationResult`].
 //! - **Prompt search** — [`PromptSearchOptimizer`] runs Python's bounded,
 //!   elitist multi-round search: each round starts from the best prompt so far,
 //!   adds the deterministic mutations and one model rewrite, executes every
