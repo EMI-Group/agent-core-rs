@@ -405,6 +405,14 @@ mod tests {
     }
 
     #[test]
+    fn exporter_is_send_sync_and_static() {
+        // The SDK owns the exporter for the provider lifetime and drives it from
+        // the batch-processor thread.
+        fn assert_bounds<T: Send + Sync + 'static>() {}
+        assert_bounds::<TraceFileExporter>();
+    }
+
+    #[test]
     fn trace_file_name_is_prefixed_and_jsonl_suffixed() {
         let name = trace_file_name();
         assert!(
