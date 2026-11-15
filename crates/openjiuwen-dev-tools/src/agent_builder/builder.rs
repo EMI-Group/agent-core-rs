@@ -290,6 +290,7 @@ impl AgentBuilder {
             session_id: session_id.to_owned(),
             agent_type,
             output,
+            ..BuildResult::default()
         })
     }
 
@@ -396,6 +397,7 @@ impl AgentBuilder {
             session_id: session_id.to_owned(),
             agent_type,
             output,
+            ..BuildResult::default()
         })
     }
 
