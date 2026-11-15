@@ -10,6 +10,7 @@ Components declare capabilities (`invoke`, `stream`, `collect`, `transform`) tha
 Fourteen built-ins cover control flow, the leaf components (LLM, tool, retrieval, memory), HTTP requests, human-in-the-loop questioning, intent detection, ReAct, and nested workflows.
 `execute_single_component` runs one component outside any graph, mirroring Python's `_workflow.py` helper.
 Workflows render locally, and deterministically, as Mermaid text or SVG; PNG selection is a typed `Error::Unsupported` because Python rasterizes it through the external mermaid.ink service.
+Stream composition is buffered and template-ordered; live interleaving is selected through `WorkflowRunOptions::stream_delivery` and `StreamDelivery::Interleaved` is a typed `Error::Unsupported` because `openjiuwen-graph` has no `stream_actor` machinery.
 
 ## API Surface
 
@@ -63,8 +64,8 @@ impl CompiledWorkflow {
     pub fn end_comp_id(&self) -> &str;
     pub fn ability(&self, id: &str) -> Option<ComponentAbility>;
     pub fn is_streaming(&self) -> bool;
-    pub fn to_mermaid(&self) -> String;                    // never fails
-    pub fn to_svg(&self) -> String;                        // never fails; errors render as a message box
+    pub fn to_mermaid(&self) -> Result<String>;             // compile + render; a compile failure is the coded error
+    pub fn to_svg(&self) -> Result<String>;                 // compile + render; a compile failure is the coded error
     pub async fn invoke(&self, inputs: Value, session: Arc<dyn Session>, options: WorkflowRunOptions) -> Result<WorkflowOutput>;
     pub fn stream(&self, inputs: Value, session: Arc<dyn Session>, options: WorkflowRunOptions) -> BoxStream<'static, Result<WorkflowChunk>>;
     pub async fn resume(&self, interactive: InteractiveInput, session: Arc<dyn Session>, options: WorkflowRunOptions) -> Result<WorkflowOutput>;
