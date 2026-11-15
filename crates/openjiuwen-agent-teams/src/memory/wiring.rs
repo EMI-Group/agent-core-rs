@@ -1,8 +1,8 @@
 //! The per-team team-memory wiring a `TeamAgent` drives.
 //!
 //! Python parity source: `openjiuwen/agent_teams/memory/manager.py` (`TeamMemoryManager`), which
-//! owns one team's memory, binds the coordination session, registers the member tools, and
-//! extracts memories when the session pauses or stops. Rust keeps the same shape as one handle:
+//! owns one team's memory, binds the coordination session, and registers the member tools. Rust
+//! keeps the same shape as one handle:
 //!
 //! - [`TeamMemoryWiring::open`] builds the [`TeamMemory`] facade, the
 //!   [`TeamMemoryHooks`] lifecycle seam over it, and the `TEAM_MEMORY.md` document path;
@@ -16,6 +16,20 @@
 //!
 //! The engine is [`openjiuwen_memory::team`]; nothing here re-implements records, extraction,
 //! search, or the document format.
+//!
+//! # Extraction
+//!
+//! Extraction is explicit and batched, never per round and never in the background:
+//!
+//! 1. [`TeamMemoryWiring::on_turn`] only *buffers* the turn in the engine's
+//!    [`TeamMemoryHooks`];
+//! 2. [`TeamMemoryWiring::flush`] extracts every buffered turn in one pass, writes the batch with
+//!    deterministic ids, and clears the buffer;
+//! 3. a failing pass returns the engine's error with the buffer intact, so a retry is safe: the
+//!    deterministic ids make it converge on the same rows instead of duplicating them.
+//!
+//! The runtime drives those two calls at the settled-run boundary and again on `stop`, so a team's
+//! memory holds one record set per settled run.
 //!
 //! # Durability
 //!
@@ -83,6 +97,8 @@ use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::Model;
 use openjiuwen_foundation::tool::Tool;
 use openjiuwen_memory::record::CallOptions;
+#[cfg(test)]
+use openjiuwen_memory::team::TeamMemoryStore;
 use openjiuwen_memory::team::{
     LlmTeamExtractor, MemberMemoryContext, MemberMemoryToolkit, RuleTeamExtractor,
     TeamExtractConfig, TeamMemory, TeamMemoryExtractor, TeamMemoryFilter, TeamMemoryFlush,
@@ -220,13 +236,32 @@ impl TeamMemoryWiring {
         workspace_root: PathBuf,
         extractor: Arc<dyn TeamMemoryExtractor>,
     ) -> Result<Arc<Self>> {
+        Self::assemble(team_id, config, workspace_root, extractor, None).await
+    }
+
+    /// Builds the wiring over `store` when one is supplied, or over the store the configuration
+    /// selects otherwise.
+    ///
+    /// `store` replaces the facade's store only: [`MemoryConfig::store`] still selects the
+    /// document's directory, and the selection log line of [`trace::facade`] is skipped, because
+    /// no selection happened.
+    async fn assemble(
+        team_id: String,
+        config: MemoryConfig,
+        workspace_root: PathBuf,
+        extractor: Arc<dyn TeamMemoryExtractor>,
+        store: Option<TeamMemory>,
+    ) -> Result<Arc<Self>> {
         validate_id("team_id", &team_id)?;
         config.validate()?;
         let document_path = config.store.dir().map_or_else(
             || workspace_root.join(TEAM_MEMORY_FILE),
             |dir| dir.join(TEAM_MEMORY_FILE),
         );
-        let (memory, observer) = trace::facade(&team_id, &config);
+        let (memory, observer) = match store {
+            Some(memory) => trace::facade_over(&team_id, &config, memory),
+            None => trace::facade(&team_id, &config),
+        };
         let memory = Arc::new(memory);
         let hooks = TeamMemoryHooks::new(
             team_id.clone(),
@@ -255,6 +290,34 @@ impl TeamMemoryWiring {
             }
         }
         Ok(wiring)
+    }
+
+    /// Builds the wiring over `store` for a test, with the extractor [`Self::open`] would select.
+    ///
+    /// The production constructors pick the store from [`MemoryConfig::store`]; this one lets a
+    /// suite inject its own [`TeamMemoryStore`] (a failing store, for instance) so the extraction
+    /// failure path can be driven deterministically. Everything else is [`Self::build`]: the same
+    /// validation, the same observer choice through `trace::facade_over`, the same document import.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`Self::open`].
+    #[cfg(test)]
+    pub(crate) async fn with_store_for_tests(
+        team_id: impl Into<String>,
+        config: MemoryConfig,
+        workspace_root: impl Into<PathBuf>,
+        store: Arc<dyn TeamMemoryStore>,
+    ) -> Result<Arc<Self>> {
+        let extractor = default_extractor(&config);
+        Self::assemble(
+            team_id.into(),
+            config,
+            workspace_root.into(),
+            extractor,
+            Some(TeamMemory::new(store)),
+        )
+        .await
     }
 
     /// Returns a new handle over the same facade whose hooks extract with `extractor`.
@@ -422,6 +485,9 @@ impl TeamMemoryWiring {
 
     /// Buffers one team turn for the next [`TeamMemoryWiring::flush`].
     ///
+    /// Nothing is extracted here: the turn reaches the store only through [`Self::flush`], which
+    /// extracts and writes the whole buffer in one batch.
+    ///
     /// # Errors
     ///
     /// [`Error::Validation`] for an invalid turn or team id.
@@ -461,7 +527,12 @@ impl TeamMemoryWiring {
 
     /// Extracts the buffered turns and writes them as one batch.
     ///
-    /// A disabled wiring answers an empty flush without touching the engine.
+    /// This is the only call that extracts: it runs the extractor over every buffered turn,
+    /// writes the records with deterministic ids and clears the buffer. A disabled wiring answers
+    /// an empty flush without touching the engine.
+    ///
+    /// A failed pass leaves the buffer intact; retrying is safe and converges, because the ids are
+    /// a pure function of the extracted content.
     ///
     /// # Errors
     ///

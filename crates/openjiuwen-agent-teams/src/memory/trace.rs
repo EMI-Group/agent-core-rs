@@ -97,10 +97,23 @@ pub fn facade(
             TeamMemory::in_memory()
         }
     };
+    facade_over(team_id, config, store)
+}
+
+/// Attaches the observer `config` asks for to an already-built facade.
+///
+/// [`facade`] calls this after selecting the store from [`MemoryConfig::store`]; the test
+/// constructor in the wiring passes a facade over its own store instead, so "traced or not" stays
+/// one decision on both paths.
+pub(crate) fn facade_over(
+    team_id: &str,
+    config: &MemoryConfig,
+    memory: TeamMemory,
+) -> (TeamMemory, Option<Arc<dyn TeamMemoryObserver>>) {
     let observer = observer_for(team_id, config);
     let memory = match observer.as_ref() {
-        Some(observer) => store.with_observer(Arc::clone(observer)),
-        None => store,
+        Some(observer) => memory.with_observer(Arc::clone(observer)),
+        None => memory,
     };
     (memory, observer)
 }
