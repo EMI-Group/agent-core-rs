@@ -247,6 +247,16 @@ pub(crate) async fn run(
                 answer_chars = answer.chars().count(),
                 "team run settled"
             );
+            // The settled run is the extraction boundary (`_finalize_round` parity): the leader's
+            // answer joins the turns the mailbox buffered, and one flush writes them. Advisory, so
+            // a failing memory store never fails a run that otherwise succeeded.
+            super::memory_bind::record_settled_run(
+                agent.memory().as_ref(),
+                agent.team_name(),
+                agent.member_name(),
+                &answer,
+            )
+            .await;
             Ok(AgentOutput::answer(answer))
         }
         RunExit::Cancelled => Err(Error::cancelled()),
@@ -456,6 +466,7 @@ async fn unread_lines(agent: &TeamAgent, leader: &str) -> Option<String> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::memory::{MemoryConfig, TeamMemoryWiring};
     use crate::runtime::team_agent::test_support::{
         blueprint, built, deps, RecordingWorkspaceProvider, ScriptedFactory,
     };
@@ -463,6 +474,7 @@ mod tests {
     use crate::schema::{is_team_event_marker, TaskGraphSpec};
     use futures::StreamExt;
     use openjiuwen_common::error::ErrorKind;
+    use openjiuwen_memory::team::{TeamMemoryFilter, TeamMemoryKind, TeamMemoryRecord};
     use serde_json::json;
 
     /// Upper bound for any single wait in these tests.
@@ -601,5 +613,89 @@ mod tests {
             Err(error) => assert_eq!(error.kind(), ErrorKind::Cancelled),
             Ok(chunk) => panic!("expected the cancellation, got {chunk:?}"),
         }
+    }
+
+    /// Returns the stored records of `wiring`, ordered by id.
+    async fn records(wiring: &Arc<TeamMemoryWiring>) -> Vec<TeamMemoryRecord> {
+        wiring
+            .memory()
+            .list(&TeamMemoryFilter::for_team(wiring.team_id()))
+            .await
+            .expect("the team memory store answered")
+    }
+
+    #[tokio::test]
+    async fn a_settled_run_extracts_the_leader_answer_and_the_mailbox_turn() {
+        let factory = ScriptedFactory::new();
+        let workspace = RecordingWorkspaceProvider::new();
+        factory.answering("boss", "We decided to use SQLite.");
+        let dir = tempfile::tempdir().unwrap();
+        let wiring = TeamMemoryWiring::open("alpha", MemoryConfig::default(), dir.path())
+            .await
+            .unwrap();
+        let agent = blueprint("alpha", "boss", &["dev-1"])
+            .build_with(deps(&factory, &workspace).with_memory(Arc::clone(&wiring)))
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(
+                &wiring,
+                agent.memory().as_ref().expect("the injected wiring")
+            ),
+            "the build adopts the injected wiring"
+        );
+        // The mailbox row is buffered through the turn seam; the leader's answer is not a mailbox
+        // row at all, so it can only reach the store through the settled-run boundary.
+        // `start` installs the coordination session (which discards a previous session's buffer),
+        // so it runs first and the message is buffered under this run's session.
+        agent.start().await.unwrap();
+        agent
+            .backend()
+            .send_message("dev-1", Some("boss"), "We decided to migrate off Postgres.")
+            .await
+            .unwrap();
+
+        let output = agent.invoke(json!("hello"), None).await.unwrap();
+        assert!(
+            output.output.contains("We decided to use SQLite."),
+            "{output:?}"
+        );
+
+        let stored = records(&wiring).await;
+        assert!(
+            stored
+                .iter()
+                .any(|record| record.content.contains("SQLite")),
+            "the leader answer was extracted at the settled-run boundary: {stored:?}"
+        );
+        assert!(
+            stored
+                .iter()
+                .any(|record| record.content.contains("migrate off Postgres")),
+            "the mailbox turn landed in the same flush: {stored:?}"
+        );
+
+        // The settled-run flush cleared the buffer, so a second flush has nothing to re-extract.
+        let repeated = wiring.flush().await.unwrap();
+        assert!(repeated.is_empty(), "{repeated:?}");
+        assert_eq!(repeated.turns, 0, "{repeated:?}");
+
+        // `stop` flushes the leftovers (none) and writes the live members' handoff notes, so the
+        // extracted decisions must stay exactly the ones the settled-run flush wrote.
+        let decisions: Vec<String> = stored
+            .iter()
+            .filter(|record| record.kind == TeamMemoryKind::Decision)
+            .map(|record| record.id.clone())
+            .collect();
+        assert_eq!(decisions.len(), 2, "one decision per turn: {stored:?}");
+        agent.stop().await.unwrap();
+        assert_eq!(wiring.hooks().pending_turns(), 0);
+        let after: Vec<String> = records(&wiring)
+            .await
+            .iter()
+            .filter(|record| record.kind == TeamMemoryKind::Decision)
+            .map(|record| record.id.clone())
+            .collect();
+        assert_eq!(after, decisions, "a later stop re-extracts nothing");
     }
 }

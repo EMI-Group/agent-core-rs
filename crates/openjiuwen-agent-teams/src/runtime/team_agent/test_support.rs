@@ -272,6 +272,8 @@ pub(crate) struct ScriptedFactory {
     hanging: Mutex<BTreeSet<String>>,
     /// Harness built per member, so a test can inspect what the leader received.
     harnesses: Mutex<BTreeMap<String, Arc<ScriptedHarness>>>,
+    /// Per-member answer overrides, used by `create` instead of the default text.
+    answers: Mutex<BTreeMap<String, String>>,
     /// Whether harnesses built from now on close each turn with a terminal event.
     turn_events: Mutex<bool>,
 }
@@ -290,6 +292,13 @@ impl ScriptedFactory {
     /// Makes the harness of `member` hang on every input.
     pub(crate) fn hanging_for(&self, member: &str) {
         self.hanging.lock().insert(member.to_owned());
+    }
+
+    /// Overrides the answer text of `member`, replacing the default `done: <member>`.
+    pub(crate) fn answering(&self, member: &str, answer: &str) {
+        self.answers
+            .lock()
+            .insert(member.to_owned(), answer.to_owned());
     }
 
     /// Makes every harness built from now on close its turns with a terminal event.
@@ -325,8 +334,14 @@ impl MemberHarnessFactory for ScriptedFactory {
                 ctx.member_name
             )));
         }
+        let answer = self
+            .answers
+            .lock()
+            .get(&ctx.member_name)
+            .cloned()
+            .unwrap_or_else(|| format!("done: {}", ctx.member_name));
         let harness = ScriptedHarness::new(
-            format!("done: {}", ctx.member_name),
+            answer,
             self.hanging.lock().contains(&ctx.member_name),
             *self.turn_events.lock(),
         );

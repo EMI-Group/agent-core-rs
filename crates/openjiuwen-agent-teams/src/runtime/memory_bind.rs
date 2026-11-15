@@ -16,10 +16,10 @@
 //!    [`observer`](crate::memory::MemoryConfig::observer) before the wiring is opened; with an
 //!    injected wiring it is ignored.
 //! 2. **Lifecycle hooks** — the `warn!`-and-continue pass-throughs ([`session_started`],
-//!    [`member_joined`], [`member_left`], [`finish`], [`export_document`]). Memory is advisory for
-//!    a run: a hook failure is logged with the team (and member) and never fails the lifecycle
-//!    operation that triggered it, so a broken memory store can never block a start, a spawn, a
-//!    shutdown or a stop.
+//!    [`member_joined`], [`member_left`], [`record_settled_run`], [`finish`], [`export_document`]).
+//!    Memory is advisory for a run: a hook failure is logged with the team (and member) and never
+//!    fails the lifecycle operation that triggered it, so a broken memory store can never block a
+//!    start, a spawn, a shutdown, a settle or a stop.
 //! 3. **Who is live** — [`is_live`] defines the roster rows a `stop` still has to hand a
 //!    `handoff` note for.
 //!
@@ -32,6 +32,7 @@
 //! resolve: injected wiring -> metadata["memory"] -> no wiring (disabled or unconfigured)
 //! start   -> on_session_start   (warn! on failure)
 //! spawn   -> on_member_join     (warn! on failure)
+//! settled run -> on_turn(leader answer) then flush() (warn! on failure; never on cancellation)
 //! shutdown/stop -> on_member_leave for every live row, then flush() + export() (warn! on failure)
 //! ```
 use std::path::Path;
@@ -236,6 +237,72 @@ pub(crate) async fn export_document(memory: Option<&Arc<TeamMemoryWiring>>, team
             document = %wiring.document_path().display(),
             %error,
             "failed to export the team memory document"
+        ),
+    }
+}
+
+/// Extracts the run's buffered turns once the team settles.
+///
+/// This is the runtime's `_finalize_round` equivalent: Python's
+/// `TeamMemoryManager.extract_after_round`, called from `_finalize_round` in
+/// `openjiuwen/agent_teams/memory/manager.py`. It runs once per settled run, after the
+/// `team.completed` marker and its bus event and before the run returns to the caller, so the
+/// leader's answer becomes the run's last turn and everything the mailbox buffered during the run
+/// is extracted and written in the same pass.
+///
+/// Both steps are advisory: a broken memory store can never fail a run that otherwise succeeded,
+/// so an `on_turn` or `flush` failure is logged and the run still returns its answer. It never runs
+/// on cancellation — `stop` flushes the leftovers there. The flush clears the buffer, so a later
+/// `stop` re-extracts nothing; retries rely on the engine's deterministic record ids (an upsert).
+pub(crate) async fn record_settled_run(
+    memory: Option<&Arc<TeamMemoryWiring>>,
+    team: &str,
+    from: &str,
+    answer: &str,
+) {
+    let Some(wiring) = memory else {
+        return;
+    };
+    let trimmed = answer.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    // A leader answer may legitimately exceed the engine's per-turn limit, and dropping the whole
+    // turn would lose the run's conclusions: truncating keeps a valid turn the engine accepts.
+    let content: String = trimmed
+        .chars()
+        .take(openjiuwen_memory::team::MAX_TURN_CONTENT_CHARS)
+        .collect();
+    if let Err(error) = wiring
+        .on_turn(openjiuwen_memory::team::TeamTurn::new(
+            from,
+            content,
+            chrono::Utc::now(),
+        ))
+        .await
+    {
+        warn!(
+            target: LOG_TARGET,
+            team,
+            member = from,
+            %error,
+            "failed to buffer the settled run's leader answer in team memory; extracting the \
+             mailbox turns only"
+        );
+    }
+    match wiring.flush().await {
+        Ok(flush) => debug!(
+            target: LOG_TARGET,
+            team,
+            records = flush.records.len(),
+            turns = flush.turns,
+            "extracted the settled run's team-memory turns"
+        ),
+        Err(error) => warn!(
+            target: LOG_TARGET,
+            team,
+            %error,
+            "failed to extract the settled run's team-memory turns; continuing the run"
         ),
     }
 }

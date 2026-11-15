@@ -301,7 +301,7 @@ every parser except `organization` degrades to its default with a `warn!` on a m
 | `attach` | `"/path/team.sock"` or `{"socket"\|"path": "…", "required": bool}`; blank ⇒ unset; `OPENJIUWEN_TEAM_SOCKET` is the fallback and an explicit metadata socket wins | `start()` binds an `AttachHost` that serves `AttachOp`s over a Unix socket |
 
 | `checkpoint` | `CheckpointConfig`: `enabled`, `resume`, `policy` and `store` (`"memory"` or `{"store": "file", "dir": "…"}`); absent ⇒ enabled, in-memory, resume-if-available | the store, policy and card id every member runtime is wired with (`./checkpoints.rs`); the build path resolves the team-shared store once, and `file` roots each member under its own workspace unless `dir` is named |
-| `memory` | `MemoryConfig`: `enabled`, `store`, `extractor`, `export_on_stop`, `import_on_build`, `hooks`; absent or `null` ⇒ **no team memory**, `{"enabled": false}` ⇒ no wiring either | the team-memory wiring (`./memory_bind.rs`): one per team, its `TEAM_MEMORY.md` at the leader's workspace root, its toolkit on every member context and its turn buffer fed by `TeamBackend::send_message`; an injected `TeamBuildDeps::memory_observer` is copied onto the resolved configuration's `observer` |
+| `memory` | `MemoryConfig`: `enabled`, `store`, `extractor`, `export_on_stop`, `import_on_build`, `hooks`; absent or `null` ⇒ **no team memory**, `{"enabled": false}` ⇒ no wiring either | the team-memory wiring (`./memory_bind.rs`): one per team, its `TEAM_MEMORY.md` at the leader's workspace root, its toolkit on every member context, its turn buffer fed by `TeamBackend::send_message` and its extraction at the settled-run boundary; an injected `TeamBuildDeps::memory_observer` is copied onto the resolved configuration's `observer` |
 Per-kind launch shapes (`process`, `external_cli`, `ssh`) live in `src/member/CONTEXT.md`; the org chart
 shapes (`OrganizationSpec`, `DelegationRules`, `OrgTaskSpec`) live in `src/org/CONTEXT.md`.
 `TeamBuildDeps` adds only *injection* hooks: `with_observability_hook`, `with_kv_cache`, `with_routing`, `with_checkpoint_store`, `with_memory`, `with_memory_observer`.
@@ -341,9 +341,13 @@ The observer is applied only on the metadata path: an injected `deps.memory` is 
 | `flush()` then `export()` | end of `TeamAgent::stop`, after the workspaces are released | each logged, the teardown still completes |
 | `export()` | `TeamAgent::snapshot`, after the roster/board read | logged; the snapshot stays infallible and its shape unchanged |
 | `on_turn_message(from, to, content, now)` | `TeamBackend::direct_row` / `broadcast_row`, after the row is persisted and published | `warn!`, the send still succeeds |
+| `on_turn(leader answer)` then `flush()` | `leader.rs`'s `RunExit::Settled`, after the `team.completed` marker and the `team_completed` bus event and before the run returns `Ok` | `warn!`, the run still succeeds; never on `RunExit::Cancelled` |
 
 Live means `memory_bind::is_live`: a row that started at least once and has not departed — so a failed spawn leaves no join record and an unstarted row gets no handoff note, keeping the join/leave pair symmetric.
-The turn seam is the mailbox, not the leader loop: every coordination message (member send, human-agent delivery, leader-bound operator/group-chat/god-view payload) ends in exactly one `direct_row` (one addressee, one turn) or one `broadcast_row` (`to: None`), so relayed content is never buffered twice and the memory tools' own `remember`/`forget` writes buffer nothing.
+The turn seam is the mailbox: every coordination message (member send, human-agent delivery, leader-bound operator/group-chat/god-view payload) ends in exactly one `direct_row` (one addressee, one turn) or one `broadcast_row` (`to: None`), so relayed content is never buffered twice and the memory tools' own `remember`/`forget` writes buffer nothing.
+Extraction has exactly two points: a member turn is **buffered only** (no write), then one settled run appends the leader's answer as one turn and `memory_bind::record_settled_run` extracts and writes everything buffered in a single `flush`; `stop` flushes the leftovers and exports, and a cancelled run extracts nothing so its turns reach the store only through that `stop` flush.
+The leader answer is the one turn no mailbox row carries, so it is truncated to `MAX_TURN_CONTENT_CHARS` (never byte-sliced) instead of being rejected by the engine's per-turn limit.
+`flush()` clears the buffer, so a later `stop` flush finds nothing to re-extract and a second settled run does not duplicate the first; retries rely on the engine's deterministic record ids (an upsert).
 `stop` closes memory out last: handoff notes for live members, then `flush`, then `export` when `MemoryConfig::export_on_stop` is set (the export gates on that flag itself); a repeated `stop`/`export` flushes nothing new and stores no new record, though the rendered document's `generated_at` header moves.
 The toolkit reaches a member through `MemberHarnessContext::with_memory_toolkit(wiring.toolkit(member, Some(team session)))`: the build path does it for the leader, `TeamMemberSpawner::build_harness_runtime` for a teammate, and `NativeMemberFactory` turns it into the four `team_memory_*` tools in `src/harness/`.
 A teammate's toolkit lookup happens before the factory call, so an unusable member/session id fails that member's spawn with the same `Validation` error kind as the surrounding build.
@@ -648,7 +652,9 @@ of 2 s polling every 5 ms, no `#[ignore]`).
 - `leader.rs` / `./tests/`: invoke with an immediate fake answer and an empty board → exactly one
   `team.completed` marker last, exactly one `team_completed` bus event carrying the team name and
   `reason: "settled"`, and the leader answer in `AgentOutput.output`; an open task keeps the stream
-  open until the board settles; cancellation ends the run and publishes no completion event.
+  open until the board settles; cancellation ends the run and publishes no completion event; a settled run
+  over an injected wiring extracts the leader answer and the mailbox turn in one flush, and a later
+  `flush`/`stop` re-extracts neither.
 - `manager.rs`: activate → live, session-mismatch rejection for a temporary team, `interact` unknown
   (`not_active`) and after `stop_team` (`gate_closed`/`not_active`), `finalize_member`, `shutdown`,
   `stop_team` tearing the attach socket down.
@@ -792,7 +798,7 @@ tests over 15 binaries),
   (an `extractor: "llm"` block degrades to the rules — `TeamMemoryWiring::open_with_model` is the seam), no
   distributed store, and the `TEAM_MEMORY.md` document is the only durable artefact (this crate does not enable
   the `openjiuwen-memory` `sqlite` feature). The hooks are advisory by design, so a broken memory store never
-  fails a start, spawn, shutdown or stop.
+  fails a start, spawn, shutdown, settle or stop.
 - A roster removal that bypasses `shutdown_member` (`TeamBackend::remove_member`) records no handoff note: the
   hook is async and the removal seam is sync, and the documented restart path is
   `shutdown_member` → `remove_member` → `spawn_member`, so the leave hook already ran.
