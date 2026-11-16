@@ -119,7 +119,8 @@ pub const API_VERSION: &str = "2021-12-02";
 
 /// Why [`AzureBlobStore::from_client_credentials`] refuses to mint an Azure AD token.
 pub const CLIENT_CREDENTIALS_REASON: &str = "Azure AD client-credential OAuth for Blob Storage \
-     is not supported (the identity-endpoint token exchange and its cache are out of scope); \
+     is not supported (it needs a live OIDC client-credentials token exchange against the \
+     Microsoft identity platform plus a token cache, which this transport does not perform); \
      configure a storage account shared key or a shared access signature (SAS) token instead";
 
 /// Short service name used in diagnostics.
@@ -500,10 +501,11 @@ impl AzureBlobStore {
 
     /// Reports that the Azure AD client-credential OAuth flow is not supported.
     ///
-    /// Minting a Blob token from a client secret means calling the identity endpoint and
-    /// caching the reply, which is outside this crate's scope. The call therefore fails with
-    /// [`Error::Unsupported`] instead of falling back to anonymous requests, which would look
-    /// like a permission problem on the service side.
+    /// Minting a Blob token from a client secret means a live OIDC client-credentials exchange
+    /// against the Microsoft identity platform plus a token cache, which this transport does
+    /// not perform. The call therefore fails with [`Error::Unsupported`] instead of falling
+    /// back to anonymous requests, which would look like a permission problem on the service
+    /// side.
     ///
     /// Supply a storage account shared key ([`AzureBlobConfig::with_shared_key`]) or a SAS
     /// token ([`AzureBlobConfig::with_sas_token`]) instead.
