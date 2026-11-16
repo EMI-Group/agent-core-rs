@@ -42,7 +42,8 @@ Workflow designer (`designer.rs` with `designer/passes.rs`, `designer/passes/cla
 - `stream` owns `DesignEvent { PassStarted(DesignPassKind), PassCompleted(DesignPass), Completed(ThreePassDesign) }`, externally tagged.
 
 DL generation (`dl_generator.rs`):
-- `DlGenerator::{new, with_model}`, `generate(&WorkflowDesign)`, `from_spec(&WorkflowSpec)`, `async generate_with_model(&WorkflowDesign)`, and `async refine(feedback, existing, mermaid) -> Result<Refinement>`.
+- `DlGenerator::{new, with_model}`, `generate(&WorkflowDesign)`, `from_spec(&WorkflowSpec)`, `async generate_with_model(&WorkflowDesign)`, `async generate_candidate(&WorkflowDesign) -> Result<GeneratedDl>`, and `async refine(feedback, existing, mermaid) -> Result<Refinement>`.
+- `GeneratedDl` — the candidate-mode result of one generation round trip: `candidate` (the model's parsed document even when it fails validation), `baseline` (the deterministic document), `issues` (one validation note per failure), `provenance` (one `generating_dl` record), plus `start()`, `is_model_answer()`, and `is_accepted()`.
 - `Refinement { workflow, provenance }`; the provenance always holds exactly one `refining_dl` record.
 
 DL reflection (`dl_reflector.rs` with `dl_reflector/dl_checks.rs`):
@@ -55,7 +56,7 @@ Builder (`builder.rs` with `builder/pipeline.rs`, `builder/stream.rs`):
 - `AgentBuilder::{new, build_agent, build_agent_at, build_with_pipeline, build_with_pipeline_stream, record_result, history(session_id, k), clear_session, status, model}`.
 - `AgentType` (`llm_agent`/`workflow`) with `as_str`/`Display`/`FromStr`; `now_millis`; `PipelineEvent`.
 - A session is a private `SessionState { history, state, agent_type, workflow }`; `workflow` is the newest workflow document the session produced and the input to the next request's refinement decision.
-- `pipeline` owns `run` (collapses the stream to its `Final`), `llm_agent_pipeline`, `generate_workflow`, `clarification_text`, `last_provenance`, `issue_note`, `joined_issue_notes`, and `repair_feedback`.
+- `pipeline` owns `run` (collapses the stream to its `Final`), `llm_agent_pipeline`, `generate_workflow` (a thin wrapper over `DlGenerator::generate_candidate` returning `GeneratedDl`), `clarification_text`, `last_provenance`, `issue_note`, `problem_lines`, `repair_request`, and `repair_feedback(issues, notes)`.
 - `stream` owns `pipeline_stream` (the single implementation of the pipeline) and `PipelineEvent { StageStarted { stage }, StageCompleted { stage, source, detail }, Clarified(ClarificationRound), Repaired(RepairReport), Final(BuildResult) }`.
 
 Support:
@@ -80,21 +81,25 @@ Stage order and events:
 2. **Refinement** (`refining_dl`) — when the verdict is `BuildIntent::Refine` and a workflow artifact exists, one `DlGenerator::refine(&query, &workflow, &render_mermaid(&workflow))` call, then the result is `completed` immediately (no clarify, design, or generation stage runs).
 3. **Clarification** (`clarifying`) — `Clarifier::with_model(..).clarify_rounds(&query, &prior, &ClarifyConfig::new(DEFAULT_MAX_CLARIFY_ROUNDS))`, with a responder that always returns `None`, so the dialogue is exactly one round and terminates `Ready` or `NoAnswer`; every round is reported as `Clarified`, and a not-ready verdict ends the build with `BuildOutput::Response` and state `Clarifying`.
 4. **LLM agent** (`generating_config`) — one generation round trip over `prior` plus the query, then `repair_llm_dsl`; output `Dsl`, state `Completed`.
-5. **Workflow** — the designer's three passes streamed as designer events (`generating_workflow_design`, `generating_workflow_design`, `validating_dl`), then `generating_dl`, then the bounded repair loop.
+5. **Workflow** — the designer's three passes streamed as designer events (`generating_workflow_design`, `generating_workflow_design`, `validating_dl`), then `generating_dl` through `DlGenerator::generate_candidate`, then the bounded repair loop.
 
-The repair loop counts one `RepairReport::record_attempt` per `DlReflector::reflect` and reports each with `Repaired`.
+The repair loop starts from the model's own document whenever the model answered — including an answer that failed `WorkflowDsl::validate` — and starts from the deterministic baseline only when no model document exists.
+It counts one `RepairReport::record_attempt` per `DlReflector::reflect` and reports each with `Repaired`.
 A `reflect` error or a failed `DlGenerator::refine` logs at debug, reports the stage `Deterministic` with the reason, and ends the loop with the document it already has.
+Every attempt collects that attempt's problems — the generation stage's still-unanswered validation notes first, then the issues the deterministic reflection just repaired — and stops when the list is empty.
+Otherwise it records the joined problems as one `RepairReport` note and feeds `repair_feedback(issues, notes)` to `DlGenerator::refine` with the repaired document and its Mermaid diagram, so both a generation validation failure and a reflection repair reach the model.
 A refinement is used only when it differs from the repaired document and validates; otherwise the loop ends with the repaired document.
-After a non-passing reflection the loop records the joined issue notes and feeds `repair_feedback(issues)` to `DlGenerator::refine` with the repaired document and its Mermaid diagram, so a refusal by the reflector costs one refine call.
-The loop stops when `reflection.passed` or `repair.attempts >= DEFAULT_MAX_RETRIES` (3 reflections, hence at most 2 refinements), and never errors.
+The loop stops when nothing is left to repair or `repair.attempts >= DEFAULT_MAX_RETRIES` (3 reflections, hence at most 2 refinements), and never errors.
+A model document that never validates is discarded in favour of the deterministic baseline, recorded as one `validating_dl` `fallback` naming the exhausted attempts, so a build never stands on an invalid document.
 
 Provenance records the pipeline emits, in order: `detecting_intention`; `refining_dl` on the refine path; one `clarifying` per round; then `generating_config`, or the designer's two `generating_workflow_design` and one `validating_dl` records followed by `generating_dl` and one `refining_dl` per refinement.
+The `generating_dl` record is `model` only when the model's document validated as answered; a parsed answer that failed validation is `fallback` with a `model document needs repair: …` detail, and a rescue then shows up as a `refining_dl` `model` record.
 The per-attempt reflect results are carried by `RepairReport` (`attempts`, `notes`), not by provenance.
 `warn_if_degraded` is called once before each `Final`, so a degraded build logs one `warn!` per non-model stage.
 
 Model-call counts on a first request (empty session history, so the intention verdict is deterministic): a workflow build makes 5 calls (clarifier, three designer passes, DL generator) and an LLM-agent build makes 2 (clarifier, generation); a request the clarifier rejects makes 1 and stops there.
 A later request adds one intention call to whichever path it takes, and a refine path is intention plus refinement only (2 calls).
-Each repair-loop re-attempt adds one refine call.
+Each repair-loop re-attempt adds one refine call, and it costs one refine call even when that refine fails, so a generation answer that failed validation and cannot be rescued makes 6 calls.
 
 ## Stage Contracts
 
@@ -149,7 +154,11 @@ The stream's `Completed` payload is the same value `design_three_pass` returns f
 ### DL generator
 
 `generate` is `design.to_workflow_dsl()`; `from_spec` is `spec.to_dsl()` plus `validate()` and never calls a model.
-`generate_with_model` computes the deterministic baseline first (an invalid design is a validation error regardless of the model), then asks the model for one fenced workflow document and accepts it only when `WorkflowDsl::validate` passes; any model failure or invalid document falls back to the baseline. Its result carries no source, so the pipeline infers one by comparing the answer with the baseline.
+`generate_with_model` computes the deterministic baseline first (an invalid design is a validation error regardless of the model), then asks the model for one fenced workflow document and returns it only when `WorkflowDsl::validate` passes; any model failure or invalid document returns the baseline.
+`generate_candidate` performs the same one round trip and reports the whole stage as a `GeneratedDl`: `candidate` holds the parsed document even when it fails validation, `baseline` holds the deterministic document, `issues` holds one note per validation failure, and `provenance` holds exactly one `generating_dl` record.
+That record is `deterministic` without a model, `fallback` when the model answered with nothing parseable or its parsed document was rejected, and `model` when the answer validated.
+`candidate` is `None` exactly when no parseable model document exists, so a caller repairs `candidate` when it is `Some` and substitutes `baseline` when the repair fails.
+`start()` is `candidate` else `baseline`, `is_model_answer()` is `candidate.is_some()`, and `is_accepted()` is a candidate that validated.
 `refine` rejects blank feedback as a validation error before any model call; without a model it returns the document unchanged with a `deterministic` record (`no model configured; keeping the existing workflow`), and with one it sends the refine system contract plus a user message holding the feedback, the Mermaid diagram, and the document JSON.
 A refinement answer is accepted only when the fenced-or-bare JSON parses as `WorkflowDsl` and validates; a model error, a choice-less answer, an unparseable answer, or an invalid document keeps the existing document with a `fallback` record naming the reason.
 The accepted path's provenance holds one `model` record and no warning is emitted.
@@ -206,8 +215,9 @@ Every invalid input (unknown type, missing required config, malformed reference/
 - Async-first: model-assisted entry points are `async fn` and compose inside an existing tokio runtime; no blocking calls, no environment reads, no `block_on`.
 - Streams are `BoxStream<'static, Result<_>>` built with `async_stream` and own their inputs, so a stream outlives the value that created it; `build_with_pipeline_stream` takes `&self` and never mutates a session, and the caller persists a `Final` result with `record_result`.
 - No `unsafe`, no `unwrap`/`expect`/`panic!` in library code, no printing; diagnostics go through `tracing`.
-- Files stay around the ~1000-line baseline: `dl_transformer/model.rs` (954), `designer/passes.rs` (859), `clarifier.rs` (820), `outcome.rs` (820), `mermaid.rs` (808), `dl_generator.rs` (757), `builder.rs` (749), `dl_reflector.rs` (718), `designer.rs` (652), `intention.rs` (511), `clarifier/rounds.rs` (391), `builder/stream.rs` (374), `mermaid/labels.rs` (307).
-- The graph and pipeline implementation files carry no tests; suites live in inline `#[cfg(test)] mod tests` blocks (`outcome`, `clarifier`, `dl_generator`, `mermaid`, `mermaid/labels`) or in sibling modules (`designer/tests.rs`, `designer/passes/tests.rs`, `designer/stream/tests.rs`, `clarifier/rounds/tests.rs`, `intention/tests.rs`, `builder/tests.rs`, `builder/pipeline_tests.rs`, `builder/stream_tests.rs`, `dl_reflector/tests/`, `dl_transformer/convert/tests/`), each also under the ~1000-line baseline (largest: `designer/passes/tests.rs`, 789).
+- Files stay around the ~1000-line baseline: `dl_transformer/model.rs` (954), `designer/passes.rs` (859), `clarifier.rs` (820), `outcome.rs` (820), `mermaid.rs` (808), `builder/pipeline_tests.rs` (764), `builder.rs` (749), `dl_reflector.rs` (718), `designer.rs` (652), `dl_generator/tests.rs` (612), `intention.rs` (511), `dl_generator.rs` (498), `builder/stream.rs` (414), `clarifier/rounds.rs` (391), `mermaid/labels.rs` (307).
+- The graph and pipeline implementation files carry no tests; suites live in inline `#[cfg(test)] mod tests` blocks (`outcome`, `clarifier`, `mermaid`, `mermaid/labels`) or in sibling modules (`designer/tests.rs`, `designer/passes/tests.rs`, `designer/stream/tests.rs`, `clarifier/rounds/tests.rs`, `intention/tests.rs`, `builder/tests.rs`, `builder/pipeline_tests.rs`, `builder/stream_tests.rs`, `dl_generator/tests.rs`, `dl_reflector/tests/`, `dl_transformer/convert/tests/`), each also under the ~1000-line baseline (largest: `designer/passes/tests.rs`, 789).
+- `dl_generator/tests.rs` is a sibling file declared as `#[cfg(test)] #[path = "dl_generator/tests.rs"] mod tests;` beside `dl_generator.rs`, so the generator's suite keeps its inline-module scope while the implementation file stays well under the baseline.
 - A moved test module keeps its path (`builder::pipeline_tests`, `designer::passes::tests`), so test bodies move verbatim and only the crate's `tests/` suites observe the public API.
 - Three lints are allowed locally and deliberately: `large_enum_variant` on `BuildOutput` and `PipelineEvent` (the document/result is the payload callers want), and `too_many_lines`/`cognitive_complexity` on `pipeline_stream` (one ordered narrative is clearer than a helper per stage).
 
@@ -222,7 +232,9 @@ Every invalid input (unknown type, missing required config, malformed reference/
 - Clarification inside the pipeline is one round on purpose: the pipeline has no user to answer, so the bounded multi-round dialogue stays a caller-driven API (`clarify_rounds_with` with a responder) rather than an internal loop.
 - The intention detector asks the model only once a session holds turns, so a first request costs no intention call and a first-request `Refine` verdict cannot fire (there is no artifact to refine).
 - The repair loop never errors and is bounded by `DEFAULT_MAX_RETRIES`: a failed reflection or refinement keeps the best document so far, an exhausted budget still returns a validated document, and a refinement that is equal or invalid ends the loop instead of burning another attempt.
-- `generate_with_model` keeps its single-document signature, so the pipeline infers `model` vs `fallback` by comparing the answer with the deterministic baseline; an answer identical to the baseline counts as a fallback.
+- Candidate mode is the pipeline's entry point and the tolerant single-document form stays the public convenience: `generate_candidate` keeps an invalid model document for the repair loop, `generate_with_model` validates it and substitutes the baseline, and both share one round trip so the pipeline never loses the model's content without the older signature changing.
+- A stage record says whether that stage's own document was accepted, not what the final artifact derives from: an invalid generation answer is `fallback` even when a later refinement rescues the build, and the rescue is visible as the `refining_dl` `model` record.
+- The repair loop refuses to emit model content that never validated: an exhausted or refused repair records one `validating_dl` `fallback` and builds on the baseline, so `GenerationSource::Model` never describes a document the model's text could not support.
 - The three designer passes record typed `DesignPass` values rather than parsing Python's Markdown sections: each pass's acceptance rule is explicit, and the reflection notes make every applied repair visible.
 - The single-pass designers keep a narrower shape than the three-pass pipeline: `design`/`design_offline` are the offline basic design plus a legacy `branch` node (`title` `Decide`, `config.conditions = ["default"]`), while the branch pass uses `["condition", "default"]`.
 - Per-node-type DL validation is a pure report (`DlValidation`) beside the repairing `reflect`, so the pipeline's graph repair keeps its `passed` semantics and Python's field checks stay model-free and non-mutating.
@@ -248,7 +260,7 @@ Every invalid input (unknown type, missing required config, malformed reference/
 
 ## Test Strategy
 
-- Unit tests live beside the code: `outcome`, `clarifier` (the single-pass verdict), `dl_generator`, `mermaid`, and `mermaid/labels` each own an inline `#[cfg(test)] mod tests`; `designer`, `designer/passes`, `designer/stream`, `intention`, `builder`, `dl_reflector`, and `dl_transformer::convert` declare sibling modules.
+- Unit tests live beside the code: `outcome`, `clarifier` (the single-pass verdict), `mermaid`, and `mermaid/labels` each own an inline `#[cfg(test)] mod tests`; `designer`, `designer/passes`, `designer/stream`, `intention`, `builder`, `dl_generator`, `dl_reflector`, and `dl_transformer::convert` declare sibling modules.
 - `builder.rs` declares three suites: `builder/tests.rs` (`mod tests`), `builder/pipeline_tests.rs` (`mod pipeline_tests`), and `builder/stream_tests.rs` (`mod stream_tests`).
 - `dl_reflector/tests/mod.rs` groups six files: `support` (fixtures), `graph` (every graph repair rule), `repair` (`passed` semantics, reflection vocabulary, model-revision accept/reject), `node_rules` (basic and per-node-type field validation), `branch_rules` (intent and branch conditions), and `variable_rules` (duplicate names, input values, references, output descriptions).
 - `dl_transformer/convert/tests/mod.rs` groups eight files: `support`, `basics` (node types, ids, positions, titles), `branches`, `intents` (rendered ports, generated vs explicit ids, per-conversion id drift), `defaults` (questioner/code/output), `plugins` (resource/config/field-default precedence), `variables` (`_of_` splitting, references, output schemas), and `serialization` (null-dropping, DSL validation, error paths).
@@ -260,8 +272,10 @@ Every invalid input (unknown type, missing required config, malformed reference/
 - `designer/stream`: every pass reported in order, parity with `design_three_pass`, `Send + 'static`, blank-query rejection, per-pass provenance, fallbacks, and externally tagged serialization.
 - `builder/tests`: legacy single-round-trip builds, metadata stamping, session isolation/clearing, `history(k)`, plain-text clarifications, blank validation, workflow completion and fallback, propagated model failures, clock use, legacy provenance (model and fallback), and `record_result` persisting turns in pairs.
 - `builder/pipeline_tests`: the full workflow path with call-count and prompt assertions (5 calls), the deterministic fallback for every stage, a clarification-only request (1 call), LLM-agent repair and absorbed model failure, blank validation, reproducible fallbacks, the legacy entry point, provenance recording every stage, the repair loop reaching a fixed document (3 attempts, 2 notes, 7 calls) and exhausting its budget without error, the second-turn refine path (intention + refinement, stored artifact replaced), a first-turn refine intent being ignored, and model-vs-fallback provenance for an LLM agent.
+- `builder/pipeline_tests` also proves the candidate path: an invalid generation answer that a refine rescues (final document the model's revision, 2 attempts, 1 note naming the dangling node, one `refining_dl` `model` record, 6 calls, and the refine prompt carrying the issue), and an invalid answer whose revision is invalid too (final document the design-derived baseline, one `validating_dl` `fallback` naming the exhausted attempts, 6 calls).
 - `builder/stream_tests`: stage order, parity with the buffered build, one `Repaired` event per attempt, a blank query yielding a single validation error, and `Send + 'static` with sessions left untouched.
 - `dl_generator`: deterministic parity with `to_workflow_dsl`, `from_spec` valid/invalid, model success assertions, invalid/garbage/error fallbacks, no-model passthrough, and `refine`'s blank-feedback rejection, deterministic no-model path, accepted revision, and every fallback reason.
+- `dl_generator` also covers candidate mode: an invalid answer returned as `candidate` with its `ghost` validation note, the matching `baseline`, one `fallback` record mentioning repair, and one model call; the three reasons a candidate is absent (unparseable answer, model failure, no model); an accepted candidate with an empty detail that `generate_with_model` returns verbatim; and a `GeneratedDl` JSON round trip including an empty object through the container `default`.
 - `dl_reflector`: every graph repair and repaired-document validation, `passed` semantics, valid-document passthrough, determinism, serde round trips, model revision accepted only with the same id set, all rejection paths, `validate_dl`'s valid multi-node document, one failing fixture per node-type and variable rule, declaration order, dangling links, determinism, `DEFAULT_MAX_RETRIES`, and issue-kind wire names.
 - `mermaid` and `mermaid/labels`: byte-exact `graph TD` output, `Node{id}: {description}` lines, description-over-title and blank fallbacks, quote/backtick escaping, multi-successor labelled edges vs single-successor unlabelled ones, `When condition met` label extraction (bracketed, unbracketed, one leading separator, nested brackets, unbalanced fallback) on labelled edges only, id sanitizing/deduplication, dangling endpoints, determinism/document order, no trailing newline, empty document, and design/DSL equivalence.
 - `dl_transformer`: DL round trip and structural validation, `DlNodeType` wire/numeric ids and unknown rejection, one full conversion fixture per node type, `_of_` splitting, constant-vs-ref inputs and index counters, plugin/questioner/branch defaults and operator/logic maps, code exception config, intent determinism with explicit ids and id-only drift without them, null-dropping, error paths, and `to_workflow_dsl` validation.
@@ -276,10 +290,10 @@ Every invalid input (unknown type, missing required config, malformed reference/
 - `./history.rs` → bounded `HistoryManager` and `DialogueMessage`
 - `./outcome.rs` → `BuildState`, `BuildStatus`, `BuildOutput`, `BuildResult` with the conditional `to_json`, plus the provenance vocabulary (`GenerationSource`, `StageProvenance`, `GenerationProvenance`, `RepairReport`)
 - `./builder.rs` → session-based `AgentBuilder`, `AgentType`, the legacy single-round-trip build, `build_with_pipeline`, `build_with_pipeline_stream`, `record_result`, deterministic LLM-agent repair, prompts, and `now_millis`
-- `./builder/pipeline.rs` → the non-streaming driver `run`, the LLM-agent generation helper, workflow generation with baseline-based source inference, clarification text, issue notes, and repair feedback
+- `./builder/pipeline.rs` → the non-streaming driver `run`, the LLM-agent generation helper, the `generate_workflow` candidate wrapper, clarification text, issue notes, problem rendering, and repair feedback
 - `./builder/stream.rs` → `pipeline_stream` (the pipeline implementation) and `PipelineEvent`
 - `./builder/tests.rs` → `builder`'s `mod tests`: legacy builds, result vocabulary, provenance, `record_result`
-- `./builder/pipeline_tests.rs` → `builder`'s `mod pipeline_tests`: stage order, call counts, fallbacks, repair loop, refine path
+- `./builder/pipeline_tests.rs` → `builder`'s `mod pipeline_tests`: stage order, call counts, fallbacks, repair loop, candidate rescue and rejection, refine path
 - `./builder/stream_tests.rs` → `builder`'s `mod stream_tests`: event order and parity, `Repaired` events, `Send + 'static`, untouched sessions
 - `./intention.rs` → `IntentionDetector`/`IntentionVerdict`/`BuildIntent`, the deterministic initial/refine rules, and the two model contracts
 - `./intention/tests.rs` → `intention`'s `mod tests`: rules, history contribution, model answers, fallbacks, wire names
@@ -293,7 +307,8 @@ Every invalid input (unknown type, missing required config, malformed reference/
 - `./designer/stream.rs` → `DesignEvent` and the streamed three-pass pipeline
 - `./designer/stream/tests.rs` → `designer::stream`'s `mod tests`: event order, parity, blank query, provenance
 - `./designer/tests.rs` → `designer`'s `mod tests`: offline synthesis, single-pass model path and aliases, validation, design→DSL conversion
-- `./dl_generator.rs` → `DlGenerator` deterministic/model generation, spec conversion, `refine` and `Refinement`
+- `./dl_generator.rs` → `DlGenerator` deterministic generation, `generate_candidate`/`GeneratedDl` candidate mode, the tolerant `generate_with_model`, spec conversion, `refine` and `Refinement`
+- `./dl_generator/tests.rs` → `dl_generator`'s `mod tests` (declared with `#[path]`): deterministic parity, every model fallback, candidate mode, `refine`, `GeneratedDl` serde
 - `./dl_reflector.rs` → `DlReflector`, graph-shape repair with issue reporting, optional model revision, `DEFAULT_MAX_RETRIES`, and `validate_dl`
 - `./dl_reflector/dl_checks.rs` → private per-node-type validation helpers (basic checks, required fields, intent/branch expressions, references, default branches, variable checks)
 - `./dl_reflector/tests/` → `dl_reflector`'s `mod tests` directory module: `graph`, `repair`, `node_rules`, `branch_rules`, `variable_rules`, and fixtures in `support`
