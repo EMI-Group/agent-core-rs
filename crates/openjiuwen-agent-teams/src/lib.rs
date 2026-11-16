@@ -118,9 +118,9 @@ pub use member::*;
 // --- human-in-the-loop -----------------------------------------------------
 pub use interaction::{
     approval_result_event, parse_confirm, parse_interact_str, resolve_targets, ConfirmPayload,
-    DeliverResult, DeliverResult as InteractDeliverResult, GodViewMessage, GroupChatMessage,
-    HumanAgentInbox, HumanAgentMessage, HumanAgentToolCall, InteractGate, InteractPayload,
-    OperatorMessage, Route, ToolApprovalRequest,
+    DeliverResult, DeliverResult as InteractDeliverResult, ExternalTeamEvent, GodViewMessage,
+    GroupChatMessage, HumanAgentInbox, HumanAgentMessage, HumanAgentToolCall, InteractGate,
+    InteractPayload, OperatorMessage, Route, ToolApprovalRequest,
 };
 // --- runtime ---------------------------------------------------------------
 pub use runtime::{
