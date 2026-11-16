@@ -321,11 +321,11 @@ impl AgentBuilder {
     ///
     /// The stages run in this order:
     ///
-    /// 1. intention detection ([`IntentionDetector`]) — deterministic on a first
+    /// 1. intention detection (`IntentionDetector`) — deterministic on a first
     ///    request and model-assisted once the session holds turns;
-    /// 2. refinement ([`DlGenerator::refine`]) when the session holds a workflow
+    /// 2. refinement (`DlGenerator::refine`) when the session holds a workflow
     ///    document and the detector reports `Refine`;
-    /// 3. clarification ([`Clarifier`]) — a not-ready request stops the build with
+    /// 3. clarification (`Clarifier`) — a not-ready request stops the build with
     ///    its question;
     /// 4. a workflow request runs the three-pass designer, the DL generator, and
     ///    the bounded repair loop; an LLM-agent request runs one generation round

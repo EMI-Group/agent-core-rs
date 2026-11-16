@@ -14,6 +14,16 @@
 //! baseline, so [`DlGenerator::generate_with_model`] never fails because of the
 //! model. Only an invalid *design* is a [`Error::Validation`].
 //!
+//! # Candidate mode
+//!
+//! [`DlGenerator::generate_candidate`] is the repair-aware form of the model
+//! path: the model's parsed answer comes back even when it fails
+//! [`WorkflowDsl::validate`], together with one note per structural failure, so
+//! the pipeline's bounded repair loop can refine that document instead of
+//! throwing the model's content away.
+//! The deterministic document always comes back beside the candidate, so a caller that cannot repair the answer still has its baseline to fall back to.
+//! The generation stage is recorded as `GenerationSource::Fallback` in that case, because its document is rejected; the repair loop may still rescue the answer, which then shows up as a later `refining_dl` = `model` record.
+//!
 //! # Refine mode
 //!
 //! [`DlGenerator::refine`] ports Python's `DlGenerator.refine`: instead of a
@@ -40,7 +50,8 @@ use super::utils::extract_json_from_text;
 use super::workflow_dsl::WorkflowDsl;
 use crate::util::extract_json_fence;
 
-/// The instruction sent to the model by [`DlGenerator::generate_with_model`].
+/// The instruction sent to the model by the generation round trip of
+/// [`DlGenerator::generate_with_model`] and [`DlGenerator::generate_candidate`].
 ///
 /// It names every key the parser reads, so a compliant answer round-trips into
 /// [`WorkflowDsl`] without repair.
@@ -96,6 +107,50 @@ Make sure the result satisfies the request and is free of errors.
 
 ## Existing workflow document
 {dsl}";
+
+/// One workflow document produced by the generation stage, before repair.
+///
+/// The candidate is the model's answer as answered — including a document that
+/// fails [`WorkflowDsl::validate`], with one [`Self::issues`] note per structural
+/// failure — so a repair loop can refine it. The deterministic document is
+/// always present beside it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct GeneratedDl {
+    /// The model's parsed answer, present even when it fails
+    /// [`WorkflowDsl::validate`]; `None` when no model is configured or the
+    /// model could not produce a document.
+    pub candidate: Option<WorkflowDsl>,
+    /// The deterministic document for the same design.
+    pub baseline: WorkflowDsl,
+    /// One note per structural failure of `candidate`; empty when it validated
+    /// or is absent.
+    pub issues: Vec<String>,
+    /// Exactly one [`ProgressStage::GeneratingDl`] record describing where the
+    /// generation answer came from.
+    pub provenance: GenerationProvenance,
+}
+
+impl GeneratedDl {
+    /// The document to work with: the model's candidate when it answered,
+    /// otherwise the deterministic baseline.
+    #[must_use]
+    pub fn start(&self) -> &WorkflowDsl {
+        self.candidate.as_ref().unwrap_or(&self.baseline)
+    }
+
+    /// Whether the model answered with a document at all, valid or not.
+    #[must_use]
+    pub fn is_model_answer(&self) -> bool {
+        self.candidate.is_some()
+    }
+
+    /// Whether the model's document parsed and validated as answered.
+    #[must_use]
+    pub fn is_accepted(&self) -> bool {
+        self.candidate.is_some() && self.issues.is_empty()
+    }
+}
 
 /// One model-assisted refinement of an existing workflow document.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -164,32 +219,111 @@ impl DlGenerator {
     /// Converts a design into a workflow DSL document, using the model when one
     /// is configured.
     ///
-    /// The deterministic baseline is computed first, so an invalid design is a
-    /// validation error regardless of the model. Without a model the baseline
-    /// is returned. Otherwise one system message describing the JSON contract is
-    /// followed by one user message carrying the design as JSON. A model error,
-    /// a choice-less answer, a missing JSON fence, an unparseable document, or a
-    /// document failing [`WorkflowDsl::validate`] is logged and replaced by the
-    /// baseline.
+    /// The model's document is used only when it parses *and*
+    /// [`WorkflowDsl::validate`] passes; every other outcome — no model, a model
+    /// error, a choice-less answer, a missing JSON fence, an unparseable
+    /// document, or an invalid one — yields the deterministic baseline. That is
+    /// exactly [`Self::generate_candidate`] with the candidate dropped unless it
+    /// validated, so an invalid design is still a validation error before any
+    /// model call and the model is still called at most once.
     ///
     /// # Errors
     ///
     /// Returns the [`Error::Validation`] of [`Self::generate`] for an invalid
     /// design — the only error this entry point produces.
     pub async fn generate_with_model(&self, design: &WorkflowDesign) -> Result<WorkflowDsl> {
+        let GeneratedDl {
+            candidate,
+            baseline,
+            issues,
+            ..
+        } = self.generate_candidate(design).await?;
+        match candidate {
+            Some(document) if issues.is_empty() => Ok(document),
+            _ => Ok(baseline),
+        }
+    }
+
+    /// Converts a design into a workflow-DSL candidate for the repair loop.
+    ///
+    /// The deterministic baseline is computed first, so an invalid design is a
+    /// validation error regardless of the model.
+    /// Without a model the result holds no candidate and one
+    /// [`GenerationSource::Deterministic`] record.
+    /// Otherwise the single model round trip produces the document the model
+    /// answered with — *even when it fails [`WorkflowDsl::validate`]* — beside
+    /// one note per structural failure, so a caller can repair it instead of
+    /// keeping the baseline.
+    /// A parsed answer that fails [`WorkflowDsl::validate`] is recorded as
+    /// [`GenerationSource::Fallback`], because its document is rejected and the
+    /// stage delivered no usable document; the candidate is still handed over
+    /// for repair.
+    /// The repair loop may still rescue such an answer, which then shows up as a
+    /// later `refining_dl` = `model` record.
+    /// A failed call, a choice-less answer, a missing JSON fence, or an
+    /// unparseable document yields no candidate, no issues, and one
+    /// [`GenerationSource::Fallback`] record naming the reason.
+    ///
+    /// Degradation is not warned about here: the pipeline warns once at the end
+    /// of a build.
+    ///
+    /// [`GenerationSource::Deterministic`]: super::outcome::GenerationSource::Deterministic
+    /// [`GenerationSource::Fallback`]: super::outcome::GenerationSource::Fallback
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Error::Validation`] of [`Self::generate`] for an invalid
+    /// design — the only error this entry point produces.
+    pub async fn generate_candidate(&self, design: &WorkflowDesign) -> Result<GeneratedDl> {
         let baseline = self.generate(design)?;
+        let mut provenance = GenerationProvenance::new();
         let Some(model) = self.model.as_deref() else {
-            return Ok(baseline);
+            provenance.record_deterministic(
+                ProgressStage::GeneratingDl,
+                "no model configured; using the deterministic document",
+            );
+            return Ok(GeneratedDl {
+                candidate: None,
+                baseline,
+                issues: Vec::new(),
+                provenance,
+            });
         };
 
-        match generate_with_model(model, design).await {
-            Ok(document) => Ok(document),
-            Err(error) => {
+        match request_document(model, design).await {
+            Ok(document) => {
+                let issues: Vec<String> = document
+                    .validate()
+                    .err()
+                    .map(|error| vec![error.to_string()])
+                    .unwrap_or_default();
+                if issues.is_empty() {
+                    provenance.record_model(ProgressStage::GeneratingDl);
+                } else {
+                    provenance.record_fallback(
+                        ProgressStage::GeneratingDl,
+                        format!("model document needs repair: {}", issues.join("; ")),
+                    );
+                }
+                Ok(GeneratedDl {
+                    candidate: Some(document),
+                    baseline,
+                    issues,
+                    provenance,
+                })
+            }
+            Err(reason) => {
                 tracing::debug!(
-                    %error,
-                    "workflow DL generation failed; falling back to the deterministic document"
+                    %reason,
+                    "workflow DL generation produced no document; using the deterministic document"
                 );
-                Ok(baseline)
+                provenance.record_fallback(ProgressStage::GeneratingDl, reason);
+                Ok(GeneratedDl {
+                    candidate: None,
+                    baseline,
+                    issues: Vec::new(),
+                    provenance,
+                })
             }
         }
     }
@@ -275,8 +409,16 @@ impl fmt::Debug for DlGenerator {
     }
 }
 
-/// Asks the model for one fenced workflow document and validates it.
-async fn generate_with_model(model: &dyn Model, design: &WorkflowDesign) -> Result<WorkflowDsl> {
+/// Asks the model for one fenced workflow document, without validating it.
+///
+/// The failure is a short reason rather than an error, because every generation
+/// failure keeps the deterministic baseline and is reported as provenance
+/// detail. Validation is the caller's job: [`DlGenerator::generate_candidate`]
+/// keeps an invalid document and reports what is wrong with it.
+async fn request_document(
+    model: &dyn Model,
+    design: &WorkflowDesign,
+) -> std::result::Result<WorkflowDsl, String> {
     let design_json =
         serde_json::to_string_pretty(design).unwrap_or_else(|_| format!("{design:?}"));
     let messages = vec![
@@ -284,19 +426,19 @@ async fn generate_with_model(model: &dyn Model, design: &WorkflowDesign) -> Resu
         BaseMessage::user(design_json),
     ];
     let request = ModelRequestConfig::new(model.model_name());
-    let response = model.invoke(&messages, &request).await?;
+    let response = model
+        .invoke(&messages, &request)
+        .await
+        .map_err(|error| format!("model call failed: {error}"))?;
     let Some(choice) = response.choices.into_iter().next() else {
-        return Err(Error::llm("model returned no choices"));
+        return Err("model returned no choices".to_string());
     };
 
     let text = choice.message.text().into_owned();
     let value = extract_json_fence(&text)
-        .ok_or_else(|| Error::validation("model answer contained no JSON code fence"))?;
-    let document: WorkflowDsl = serde_json::from_value(value).map_err(|error| {
-        Error::validation(format!("failed to parse workflow DSL JSON: {error}"))
-    })?;
-    document.validate()?;
-    Ok(document)
+        .ok_or_else(|| "model answer contained no JSON code fence".to_string())?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("failed to parse workflow DSL JSON: {error}"))
 }
 
 /// Asks the model for one refined workflow document, or reports why it failed.
@@ -352,406 +494,5 @@ fn refine_user_message(feedback: &str, mermaid: &str, dsl: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use openjiuwen_common::error::ErrorKind;
-    use openjiuwen_test_support::{ScriptedModel, ScriptedTurn};
-    use serde_json::{json, Value};
-
-    use super::*;
-    use crate::agent_builder::designer::WorkflowDesigner;
-    use crate::agent_builder::outcome::{GenerationSource, StageProvenance};
-    use crate::agent_builder::workflow_dsl::{DslEdge, DslNode};
-
-    /// The request the offline designer is fed in the deterministic tests.
-    const QUERY: &str = "Collect the order. Then confirm it.";
-
-    /// A model answer holding a valid two-node workflow document.
-    const MODEL_FENCE: &str = r#"```json
-{"name": "model-name", "description": "a model workflow",
- "nodes": [{"id": "start", "type": "start", "title": "Start"}, {"id": "end", "type": "end"}],
- "edges": [{"source": "start", "target": "end"}]}
-```"#;
-
-    /// Coerces a scripted model into the trait object the generator takes.
-    fn dynamic(model: &Arc<ScriptedModel>) -> Arc<dyn Model> {
-        let cloned: Arc<ScriptedModel> = Arc::clone(model);
-        cloned
-    }
-
-    /// A design produced by the offline designer.
-    fn design() -> WorkflowDesign {
-        WorkflowDesigner::new()
-            .design_offline(QUERY)
-            .expect("the offline designer accepts the query")
-    }
-
-    /// A two-node, one-edge node list: `start` -> `end`.
-    fn demo_nodes() -> Vec<DslNode> {
-        vec![
-            DslNode {
-                id: "start".to_string(),
-                node_type: "start".to_string(),
-                title: "Start".to_string(),
-                description: "entry".to_string(),
-                inputs: BTreeMap::from([("query".to_string(), json!({"type": "string"}))]),
-                outputs: BTreeMap::new(),
-                data: Value::Null,
-            },
-            DslNode {
-                id: "end".to_string(),
-                node_type: "end".to_string(),
-                title: "End".to_string(),
-                description: "exit".to_string(),
-                inputs: BTreeMap::new(),
-                outputs: BTreeMap::new(),
-                data: Value::Null,
-            },
-        ]
-    }
-
-    /// A valid two-node workflow specification.
-    fn demo_spec() -> WorkflowSpec {
-        WorkflowSpec {
-            name: "demo".to_string(),
-            description: "a demo workflow".to_string(),
-            nodes: demo_nodes(),
-            edges: vec![DslEdge {
-                source: "start".to_string(),
-                target: "end".to_string(),
-                condition: None,
-            }],
-        }
-    }
-
-    #[test]
-    fn deterministic_generation_matches_the_design_conversion() {
-        let design = design();
-        let generator = DlGenerator::new();
-
-        let document = generator.generate(&design).expect("generate");
-        assert_eq!(document, design.to_workflow_dsl().expect("convert"));
-        document.validate().expect("the document is valid");
-        assert!(document.node("start").is_some(), "the start node survives");
-        assert_eq!(document.name, design.name);
-
-        let spec = WorkflowSpec {
-            name: document.name.clone(),
-            description: document.description.clone(),
-            nodes: document.nodes.clone(),
-            edges: document.edges.clone(),
-        };
-        assert_eq!(
-            generator.from_spec(&spec).expect("the spec is valid"),
-            document
-        );
-    }
-
-    #[test]
-    fn generate_rejects_an_invalid_design() {
-        let generator = DlGenerator::new();
-        let error = generator
-            .generate(&WorkflowDesign::default())
-            .expect_err("an empty design is invalid");
-        assert_eq!(error.kind(), ErrorKind::Validation);
-    }
-
-    #[test]
-    fn from_spec_keeps_the_document_and_validates_it() {
-        let generator = DlGenerator::new();
-        let spec = demo_spec();
-
-        let document = generator.from_spec(&spec).expect("the spec is valid");
-        assert_eq!(document.name, "demo");
-        assert_eq!(document.description, "a demo workflow");
-        assert_eq!(document.nodes, spec.nodes);
-        assert_eq!(document.edges, spec.edges);
-        assert_eq!(document, spec.to_dsl());
-
-        let mut dangling = demo_spec();
-        dangling.edges[0].target = "ghost".to_string();
-        let error = generator
-            .from_spec(&dangling)
-            .expect_err("a dangling edge is invalid");
-        assert_eq!(error.kind(), ErrorKind::Validation);
-        assert!(error.to_string().contains("ghost"));
-    }
-
-    #[tokio::test]
-    async fn model_document_replaces_the_baseline_when_it_validates() {
-        let model = Arc::new(ScriptedModel::text(MODEL_FENCE));
-        let generator = DlGenerator::with_model(dynamic(&model));
-        let design = design();
-
-        let document = generator
-            .generate_with_model(&design)
-            .await
-            .expect("the model path succeeds");
-        assert_eq!(document.name, "model-name");
-        document.validate().expect("the model document is valid");
-
-        assert_eq!(model.call_count(), 1);
-        let call = model.last_call().expect("one call");
-        assert_eq!(call.messages.len(), 2);
-        assert_eq!(call.messages[0].text(), DL_GENERATOR_SYSTEM_PROMPT);
-        assert!(
-            call.messages[1].text().contains(&design.name),
-            "the user message carries the design"
-        );
-        assert_eq!(call.request.model_name, "scripted-model");
-    }
-
-    #[tokio::test]
-    async fn invalid_model_documents_fall_back_to_the_baseline() {
-        let fences = [
-            r#"```json
-{"name": "dangling", "description": "broken",
- "nodes": [{"id": "start", "type": "start"}],
- "edges": [{"source": "start", "target": "ghost"}]}
-```"#,
-            r#"```json
-{"name": "empty", "description": "no nodes", "nodes": [], "edges": []}
-```"#,
-        ];
-
-        for fence in fences {
-            let model = Arc::new(ScriptedModel::text(fence));
-            let generator = DlGenerator::with_model(dynamic(&model));
-            let design = design();
-
-            let document = generator
-                .generate_with_model(&design)
-                .await
-                .expect("model problems never fail generation");
-            assert_eq!(
-                document,
-                generator.generate(&design).expect("baseline"),
-                "the baseline replaces an invalid model document"
-            );
-            assert_eq!(model.call_count(), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn model_errors_fall_back_to_the_baseline() {
-        let model = Arc::new(ScriptedModel::new([ScriptedTurn::fail("boom")]));
-        let generator = DlGenerator::with_model(dynamic(&model));
-        let design = design();
-
-        let document = generator
-            .generate_with_model(&design)
-            .await
-            .expect("model errors never fail generation");
-        assert_eq!(document, generator.generate(&design).expect("baseline"));
-        assert_eq!(model.call_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn an_invalid_design_fails_before_the_model_is_called() {
-        let model = Arc::new(ScriptedModel::text(MODEL_FENCE));
-        let generator = DlGenerator::with_model(dynamic(&model));
-
-        let error = generator
-            .generate_with_model(&WorkflowDesign::default())
-            .await
-            .expect_err("an empty design is invalid");
-        assert_eq!(error.kind(), ErrorKind::Validation);
-        assert_eq!(model.call_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn a_model_less_generator_returns_the_baseline() {
-        let design = design();
-        let generator = DlGenerator::default();
-
-        let document = generator
-            .generate_with_model(&design)
-            .await
-            .expect("generate without a model");
-        assert_eq!(document, generator.generate(&design).expect("baseline"));
-    }
-
-    #[test]
-    fn new_and_debug_describe_the_configuration() {
-        assert_eq!(
-            format!("{:?}", DlGenerator::new()),
-            "DlGenerator { has_model: false }"
-        );
-        assert_eq!(
-            format!("{:?}", DlGenerator::default()),
-            "DlGenerator { has_model: false }"
-        );
-
-        let model = Arc::new(ScriptedModel::text(MODEL_FENCE));
-        assert_eq!(
-            format!("{:?}", DlGenerator::with_model(dynamic(&model))),
-            "DlGenerator { has_model: true }"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Refine mode
-    // -----------------------------------------------------------------------
-
-    /// The requested change the refine tests send.
-    const REFINE_FEEDBACK: &str = "Add a confirmation step after the order is collected.";
-
-    /// The Mermaid diagram of the document refine starts from.
-    const REFINE_MERMAID: &str =
-        "graph TD\n  start[Node start: Start]\n  end[Node end: End]\n  start --> end";
-
-    /// The document refine starts from.
-    fn existing() -> WorkflowDsl {
-        demo_spec().to_dsl()
-    }
-
-    /// The one provenance record of a refinement.
-    fn only_record(refinement: &Refinement) -> &StageProvenance {
-        assert_eq!(refinement.provenance.len(), 1);
-        &refinement.provenance.stages[0]
-    }
-
-    #[tokio::test]
-    async fn refine_rejects_blank_feedback_before_the_model() {
-        let model = Arc::new(ScriptedModel::text(MODEL_FENCE));
-        let generator = DlGenerator::with_model(dynamic(&model));
-        let current = existing();
-
-        for feedback in ["", "   ", "\n\t "] {
-            let error = generator
-                .refine(feedback, &current, REFINE_MERMAID)
-                .await
-                .expect_err("blank feedback is invalid");
-            assert_eq!(error.kind(), ErrorKind::Validation);
-        }
-        assert_eq!(model.call_count(), 0, "no model call for blank feedback");
-    }
-
-    #[tokio::test]
-    async fn refine_accepts_a_valid_model_document() {
-        let model = Arc::new(ScriptedModel::text(MODEL_FENCE));
-        let generator = DlGenerator::with_model(dynamic(&model));
-        let current = existing();
-
-        let refinement = generator
-            .refine(REFINE_FEEDBACK, &current, REFINE_MERMAID)
-            .await
-            .expect("the model path succeeds");
-
-        assert_eq!(refinement.workflow.name, "model-name");
-        refinement
-            .workflow
-            .validate()
-            .expect("the revision is valid");
-        let record = only_record(&refinement);
-        assert_eq!(record.stage, ProgressStage::RefiningDl);
-        assert_eq!(record.source, GenerationSource::Model);
-        assert_eq!(record.detail, "");
-        assert!(!refinement.provenance.has_fallback());
-
-        assert_eq!(model.call_count(), 1);
-        let call = model.last_call().expect("one call");
-        assert_eq!(call.messages.len(), 2);
-        assert_eq!(call.messages[0].text(), DL_REFINE_SYSTEM_PROMPT);
-        let user = call.messages[1].text();
-        assert!(
-            user.contains(REFINE_FEEDBACK),
-            "the user message carries the feedback"
-        );
-        assert!(
-            user.contains(REFINE_MERMAID),
-            "the user message carries the Mermaid diagram"
-        );
-        let document_json = serde_json::to_string_pretty(&current).expect("serialize");
-        assert!(
-            user.contains(&document_json),
-            "the user message carries the existing document"
-        );
-        assert!(user.contains("## Existing workflow document"));
-        assert_eq!(call.request.model_name, "scripted-model");
-    }
-
-    #[tokio::test]
-    async fn refine_keeps_the_existing_document_on_unusable_answers() {
-        let cases = [
-            (
-                Arc::new(ScriptedModel::text("there is no document here")),
-                "answer is not a workflow document",
-            ),
-            (
-                Arc::new(ScriptedModel::text(
-                    r#"```json
-{"name": "dangling", "description": "broken",
- "nodes": [{"id": "start", "type": "start"}],
- "edges": [{"source": "start", "target": "ghost"}]}
-```"#,
-                )),
-                "revised document is invalid",
-            ),
-            (
-                Arc::new(ScriptedModel::new([ScriptedTurn::fail("boom")])),
-                "model call failed",
-            ),
-        ];
-
-        let current = existing();
-        for (model, reason) in cases {
-            let generator = DlGenerator::with_model(dynamic(&model));
-
-            let refinement = generator
-                .refine(REFINE_FEEDBACK, &current, REFINE_MERMAID)
-                .await
-                .expect("refine problems never fail");
-
-            assert_eq!(
-                refinement.workflow, current,
-                "the existing document is kept"
-            );
-            let record = only_record(&refinement);
-            assert_eq!(record.stage, ProgressStage::RefiningDl);
-            assert_eq!(record.source, GenerationSource::Fallback);
-            assert!(
-                record.detail.contains(reason),
-                "detail {:?} lacks {reason:?}",
-                record.detail
-            );
-            assert_eq!(refinement.provenance.fallback_count(), 1);
-            assert_eq!(model.call_count(), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn refine_without_a_model_keeps_the_existing_document() {
-        let current = existing();
-        let refinement = DlGenerator::new()
-            .refine(REFINE_FEEDBACK, &current, REFINE_MERMAID)
-            .await
-            .expect("refine without a model succeeds");
-
-        assert_eq!(refinement.workflow, current);
-        let record = only_record(&refinement);
-        assert_eq!(record.stage, ProgressStage::RefiningDl);
-        assert_eq!(record.source, GenerationSource::Deterministic);
-        assert!(record.detail.contains("no model configured"));
-        assert!(!refinement.provenance.has_fallback());
-    }
-
-    #[test]
-    fn refinement_round_trips_as_json() {
-        let mut provenance = GenerationProvenance::new();
-        provenance.record_model(ProgressStage::RefiningDl);
-        let refinement = Refinement {
-            workflow: existing(),
-            provenance,
-        };
-
-        let value = serde_json::to_value(&refinement).expect("serialize");
-        assert_eq!(value["provenance"]["stages"][0]["stage"], "refining_dl");
-        let restored: Refinement = serde_json::from_value(value).expect("parse");
-        assert_eq!(restored, refinement);
-
-        let empty: Refinement = serde_json::from_value(json!({})).expect("parse an empty object");
-        assert_eq!(empty, Refinement::default());
-    }
-}
+#[path = "dl_generator/tests.rs"]
+mod tests;
