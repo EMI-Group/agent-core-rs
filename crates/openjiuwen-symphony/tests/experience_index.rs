@@ -8,6 +8,7 @@
 #![allow(clippy::float_cmp)]
 #![allow(clippy::assert_is_empty)]
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -136,6 +137,28 @@ async fn read_json(dir: &Path, relative: &str) -> serde_json::Value {
         .await
         .expect("read artifact");
     serde_json::from_str(&text).expect("parse artifact")
+}
+
+/// A `HashEmbedding` of eight components behind the trait object the index takes.
+fn hash_embedding() -> Arc<dyn Embedding> {
+    Arc::new(HashEmbedding::new(8))
+}
+
+/// The distinct query patterns the probe-search tests index.
+const PROBE_PATTERNS: [&str; 6] = [
+    "summarize the report",
+    "deploy the service",
+    "bake a cake",
+    "translate the contract",
+    "render a chart",
+    "audit the ledger",
+];
+
+/// Adds one item per [`PROBE_PATTERNS`] entry to `index`.
+async fn filled(index: &ExperienceIndex) {
+    for pattern in PROBE_PATTERNS {
+        index.add(item(pattern, &["skill"])).await.expect("add");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -760,35 +783,241 @@ async fn the_flat_algorithm_is_case_insensitive() {
 }
 
 #[tokio::test]
-async fn ivf_algorithms_are_unsupported_and_unknown_ones_are_validation_errors() {
+async fn the_vector_algorithm_grammar_accepts_factory_names_and_reports_canonical_ones() {
     let dir = tempfile::tempdir().expect("tempdir");
-    for raw in ["ivf", "IVFPQ", "IVF4096,PQ16"] {
-        let error =
+    for (raw, canonical) in [
+        ("flat", "flat"),
+        ("Flat", "flat"),
+        (" FLAT ", "flat"),
+        ("ivf", "ivf"),
+        ("ivfflat", "ivf"),
+        ("IvfFlat", "ivf"),
+        ("ivfpq", "ivf"),
+        ("ivf16", "ivf16"),
+        (" IVF 16 ", "ivf16"),
+        ("ivf16,pq8", "ivf16,pq8"),
+        ("IVF4096,PQ16", "ivf4096,pq16"),
+    ] {
+        let in_memory =
+            ExperienceIndex::new_with_algorithm(Arc::new(HashEmbedding::new(8)), raw).expect(raw);
+        assert_eq!(in_memory.algorithm(), canonical, "{raw}");
+        // `nlist` is derived from the catalog, so an empty index has nothing to quantise.
+        assert_eq!(in_memory.nlist(), 0, "{raw}");
+
+        let opened =
             ExperienceIndex::open_with_algorithm(dir.path(), Arc::new(HashEmbedding::new(8)), raw)
                 .await
-                .expect_err("ivf");
-        assert_eq!(error.kind(), ErrorKind::Unsupported, "{raw}");
-        assert!(error.message().contains("faiss IVF"), "{raw}");
+                .expect(raw);
+        assert_eq!(opened.algorithm(), canonical, "{raw}");
+        assert_eq!(opened.nlist(), 0, "{raw}");
     }
-
-    let unknown =
-        ExperienceIndex::open_with_algorithm(dir.path(), Arc::new(HashEmbedding::new(8)), "hnsw")
-            .await
-            .expect_err("hnsw");
-    assert_eq!(unknown.kind(), ErrorKind::Validation);
-    assert!(unknown.message().contains("vector_algorithm"));
-
-    let blank =
-        ExperienceIndex::open_with_algorithm(dir.path(), Arc::new(HashEmbedding::new(8)), "  ")
-            .await
-            .expect_err("blank");
-    assert_eq!(blank.kind(), ErrorKind::Validation);
-    assert!(blank.message().contains("vector_algorithm"));
-
-    // None of the rejected openings wrote an artifact.
+    // The accepted names left no artifact behind: none of them persisted anything.
     assert!(!tokio::fs::try_exists(dir.path().join("meta.json"))
         .await
         .expect("stat"));
+
+    // A name this crate does not implement, a blank name and a zero count are all
+    // validation errors naming the field, on both constructors.
+    for raw in ["hnsw", "lsh", "  ", "ivf0", "ivf16,pq0"] {
+        let in_memory = ExperienceIndex::new_with_algorithm(Arc::new(HashEmbedding::new(8)), raw)
+            .expect_err(raw);
+        assert_eq!(in_memory.kind(), ErrorKind::Validation, "{raw}");
+        assert!(
+            in_memory.message().contains("vector_algorithm"),
+            "{raw}: {}",
+            in_memory.message()
+        );
+
+        let opened =
+            ExperienceIndex::open_with_algorithm(dir.path(), Arc::new(HashEmbedding::new(8)), raw)
+                .await
+                .expect_err(raw);
+        assert_eq!(opened.kind(), ErrorKind::Validation, "{raw}");
+        assert!(
+            opened.message().contains("vector_algorithm"),
+            "{raw}: {}",
+            opened.message()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_full_probe_reproduces_the_flat_neighbours() {
+    let flat = ExperienceIndex::new(Arc::new(HashEmbedding::new(8)));
+    let ivf =
+        ExperienceIndex::new_with_algorithm(Arc::new(HashEmbedding::new(8)), "ivf4").expect("ivf4");
+    filled(&flat).await;
+    filled(&ivf).await;
+    assert_eq!(flat.count(), PROBE_PATTERNS.len());
+    assert_eq!(ivf.count(), PROBE_PATTERNS.len());
+    // Six vectors clamp the requested four coarse lists to four.
+    assert_eq!(ivf.nlist(), 4);
+
+    let ranking = ExperienceRanking::new(0);
+    let query = "summarize the report";
+    let flat_hits = flat.search(query, &ranking).await.expect("flat search");
+    assert_eq!(flat_hits.len(), PROBE_PATTERNS.len());
+
+    // The documented default probe is 8, which already covers the four lists, so every
+    // candidate is scored and the IVF order is the flat order — items and scores included.
+    assert_eq!(ivf.nprobe(), 8);
+    assert!(ivf.nprobe() >= ivf.nlist());
+    let full_hits = ivf.search(query, &ranking).await.expect("ivf search");
+    assert_eq!(hit_ids(&full_hits), hit_ids(&flat_hits));
+    assert_eq!(full_hits, flat_hits);
+
+    // An over-large probe is clamped to `nlist`; an explicit `nlist` is the same thing.
+    ivf.set_nprobe(usize::MAX);
+    assert_eq!(
+        ivf.search(query, &ranking).await.expect("clamped search"),
+        flat_hits
+    );
+    ivf.set_nprobe(ivf.nlist());
+    assert_eq!(
+        ivf.search(query, &ranking).await.expect("nlist search"),
+        flat_hits
+    );
+
+    // A flat index ignores the probe setting entirely.
+    flat.set_nprobe(1);
+    assert_eq!(
+        flat.search(query, &ranking)
+            .await
+            .expect("flat with a probe"),
+        flat_hits
+    );
+}
+
+#[tokio::test]
+async fn a_larger_probe_never_loses_a_neighbour() {
+    let index =
+        ExperienceIndex::new_with_algorithm(Arc::new(HashEmbedding::new(8)), "ivf4").expect("ivf4");
+    filled(&index).await;
+    let nlist = index.nlist();
+    assert_eq!(nlist, 4);
+
+    let ranking = ExperienceRanking::new(0);
+    let mut previous: BTreeSet<String> = BTreeSet::new();
+    for probe in 1..=nlist {
+        index.set_nprobe(probe);
+        let hits = index
+            .search("bake a chocolate cake", &ranking)
+            .await
+            .expect("search");
+        let ids: BTreeSet<String> = hits.iter().map(|hit| hit.id().to_string()).collect();
+        // The probe takes the nearest `probe` lists, so the candidate set only grows.
+        let lost: Vec<&String> = previous.difference(&ids).collect();
+        assert!(lost.is_empty(), "probe {probe} lost {lost:?}");
+        previous = ids;
+    }
+    // Probing every list scores the whole catalog.
+    assert_eq!(previous.len(), index.count());
+}
+
+#[tokio::test]
+async fn an_ivf_index_round_trips_through_the_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let index = ExperienceIndex::open_with_algorithm(dir.path(), hash_embedding(), "ivf4")
+        .await
+        .expect("open ivf4");
+    filled(&index).await;
+    index.set_nprobe(2);
+
+    let ranking = ExperienceRanking::new(0);
+    let query = "summarize the report";
+    let before_hits = index.search(query, &ranking).await.expect("search before");
+    let before_items = index.items();
+    let before_meta = index.meta();
+    assert_eq!(before_meta.vector_algorithm, "ivf4");
+    assert_eq!(before_meta.vector_count, PROBE_PATTERNS.len());
+    assert_eq!(before_meta.vector_dimension, 8);
+    assert!(
+        before_meta
+            .ivf_sha256
+            .as_deref()
+            .is_some_and(|digest| digest.len() == 64),
+        "{:?}",
+        before_meta.ivf_sha256
+    );
+
+    // The coarse quantiser is its own artifact: four centroids and one list per item.
+    let coarse = read_json(dir.path(), "vector/ivf.json").await;
+    assert_eq!(coarse["algorithm"], "ivf4");
+    assert_eq!(coarse["nlist"], 4);
+    assert_eq!(coarse["dimension"], 8);
+    assert_eq!(
+        coarse["ids"].as_array().expect("ids").len(),
+        PROBE_PATTERNS.len()
+    );
+    assert_eq!(
+        coarse["lists"].as_array().expect("lists").len(),
+        PROBE_PATTERNS.len()
+    );
+    assert_eq!(coarse["centroids"].as_array().expect("centroids").len(), 4);
+
+    let reopened = ExperienceIndex::open_with_algorithm(dir.path(), hash_embedding(), "ivf4")
+        .await
+        .expect("reopen ivf4");
+    assert_eq!(reopened.items(), before_items);
+    assert_eq!(reopened.meta(), before_meta);
+    assert_eq!(reopened.count(), PROBE_PATTERNS.len());
+    assert_eq!(reopened.algorithm(), "ivf4");
+    // The list count comes from the stored quantiser, which was reused instead of retrained.
+    assert_eq!(reopened.nlist(), 4);
+    // `nprobe` is a query-time setting and is not part of the persisted manifest, so a
+    // reopen starts at the documented default of 8.
+    assert_eq!(reopened.nprobe(), 8);
+    reopened.set_nprobe(2);
+    let after_hits = reopened
+        .search(query, &ranking)
+        .await
+        .expect("search after");
+    assert_eq!(after_hits, before_hits);
+
+    // The directory records the algorithm it was built with, so opening it as the exact
+    // flat index is a loud error rather than a silent rebuild.
+    let error = ExperienceIndex::open(dir.path(), hash_embedding())
+        .await
+        .expect_err("flat open");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.message().contains("meta.json"));
+    assert!(error.message().contains("ivf4"));
+}
+
+#[tokio::test]
+async fn a_corrupt_or_missing_coarse_quantiser_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let index = ExperienceIndex::open_with_algorithm(dir.path(), hash_embedding(), "ivf4")
+        .await
+        .expect("open ivf4");
+    filled(&index).await;
+    let path = dir.path().join("vector/ivf.json");
+    assert!(tokio::fs::try_exists(&path).await.expect("stat"));
+
+    // A single appended byte is still valid JSON but breaks the `ivf_sha256` digest.
+    let mut tampered = tokio::fs::read(&path).await.expect("read coarse");
+    tampered.push(b' ');
+    tokio::fs::write(&path, &tampered)
+        .await
+        .expect("write coarse");
+    let error = ExperienceIndex::open_with_algorithm(dir.path(), hash_embedding(), "ivf4")
+        .await
+        .expect_err("tampered coarse");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.message().contains("ivf.json"), "{}", error.message());
+    assert!(
+        error.message().contains("sha256 mismatch"),
+        "{}",
+        error.message()
+    );
+
+    // A deleted quantiser is an I/O failure that still names the file.
+    tokio::fs::remove_file(&path).await.expect("remove coarse");
+    let error = ExperienceIndex::open_with_algorithm(dir.path(), hash_embedding(), "ivf4")
+        .await
+        .expect_err("missing coarse");
+    assert_eq!(error.kind(), ErrorKind::External);
+    assert!(error.message().contains("ivf.json"), "{}", error.message());
 }
 
 #[tokio::test]

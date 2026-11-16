@@ -19,6 +19,17 @@
 //! and `AzureBlob` builds the Azure Blob Storage client in the `azure` submodule, which speaks
 //! the Blob REST API directly.
 //!
+//! # Credentials
+//!
+//! The GCS transport resolves its credential in one order, and the first form that is present
+//! wins: a non-empty
+//! [`GcsConfig::access_token`](crate::object_artifact::GcsConfig::access_token) is sent as a
+//! bearer token; otherwise a service-account key file attached by
+//! [`GcsObjectStore::from_service_account_file`](crate::object_artifact::GcsObjectStore::from_service_account_file)
+//! mints an RS256 JWT assertion and exchanges it at the key file's `token_uri` for a bearer
+//! token; otherwise requests are anonymous, which a local emulator and a public read-only
+//! bucket accept.
+//!
 //! # Bucket layout
 //!
 //! ```text
@@ -83,7 +94,7 @@ pub use azure::{
     AzureBlobAuth, AzureBlobConfig, AzureBlobStore, API_VERSION, AZURITE_ENDPOINT,
     CLIENT_CREDENTIALS_REASON, DEFAULT_ENDPOINT_SUFFIX,
 };
-pub use gcs::{GcsConfig, GcsObjectStore, DEFAULT_ENDPOINT, SERVICE_ACCOUNT_REASON};
+pub use gcs::{GcsConfig, GcsObjectStore, DEFAULT_ENDPOINT};
 
 /// Bucket used by [`ObjectGraphArtifactStore::in_memory`] and
 /// [`ObjectGraphArtifactStore::local`], the two constructors that take no bucket name.

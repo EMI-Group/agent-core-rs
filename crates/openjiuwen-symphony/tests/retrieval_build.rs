@@ -1,6 +1,8 @@
 //! Behavior tests for the capability-tree index BUILD half of
 //! `openjiuwen_symphony::retrieval::build`: the item sources, the deterministic grouping,
-//! the preset override, the schema guard, incremental patches, and the typed deferrals.
+//! the runtime grouping strategies, the preset override, the schema guard, incremental
+//! patches, the optional HTML visualizer, and the typed deferral of the synchronous
+//! grouping entry points.
 //!
 //! Everything here goes through the crate's public API only. The fixtures are built with
 //! `tempfile::tempdir()` (never the repository working tree), every assertion is
@@ -15,12 +17,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
+use openjiuwen_retrieval::HashEmbedding;
 use openjiuwen_symphony::discovery::{SkillInventory, SkillRecord, SkillScanConfig};
 use openjiuwen_symphony::error::{is_unsupported, ErrorKind};
+use openjiuwen_symphony::llm::{FallbackMode, StaticCompletionModel};
 use openjiuwen_symphony::model::CapabilityDescriptor;
 use openjiuwen_symphony::retrieval::build::grouping::{
-    group_items, GroupingConfig, GroupingStrategy,
+    group_items, group_items_with, GroupingConfig, GroupingOutcome, GroupingProvenance,
+    GroupingRuntime, GroupingStrategy,
 };
 use openjiuwen_symphony::retrieval::build::presets::{PresetNode, TreePreset};
 use openjiuwen_symphony::retrieval::build::scanner::{
@@ -32,7 +38,10 @@ use openjiuwen_symphony::retrieval::build::schema::{
     DIAGNOSTIC_EXCESSIVE_DEPTH, DIAGNOSTIC_MISSING_WORKER_ID, DIAGNOSTIC_TOO_MANY_NODES,
 };
 use openjiuwen_symphony::retrieval::build::workflows::{BuildConfig, IndexBuilder};
-use openjiuwen_symphony::retrieval::types::{IndexNode, RetrieverItem, MODE_FULL};
+use openjiuwen_symphony::retrieval::types::{
+    IndexNode, RetrieverItem, CATALOG_FILENAME, MANIFEST_FILENAME, MODE_FULL, TREE_HTML_FILENAME,
+    TREE_INDEX_FILENAME,
+};
 
 /// One scanned skill item: a name, a description, content, and a `store/<id>` inventory
 /// path, so a deletion can prune its inventory entry.
@@ -1077,25 +1086,456 @@ async fn rebuild_subtree_rejects_an_unknown_branch() {
 }
 
 // --------------------------------------------------------------------------------------
-// 9. Deferrals
+// 9. Runtime grouping strategies, their synchronous deferral, and the HTML visualizer
 // --------------------------------------------------------------------------------------
 
-#[test]
-fn the_model_and_faiss_grouping_strategies_are_typed_deferrals() {
+/// The three artifacts every build publishes, sorted by file name.
+const ARTIFACTS: [&str; 3] = [CATALOG_FILENAME, MANIFEST_FILENAME, TREE_INDEX_FILENAME];
+
+/// The three-artifact contract as the sorted file names a build publishes.
+fn artifact_names() -> Vec<String> {
+    let mut names: Vec<String> = ARTIFACTS.iter().map(|name| (*name).to_string()).collect();
+    names.sort();
+    names
+}
+
+/// The sorted file names `dir` holds.
+fn published_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The `(worker_id, path)` pairs of one grouping run, in assignment order.
+fn grouped_paths(outcome: &GroupingOutcome) -> Vec<(String, Vec<String>)> {
+    outcome
+        .assignments
+        .iter()
+        .map(|assignment| (assignment.worker_id.clone(), assignment.path.clone()))
+        .collect()
+}
+
+/// The distinct branch paths one grouping run produced.
+fn distinct_paths(outcome: &GroupingOutcome) -> BTreeSet<Vec<String>> {
+    outcome
+        .assignments
+        .iter()
+        .map(|assignment| assignment.path.clone())
+        .collect()
+}
+
+/// `segments` as one branch path.
+fn path_of(segments: &[&str]) -> Vec<String> {
+    segments
+        .iter()
+        .map(|segment| (*segment).to_string())
+        .collect()
+}
+
+/// Every runtime strategy is implemented, and only the synchronous entry points defer.
+///
+/// The deferral that remains is the one a synchronous call cannot avoid: it cannot await an
+/// embedder or a completion model, so it names `group_items_with` and the crate's deferred
+/// scope instead of silently grouping with the deterministic rule.
+#[tokio::test]
+async fn the_runtime_grouping_strategies_are_supported_and_only_the_sync_entries_defer() {
     let items = tools(3, "documents");
     for strategy in [
+        GroupingStrategy::LlmGrouping,
         GroupingStrategy::FaissKmeans,
         GroupingStrategy::Kmeans,
-        GroupingStrategy::LlmGrouping,
     ] {
-        assert!(!strategy.is_supported());
-        let error = group_items(&items, &GroupingConfig::default().with_strategy(strategy))
-            .expect_err("a model/faiss strategy cannot group offline");
-        assert!(is_unsupported(&error), "{strategy:?} was not Unsupported");
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(strategy.is_supported(), "{strategy:?} is implemented");
+        assert!(
+            strategy.requires_runtime(),
+            "{strategy:?} needs a supplied runtime"
+        );
     }
-    assert!(GroupingStrategy::Deterministic.is_supported());
-    assert!(group_items(&items, &GroupingConfig::default()).is_ok());
+    for strategy in [
+        GroupingStrategy::Deterministic,
+        GroupingStrategy::CategoryPath,
+        GroupingStrategy::NameTokens,
+    ] {
+        assert!(strategy.is_supported(), "{strategy:?} is implemented");
+        assert!(
+            !strategy.requires_runtime(),
+            "{strategy:?} needs no runtime"
+        );
+        let config = GroupingConfig::default().with_strategy(strategy);
+        assert!(group_items(&items, &config).is_ok(), "{strategy:?}");
+    }
+    for (strategy, reason) in [
+        (GroupingStrategy::LlmGrouping, "LLM-guided tree grouping"),
+        (GroupingStrategy::FaissKmeans, "faiss k-means tree grouping"),
+        (GroupingStrategy::Kmeans, "k-means tree grouping"),
+    ] {
+        let config = GroupingConfig::default().with_strategy(strategy);
+        let error = group_items(&items, &config)
+            .expect_err("a synchronous call cannot await a runtime strategy");
+        assert!(is_unsupported(&error), "{strategy:?}: {error}");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.message();
+        assert!(message.starts_with(reason), "{strategy:?}: {message}");
+        assert!(
+            message.contains("group_items_with"),
+            "{strategy:?} names the async entry point: {message}"
+        );
+        assert!(
+            message.contains("deferred scope"),
+            "{strategy:?} points at the deferred scope: {message}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let error = IndexBuilder::build(
+            sources(tools(3, "documents")),
+            dir.path(),
+            BuildConfig::new().with_grouping(config),
+        )
+        .await
+        .expect_err("a build without a runtime keeps the typed deferral");
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{strategy:?}");
+        assert!(error.message().contains(reason), "{strategy:?}: {error}");
+        assert!(
+            error.message().contains("group_items_with"),
+            "{strategy:?}: {error}"
+        );
+        assert_eq!(
+            published_names(dir.path()),
+            Vec::<String>::new(),
+            "{strategy:?} published an artifact instead of deferring"
+        );
+    }
+}
+
+/// The embedding-backed strategy places the same items the same way on every run.
+#[tokio::test]
+async fn kmeans_grouping_through_an_embedding_is_deterministic() {
+    let items = vec![
+        item("charts", "Chart Builder", "charts"),
+        item("mail", "Mail Digest", "mail"),
+        item("reader", "PDF Parser", "documents/pdf"),
+        item("sheets", "Spreadsheet Reader", "documents/sheets"),
+        item("web", "Web Search", "web/search"),
+    ];
+    let runtime = GroupingRuntime::new().with_embedding(Arc::new(HashEmbedding::new(16)));
+    let config = GroupingConfig::default()
+        .with_strategy(GroupingStrategy::Kmeans)
+        .with_max_children(3)
+        .with_max_depth(3)
+        .with_clusters(Some(2));
+    let first = group_items_with(&items, &config, &runtime).await.unwrap();
+    let second = group_items_with(&items, &config, &runtime).await.unwrap();
+    assert_eq!(first, second, "two runs over the same inventory differ");
+    assert_eq!(first.strategy, GroupingStrategy::Kmeans);
+    assert_eq!(first.provenance, GroupingProvenance::Embedding);
+    assert_eq!(first.assignments.len(), items.len(), "one path per item");
+    let ids: Vec<&str> = first
+        .assignments
+        .iter()
+        .map(|assignment| assignment.worker_id.as_str())
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted, "the assignments are ordered by worker id");
+    for assignment in &first.assignments {
+        assert!(
+            assignment.path.len() <= 2,
+            "{:?} is deeper than max_depth - 1",
+            assignment.path
+        );
+    }
+    let mut reversed = items;
+    reversed.reverse();
+    assert_eq!(
+        group_items_with(&reversed, &config, &runtime)
+            .await
+            .unwrap(),
+        first,
+        "the caller's item order decided a placement"
+    );
+}
+
+/// `GroupingConfig::clusters` bounds the branch count of a k-means run.
+#[tokio::test]
+async fn kmeans_grouping_honours_the_cluster_count_bounds() {
+    let items: Vec<SourceItem> = (0..8)
+        .map(|index| {
+            item(
+                &format!("w{index}"),
+                &format!("Capability {index}"),
+                &format!("group{}", index % 2),
+            )
+        })
+        .collect();
+    let runtime = GroupingRuntime::new().with_embedding(Arc::new(HashEmbedding::new(32)));
+    // `clusters` clamps into `[1, min(items, max_children)]`, so every case is an upper bound.
+    let cases: [(Option<usize>, usize); 5] = [
+        (Some(1), 1),
+        (Some(2), 2),
+        (Some(999), 8),
+        (Some(0), 1),
+        (None, 1),
+    ];
+    for (clusters, max_paths) in cases {
+        let config = GroupingConfig::default()
+            .with_strategy(GroupingStrategy::Kmeans)
+            .with_clusters(clusters);
+        let outcome = group_items_with(&items, &config, &runtime).await.unwrap();
+        let distinct = distinct_paths(&outcome);
+        assert!(
+            !distinct.is_empty() && distinct.len() <= max_paths,
+            "clusters {clusters:?} produced {} paths, want 1..={max_paths}: {distinct:?}",
+            distinct.len()
+        );
+        assert_eq!(outcome.assignments.len(), items.len(), "{clusters:?}");
+        assert_eq!(outcome.strategy, GroupingStrategy::Kmeans, "{clusters:?}");
+        assert_eq!(
+            outcome.provenance,
+            GroupingProvenance::Embedding,
+            "{clusters:?}"
+        );
+    }
+    let single = GroupingConfig::default()
+        .with_strategy(GroupingStrategy::Kmeans)
+        .with_clusters(Some(1));
+    let outcome = group_items_with(&items, &single, &runtime).await.unwrap();
+    assert_eq!(
+        distinct_paths(&outcome).len(),
+        1,
+        "one cluster is one branch"
+    );
+    let empty = group_items_with(&[], &single, &runtime).await.unwrap();
+    assert_eq!(
+        empty.assignments,
+        Vec::new(),
+        "an empty inventory groups to nothing"
+    );
+    assert_eq!(empty.provenance, GroupingProvenance::Embedding);
+}
+
+/// The model-guided strategy places the items the scripted reply names, and only those.
+#[tokio::test]
+async fn llm_grouping_places_the_items_a_scripted_reply_names() {
+    let items = vec![
+        item("a", "PDF Parser", "documents/pdf"),
+        item("b", "Spreadsheet Reader", "documents/sheets"),
+        item("c", "Chart Builder", "charts"),
+    ];
+    let config = GroupingConfig::default()
+        .with_strategy(GroupingStrategy::LlmGrouping)
+        .with_max_depth(3);
+    let model = Arc::new(StaticCompletionModel::single(
+        r#"{"groups":[{"path":["Documents","PDFs","Forms"],"worker_ids":["a","b"]},
+            {"path":["Visuals","Charts"],"worker_ids":["c"]}]}"#,
+    ));
+    let runtime = GroupingRuntime::new().with_model(model.clone());
+    let outcome = group_items_with(&items, &config, &runtime).await.unwrap();
+    assert_eq!(model.call_count(), 1, "one prompt groups the inventory");
+    assert_eq!(outcome.strategy, GroupingStrategy::LlmGrouping);
+    assert_eq!(outcome.provenance, GroupingProvenance::Model);
+    assert_eq!(
+        grouped_paths(&outcome),
+        vec![
+            ("a".to_string(), path_of(&["documents", "pdfs"])),
+            ("b".to_string(), path_of(&["documents", "pdfs"])),
+            ("c".to_string(), path_of(&["visuals", "charts"])),
+        ],
+        "the reply's three segments are cut to max_depth - 1"
+    );
+
+    let partial = Arc::new(StaticCompletionModel::single(
+        r#"{"groups":[{"path":["Documents"],"worker_ids":["a","b"]}]}"#,
+    ));
+    let outcome = group_items_with(&items, &config, &GroupingRuntime::new().with_model(partial))
+        .await
+        .unwrap();
+    assert_eq!(outcome.provenance, GroupingProvenance::Model);
+    assert_eq!(
+        grouped_paths(&outcome),
+        vec![
+            ("a".to_string(), path_of(&["documents"])),
+            ("b".to_string(), path_of(&["documents"])),
+        ],
+        "an item the reply leaves out gets no placement"
+    );
+    assert!(
+        !outcome
+            .assignments
+            .iter()
+            .any(|assignment| assignment.worker_id == "c"),
+        "the reply left c unassigned"
+    );
+}
+
+/// A failed call or unusable reply either degrades to the rule or surfaces, by config.
+#[tokio::test]
+async fn llm_grouping_falls_back_or_surfaces_an_unusable_reply() {
+    let items = tools(3, "documents");
+    let config = GroupingConfig::default().with_strategy(GroupingStrategy::LlmGrouping);
+    let unusable = || Arc::new(StaticCompletionModel::single("no json here"));
+
+    let fallback = GroupingRuntime::new().with_model(unusable());
+    let outcome = group_items_with(&items, &config, &fallback).await.unwrap();
+    assert_eq!(outcome.strategy, GroupingStrategy::Deterministic);
+    assert_eq!(
+        outcome.provenance,
+        GroupingProvenance::DeterministicFallback
+    );
+    assert_eq!(
+        outcome.assignments,
+        group_items(&items, &GroupingConfig::default()).unwrap(),
+        "the fallback is the deterministic rule"
+    );
+
+    let strict = GroupingRuntime::new()
+        .with_model(unusable())
+        .with_fallback(FallbackMode::Error);
+    let error = group_items_with(&items, &config, &strict)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Llm);
+    assert!(error.message().contains("llm_grouping"), "{error}");
+    assert!(error.message().contains("no usable JSON object"), "{error}");
+
+    let failed_call = GroupingRuntime::new()
+        .with_model(Arc::new(StaticCompletionModel::new(Vec::<String>::new())))
+        .with_fallback(FallbackMode::Error);
+    let error = group_items_with(&items, &config, &failed_call)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Llm);
+    assert!(error.message().contains("model call failed"), "{error}");
+
+    let missing = GroupingRuntime::new().with_fallback(FallbackMode::Error);
+    let error = group_items_with(&items, &config, &missing)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Config);
+    assert!(error.message().contains("with_model"), "{error}");
+}
+
+/// A build handed the runtime publishes the same three-artifact index as any other build.
+#[tokio::test]
+async fn build_with_runtime_publishes_a_normal_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let items = vec![
+        item("charts", "Chart Builder", "charts"),
+        item("reader", "PDF Parser", "documents/pdf"),
+        item("sheets", "Spreadsheet Reader", "documents/sheets"),
+        item("web", "Web Search", "web/search"),
+    ];
+    let config = BuildConfig::new().with_grouping(
+        GroupingConfig::default()
+            .with_strategy(GroupingStrategy::Kmeans)
+            .with_max_children(2)
+            .with_clusters(Some(2)),
+    );
+    let runtime = GroupingRuntime::new().with_embedding(Arc::new(HashEmbedding::new(16)));
+    let report =
+        IndexBuilder::build_with_runtime(sources(items), dir.path(), config.clone(), &runtime)
+            .await
+            .unwrap();
+    assert_eq!(report.grouping_provenance, GroupingProvenance::Embedding);
+    assert_eq!(report.record_count, 4, "every item keeps a catalog record");
+    assert_eq!(report.manifest.count, 4);
+    assert!(
+        report.node_count > report.record_count,
+        "the tree holds branches above its leaves"
+    );
+    assert_eq!(
+        published_names(dir.path()),
+        artifact_names(),
+        "the runtime build keeps the three-artifact contract"
+    );
+
+    let builder = IndexBuilder::open(dir.path(), config).await.unwrap();
+    let mut ids: Vec<&str> = builder
+        .records()
+        .iter()
+        .map(|record| record.worker_id.as_str())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["charts", "reader", "sheets", "web"]);
+    for record in builder.records() {
+        assert_eq!(
+            record.branch_path.first().map(String::as_str),
+            Some("Skills"),
+            "{} sits below the root",
+            record.worker_id
+        );
+    }
+    assert!(builder.nodes().iter().any(IndexNode::is_leaf));
+    assert_eq!(
+        fs::read_to_string(dir.path().join(CATALOG_FILENAME))
+            .unwrap()
+            .lines()
+            .count(),
+        4
+    );
+}
+
+/// The visualizer is one additive, escaped file; the default build keeps three artifacts.
+#[tokio::test]
+async fn with_html_publishes_the_visualizer_beside_the_three_artifacts() {
+    let plain = tempfile::tempdir().unwrap();
+    let report = IndexBuilder::build(
+        sources(tools(2, "documents")),
+        plain.path(),
+        BuildConfig::new(),
+    )
+    .await
+    .unwrap();
+    assert!(!report.html_written, "the visualizer is opt-in");
+    assert_eq!(
+        published_names(plain.path()),
+        artifact_names(),
+        "the default contract is still the three artifacts"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let items = vec![
+        item("PdfFill", "PDF <Fill> & Reader", "documents/pdf"),
+        item("Reader", "Doc Reader", "documents"),
+    ];
+    let report = IndexBuilder::build(
+        sources(items),
+        dir.path(),
+        BuildConfig::new().with_html(true),
+    )
+    .await
+    .unwrap();
+    assert!(report.html_written);
+    let mut expected = artifact_names();
+    expected.push(TREE_HTML_FILENAME.to_string());
+    expected.sort();
+    assert_eq!(published_names(dir.path()), expected);
+    for name in ARTIFACTS {
+        assert!(dir.path().join(name).exists(), "{name} was not written");
+    }
+
+    let html = fs::read_to_string(dir.path().join(TREE_HTML_FILENAME)).unwrap();
+    assert!(html.starts_with("<!DOCTYPE html>\n"), "{html:.80}");
+    assert!(html.ends_with("</html>\n"), "the document is closed");
+    assert!(
+        html.contains("<title>Skills</title>"),
+        "the root labels the document"
+    );
+    assert!(
+        html.contains("<h2>Capability tree</h2>"),
+        "the tree section is present"
+    );
+    assert!(
+        html.contains("PDF &lt;Fill&gt; &amp; Reader"),
+        "the item name is escaped"
+    );
+    assert!(
+        !html.contains("<Fill>"),
+        "no raw markup from an item name reaches the document"
+    );
+    assert!(html.contains("Doc Reader"), "the second item is listed");
 }
 
 // --------------------------------------------------------------------------------------
