@@ -137,7 +137,7 @@ The `data` column is what the in-repo `BackendAttachHandler` (`../runtime/attach
 | `update_task` | `task_id`, `title?`, `content?` | the refreshed `TaskDetail`; unknown id is `not_found` | attach_host.rs:240 |
 | `claim_task` | `task_id` | a `TaskOpResult` (`{"ok", "reason"}`) | attach_host.rs:277 |
 | `complete_task` | `task_id` | the completed `TaskRecord` | attach_host.rs:287 |
-| `invoke_tool` | `name`, `arguments` | always an `unsupported` error — in-process tool invocation is not in the contract | attach_host.rs:300 |
+| `invoke_tool` | `name`, `arguments` | the tool's own wire shape, dispatched as the leader through `tool_dispatch::dispatch_tool`; an unknown tool is `not_found` and bad arguments `validation`, both in band | attach_host.rs:312 |
 | `snapshot` | — | a `TeamSnapshot` carrying members and tasks | attach_host.rs:308 |
 | `stop_team` | — | `{"stopping": true}` | attach_host.rs:317 |
 
