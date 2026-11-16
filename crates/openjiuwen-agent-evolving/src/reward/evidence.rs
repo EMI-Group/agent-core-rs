@@ -56,8 +56,10 @@ gather facts, and print values rather than pass/fail verdicts.
 
 Read code closely only when code is the deliverable. A page's source is not read: how a page looks \
 and behaves is seen by using it, and using it needs the browser tool, which is not available in \
-this run. When a check cannot show a claim, say which criteria still lack evidence and why instead \
-of repeating the check: a check identical to one already run is not run again.
+this run. A picture file is read as its format and pixel size, not its pixels, so a claim about how \
+a picture looks is left to the Judge. When a check cannot show a claim, say which criteria still \
+lack evidence and why instead of repeating the check: a check identical to one already run is not \
+run again.
 
 Checks measure; you stop. When every claim has evidence, or the rest cannot be settled with these \
 tools, reply in one line without a check.

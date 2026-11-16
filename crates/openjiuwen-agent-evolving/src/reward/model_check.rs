@@ -61,7 +61,9 @@ reply and the inputs when given. Files show intent; checks show behaviour.
 Judge only this criterion's claims, each on its own subject: how the work looks belongs to another \
 criterion, so a visual weakness never lowers a claim about behaviour, content or data. A check that \
 failed to run is not a defect of the work; a check that ran and showed a failure is. When the work \
-has no files, the final reply is the outcome.
+has no files, the final reply is the outcome. A skipped check settles nothing: a page whose source \
+was refused stays unknown unless a browser check saw it, and a picture check reports the file's \
+format and size, not what it shows.
 
 Status per claim: met (evidence shows the whole claim), partial (evidence shows the work does only \
 part of it), unmet (evidence shows it fails), unknown (no evidence either way). A claim about \

@@ -13,7 +13,10 @@
 //! - `RewardSummary` / `RewardPack` — the persisted results and the pack that
 //!   describes which dimensions a run scores.
 //! - `RewardCheck` / `CheckRunner` — the `read` and `python` checks a model asks
-//!   for; browser and picture checks are deferred with a typed error.
+//!   for. A `read` of a picture reports the file's header (format, pixel size,
+//!   byte count) instead of decoding it, and a `read` of a page's source is
+//!   skipped: a page is judged only by using it in a browser. Browser checks are
+//!   deferred with a typed error naming playwright.
 //! - `EvidenceAgent` — the model-driven loop that gathers check evidence.
 //! - `ModelRewardJudge` — per-criterion judging, the rubric arithmetic
 //!   (`score_criterion`, `FLOOR_FAIL_CAP`) and `to_reward_signal`, which feeds a
@@ -27,6 +30,7 @@ mod evidence;
 mod model_check;
 mod models;
 mod pack;
+mod picture;
 mod scoring;
 
 #[cfg(test)]
@@ -35,7 +39,8 @@ mod end_to_end;
 pub use check::{
     inside, CheckOutcome, CheckRunner, CheckTool, RewardCheck, DEFAULT_LISTING_LIMIT,
     DEFAULT_MAX_HITS, DEFAULT_MAX_OUTPUT_CHARS, DEFAULT_RANGE_COUNT, IMAGE_SUFFIXES,
-    MAX_RANGE_COUNT, PAGE_SUFFIXES, PROXY_SINK, PYTHON_TIMEOUT_MS,
+    MAX_RANGE_COUNT, PAGE_SOURCE_REFUSED, PAGE_SOURCE_SUFFIXES, PAGE_SUFFIXES, PROXY_SINK,
+    PYTHON_TIMEOUT_MS,
 };
 pub use evidence::{
     CriterionKind, EvidenceAgent, EvidenceClaim, EvidenceCriterion, EvidenceGathered, EvidenceTask,
@@ -48,6 +53,10 @@ pub use model_check::{
 };
 pub use models::{DimensionScore, RewardDimension, RewardSignal, RewardSummary};
 pub use pack::{default_pack, reward_from_score, score_evaluated_cases, RewardPack};
+pub use picture::{
+    PictureFormat, PictureInfo, MODEL_PICTURE_FORMATS, PICTURE_BYTES, PICTURE_SIDE,
+    UNREADABLE_PICTURE,
+};
 pub use scoring::{
     aggregate_scores, MissingDimensionPolicy, RewardAggregator, ScoreNormalisation, ScoreStats,
 };
