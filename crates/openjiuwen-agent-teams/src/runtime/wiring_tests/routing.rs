@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{ErrorKind, Result};
 use openjiuwen_harness_protocol::HarnessProtocol;
 
 use crate::harness::{MemberHarnessContext, MemberHarnessFactory};
@@ -507,4 +507,43 @@ async fn build_with_replaces_an_injected_router_with_the_spec_pool() {
         "build_with derives its router from the spec pool, not from the injected one"
     );
     assert!(!Arc::ptr_eq(agent.spawner().routing(), &routing));
+}
+
+#[tokio::test]
+async fn an_intelli_router_spec_deserializes_and_the_build_refuses_it() {
+    // A Python-format spec carrying the `intelli_router` strategy must parse, and the build path
+    // must then refuse it with a typed error instead of silently rotating the pool.
+    let wire = serde_json::to_value(pooled(ModelPoolStrategy::IntelliRouter)).expect("wire form");
+    assert_eq!(
+        wire["model_pool_strategy"],
+        serde_json::json!("intelli_router")
+    );
+    assert_eq!(
+        wire["model_pool"].as_array().map(Vec::len),
+        Some(2),
+        "the pool is declared, so the refusal cannot come from an empty pool"
+    );
+    let spec: TeamAgentSpec = serde_json::from_value(wire).expect("the spec must deserialize");
+    assert_eq!(spec.model_pool_strategy, ModelPoolStrategy::IntelliRouter);
+
+    let inner = ScriptedFactory::new();
+    let factory = RecordingFactory::new(Arc::clone(&inner));
+    let workspace = RecordingWorkspaceProvider::new();
+    let build_deps = deps(&inner, &workspace)
+        .with_harness_factory(Arc::clone(&factory) as Arc<dyn MemberHarnessFactory>);
+
+    let error = spec
+        .build_with(build_deps)
+        .await
+        .expect_err("an intelli_router team must not build");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let message = error.to_string();
+    assert!(
+        message.contains("intelli_router") || message.contains("IntelliRouter"),
+        "{message}"
+    );
+    assert!(
+        factory.spec("boss").is_none(),
+        "the refusal fires before any harness is built"
+    );
 }

@@ -106,8 +106,8 @@ impl ModelAllocator {
     pub fn new(entries: &[ModelPoolEntry], strategy: ModelPoolStrategy) -> Self;
     pub fn is_empty(&self) -> bool;   pub fn len(&self) -> usize;
     pub fn strategy(&self) -> ModelPoolStrategy;
-    pub fn allocate(&self, model_name: Option<&str>) -> Result<TeamModelAllocation>;
-    pub fn state_dict(&self) -> Value;                    // {"strategy","next_index"}
+    pub fn allocate(&self, model_name: Option<&str>) -> Result<TeamModelAllocation>;   // Unsupported for intelli_router
+    pub fn state_dict(&self) -> Value;                    // {"strategy","next_index"} over the three wire values
     pub fn from_state_dict(value: &Value) -> Result<Self>;   // restores the cursor, empty pool
 }
 
@@ -359,6 +359,10 @@ Invariant: **one allocation per member**, reused by the roster row (`MemberRecor
 `DeepAgentSpec` handed to `MemberHarnessFactory` and the KV identity.
 `round_robin` hand outs pool entries in roster order (leader first, then sorted teammates) and advances on every member; it ignores a requested model name (Python allocator semantics).
 `by_model_name` honours the requested name and falls back to the first entry.
+`intelli_router` never allocates: `ModelAllocator::allocate` returns a typed `Error::Unsupported` naming the `IntelliRouter` client-side reliable router and its route-group service, and that refusal precedes the empty-pool echo, so a populated pool and an empty one are both refused.
+`build_with` (through `routing.effective_spec_for(leader, ..)`) and `spawn_member` (through `TeamMemberSpawner::effective_spec`) both propagate the router's `Result`, so a declared `intelli_router` team fails its build and fails a member spawn instead of rotating the pool.
+The strategy wire value round-trips through serde as `intelli_router`, so a Python spec declaring it deserializes instead of failing.
+The state dict is `{"strategy": "round_robin"|"by_model_name"|"intelli_router", "next_index": n}`: a known wire value restores faithfully, an unknown string restores `round_robin` with one `warn!`, and an absent or null strategy restores `round_robin` silently (the Python default).
 An empty pool leaves the member's own spec untouched and returns `entry: None`; `effective_spec_for` is then a no-op.
 `build_with` always builds the router from `model_pool` — an injected `deps.routing` is replaced there and only survives in a directly constructed `TeamMemberSpawner`.
 Per-member memoization also means a re-spawn keeps the member's endpoint and the cursor does not drift.
@@ -616,7 +620,9 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   `execution`, `alive`).
 - `allocator.rs`: round-robin cycles in pool order and persists its cursor; `by_name` picks the named
   entry and falls back to the first; empty pool + `Some(name)` echoes the name with `index = 0`; empty pool
-  + `None` is `Error::config`; `state_dict` round-trip.
+  + `None` is `Error::config`; `state_dict` round-trip; `intelli_router` round-trips as its wire value,
+  restores faithfully from a state dict, and is refused with `Unsupported` on a populated *and* an empty
+  pool (so the refusal precedes the echo); an unknown strategy string restores `round_robin`.
 - `routing.rs`: pool parsing from the spec, empty-pool no-op, one allocation per member (memo), rotation
   order, `by_name` honouring a requested name, `effective_spec` preserving params, `apply_selection` model ref shape.
 - `spec_meta.rs`: every documented shape plus the malformed fallbacks (in-process, no isolation, no fork,
@@ -663,16 +669,18 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   `stop_team` tearing the attach socket down.
 - `adapter.rs`: `team_id() == team_name`, `agent_count()`, `invoke` delegation, `kind() == "agent_teams"`.
 
-`./wiring_tests/` (85 tests, one module per wiring point; the shared `Wiring` harness builds a team over a
+`./wiring_tests/` (86 tests, one module per wiring point; the shared `Wiring` harness builds a team over a
 `ScriptedFactory` + `RecordingWorkspaceProvider` and returns the agent, the factory and the workspace):
 
 - `spawn_modes.rs` (9): the default blueprint stays in-process; `metadata["spawn"]` selects
   Process/ExternalCli and spawns+reaps a real child through a fake `sh` script; the metadata wins over the
   typed `spawn_mode`; the `{"options", "fork"}` wrapper parses both; malformed metadata falls back to
   in-process; a bare process/SSH request without its launch config fails with `Config`.
-- `routing.rs` (11): one allocation per member reused by the harness spec and the roster row (leader `m0`,
+- `routing.rs` (12): one allocation per member reused by the harness spec and the roster row (leader `m0`,
   `dev-1` `m1`, `dev-2` `m0` with two entries); rotation on every `select`; `by_name` honouring a name;
-  empty pool untouched; an injected router only reaches a directly built spawner; re-spawn keeps the endpoint.
+  empty pool untouched; an injected router only reaches a directly built spawner; re-spawn keeps the endpoint;
+  an `intelli_router` spec with a non-empty pool deserializes and then fails `build_with` with `Unsupported`
+  before any harness is built.
 - `kv_affinity.rs` (6): a fresh build registers the leader; a spawn registers the teammate; a fork registers
   via `register_child`; `shutdown_member` releases one member and `stop` releases the team; `enabled: false`
   registers nothing; an injected registry is reused.
@@ -706,8 +714,8 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   sees a spawn's write, while a build without one keeps the bridge, `{"trace": false}` attaches nothing even
   when an observer is injected, and an injected wiring keeps its own observer.
 
-Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` (1548 lib
-tests in the default build, 1601 with `--all-features`, plus 219 integration
+Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` (1592 lib
+tests in the default build, 1645 with `--all-features`, plus 219 integration
 tests over 15 binaries),
 `cargo test -p openjiuwen-agent-teams --no-default-features`,
 `cargo test -p openjiuwen-agent-teams --features sqlite`, `cargo clippy -p openjiuwen-agent-teams
@@ -789,6 +797,7 @@ tests over 15 binaries),
 
 - Model routing is decided per member: there is no per-request routing, `IntelliRouter` or builtin-model
   selection.
+  A team that declares `intelli_router` is refused at allocation with `Error::Unsupported` rather than routed.
   The router's cursor and per-member memo are not checkpointed, so a rebuilt team re-allocates from the
   pool while an in-process resume keeps its memoized endpoints.
 - KV-cache affinity records identity only: no cache-hit telemetry, no eviction policy beyond `max_entries`,
