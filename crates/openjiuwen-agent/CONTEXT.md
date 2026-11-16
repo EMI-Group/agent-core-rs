@@ -177,7 +177,7 @@ Loop semantics (Python `_inner_invoke`): iteration `1..=limit`; per iteration bu
 No tool calls → `{"output": content, "result_type": "answer"}`; empty content → one retry after injecting a notice, then `result_type: "error"` with `finish_reason`/`reasoning_present`.
 Exhaustion → `termination_reason: "max_iterations"`, `iterations_used`, `truncated_by_max_iterations: true` and the configured policy (`Error` → error output; `ReturnObservations` → observations attached; `FinalAnswer` → one extra tool-free model call).
 Interrupts pause the loop into an `AgentOutput` with `result_type: "interrupt"`, `state` frames and `interrupt_ids`; state is persisted under `__react_agent_interruption__` and cleared on resume.
-Cancellation (`CancellationToken` from the session config / tool context) yields `Error::Cancelled` and sanitizes the partial turn when `retain_tool_facts_on_abort = false`.
+The loop never observes cancellation: `run_with` takes no `CancellationToken` and `retain_tool_facts_on_abort` is never read, so only tool execution sees a token (`ToolExecutionOptions::cancellation`, reported as a failed tool result).
 
 ### Context usage frames (`react/frames.rs`)
 
@@ -452,7 +452,7 @@ Each has its own `CONTEXT.md` with the full API.
 - A pause stores each request under its tool-call id (the interrupt id when the call has none) and emits `{"id": interrupt_id, "value": <serialized InterruptRequest>}` frames; `InterruptRequest::to_interaction_request` exists for hosts but the loop never calls `Session::request_interaction` — it mirrors frames with `Session::write_stream`.
 - `InterruptRequest` serializes with Python wire names `interrupt_kind`/`interrupt_owner` (deserialization also accepts the Rust `kind`/`owner`), so an `__interaction__` frame payload is `{id, value}` with a Python-shaped `value`.
 - `AgentOutput::truncated_by_max_iterations` is omitted from the wire object unless it is `true`.
-- `AgentOutput::termination_reason` is a free-form `Option<String>`, not an enum: `"max_iterations"` / `"token_budget"` / `"cancelled"` from the ReAct loop and `"workflow_error"` from `WorkflowAgent`.
+- `AgentOutput::termination_reason` is a free-form `Option<String>`, not an enum: the ReAct loop emits `"max_iterations"` or `"token_budget"` and `WorkflowAgent` emits `"workflow_error"`; nothing emits `"cancelled"`.
 - The `AgentChunk` frame-kind constants (`LLM_OUTPUT`, `LLM_REASONING`, `LLM_USAGE`, `ANSWER`, `INTERACTION`, `WORKFLOW_FINAL`, `CONTEXT_USAGE`, `LLM_ROUTE`) live in the `output` module but are not re-exported from the crate root; refer to them as `openjiuwen_agent::output::*`.
 - `context.usage` frames are emitted twice per iteration: a pre-call frame after every successful `ContextEngine::prepare` (`phase: "pre_call"`, `iteration`, `message_count`, `tool_count`, `token_count`, `overflow`, `window_size`, `usage`) and a post-call frame after every successful model call (`phase: "post_call"`, `iteration`, `input_tokens`, `output_tokens`, `total_tokens`, `tokens`, `overflow`, `window_size`, `usage`); `llm_route` frames are emitted only when a rail's `model_override` makes the run diverge from the primary model (`route`, `model`, `reason`).
 - `abilities::AbilityManager::execute` batches runs of consecutive `parallel_safe` tools (capped by `MAX_PARALLEL_BATCH`), treats any other call as a barrier, and applies `ToolExecutionOptions::timeout` per call.
