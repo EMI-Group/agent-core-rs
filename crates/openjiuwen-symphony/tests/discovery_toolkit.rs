@@ -15,7 +15,10 @@ use openjiuwen_symphony::discovery::directory_toolkit::{
     PipelineStage, ReadMode, RequestIssue, ResponseSummary, Row, SearchMatch, SearchResult,
     SkillDirectoryView, SkillIndexRequest, ValidatedRequest, SHORTENED_MARKER,
 };
-use openjiuwen_symphony::discovery::SkillFs;
+use openjiuwen_symphony::discovery::{
+    index_state_for, skillfs_layout, IndexBaseline, IndexState, SkillFs, SkillFsLayout,
+    SkillScanConfig,
+};
 
 /// Writes `content` to `root/relative`, creating parent directories.
 fn write(root: &Path, relative: &str, content: &str) {
@@ -2642,4 +2645,232 @@ async fn identical_calls_are_byte_identical() {
         assert_eq!(left.rows, right.rows);
         assert_eq!(left.total_count, right.total_count);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The derived layout and the index-state baseline
+// ---------------------------------------------------------------------------
+
+/// A fixture whose skills sit at two depths, so the catalog is nested.
+async fn nested_catalog(root: &Path) -> SkillFs {
+    write(
+        root,
+        "flat-one/SKILL.md",
+        &skill("Flat One", "First skill", "category: Data\n"),
+    );
+    write(
+        root,
+        "data/pdf/deep/SKILL.md",
+        &skill("Deep One", "Second skill", "category: Data > PDF\n"),
+    );
+    SkillFs::open_with(SkillScanConfig::recursive(Some(3)), root)
+        .await
+        .unwrap()
+}
+
+/// Adds one more immediate-child skill, so the inventory fingerprint moves.
+fn add_extra_skill(root: &Path) {
+    write(
+        root,
+        "omega-extra/SKILL.md",
+        &skill("Omega Extra", "Another skill", "category: Data\n"),
+    );
+}
+
+#[tokio::test]
+async fn the_layout_is_derived_from_the_catalog_nesting() {
+    let (directory, catalog) = fixture().await;
+    assert_eq!(
+        skillfs_layout(&catalog),
+        SkillFsLayout::Flat,
+        "every fixture skill is an immediate child of the scan root"
+    );
+    assert_eq!(skillfs_layout(&catalog).as_str(), "flat");
+
+    let nested_directory = tempfile::tempdir().unwrap();
+    let nested = nested_catalog(nested_directory.path()).await;
+    assert_eq!(
+        skillfs_layout(&nested),
+        SkillFsLayout::Tree,
+        "one skill sits two directories down"
+    );
+    assert_eq!(skillfs_layout(&nested).as_str(), "tree");
+
+    let mut flat_toolkit =
+        SkillIndexToolkit::new(catalog, SkillIndexConfig::new("session-layout")).unwrap();
+    let flat = flat_toolkit
+        .invoke(&serde_json::json!({"operation": "list"}))
+        .unwrap();
+    assert_eq!(flat.skillfs_layout, "flat");
+
+    let mut nested_toolkit =
+        SkillIndexToolkit::new(nested, SkillIndexConfig::new("session-layout")).unwrap();
+    let tree = nested_toolkit
+        .invoke(&serde_json::json!({"operation": "list"}))
+        .unwrap();
+    assert_eq!(tree.skillfs_layout, "tree");
+
+    // The directory is only kept alive for the scan above.
+    assert!(directory.path().exists());
+}
+
+#[tokio::test]
+async fn the_index_state_moves_missing_then_fresh_then_stale() {
+    let (directory, catalog) = fixture().await;
+    let mut toolkit =
+        SkillIndexToolkit::new(catalog, SkillIndexConfig::new("session-state")).unwrap();
+
+    let first = toolkit
+        .invoke(&serde_json::json!({"operation": "list"}))
+        .unwrap();
+    assert_eq!(
+        first.index_state, "missing",
+        "a fresh toolkit has no baseline yet"
+    );
+    assert_eq!(first.index_baseline_fingerprint, None);
+    assert!(!first.inventory_fingerprint.is_empty());
+    assert_eq!(
+        toolkit.index_state(),
+        IndexState::Fresh,
+        "the call itself recorded the baseline it just handed out"
+    );
+
+    let second = toolkit
+        .invoke(&serde_json::json!({"operation": "list"}))
+        .unwrap();
+    assert_eq!(
+        second.index_state, "fresh",
+        "the first result recorded a baseline over the same inventory"
+    );
+    assert_eq!(second.inventory_fingerprint, first.inventory_fingerprint);
+    let baseline_after = toolkit
+        .index_baseline()
+        .cloned()
+        .expect("the first call recorded a baseline");
+    assert_eq!(
+        baseline_after.inventory_fingerprint, second.inventory_fingerprint,
+        "the recorded baseline names the inventory it was taken over"
+    );
+    assert_eq!(
+        second.index_baseline_fingerprint.as_deref(),
+        Some(baseline_after.index_fingerprint.as_str()),
+        "the result reports the baseline's generation digest"
+    );
+    assert_eq!(toolkit.index_state(), IndexState::Fresh);
+    let recorded_generation = second
+        .index_baseline_fingerprint
+        .clone()
+        .expect("the fresh baseline carries its generation digest");
+
+    // A skill appears on disk, so the inventory moves under the recorded baseline.
+    write(
+        directory.path(),
+        "zeta/SKILL.md",
+        &skill("Zeta", "A new skill", "category: Data\n"),
+    );
+    let reloaded = toolkit.reload().await.unwrap();
+    assert_eq!(reloaded, 9, "the reload rescanned nine skills");
+    let stale = toolkit
+        .invoke(&serde_json::json!({"operation": "list"}))
+        .unwrap();
+    assert_eq!(stale.index_state, "stale");
+    assert_ne!(stale.inventory_fingerprint, first.inventory_fingerprint);
+    assert_eq!(
+        stale.index_baseline_fingerprint.as_deref(),
+        Some(recorded_generation.as_str()),
+        "the stale result still names the baseline it was measured against"
+    );
+
+    // Recording the moved inventory makes it the baseline again.
+    let recorded = toolkit.record_index_baseline();
+    assert_eq!(recorded.inventory_fingerprint, stale.inventory_fingerprint);
+    assert_eq!(recorded.indexed_skills, 9);
+    assert_eq!(recorded.layout, "flat");
+    let fresh = toolkit
+        .invoke(&serde_json::json!({"operation": "list"}))
+        .unwrap();
+    assert_eq!(fresh.index_state, "fresh");
+    assert_eq!(
+        fresh.index_baseline_fingerprint.as_deref(),
+        Some(recorded.index_fingerprint.as_str())
+    );
+    assert_eq!(
+        toolkit.record_index_baseline().index_fingerprint,
+        recorded.index_fingerprint,
+        "recording an unchanged inventory is stable"
+    );
+}
+
+#[tokio::test]
+async fn a_baseline_from_another_snapshot_reports_stale_and_can_be_cleared() {
+    let (directory, catalog) = fixture().await;
+    let baseline = IndexBaseline::from_catalog(&catalog);
+    assert_eq!(baseline.layout, "flat");
+    assert_eq!(baseline.indexed_skills, 8);
+    assert_eq!(
+        baseline.inventory_fingerprint,
+        catalog.inventory().fingerprint
+    );
+    assert!(!baseline.index_fingerprint.is_empty());
+    assert_eq!(baseline.index_state(&catalog), IndexState::Fresh);
+    assert_eq!(
+        index_state_for(&catalog, Some(&baseline)),
+        IndexState::Fresh
+    );
+    assert_eq!(index_state_for(&catalog, None), IndexState::Missing);
+
+    add_extra_skill(directory.path());
+    let moved = SkillFs::open(directory.path()).await.unwrap();
+    assert_eq!(index_state_for(&moved, Some(&baseline)), IndexState::Stale);
+    assert_eq!(moved.inventory().count, 9);
+
+    let mut toolkit = SkillIndexToolkit::new_with_baseline(
+        moved,
+        SkillIndexConfig::new("session-handoff"),
+        Some(baseline.clone()),
+    )
+    .unwrap();
+    let result = toolkit
+        .invoke(&serde_json::json!({"operation": "list"}))
+        .unwrap();
+    assert_eq!(result.index_state, "stale");
+    assert_eq!(
+        result.index_baseline_fingerprint.as_deref(),
+        Some(baseline.index_fingerprint.as_str())
+    );
+    assert_eq!(result.skillfs_layout, "flat");
+
+    toolkit.set_index_baseline(None);
+    assert!(toolkit.index_baseline().is_none());
+    let cleared = toolkit
+        .invoke(&serde_json::json!({"operation": "list"}))
+        .unwrap();
+    assert_eq!(cleared.index_state, "missing");
+
+    // The baseline is an ordinary wire type.
+    let json = serde_json::to_string(&baseline).unwrap();
+    let restored: IndexBaseline = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, baseline);
+    let defaulted: IndexBaseline = serde_json::from_str("{}").unwrap();
+    assert_eq!(defaulted, IndexBaseline::default());
+}
+
+#[tokio::test]
+async fn the_derived_values_survive_a_result_round_trip() {
+    let (_directory, catalog) = fixture().await;
+    let mut toolkit =
+        SkillIndexToolkit::new(catalog, SkillIndexConfig::new("session-roundtrip")).unwrap();
+    let result = toolkit
+        .invoke(&serde_json::json!({"operation": "list"}))
+        .unwrap();
+    let json = serde_json::to_string(&result).unwrap();
+    let restored: openjiuwen_symphony::discovery::SkillIndexResult =
+        serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.skillfs_layout, result.skillfs_layout);
+    assert_eq!(restored.index_state, result.index_state);
+    assert_eq!(restored.inventory_fingerprint, result.inventory_fingerprint);
+    assert_eq!(
+        restored.index_baseline_fingerprint,
+        result.index_baseline_fingerprint
+    );
 }

@@ -85,6 +85,10 @@ pub use scanner::{
 };
 pub use settings::{DiscoverySettings, DEFAULT_MAX_OUTPUT_CHARS, DEFAULT_MAX_RESULTS};
 
+pub use directory_toolkit::layout::{
+    index_fingerprint, index_state_for, layout_for_records, skillfs_layout, IndexBaseline,
+    IndexState, SkillFsLayout, INDEX_FRESH, INDEX_MISSING, INDEX_STALE, LAYOUT_FLAT, LAYOUT_TREE,
+};
 pub use directory_toolkit::{
     apply_pipeline, empty_message, execute_list, execute_read, execute_search, fit_rows, list_row,
     metadata_card, sanitize_model_text, search_directory_row, search_row, tool_input_schema,
@@ -93,10 +97,6 @@ pub use directory_toolkit::{
     SearchMatch, SearchResult, SkillDirectoryView, SkillIndexConfig, SkillIndexRequest,
     SkillIndexResult, SkillIndexToolCard, SkillIndexToolkit, ValidatedRequest, CURSOR_MAX_CHARS,
     MAX_CURSORS, MAX_OUTPUT_CHARS, MIN_OUTPUT_CHARS, ROOT_PATH, SHORTENED_MARKER,
-};
-pub use directory_toolkit::layout::{
-    index_fingerprint, index_state_for, layout_for_records, skillfs_layout, IndexBaseline,
-    IndexState, SkillFsLayout, INDEX_FRESH, INDEX_MISSING, INDEX_STALE, LAYOUT_FLAT, LAYOUT_TREE,
 };
 pub use toolkit::{
     cards_from_inventory, normalize_cards, tool_id, IncrementalNoticeRegistry,

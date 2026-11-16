@@ -199,7 +199,7 @@ No malformed request panics; `page_size`/`top_k` are clamped rather than rejecte
 - `std::fmt::Write as _` + `let _ = write!(…)` for string building (the crate's `clippy::format_push_string` policy); `push_str` for literals.
 - `#[serde(rename_all = "snake_case", default)]` on every public data type; unknown JSON fields are tolerated on deserialization.
 - One toolkit per session: `invoke`/`execute` take `&mut self` because the toolkit owns the page-cursor store; `index`, `config`, `retriever`, `card` and `prompt_snapshot` are `&self`.
-- Files stay ≲1000 lines; `render.rs`, `ops.rs`, `validate.rs`, `toolkit.rs` split by responsibility, with `tests.rs` holding the in-file suite.
+- Files stay ≲1000 lines; `render.rs`, `ops.rs`, `validate.rs`, `toolkit.rs` split by responsibility, with `tests.rs` holding the in-file suite (the documented exception: it sits just over the soft cap because a 42-case behaviour suite belongs beside the code it pins).
 
 ## Routing Table
 
