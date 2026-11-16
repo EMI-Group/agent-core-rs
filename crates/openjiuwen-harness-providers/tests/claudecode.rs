@@ -567,3 +567,412 @@ async fn an_error_result_fails_the_turn_with_its_category() {
     assert_eq!(chunks[1].payload["error_message"], json!("bad tool schema"));
     adapter.stop().await.expect("the harness stops");
 }
+
+// ---------------------------------------------------------------------------
+// Delivery receipts (turn boundary)
+// ---------------------------------------------------------------------------
+/// Shell definition of `receipt <message-id> <state>`, the CLI's delivery acknowledgement.
+const RECEIPT_FN: &str = "receipt() { printf '%s\\n' \"{\\\"type\\\":\\\"command_lifecycle\\\",\\\"command_uuid\\\":\\\"$1\\\",\\\"state\\\":\\\"$2\\\"}\"; }\n";
+
+/// Shell prologue: logs the argv, reads one request line into `$<into>` and extracts its uuid.
+fn read_request(into: &str) -> String {
+    format!(
+        "printf 'ARGV %s\\n' \"$*\" >> \"$FAKE_CLI_LOG\"\n\
+         IFS= read -r {into}\n\
+         printf '%s\\n' \"}}\" >> \"$FAKE_CLI_LOG\"\n\
+         {into}_uuid=$(printf '%s' \"}}\" | sed -n 's/.*\"uuid\":\"\\([^\"]*\\)\".*/\\1/p')\n"
+    )
+}
+
+/// Shell snippet emitting one NDJSON frame.
+fn emit(frame: &str) -> String {
+    format!("printf '%s\\n' '{frame}'\n")
+}
+
+/// Shell snippet emitting one delivery receipt for `message_id`.
+fn acknowledge(message_id: &str, state: &str) -> String {
+    format!("receipt \"{message_id}\" {state}\n")
+}
+
+/// Reads chunks until the turn's `finished` lifecycle chunk, returning everything seen.
+async fn read_until_finished(stream: &mut BoxStream<'static, AgentChunk>) -> Vec<AgentChunk> {
+    let mut chunks = Vec::new();
+    loop {
+        let chunk = next_chunk(stream).await;
+        let finished = chunk.kind == "turn_lifecycle" && chunk.payload["kind"] == json!("finished");
+        chunks.push(chunk);
+        if finished {
+            return chunks;
+        }
+    }
+}
+
+/// Collects the projected answer texts of `chunks`.
+fn answer_texts(chunks: &[AgentChunk]) -> Vec<String> {
+    chunks
+        .iter()
+        .filter(|chunk| chunk.kind == "llm_output" && chunk.payload["channel"] == json!("answer"))
+        .map(output_text)
+        .collect()
+}
+
+/// A message steered into the running cycle is answered in a new cycle: the turn stays open until
+/// every submitted message is acknowledged, so both cycles' output belongs to that one turn.
+#[tokio::test]
+async fn a_steered_message_answered_in_a_new_cycle_stays_inside_the_turn() {
+    let body = [
+        RECEIPT_FN.to_owned(),
+        read_request("first"),
+        acknowledge("$first_uuid", "queued"),
+        acknowledge("$first_uuid", "completed"),
+        emit(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"first cycle"}]}}"#,
+        ),
+        // Give the host time to steer before the first cycle's result arrives.
+        "sleep 0.4\n".to_owned(),
+        emit(r#"{"type":"result","subtype":"success","is_error":false,"result":"first"}"#),
+        read_request("second"),
+        acknowledge("$second_uuid", "started"),
+        emit(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"second cycle"}]}}"#,
+        ),
+        emit(r#"{"type":"result","subtype":"success","is_error":false,"result":"second"}"#),
+        acknowledge("$second_uuid", "completed"),
+        "cat > /dev/null\n".to_owned(),
+    ]
+    .concat();
+    let cli = FakeCli::script(&body);
+    let adapter = adapter(harness_for(&cli));
+    adapter.start(context()).await.expect("the harness starts");
+    let mut stream = adapter.outputs().expect("the stream is handed out once");
+    adapter
+        .send(json!("hello"), true)
+        .await
+        .expect("the input is accepted");
+    let started = next_chunk(&mut stream).await;
+    assert_eq!(started.payload["kind"], json!("started"));
+    let first = next_chunk(&mut stream).await;
+    assert_eq!(output_text(&first), "first cycle");
+    adapter
+        .send(json!("and more"), true)
+        .await
+        .expect("the steer is accepted into the running turn");
+    let chunks = read_until_finished(&mut stream).await;
+    assert_eq!(
+        answer_texts(&chunks),
+        ["second cycle"],
+        "the second cycle's output belongs to the same turn"
+    );
+    assert_eq!(
+        chunks
+            .iter()
+            .filter(|chunk| chunk.kind == "turn_lifecycle")
+            .count(),
+        1,
+        "the turn ended exactly once"
+    );
+    assert_eq!(
+        chunks.last().unwrap().payload["final_output"],
+        json!("second")
+    );
+    let requests = requests(&cli);
+    assert_eq!(
+        requests.len(),
+        2,
+        "the turn wrote both messages: {requests:?}"
+    );
+    let steered: JsonValue = serde_json::from_str(&requests[1]).expect("the steered frame is JSON");
+    assert_eq!(steered["message"]["content"][0]["text"], json!("and more"));
+    assert_ne!(
+        steered["uuid"],
+        json!(serde_json::from_str::<JsonValue>(&requests[0]).unwrap()["uuid"]),
+        "a steered message carries its own frame id"
+    );
+    adapter.stop().await.expect("the harness stops");
+}
+
+/// A CLI build that reports no delivery receipt keeps the first result as the turn boundary.
+#[tokio::test]
+async fn a_cli_without_receipts_ends_the_turn_at_the_first_result() {
+    let body = [
+        read_request("first"),
+        emit(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"only cycle"}]}}"#),
+        // The steer is written while the turn runs; without receipts it cannot hold the turn open.
+        "sleep 0.4\n".to_owned(),
+        emit(r#"{"type":"result","subtype":"success","is_error":false,"result":"only"}"#),
+        "cat > /dev/null\n".to_owned(),
+    ]
+    .concat();
+    let cli = FakeCli::script(&body);
+    let adapter = adapter(harness_for(&cli));
+    adapter.start(context()).await.expect("the harness starts");
+    let mut stream = adapter.outputs().expect("the stream is handed out once");
+    adapter
+        .send(json!("hello"), true)
+        .await
+        .expect("the input is accepted");
+    let _started = next_chunk(&mut stream).await;
+    let first = next_chunk(&mut stream).await;
+    assert_eq!(output_text(&first), "only cycle");
+    adapter
+        .send(json!("and more"), true)
+        .await
+        .expect("the steer is accepted into the running turn");
+    let chunks = read_until_finished(&mut stream).await;
+    assert_eq!(answer_texts(&chunks), Vec::<&str>::new());
+    assert_eq!(
+        chunks.last().unwrap().payload["final_output"],
+        json!("only")
+    );
+    adapter.stop().await.expect("the harness stops");
+}
+
+/// An unacknowledged message stops blocking the turn once `lifecycle_ack_timeout_s` elapses.
+#[tokio::test]
+async fn an_unacknowledged_message_stops_blocking_the_turn() {
+    let body = [
+        RECEIPT_FN.to_owned(),
+        read_request("first"),
+        acknowledge("$first_uuid", "completed"),
+        emit(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"answered"}]}}"#),
+        // Let the host steer, then answer the first message only.
+        "sleep 0.1\n".to_owned(),
+        emit(r#"{"type":"result","subtype":"success","is_error":false,"result":"answered"}"#),
+        // The steered message is read but never acknowledged: only the deadline can end the turn.
+        read_request("second"),
+        "cat > /dev/null\n".to_owned(),
+    ]
+    .concat();
+    let cli = FakeCli::script(&body);
+    let adapter = adapter(create(json!({
+        "cli_path": cli.path().to_string_lossy(),
+        "lifecycle_ack_timeout_s": 0.4,
+    })));
+    adapter.start(context()).await.expect("the harness starts");
+    let mut stream = adapter.outputs().expect("the stream is handed out once");
+    adapter
+        .send(json!("hello"), true)
+        .await
+        .expect("the input is accepted");
+    let _started = next_chunk(&mut stream).await;
+    let first = next_chunk(&mut stream).await;
+    assert_eq!(output_text(&first), "answered");
+    let steered_at = std::time::Instant::now();
+    adapter
+        .send(json!("and more"), true)
+        .await
+        .expect("the steer is accepted into the running turn");
+    let chunks = read_until_finished(&mut stream).await;
+    let elapsed = steered_at.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "the turn waited for the acknowledgement deadline: {elapsed:?}"
+    );
+    assert!(elapsed < WAIT, "the turn did not hang: {elapsed:?}");
+    assert_eq!(
+        chunks.last().unwrap().payload["final_output"],
+        json!("answered")
+    );
+    adapter.stop().await.expect("the harness stops");
+}
+
+// ---------------------------------------------------------------------------
+// Failure classification
+// ---------------------------------------------------------------------------
+/// Decodes a JSON object into a CLI frame.
+fn frame(value: JsonValue) -> serde_json::Map<String, JsonValue> {
+    value
+        .as_object()
+        .cloned()
+        .expect("the test value is a JSON object")
+}
+
+/// The API statuses of a failed result map onto the shared categories and their retry flags.
+#[test]
+fn http_status_failures_are_classified_with_retryable_flags() {
+    let cases = [
+        (400_u64, "request_rejected", false),
+        (401, "auth_required", false),
+        (403, "auth_required", false),
+        (429, "rate_limited", true),
+        (500, "server_unavailable", true),
+        (529, "server_unavailable", true),
+    ];
+    for (status, category, retryable) in cases {
+        let result = frame(json!({
+            "type": "result",
+            "subtype": "error",
+            "is_error": true,
+            "api_error_status": status,
+            "errors": ["boom"],
+        }));
+        let error = claudecode::classify_result_message(&result);
+        assert_eq!(error.category.as_deref(), Some(category), "status {status}");
+        assert_eq!(error.retryable, Some(retryable), "status {status}");
+        assert_eq!(error.provider_data["http_status"], json!(status));
+        assert_eq!(error.message, "boom", "status {status}");
+        assert_eq!(error.code.as_deref(), Some("error"));
+    }
+    let unknown = frame(json!({"type": "result", "subtype": "error", "is_error": true}));
+    let error = claudecode::classify_result_message(&unknown);
+    assert_eq!(error.category.as_deref(), Some("sdk_error"));
+    assert_eq!(error.retryable, Some(false));
+    assert_eq!(error.message, "Claude turn failed (error)");
+    assert!(!error.provider_data.contains_key("http_status"));
+}
+
+/// The `assistant.error` identifiers map onto the shared categories, with their text as detail.
+#[test]
+fn assistant_error_identifiers_map_to_the_shared_categories() {
+    let cases = [
+        ("authentication_failed", "auth_required"),
+        ("billing_error", "quota_exceeded"),
+        ("invalid_request", "request_rejected"),
+        ("rate_limit", "rate_limited"),
+        ("server_error", "server_unavailable"),
+        ("something_new", "sdk_error"),
+    ];
+    for (identifier, category) in cases {
+        let error = claudecode::classify_assistant_error(identifier, None);
+        assert_eq!(error.category.as_deref(), Some(category), "{identifier}");
+        assert_eq!(error.code.as_deref(), Some(identifier));
+        assert_eq!(error.message, identifier);
+        assert_eq!(
+            error.retryable,
+            Some(matches!(category, "rate_limited" | "server_unavailable")),
+            "{identifier}"
+        );
+    }
+    let message = frame(json!({"content": [
+        {"type": "text", "text": "the API key expired"},
+        {"type": "tool_use", "id": "tool-1", "name": "Read"},
+    ]}));
+    let error = claudecode::classify_assistant_error("authentication_failed", Some(&message));
+    assert_eq!(error.message, "the API key expired");
+    assert_eq!(error.category.as_deref(), Some("auth_required"));
+    let huge = "x".repeat(claudecode::MAX_FAILURE_DETAIL_CHARS + 10);
+    let message = frame(json!({"content": [{"type": "text", "text": huge}]}));
+    let error = claudecode::classify_assistant_error("server_error", Some(&message));
+    assert!(
+        error.message.ends_with("...[truncated]"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        error.message.chars().count(),
+        claudecode::MAX_FAILURE_DETAIL_CHARS + "...[truncated]".chars().count()
+    );
+}
+
+/// CLI/process failures are classified by phase, with the CLI's error output folded in.
+#[test]
+fn cli_failures_are_classified_by_phase() {
+    let timeout = claudecode::classify_cli_failure(
+        claudecode::FailurePhase::Turn,
+        "TimeoutError",
+        "the read timed out",
+        None,
+    );
+    assert_eq!(timeout.category.as_deref(), Some("network_timeout"));
+    assert_eq!(timeout.retryable, Some(true));
+    assert_eq!(
+        timeout.provider_data["sdk_error_type"],
+        json!("TimeoutError")
+    );
+    let missing = claudecode::classify_cli_failure(
+        claudecode::FailurePhase::Startup,
+        "CLINotFoundError",
+        "the claude CLI was not found",
+        None,
+    );
+    assert_eq!(missing.category.as_deref(), Some("process_start_failed"));
+    assert_eq!(missing.retryable, Some(false));
+    let denied = claudecode::classify_cli_failure(
+        claudecode::FailurePhase::Startup,
+        "ProcessError",
+        "permission denied",
+        Some("sh: 1: claude: Permission denied"),
+    );
+    assert_eq!(denied.category.as_deref(), Some("process_start_failed"));
+    assert_eq!(
+        denied.message,
+        "permission denied\nError output: sh: 1: claude: Permission denied"
+    );
+    let late = claudecode::classify_cli_failure(
+        claudecode::FailurePhase::Turn,
+        "ProcessError",
+        "the CLI exited",
+        None,
+    );
+    assert_eq!(
+        late.category.as_deref(),
+        Some("sdk_error"),
+        "a process failure inside a turn is not a startup failure"
+    );
+    let unnamed = claudecode::classify_cli_failure(
+        claudecode::FailurePhase::Turn,
+        "CLIConnectionError",
+        "",
+        None,
+    );
+    assert_eq!(unnamed.message, "CLIConnectionError");
+    assert_eq!(
+        claudecode::FAILURE_CATEGORIES.len(),
+        9,
+        "the shared vocabulary is the documented one"
+    );
+}
+
+/// A pending assistant diagnostic is folded into the terminal failure.
+#[test]
+fn a_pending_assistant_error_is_merged_into_the_terminal_failure() {
+    let pending = claudecode::classify_assistant_error("rate_limit", None);
+    let terminal = claudecode::classify_result_message(&frame(json!({
+        "type": "result",
+        "subtype": "error",
+        "is_error": true,
+        "errors": ["unknown"],
+    })));
+    assert_eq!(terminal.category.as_deref(), Some("sdk_error"));
+    let merged = claudecode::merge_pending_error(Some(&pending), terminal);
+    assert_eq!(
+        merged.category.as_deref(),
+        Some("rate_limited"),
+        "the specific pending category wins over a generic terminal one"
+    );
+    assert_eq!(merged.retryable, Some(true));
+    assert_eq!(merged.message, "Claude turn failed (error)");
+    let terminal = claudecode::classify_result_message(&frame(json!({
+        "type": "result",
+        "subtype": "server_error",
+        "is_error": true,
+    })));
+    assert_eq!(
+        claudecode::merge_pending_error(None, terminal.clone()),
+        terminal,
+        "without a pending error the terminal failure is unchanged"
+    );
+}
+
+/// A failed result reaches the shell with the classified failure, including a status-only message.
+#[tokio::test]
+async fn a_rate_limited_result_reaches_the_shell_as_a_failure() {
+    let cli = frame_script(&[
+        r#"{"type":"result","subtype":"error","is_error":true,"api_error_status":429,"errors":["unknown"]}"#,
+    ]);
+    let adapter = adapter(harness_for(&cli));
+    adapter.start(context()).await.expect("the harness starts");
+    let mut stream = adapter.outputs().expect("the stream is handed out once");
+    adapter
+        .send(json!("go"), true)
+        .await
+        .expect("the input is accepted");
+    let chunks = read_chunks(&mut stream, 2).await;
+    assert_eq!(chunks[1].payload["kind"], json!("failed"));
+    assert_eq!(chunks[1].payload["error_code"], json!("error"));
+    assert_eq!(
+        chunks[1].payload["error_message"],
+        json!("Claude turn failed: HTTP 429")
+    );
+    adapter.stop().await.expect("the harness stops");
+}

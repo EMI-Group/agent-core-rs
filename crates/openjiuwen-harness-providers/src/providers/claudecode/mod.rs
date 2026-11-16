@@ -10,7 +10,10 @@
 //! - this module — the configuration data, the permission/system-prompt enums, the card, the
 //!   provider and the model mapping;
 //! - `harness` — [`ClaudeDriver`], the transport that spawns the `claude` CLI, speaks its
-//!   stream-json protocol and maps its frames onto the harness SPI.
+//!   stream-json protocol and maps its frames onto the harness SPI;
+//! - `lifecycle` — [`TurnCycleTracker`], the turn boundary taken from the CLI's `command_lifecycle`
+//!   delivery receipts;
+//! - `failure` — the failure classification of the CLI's error fields and process failures.
 //!
 //! # Python parity
 //!
@@ -46,11 +49,18 @@ use crate::vendor_cli::{resolve_binary, BinarySpec, VendorHarness};
 
 use super::vendor;
 
+mod failure;
 mod frames;
 mod harness;
+mod lifecycle;
 mod wire;
 
+pub use failure::{
+    classify_assistant_error, classify_cli_failure, classify_result_message, merge_pending_error,
+    FailurePhase, FAILURE_CATEGORIES, MAX_FAILURE_DETAIL_CHARS,
+};
 pub use harness::ClaudeDriver;
+pub use lifecycle::{CommandState, TurnCycleTracker, LIFECYCLE_FRAME_TYPE, SETTLED_SUBTYPE};
 
 /// Registry name of the Claude Code provider.
 pub const PROVIDER_NAME: &str = "claudecode";

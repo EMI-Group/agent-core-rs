@@ -37,7 +37,7 @@
 //!
 //! # Wire contract
 //!
-//! Every turn writes exactly one user frame and then reads until a terminal `result`:
+//! Every turn writes one user frame and then reads until the turn settles:
 //!
 //! ```json
 //! {"type":"user","message":{"role":"user","content":[{"type":"text","text":"…"}]},
@@ -45,24 +45,38 @@
 //! ```
 //!
 //! Frames are handled as follows: `system/init` captures and emits the provider session id,
-//! `assistant` projects text/thinking outputs, tool calls and usage, `user` projects tool results,
-//! `stream_event` projects delta outputs (partial messages only), `control_request/can_use_tool`
-//! answers the host's permission policy, `control_response` is ignored, `result` terminates the
-//! turn, and any other frame is forwarded as a provider event (nothing is silently dropped).
+//! `assistant` projects text/thinking outputs, tool calls and usage (and classifies a reported
+//! `error`), `user` projects tool results, `stream_event` projects delta outputs (partial messages
+//! only), `control_request/can_use_tool` answers the host's permission policy, `control_response` is
+//! ignored, `result` records the turn's terminal outcome, and any other frame — including the
+//! `command_lifecycle` delivery receipts — is forwarded as a provider event (nothing is silently
+//! dropped).
+//!
+//! # Turn boundary
+//!
+//! A `result` frame alone does not end the turn. The CLI acknowledges every user message with a
+//! `command_lifecycle` receipt keyed by the frame `uuid`, and a message the host steered into an
+//! idle CLI is answered in a *new* cycle carrying a result of its own; ending at the first result
+//! would leave that cycle's output outside the turn. The loop therefore feeds every inbound frame to
+//! a [`TurnCycleTracker`] and stops when the tracker says the turn settled: a result arrived and no
+//! submitted message is still outstanding. A CLI build that reports no receipts at all settles on
+//! the first result, exactly as before. After `lifecycle_ack_timeout_s` a message the CLI never
+//! acknowledged stops blocking the turn, and the abandonment is published as a `warning` diagnostic.
 //!
 //! # Cancellation
 //!
 //! A turn owns the child process for its whole duration and multiplexes between the next stdout
-//! line and its control channel (steer, interrupt, close). A control command therefore wins over a
-//! blocked read. `ChildProcess::read_json` is resumable after such a cancellation, but a partially
-//! read line is discarded: commands normally arrive while the CLI is idle, so no frame is in
-//! flight.
+//! line, its control channel (steer, interrupt, close) and the acknowledgement deadline. A control
+//! command therefore wins over a blocked read. `ChildProcess::read_json` is resumable after such a
+//! cancellation, but a partially read line is discarded: commands normally arrive while the CLI is
+//! idle, and the deadline only arms when the CLI has acknowledged nothing at all, so no frame is in
+//! flight on either path.
 //!
 //! # Files
 //!
 //! This module owns the driver lifecycle and the turn loop; `frames` projects the CLI's frames
-//! onto harness observations and `wire` builds the process invocation (argv, `--settings`,
-//! environment).
+//! onto harness observations, `lifecycle` decides the turn boundary, `failure` classifies CLI
+//! failures and `wire` builds the process invocation (argv, `--settings`, environment).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -71,9 +85,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use openjiuwen_harness_protocol::{
-    empty_json_object, AbortMode, CheckpointReason, HarnessCheckpoint, HarnessContext,
-    HarnessError, HarnessInput, HarnessInteractionHandler, HarnessResult, JsonObject, JsonValue,
-    TurnResult, TurnTerminationKind,
+    empty_json_object, AbortMode, CheckpointReason, DiagnosticLevel, HarnessCheckpoint,
+    HarnessContext, HarnessError, HarnessInput, HarnessInteractionHandler, HarnessResult,
+    JsonObject, JsonValue, TurnError, TurnResult, TurnTerminationKind,
 };
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -83,11 +97,12 @@ use crate::input::harness_input_text;
 use crate::skills::install_for_provider;
 use crate::vendor_cli::{
     checkpoint_str, derive_session_id, failed_turn, interrupted_turn, resolve_resume_id,
-    turn_error, ChildProcess, ChildProcessConfig, PermissionPolicy, TurnContext, TurnRequest,
-    VendorDriver,
+    ChildProcess, ChildProcessConfig, PermissionPolicy, TurnContext, TurnRequest, VendorDriver,
 };
 
-use super::frames::{with_tail, FrameAction, TurnAccumulator};
+use super::failure::{classify_cli_failure, FailurePhase};
+use super::frames::TurnAccumulator;
+use super::lifecycle::TurnCycleTracker;
 use super::wire::{build_args, build_env};
 use super::{ClaudeCodeHarnessConfig, CARD_NAME, DEFAULT_CLAUDE_MAX_BUFFER_SIZE};
 
@@ -106,8 +121,11 @@ const MISSING_RESULT_CODE: &str = "CLAUDE_MISSING_RESULT";
 /// Normalized failure code of a malformed CLI stream.
 const TRANSPORT_CODE: &str = "CLAUDE_TRANSPORT";
 
-/// Coarse failure category of an SDK/transport level failure.
-pub(super) const SDK_ERROR_CATEGORY: &str = "sdk_error";
+/// Error type name reported when the CLI's message stream ends before the turn does.
+const STREAM_ENDED_TYPE: &str = "CLIConnectionError";
+
+/// Error type name reported when a stdout line cannot be read or decoded.
+const READ_FAILED_TYPE: &str = "ProcessError";
 
 /// How long `close` waits for a running turn to release the child process.
 const CLOSE_LOCK_TIMEOUT: Duration = Duration::from_secs(4);
@@ -117,7 +135,7 @@ const CLOSE_LOCK_TIMEOUT: Duration = Duration::from_secs(4);
 enum TurnCommand {
     /// Write `text` as another user frame (host steering).
     Steer {
-        /// Message identifier minted by the harness shell.
+        /// Frame id minted for the steered message, so its receipts are attributable.
         message_id: String,
         /// Text projection of the steered input.
         text: String,
@@ -174,6 +192,10 @@ pub struct ClaudeDriver {
     interrupt_requested: AtomicBool,
     /// Last allocated checkpoint sequence.
     sequence: AtomicU64,
+    /// Number of steered messages the current cycle wrote, for their distinct frame ids.
+    steers: AtomicU64,
+    /// Receipt tracker of the current cycle; taken by the running turn and restored when it ends.
+    cycle_tracker: Mutex<Option<TurnCycleTracker>>,
 }
 
 impl ClaudeDriver {
@@ -188,6 +210,8 @@ impl ClaudeDriver {
             state: Mutex::new(DriverState::default()),
             interrupt_requested: AtomicBool::new(false),
             sequence: AtomicU64::new(0),
+            steers: AtomicU64::new(0),
+            cycle_tracker: Mutex::new(None),
         }
     }
 
@@ -265,6 +289,57 @@ impl ClaudeDriver {
         }
     }
 
+    /// Returns the acknowledgement timeout of an unacknowledged message.
+    fn ack_timeout(&self) -> Duration {
+        Duration::try_from_secs_f64(self.config.lifecycle_ack_timeout_s)
+            .unwrap_or_else(|_| Duration::from_secs_f64(DEFAULT_ACK_TIMEOUT_S))
+    }
+
+    /// Starts a fresh receipt tracker for a new CLI cycle (Python's `_connect`).
+    fn install_cycle_tracker(&self) {
+        *lock(&self.cycle_tracker) = Some(TurnCycleTracker::new(self.ack_timeout()));
+    }
+
+    /// Takes the cycle's tracker and starts tracking `turn_id`.
+    ///
+    /// The tracker is owned by the turn while it runs so its state can be advanced across awaits;
+    /// [`TurnCycleGuard`] puts it back when the turn ends.
+    fn begin_cycle(&self, turn_id: &str) -> TurnCycleGuard<'_> {
+        let mut tracker = lock(&self.cycle_tracker)
+            .take()
+            .unwrap_or_else(|| TurnCycleTracker::new(self.ack_timeout()));
+        tracker.begin_turn(turn_id);
+        TurnCycleGuard {
+            driver: self,
+            tracker: Some(tracker),
+        }
+    }
+
+    /// Mints the frame id of a steered message.
+    ///
+    /// The CLI echoes this id back as the `command_uuid` of its delivery receipts, which is what
+    /// ties a receipt to the message it answers; reusing the turn's own id would make a steered
+    /// message indistinguishable from the one that opened the turn.
+    fn mint_steer_id(&self, turn_message_id: &str) -> String {
+        let sequence = self.steers.fetch_add(1, Ordering::SeqCst) + 1;
+        format!("{turn_message_id}-steer-{sequence}")
+    }
+
+    /// Writes one user frame, recording its id for the CLI's receipts before it goes out.
+    async fn submit(
+        &self,
+        cycle: &mut TurnCycleGuard<'_>,
+        process: &mut ChildProcess,
+        message_id: &str,
+        text: &str,
+    ) -> HarnessResult<()> {
+        let frame = self.user_frame(message_id, text);
+        if let (Some(object), Some(tracker)) = (frame.as_object(), cycle.tracker.as_mut()) {
+            tracker.note_outbound(object);
+        }
+        process.write_json(&frame).await
+    }
+
     /// Writes the interrupt request and waits for the CLI's terminal acknowledgement.
     async fn finish_interrupt(
         &self,
@@ -320,6 +395,20 @@ impl ClaudeDriver {
 /// Message of a turn the host interrupted.
 const INTERRUPTED_MESSAGE: &str = "Claude Code interrupted the turn";
 
+/// Acknowledgement timeout used when the configuration carries no usable value.
+const DEFAULT_ACK_TIMEOUT_S: f64 = 10.0;
+
+/// Builds the failure of a CLI stream that died inside a turn.
+///
+/// The classification is the shared turn-phase one; the code keeps the adapter's normalized
+/// identifier, which a host can match without knowing the vendor's exception names.
+fn stream_failure(code: &str, message: &str, error_type: &str, stderr_tail: &str) -> TurnError {
+    let mut error =
+        classify_cli_failure(FailurePhase::Turn, error_type, message, Some(stderr_tail));
+    error.code = Some(code.to_owned());
+    error
+}
+
 /// Outcome of one interrupt-acknowledgement read.
 enum InterruptOutcome {
     /// The acknowledgement deadline elapsed.
@@ -336,22 +425,34 @@ enum TurnStep {
     Command(Option<TurnCommand>),
     /// A frame (or read failure) arrived.
     Frame(HarnessResult<Option<JsonValue>>),
+    /// The acknowledgement deadline of an unanswered message elapsed.
+    Deadline,
 }
 
-/// Waits for the next stdout frame or control command.
+/// Waits for the next stdout frame, control command or acknowledgement deadline.
 ///
 /// The read future is scoped to this call so cancelling it releases the process borrow; the
-/// control channel is polled first so a queued command always wins over a blocked read.
+/// control channel is polled first so a queued command always wins over a blocked read, and the
+/// deadline last so a frame that is already available is never traded for a timeout.
 async fn next_step(
     process: &mut ChildProcess,
     receiver: &mut mpsc::UnboundedReceiver<TurnCommand>,
+    deadline: Option<Duration>,
 ) -> TurnStep {
     let read = process.read_json();
     tokio::pin!(read);
+    let expiry = async {
+        match deadline {
+            Some(wait) => tokio::time::sleep(wait).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(expiry);
     tokio::select! {
         biased;
         command = receiver.recv() => TurnStep::Command(command),
         frame = &mut read => TurnStep::Frame(frame),
+        () = &mut expiry => TurnStep::Deadline,
     }
 }
 
@@ -369,6 +470,39 @@ struct TurnLinkGuard<'a> {
 impl Drop for TurnLinkGuard<'_> {
     fn drop(&mut self) {
         lock(&self.driver.turn_link).sender = None;
+    }
+}
+
+/// Ends the tracked turn and hands the receipt tracker back when the turn ends.
+struct TurnCycleGuard<'a> {
+    /// Driver the tracker belongs to.
+    driver: &'a ClaudeDriver,
+    /// Tracker owned by the running turn.
+    tracker: Option<TurnCycleTracker>,
+}
+
+impl TurnCycleGuard<'_> {
+    /// Returns the tracker of the running turn.
+    fn tracker(&self) -> &TurnCycleTracker {
+        self.tracker
+            .as_ref()
+            .expect("the turn owns its cycle tracker")
+    }
+
+    /// Returns the tracker of the running turn, mutably.
+    fn tracker_mut(&mut self) -> &mut TurnCycleTracker {
+        self.tracker
+            .as_mut()
+            .expect("the turn owns its cycle tracker")
+    }
+}
+
+impl Drop for TurnCycleGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(mut tracker) = self.tracker.take() {
+            tracker.end_turn();
+            *lock(&self.driver.cycle_tracker) = Some(tracker);
+        }
     }
 }
 
@@ -464,6 +598,7 @@ impl VendorDriver for ClaudeDriver {
         })
         .await?;
         *self.process.lock().await = Some(process);
+        self.install_cycle_tracker();
         if let Some(sink) = context.checkpoint_sink.as_ref() {
             let checkpoint = self.checkpoint(&provider_session_id, resumed);
             if let Err(error) = sink
@@ -485,6 +620,7 @@ impl VendorDriver for ClaudeDriver {
                 let _ = sender.send(TurnCommand::Close);
             }
         }
+        lock(&self.cycle_tracker).take();
         let Ok(mut guard) = tokio::time::timeout(CLOSE_LOCK_TIMEOUT, self.process.lock()).await
         else {
             return Err(HarnessError::state(format!(
@@ -502,7 +638,7 @@ impl VendorDriver for ClaudeDriver {
         Ok(())
     }
 
-    /// Runs one turn: writes the user frame and reads until a terminal `result`.
+    /// Runs one turn: writes the user frame and reads until the delivery receipts settle the turn.
     async fn run_turn(
         &self,
         turn: &TurnRequest,
@@ -530,20 +666,27 @@ impl VendorDriver for ClaudeDriver {
             link.sender = Some(sender);
         }
         let _link_guard = TurnLinkGuard { driver: self };
-        process
-            .write_json(&self.user_frame(&turn.message_id, &text))
+        let mut cycle = self.begin_cycle(&turn.turn_id);
+        self.submit(&mut cycle, process, &turn.message_id, &text)
             .await?;
         let mut accumulator = TurnAccumulator::default();
         if self.interrupt_requested.swap(false, Ordering::SeqCst) {
             return self.finish_interrupt(process, &mut receiver).await;
         }
         loop {
-            let outcome = next_step(process, &mut receiver).await;
+            let deadline = cycle.tracker().straggler_timeout();
+            let outcome = next_step(process, &mut receiver, deadline).await;
             let frame = match outcome {
+                TurnStep::Deadline => {
+                    // A message the CLI never acknowledged stops blocking the turn; a settle here
+                    // means nothing else is coming for it.
+                    if cycle.tracker_mut().abandon_unacknowledged() {
+                        break;
+                    }
+                    continue;
+                }
                 TurnStep::Command(Some(TurnCommand::Steer { message_id, text })) => {
-                    process
-                        .write_json(&self.user_frame(&message_id, &text))
-                        .await?;
+                    self.submit(&mut cycle, process, &message_id, &text).await?;
                     continue;
                 }
                 TurnStep::Command(Some(TurnCommand::Interrupt)) => {
@@ -562,23 +705,19 @@ impl VendorDriver for ClaudeDriver {
             }
             match frame {
                 Ok(None) => {
-                    let message = with_tail(
-                        "Claude Code ended the response stream without a result".to_owned(),
-                        &process.stderr_tail(),
-                    );
-                    return Ok(failed_turn(turn_error(
-                        message,
+                    return Ok(failed_turn(stream_failure(
                         MISSING_RESULT_CODE,
-                        SDK_ERROR_CATEGORY,
-                        false,
+                        "Claude Code ended the response stream without a result",
+                        STREAM_ENDED_TYPE,
+                        &process.stderr_tail(),
                     )));
                 }
                 Err(error) => {
-                    return Ok(failed_turn(turn_error(
-                        error.message(),
+                    return Ok(failed_turn(stream_failure(
                         TRANSPORT_CODE,
-                        SDK_ERROR_CATEGORY,
-                        false,
+                        error.message(),
+                        READ_FAILED_TYPE,
+                        &process.stderr_tail(),
                     )));
                 }
                 Ok(Some(value)) => {
@@ -588,16 +727,35 @@ impl VendorDriver for ClaudeDriver {
                             .await;
                         continue;
                     };
-                    match self
-                        .dispatch(frame, &turn.turn_id, session, &mut accumulator, process)
-                        .await?
-                    {
-                        FrameAction::Continue => {}
-                        FrameAction::Terminal(result) => return Ok(*result),
+                    self.dispatch(frame, &turn.turn_id, session, &mut accumulator, process)
+                        .await?;
+                    let settled = cycle.tracker_mut().note_inbound(frame);
+                    if accumulator.has_result() && settled {
+                        break;
                     }
                 }
             }
         }
+        let diagnostics = cycle.tracker_mut().drain_diagnostics();
+        let Some(result) = accumulator.terminal_result() else {
+            return Ok(failed_turn(stream_failure(
+                MISSING_RESULT_CODE,
+                "Claude Code ended the response stream without a result",
+                STREAM_ENDED_TYPE,
+                &process.stderr_tail(),
+            )));
+        };
+        for reported in diagnostics {
+            session
+                .diagnostic(
+                    &turn.turn_id,
+                    DiagnosticLevel::Warning,
+                    &format!("Claude Code {reported}"),
+                    JsonObject::new(),
+                )
+                .await;
+        }
+        Ok(result)
     }
 
     /// Writes the steered content as another user frame.
@@ -612,7 +770,7 @@ impl VendorDriver for ClaudeDriver {
             metadata: empty_json_object(),
         });
         self.send_command(TurnCommand::Steer {
-            message_id: turn.message_id.clone(),
+            message_id: self.mint_steer_id(&turn.message_id),
             text,
         })
     }
