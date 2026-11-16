@@ -131,7 +131,7 @@ Broadcast tokens are recognized before roster resolution; `resolve_targets` is p
 - `gate.rs`: FIFO admit/try_admit, drain, `not_active`, `gate_closed` after close (including after close+drain), close idempotence.
 - `approval.rs`: `to_interaction` kind/id/question, `parse_confirm` happy path/defaults/malformed, `approval_result_event` shape and `tool_approval_result` event type.
 - `inbox.rs`: FIFO push/drain, `msg_` id format, enabled/disabled `require_enabled`, builder field resolution.
-- Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` (the last one is currently blocked by the unimplemented sibling placeholder modules).
+- Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings`.
 
 ## Notes for Agents
 
