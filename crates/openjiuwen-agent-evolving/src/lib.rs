@@ -95,6 +95,8 @@ pub mod signal;
 pub mod trajectory;
 /// Test-time skill experience: tip bank, induction, consultation.
 pub mod ttse;
+/// Update contracts, apply helpers, updaters, and the RL update pipeline.
+pub mod updater;
 
 /// The crate name as reported by Cargo.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -200,4 +202,15 @@ pub use ttse::{
     DreamReport, Dreamer, EmbeddingIndex, IndexMatch, RankedTip, RetrieveMode, SuccessAssessment,
     SuccessDetector, TipBank, TipBankStats, TipCategory, TipClassifier, TipInducer, TipParser,
     TipRecord, TtseConfig, TtseEngine, RRF_K,
+};
+/// Update contracts, apply helpers, updaters, and the RL update pipeline.
+pub use updater::{
+    apply_updates, compute_advantages, domain_for_signal, execute_updates, normalize_update_value,
+    normalize_updates, policy_update_key, signals_from_cases, summarize_apply_results,
+    AdvantageGroupStats, AdvantageReport, ApplyResult, ApplySummary, GradientOptimizer,
+    GpuGradientOptimizer, LifecycleStage, MultiDimUpdater, OfflinePolicyOptimizer, OperatorMap,
+    ParameterUpdate, RecordingOptimizer, RecordingTarget, RlUpdatePipeline, SingleDimUpdater,
+    TextualOptimizer, Update, UpdateConfig, UpdateDomain, UpdateEffect, UpdateEntry, UpdateKey,
+    UpdateMode, UpdateTarget, UpdateValue, Updater, Updates, EXPERIENCES_TARGET, POLICY_TARGET,
+    SKILL_EXPERIENCE_ENTRY,
 };
