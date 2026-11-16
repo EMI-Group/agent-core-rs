@@ -334,9 +334,89 @@ pub struct PromptBundle {
     pub messages: Vec<ChatMessage>,
 }
 
+/// How one selection (or one whole search) was answered.
+///
+/// Rust-only provenance marker: a caller that never reads a log line or a trace event can
+/// read it off a [`SelectionResult`], a
+/// [`ProgressiveSearchResult`](crate::retrieval::search::progressive::ProgressiveSearchResult)
+/// or the facade's [`RetrievalResult`](crate::retrieval::search::service::RetrievalResult) to
+/// learn whether the configured model actually produced the selection.
+/// The degraded variants are the ones where it did not: [`SelectionProvenance::LexicalNoModel`],
+/// [`SelectionProvenance::LexicalAfterModelError`] and [`SelectionProvenance::UnusableReply`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionProvenance {
+    /// The configured model answered.
+    Model,
+    /// The lexical scorer answered because
+    /// [`SelectionMode::Lexical`](crate::retrieval::search::config::SelectionMode) asked for it
+    /// (or because no selection was made at all).
+    #[default]
+    Lexical,
+    /// [`SelectionMode::Generate`](crate::retrieval::search::config::SelectionMode) was
+    /// configured but no model is wired, so the lexical scorer answered as a documented
+    /// degradation (`MODE_LEXICAL_NO_MODEL`).
+    LexicalNoModel,
+    /// The model call or its reply failed and the fallback selector answered.
+    LexicalAfterModelError,
+    /// The embedding blend answered; no model is involved.
+    EmbeddingBlend,
+    /// A node with exactly one selectable target was taken without any selection.
+    SingleSelectable,
+    /// The model answered, but no code in its reply could be parsed, so the node selected
+    /// nothing.
+    UnusableReply,
+}
+
+impl SelectionProvenance {
+    /// The `snake_case` name the trace event and the provenance fields carry.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Lexical => "lexical",
+            Self::LexicalNoModel => "lexical_no_model",
+            Self::LexicalAfterModelError => "lexical_after_model_error",
+            Self::EmbeddingBlend => "embedding_blend",
+            Self::SingleSelectable => "single_selectable",
+            Self::UnusableReply => "unusable_reply",
+        }
+    }
+
+    /// Parses [`SelectionProvenance::as_str`]; `None` for an unknown name.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "model" => Some(Self::Model),
+            "lexical" => Some(Self::Lexical),
+            "lexical_no_model" => Some(Self::LexicalNoModel),
+            "lexical_after_model_error" => Some(Self::LexicalAfterModelError),
+            "embedding_blend" => Some(Self::EmbeddingBlend),
+            "single_selectable" => Some(Self::SingleSelectable),
+            "unusable_reply" => Some(Self::UnusableReply),
+            _ => None,
+        }
+    }
+
+    /// Whether the selection is a degradation: the configured model did not produce it.
+    ///
+    /// [`SelectionProvenance::Model`], [`SelectionProvenance::Lexical`] chosen by
+    /// configuration, [`SelectionProvenance::EmbeddingBlend`] and
+    /// [`SelectionProvenance::SingleSelectable`] are not degradations.
+    #[must_use]
+    pub fn is_degraded(self) -> bool {
+        matches!(
+            self,
+            Self::LexicalNoModel | Self::LexicalAfterModelError | Self::UnusableReply
+        )
+    }
+}
+
 /// One parsed selection answer.
 ///
-/// Mirrors Python `SelectionResult`.
+/// Mirrors Python `SelectionResult`, plus the Rust-only [`SelectionResult::provenance`] /
+/// [`SelectionResult::degraded`] markers so a selection that degraded away from the
+/// configured model says so in the value itself.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]
 pub struct SelectionResult {
@@ -346,6 +426,21 @@ pub struct SelectionResult {
     pub selected_targets: Vec<SelectableTarget>,
     /// Whether the answer abstained.
     pub is_abstain: bool,
+    /// How the selection was answered ([`SelectionProvenance`]).
+    pub provenance: SelectionProvenance,
+    /// Whether the configured model did not produce the answer
+    /// ([`SelectionProvenance::is_degraded`]).
+    pub degraded: bool,
+}
+
+impl SelectionResult {
+    /// Returns this result with `provenance` set, and `degraded` derived from it.
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: SelectionProvenance) -> Self {
+        self.provenance = provenance;
+        self.degraded = provenance.is_degraded();
+        self
+    }
 }
 
 /// One child subtree to recurse into, with the target that reached it.

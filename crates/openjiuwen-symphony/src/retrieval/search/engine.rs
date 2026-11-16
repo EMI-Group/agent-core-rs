@@ -84,7 +84,7 @@ use crate::retrieval::search::contracts::{
     BranchReducer, CurrentSubtreeProvider, SelectRequest, TargetExpander, TopKSelector,
 };
 use crate::retrieval::search::flow::{
-    ChatMessage, NodeSearchResult, SearchCursor, SelectableTarget,
+    ChatMessage, NodeSearchResult, SearchCursor, SelectableTarget, SelectionProvenance,
 };
 use crate::retrieval::search::render::SubtreeRenderer;
 use crate::retrieval::search::selector::FRAGMENT_SELECTED_EVENT;
@@ -525,6 +525,11 @@ impl RecursiveSearchEngine {
                     "selected_canonical_ids".to_owned(),
                     json!([only.canonical_id()]),
                 ),
+                (
+                    "provenance".to_owned(),
+                    json!(SelectionProvenance::SingleSelectable.as_str()),
+                ),
+                ("degraded".to_owned(), json!(false)),
             ]);
             state.trace.record(
                 FRAGMENT_SELECTED_EVENT,

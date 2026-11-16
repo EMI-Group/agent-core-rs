@@ -45,7 +45,10 @@
 //! # Methods
 //!
 //! [`FlatSearchResult::method`] is [`METHOD_FLAT`] when an embedder is configured *and* its
-//! weight is positive, and [`METHOD_FLAT_LEXICAL`] otherwise.
+//! weight is positive, and [`METHOD_FLAT_LEXICAL`] otherwise;
+//! [`FlatSearchResult::selection_provenance`] states the same fact as an enum
+//! ([`SelectionProvenance::EmbeddingBlend`] or [`SelectionProvenance::Lexical`]).
+//! The flat retriever calls no model, so no flat result is ever degraded.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -58,6 +61,7 @@ use serde_json::json;
 use crate::error::{validation, Result};
 use crate::retrieval::search::config::ProgressiveSearchConfig;
 use crate::retrieval::search::embedding::{blend_scores, EmbeddingScorer};
+use crate::retrieval::search::flow::SelectionProvenance;
 use crate::retrieval::search::lexical::{LexicalDocument, LexicalIndex};
 use crate::retrieval::search::selector::ranking_expression;
 use crate::retrieval::search::truncation::truncate_sorted_by_score;
@@ -93,6 +97,10 @@ pub struct FlatSearchResult {
     pub method: String,
     /// The ranking keys (each candidate's payload) in rank order.
     pub ranked_keys: Vec<String>,
+    /// How the ranking was produced: [`SelectionProvenance::EmbeddingBlend`] for the blend,
+    /// [`SelectionProvenance::Lexical`] for the lexical-only pass. Never degraded — the flat
+    /// retriever calls no model, so there is nothing to fall back from.
+    pub selection_provenance: SelectionProvenance,
 }
 
 /// The one-shot retriever: rank a flattened catalog for a query in a single pass.
@@ -136,6 +144,20 @@ impl FlatRetriever {
             METHOD_FLAT
         } else {
             METHOD_FLAT_LEXICAL
+        }
+    }
+
+    /// The provenance a call would report, matching [`Self::method`] one for one.
+    ///
+    /// An embedder configured with `weight == 0.0` is reported as
+    /// [`SelectionProvenance::Lexical`], because the blend is inactive and the ranking is exactly
+    /// the lexical one.
+    #[must_use]
+    pub fn selection_provenance(&self) -> SelectionProvenance {
+        if self.method() == METHOD_FLAT {
+            SelectionProvenance::EmbeddingBlend
+        } else {
+            SelectionProvenance::Lexical
         }
     }
 
@@ -231,6 +253,7 @@ impl FlatRetriever {
                 trace: search_trace(trace, node_id, 0),
                 method: self.method().to_owned(),
                 ranked_keys: Vec::new(),
+                selection_provenance: self.selection_provenance(),
             });
         }
 
@@ -283,6 +306,7 @@ impl FlatRetriever {
             trace: search_trace(trace, node_id, ranked_keys.len()),
             method: self.method().to_owned(),
             ranked_keys,
+            selection_provenance: self.selection_provenance(),
         })
     }
 }
@@ -523,7 +547,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(blended.method, METHOD_FLAT_LEXICAL);
+        assert_eq!(blended.selection_provenance, SelectionProvenance::Lexical);
         assert_eq!(keys(&blended), keys(&lexical));
+    }
+    #[tokio::test]
+    async fn the_flat_provenance_matches_the_reported_method() {
+        let lexical = FlatRetriever::new(config());
+        assert_eq!(lexical.selection_provenance(), SelectionProvenance::Lexical);
+        let result = lexical.retrieve(&tree(), "alpha", Some(0)).await.unwrap();
+        assert_eq!(result.selection_provenance, SelectionProvenance::Lexical);
+        let mut blended_config = config();
+        blended_config.embedding = blended_config.embedding.with_weight(0.5);
+        let blended =
+            FlatRetriever::new(blended_config).with_embedding(Arc::new(HashEmbedding::new(16)));
+        assert_eq!(
+            blended.selection_provenance(),
+            SelectionProvenance::EmbeddingBlend
+        );
+        let result = blended.retrieve(&tree(), "alpha", Some(0)).await.unwrap();
+        assert_eq!(
+            result.selection_provenance,
+            SelectionProvenance::EmbeddingBlend
+        );
+        assert!(!result.selection_provenance.is_degraded());
     }
 
     #[tokio::test]

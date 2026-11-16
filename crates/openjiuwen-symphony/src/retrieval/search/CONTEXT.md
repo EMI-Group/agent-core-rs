@@ -485,7 +485,7 @@ The model's line order is preserved and each `canonical_id` is emitted once (fir
 - Every public item carries a doc comment and a `//!` block links same-file or sibling items with an absolute `crate::retrieval::search::…` path; `cargo doc -p openjiuwen-symphony --no-deps` must stay warning-free.
 - Public data types are `serde`-serializable with `snake_case` field names, tolerant of unknown fields, and `JsonSchema` where the field types allow it (the borrowed request structs and the callback aliases are the documented exceptions).
 - Determinism: `BTreeMap`/`BTreeSet` everywhere in public and serialized shapes, sorted outputs, ties on the key, no clock, no RNG; the request marker is a digest for that reason.
-- Files stay ≲1000 lines; `lexical.rs` (~1584 lines) and `render/expose.rs` (~1566 lines) sit over the soft cap only because their in-file `#[cfg(test)]` suites stay beside the logic — see Notes for Agents.
+- Files stay ≲1000 lines; `lexical.rs` (~1584 lines), `render/expose.rs` (~1566 lines) and `selector.rs` (~1290 lines) sit over the soft cap only because their in-file `#[cfg(test)]` suites stay beside the logic — see Notes for Agents.
 - Deviations from the reference are documented, not silent: the matcher is a bounded subset, the code book is generated, `LexicalIndex.search_terms` is not ported, `casefold()` is approximated by `to_lowercase()`, and the model call takes one flattened prompt.
 
 ## Design Decisions
@@ -514,7 +514,7 @@ The model's line order is preserved and each `canonical_id` is emitted once (fir
 - Python's `LexicalIndex.search_terms` plural/verb term-family coverage ranking: every family here is the token plus its own derivations, which `missing_terms` documents.
 - The legacy direct-recursion path in `progressive.py` (`_search_node`, `_continue_from_resolutions`, `_select_items*`): `FlatRetriever` covers that shape with a one-pass ranking, and the engine path is the only traversal.
 - Branch parallelism (`ThreadPoolExecutor`, `max_parallel_branches`, `enable_parallel_branches`): the walk visits children sequentially in declared order; the config fields are carried for parity and ignored.
-- The fixed-prefix-cache request rejection (Python raises for a per-request `top_k` differing from the initialized one on `transformers_prefix_cached*`/`vllm`/`local_vllm` backends): there is no prefix-cache backend here, so a larger request is clamped instead.
+- The fixed-prefix-cache request rejection (Python raises for a per-request `top_k` differing from the initialized one on `transformers_prefix_cached*`/`vllm`/`local_vllm` backends): there is no prefix-cache backend here, so a larger request is clamped instead (reported as `RetrievalResult::top_k_clamped` plus a `tracing::warn!`).
 - S3/HTTP index materialization (`artifacts.loading`'s download-then-parse path): the index is a local directory read by `artifacts::load_index`.
 - `service/serving.py` (the vLLM demo script with hardcoded engine args): a dev script, not an entry point.
 - `agent/retrieval_toolkit.py`, the agent-facing browsing tools over this runtime (tree browsing, subtree disclosure rendering to an agent), which are not ported.

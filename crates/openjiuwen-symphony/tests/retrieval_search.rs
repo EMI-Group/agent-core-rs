@@ -47,7 +47,9 @@ use openjiuwen_symphony::retrieval::search::engine::{
     SEARCH_TRUNCATED_EVENT,
 };
 use openjiuwen_symphony::retrieval::search::flat::{FlatRetriever, METHOD_FLAT_LEXICAL};
-use openjiuwen_symphony::retrieval::search::flow::ChatMessage;
+use openjiuwen_symphony::retrieval::search::flow::{
+    ChatMessage, SelectionProvenance, SelectionResult,
+};
 use openjiuwen_symphony::retrieval::search::lexical::{LexicalDocument, LexicalIndex};
 use openjiuwen_symphony::retrieval::search::progressive::{
     ProgressiveRetriever, METHOD_LEXICAL_FALLBACK, METHOD_PROGRESSIVE,
@@ -56,7 +58,10 @@ use openjiuwen_symphony::retrieval::search::service::{
     runtime_config_from_config, GenerationConfig, RenderConfig, Retriever, RetrieverConfig,
     SearchRequest, TraversalConfig,
 };
-use openjiuwen_symphony::retrieval::search::FRAGMENT_SELECTED_EVENT;
+use openjiuwen_symphony::retrieval::search::{
+    trace_degraded_selections, trace_selection_provenance, FRAGMENT_SELECTED_EVENT, MODE_LEXICAL,
+    MODE_LEXICAL_NO_MODEL,
+};
 use openjiuwen_symphony::retrieval::types::{
     CatalogRecord, IndexManifest, IndexNode, LoadedIndex, RetrieverItem, RetrieverNode,
     CATALOG_FILENAME, MANIFEST_FILENAME, MODE_FULL, ROOT_NODE_ID,
@@ -1330,4 +1335,230 @@ async fn case_17_validation_and_the_accessors() {
             .embedding,
         EmbeddingScoringConfig::default()
     );
+}
+
+// ---------------------------------------------------------------------------
+// 18–22: the degraded-selection provenance
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn case_18_generate_without_a_model_is_an_observable_degradation() {
+    let degraded = model_retriever(level_config()).await;
+    assert_eq!(degraded.method(), METHOD_LEXICAL_FALLBACK);
+    assert_eq!(
+        degraded.selection_provenance(),
+        SelectionProvenance::LexicalNoModel
+    );
+
+    let lexical = model_retriever(RetrieverConfig {
+        generation: GenerationConfig {
+            mode: SelectionMode::Lexical,
+            ..GenerationConfig::default()
+        },
+        ..level_config()
+    })
+    .await;
+
+    let degraded_details = degraded.search_details("alpha writing").await.unwrap();
+    let lexical_details = lexical.search_details("alpha writing").await.unwrap();
+    assert_eq!(
+        degraded_details.item_ids, lexical_details.item_ids,
+        "the degradation keeps the lexical ranking"
+    );
+    assert_eq!(degraded_details.method, METHOD_LEXICAL_FALLBACK);
+    assert_eq!(
+        degraded_details.selection_provenance,
+        SelectionProvenance::LexicalNoModel
+    );
+    assert!(degraded_details.degraded_selections >= 1);
+
+    let degraded_trace = retriever_probe(&degraded_details);
+    let selections: Vec<_> = degraded_trace
+        .events()
+        .iter()
+        .filter(|event| event.event_type == FRAGMENT_SELECTED_EVENT)
+        .collect();
+    assert!(!selections.is_empty());
+    let mut degraded_count = 0_usize;
+    for event in &selections {
+        match event.detail["mode"].as_str() {
+            Some(MODE_LEXICAL_NO_MODEL) => {
+                degraded_count += 1;
+                assert_eq!(
+                    event.detail["provenance"],
+                    serde_json::json!("lexical_no_model")
+                );
+                assert_eq!(event.detail["degraded"], serde_json::json!(true));
+            }
+            // A node with one selectable target is taken without a selection (never degraded).
+            Some("single_selectable_shortcut") => {
+                assert_eq!(
+                    event.detail["provenance"],
+                    serde_json::json!("single_selectable")
+                );
+                assert_eq!(event.detail["degraded"], serde_json::json!(false));
+            }
+            other => panic!("unexpected selection mode {other:?}"),
+        }
+    }
+    assert!(degraded_count >= 1, "the model-less selections are marked");
+    assert_eq!(trace_degraded_selections(&degraded_trace), degraded_count);
+    assert!(
+        matches!(
+            trace_selection_provenance(&degraded_trace),
+            Some(SelectionProvenance::LexicalNoModel | SelectionProvenance::SingleSelectable,)
+        ),
+        "the walk's last selection is either a degraded selection or the shortcut"
+    );
+
+    // The deliberately lexical retriever ranks identically and is not marked degraded.
+    assert_eq!(lexical.selection_provenance(), SelectionProvenance::Lexical);
+    assert_eq!(
+        lexical_details.selection_provenance,
+        SelectionProvenance::Lexical
+    );
+    assert_eq!(lexical_details.degraded_selections, 0);
+    for event in lexical_details
+        .trace_events
+        .iter()
+        .filter(|event| event.event_type == FRAGMENT_SELECTED_EVENT)
+    {
+        let (provenance, mode) = if event.detail["mode"] == serde_json::json!(MODE_LEXICAL) {
+            ("lexical", MODE_LEXICAL)
+        } else {
+            // The single-selectable shortcut is not a selection either.
+            ("single_selectable", "single_selectable_shortcut")
+        };
+        assert_eq!(event.detail["mode"], serde_json::json!(mode));
+        assert_eq!(event.detail["provenance"], serde_json::json!(provenance));
+        assert_eq!(event.detail["degraded"], serde_json::json!(false));
+    }
+    assert_eq!(
+        trace_degraded_selections(&retriever_probe(&lexical_details)),
+        0
+    );
+}
+
+#[tokio::test]
+async fn case_19_error_mode_reports_the_typed_unsupported_with_guidance() {
+    let retriever = model_retriever(RetrieverConfig {
+        generation: GenerationConfig {
+            fallback_mode: FallbackMode::Error,
+            ..GenerationConfig::default()
+        },
+        ..level_config()
+    })
+    .await;
+    let error = retriever
+        .search_details("alpha")
+        .await
+        .expect_err("generate mode without a model must not select");
+    assert!(is_unsupported(&error), "{error}");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let message = error.message();
+    for needle in [
+        "needs a model",
+        "with_generate_selector",
+        "SelectionMode::Lexical",
+        "FallbackMode::Deterministic",
+    ] {
+        assert!(message.contains(needle), "missing {needle:?}: {message}");
+    }
+}
+
+#[tokio::test]
+async fn case_20_the_provenance_fields_round_trip_and_default_for_old_payloads() {
+    // An old `SelectionResult` payload carries neither new field.
+    let old: SelectionResult =
+        serde_json::from_str(r#"{"raw_output":"1","selected_targets":[],"is_abstain":false}"#)
+            .unwrap();
+    assert_eq!(old.provenance, SelectionProvenance::Lexical);
+    assert!(!old.degraded);
+
+    let degraded = SelectionResult::default().with_provenance(SelectionProvenance::LexicalNoModel);
+    assert!(degraded.degraded);
+    let encoded = serde_json::to_string(&degraded).unwrap();
+    let parsed: SelectionResult = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(parsed.provenance, SelectionProvenance::LexicalNoModel);
+    assert!(parsed.degraded);
+
+    // An old `RetrievalResult` payload parses and reports the additive defaults.
+    let legacy: openjiuwen_symphony::retrieval::search::RetrievalResult =
+        serde_json::from_str(r#"{"method":"lexical_fallback","item_ids":["alpha-writer"]}"#)
+            .unwrap();
+    assert_eq!(legacy.selection_provenance, SelectionProvenance::Lexical);
+    assert_eq!(legacy.degraded_selections, 0);
+    assert!(!legacy.top_k_clamped);
+
+    // A live result round-trips with its provenance.
+    let retriever = model_retriever(level_config()).await;
+    let details = retriever.search_details("alpha writing").await.unwrap();
+    assert_eq!(
+        details.selection_provenance,
+        SelectionProvenance::LexicalNoModel
+    );
+    let encoded = serde_json::to_string(&details).unwrap();
+    let parsed: openjiuwen_symphony::retrieval::search::RetrievalResult =
+        serde_json::from_str(&encoded).unwrap();
+    assert_eq!(parsed, details);
+}
+
+#[tokio::test]
+async fn case_21_the_degraded_walk_renders_byte_identical_disclosures() {
+    let retriever = model_retriever(level_config()).await;
+    let rendered = |details: &openjiuwen_symphony::retrieval::search::RetrievalResult| {
+        details
+            .trace_events
+            .iter()
+            .filter(|event| event.event_type == FRAGMENT_BUILT_EVENT)
+            .map(|event| event.detail["rendered_tree"].clone())
+            .collect::<Vec<serde_json::Value>>()
+    };
+    let first = retriever.search_details("alpha writing").await.unwrap();
+    let second = retriever.search_details("alpha writing").await.unwrap();
+    assert!(!rendered(&first).is_empty());
+    assert_eq!(
+        rendered(&first),
+        rendered(&second),
+        "byte-identical disclosures"
+    );
+    assert_eq!(first.trace_events, second.trace_events);
+    assert_eq!(first.selection_provenance, second.selection_provenance);
+    assert_eq!(first.degraded_selections, second.degraded_selections);
+}
+
+#[tokio::test]
+async fn case_22_the_top_k_clamp_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path()).await;
+    let retriever = Retriever::load(
+        dir.path(),
+        RetrieverConfig {
+            top_k: 2,
+            ..RetrieverConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let defaulted = retriever.search_details("capability").await.unwrap();
+    assert!(
+        !defaulted.top_k_clamped,
+        "the configured top_k is not a clamp"
+    );
+    let one = retriever
+        .search_details_with("capability", &SearchRequest { top_k: Some(1) })
+        .await
+        .unwrap();
+    assert!(!one.top_k_clamped);
+    let unlimited = retriever
+        .search_details_with("capability", &SearchRequest { top_k: Some(0) })
+        .await
+        .unwrap();
+    assert!(!unlimited.top_k_clamped, "0 is the unlimited sentinel");
+    let oversized = retriever
+        .search_details_with("capability", &SearchRequest { top_k: Some(9) })
+        .await
+        .unwrap();
+    assert!(oversized.top_k_clamped);
+    assert_eq!(oversized.item_ids.len(), 2);
 }

@@ -13,7 +13,7 @@
 //!   [`FallbackMode::Error`](crate::llm::FallbackMode) answers
 //!   [`Error::Unsupported`](crate::error::Error) instead of panicking, and
 //!   [`FallbackMode::Deterministic`](crate::llm::FallbackMode) (the default) uses the
-//!   lexical selector.
+//!   lexical selector **as an observable degradation** (see below).
 //!
 //! # Selection order
 //!
@@ -25,10 +25,29 @@
 //!    [`FallbackMode::Error`](crate::llm::FallbackMode) and logged-then-degraded to the
 //!    lexical selector under [`FallbackMode::Deterministic`](crate::llm::FallbackMode).
 //! 3. [`SelectionMode::Generate`] without a generate selector: the deterministic mode uses
-//!    [`LexicalTopKSelector`], the error mode is [`Error::Unsupported`](crate::error::Error).
+//!    [`LexicalTopKSelector`] and reports [`MODE_LEXICAL_NO_MODEL`], the error mode is
+//!    [`Error::Unsupported`](crate::error::Error).
 //!
 //! Every selection records exactly one `fragment_selected` trace event carrying the mode,
-//! the selected codes, the selected canonical ids and the raw model output.
+//! the selected codes, the selected canonical ids, the raw model output, the
+//! [`SelectionProvenance`] (`provenance`) and whether the selection degraded
+//! (`degraded`). The returned [`SelectionResult`] carries the same two markers, so a caller
+//! that reads neither the log nor the trace still learns whether the configured model
+//! actually produced the answer:
+//!
+//! | path | `mode` | provenance | degraded |
+//! | --- | --- | --- | --- |
+//! | model answered | [`MODE_GENERATE`] | [`SelectionProvenance::Model`] | no |
+//! | model answered unparseably | [`MODE_GENERATE`] | [`SelectionProvenance::UnusableReply`] | yes |
+//! | model failed, lexical fell in | [`MODE_LEXICAL`] | [`SelectionProvenance::LexicalAfterModelError`] | yes |
+//! | [`SelectionMode::Lexical`] | [`MODE_LEXICAL`] | [`SelectionProvenance::Lexical`] | no |
+//! | `Generate` with no model wired | [`MODE_LEXICAL_NO_MODEL`] | [`SelectionProvenance::LexicalNoModel`] | yes |
+//!
+//! The no-model degradation warns **once per selector instance** (clones share the flag),
+//! because a walk would otherwise repeat the same configuration problem at every node; a
+//! model failure and an unusable reply warn on every occurrence, because each names a
+//! distinct failing call and reply. Aggregates over the trace are reported by
+//! [`trace_selection_provenance`] and [`trace_degraded_selections`].
 //!
 //! # The lexical selector
 //!
@@ -43,23 +62,27 @@
 //! [`ProgressiveSearchConfig::truncation`] then applies, and `top_k == 0` means unlimited.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::error::{unsupported, Result};
 use crate::llm::FallbackMode;
+use crate::retrieval::search::blend_selector::MODE_EMBEDDING_BLEND;
 use crate::retrieval::search::config::{ProgressiveSearchConfig, SelectionMode};
 use crate::retrieval::search::contracts::{
     GenerateFragmentSelector, GenerateRequest, SelectRequest, TopKSelector,
 };
+use crate::retrieval::search::engine::MODE_SINGLE_SELECTABLE_SHORTCUT;
 use crate::retrieval::search::flow::{
     ChatMessage, CurrentSubtree, SearchCursor, SelectableTarget, SelectionProtocol,
-    SelectionResult, ABSTAIN_TOKEN,
+    SelectionProvenance, SelectionResult, ABSTAIN_TOKEN,
 };
 use crate::retrieval::search::lexical::{LexicalDocument, LexicalIndex, MAX_QUERY_CHARS};
 use crate::retrieval::search::truncation::{truncate_chars, truncate_sorted_by_score};
-use crate::retrieval::types::RetrieverTrace;
+use crate::retrieval::types::{RetrieverTrace, RetrieverTraceEvent};
 
 /// The trace event every selection records.
 pub const FRAGMENT_SELECTED_EVENT: &str = "fragment_selected";
@@ -69,6 +92,13 @@ pub const MODE_LEXICAL: &str = "lexical_fallback";
 
 /// The `mode` a model-backed selection reports in its trace event.
 pub const MODE_GENERATE: &str = "generate";
+
+/// The `mode` a lexical selection reports when
+/// [`SelectionMode::Generate`] had no model to select with.
+///
+/// This is the observable form of the no-model degradation: [`MODE_LEXICAL`] means the
+/// lexical scorer was asked for, this value means it was all that was available.
+pub const MODE_LEXICAL_NO_MODEL: &str = "lexical_no_model";
 
 /// The "nothing here is relevant" phrasings, all lowercase.
 ///
@@ -190,7 +220,9 @@ impl LexicalTopKSelector {
             raw_output: String::new(),
             selected_targets,
             is_abstain: false,
+            ..SelectionResult::default()
         }
+        .with_provenance(SelectionProvenance::Lexical)
     }
 }
 
@@ -254,13 +286,17 @@ pub(crate) fn document(target: &SelectableTarget) -> LexicalDocument {
 /// The default [`TopKSelector`].
 ///
 /// Mirrors Python `DefaultTopKSelector`, except that the generate selector is optional
-/// (`with_generate_selector`) and a lexical selector fills in when it is absent or fails.
+/// (`with_generate_selector`) and a lexical selector fills in when it is absent or fails —
+/// visibly: the no-model degradation reports [`MODE_LEXICAL_NO_MODEL`] and warns once, and
+/// every degraded answer carries its [`SelectionProvenance`].
 #[derive(Debug, Clone, Default)]
 pub struct DefaultTopKSelector {
     /// The traversal config (the selection mode, the fallback mode and the truncation).
     config: ProgressiveSearchConfig,
     /// The injected model-facing selector; `None` selects lexically.
     generate: Option<GenerateFragmentSelector>,
+    /// Whether the one-per-selector no-model warning has been emitted. Clones share it.
+    no_model_warned: Arc<AtomicBool>,
 }
 
 impl DefaultTopKSelector {
@@ -270,6 +306,7 @@ impl DefaultTopKSelector {
         Self {
             config,
             generate: None,
+            no_model_warned: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -285,6 +322,30 @@ impl DefaultTopKSelector {
     #[must_use]
     pub fn is_model_backed(&self) -> bool {
         self.generate.is_some()
+    }
+
+    /// Whether the no-model degradation warning has already been emitted.
+    #[must_use]
+    pub fn has_warned_no_model(&self) -> bool {
+        self.no_model_warned.load(Ordering::Relaxed)
+    }
+
+    /// Warns once per selector instance (clones share the flag) about the no-model
+    /// degradation.
+    fn warn_no_model_once(&self, cursor: &SearchCursor) {
+        if self.no_model_warned.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        tracing::warn!(
+            node_id = %cursor.node_id,
+            depth = cursor.depth,
+            selection_mode = ?self.config.selection_mode,
+            fallback = MODE_LEXICAL_NO_MODEL,
+            "SelectionMode::Generate has no generate selector; selecting lexically without a \
+             model (warned once per selector instance). Wire a selector with \
+             DefaultTopKSelector::with_generate_selector, use SelectionMode::Lexical, or keep \
+             FallbackMode::Deterministic"
+        );
     }
 
     /// The lexical selector this one falls back to.
@@ -320,11 +381,130 @@ impl DefaultTopKSelector {
             .take(limit)
             .collect();
         let is_abstain = selected_targets.is_empty() && is_abstain_output(&raw_output);
+        let provenance =
+            unusable_reply_provenance(cursor, &raw_output, &selected_targets, is_abstain);
         Ok(SelectionResult {
             raw_output,
             selected_targets,
             is_abstain,
+            ..SelectionResult::default()
+        }
+        .with_provenance(provenance))
+    }
+}
+
+/// Whether an answered selection is an unusable reply, warning when it is.
+///
+/// A blank answer and the abstain token are legitimate ("nothing asked", "nothing relevant"),
+/// so only a non-blank, non-abstaining answer that selected nothing counts: the model replied
+/// but no code in it named a known candidate.
+fn unusable_reply_provenance(
+    cursor: &SearchCursor,
+    raw_output: &str,
+    selected_targets: &[SelectableTarget],
+    is_abstain: bool,
+) -> SelectionProvenance {
+    if !selected_targets.is_empty() || is_abstain || raw_output.trim().is_empty() {
+        return SelectionProvenance::Model;
+    }
+    tracing::warn!(
+        node_id = %cursor.node_id,
+        depth = cursor.depth,
+        reply_chars = raw_output.chars().count(),
+        "the model reply named no known candidate; the node selects nothing"
+    );
+    SelectionProvenance::UnusableReply
+}
+
+/// The [`SelectionProvenance`] a trace `mode` maps to, for a trace event that carries no
+/// explicit `provenance` detail (an older record or a custom selector).
+#[must_use]
+pub fn selection_provenance_for_mode(mode: &str) -> Option<SelectionProvenance> {
+    match mode {
+        MODE_GENERATE => Some(SelectionProvenance::Model),
+        MODE_LEXICAL => Some(SelectionProvenance::Lexical),
+        MODE_LEXICAL_NO_MODEL => Some(SelectionProvenance::LexicalNoModel),
+        MODE_EMBEDDING_BLEND => Some(SelectionProvenance::EmbeddingBlend),
+        MODE_SINGLE_SELECTABLE_SHORTCUT => Some(SelectionProvenance::SingleSelectable),
+        _ => None,
+    }
+}
+
+/// The provenance of one selection event, preferring its explicit `provenance` detail and
+/// falling back to its `mode`.
+fn event_provenance(event: &RetrieverTraceEvent) -> Option<SelectionProvenance> {
+    event
+        .detail
+        .get("provenance")
+        .and_then(Value::as_str)
+        .and_then(SelectionProvenance::parse)
+        .or_else(|| {
+            event
+                .detail
+                .get("mode")
+                .and_then(Value::as_str)
+                .and_then(selection_provenance_for_mode)
         })
+}
+
+/// The provenance of the last `fragment_selected` event in `trace`.
+///
+/// `None` when the trace recorded no selection at all.
+#[must_use]
+pub fn trace_selection_provenance(trace: &RetrieverTrace) -> Option<SelectionProvenance> {
+    trace
+        .events()
+        .iter()
+        .rev()
+        .filter(|event| event.event_type == FRAGMENT_SELECTED_EVENT)
+        .find_map(event_provenance)
+}
+
+/// How many `fragment_selected` events in `trace` report a degraded selection.
+///
+/// An event without the explicit `degraded` detail is classified by its provenance (or, for
+/// an older record, its `mode`), so a custom selector's events are counted too.
+#[must_use]
+pub fn trace_degraded_selections(trace: &RetrieverTrace) -> usize {
+    trace
+        .events()
+        .iter()
+        .filter(|event| event.event_type == FRAGMENT_SELECTED_EVENT)
+        .filter(
+            |event| match event.detail.get("degraded").and_then(Value::as_bool) {
+                Some(degraded) => degraded,
+                None => event_provenance(event).is_some_and(SelectionProvenance::is_degraded),
+            },
+        )
+        .count()
+}
+
+/// Rewrites the last `fragment_selected` event of `cursor` in `trace` as a degraded
+/// selection.
+///
+/// Used after a fallback selector answered: the fallback records its own event (with its own
+/// mode), and this adds the provenance that says *why* it answered. Returns whether a
+/// matching event was found.
+pub(crate) fn mark_selection_degraded(
+    trace: &mut RetrieverTrace,
+    cursor: &SearchCursor,
+    provenance: SelectionProvenance,
+) -> bool {
+    match trace.events.iter_mut().rev().find(|event| {
+        event.event_type == FRAGMENT_SELECTED_EVENT
+            && event.node_id == cursor.node_id
+            && event.depth == cursor.depth
+    }) {
+        Some(event) => {
+            event
+                .detail
+                .insert("provenance".to_owned(), json!(provenance.as_str()));
+            event
+                .detail
+                .insert("degraded".to_owned(), json!(provenance.is_degraded()));
+            true
+        }
+        None => false,
     }
 }
 
@@ -356,8 +536,8 @@ impl TopKSelector for DefaultTopKSelector {
     ) -> Result<SelectionResult> {
         let cursor = request.cursor;
         if self.config.selection_mode == SelectionMode::Generate {
-            match self.generate.as_ref() {
-                Some(selector) => match Self::select_generated(selector, &request, trace) {
+            if let Some(selector) = self.generate.as_ref() {
+                match Self::select_generated(selector, &request, trace) {
                     Ok(result) => {
                         record_selection(trace, cursor, MODE_GENERATE, &result);
                         return Ok(result);
@@ -371,21 +551,35 @@ impl TopKSelector for DefaultTopKSelector {
                             "progressive selection failed; falling back to the lexical selector"
                         ),
                     },
-                },
-                None => {
-                    if self.config.fallback_mode == FallbackMode::Error {
-                        return Err(unsupported(
-                            "progressive selection needs a model: configure a generate selector \
-                             with DefaultTopKSelector::with_generate_selector, use \
-                             SelectionMode::Lexical, or FallbackMode::Deterministic",
-                        ));
-                    }
                 }
+            } else {
+                if self.config.fallback_mode == FallbackMode::Error {
+                    return Err(unsupported(
+                        "progressive selection needs a model: configure a generate selector \
+                         with DefaultTopKSelector::with_generate_selector, use \
+                         SelectionMode::Lexical, or FallbackMode::Deterministic",
+                    ));
+                }
+                self.warn_no_model_once(cursor);
+                let result = self
+                    .lexical()
+                    .select(request.subtree, request.query_messages, cursor.top_k)
+                    .with_provenance(SelectionProvenance::LexicalNoModel);
+                record_selection(trace, cursor, MODE_LEXICAL_NO_MODEL, &result);
+                return Ok(result);
             }
+            // The generate selector failed under the deterministic mode.
+            let result = self
+                .lexical()
+                .select(request.subtree, request.query_messages, cursor.top_k)
+                .with_provenance(SelectionProvenance::LexicalAfterModelError);
+            record_selection(trace, cursor, MODE_LEXICAL, &result);
+            return Ok(result);
         }
         let result = self
             .lexical()
-            .select(request.subtree, request.query_messages, cursor.top_k);
+            .select(request.subtree, request.query_messages, cursor.top_k)
+            .with_provenance(SelectionProvenance::Lexical);
         record_selection(trace, cursor, MODE_LEXICAL, &result);
         Ok(result)
     }
@@ -413,6 +607,8 @@ pub(crate) fn record_selection(
         ("raw_output".to_owned(), json!(result.raw_output)),
         ("selected_canonical_ids".to_owned(), json!(canonical_ids)),
         ("selected_codes".to_owned(), json!(codes)),
+        ("provenance".to_owned(), json!(result.provenance.as_str())),
+        ("degraded".to_owned(), json!(result.degraded)),
     ]);
     trace.record(
         FRAGMENT_SELECTED_EVENT,
@@ -909,5 +1105,186 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(result.selected_targets.len(), 2);
         assert_eq!(trace.last().unwrap().detail["mode"], json!(MODE_LEXICAL));
+    }
+
+    #[tokio::test]
+    async fn the_no_model_degradation_is_marked_and_warned_once() {
+        let selector = DefaultTopKSelector::new(ProgressiveSearchConfig::default());
+        assert!(!selector.has_warned_no_model());
+        let subtree = ranked_subtree();
+        let cursor = cursor(5);
+        let messages = [ChatMessage::user("markdown documentation")];
+        let prompt = PromptBundle::default();
+
+        // The ranking is exactly the lexical selector's.
+        let lexical = LexicalTopKSelector::new(ProgressiveSearchConfig::default())
+            .select(&subtree, &messages, 5);
+        let mut trace = RetrieverTrace::default();
+        let degraded = selector
+            .select_topk(request(&cursor, &messages, &subtree, &prompt), &mut trace)
+            .await
+            .unwrap();
+        assert_eq!(degraded.selected_targets, lexical.selected_targets);
+        assert_eq!(degraded.provenance, SelectionProvenance::LexicalNoModel);
+        assert!(degraded.degraded);
+
+        let event = trace.last().unwrap();
+        assert_eq!(event.detail["mode"], json!(MODE_LEXICAL_NO_MODEL));
+        assert_eq!(event.detail["provenance"], json!("lexical_no_model"));
+        assert_eq!(event.detail["degraded"], json!(true));
+        assert!(selector.has_warned_no_model());
+
+        // A second node of the same walk reports the same mode and does not re-warn.
+        let mut again = RetrieverTrace::default();
+        let next = selector
+            .select_topk(request(&cursor, &messages, &subtree, &prompt), &mut again)
+            .await
+            .unwrap();
+        assert_eq!(next.provenance, SelectionProvenance::LexicalNoModel);
+        assert_eq!(
+            again.last().unwrap().detail["mode"],
+            json!(MODE_LEXICAL_NO_MODEL)
+        );
+        assert!(selector.has_warned_no_model());
+    }
+
+    #[tokio::test]
+    async fn a_failing_generate_fn_is_marked_as_degraded() {
+        let selector = DefaultTopKSelector::new(ProgressiveSearchConfig::default())
+            .with_generate_selector(GenerateFragmentSelector::new(Arc::new(
+                |_request: GenerateRequest<'_>| Err(Error::llm("model unavailable")),
+            )));
+        let subtree = ranked_subtree();
+        let cursor = cursor(5);
+        let messages = [ChatMessage::user("markdown documentation")];
+        let prompt = PromptBundle::default();
+        let mut trace = RetrieverTrace::default();
+        let result = selector
+            .select_topk(request(&cursor, &messages, &subtree, &prompt), &mut trace)
+            .await
+            .unwrap();
+        assert!(!result.selected_targets.is_empty());
+        assert_eq!(
+            result.provenance,
+            SelectionProvenance::LexicalAfterModelError
+        );
+        assert!(result.degraded);
+        let event = trace.last().unwrap();
+        assert_eq!(event.detail["mode"], json!(MODE_LEXICAL));
+        assert_eq!(
+            event.detail["provenance"],
+            json!("lexical_after_model_error")
+        );
+        assert_eq!(event.detail["degraded"], json!(true));
+        assert!(trace_selection_provenance(&trace).unwrap().is_degraded());
+        assert_eq!(trace_degraded_selections(&trace), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unusable_reply_is_marked_and_selects_nothing() {
+        let selector = DefaultTopKSelector::new(ProgressiveSearchConfig::default())
+            .with_generate_selector(GenerateFragmentSelector::new(Arc::new(|_| {
+                Ok(("garbage !!".to_owned(), Vec::new()))
+            })));
+        let subtree = ranked_subtree();
+        let cursor = cursor(5);
+        let messages = [ChatMessage::user("ask")];
+        let prompt = PromptBundle::default();
+        let mut trace = RetrieverTrace::default();
+        let result = selector
+            .select_topk(request(&cursor, &messages, &subtree, &prompt), &mut trace)
+            .await
+            .unwrap();
+        assert!(result.selected_targets.is_empty());
+        assert!(!result.is_abstain);
+        assert_eq!(result.provenance, SelectionProvenance::UnusableReply);
+        assert!(result.degraded);
+        let event = trace.last().unwrap();
+        assert_eq!(event.detail["mode"], json!(MODE_GENERATE));
+        assert_eq!(event.detail["provenance"], json!("unusable_reply"));
+        assert_eq!(event.detail["degraded"], json!(true));
+
+        // A blank answer is not an unusable reply: nothing was said.
+        let silent = DefaultTopKSelector::new(ProgressiveSearchConfig::default())
+            .with_generate_selector(GenerateFragmentSelector::new(Arc::new(|_| {
+                Ok((String::new(), Vec::new()))
+            })));
+        let mut trace = RetrieverTrace::default();
+        let result = silent
+            .select_topk(request(&cursor, &messages, &subtree, &prompt), &mut trace)
+            .await
+            .unwrap();
+        assert_eq!(result.provenance, SelectionProvenance::Model);
+        assert!(!result.degraded);
+    }
+
+    #[tokio::test]
+    async fn the_lexical_mode_is_not_degraded() {
+        let selector = DefaultTopKSelector::new(ProgressiveSearchConfig {
+            selection_mode: SelectionMode::Lexical,
+            ..ProgressiveSearchConfig::default()
+        });
+        let subtree = ranked_subtree();
+        let cursor = cursor(5);
+        let messages = [ChatMessage::user("markdown")];
+        let prompt = PromptBundle::default();
+        let mut trace = RetrieverTrace::default();
+        let result = selector
+            .select_topk(request(&cursor, &messages, &subtree, &prompt), &mut trace)
+            .await
+            .unwrap();
+        assert_eq!(result.provenance, SelectionProvenance::Lexical);
+        assert!(!result.degraded);
+        let event = trace.last().unwrap();
+        assert_eq!(event.detail["mode"], json!(MODE_LEXICAL));
+        assert_eq!(event.detail["provenance"], json!("lexical"));
+        assert_eq!(event.detail["degraded"], json!(false));
+        assert!(!selector.has_warned_no_model());
+        assert_eq!(trace_degraded_selections(&trace), 0);
+    }
+
+    #[test]
+    fn the_trace_helpers_classify_events_without_the_new_detail() {
+        let mut trace = RetrieverTrace::default();
+        trace.record_simple(FRAGMENT_SELECTED_EVENT, ROOT_NODE_ID, 0);
+        // An older record carries no provenance/degraded detail: the `mode` decides.
+        trace.events[0]
+            .detail
+            .insert("mode".to_owned(), json!(MODE_LEXICAL_NO_MODEL));
+        trace.record(
+            FRAGMENT_SELECTED_EVENT,
+            ROOT_NODE_ID,
+            1,
+            BTreeMap::from([("mode".to_owned(), json!(MODE_GENERATE))]),
+        );
+        assert_eq!(
+            trace_selection_provenance(&trace),
+            Some(SelectionProvenance::Model)
+        );
+        assert_eq!(trace_degraded_selections(&trace), 1);
+
+        let mut empty = RetrieverTrace::default();
+        assert_eq!(trace_selection_provenance(&empty), None);
+        assert_eq!(trace_degraded_selections(&empty), 0);
+        empty.record_simple(FRAGMENT_SELECTED_EVENT, ROOT_NODE_ID, 0);
+        assert_eq!(
+            trace_selection_provenance(&empty),
+            None,
+            "no mode, no provenance"
+        );
+
+        for (mode, expected) in [
+            (MODE_GENERATE, SelectionProvenance::Model),
+            (MODE_LEXICAL, SelectionProvenance::Lexical),
+            (MODE_LEXICAL_NO_MODEL, SelectionProvenance::LexicalNoModel),
+            ("embedding_blend", SelectionProvenance::EmbeddingBlend),
+            (
+                "single_selectable_shortcut",
+                SelectionProvenance::SingleSelectable,
+            ),
+        ] {
+            assert_eq!(selection_provenance_for_mode(mode), Some(expected));
+        }
+        assert_eq!(selection_provenance_for_mode("unknown"), None);
     }
 }

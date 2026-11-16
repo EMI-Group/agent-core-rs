@@ -97,7 +97,7 @@ pub use flat::{
 pub use flow::{
     ChatMessage, ChildSearchCursor, CurrentSubtree, ExpansionPlan, ExposedFragment, ExposedNode,
     NodeSearchResult, PromptBundle, SearchCursor, SelectableResolution, SelectableTarget,
-    SelectionProtocol, SelectionResult, ABSTAIN_TOKEN,
+    SelectionProtocol, SelectionProvenance, SelectionResult, ABSTAIN_TOKEN,
 };
 pub use lexical::{
     compile_matcher, tokenize, LexicalDocument, LexicalHit, LexicalIndex, QueryMatcher, BM25_B,
@@ -115,8 +115,9 @@ pub use render::{
     DisclosurePromptParts, SubtreeRenderer, DISCLOSURE_PROMPT_VERSION,
 };
 pub use selector::{
-    is_abstain_output, query_text, DefaultTopKSelector, LexicalTopKSelector, ABSTAIN_HINTS,
-    FRAGMENT_SELECTED_EVENT, MODE_GENERATE, MODE_LEXICAL,
+    is_abstain_output, query_text, selection_provenance_for_mode, trace_degraded_selections,
+    trace_selection_provenance, DefaultTopKSelector, LexicalTopKSelector, ABSTAIN_HINTS,
+    FRAGMENT_SELECTED_EVENT, MODE_GENERATE, MODE_LEXICAL, MODE_LEXICAL_NO_MODEL,
 };
 pub use service::{
     runtime_config_from_config, CandidateRecord, GenerationConfig, RenderConfig, RetrievalResult,

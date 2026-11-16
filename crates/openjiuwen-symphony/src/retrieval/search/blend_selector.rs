@@ -53,7 +53,8 @@ use crate::retrieval::search::config::ProgressiveSearchConfig;
 use crate::retrieval::search::contracts::{SelectRequest, TopKSelector};
 use crate::retrieval::search::embedding::{blend_scores, EmbeddingScorer};
 use crate::retrieval::search::flow::{
-    CurrentSubtree, SelectableTarget, SelectionProtocol, SelectionResult, ABSTAIN_TOKEN,
+    CurrentSubtree, SelectableTarget, SelectionProtocol, SelectionProvenance, SelectionResult,
+    ABSTAIN_TOKEN,
 };
 use crate::retrieval::search::lexical::{LexicalDocument, LexicalIndex};
 use crate::retrieval::search::selector::{
@@ -155,7 +156,9 @@ impl EmbeddingBlendedTopKSelector {
             raw_output: String::new(),
             selected_targets,
             is_abstain: false,
-        })
+            ..SelectionResult::default()
+        }
+        .with_provenance(SelectionProvenance::EmbeddingBlend))
     }
 }
 
