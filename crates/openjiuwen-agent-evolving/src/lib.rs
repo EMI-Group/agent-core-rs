@@ -70,6 +70,10 @@ pub mod evaluator;
 pub mod evaluator_pipeline;
 /// Online RL task registry: task/capture state machine over a primitive store seam.
 pub mod online;
+/// GPU-free offline RL runtime: task queue, rollout workers, encoding, batch
+/// planning, processors, persistence, metrics, the training coordinator and the
+/// offline trainer (the Python `agent_rl/offline` pipeline).
+pub mod offline;
 /// Candidates, the optimizer baseline, and checkpoints/stores/manager.
 pub mod optimizer;
 /// Pure evolution events, observer trait, and harness rail adapter.
@@ -186,6 +190,22 @@ pub use signal::{
 pub use trainer::{
     Callbacks, EpochReport, NoopCallbacks, Progress, StopReason, TrainableTarget, Trainer,
     TrainerConfig, TrainerReport,
+};
+/// The offline RL runtime's primary types: queue, store, processors, encoding,
+/// batch planning, runtime workers, coordinator, metrics, trainer and the
+/// experience hook.
+pub use offline::{
+    BatchBuilder, BatchComponents, BatchConfig, BatchDiagnostics, BatchPlan, ClassifierFn,
+    CoordinatorConfig, CoordinatorReport, EncodingOutcome, ExactMatchComposer,
+    ExperienceCollector, FileRolloutStore, GpuTrainingExecutor, MetricsTracker,
+    NullRolloutStore, OfflineStopReason, OfflineTrainReport, OfflineTrainer, OfflineTrainerConfig,
+    ParallelRuntimeExecutor, PpoTrainingExecutor, ProcessorsRegistry, RewardComposer,
+    RolloutPersistence, RolloutPhase, RolloutRewards, RolloutSource, RoundReport, RuntimeExecutor,
+    RuntimeOutcome, SamplerFn, ScriptedRolloutSource, SeriesSummary, TaskQueue,
+    TrainingCoordinator, TrainingStepMetrics, TrajectoryExperienceCollector, TurnEncoder,
+    ValidationMetrics, ValidationSummary, ValidatorFn, WeightedRewardComposer,
+    ADAPTIVE_SAMPLER, BALANCED_VALIDATOR, DEFAULT_CLASSIFIER, DEFAULT_SAMPLER, DEFAULT_VALIDATOR,
+    GPU_TRAINING_AREA,
 };
 /// Trajectory recording, spans, windows, grouping, and digests.
 pub use trajectory::{
