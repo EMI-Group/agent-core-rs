@@ -3,7 +3,8 @@
 //! [`PersonalContextStore`] owns the durable layout under a caller-provided
 //! home: the context root, the persisted entry index, the source-metadata
 //! directory, the source-link book and the caller-published description. It
-//! ingests local directories while deduplicating against the index, answers
+//! ingests local directories and provider-fetched sources while deduplicating
+//! against the index, answers
 //! keyword queries over the indexed text, and keeps the link book reachable
 //! from one place.
 //!
@@ -18,6 +19,8 @@
 //! Every path is derived from `home`, so a caller must pass a real home
 //! directory: an empty [`PathBuf`] makes every derived path relative to the
 //! process working directory.
+// Size note: ~600 lines of implementation plus an inline test module; the
+// dedupe, metadata and index assertions stay beside the code they verify.
 use std::path::{Path, PathBuf};
 
 use openjiuwen_common::error::{Error, Result};
@@ -26,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use super::atomic::{temp_path, write_json_atomic};
 use super::ingest::{ingest_local_directory, IngestReport, IngestedDocument, LocalDirectoryConfig};
 use super::link_book::SourceLinkBook;
+use super::provider::FetchedSource;
 use super::search::{search, SearchDocument, SearchHit, MAX_SEARCH_RESULTS};
 use super::source::{is_source_id, observed_at_string, SourceMetadata, SourceMetadataStore};
 
@@ -58,7 +62,8 @@ const DESCRIPTION_LABEL: &str = "personal context description";
 /// A local plain-text file has no provider-side revision, so
 /// [`ContextEntry::from_document`] uses the content hash as
 /// [`ContextEntry::latest_revision`] too: for these sources the digest is the
-/// revision identity.
+/// revision identity. A provider-fetched source keeps its own revision marker
+/// when it reports one (see [`PersonalContextStore::ingest_fetched`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct ContextEntry {
@@ -297,55 +302,89 @@ impl PersonalContextStore {
             aggregate.failed += report.failed;
 
             for document in &report.documents {
-                match index
-                    .entries
-                    .iter_mut()
-                    .find(|entry| entry.source_id == document.source_id)
-                {
-                    None => {
-                        index
-                            .entries
-                            .push(ContextEntry::from_document(document, &observed_at));
-                        aggregate.ingested += 1;
-                        dirty = true;
-                        changed_documents.push(document.clone());
-                    }
-                    Some(entry) if entry.content_hash == document.content_hash => {
-                        aggregate.unchanged += 1;
-                        if entry.last_seen != observed_at {
-                            entry.last_seen.clone_from(&observed_at);
-                            dirty = true;
-                        }
-                    }
-                    Some(entry) => {
-                        let mut replacement = ContextEntry::from_document(document, &observed_at);
-                        replacement.first_seen = if entry.first_seen.is_empty() {
-                            observed_at.clone()
-                        } else {
-                            entry.first_seen.clone()
-                        };
-                        *entry = replacement;
-                        aggregate.updated += 1;
-                        dirty = true;
-                        changed_documents.push(document.clone());
-                    }
+                let draft = ContextEntry::from_document(document, &observed_at);
+                let (outcome, changed) =
+                    apply_document(&mut index, &metadata_store, draft, &observed_at)?;
+                dirty |= changed;
+                match outcome {
+                    IngestOutcome::Ingested => aggregate.ingested += 1,
+                    IngestOutcome::Unchanged => aggregate.unchanged += 1,
+                    IngestOutcome::Updated => aggregate.updated += 1,
                 }
-
-                metadata_store.upsert(SourceMetadata {
-                    source_id: document.source_id.clone(),
-                    source_type: document.provider.clone(),
-                    title: document.title.clone(),
-                    locator: document.locator.clone(),
-                    provider: document.provider.clone(),
-                    service: document.service.clone(),
-                    first_seen: observed_at.clone(),
-                    last_seen: observed_at.clone(),
-                    latest_revision: document.content_hash.clone(),
-                    latest_hash: document.content_hash.clone(),
-                })?;
+                if outcome != IngestOutcome::Unchanged {
+                    changed_documents.push(document.clone());
+                }
             }
 
             aggregate.warnings.extend(report.warnings);
+        }
+
+        if dirty {
+            sort_entries(&mut index.entries);
+            write_json_atomic(&self.index_path(), &index, INDEX_LABEL)?;
+        }
+
+        changed_documents.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        aggregate.documents = changed_documents;
+        Ok(aggregate)
+    }
+
+    /// Ingests provider-fetched sources against the persisted index.
+    ///
+    /// Every source is projected onto the local-scan document shape and
+    /// classified by `source_id` exactly like [`PersonalContextStore::ingest_local`]:
+    /// absent from the index is `ingested`, a matching `content_hash` is
+    /// `unchanged`, anything else is `updated` with the original `first_seen`
+    /// preserved. A blank `service` becomes the provider kind literal, a blank
+    /// `relative_path` becomes the `source_id`, and `latest_revision` keeps
+    /// [`FetchedSource::revision`] when it is set (the content digest
+    /// otherwise), while `latest_hash` stays the content digest.
+    ///
+    /// The report carries the local scan's shape: `scanned` counts the sources
+    /// considered, `skipped`/`failed`/`warnings` stay empty, and `documents`
+    /// holds only this run's ingested and updated sources as
+    /// [`IngestedDocument`] values sorted by `relative_path`.
+    ///
+    /// # Errors
+    ///
+    /// `Validation` for a blank `source_id`, a malformed index or a source
+    /// whose metadata the store rejects, and any error the metadata or
+    /// atomic-write layers return.
+    pub fn ingest_fetched(
+        &self,
+        sources: &[FetchedSource],
+        observed_at_ms: i64,
+    ) -> Result<IngestReport> {
+        if sources
+            .iter()
+            .any(|source| source.source_id.trim().is_empty())
+        {
+            return Err(Error::validation(
+                "personal context fetched source id is empty",
+            ));
+        }
+        let observed_at = observed_at_string(observed_at_ms);
+        let mut index = self.load_index()?;
+        let metadata_store = self.metadata_store();
+        let mut aggregate = IngestReport::default();
+        let mut dirty = false;
+        let mut changed_documents: Vec<IngestedDocument> = Vec::new();
+
+        for source in sources {
+            aggregate.scanned += 1;
+            let document = document_from_fetched(source);
+            let draft = entry_from_fetched(source, &document, &observed_at);
+            let (outcome, changed) =
+                apply_document(&mut index, &metadata_store, draft, &observed_at)?;
+            dirty |= changed;
+            match outcome {
+                IngestOutcome::Ingested => aggregate.ingested += 1,
+                IngestOutcome::Unchanged => aggregate.unchanged += 1,
+                IngestOutcome::Updated => aggregate.updated += 1,
+            }
+            if outcome != IngestOutcome::Unchanged {
+                changed_documents.push(document);
+            }
         }
 
         if dirty {
@@ -441,6 +480,135 @@ fn sort_entries(entries: &mut [ContextEntry]) {
     });
 }
 
+/// How one candidate entry was classified against the persisted index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestOutcome {
+    /// The source id was absent from the index.
+    Ingested,
+    /// The source id was present with the same content digest.
+    Unchanged,
+    /// The source id was present with a different content digest.
+    Updated,
+}
+
+/// Classifies `draft` against `index`, applies it and upserts its metadata.
+///
+/// This is the one dedupe step shared by [`PersonalContextStore::ingest_local`]
+/// and [`PersonalContextStore::ingest_fetched`]: an absent `source_id` is
+/// pushed as-is, an equal `content_hash` only advances `last_seen` (and a
+/// changed `latest_revision`), and a different digest replaces the entry while
+/// preserving the original `first_seen`.
+///
+/// The metadata record is derived from the draft and upserted on every
+/// observation, so [`SourceMetadataStore::upsert`] keeps `first_seen` across
+/// runs. The second element of the result reports whether the index document
+/// changed and therefore needs an atomic rewrite.
+fn apply_document(
+    index: &mut ContextIndex,
+    metadata_store: &SourceMetadataStore,
+    draft: ContextEntry,
+    observed_at: &str,
+) -> Result<(IngestOutcome, bool)> {
+    let mut dirty = false;
+    let outcome = match index
+        .entries
+        .iter_mut()
+        .find(|entry| entry.source_id == draft.source_id)
+    {
+        None => {
+            index.entries.push(draft.clone());
+            dirty = true;
+            IngestOutcome::Ingested
+        }
+        Some(entry) if entry.content_hash == draft.content_hash => {
+            if entry.last_seen != observed_at {
+                observed_at.clone_into(&mut entry.last_seen);
+                dirty = true;
+            }
+            if entry.latest_revision != draft.latest_revision {
+                entry.latest_revision.clone_from(&draft.latest_revision);
+                dirty = true;
+            }
+            IngestOutcome::Unchanged
+        }
+        Some(entry) => {
+            let first_seen = if entry.first_seen.is_empty() {
+                observed_at.to_string()
+            } else {
+                entry.first_seen.clone()
+            };
+            *entry = ContextEntry {
+                first_seen,
+                ..draft.clone()
+            };
+            dirty = true;
+            IngestOutcome::Updated
+        }
+    };
+
+    metadata_store.upsert(SourceMetadata {
+        source_id: draft.source_id.clone(),
+        source_type: draft.provider.clone(),
+        title: draft.title.clone(),
+        locator: draft.locator.clone(),
+        provider: draft.provider.clone(),
+        service: draft.service.clone(),
+        first_seen: observed_at.to_string(),
+        last_seen: observed_at.to_string(),
+        latest_revision: draft.latest_revision.clone(),
+        latest_hash: draft.content_hash.clone(),
+    })?;
+
+    Ok((outcome, dirty))
+}
+
+/// Projects one fetched source onto the local-scan document shape.
+///
+/// The provider kind becomes the document's `provider` and the fallback
+/// `service`, a blank `relative_path` falls back to the `source_id`, and the
+/// indexed text is the source's `content`.
+fn document_from_fetched(source: &FetchedSource) -> IngestedDocument {
+    let kind = source.kind.as_str();
+    IngestedDocument {
+        source_id: source.source_id.clone(),
+        service: if source.service.trim().is_empty() {
+            kind.to_string()
+        } else {
+            source.service.clone()
+        },
+        provider: kind.to_string(),
+        title: source.title.clone(),
+        locator: source.locator.clone(),
+        relative_path: if source.relative_path.trim().is_empty() {
+            source.source_id.clone()
+        } else {
+            source.relative_path.clone()
+        },
+        content_hash: source.content_hash.clone(),
+        size_bytes: source.size_bytes,
+        text: source.content.clone(),
+    }
+}
+
+/// Builds the index entry for a fetched source.
+///
+/// Everything but `latest_revision` comes from the local-scan projection, so a
+/// fetched source and a local file dedupe through one [`ContextEntry`] shape;
+/// `latest_revision` keeps the provider's own revision marker when it reports
+/// one and falls back to the content digest otherwise.
+fn entry_from_fetched(
+    source: &FetchedSource,
+    document: &IngestedDocument,
+    observed_at: &str,
+) -> ContextEntry {
+    let mut entry = ContextEntry::from_document(document, observed_at);
+    let revision = source.revision.trim();
+    if !revision.is_empty() {
+        entry.latest_revision = revision.to_string();
+    }
+    entry
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -448,7 +616,8 @@ mod tests {
     use openjiuwen_common::error::ErrorKind;
 
     use super::super::ingest::LocalDirectoryConfig;
-    use super::super::source::observed_at_string;
+    use super::super::provider::SourceKind;
+    use super::super::source::{observed_at_string, source_id_for_locator};
     use super::*;
 
     const T0: i64 = 0;
@@ -700,5 +869,212 @@ mod tests {
             assert_eq!(record.latest_revision, record.latest_hash);
             assert_eq!(record.latest_hash.len(), 64);
         }
+    }
+
+    /// Builds a fetched source with a blank `service` and `relative_path`, so
+    /// the store's fallbacks are exercised, and no provider revision.
+    fn fetched(locator: &str, content: &str) -> FetchedSource {
+        FetchedSource {
+            source_id: source_id_for_locator(locator).unwrap(),
+            kind: SourceKind::RssFeed,
+            title: "Feed item".to_string(),
+            locator: locator.to_string(),
+            content_hash: openjiuwen_sysop::util::sha256_hex(content.as_bytes()),
+            size_bytes: content.len() as u64,
+            content: content.to_string(),
+            ..FetchedSource::default()
+        }
+    }
+
+    fn entry_for(store: &PersonalContextStore, locator: &str) -> ContextEntry {
+        store
+            .entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.locator == locator)
+            .expect("locator is indexed")
+    }
+
+    #[test]
+    fn first_fetched_ingest_indexes_and_persists_every_source() {
+        let home = tempfile::tempdir().unwrap();
+        let store = PersonalContextStore::new(home.path());
+        let sources = vec![
+            fetched("https://example.test/b", "beta body"),
+            fetched("https://example.test/a", "alpha body"),
+        ];
+
+        let report = store.ingest_fetched(&sources, T0).unwrap();
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.ingested, 2);
+        assert_eq!(
+            (report.unchanged, report.updated, report.skipped),
+            (0, 0, 0)
+        );
+        assert_eq!(report.failed, 0);
+        assert!(report.warnings.is_empty());
+        assert_eq!(report.documents.len(), 2);
+        assert!(report.documents[0].relative_path <= report.documents[1].relative_path);
+
+        let alpha = entry_for(&store, "https://example.test/a");
+        assert_eq!(alpha.provider, "rss_feed");
+        assert_eq!(alpha.service, "rss_feed");
+        assert_eq!(alpha.relative_path, alpha.source_id);
+        assert_eq!(alpha.text, "alpha body");
+        assert_eq!(alpha.size_bytes, "alpha body".len() as u64);
+        assert_eq!(alpha.first_seen, observed_at_string(T0));
+        assert_eq!(alpha.last_seen, observed_at_string(T0));
+        assert_eq!(alpha.latest_revision, alpha.content_hash);
+
+        let metadata = store.metadata_store().list().unwrap();
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata[0].source_type, "rss_feed");
+        assert_eq!(metadata[0].provider, "rss_feed");
+    }
+
+    #[test]
+    fn second_fetched_ingest_of_identical_sources_is_unchanged() {
+        let home = tempfile::tempdir().unwrap();
+        let store = PersonalContextStore::new(home.path());
+        let sources = vec![fetched("https://example.test/a", "alpha body")];
+        store.ingest_fetched(&sources, T0).unwrap();
+        let before = store.entries().unwrap();
+
+        let report = store.ingest_fetched(&sources, T1).unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.ingested, 0);
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.updated, 0);
+        assert!(report.documents.is_empty());
+
+        let after = store.entries().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].source_id, before[0].source_id);
+        assert_eq!(after[0].first_seen, observed_at_string(T0));
+        assert_eq!(after[0].last_seen, observed_at_string(T1));
+        assert_eq!(after[0].content_hash, before[0].content_hash);
+        assert_eq!(after[0].text, "alpha body");
+    }
+
+    #[test]
+    fn changed_fetched_content_is_updated_and_keeps_first_seen() {
+        let home = tempfile::tempdir().unwrap();
+        let store = PersonalContextStore::new(home.path());
+        let original = fetched("https://example.test/a", "alpha body");
+        store
+            .ingest_fetched(std::slice::from_ref(&original), T0)
+            .unwrap();
+
+        let rewritten = FetchedSource {
+            content: "rewritten alpha body".to_string(),
+            content_hash: openjiuwen_sysop::util::sha256_hex(b"rewritten alpha body"),
+            size_bytes: 20,
+            revision: "rev-2".to_string(),
+            ..original.clone()
+        };
+        let report = store.ingest_fetched(&[rewritten], T2).unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.ingested, 0);
+        assert_eq!(report.unchanged, 0);
+        assert_eq!(report.updated, 1);
+        assert_eq!(report.documents.len(), 1);
+        assert_eq!(report.documents[0].text, "rewritten alpha body");
+
+        let updated = entry_for(&store, "https://example.test/a");
+        assert_eq!(updated.source_id, original.source_id);
+        assert_eq!(updated.first_seen, observed_at_string(T0));
+        assert_eq!(updated.last_seen, observed_at_string(T2));
+        assert_ne!(updated.content_hash, original.content_hash);
+        assert_eq!(updated.text, "rewritten alpha body");
+        assert_eq!(updated.latest_revision, "rev-2");
+    }
+
+    #[test]
+    fn fetched_metadata_keeps_the_provider_revision() {
+        let home = tempfile::tempdir().unwrap();
+        let store = PersonalContextStore::new(home.path());
+        let source = FetchedSource {
+            revision: "rev-1".to_string(),
+            ..fetched("https://example.test/feed", "feed body")
+        };
+        store.ingest_fetched(&[source], T0).unwrap();
+
+        let entry = entry_for(&store, "https://example.test/feed");
+        assert_eq!(entry.latest_revision, "rev-1");
+        assert_eq!(entry.content_hash.len(), 64);
+
+        let record = store.metadata_store().list().unwrap().remove(0);
+        assert_eq!(record.source_type, "rss_feed");
+        assert_eq!(record.service, "rss_feed");
+        assert_eq!(record.latest_revision, "rev-1");
+        assert_eq!(record.latest_hash, entry.content_hash);
+        assert_eq!(record.first_seen, observed_at_string(T0));
+    }
+
+    #[test]
+    fn entry_deleted_from_disk_is_reingested() {
+        let home = tempfile::tempdir().unwrap();
+        let store = PersonalContextStore::new(home.path());
+        let sources = vec![fetched("https://example.test/a", "alpha body")];
+        store.ingest_fetched(&sources, T0).unwrap();
+
+        std::fs::remove_file(store.index_path()).unwrap();
+        let report = store.ingest_fetched(&sources, T2).unwrap();
+        assert_eq!(report.ingested, 1);
+        assert_eq!(report.unchanged, 0);
+        assert_eq!(report.updated, 0);
+
+        let entries = store.entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].first_seen, observed_at_string(T2));
+        assert_eq!(entries[0].text, "alpha body");
+        assert_eq!(
+            store.metadata_store().list().unwrap()[0].first_seen,
+            observed_at_string(T0)
+        );
+    }
+
+    #[test]
+    fn empty_fetched_slice_leaves_the_index_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let store = PersonalContextStore::new(home.path());
+
+        let report = store.ingest_fetched(&[], T0).unwrap();
+        assert_eq!(report.scanned, 0);
+        assert_eq!(
+            (report.ingested, report.unchanged, report.updated),
+            (0, 0, 0)
+        );
+        assert!(report.documents.is_empty());
+        assert!(!store.index_path().exists());
+
+        store
+            .ingest_fetched(&[fetched("https://example.test/a", "alpha body")], T0)
+            .unwrap();
+        let index_before = std::fs::read_to_string(store.index_path()).unwrap();
+        let report = store.ingest_fetched(&[], T1).unwrap();
+        assert_eq!(report.scanned, 0);
+        assert!(report.documents.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(store.index_path()).unwrap(),
+            index_before
+        );
+        assert_eq!(
+            store.entries().unwrap()[0].last_seen,
+            observed_at_string(T0)
+        );
+    }
+
+    #[test]
+    fn blank_fetched_source_id_is_a_validation_error() {
+        let home = tempfile::tempdir().unwrap();
+        let store = PersonalContextStore::new(home.path());
+
+        let error = store
+            .ingest_fetched(&[FetchedSource::default()], T0)
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.to_string().contains("source id is empty"));
+        assert!(!store.index_path().exists());
     }
 }

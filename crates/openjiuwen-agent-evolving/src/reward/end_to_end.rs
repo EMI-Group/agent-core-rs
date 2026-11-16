@@ -19,10 +19,11 @@ use serde_json::json;
 use super::{
     default_pack, score_criterion, to_reward_signal, CheckRunner, CheckTool, CriterionKind,
     CriterionStatus, EvidenceAgent, EvidenceCriterion, EvidenceGathered, EvidenceTask,
-    ModelRewardJudge, RewardCheck, FLOOR_FAIL_CAP, REWARD_CHECK_DIMENSION, REWARD_CHECK_SOURCE,
-    SCHEMA_VERSION,
+    ModelRewardJudge, RewardCheck, FLOOR_FAIL_CAP, PAGE_SOURCE_REFUSED, REWARD_CHECK_DIMENSION,
+    REWARD_CHECK_SOURCE, SCHEMA_VERSION,
 };
 use crate::evaluator_pipeline::FakeCommandRunner;
+use crate::reward::picture::fixtures;
 
 /// A criterion with two claims, both floor requirements.
 fn task() -> EvidenceTask {
@@ -32,6 +33,11 @@ fn task() -> EvidenceTask {
         .with_criteria(vec![EvidenceCriterion::new("c1", "Content")
             .with_claim("Names the score")
             .with_claim("Names the date")])
+}
+
+/// A picture header the read tool reports (no pixels, because none are decoded).
+fn png(width: u32, height: u32) -> Vec<u8> {
+    fixtures::png(width, height)
 }
 
 /// A workspace with one notes file.
@@ -99,7 +105,7 @@ async fn evidence_gathering_then_judging_scores_the_work() {
 }
 
 #[tokio::test]
-async fn browser_and_picture_checks_are_typed_deferred() {
+async fn browser_checks_are_deferred_and_pictures_report_their_headers() {
     let temp = workspace();
     let checks = runner(temp.path());
 
@@ -113,19 +119,40 @@ async fn browser_and_picture_checks_are_typed_deferred() {
     );
     assert!(error.to_string().contains("playwright"));
 
-    std::fs::write(temp.path().join("poster.png"), b"not a picture").unwrap();
-    let error = checks
+    // A picture is evidence, but of its header only: nothing is decoded.
+    std::fs::write(temp.path().join("poster.png"), png(800, 600)).unwrap();
+    let outcome = checks
         .run(&RewardCheck::new().with_path("poster.png"))
         .await
-        .unwrap_err();
+        .unwrap();
+    assert!(outcome.succeeded(), "unexpected: {outcome:?}");
     assert!(
-        matches!(error, Error::Unsupported(_)),
-        "unexpected: {error}"
+        outcome
+            .result
+            .contains("picture file (800x600 PNG, 33 bytes)"),
+        "{}",
+        outcome.result
     );
-    assert!(error.to_string().contains("PIL"));
+    assert!(
+        outcome
+            .result
+            .contains("the judge sees the picture's metadata (format and size), not its pixels"),
+        "{}",
+        outcome.result
+    );
 
-    // The evidence loop records the deferred check instead of aborting the run,
-    // so the model sees why the check could not run.
+    // A page's source is refused, so it can never score a page.
+    std::fs::write(temp.path().join("index.html"), "<p>the score is 7</p>").unwrap();
+    let outcome = checks
+        .run(&RewardCheck::new().with_path("index.html"))
+        .await
+        .unwrap();
+    assert!(!outcome.succeeded());
+    assert_eq!(outcome.skipped.as_deref(), Some(PAGE_SOURCE_REFUSED));
+    assert_eq!(outcome.result, "");
+
+    // The evidence loop records the deferred browser check instead of aborting
+    // the run, so the model sees why the check could not run.
     let model = ScriptedModel::new([
         ScriptedTurn::text(r#"{"checks": [{"page": "index.html", "criteria": ["c1"]}]}"#),
         ScriptedTurn::text(r#"{"checks": []}"#),
@@ -138,6 +165,62 @@ async fn browser_and_picture_checks_are_typed_deferred() {
     let error = gathered.checks[0].error.as_deref().unwrap();
     assert!(error.contains("playwright"), "recorded error: {error}");
     assert!(!gathered.checks[0].usable());
+}
+
+#[tokio::test]
+async fn a_refused_page_and_a_picture_header_both_reach_the_judge() {
+    let temp = workspace();
+    std::fs::write(temp.path().join("index.html"), "<p>the score is 7</p>").unwrap();
+    std::fs::write(temp.path().join("poster.png"), png(800, 600)).unwrap();
+    let scripted = ScriptedModel::new([
+        ScriptedTurn::text(
+            r#"{"checks": [{"path": "index.html", "criteria": ["c1"]},
+                           {"path": "poster.png", "criteria": ["c1"]}]}"#,
+        ),
+        ScriptedTurn::text(r#"{"checks": []}"#),
+        ScriptedTurn::text(verdict()),
+    ]);
+    let model: Arc<dyn Model> = Arc::new(scripted.clone());
+    let agent = EvidenceAgent::new(Arc::clone(&model), ModelRequestConfig::default());
+    let gathered = agent.gather(&task(), &runner(temp.path())).await.unwrap();
+    assert_eq!(gathered.checks.len(), 2);
+
+    // The page was skipped with a reason and kept no source text; the picture
+    // carried its header and no pixels.
+    let page = &gathered.checks[0];
+    assert!(!page.usable());
+    let skipped = page.skipped.as_deref().unwrap();
+    assert!(
+        skipped.contains("the source of a page is not read"),
+        "{skipped}"
+    );
+    assert!(skipped.contains("playwright"), "{skipped}");
+    let picture = &gathered.checks[1];
+    assert!(picture.usable());
+    assert!(
+        picture
+            .result
+            .contains("picture file (800x600 PNG, 33 bytes)"),
+        "{}",
+        picture.result
+    );
+
+    let judge = ModelRewardJudge::new(Arc::clone(&model), ModelRequestConfig::default());
+    let report = judge.judge(&task(), &gathered, "").await.unwrap();
+    assert_eq!(report.used_checks, 2);
+    let user = scripted.calls()[2]
+        .messages
+        .last()
+        .unwrap()
+        .text()
+        .into_owned();
+    assert!(
+        user.contains("picture file (800x600 PNG, 33 bytes)"),
+        "{user}"
+    );
+    assert!(user.contains("the source of a page is not read"), "{user}");
+    // The page's own source never reaches the judge.
+    assert!(!user.contains("<p>the score is 7</p>"), "{user}");
 }
 
 #[tokio::test]

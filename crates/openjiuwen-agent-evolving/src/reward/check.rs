@@ -2,14 +2,30 @@
 //!
 //! Ports the offline half of Python `openjiuwen.agent_evolving.reward.checks`: the
 //! check vocabulary the evidence agent emits, the `read` tool (folder listings,
-//! line ranges and a case-insensitive pattern search) and the `python` tool (a
-//! script run in a scratch directory with a 60 s limit, a stripped proxy
-//! environment and a bounded output).
+//! line ranges, a case-insensitive pattern search, picture headers and a page
+//! refusal) and the `python` tool (a script run in a scratch directory with a 60 s
+//! limit, a stripped proxy environment and a bounded output).
 //!
-//! `browser` checks and picture (`PIL`) handling are deferred: they need
-//! playwright and Pillow, which this port does not bundle. Those paths return
-//! [`Error::Unsupported`] naming the missing dependency instead of skipping the
-//! check silently.
+//! Two `read` paths differ from Python by construction, and both say so in their
+//! result instead of degrading silently:
+//!
+//! - **A page's source is never read.** Python refuses to judge a page from its
+//!   source at all — it reads a page only through a headless browser and raises
+//!   when playwright is missing. This port bundles no browser, so a `.html`/`.htm`
+//!   read is [`CheckOutcome::skipped`] with Python's "the source of a page is not
+//!   read" message plus the reason (no playwright), which means a page cannot be
+//!   scored from its source here either. `.js`/`.mjs`/`.css` are still readable as
+//!   source, exactly because Python reads them as source when no browser is
+//!   available.
+//! - **A picture is reported by its header, not its pixels.** Python opens the
+//!   file with Pillow and attaches it to the Judge's message as a model image
+//!   part. This port bundles neither Pillow nor an image decoder, so a picture
+//!   read returns its [header](crate::reward::picture::PictureInfo) — format,
+//!   pixel size and byte count — and states in the result that the Judge sees the
+//!   metadata, not the picture.
+//!
+//! `browser` checks stay deferred: they need playwright, and they return
+//! [`Error::Unsupported`] naming it.
 //!
 //! Every side effect of the `python` tool goes through
 //! [`CommandRunner`](crate::evaluator_pipeline::CommandRunner), so the check can
@@ -27,6 +43,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::evaluator_pipeline::{find_program, CommandRunner, CommandSpec};
+use crate::reward::picture::{PictureInfo, UNREADABLE_PICTURE};
 
 /// The characters kept from one check's output (Python `CHECK_OUTPUT`).
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 6000;
@@ -52,8 +69,20 @@ pub const PROXY_SINK: &str = "http://127.0.0.1:9";
 /// The source file suffixes a browser check runs instead of reads.
 pub const PAGE_SUFFIXES: [&str; 5] = ["html", "htm", "js", "mjs", "css"];
 
-/// The picture suffixes that would need `PIL` to be turned into a model picture.
+/// The page suffixes whose source is refused outright: a page is judged by using
+/// it in a browser, never by reading its source (Python's `PAGE_CODE` gate).
+///
+/// A script or a stylesheet (`.js`, `.mjs`, `.css`) is still read as source, which
+/// is what Python does when no browser is available.
+pub const PAGE_SOURCE_SUFFIXES: [&str; 2] = ["html", "htm"];
+
+/// The picture suffixes read as a picture header instead of as text.
 pub const IMAGE_SUFFIXES: [&str; 6] = ["png", "jpg", "jpeg", "webp", "gif", "bmp"];
+
+/// The reason a `.html`/`.htm` read is skipped: Python's own wording (its `read`
+/// tool's "source of a page is not read" skip) plus this port's reason for
+/// refusing a page outright.
+pub const PAGE_SOURCE_REFUSED: &str = "the source of a page is not read: use the page in the browser; find the names a probe needs with a probe (Object.keys(window), the page's buttons); this port has no browser (playwright), so a page cannot be judged here and cannot be scored from its source";
 
 /// The field-to-tool rule (Python `TOOL_BY_FIELD`): a check that names only a
 /// payload field still picks the tool that field belongs to.
@@ -409,11 +438,11 @@ impl CheckRunner {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] for a deferred tool (`browser`, picture reading),
-    /// [`Error::validation`] for a path that leaves the workspace, and the
-    /// runner's own errors. A check that names no tool, a `read` without a path
-    /// and an unavailable Python interpreter are reported in the outcome instead,
-    /// because the evidence agent can act on them.
+    /// [`Error::Unsupported`] for a deferred tool (`browser`), [`Error::validation`]
+    /// for a path that leaves the workspace, and the runner's own errors. A check
+    /// that names no tool, a `read` without a path, an unreadable picture, a page
+    /// whose source is refused and an unavailable Python interpreter are reported in
+    /// the outcome instead, because the evidence agent can act on them.
     ///
     /// A check has no cancellation token of its own: each is bounded by its own
     /// output and time limits, and the runner is shared.
@@ -449,14 +478,16 @@ impl CheckRunner {
             .map(|extension| extension.to_string_lossy().to_lowercase())
             .unwrap_or_default();
         if IMAGE_SUFFIXES.contains(&suffix.as_str()) {
-            return Err(Error::unsupported(format!(
-                "reading {path} as a picture is deferred: it needs PIL (Pillow) image processing, \
-                 which this port does not bundle"
-            )));
+            return Ok(picture_outcome(path, &target));
         }
-        // A page's source is skipped only when a browser is available (Python's
-        // "use the page, do not read it" rule); the browser tool is deferred here,
-        // so reading the source is the only evidence a page can give.
+        // Python's "use the page, do not read it" rule: a page's source is never
+        // evidence of how the page looks or behaves. Python reads a page only
+        // through a headless browser and fails the run when playwright is missing;
+        // this port has no browser, so the read is skipped with that reason instead
+        // of scoring the page from its source.
+        if PAGE_SOURCE_SUFFIXES.contains(&suffix.as_str()) {
+            return Ok(CheckOutcome::skipped(PAGE_SOURCE_REFUSED));
+        }
         let bytes = std::fs::read(&target)
             .map_err(|error| Error::sys_op(format!("failed to read {path}: {error}")))?;
         let text = match String::from_utf8(bytes) {
@@ -593,6 +624,22 @@ impl CheckRunner {
     }
 }
 
+/// Reads a picture's header as the check's result.
+///
+/// The file's bytes are never decoded: [`PictureInfo::parse`] reads the format's
+/// own header, and a file it cannot read truthfully answers Python's "not a
+/// readable picture" (an `ok` outcome, not an error), so the evidence agent
+/// records what it saw instead of aborting the run.
+fn picture_outcome(path: &str, target: &Path) -> CheckOutcome {
+    let Ok(bytes) = std::fs::read(target) else {
+        return CheckOutcome::ok(UNREADABLE_PICTURE);
+    };
+    match PictureInfo::parse(&bytes) {
+        Some(info) => CheckOutcome::ok(info.evidence(path)),
+        None => CheckOutcome::ok(UNREADABLE_PICTURE),
+    }
+}
+
 /// Resolves `relative` against `root` and refuses a path that leaves it.
 ///
 /// The check is lexical (Python's `Path.resolve` also follows symlinks; this port
@@ -720,6 +767,7 @@ mod tests {
 
     use super::*;
     use crate::evaluator_pipeline::{ExecResult, FakeCommandRunner, ProcessCommandRunner};
+    use crate::reward::picture::fixtures;
 
     fn runner(root: &Path) -> CheckRunner {
         CheckRunner::new(root, Arc::new(FakeCommandRunner::new().record_only()))
@@ -974,28 +1022,212 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pictures_and_browser_checks_are_typed_deferred() {
+    async fn picture_reads_report_the_header_not_the_pixels() {
         let temp = tempfile::tempdir().unwrap();
-        write(temp.path(), "poster.png", "not really a picture");
-        let error = runner(temp.path())
+        std::fs::write(temp.path().join("poster.png"), fixtures::png(800, 600)).unwrap();
+        let outcome = runner(temp.path())
             .run(&RewardCheck::new().with_path("poster.png"))
             .await
-            .unwrap_err();
-        assert!(
-            matches!(error, Error::Unsupported(_)),
-            "unexpected: {error}"
+            .unwrap();
+        assert!(outcome.succeeded(), "unexpected: {outcome:?}");
+        assert_eq!(
+            outcome.result,
+            "path: poster.png\npicture file (800x600 PNG, 33 bytes)\n\
+             the judge sees the picture's metadata (format and size), not its pixels"
         );
-        assert!(error.to_string().contains("PIL"));
+        // No picture is attached, because none was decoded.
+        assert!(outcome.screenshots.is_empty());
+    }
 
-        let error = runner(temp.path())
-            .run(&RewardCheck::new().with_page("index.html"))
+    #[tokio::test]
+    async fn every_supported_picture_format_is_read_from_its_header() {
+        let temp = tempfile::tempdir().unwrap();
+        let cases: [(&str, Vec<u8>, &str, u32, u32); 7] = [
+            ("a.png", fixtures::png(800, 600), "PNG", 800, 600),
+            ("b.jpg", fixtures::jpeg(1920, 1080), "JPEG", 1920, 1080),
+            ("c.jpeg", fixtures::jpeg(12, 34), "JPEG", 12, 34),
+            ("d.gif", fixtures::gif(64, 32, 2), "animated GIF", 64, 32),
+            ("e.webp", fixtures::webp_lossy(320, 240), "WEBP", 320, 240),
+            ("f.webp", fixtures::webp_lossless(64, 48), "WEBP", 64, 48),
+            ("g.bmp", fixtures::bmp(640, -480), "BMP", 640, 480),
+        ];
+        for (name, bytes, format, width, height) in cases {
+            std::fs::write(temp.path().join(name), &bytes).unwrap();
+            let outcome = runner(temp.path())
+                .run(&RewardCheck::new().with_path(name))
+                .await
+                .unwrap();
+            assert!(outcome.succeeded(), "{name}: {outcome:?}");
+            let header = format!(
+                "picture file ({width}x{height} {format}, {} bytes)",
+                bytes.len()
+            );
+            assert!(
+                outcome.result.contains(&header),
+                "{name}: {}",
+                outcome.result
+            );
+            assert!(
+                outcome.result.contains("not its pixels"),
+                "{name}: {}",
+                outcome.result
+            );
+            assert!(
+                outcome.result.starts_with(&format!("path: {name}\n")),
+                "{name}: {}",
+                outcome.result
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_picture_is_ok_evidence_not_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        // A file whose bytes are not a picture at all.
+        write(temp.path(), "broken.png", "not really a picture");
+        let outcome = runner(temp.path())
+            .run(&RewardCheck::new().with_path("broken.png"))
             .await
-            .unwrap_err();
+            .unwrap();
+        assert!(outcome.succeeded(), "unexpected: {outcome:?}");
+        assert_eq!(outcome.result, UNREADABLE_PICTURE);
+        assert_eq!(outcome.result, "not a readable picture");
+
+        // A truncated header.
+        let mut truncated = fixtures::png(800, 600);
+        truncated.truncate(18);
+        std::fs::write(temp.path().join("short.jpg"), truncated).unwrap();
+        let outcome = runner(temp.path())
+            .run(&RewardCheck::new().with_path("short.jpg"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, UNREADABLE_PICTURE);
+        assert!(outcome.skipped.is_none());
+
+        // A picture that is not there reads as unreadable too, as in Python.
+        let outcome = runner(temp.path())
+            .run(&RewardCheck::new().with_path("missing.png"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, UNREADABLE_PICTURE);
+    }
+
+    #[tokio::test]
+    async fn a_picture_above_pythons_limits_says_so_without_converting() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("wide.png"), fixtures::png(2000, 900)).unwrap();
+        let outcome = runner(temp.path())
+            .run(&RewardCheck::new().with_path("wide.png"))
+            .await
+            .unwrap();
         assert!(
-            matches!(error, Error::Unsupported(_)),
-            "unexpected: {error}"
+            outcome
+                .result
+                .contains("because its longest side (2000 px) is longer than 1600 px"),
+            "{}",
+            outcome.result
         );
-        assert!(error.to_string().contains("playwright"));
+        assert!(
+            outcome.result.contains("this port does not re-encode"),
+            "{}",
+            outcome.result
+        );
+
+        // A small BMP is still outside what a vision API takes as it is.
+        std::fs::write(temp.path().join("small.bmp"), fixtures::bmp(10, 10)).unwrap();
+        let outcome = runner(temp.path())
+            .run(&RewardCheck::new().with_path("small.bmp"))
+            .await
+            .unwrap();
+        assert!(
+            outcome
+                .result
+                .contains("because BMP is not a format a model takes as it is"),
+            "{}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uppercase_picture_suffix_is_still_a_picture() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("POSTER.PNG"), fixtures::png(20, 10)).unwrap();
+        let outcome = runner(temp.path())
+            .run(&RewardCheck::new().with_path("POSTER.PNG"))
+            .await
+            .unwrap();
+        assert!(
+            outcome
+                .result
+                .contains("picture file (20x10 PNG, 33 bytes)"),
+            "{}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn page_source_is_refused_while_scripts_and_styles_are_read() {
+        let temp = tempfile::tempdir().unwrap();
+        write(temp.path(), "index.html", "the score is 7\n");
+        write(temp.path(), "flat.htm", "the score is 7\n");
+        write(temp.path(), "app.js", "const score = 7\n");
+        write(temp.path(), "theme.css", ".score { color: red }\n");
+
+        for name in ["index.html", "flat.htm"] {
+            let outcome = runner(temp.path())
+                .run(&RewardCheck::new().with_path(name))
+                .await
+                .unwrap();
+            assert!(!outcome.ok, "{name}: {outcome:?}");
+            assert_eq!(outcome.skipped.as_deref(), Some(PAGE_SOURCE_REFUSED));
+            // Nothing of the page's source reaches the evidence.
+            assert_eq!(outcome.result, "");
+            assert!(outcome.error.is_none());
+            let reason = outcome.skipped.unwrap();
+            assert!(
+                reason.contains("the source of a page is not read"),
+                "{reason}"
+            );
+            assert!(reason.contains("playwright"), "{reason}");
+
+            // A pattern does not sneak the source past the refusal.
+            let outcome = runner(temp.path())
+                .run(&RewardCheck::new().with_path(name).with_pattern("score"))
+                .await
+                .unwrap();
+            assert_eq!(outcome.skipped.as_deref(), Some(PAGE_SOURCE_REFUSED));
+            assert_eq!(outcome.result, "");
+        }
+
+        // A script and a stylesheet are read as source, as Python reads them.
+        for name in ["app.js", "theme.css"] {
+            let outcome = runner(temp.path())
+                .run(&RewardCheck::new().with_path(name))
+                .await
+                .unwrap();
+            assert!(outcome.succeeded(), "{name}: {outcome:?}");
+            assert!(
+                outcome.result.contains("score"),
+                "{name}: {}",
+                outcome.result
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_checks_are_typed_deferred() {
+        let temp = tempfile::tempdir().unwrap();
+        for check in [
+            RewardCheck::new().with_page("index.html"),
+            RewardCheck::new().with_action(json!({"type": "click"})),
+        ] {
+            let error = runner(temp.path()).run(&check).await.unwrap_err();
+            assert!(
+                matches!(error, Error::Unsupported(_)),
+                "unexpected: {error}"
+            );
+            assert!(error.to_string().contains("playwright"));
+        }
 
         let outcome = runner(temp.path()).run(&RewardCheck::new()).await.unwrap();
         assert!(outcome.skipped.unwrap().contains("unknown tool"));

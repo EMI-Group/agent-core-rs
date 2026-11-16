@@ -186,15 +186,67 @@ async fn a_path_that_leaves_the_workspace_is_rejected() {
 }
 
 #[tokio::test]
-async fn a_picture_check_is_typed_unsupported() {
+async fn a_picture_check_reports_the_header_not_the_pixels() {
     let dir = TempDir::new().expect("temp dir");
-    write(&dir, "shot.png", "not really a png");
-    let error = runner(&dir)
+    // A minimal PNG: the signature and a 13-byte IHDR chunk, 800x600.
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    png.extend_from_slice(&13_u32.to_be_bytes());
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&800_u32.to_be_bytes());
+    png.extend_from_slice(&600_u32.to_be_bytes());
+    png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    std::fs::write(dir.path().join("shot.png"), &png).expect("fixture file");
+
+    let outcome = runner(&dir)
         .run(&RewardCheck::new().with_path("shot.png"))
         .await
-        .expect_err("pictures need PIL");
-    assert!(matches!(error, Error::Unsupported(_)), "got {error:?}");
-    assert!(error.to_string().contains("PIL"), "{error}");
+        .expect("pictures are read, not refused");
+    assert!(outcome.succeeded(), "unexpected: {outcome:?}");
+    assert_eq!(
+        outcome.result,
+        "path: shot.png\npicture file (800x600 PNG, 33 bytes)\n\
+         the judge sees the picture's metadata (format and size), not its pixels"
+    );
+}
+
+#[tokio::test]
+async fn a_picture_that_is_not_readable_is_evidence_not_an_error() {
+    let dir = TempDir::new().expect("temp dir");
+    write(&dir, "shot.png", "not really a png");
+    let outcome = runner(&dir)
+        .run(&RewardCheck::new().with_path("shot.png"))
+        .await
+        .expect("an unreadable picture is not an error");
+    assert!(outcome.succeeded(), "unexpected: {outcome:?}");
+    assert_eq!(outcome.result, "not a readable picture");
+}
+
+#[tokio::test]
+async fn page_source_is_refused_while_scripts_and_styles_are_read() {
+    let dir = TempDir::new().expect("temp dir");
+    write(&dir, "index.html", "<p>the score is 7</p>");
+    let outcome = runner(&dir)
+        .run(&RewardCheck::new().with_path("index.html"))
+        .await
+        .expect("a refused page is not an error");
+    assert!(!outcome.succeeded());
+    let reason = outcome
+        .skipped
+        .expect("a page read is skipped, with a reason");
+    assert!(
+        reason.contains("the source of a page is not read"),
+        "{reason}"
+    );
+    assert!(reason.contains("playwright"), "{reason}");
+    assert_eq!(outcome.result, "");
+
+    write(&dir, "app.js", "const score = 7;");
+    let outcome = runner(&dir)
+        .run(&RewardCheck::new().with_path("app.js"))
+        .await
+        .expect("a script is read as source");
+    assert!(outcome.succeeded(), "unexpected: {outcome:?}");
+    assert!(outcome.result.contains("const score = 7;"), "{outcome:?}");
 }
 
 #[tokio::test]

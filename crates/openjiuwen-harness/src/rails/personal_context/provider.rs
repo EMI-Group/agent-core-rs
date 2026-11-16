@@ -158,14 +158,20 @@ pub struct FetchedSource {
     pub source_id: String,
     /// Kind of provider that produced the source.
     pub kind: SourceKind,
+    /// Service id the source is namespaced under.
+    pub service: String,
     /// Display title of the source.
     pub title: String,
     /// Provider-specific locator of the source (an absolute path for local files).
     pub locator: String,
+    /// Location shown for the source, with `/` separators; empty falls back to `source_id`.
+    pub relative_path: String,
     /// Provider revision marker; the content digest for local files.
     pub revision: String,
-    /// SHA-256 hex digest (64 lowercase characters) of the source bytes.
+    /// SHA-256 hex digest (64 lowercase characters) of the indexed text.
     pub content_hash: String,
+    /// Size of the indexed content in bytes.
+    pub size_bytes: u64,
     /// Indexed text content of the source.
     pub content: String,
     /// Provider-specific extra facts, always rendered as strings.
@@ -271,16 +277,19 @@ fn fetched_source(document: IngestedDocument) -> FetchedSource {
         normalize_source_locator(&document.locator).unwrap_or_else(|_| document.locator.clone());
     let source_id = source_id_for_locator(&locator).unwrap_or_else(|_| document.source_id.clone());
     let mut metadata = BTreeMap::new();
-    metadata.insert("relative_path".to_string(), document.relative_path);
-    metadata.insert("service".to_string(), document.service);
+    metadata.insert("relative_path".to_string(), document.relative_path.clone());
+    metadata.insert("service".to_string(), document.service.clone());
     metadata.insert("size_bytes".to_string(), document.size_bytes.to_string());
     FetchedSource {
         source_id,
         kind: SourceKind::LocalFiles,
+        service: document.service,
         title: document.title,
         locator,
+        relative_path: document.relative_path,
         revision: document.content_hash.clone(),
         content_hash: document.content_hash,
+        size_bytes: document.size_bytes,
         content: document.text,
         metadata,
     }

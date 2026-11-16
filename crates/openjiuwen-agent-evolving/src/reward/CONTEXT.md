@@ -22,7 +22,10 @@ Everything here is deterministic offline: no container runtime, no browser, no w
 - `CheckOutcome { ok, result, screenshots, skipped, error }` — constructors `ok`, `skipped`, `failed`, plus `succeeded()`.
 - `CheckRunner { root, runner, max_output_chars (6000), max_hits (60), listing_limit (200) }` — `new(root, runner)`, the three `with_*` limit setters, `root()`, `async run(&RewardCheck) -> Result<CheckOutcome>`.
 - `inside(root, relative)` — lexical containment check: the target must equal `root` or sit under it; `Error::validation` otherwise.
-- `CheckRunner` constants: `DEFAULT_MAX_OUTPUT_CHARS` `6000`, `DEFAULT_MAX_HITS` `60`, `DEFAULT_LISTING_LIMIT` `200`, `PYTHON_TIMEOUT_MS` `60000`, `PROXY_SINK` `http://127.0.0.1:9`, `DEFAULT_RANGE_COUNT` `200`, `MAX_RANGE_COUNT` `400`, `PAGE_SUFFIXES`, `IMAGE_SUFFIXES`.
+- `CheckRunner` constants: `DEFAULT_MAX_OUTPUT_CHARS` `6000`, `DEFAULT_MAX_HITS` `60`, `DEFAULT_LISTING_LIMIT` `200`, `PYTHON_TIMEOUT_MS` `60000`, `PROXY_SINK` `http://127.0.0.1:9`, `DEFAULT_RANGE_COUNT` `200`, `MAX_RANGE_COUNT` `400`, `PAGE_SUFFIXES`, `PAGE_SOURCE_SUFFIXES` (`html`, `htm`), `IMAGE_SUFFIXES`, `PAGE_SOURCE_REFUSED` (the skip reason for a page read).
+- `PictureInfo { format, width, height, bytes, animated }` — what a picture file's header says; `parse` (header-only, no decode), `longest_side`, `rewrite_reasons` (why Python would re-encode it), `render_format`, `evidence(path)`.
+- `PictureFormat { Png, Jpeg, Gif, Webp, Bmp, Unknown }` — `sniff(bytes)` reads the magic, `as_str` is the Pillow/vision-API spelling (`PNG`, `JPEG`, `GIF`, `WEBP`, `BMP`, `unknown`).
+- Picture constants: `PICTURE_SIDE` `1600`, `PICTURE_BYTES` `3_000_000`, `MODEL_PICTURE_FORMATS` (`PNG`/`JPEG`/`GIF`/`WEBP`), `UNREADABLE_PICTURE` `"not a readable picture"`.
 - `EvidenceAgent { model, request, max_rounds (4), max_result_chars (7500) }` — `new`, `with_max_rounds`, `with_max_result_chars`, `async gather(&EvidenceTask, &CheckRunner) -> Result<EvidenceGathered>`.
 - `EVIDENCE_AGENT_PROMPT` — the agent's instructions with documented placeholders `{task}`, `{criteria}`, `{workspace_files}`, `{inputs_excerpt}`, `{final_reply}`, `{rounds}`.
 - `EvidenceTask { task, workspace_files, inputs_excerpt, final_reply, criteria }`, `EvidenceCriterion { id, name, kind, claims }`, `EvidenceClaim { index, text }`, `CriterionKind { Floor, ProactiveChallenge }` (serde `floor|proactive_challenge`), each with `new`/`with_*` builders.
@@ -47,14 +50,18 @@ Everything here is deterministic offline: no container runtime, no browser, no w
 - `read` with a `pattern` matches case-insensitively as a substring (no regular-expression dependency), reports at most `max_hits` hits, shows whole lines only and names a cut when the output cap truncates them; Python's `context` knob (0–5 lines) is not part of this reduced check model, so context is always `0`.
 - `read` without a pattern shows `count` lines from line 1 (clamped `1..=400`) and reports `lines: 1-N of M`.
 - `read` without a `path`, and a check that names no resolvable tool, are `CheckOutcome::skipped`, not errors.
+- A `.html`/`.htm` read never reads the file: it is `CheckOutcome::skipped(PAGE_SOURCE_REFUSED)`, which carries Python's "the source of a page is not read: use the page in the browser; find the names a probe needs with a probe (Object.keys(window), the page's buttons)" plus this port's reason (no playwright), with `result` empty so no source text can reach the judge.
+- `.js`/`.mjs`/`.css` are read as source, exactly as Python reads them when no browser is available; only a page is refused.
+- A picture (`png`/`jpg`/`jpeg`/`webp`/`gif`/`bmp`, suffix case-insensitive) is read as a header: `path: <p>\npicture file (800x600 PNG, 12345 bytes)\nthe judge sees the picture's metadata (format and size), not its pixels`. Nothing is decoded or re-encoded, and a file above `PICTURE_SIDE`/`PICTURE_BYTES` (or in a format a vision API does not take) adds a `note:` naming why Python would re-encode it as a JPEG and that this port converted nothing.
+- An unreadable or corrupt picture is `CheckOutcome::ok("not a readable picture")` — Python's answer, not a typed error; a picture file that cannot be opened at all answers the same.
 - `python` writes the script into a unique scratch directory outside the workspace (`std::env::temp_dir()`, process id plus a counter, removed afterwards), runs `python3 -I <script>` (or `python`) through `CommandRunner` with `cwd` = the workspace so the check can measure the work, `TMPDIR`/`TEMP`/`TMP` = the scratch directory, `HTTP_PROXY`/`HTTPS_PROXY` = `PROXY_SINK`, `PYTHONIOENCODING=utf-8`, `PYTHONDONTWRITEBYTECODE=1` and the 60 s timeout.
 - The `python` result keeps 6000 stdout characters and 3000 stderr characters; a non-zero exit or a timeout sets `error` and `ok = false` instead of discarding the output.
 - A missing interpreter is `Error::Unsupported` naming `python3`/`python`; there is no `GUARD` audit hook in this port, so a script runs unguarded inside its scratch directory.
 
 ## Deferred surface
-- `browser` checks return `Error::Unsupported` with the message `browser checks are deferred: they need playwright (headless browser automation), which this port does not bundle`.
-- Reading a picture (`png`, `jpg`, `jpeg`, `webp`, `gif`, `bmp`) returns `Error::Unsupported` with the message `reading <path> as a picture is deferred: it needs PIL (Pillow) image processing, which this port does not bundle`.
-- Inside `EvidenceAgent::gather` such a deferred check is recorded on its `GatheredCheck` (`error` names playwright or PIL) instead of aborting the run, mirroring Python's `run_one` catch so the model can plan around it.
+- `browser` checks return `Error::Unsupported` with the message `browser checks are deferred: they need playwright (headless browser automation), which this port does not bundle`. The `with_page`/`actions` inference (`TOOL_BY_FIELD`) still yields it, so a page is never scored from raw source.
+- Pixel-level picture judging is replaced (not deferred): `src/reward/picture.rs` parses PNG/JPEG/GIF/WebP/BMP headers with no dependency and reports format, size and bytes. No image decoder is bundled, so the judge sees metadata only and the result says so; Python's Pillow-based `picture_data`/`image_views` (re-encoding, base64 image parts, `max_images` views) is not ported.
+- Inside `EvidenceAgent::gather` a deferred browser check is recorded on its `GatheredCheck` (`error` names playwright) and a refused page or unreadable picture is recorded as `skipped`/`ok` evidence instead of aborting the run, mirroring Python's `run_one` catch so the model can plan around it.
 - Not ported from Python's evidence agent: the harness `run_checks`/`read_evidence` tool loop, saved-result paging, idle stopping, restart after a dropped stream, the default screenshot walk, screenshot-carrying messages and image judging.
 - Not ported from Python's pipeline: the criteria writer, feedback placement, the art judge, `cap_by_critique`, `claim_gains` and the per-run result document.
 
@@ -83,7 +90,8 @@ Everything here is deterministic offline: no container runtime, no browser, no w
 - `./models.rs` → `RewardDimension`, `RewardSignal`, `DimensionScore`, `RewardSummary`
 - `./scoring.rs` → `ScoreNormalisation`, `MissingDimensionPolicy`, `RewardAggregator`, `ScoreStats`
 - `./pack.rs` → `RewardPack`, `default_pack`, `reward_from_score`, `score_evaluated_cases`
-- `./check.rs` → `CheckTool`, `RewardCheck`, `CheckOutcome`, `CheckRunner`, `inside` and the read/python tools
+- `./check.rs` → `CheckTool`, `RewardCheck`, `CheckOutcome`, `CheckRunner`, `inside`, the read/python tools, the page refusal and the picture-header hand-off
+- `./picture.rs` → `PictureInfo`, `PictureFormat`, the PNG/JPEG/GIF/WebP/BMP header parsers and the send-limit constants
 - `./evidence.rs` → `EvidenceAgent`, `EvidenceTask`, `EvidenceCriterion`, `EvidenceClaim`, `CriterionKind`, `GatheredCheck`, `EvidenceGathered`, `EVIDENCE_AGENT_PROMPT`
 - `./model_check.rs` → `CriterionStatus`, `score_criterion`, `total`, `CriterionReport`, `CheckRewardReport`, `ModelRewardJudge`, `to_reward_signal`, `JUDGE_PROMPT`
 - `./end_to_end.rs` → test-only end-to-end scenarios for gathering, judging, the deferred tools and the report → signal → pack round trip

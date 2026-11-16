@@ -1,9 +1,10 @@
 //! Frame projection of the Claude Code transport.
 //!
 //! Every method here turns one decoded CLI frame into harness observations (outputs, tool calls,
-//! tool results, usage, provider events, permission prompts) or into the turn's terminal result.
-//! The turn loop, process ownership and lifecycle live in `harness`; the argv and environment live
-//! in `wire`.
+//! tool results, usage, provider events, permission prompts) or records the turn's terminal
+//! `result` in the accumulator. The turn loop, process ownership and the receipt-driven turn
+//! boundary live in `harness`; the argv and environment live in `wire`; the failure classification
+//! lives in `failure`.
 
 use std::collections::BTreeMap;
 
@@ -15,18 +16,22 @@ use openjiuwen_harness_protocol::{
 use serde_json::json;
 
 use crate::vendor_cli::{
-    ask_tool_approval, ask_user_input, completed_turn, failed_turn, turn_error, ApprovalDecision,
-    ChildProcess, TurnContext,
+    ask_tool_approval, ask_user_input, completed_turn, failed_turn, ApprovalDecision, ChildProcess,
+    TurnContext,
 };
 
-use super::harness::{lock, PROVIDER_EVENT_NAME, SDK_ERROR_CATEGORY};
+use super::failure::{classify_assistant_error, classify_result_message, merge_pending_error};
+use super::harness::{lock, PROVIDER_EVENT_NAME};
 use super::ClaudeDriver;
 
 /// Tool name the CLI uses for its user-input prompt.
 const ASK_USER_QUESTION: &str = "AskUserQuestion";
 
 impl ClaudeDriver {
-    /// Maps one decoded stdout frame onto observations, or returns the terminal result.
+    /// Projects one decoded stdout frame onto observations, recording a terminal `result`.
+    ///
+    /// Returning is not the same as ending the turn: a `result` frame only settles it once the
+    /// cycle tracker sees no submitted message outstanding, which the turn loop decides.
     pub(super) async fn dispatch(
         &self,
         frame: &Frame,
@@ -34,38 +39,37 @@ impl ClaudeDriver {
         session: &TurnContext,
         accumulator: &mut TurnAccumulator,
         process: &mut ChildProcess,
-    ) -> HarnessResult<FrameAction> {
+    ) -> HarnessResult<()> {
         match frame.get("type").and_then(JsonValue::as_str) {
             Some("system") => {
                 self.handle_system(frame, turn_id, session).await;
-                Ok(FrameAction::Continue)
+                Ok(())
             }
             Some("assistant") => {
                 self.handle_assistant(frame, turn_id, session, accumulator)
                     .await;
-                Ok(FrameAction::Continue)
+                Ok(())
             }
             Some("user") => {
                 self.handle_user(frame, turn_id, session, accumulator).await;
-                Ok(FrameAction::Continue)
+                Ok(())
             }
             Some("stream_event") => {
                 self.handle_stream_event(frame, turn_id, session, accumulator)
                     .await;
-                Ok(FrameAction::Continue)
+                Ok(())
             }
             Some("control_request") => {
                 self.handle_control_request(frame, turn_id, session, process)
                     .await?;
-                Ok(FrameAction::Continue)
+                Ok(())
             }
-            Some("control_response") => Ok(FrameAction::Continue),
+            Some("control_response") => Ok(()),
             Some("result") => {
                 let tail = process.stderr_tail();
-                Ok(FrameAction::Terminal(Box::new(
-                    self.handle_result(frame, turn_id, session, accumulator, &tail)
-                        .await,
-                )))
+                self.handle_result(frame, turn_id, session, accumulator, &tail)
+                    .await;
+                Ok(())
             }
             other => {
                 let event_type = other.unwrap_or("unknown");
@@ -77,7 +81,7 @@ impl ClaudeDriver {
                         JsonValue::Object(frame.clone()),
                     )
                     .await;
-                Ok(FrameAction::Continue)
+                Ok(())
             }
         }
     }
@@ -152,6 +156,10 @@ impl ClaudeDriver {
                 session.usage(turn_id, mapped).await;
             }
         }
+        if let Some(error) = message.get("error").filter(|error| !error.is_null()) {
+            self.report_assistant_error(error, message, turn_id, session, accumulator)
+                .await;
+        }
         if blocks.is_empty() {
             return;
         }
@@ -169,6 +177,41 @@ impl ClaudeDriver {
             data,
         });
     }
+
+    /// Classifies the `error` an assistant message reported and keeps it as the pending failure.
+    ///
+    /// The assistant message is the diagnostic; the result that follows is the verdict. The pending
+    /// error is folded into the terminal failure (`merge_pending_error`) because its text usually
+    /// names the actual cause.
+    async fn report_assistant_error(
+        &self,
+        error: &JsonValue,
+        message: &serde_json::Map<String, JsonValue>,
+        turn_id: &str,
+        session: &TurnContext,
+        accumulator: &mut TurnAccumulator,
+    ) {
+        let identifier = error
+            .as_str()
+            .map_or_else(|| compact_json(error), str::to_owned);
+        let classified = classify_assistant_error(&identifier, Some(message));
+        let category = classified.category.clone().unwrap_or_default();
+        let mut data = JsonObject::new();
+        if !category.is_empty() {
+            data.insert("category".to_owned(), json!(category));
+        }
+        data.insert("error".to_owned(), json!(identifier));
+        session
+            .diagnostic(
+                turn_id,
+                DiagnosticLevel::Error,
+                &format!("Claude assistant message reported {category}"),
+                data,
+            )
+            .await;
+        accumulator.pending_error = Some(classified);
+    }
+
     /// Projects one `assistant` content block, publishing the observations it carries.
     #[allow(clippy::too_many_arguments)]
     async fn assistant_block(
@@ -486,7 +529,7 @@ impl ClaudeDriver {
         session: &TurnContext,
         accumulator: &mut TurnAccumulator,
         stderr_tail: &str,
-    ) -> TurnResult {
+    ) {
         let subtype = frame
             .get("subtype")
             .and_then(JsonValue::as_str)
@@ -511,13 +554,10 @@ impl ClaudeDriver {
                 .and_then(JsonValue::as_str)
                 .unwrap_or_default()
                 .to_owned();
-            return completed_turn(
-                JsonValue::String(text),
-                std::mem::take(&mut accumulator.messages),
-                accumulator.usage.clone(),
-            );
+            accumulator.outcome = Some(TerminalOutcome::Completed(text));
+            return;
         }
-        let error = result_error(frame, &subtype, stderr_tail);
+        let error = result_error(frame, accumulator.pending_error.as_ref(), stderr_tail);
         let mut data = JsonObject::new();
         data.insert("subtype".to_owned(), json!(subtype));
         if let Some(status) = frame.get("api_error_status").and_then(JsonValue::as_u64) {
@@ -526,19 +566,22 @@ impl ClaudeDriver {
         session
             .diagnostic(turn_id, DiagnosticLevel::Error, &error.message, data)
             .await;
-        failed_turn(error)
+        accumulator.outcome = Some(TerminalOutcome::Failed(error));
     }
 }
 
 /// One decoded JSON object off the CLI's stdout.
 type Frame = serde_json::Map<String, JsonValue>;
 
-/// Outcome of one turn-loop iteration.
-pub(super) enum FrameAction {
-    /// Keep reading frames.
-    Continue,
-    /// The turn reached its terminal result; boxed because it dwarfs `Continue`.
-    Terminal(Box<TurnResult>),
+/// Last terminal `result` the turn received, already classified.
+///
+/// A turn can span several CLI cycles (a steered message answered in a new cycle), so the loop
+/// records every result and the last one states how the turn ended.
+pub(super) enum TerminalOutcome {
+    /// The cycle succeeded and reported this `result` text.
+    Completed(String),
+    /// The cycle failed with this classified error.
+    Failed(TurnError),
 }
 
 /// Per-turn accumulator: message history, usage and output indices.
@@ -554,9 +597,29 @@ pub(super) struct TurnAccumulator {
     tool_names: BTreeMap<String, String>,
     /// Usage accumulated over every frame of the turn.
     usage: Option<TurnUsage>,
+    /// Terminal outcome of the last `result` frame, when one arrived.
+    outcome: Option<TerminalOutcome>,
+    /// Error an earlier assistant message reported, folded into the terminal failure.
+    pending_error: Option<TurnError>,
 }
 
 impl TurnAccumulator {
+    /// Builds the terminal result of the turn, or returns `None` when no `result` arrived.
+    pub(super) fn terminal_result(&mut self) -> Option<TurnResult> {
+        match self.outcome.take()? {
+            TerminalOutcome::Completed(text) => Some(completed_turn(
+                JsonValue::String(text),
+                std::mem::take(&mut self.messages),
+                self.usage.clone(),
+            )),
+            TerminalOutcome::Failed(error) => Some(failed_turn(error)),
+        }
+    }
+
+    /// Returns whether a `result` frame has arrived.
+    pub(super) fn has_result(&self) -> bool {
+        self.outcome.is_some()
+    }
     /// Starts an assistant message and returns its index.
     fn begin_message(&mut self) -> u64 {
         if self.stream_open {
@@ -736,67 +799,14 @@ fn question_choices(input: &JsonValue) -> Vec<String> {
 }
 
 /// Builds the normalized failure of a terminal `result` frame.
-fn result_error(frame: &Frame, subtype: &str, stderr_tail: &str) -> TurnError {
-    let status = frame.get("api_error_status").and_then(JsonValue::as_u64);
-    let category = failure_category(subtype, status);
-    let retryable = matches!(
-        category,
-        "rate_limited" | "server_unavailable" | "network_timeout"
-    );
-    let message = frame
-        .get("result")
-        .and_then(JsonValue::as_str)
-        .filter(|text| !text.trim().is_empty())
-        .map(str::to_owned)
-        .or_else(|| errors_text(frame))
-        .unwrap_or_else(|| match status {
-            Some(status) => format!("Claude turn failed: HTTP {status}"),
-            None => format!("Claude turn failed ({subtype})"),
-        });
-    turn_error(
-        with_tail(message, stderr_tail),
-        subtype,
-        category,
-        retryable,
-    )
-}
-
-/// Joins the informative `errors` strings of a result frame.
-fn errors_text(frame: &Frame) -> Option<String> {
-    let errors = frame.get("errors").and_then(JsonValue::as_array)?;
-    let informative: Vec<&str> = errors
-        .iter()
-        .filter_map(JsonValue::as_str)
-        .filter(|item| !item.trim().is_empty() && !item.trim().eq_ignore_ascii_case("unknown"))
-        .collect();
-    if informative.is_empty() {
-        None
-    } else {
-        Some(informative.join("\n"))
-    }
-}
-
-/// Classifies a failure by HTTP status and subtype, using Python's maps.
-fn failure_category(subtype: &str, http_status: Option<u64>) -> &'static str {
-    if let Some(status) = http_status {
-        let category = match status {
-            400 => "request_rejected",
-            401 | 403 => "auth_required",
-            429 => "rate_limited",
-            500 | 529 => "server_unavailable",
-            _ => SDK_ERROR_CATEGORY,
-        };
-        if category != SDK_ERROR_CATEGORY {
-            return category;
-        }
-    }
-    match subtype {
-        "authentication_failed" => "auth_required",
-        "billing_error" => "quota_exceeded",
-        "invalid_request" => "request_rejected",
-        "rate_limit" => "rate_limited",
-        "server_error" => "server_unavailable",
-        _ => SDK_ERROR_CATEGORY,
+///
+/// The classification is the shared one (`failure::classify_result_message`); this wrapper only
+/// folds in an earlier assistant diagnostic and appends the CLI's stderr tail.
+fn result_error(frame: &Frame, pending: Option<&TurnError>, stderr_tail: &str) -> TurnError {
+    let classified = merge_pending_error(pending, classify_result_message(frame));
+    TurnError {
+        message: with_tail(classified.message, stderr_tail),
+        ..classified
     }
 }
 

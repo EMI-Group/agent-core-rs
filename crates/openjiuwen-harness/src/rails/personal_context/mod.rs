@@ -24,6 +24,7 @@
 //! - `rail` — [`PersonalContextRail`] prompt-section injection
 
 mod atomic;
+mod fetch;
 mod ingest;
 mod link_book;
 mod path;
