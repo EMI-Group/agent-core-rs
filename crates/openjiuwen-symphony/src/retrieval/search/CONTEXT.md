@@ -7,6 +7,7 @@ It loads a prebuilt index — nothing here builds, mutates or persists one — a
 Everything is offline and deterministic: no network, no clock, no RNG, no hash-map iteration order in any output, and every model-facing stage has a documented model-free path.
 The public shape is [`Retriever`](crate::retrieval::search::service::Retriever), which validates a query, resolves `top_k`, runs the walk and publicizes the raw candidates into [`RetrievalResult`](crate::retrieval::search::service::RetrievalResult) rows; everything below it is engine detail.
 The model is optional, unlike Python: [`SelectionMode::Lexical`](crate::retrieval::search::config::SelectionMode) and [`FallbackMode::Deterministic`](crate::llm::FallbackMode) make a model-free deployment a supported configuration.
+No fallback is silent: [`SelectionProvenance`](crate::retrieval::search::flow::SelectionProvenance) travels on every [`SelectionResult`](crate::retrieval::search::flow::SelectionResult) and is summarized on [`ProgressiveSearchResult`](crate::retrieval::search::progressive::ProgressiveSearchResult), [`FlatSearchResult`](crate::retrieval::search::flat::FlatSearchResult) and [`RetrievalResult`](crate::retrieval::search::service::RetrievalResult), so a configured-but-unused model is visible in the returned value and not only in the log.
 
 ### Pipeline
 
@@ -18,6 +19,30 @@ The model is optional, unlike Python: [`SelectionMode::Lexical`](crate::retrieva
 6. **Expand and reduce** — [`DefaultTargetExpander`](crate::retrieval::search::expand::DefaultTargetExpander) turns selected targets into an [`ExpansionPlan`](crate::retrieval::search::flow::ExpansionPlan) of leaves and child cursors, and [`DefaultBranchReducer`](crate::retrieval::search::reduce::DefaultBranchReducer) merges a node's own leaves with its children's results into one [`NodeSearchResult`](crate::retrieval::search::flow::NodeSearchResult).
 7. **Publicize** — [`Retriever::search_details_with`](crate::retrieval::search::service::Retriever::search_details_with) resolves each candidate's `payload` (a leaf `cid`) through the catalog to a [`CatalogRecord`](crate::retrieval::types::CatalogRecord) and exposes the public `worker_id`, name, description, branch path and category.
 8. **Trace** — every stage records [`RetrieverTraceEvent`](crate::retrieval::types::RetrieverTraceEvent)s into one [`RetrieverTrace`](crate::retrieval::types::RetrieverTrace), which the facade copies into `RetrievalResult::trace_events`.
+
+### Degradation observability
+
+Every place this module answers with something other than what was configured says so, in the returned value, the trace, or at least one `tracing` record.
+
+| Path | How it is observable |
+| --- | --- |
+| `SelectionMode::Generate`, model wired, model answered | `MODE_GENERATE` + `SelectionProvenance::Model`, `degraded = false` |
+| `SelectionMode::Generate`, no generate selector (`Deterministic`, the default) | `MODE_LEXICAL_NO_MODEL` + `LexicalNoModel`, `degraded = true`, one `tracing::warn!` per selector instance (clones share it), `RetrievalResult::degraded_selections ≥ 1` |
+| `SelectionMode::Generate`, no generate selector under `FallbackMode::Error` | typed `Error::Unsupported` naming the fix, before any selection |
+| model call (or prompt construction) failed under `Deterministic` | `MODE_LEXICAL` + `LexicalAfterModelError`, `degraded = true`, a warn per failing call naming node, depth, model and error |
+| reply parsed to no known code (non-blank, not abstaining) | `MODE_GENERATE` + `UnusableReply`, `degraded = true`, a warn naming the reply length; the node selects nothing |
+| model abstained, or replied blankly | `SelectionProvenance::Model` with `is_abstain` (blank) — a legitimate empty answer, not a degradation |
+| `SelectionMode::Lexical` | `MODE_LEXICAL` + `Lexical`, `degraded = false` |
+| embedder wired with a positive weight | `MODE_EMBEDDING_BLEND` + `EmbeddingBlend`; the flat retriever reports `METHOD_FLAT` + `EmbeddingBlend` |
+| embedder wired with weight `0.0`, or no embedder | the blend is inactive by configuration: `Lexical` / `METHOD_FLAT_LEXICAL`, never degraded |
+| exactly one selectable target at a node | `MODE_SINGLE_SELECTABLE_SHORTCUT` + `SingleSelectable`, a documented shortcut rather than a degradation |
+| no selectable target / empty subtree | the node ends without a selection event; nothing was configured away, so nothing is marked |
+| over-large `SearchRequest::top_k` | clamped with a `tracing::warn!` naming both bounds and `RetrievalResult::top_k_clamped = true` |
+| `max_steps` reached | one `search_truncated` event carrying `max_steps`, state reported exhausted (never an error) |
+| disclosure budget exceeded (`max_chars`, `max_description_chars`, `max_items_per_branch`) | `ExposedFragment::{rendered_chars, truncated}` on the fragment, plus a `tracing` record naming the withheld count for the item cap |
+| subtree provider built without a `FragmentBuildFn` | typed `Error::Unsupported` (never an empty subtree) |
+| unusable lexical query expression | a `tracing::warn!`; the selection still runs |
+| flat retriever without a usable embedder | `method`/`selection_provenance` on the result state the lexical pass; never a silent blend |
 
 ## API Surface
 
@@ -46,7 +71,10 @@ pub struct SelectableTarget { pub resolution: SelectableResolution }   // new / 
 pub struct CurrentSubtree { pub cursor: SearchCursor, pub fragment: ExposedFragment, pub selectable_targets: Vec<SelectableTarget> }
 pub struct SelectionProtocol { pub compact_codes_enabled: bool, pub candidate_codes: Vec<String>, pub code_width: usize, pub abstain_token: String }
 pub struct PromptBundle { pub fragment: ExposedFragment, pub protocol: SelectionProtocol, pub messages: Vec<ChatMessage> }
-pub struct SelectionResult { pub raw_output: String, pub selected_targets: Vec<SelectableTarget>, pub is_abstain: bool }
+pub enum SelectionProvenance { Model, Lexical, LexicalNoModel, LexicalAfterModelError,
+                               EmbeddingBlend, SingleSelectable, UnusableReply }   // as_str / parse / is_degraded
+pub struct SelectionResult { pub raw_output: String, pub selected_targets: Vec<SelectableTarget>, pub is_abstain: bool,
+                             pub provenance: SelectionProvenance, pub degraded: bool }   // with_provenance
 pub struct ChildSearchCursor { pub cursor: SearchCursor, pub target: SelectableTarget }
 pub struct ExpansionPlan { pub leaf_results: Vec<RetrieverCandidate>, pub child_cursors: Vec<ChildSearchCursor> }
 pub struct NodeSearchResult { pub candidates: Vec<RetrieverCandidate> }
@@ -55,6 +83,8 @@ pub struct NodeSearchResult { pub candidates: Vec<RetrieverCandidate> }
 `SelectionProtocol::default().abstain_token == ABSTAIN_TOKEN` (a custom `Default`).
 `SearchCursor::node_id`/`SelectableResolution::node_id` replace Python's embedded node objects, so both are serializable and cheap to copy.
 `ExposedFragment` adds the Rust-only `rendered_chars`/`truncated` bookkeeping and drops Python's `selectable_nodes`/`score_key`/`token_id`, which no ported stage reads.
+[`SelectionProvenance`](crate::retrieval::search::flow::SelectionProvenance) and the two `SelectionResult` fields are Rust-only: they record how a selection was answered, and `degraded` is exactly `provenance.is_degraded()` (true for `LexicalNoModel`, `LexicalAfterModelError` and `UnusableReply`).
+`SelectionProvenance`'s serde default is `Lexical`, so an old payload without the fields parses as a non-degraded lexical selection.
 All collections are `Vec`/`BTreeMap`, so serialization order is deterministic.
 
 ### `config` (`src/retrieval/search/config.rs`)
@@ -232,15 +262,32 @@ A cache hit pairs the cached fragment and targets with the caller's own cursor, 
 pub const FRAGMENT_SELECTED_EVENT: &str = "fragment_selected";
 pub const MODE_LEXICAL: &str = "lexical_fallback";
 pub const MODE_GENERATE: &str = "generate";
+pub const MODE_LEXICAL_NO_MODEL: &str = "lexical_no_model";
 pub const ABSTAIN_HINTS: &[&str];                    // English + Chinese "nothing relevant" phrasings
 pub fn is_abstain_output(output: &str) -> bool;      // blank is NOT an abstention; "0" and hints are
 pub fn query_text(query_messages: &[ChatMessage]) -> String;   // every content joined with "\n"
 pub struct LexicalTopKSelector;   // new(config) / select(&subtree, &messages, top_k) -> SelectionResult (sync)
-pub struct DefaultTopKSelector;   // new(config) / with_generate_selector(GenerateFragmentSelector) / is_model_backed
+pub struct DefaultTopKSelector;   // new(config) / with_generate_selector(GenerateFragmentSelector) / is_model_backed /
+                                  // has_warned_no_model
+pub fn selection_provenance_for_mode(mode: &str) -> Option<SelectionProvenance>;
+pub fn trace_selection_provenance(trace: &RetrieverTrace) -> Option<SelectionProvenance>;
+pub fn trace_degraded_selections(trace: &RetrieverTrace) -> usize;
 ```
 
 Selection order: `SelectionMode::Lexical` always uses [`LexicalTopKSelector`]; `SelectionMode::Generate` with a generate selector calls it and honours [`FallbackMode`](crate::llm::FallbackMode) (`Error` surfaces the failure, `Deterministic` warns and degrades to the lexical selector); `Generate` without a generate selector selects lexically under `Deterministic` and answers `Error::Unsupported` under `Error`.
-Every selection records exactly one `fragment_selected` event with the detail keys `mode`, `raw_output`, `selected_canonical_ids` and `selected_codes`.
+Every degraded path is observable, in the returned value and in the trace:
+
+| path | `mode` | `provenance` | `degraded` |
+| --- | --- | --- | --- |
+| model answered | `MODE_GENERATE` | `Model` | false |
+| model answered unparseably (non-blank, not abstaining, no known code) | `MODE_GENERATE` | `UnusableReply` | true |
+| model failed, lexical fell in | `MODE_LEXICAL` | `LexicalAfterModelError` | true |
+| `SelectionMode::Lexical` | `MODE_LEXICAL` | `Lexical` | false |
+| `Generate` with no generate selector | `MODE_LEXICAL_NO_MODEL` | `LexicalNoModel` | true |
+
+Every selection records exactly one `fragment_selected` event with the detail keys `mode`, `raw_output`, `selected_canonical_ids`, `selected_codes`, `provenance` and `degraded`.
+`DefaultTopKSelector::warn_no_model_once` emits the no-model warning **once per selector instance** (clones share the `Arc<AtomicBool>` behind `has_warned_no_model`), because a walk would otherwise repeat the same configuration problem at every node; a model failure and an unusable reply each warn on the failing call, because each names a distinct error and reply.
+`trace_selection_provenance` reads the last `fragment_selected` event (its explicit `provenance` detail, else its `mode`, so an event recorded by a custom selector is classified too) and `trace_degraded_selections` counts the degraded ones.
 The lexical selector builds one `LexicalDocument` per selectable target (key = canonical id, name = display name, category = the branch path joined with `" > "`), ranks the concatenated query through `ranking_expression` (a `|`-separated alternative list, so a whole conversation does not gate every candidate out), applies the config's truncation rules, and never marks itself as an abstention.
 A blank query selects nothing and an unusable query expression is warned, not fatal; `top_k == 0` means unlimited.
 
@@ -276,7 +323,8 @@ pub struct RecursiveSearchEngine;   // new(provider, renderer, selector, expande
                                     // search(&EngineRequest, &mut TraversalState) / step(...) -> Option<TraversalStep>
 ```
 
-Per-node order: `get_current_subtree` (then a `fragment_built` event with `selectable_count` and `rendered_tree`) → no target ends the node → exactly one target takes the single-selectable shortcut (no render, no model, one `fragment_selected` event with `mode = "single_selectable_shortcut"`) → otherwise `build_protocol` → `render_subtree` → `select_topk` (an abstention or an empty selection ends the node) → `expand_selected_targets` (then `fragment_continue` with `leaf_count`, `branch_count`, `selected_terminal_ids` and `selected_branch_ids`) → child cursors pushed in reverse so the declared order is the visit order → `reduce_branch_results` (then `reduce_complete` with `input_candidates` and `output_candidates`).
+Per-node order: `get_current_subtree` (then a `fragment_built` event with `selectable_count` and `rendered_tree`) → no target ends the node → exactly one target takes the single-selectable shortcut (no render, no model, one `fragment_selected` event with `mode = "single_selectable_shortcut"` and `provenance = "single_selectable"`, `degraded = false`) → otherwise `build_protocol` → `render_subtree` → `select_topk` (an abstention or an empty selection ends the node) → `expand_selected_targets` (then `fragment_continue` with `leaf_count`, `branch_count`, `selected_terminal_ids` and `selected_branch_ids`) → child cursors pushed in reverse so the declared order is the visit order → `reduce_branch_results` (then `reduce_complete` with `input_candidates` and `output_candidates`).
+No target at a node is not a degradation: an empty exposure means the subtree holds nothing to select, and the node simply ends (`provenance` is not recorded because no selection happened).
 The walk is an explicit frame stack, so the depth bound is a real bound with no recursion; `TraversalState` is `serde`-serializable and round-trips through `serde_json`, so a walk can be begun, stepped, saved and resumed with the same candidates and trace.
 Child cursors are visited sequentially in declared order (no `ThreadPoolExecutor`), which is what makes the trace order deterministic.
 `search` closes the walk with one `search_complete` event (`steps`, `candidates`), and the root's reduction becomes `TraversalState::candidates`, bounded by the root cursor's `top_k` (`0` = unlimited).
@@ -290,7 +338,8 @@ pub const METHOD_LEXICAL_FALLBACK: &str = "lexical_fallback";
 pub const LLM_REQUEST_EVENT: &str = "llm_request";
 pub const LLM_RESPONSE_EVENT: &str = "llm_response";
 pub struct ProgressiveSearchResult { pub candidates: Vec<RetrieverCandidate>, pub trace: RetrieverTrace,
-                                     pub method: String, pub steps: usize, pub state: TraversalState }
+                                     pub method: String, pub steps: usize, pub state: TraversalState,
+                                     pub selection_provenance: SelectionProvenance, pub degraded_selections: usize }
 pub struct ProgressiveRetriever;   // new(root, config) / with_model(model, name) / with_embedding(embedding) /
                                    // rebind(root) / config / root / model_name / warmed_fragments /
                                    // prepare_root(top_k) / search(query, top_k) / search_messages(messages, top_k) /
@@ -300,9 +349,12 @@ pub fn validate_query(query: &str) -> Result<()>;   // Error::Validation naming 
 ```
 
 `new` binds the five seams: `DefaultCurrentSubtreeProvider` with a `FragmentBuildFn` built on `build_exposed_fragment`, `DefaultSubtreeRenderer`, `DefaultTopKSelector` (or `EmbeddingBlendedTopKSelector` after `with_embedding`), `DefaultTargetExpander` and `DefaultBranchReducer`.
+A `ProgressiveRetriever` keeps two selector instances: the primary one (model-backed when a model is wired) and `fallback_selector`, a clone of the same selector with `selection_mode` forced to `SelectionMode::Lexical` — so a model failure degrades to *lexical* selection and never re-enters the model, which is what `ModelTopKSelector` is handed as its `fallback`.
+`ModelTopKSelector` warns and marks `SelectionProvenance::LexicalAfterModelError` when the completion fails (or the reply cannot be split into a prompt), and flags `SelectionProvenance::UnusableReply` when a non-blank, non-abstaining reply yields no known code; an abstention or a blank reply is a legitimate empty selection and is not degraded.
 With a model configured the engine's selector is `ModelTopKSelector`, which per call builds the prompt with `build_disclosure_messages` (preferring the messages the engine already rendered), records `llm_request` (`model`, `node_id`, `depth`, `prompt_chars`, `messages`), calls [`CompletionModel::complete`](crate::llm::CompletionModel) with ONE prompt — Python's rendered system and user contents joined with `"\n\n"`, the crate's documented flattening — records `llm_response` (`model`, `node_id`, `reply_chars`), and parses the reply with `parse_selected_codes`.
 `prepare_root` exposes every reachable node once and renders the prompt of each selectable exposure, so a later search costs no rendering; `warmed_fragments` reports the cache size.
 `method` is [`METHOD_PROGRESSIVE`] when the walk recorded at least one `fragment_selected` event with `mode = "generate"`, and [`METHOD_LEXICAL_FALLBACK`] otherwise (no model configured, or `SelectionMode::Lexical`).
+`finish` reports the walk's provenance: `selection_provenance` is the last selection's provenance (`trace_selection_provenance`) and `degraded_selections` counts every degraded selection (`trace_degraded_selections`), so a `ProgressiveSearchResult` states whether the model was ever consulted and how often a stage fell back.
 `rebind` replaces the root and clears the generation-keyed exposure cache; the retriever itself is `&self`-only apart from that binding and the provider's cache.
 
 ### `blend_selector` (`src/retrieval/search/blend_selector.rs`)
@@ -314,7 +366,7 @@ pub struct EmbeddingBlendedTopKSelector;   // new(config, Arc<dyn Embedding>) / 
 ```
 
 This is the Rust-only third selection path: it keeps the lexical ranking as its backbone and nudges it with embedding similarity through `blend_scores`, then applies the config's truncation rules and the cursor's `top_k` (`0` = unlimited).
-It never calls a model and never reports an abstention, records one `fragment_selected` event with `mode = "embedding_blend"` and the same four detail keys as the other selectors, and skips the embedder entirely when the weight is `0.0`.
+It never calls a model and never reports an abstention, records one `fragment_selected` event with `mode = "embedding_blend"` and the same six detail keys as the other selectors, sets `SelectionProvenance::EmbeddingBlend` with `degraded = false`, and skips the embedder entirely when the weight is `0.0`.
 Documents are embedded in key order and the blend sorts on `(score, key)`, so the same catalog and query always select the same targets.
 
 ### `flat` (`src/retrieval/search/flat.rs`)
@@ -325,15 +377,18 @@ pub const METHOD_FLAT_LEXICAL: &str = "flat_lexical";
 pub const FLAT_ROOT_NODE_ID: &str = "flat_root";
 pub const FRAGMENT_BUILT_EVENT / REDUCE_COMPLETE_EVENT / SEARCH_COMPLETE_EVENT: &str;   // same names as the engine
 pub struct FlatSearchResult { pub candidates: Vec<RetrieverCandidate>, pub trace: RetrieverTrace,
-                              pub method: String, pub ranked_keys: Vec<String> }
+                              pub method: String, pub ranked_keys: Vec<String>,
+                              pub selection_provenance: SelectionProvenance }
 pub struct FlatRetriever;   // new(config) / with_embedding(embedding) / config / method /
-                            // retrieve(&root, query, top_k).await / retrieve_choices(&choices, query, top_k).await
+                            // selection_provenance / retrieve(&root, query, top_k).await /
+                            // retrieve_choices(&choices, query, top_k).await
 ```
 
 The one-shot retriever keeps Python's class contract (one call, one bounded ranked list, `search_complete` in the trace) but implements it as a single deterministic pass over the flattened catalog instead of the legacy `_select_items` recursion.
 It flattens via `RetrieverNode::flatten_choices` (or the caller's choices), keys documents by payload so a repeated payload collapses onto its first occurrence, ranks them with `LexicalIndex`, optionally blends embeddings with the same formula and weight as the blend selector, applies the truncation rules, and emits candidates ranked `1..n` with `item_id`/`label` = the choice id.
 Branch paths come from the tree for `retrieve` (the node id chain below the root) and from the payload's dotted proper prefixes for `retrieve_choices`; a choice-list trace reports `FLAT_ROOT_NODE_ID`.
-`method` is `METHOD_FLAT` only when an embedder is configured AND its weight is positive, else `METHOD_FLAT_LEXICAL`; a blank query is `Error::Validation` and an empty catalog is an empty result.
+`method` is `METHOD_FLAT` only when an embedder is configured AND its weight is positive, else `METHOD_FLAT_LEXICAL`; `selection_provenance` reports the same fact as [`SelectionProvenance::EmbeddingBlend`] or [`SelectionProvenance::Lexical`], and never a degraded variant because the flat path calls no model.
+A blank query is `Error::Validation` and an empty catalog is an empty result.
 
 ### `service` (`src/retrieval/search/service.rs`)
 
@@ -354,17 +409,20 @@ pub struct CandidateRecord { pub rank, item_id, worker_id, cid, name, descriptio
 pub struct RetrievalResult { pub method: String, pub item_ids: Vec<String>, pub candidates: Vec<CandidateRecord>,
                              pub summary_lines: Vec<String>, pub selected_item_id: Option<String>,
                              pub selected_rank: Option<usize>, pub trace_events: Vec<RetrieverTraceEvent>,
-                             pub steps: usize }
+                             pub steps: usize, pub selection_provenance: SelectionProvenance,
+                             pub degraded_selections: usize, pub top_k_clamped: bool }
 pub struct Retriever;   // load(dir, config).await / from_loaded_index(index, config).await / with_model / with_embedding /
                         // prepare().await / search(query).await / search_with(query, &SearchRequest).await /
                         // search_details(query).await / search_details_with(query, &SearchRequest).await /
-                        // index / config / runtime_config / flat / method / warmed_fragments
+                        // index / config / runtime_config / flat / method / selection_provenance / warmed_fragments
 ```
 
 The translator floors `top_k`, `max_tokens` and `max_branch_choices` at `1`, takes the disclosure knobs from `RenderConfig`, keeps the Rust-only disclosure bounds at their conservative defaults (the public config does not expose them), clamps `embedding_weight` into `[0, 1]` and validates the result; `max_parallel_branches`, `enable_parallel_branches` and `trie_constrained_decoding_enabled` are carried for configuration parity and ignored.
 `search_details_with` validates the query, resolves `top_k` (`None` = the configured value, `Some(0)` = the unlimited sentinel, anything else clamped to the configured value), runs the walk and publicizes: resolve the payload through the catalog (a payload with no record falls back to the candidate's own ids), dedupe by payload then by worker id, re-rank from `1`, mark the first row `selected`, trim to `top_k`, and derive `item_ids`, `summary_lines` and the selected row from the trimmed rows.
+An over-large request is reported twice: a `tracing::warn!` naming the requested and configured bounds, and `RetrievalResult::top_k_clamped = true` (a `Some(0)` request is the unlimited sentinel, not a clamp).
 `item_ids` is what `search`/`search_with` return — the public `worker_id` per row, falling back to the row's own item id, so the two entry points cannot disagree; `summary_lines` render one `"{rank}. {id} (source={method})"` line per row (no `score=` component, because candidates carry no score).
 `method` reports the backend the next search will use: `METHOD_PROGRESSIVE` with a model wired in generate mode, `METHOD_LEXICAL_FALLBACK` otherwise.
+`Retriever::selection_provenance` predicts the next search's provenance (`Model`, `LexicalNoModel`, `EmbeddingBlend` or `Lexical`), and each `RetrievalResult` carries the observed `selection_provenance` (the walk's last selection, falling back to the prediction when the walk selected nothing) plus `degraded_selections` (how many selections fell away from the configured model), so a caller that never reads logs still learns the model was not used.
 The progressive runtime is bound lazily on the first `prepare` or search and cached behind an `RwLock` that is never held across an `.await`; the config is translated eagerly in the constructor, so an unusable embedder is reported by the call that needs it.
 
 ### `render` (`src/retrieval/search/render/`)
@@ -434,7 +492,8 @@ The model's line order is preserved and each `canonical_id` is emitted once (fir
 
 - **The engine is composed from five seams, not one recursion.** `RecursiveSearchEngine` only decides *when* to expose, render, select, expand and reduce, so each stage is replaceable and each is unit-testable alone.
 - **Rendering reaches the traversal through a callback.** `FragmentBuildFn` keeps `subtree` model-free and renderer-free, and `SubtreeRenderer` keeps prompt construction in `render/`; Python's direct `render.disclosure` call in the provider is the one structural difference.
-- **Selection is async and has a model-free default.** `TopKSelector::select_topk` awaits a completion, `DefaultTopKSelector` holds an optional generate selector, and `LexicalTopKSelector` is the documented offline answer — so a walk degrades instead of failing.
+- **Selection is async and has an observable model-free default.** `TopKSelector::select_topk` awaits a completion, `DefaultTopKSelector` holds an optional generate selector, and `LexicalTopKSelector` is the offline answer — but every fallback states itself: the no-model path records `MODE_LEXICAL_NO_MODEL` with `SelectionProvenance::LexicalNoModel` and warns once per selector, a failed model call records `LexicalAfterModelError`, an unusable reply records `UnusableReply`, and only a deliberate `SelectionMode::Lexical` is plain `Lexical`.
+- **Provenance is data, not log-only.** Every selection carries `SelectionProvenance`/`degraded`, the trace event repeats them in its detail map, and each result type summarizes them, so a caller with logs disabled still learns the model was not used; the fields are additive with `SelectionProvenance::Lexical` as their serde default, so an old payload parses as a non-degraded lexical answer.
 - **`top_k == 0` means unlimited** in the engine, the expander, both reducers, both selectors, the flat retriever, the facade and truncation helpers; Python clamps or slices instead. This is the crate-wide sentinel.
 - **The walk is an explicit stack, not recursion.** That makes `max_depth` a real bound, `TraversalState` serializable/resumable, and the trace order deterministic (children visited sequentially).
 - **The exposure cache is generation-keyed.** Rebinding a tree bumps a counter inside the lock that swaps the tree, so a stale fragment is unreachable rather than merely unlikely.
@@ -463,11 +522,12 @@ The model's line order is preserved and each `canonical_id` is emitted once (fir
 
 ## Known Issues
 
-- `DefaultTopKSelector::select_topk` degrades silently when `SelectionMode::Generate` has no generate selector under the default `FallbackMode::Deterministic`: it answers the lexical selection with no `tracing::warn!`, unlike the model-failure branch, so a misconfigured retriever is indistinguishable from a model-free walk.
+- `selector.rs` is ~1290 lines, over the 1000-line soft cap, because the provenance helpers and their in-file `#[cfg(test)]` suite live beside the selectors; split it by responsibility if it grows further, never for size alone.
 - `lexical.rs` (~1584 lines) and `render/expose.rs` (~1566 lines) exceed the 1000-line soft cap only because their in-file `#[cfg(test)]` suites stay beside the logic; split them for responsibility, never for size alone.
 - Two `SearchCursor` types exist and must not be confused: `retrieval::types::SearchCursor` (the build side's resumable pre-order plan) and `search::flow::SearchCursor` (the runtime's one-node traversal cursor).
 - Python's production disclosure defaults (`flatten_full_tree_in_prompt = true`, `max_exposure_depth_per_call = 99`, `exposure_threshold = 1e9`) are this crate's `ProgressiveSearchConfig::default()` too, so the depth/threshold machinery is only exercised when a caller overrides them.
 - `TraversalConfig::max_parallel_branches`, `TraversalConfig::enable_parallel_branches` and `GenerationConfig::trie_constrained_decoding_enabled` change nothing; they exist so a Python config round-trips.
+- `map`-ordered trace details are not byte-stable across a change that adds a detail key: the `fragment_selected` event carries `provenance` and `degraded` in addition to `mode`/`raw_output`/`selected_canonical_ids`/`selected_codes`, so a trace consumer pinning the whole detail map must accept those two keys (rendered disclosures and rankings are unaffected).
 
 ## Error Strategy
 
@@ -475,14 +535,17 @@ The model's line order is preserved and each `canonical_id` is emitted once (fir
 - `Error::NotFound` — an explicitly requested index artifact that is missing, and a cursor whose `node_id` is not in the bound tree.
 - `Error::Unsupported` — a selection mode that needs a model with none wired under `FallbackMode::Error`, and a subtree provider constructed without a `FragmentBuildFn`.
 - `Error::Llm` — the model path's own failures, surfaced only under `FallbackMode::Error`; the deterministic mode warns and degrades to the fallback selector instead.
+- A degradation under `FallbackMode::Deterministic` is never an error: it is reported as `SelectionProvenance` on the result, a `mode`/`provenance`/`degraded` triple on the trace event, and one `tracing::warn!`.
 - `Error::Retrieval` — the embedder's backend failures (including "no vector returned") propagated from `openjiuwen-retrieval`; never swallowed.
 - `Error::Graph` — not produced here; `retrieval/build` owns that path.
 - Parse and truncation paths have no error channel by design: a garbage reply yields no selection, and a bad record is warned and skipped.
 
 ## Test Strategy
 
-- Unit tests live beside modules (`#[cfg(test)] mod tests`) and cover the helpers: tokenizer and matcher rules, BM25/field/phrase arithmetic, truncation bounds, code assignment and flat rendering, prompt variant selection, every parser shape, the exposure cache and generation invariant, expansion budgets, reduction order, engine step order and resumability, selector fallback order, and the facade's config translation.
+- Unit tests live beside modules (`#[cfg(test)] mod tests`) and cover the helpers: tokenizer and matcher rules, BM25/field/phrase arithmetic, truncation bounds, code assignment and flat rendering, prompt variant selection, every parser shape, the exposure cache and generation invariant, expansion budgets, reduction order, engine step order and resumability, selector fallback order and provenance, and the facade's config translation.
+- `selector` (`src/retrieval/search/selector.rs`) — the no-model degradation is marked and warned exactly once per instance (shared across clones), a failing generate function is marked `LexicalAfterModelError`, an unusable reply is marked and selects nothing, `SelectionMode::Lexical` stays undegraded, the flat provenance matches the reported method, and the trace helpers classify events recorded with or without the provenance detail keys.
 - `tests/retrieval_search.rs` — the end-to-end service facade and the layers under it: index loading and publicization, corrupt/missing artifacts, the scripted-model progressive path, the lexical fallback, `FallbackMode::Error` without a model, an unusable reply, the pinned trace sequence and detail keys, `prepare` warming, a resumed walk versus an uninterrupted search, the `max_steps`/`max_depth`/`max_branch_choices` bounds, the flat retriever and its blend, field-weighted ranking with a bounded CJK snippet, the per-request `top_k`, identical reruns, public identity (worker ids, never cids), the config translation, and the accessors.
+  Its provenance cases (`case_18`–`case_22`) pin: generate-without-a-model degrades to the identical lexical ranking but records `MODE_LEXICAL_NO_MODEL` and `LexicalNoModel` with `degraded_selections ≥ 1`; `FallbackMode::Error` still answers the typed `Unsupported` with its guidance message; `SelectionMode::Lexical` is never marked degraded; the new fields round-trip through serde and an old payload without them parses as plain `Lexical`; the degraded walk renders a byte-identical disclosure; and the `top_k` clamp is reported.
 - `tests/retrieval_search_lexical.rs` — the foundation layer built on a hand-made `LoadedIndex`: item and branch documents, field-weighted ranking, phrase and alternative rules, the CJK snippet, `search_in` scoping, blank queries and the empty index, order-independent determinism, hand-computed truncation decisions and budgets, and composition of the foundation types.
 - `tests/retrieval_search_disclosure.rs` — the render layer: nested exposure order with pinned codes and text, positional compact codes and the short-book validation error, five reply shapes recovering one selection, the two-message prompt naming every candidate once, character-boundary truncation of a multibyte budget, byte-identical reruns, the warmup renderer, flat mode's alphabetical order and fixed JSON fields, and fingerprint stability/sensitivity.
 - Everything is offline and deterministic: `StaticCompletionModel` for scripted replies, `HashEmbedding` for the blend, `tempfile` for index directories, no network, no clock, no hash-map-order assertions.
@@ -491,7 +554,7 @@ The model's line order is preserved and each `canonical_id` is emitted once (fir
 ## Routing Table
 
 - `./mod.rs` → module docs, module declarations, the re-exports, `RUNTIME_TOP_K`
-- `./flow.rs` → the flow value objects (`ChatMessage`, `SearchCursor`, `ExposedNode`, `ExposedFragment`, `SelectableResolution`, `SelectableTarget`, `CurrentSubtree`, `SelectionProtocol`, `PromptBundle`, `SelectionResult`, `ChildSearchCursor`, `ExpansionPlan`, `NodeSearchResult`, `ABSTAIN_TOKEN`)
+- `./flow.rs` → the flow value objects (`ChatMessage`, `SearchCursor`, `ExposedNode`, `ExposedFragment`, `SelectableResolution`, `SelectableTarget`, `CurrentSubtree`, `SelectionProtocol`, `PromptBundle`, `SelectionProvenance`, `SelectionResult`, `ChildSearchCursor`, `ExpansionPlan`, `NodeSearchResult`, `ABSTAIN_TOKEN`)
 - `./config.rs` → `ProgressiveSearchConfig`, `DisclosureConfig`, `EmbeddingScoringConfig`, `SelectionMode`, `DEFAULT_TOP_K`
 - `./contracts.rs` → the five seams, `FragmentBuildFn`, `GenerateFn`, `GenerateFragmentSelector`, `SelectRequest`, `GenerateRequest`
 - `./lexical.rs` → `LexicalIndex`, `LexicalDocument`, `LexicalHit`, `tokenize`, `QueryMatcher`, `compile_matcher`, the BM25/field/phrase weights, snippet and front-matter helpers
@@ -499,14 +562,14 @@ The model's line order is preserved and each `canonical_id` is emitted once (fir
 - `./codebooks.rs` → `CompactCodebook`, `CodeTrie`, `default_compact_boundary_codebook`
 - `./truncation.rs` → `truncate_sorted_by_score`, `ScoreTruncationConfig`, `ScoreTruncationDecision`, the bounded char/item helpers
 - `./subtree.rs` → `DefaultCurrentSubtreeProvider`, `ItemCounterFn`, the progressive-root catalog helpers
-- `./selector.rs` → `LexicalTopKSelector`, `DefaultTopKSelector`, `is_abstain_output`, `query_text`, `ABSTAIN_HINTS`, the `fragment_selected`/mode constants
+- `./selector.rs` → `LexicalTopKSelector`, `DefaultTopKSelector`, the provenance helpers (`selection_provenance_for_mode`, `trace_selection_provenance`, `trace_degraded_selections`), `is_abstain_output`, `query_text`, `ABSTAIN_HINTS`, the `fragment_selected`/mode constants
 - `./expand.rs` → `DefaultTargetExpander` and the per-branch budget
 - `./reduce.rs` → `DefaultBranchReducer`, the round-robin merge and dedupe key
 - `./engine.rs` → `RecursiveSearchEngine`, `EngineRequest`, `TraversalState`, `TraversalStep`, the engine event constants
-- `./progressive.rs` → `ProgressiveRetriever`, `ProgressiveSearchResult`, `ModelTopKSelector`, `validate_query`, the method/LLM event constants
+- `./progressive.rs` → `ProgressiveRetriever`, `ProgressiveSearchResult` (with `selection_provenance`/`degraded_selections`), `ModelTopKSelector`, `validate_query`, the method/LLM event constants
 - `./blend_selector.rs` → `EmbeddingBlendedTopKSelector`, `MODE_EMBEDDING_BLEND`
-- `./flat.rs` → `FlatRetriever`, `FlatSearchResult`, `FLAT_ROOT_NODE_ID`, the flat method constants
-- `./service.rs` → `Retriever`, `RetrieverConfig` with `TraversalConfig`/`RenderConfig`/`GenerationConfig`, `SearchRequest`, `runtime_config_from_config`, `CandidateRecord`, `RetrievalResult`
+- `./flat.rs` → `FlatRetriever`, `FlatSearchResult` (with `selection_provenance`), `FLAT_ROOT_NODE_ID`, the flat method constants
+- `./service.rs` → `Retriever`, `RetrieverConfig` with `TraversalConfig`/`RenderConfig`/`GenerationConfig`, `SearchRequest`, `runtime_config_from_config`, `CandidateRecord`, `RetrievalResult` (with `selection_provenance`/`degraded_selections`/`top_k_clamped`)
 - `./render/mod.rs` → `SubtreeRenderer`, `DefaultSubtreeRenderer`, `DISCLOSURE_PROMPT_VERSION`
 - `./render/expose.rs` → `build_exposed_fragment`, `exposure_item_count`, `fragmentation_fingerprint`, code assignment, flat rendering, the Rust-only budgets
 - `./render/prompt.rs` → the Chinese prompt bank, `build_disclosure_messages`, `build_disclosure_prompt_parts`, the request marker
@@ -516,6 +579,9 @@ The model's line order is preserved and each `canonical_id` is emitted once (fir
 
 ## Notes for Agents
 
+- A new fallback path must state itself: set a [`SelectionProvenance`](crate::retrieval::search::flow::SelectionProvenance) on the `SelectionResult` (via `with_provenance`), let `record_selection` put it in the trace event, and add a row to the degradation table under Intent. A path that answers a different strategy than the one configured without one of those three signals is a regression.
+- Keep `SelectionProvenance`'s serde default `Lexical` and keep new fields `#[serde(default)]`: an older serialized `SelectionResult`/`RetrievalResult` must keep parsing.
+- `selector.rs` is over the 1000-line soft cap only because the provenance helpers and their in-file suite live beside the selectors; split it by responsibility if it grows, never for size alone.
 - `lexical.rs` and `render/expose.rs` are over the 1000-line soft cap only because their `#[cfg(test)]` suites stay in-file; their non-test halves are under it, so do not split them on size alone.
 - `flow::SearchCursor` and `types::SearchCursor` are unrelated: the first names one runtime node plus the path that reached it, the second is the build half's pre-order plan. Never convert one into the other.
 - Publicization is the only place that maps internal ids to public ones; adding a public field to `RetrievalResult` means deriving it from the trimmed `CandidateRecord` rows so `search` and `search_details` cannot diverge.
