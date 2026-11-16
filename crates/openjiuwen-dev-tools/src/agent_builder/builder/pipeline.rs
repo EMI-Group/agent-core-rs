@@ -15,7 +15,9 @@
 //! 3. clarification — [`Clarifier::clarify_rounds`] over a working copy of the
 //!    retained history, stopping the build with the question when not ready;
 //! 4. for a workflow: the three-pass designer, the DL generator, and the bounded
-//!    repair loop that reflects, refines, and reflects again;
+//!    repair loop that reflects, refines, and reflects again — starting from the
+//!    model's document even when it did not validate, so the loop has something
+//!    to repair;
 //! 5. for an LLM agent: one generation round trip plus the deterministic
 //!    document repair.
 //!
@@ -34,7 +36,7 @@ use openjiuwen_foundation::llm::{Model, ModelRequestConfig};
 
 use super::super::clarifier::Clarification;
 use super::super::designer::WorkflowDesign;
-use super::super::dl_generator::DlGenerator;
+use super::super::dl_generator::{DlGenerator, GeneratedDl};
 use super::super::dl_reflector::{ReflectionIssue, ReflectionIssueKind};
 use super::super::dsl::LlmAgentDsl;
 use super::super::history::HistoryManager;
@@ -157,13 +159,13 @@ pub(super) async fn llm_agent_pipeline(
     }
 }
 
-/// Generates a workflow document and reports where it came from.
+/// Generates a workflow candidate for the repair loop.
 ///
-/// [`DlGenerator::generate_with_model`] returns one document rather than its
-/// source, so the source is inferred by comparing the answer with the
-/// deterministic document for the same design: an answer equal to the baseline
-/// is recorded as [`GenerationSource::Fallback`], and any other document as
-/// [`GenerationSource::Model`].
+/// This is the generator's own candidate form
+/// ([`DlGenerator::generate_candidate`]): it hands back the model's document even
+/// when it fails [`WorkflowDsl::validate`], so the loop can repair it instead of
+/// discarding it, together with the deterministic baseline and the provenance
+/// record that says where the answer came from.
 ///
 /// # Errors
 ///
@@ -172,18 +174,8 @@ pub(super) async fn llm_agent_pipeline(
 pub(super) async fn generate_workflow(
     generator: &DlGenerator,
     design: &WorkflowDesign,
-) -> Result<(WorkflowDsl, GenerationSource, String)> {
-    let baseline = generator.generate(design)?;
-    let candidate = generator.generate_with_model(design).await?;
-    if candidate == baseline {
-        Ok((
-            candidate,
-            GenerationSource::Fallback,
-            "model answer was not an accepted workflow document".to_string(),
-        ))
-    } else {
-        Ok((candidate, GenerationSource::Model, String::new()))
-    }
+) -> Result<GeneratedDl> {
+    generator.generate_candidate(design).await
 }
 
 /// The source and detail of the newest provenance record.
@@ -213,25 +205,43 @@ pub(super) fn issue_note(issue: &ReflectionIssue) -> String {
     }
 }
 
-/// Every issue's note, joined with `;`.
-pub(super) fn joined_issue_notes(issues: &[ReflectionIssue]) -> String {
-    issues.iter().map(issue_note).collect::<Vec<_>>().join("; ")
+/// Renders the problems of one repair attempt as the feedback lines.
+///
+/// The generation stage's validation notes come first — they have not reached the
+/// model yet — then one line per issue the deterministic reflection just repaired.
+fn problem_lines(notes: &[String], issues: &[ReflectionIssue]) -> String {
+    let mut lines: Vec<String> = notes.to_vec();
+    if !issues.is_empty() {
+        lines.push(
+            issues
+                .iter()
+                .map(issue_note)
+                .collect::<Vec<_>>()
+                .join(";\n"),
+        );
+    }
+    lines.join(";\n")
 }
 
-/// The refinement feedback used by the repair loop.
+/// Wraps rendered problem lines in the repair request the loop sends.
 ///
 /// Python's loop description names the detected problem and demands a
 /// directed-acyclic-graph conforming rewrite; this is the same request with the
-/// detected issues in place of the cycle detail.
-pub(super) fn repair_feedback(issues: &[ReflectionIssue]) -> String {
-    let details = issues
-        .iter()
-        .map(issue_note)
-        .collect::<Vec<_>>()
-        .join(";\n");
+/// detected problems in place of the cycle detail.
+fn repair_request(lines: &str) -> String {
     format!(
-        "The workflow design may contain an invalid or cyclic structure:\n{details}\n\
+        "The workflow design may contain an invalid or cyclic structure:\n{lines}\n\
          Follow the directed-acyclic-graph (DAG) rules strictly, restructure the design if \
          needed, and make sure the workflow contains no closed loop or cycle."
     )
+}
+
+/// The refinement feedback of one repair attempt.
+///
+/// `notes` are the not-yet-repaired problems of the attempt — the generation
+/// stage's validation notes, which a repair route has still to see — and `issues`
+/// are the ones the deterministic reflection just repaired. Both reach the model,
+/// so a document that never validated is refined with the reason it did not.
+pub(super) fn repair_feedback(issues: &[ReflectionIssue], notes: &[String]) -> String {
+    repair_request(&problem_lines(notes, issues))
 }

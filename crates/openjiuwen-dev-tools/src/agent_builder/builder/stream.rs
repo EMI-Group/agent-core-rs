@@ -28,7 +28,7 @@ use super::super::clarifier::{
     ClarificationRound, Clarifier, ClarifyConfig, DEFAULT_MAX_CLARIFY_ROUNDS,
 };
 use super::super::designer::{DesignEvent, DesignPassKind, WorkflowDesign, WorkflowDesigner};
-use super::super::dl_generator::DlGenerator;
+use super::super::dl_generator::{DlGenerator, GeneratedDl};
 use super::super::dl_reflector::{DlReflector, DEFAULT_MAX_RETRIES};
 use super::super::history::HistoryManager;
 use super::super::intention::{BuildIntent, IntentionDetector};
@@ -40,7 +40,7 @@ use super::super::outcome::{
 use super::super::progress::ProgressStage;
 use super::super::workflow_dsl::WorkflowDsl;
 use super::pipeline::{
-    clarification_text, generate_workflow, joined_issue_notes, last_provenance, llm_agent_pipeline,
+    clarification_text, generate_workflow, issue_note, last_provenance, llm_agent_pipeline,
     repair_feedback,
 };
 use super::AgentType;
@@ -242,14 +242,21 @@ pub(super) fn pipeline_stream(
                     return;
                 };
 
-                // 4b. Generate the workflow document.
+                // 4b. Generate the workflow document. The model's answer is kept
+                // even when it fails validation, so the loop below can repair it.
                 yield PipelineEvent::StageStarted {
                     stage: ProgressStage::GeneratingDl,
                 };
                 let generator = DlGenerator::with_model(Arc::clone(&model));
-                let (mut current, source, detail) =
-                    generate_workflow(&generator, &design).await?;
-                provenance.record(ProgressStage::GeneratingDl, source, detail.clone());
+                let generated = generate_workflow(&generator, &design).await?;
+                let GeneratedDl {
+                    candidate,
+                    baseline,
+                    issues,
+                    provenance: generation,
+                } = generated;
+                let (source, detail) = last_provenance(&generation);
+                provenance.extend_from(generation);
                 yield PipelineEvent::StageCompleted {
                     stage: ProgressStage::GeneratingDl,
                     source,
@@ -257,8 +264,17 @@ pub(super) fn pipeline_stream(
                 };
 
                 // 4c. The bounded repair loop: reflect, refine, reflect again.
+                //
+                // The document in hand is the model's answer whenever the model
+                // produced one — invalid ones included — so the loop repairs it
+                // instead of silently keeping the deterministic baseline.
+                let mut model_derived = candidate.is_some();
+                let mut model_accepted = model_derived && issues.is_empty();
+                let mut current = candidate.unwrap_or_else(|| baseline.clone());
+                // The validation notes a repair route has not seen yet.
+                let mut carry_notes: Vec<String> = issues;
                 let reflector = DlReflector::new();
-                let workflow = loop {
+                let ending = loop {
                     yield PipelineEvent::StageStarted {
                         stage: ProgressStage::ValidatingDl,
                     };
@@ -291,11 +307,15 @@ pub(super) fn pipeline_stream(
                         },
                     };
                     yield PipelineEvent::Repaired(repair.clone());
-                    if passed || repair.attempts >= DEFAULT_MAX_RETRIES {
+                    // This attempt's problems: the notes still waiting for a
+                    // repair route, then the ones the reflection just repaired.
+                    let mut notes = std::mem::take(&mut carry_notes);
+                    notes.extend(reflection.issues.iter().map(issue_note));
+                    if notes.is_empty() || repair.attempts >= DEFAULT_MAX_RETRIES {
                         break repaired;
                     }
-                    repair.record_note(joined_issue_notes(&reflection.issues));
-                    let feedback = repair_feedback(&reflection.issues);
+                    repair.record_note(notes.join("; "));
+                    let feedback = repair_feedback(&reflection.issues, &notes);
                     yield PipelineEvent::StageStarted {
                         stage: ProgressStage::RefiningDl,
                     };
@@ -330,6 +350,27 @@ pub(super) fn pipeline_stream(
                         break repaired;
                     }
                     current = refinement.workflow;
+                    model_derived = true;
+                    model_accepted = true;
+                };
+                // A model answer whose document never validated is the
+                // documented deterministic path, not a model result: say so, and
+                // produce the baseline the build actually stands on.
+                let workflow = if model_accepted && ending.validate().is_ok() {
+                    ending
+                } else if model_derived {
+                    provenance.record(
+                        ProgressStage::ValidatingDl,
+                        GenerationSource::Fallback,
+                        format!(
+                            "the model's workflow document stayed invalid after {} repair \
+                             attempt(s); using the deterministic document",
+                            repair.attempts
+                        ),
+                    );
+                    baseline
+                } else {
+                    ending
                 };
                 provenance.warn_if_degraded();
                 yield PipelineEvent::Final(build_result(
