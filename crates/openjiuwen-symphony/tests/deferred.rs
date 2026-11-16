@@ -1,26 +1,32 @@
-//! Behaviour tests for every typed `Error::Unsupported` boundary of
+//! Behaviour tests for the typed `Error::Unsupported` boundaries of
 //! `openjiuwen_symphony`.
 //!
 //! `deferred::VllmLogitSelector` is the crate's only stub module; the remaining boundaries
-//! live with their implementations
-//! (`ExperienceIndex::open_with_algorithm`, the grouping strategies behind
-//! `IndexBuilder::build`, and the two object-store credential constructors). All of them
-//! must fail the same way: an [`ErrorKind::Unsupported`] error from
+//! live with their implementations (the three synchronous grouping strategies behind
+//! `IndexBuilder::build`, and `AzureBlobStore::from_client_credentials`). All of them must
+//! fail the same way: an [`ErrorKind::Unsupported`] error from
 //! `openjiuwen_symphony::error::unsupported`, recognized by
-//! [`openjiuwen_symphony::error::is_unsupported`], whose message names the deferred
-//! feature (so a caller can log it) and points at the crate's deferred scope (so a
-//! reader can find the justification).
+//! [`openjiuwen_symphony::error::is_unsupported`], whose message names the deferred feature
+//! (so a caller can log it) and points at the crate's deferred scope (so a reader can find
+//! the justification).
 //!
-//! Nothing here touches the network: the credential constructors reject before any request
-//! is built, and the two build-stage boundaries reject before anything is written.
+//! Two capabilities that sit next to those boundaries are implemented rather than deferred,
+//! and are pinned as working: the IVF vector algorithms of
+//! [`ExperienceIndex::open_with_algorithm`] (below) and GCS service-account key files (pinned
+//! by the `object_artifact::gcs` module suite).
+//!
+//! Nothing here touches the network: the Azure constructor rejects before any request is
+//! built, the IVF index drives a deterministic in-process embedding, and the build-stage
+//! boundaries reject before anything is written.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use openjiuwen_retrieval::HashEmbedding;
 use openjiuwen_symphony::deferred::VllmLogitSelector;
 use openjiuwen_symphony::error::{is_unsupported, Error, ErrorKind};
-use openjiuwen_symphony::experience::ExperienceIndex;
-use openjiuwen_symphony::object_artifact::{AzureBlobStore, GcsObjectStore};
+use openjiuwen_symphony::experience::{ExperienceIndex, ExperienceItem, ExperienceRanking};
+use openjiuwen_symphony::object_artifact::AzureBlobStore;
 use openjiuwen_symphony::retrieval::build::grouping::{GroupingConfig, GroupingStrategy};
 use openjiuwen_symphony::retrieval::build::scanner::{ItemSources, SourceItem};
 use openjiuwen_symphony::retrieval::build::workflows::{BuildConfig, IndexBuilder};
@@ -77,18 +83,51 @@ fn sources() -> ItemSources {
 }
 
 #[tokio::test]
-async fn faiss_ivf_training_is_deferred() {
+async fn the_ivf_vector_algorithm_opens_and_searches() {
     let dir = tempfile::tempdir().expect("tempdir");
-    for algorithm in ["ivf", "ivfpq"] {
-        let index = ExperienceIndex::open_with_algorithm(
-            dir.path(),
-            std::sync::Arc::new(HashEmbedding::new(8)),
-            algorithm,
-        )
-        .await;
-        assert_unsupported(index, "faiss IVF");
-    }
-    assert!(!dir.path().join("meta.json").exists());
+    let index =
+        ExperienceIndex::open_with_algorithm(dir.path(), Arc::new(HashEmbedding::new(8)), "ivf")
+            .await
+            .expect("an IVF index opens on an empty directory");
+    assert_eq!(index.algorithm(), "ivf");
+    assert_eq!(index.count(), 0);
+
+    index
+        .add(ExperienceItem::new("summarize the report"))
+        .await
+        .expect("add an item");
+    assert_eq!(index.count(), 1);
+    // One stored vector clamps the requested 64 coarse lists to one, which the default probe
+    // covers, so the whole catalog is searched.
+    assert_eq!(index.nlist(), 1);
+
+    let hits = index
+        .search("summarize the report", &ExperienceRanking::new(1))
+        .await
+        .expect("search an IVF index");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].item.query_pattern, "summarize the report");
+    assert!(dir.path().join("meta.json").exists(), "the index persists");
+}
+
+#[tokio::test]
+async fn an_unknown_vector_algorithm_is_a_validation_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let error =
+        ExperienceIndex::open_with_algorithm(dir.path(), Arc::new(HashEmbedding::new(8)), "hnsw")
+            .await
+            .expect_err("an unimplemented algorithm must be rejected");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let message = error.message();
+    assert!(message.contains("vector_algorithm"), "{message}");
+    assert!(message.contains("hnsw"), "{message}");
+    assert_eq!(
+        std::fs::read_dir(dir.path())
+            .expect("the output directory")
+            .count(),
+        0,
+        "a rejected open must publish nothing"
+    );
 }
 
 #[test]
@@ -128,14 +167,7 @@ async fn the_model_and_faiss_grouping_strategies_are_deferred_builds() {
 }
 
 #[test]
-fn the_object_store_credential_flows_are_deferred() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let key_file = dir.path().join("service-account.json");
-    std::fs::write(&key_file, "{}").expect("the key file is written");
-    assert_unsupported(
-        GcsObjectStore::from_service_account_file(&key_file),
-        "service-account JSON credentials",
-    );
+fn the_azure_client_credential_flow_is_deferred() {
     assert_unsupported(
         AzureBlobStore::from_client_credentials("tenant", "client", "secret"),
         "Azure AD client-credential OAuth",
