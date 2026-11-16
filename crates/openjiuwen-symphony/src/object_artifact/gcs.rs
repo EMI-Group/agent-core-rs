@@ -94,10 +94,19 @@ mod token;
 /// Endpoint used when the configuration does not set one.
 pub const DEFAULT_ENDPOINT: &str = "https://storage.googleapis.com";
 
-/// Why [`GcsObjectStore::from_service_account_file`] refuses a key file.
-pub const SERVICE_ACCOUNT_REASON: &str = "Google Cloud Storage service-account JSON credentials \
-     are not supported (minting an access token from a key file needs RS256 JWT signing, which \
-     this workspace does not ship); supply an OAuth 2.0 access token instead";
+/// The credential-file forms a GCS key file is still refused for.
+///
+/// [`GcsObjectStore::from_service_account_file`] reads a `service_account` JSON key file and
+/// exchanges it for an OAuth 2.0 access token through the file's `token_uri`. Other credential
+/// files — workload identity federation (`type: external_account`), `gcloud` user credentials
+/// (`type: authorized_user`), the GCE metadata server and `GOOGLE_APPLICATION_CREDENTIALS`
+/// auto-discovery — are not read, so they are refused rather than silently sent anonymously.
+/// A service-account key file, an OAuth 2.0 access token, or an already provisioned bucket
+/// covers every GCS artifact path.
+pub const SERVICE_ACCOUNT_REASON: &str = "Google Cloud Storage reads `service_account` JSON key \
+     files only; workload identity federation (`external_account`), `authorized_user` \
+     credentials, the GCE metadata server and GOOGLE_APPLICATION_CREDENTIALS auto-discovery are \
+     not read — supply a service-account key file or an OAuth 2.0 access token";
 
 /// Short service name used in diagnostics.
 const SERVICE: &str = "GCS";

@@ -112,6 +112,7 @@ impl TokenSource {
                 self.key.token_uri(),
                 response.status,
                 &response.body,
+                &assertion,
             )));
         }
 
@@ -230,10 +231,15 @@ struct TokenExchangeFailure {
 }
 
 impl TokenExchangeFailure {
-    /// Builds the failure from the endpoint, the status and the reply body.
-    fn new(url: &str, status: u16, body: &[u8]) -> Self {
+    /// Builds the failure from the endpoint, the status, the reply body and the assertion.
+    ///
+    /// `assertion` is scrubbed out of the rendered body and description: a proxy or a
+    /// misconfigured endpoint may echo the request, and the assertion is a bearer credential
+    /// for the token exchange.
+    fn new(url: &str, status: u16, body: &[u8], assertion: &str) -> Self {
         let document: Option<Value> = serde_json::from_slice(body).ok();
         let object = document.as_ref().and_then(Value::as_object);
+        let text = String::from_utf8_lossy(body);
         Self {
             url: url.to_string(),
             status,
@@ -243,8 +249,8 @@ impl TokenExchangeFailure {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|description| !description.is_empty())
-                .map(str::to_string),
-            excerpt: excerpt(&String::from_utf8_lossy(body)),
+                .map(|description| scrub(description, assertion)),
+            excerpt: scrub(&excerpt(&text), assertion),
         }
     }
 }
@@ -290,6 +296,18 @@ fn excerpt(text: &str) -> String {
     excerpt
 }
 
+/// Replaces every occurrence of the assertion — raw and percent-encoded — in `text`.
+///
+/// A rejected exchange must never publish the credential it presented, even when the endpoint
+/// (or an intermediary) echoes the request in its error document.
+fn scrub(text: &str, assertion: &str) -> String {
+    if assertion.is_empty() {
+        return text.to_string();
+    }
+    text.replace(assertion, "<redacted-assertion>")
+        .replace(&percent_encode(assertion), "<redacted-assertion>")
+}
+
 /// Percent-encodes `text` for an `application/x-www-form-urlencoded` body.
 ///
 /// Unreserved RFC 3986 characters stay as they are and every other byte becomes `%XX`, which is
@@ -323,6 +341,7 @@ fn unix_now() -> u64 {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use openjiuwen_common::http::HttpClientConfig;
     use serde_json::json;
     use wiremock::matchers::{body_string_contains, header, method, path};
@@ -419,7 +438,6 @@ I1Ru6xykeZLm6JI5YG+U0zg=
             .expect("the form carries the assertion");
         let segments: Vec<&str> = assertion.split('.').collect();
         assert_eq!(segments.len(), 3);
-        use base64::Engine as _;
         let header: Value = serde_json::from_slice(
             &base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(segments[0])
@@ -482,7 +500,7 @@ I1Ru6xykeZLm6JI5YG+U0zg=
             let client = client();
 
             for _round in 0..3 {
-                source
+                let _ = source
                     .access_token(&client, Duration::from_secs(10))
                     .await
                     .expect("mint");
@@ -673,6 +691,7 @@ I1Ru6xykeZLm6JI5YG+U0zg=
             "https://oauth2.googleapis.com/token",
             400,
             br#"{"error":{"message":"bad assertion"},"error_description":"nope"}"#,
+            "",
         );
         let message = failure.to_string();
         assert_eq!(
@@ -680,11 +699,30 @@ I1Ru6xykeZLm6JI5YG+U0zg=
             "service-account token exchange failed with HTTP 400 for \
              https://oauth2.googleapis.com/token: bad assertion: nope"
         );
-        let failure = TokenExchangeFailure::new("https://t", 502, b"upstream \"down\"");
+        let failure = TokenExchangeFailure::new("https://t", 502, b"upstream \"down\"", "");
         assert!(
             failure.to_string().contains("upstream \"down\""),
             "{failure}"
         );
+    }
+
+    #[test]
+    fn an_echoed_assertion_is_scrubbed_from_the_failure() {
+        const ASSERTION: &str = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJ4In0.c2ln";
+        let body =
+            format!(r#"{{"error":"invalid_grant","error_description":"rejected {ASSERTION}"}}"#);
+        let failure = TokenExchangeFailure::new("https://t", 400, body.as_bytes(), ASSERTION);
+        let message = failure.to_string();
+        assert!(!message.contains(ASSERTION), "{message}");
+        assert!(!message.contains("c2ln"), "{message}");
+        assert!(message.contains("<redacted-assertion>"), "{message}");
+        assert!(message.contains("invalid_grant"), "{message}");
+
+        let echoed_form = percent_encode(ASSERTION);
+        let body =
+            format!("{{\"error\":\"invalid_grant\",\"error_description\":\"{echoed_form}\"}}");
+        let failure = TokenExchangeFailure::new("https://t", 400, body.as_bytes(), ASSERTION);
+        assert!(!failure.to_string().contains(&echoed_form), "{failure}");
     }
 
     #[test]
