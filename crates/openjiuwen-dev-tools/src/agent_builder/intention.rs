@@ -28,7 +28,7 @@
 //! match the contract falls back to that deterministic verdict with a
 //! [`GenerationSource::Fallback`] record, so detection never errors.
 //!
-//! A blank query is [`Error::Validation`](openjiuwen_common::error::Error::Validation)
+//! A blank query is [`Error::Validation`]
 //! before any model call.
 
 use std::fmt;
@@ -189,7 +189,7 @@ impl IntentionDetector {
     ///
     /// The deterministic rule looks at the retained user turns followed by
     /// `query`: at least two sequence markers, at least two numbered steps, or a
-    /// [`WORKFLOW_KEYWORDS`] mention yields [`BuildIntent::Build`]; anything else
+    /// `WORKFLOW_KEYWORDS` mention yields [`BuildIntent::Build`]; anything else
     /// yields [`BuildIntent::Clarify`].
     /// With a model configured the model is asked once, after the blank-query
     /// check; a usable answer decides the verdict, and any unusable answer falls
@@ -214,7 +214,7 @@ impl IntentionDetector {
     ///
     /// The deterministic rule is [`BuildIntent::Refine`] exactly when `mermaid`
     /// is non-blank and the query carries one of the
-    /// [`MODIFICATION_KEYWORDS`]; otherwise it is [`BuildIntent::Build`].
+    /// `MODIFICATION_KEYWORDS`; otherwise it is [`BuildIntent::Build`].
     /// The model path asks the same question with the diagram and the formatted
     /// dialogue, and falls back exactly like [`Self::detect_initial`].
     ///
