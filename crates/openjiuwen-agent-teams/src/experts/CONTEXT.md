@@ -168,7 +168,7 @@ Unit tests live in `#[cfg(test)] mod tests` beside each definition (25 tests), u
 - `bind_group` leader exclusion, display/desc resolution, external flag, persona content, the leader `SkippedMember` (`kind`/`as_str`/`reason` naming the member), a member skipped for an empty persona and one skipped for an unreadable persona (`is_complete()` false, `skipped_reason` populated), and `SkippedMember`/`BoundAgentGroup` serde round-trip plus default-fill for a payload written before `skipped` existed;
 - `compose_template_member` language precedence, placeholder rendering, skill union/dedup/sort, prompt prepending, idempotence, field preservation;
 - catalog set/get/clear, fake catalog listing/locating, `ExpertRef::label`/`to_value`, `PackageLocation` path-as-string round-trip.
-Definition of done: `cargo test -p openjiuwen-agent-teams --lib`, `cargo test -p openjiuwen-agent-teams --no-default-features --lib`, `cargo fmt -p openjiuwen-agent-teams -- --check`, and clippy clean for `src/experts/` (the empty sibling placeholder modules currently trip `missing_docs`, which belongs to the crate root node).
+Definition of done: `cargo test -p openjiuwen-agent-teams --lib`, `cargo test -p openjiuwen-agent-teams --no-default-features --lib`, `cargo fmt -p openjiuwen-agent-teams -- --check`, and clippy clean for `src/experts/`.
 
 ## Notes for Agents
 
