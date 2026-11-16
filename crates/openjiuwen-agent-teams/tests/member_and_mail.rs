@@ -13,7 +13,10 @@
 //!    multicast send (de-duplicated targets), `broadcast` for a team-wide one, and `mark_read`
 //!    only clears the named direct ids;
 //! 5. the leader handle creates tasks, the board row and its `task_created` event agree, and the
-//!    roster accessors are sorted and agree with each other.
+//!    roster accessors are sorted and agree with each other;
+//! 6. the member-role gate follows Python: every role except `passive_human` owns a local harness, so
+//!    an explicit spawn of a passive human is refused with a typed `Unsupported` naming Python's
+//!    `TeamRole.PASSIVE_HUMAN`, and `auto_start_all` skips it instead of failing the sweep.
 //!
 //! Everything is offline: `support` answers every member input with one scripted observation
 //! triple and allocates member directories under one temporary root, and every wait is bounded.
@@ -26,7 +29,8 @@ use std::collections::BTreeSet;
 
 use openjiuwen_agent_teams::harness::MemberHarnessContext;
 use openjiuwen_agent_teams::schema::{
-    MemberLifetime, MemberStatus, TaskGraphSpec, TaskStatus, TeamRole, TeamTopic,
+    MemberLifetime, MemberSpecBase, MemberStatus, PredefinedMemberSpec, TaskGraphSpec, TaskStatus,
+    TeamAgentSpec, TeamRole, TeamTopic,
 };
 use openjiuwen_agent_teams::storage::{MessageRecord, TeamStore};
 use openjiuwen_agent_teams::workspace::IsolationMode;
@@ -715,4 +719,191 @@ async fn the_roster_accessors_agree_and_are_sorted() {
     assert_eq!(stored.member_name, member.member_name());
     assert_eq!(stored.role, member.role());
     assert_eq!(stored.status, member.status());
+}
+
+/// Identity fields of one human member these cases add to the sample blueprint.
+fn human_base(member_name: &str, display_name: &str, prompt: &str) -> MemberSpecBase {
+    MemberSpecBase {
+        member_name: member_name.to_owned(),
+        display_name: display_name.to_owned(),
+        desc: format!("{display_name} on the team"),
+        prompt: prompt.to_owned(),
+        model_name: None,
+    }
+}
+
+/// Returns the sample blueprint plus one human-agent member named `human`.
+fn spec_with_a_human_agent() -> TeamAgentSpec {
+    let mut spec = sample_spec();
+    spec.predefined_members
+        .push(PredefinedMemberSpec::HumanAgent(human_base(
+            "human",
+            "Human",
+            "you are the human's avatar",
+        )));
+    spec
+}
+
+/// Returns the sample blueprint plus one passive-human member named `alice`.
+fn spec_with_a_passive_human() -> TeamAgentSpec {
+    let mut spec = sample_spec();
+    spec.predefined_members
+        .push(PredefinedMemberSpec::PassiveHuman(human_base(
+            "alice",
+            "Alice",
+            "you are alice",
+        )));
+    spec
+}
+
+#[tokio::test]
+async fn a_human_agent_member_spawns_into_one_local_harness() {
+    let fixture = Fixture::new();
+    let agent = fixture
+        .activate(&spec_with_a_human_agent(), "session-a")
+        .await;
+
+    timeout(BOUND, agent.spawn_member("human"))
+        .await
+        .expect("the human spawn did not finish")
+        .expect("a human agent owns a local harness");
+
+    wait_until("the human member to be ready", || {
+        agent
+            .backend()
+            .member("human")
+            .is_some_and(|member| member.status() == MemberStatus::Ready)
+    })
+    .await;
+
+    let member = agent.backend().member("human").expect("the human row");
+    assert_eq!(member.role(), TeamRole::HumanAgent);
+    assert_eq!(member.status(), MemberStatus::Ready);
+    assert!(member.runtime().is_some(), "a human agent owns a brain");
+    let stored = fixture
+        .store
+        .member("alpha", "human")
+        .await
+        .unwrap()
+        .expect("the roster row is persisted");
+    assert_eq!(stored.status, MemberStatus::Ready, "the store agrees");
+    assert_eq!(stored.role, TeamRole::HumanAgent);
+
+    let creations = fixture
+        .factory
+        .created_members()
+        .iter()
+        .filter(|name| name.as_str() == "human")
+        .count();
+    assert_eq!(creations, 1, "exactly one harness is built for the human");
+    assert_eq!(
+        fixture.harness("human").calls(),
+        [Call::Start],
+        "the harness was started exactly once"
+    );
+}
+
+#[tokio::test]
+async fn a_passive_human_member_is_refused_with_the_python_role_rule() {
+    let fixture = Fixture::new();
+    let agent = fixture
+        .activate(&spec_with_a_passive_human(), "session-a")
+        .await;
+
+    let error = timeout(BOUND, agent.spawn_member("alice"))
+        .await
+        .expect("the refused spawn did not finish")
+        .expect_err("a passive human has no local harness to spawn");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let message = error.to_string();
+    for needle in ["alice", "passive_human", "TeamRole.PASSIVE_HUMAN"] {
+        assert!(
+            message.contains(needle),
+            "the refusal names {needle}: {message}"
+        );
+    }
+
+    assert!(
+        fixture.factory.harness("alice").is_none(),
+        "the factory built no harness"
+    );
+    assert!(
+        fixture
+            .factory
+            .created_members()
+            .iter()
+            .all(|name| name.as_str() != "alice"),
+        "no harness was created for alice"
+    );
+    assert!(
+        fixture.workspace.root_for("alice").is_none(),
+        "the refusal precedes the workspace allocation"
+    );
+
+    let member = agent
+        .backend()
+        .member("alice")
+        .expect("the passive-human row");
+    assert_eq!(member.role(), TeamRole::PassiveHuman);
+    assert_eq!(member.status(), MemberStatus::Unstarted);
+    assert!(
+        member.runtime().is_none(),
+        "a passive human never gets a brain"
+    );
+    let stored = fixture
+        .store
+        .member("alpha", "alice")
+        .await
+        .unwrap()
+        .expect("the roster row is persisted");
+    assert_eq!(stored.status, MemberStatus::Unstarted, "the store agrees");
+    assert_eq!(stored.role, TeamRole::PassiveHuman);
+}
+
+#[tokio::test]
+async fn auto_start_all_starts_the_harnessed_roles_and_skips_a_passive_human() {
+    let fixture = Fixture::new();
+    let mut spec = spec_with_a_human_agent();
+    spec.predefined_members
+        .push(PredefinedMemberSpec::PassiveHuman(human_base(
+            "alice",
+            "Alice",
+            "you are alice",
+        )));
+    let agent = fixture.activate(&spec, "session-a").await;
+
+    timeout(BOUND, agent.auto_start_all())
+        .await
+        .expect("auto_start_all did not finish")
+        .expect("a harness-less member is skipped instead of failing the sweep");
+
+    // `sample_spec` also carries the shared `agents["teammate"]` key as a roster member, so the
+    // sweep starts it alongside `dev-1` and the human agent.
+    for name in ["dev-1", "human", "teammate"] {
+        let member = agent.backend().member(name).expect("the roster row");
+        assert_eq!(member.status(), MemberStatus::Ready, "{name}");
+        assert!(member.runtime().is_some(), "{name} owns a brain");
+    }
+    let alice = agent
+        .backend()
+        .member("alice")
+        .expect("the passive-human row");
+    assert_eq!(
+        alice.status(),
+        MemberStatus::Unstarted,
+        "a passive human is never started"
+    );
+    assert!(alice.runtime().is_none(), "and it owns no runtime");
+
+    // The leader is already live from the activation, so the sweep's leader skip shows up as a
+    // single harness creation for it below rather than as an `unstarted` row.
+    assert_eq!(
+        fixture.factory.created_members(),
+        ["team_leader", "dev-1", "human", "teammate"],
+        "one harness each for the leader and the three harnessed members"
+    );
+    assert!(
+        fixture.factory.harness("alice").is_none(),
+        "no harness is built for a passive human"
+    );
 }

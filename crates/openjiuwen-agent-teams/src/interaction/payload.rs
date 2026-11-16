@@ -104,8 +104,9 @@ pub struct GroupChatMessage {
 
 /// A standard team event received through the external interact channel.
 ///
-/// Data-only: this build has no distributed transport, so the runtime answers a payload of
-/// this kind with [`DeliverResult::unsupported`].
+/// Data-only: this build ships no distributed transport, so the runtime rejects a payload of this
+/// kind as `unsupported:external_team_transport` — `DeliverResult::unsupported` with that token,
+/// applied by `TeamAgent::deliver` in `src/runtime/team_agent/lifecycle.rs`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct ExternalTeamEvent {

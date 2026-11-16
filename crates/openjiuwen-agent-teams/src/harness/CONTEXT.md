@@ -137,7 +137,7 @@ Runtime behaviour:
 - The runtime wires every in-process member through `runtime::checkpoints::wire_runtime` — `build_with` for the leader, `TeamMemberSpawner::build_harness_runtime` for each teammate — with the derived session id, the effective card id, the policy from `metadata["checkpoint"]`, the member workspace root as `cwd` and the resolved store.
 - Store resolution: an injected store wins (`TeamBuildDeps::with_checkpoint_store`); otherwise `memory` mints one `InMemoryMemberCheckpointStore` shared by the whole team, while `file` roots each member at its own directory (`dir` when pinned, else `<workspace root>/.openjiuwen/checkpoints`).
 - A disabled policy resolves no store at either step, so no sink is attached and no record is written.
-- Only in-process runtimes are wired: a `team-member serve` child builds a bare `HarnessMemberRuntime` with no store, so a process member checkpoints nothing.
+- Every runtime is wired, a spawned child included: `skill::serve::build_member` applies `ServeContext::checkpoint_config` through `runtime::checkpoints::wire_runtime` with no shared store, so a `team-member serve` process checkpoints under its own file root (`OPENJIUWEN_MEMBER_CHECKPOINT_DIR` when set) or a process-local in-memory store and shares nothing with the leader.
 - Storage is last-write-wins JSON (never pickle); the file backend sanitises both path components (alnum, `-`, `_` kept, everything else `_`) so no identity can traverse out of the root.
 
 ## State mapping
