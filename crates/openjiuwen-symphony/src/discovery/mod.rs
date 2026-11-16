@@ -29,7 +29,9 @@
 //!   `skill_index` tool: the virtual category
 //!   [`SkillDirectoryView`](crate::discovery::SkillDirectoryView), the pinned row
 //!   renderers, request validation, and the
-//!   [`SkillIndexToolkit`](crate::discovery::SkillIndexToolkit) execution engine;
+//!   [`SkillIndexToolkit`](crate::discovery::SkillIndexToolkit) execution engine, with the
+//!   catalog's derived [`SkillFsLayout`](crate::discovery::SkillFsLayout) and the
+//!   baseline-driven [`IndexState`](crate::discovery::IndexState) it reports;
 //! - [`settings`](crate::discovery::settings) —
 //!   [`DiscoverySettings`](crate::discovery::DiscoverySettings), the result/output/token
 //!   budget for one discovery round.
@@ -91,6 +93,10 @@ pub use directory_toolkit::{
     SearchMatch, SearchResult, SkillDirectoryView, SkillIndexConfig, SkillIndexRequest,
     SkillIndexResult, SkillIndexToolCard, SkillIndexToolkit, ValidatedRequest, CURSOR_MAX_CHARS,
     MAX_CURSORS, MAX_OUTPUT_CHARS, MIN_OUTPUT_CHARS, ROOT_PATH, SHORTENED_MARKER,
+};
+pub use directory_toolkit::layout::{
+    index_fingerprint, index_state_for, layout_for_records, skillfs_layout, IndexBaseline,
+    IndexState, SkillFsLayout, INDEX_FRESH, INDEX_MISSING, INDEX_STALE, LAYOUT_FLAT, LAYOUT_TREE,
 };
 pub use toolkit::{
     cards_from_inventory, normalize_cards, tool_id, IncrementalNoticeRegistry,
