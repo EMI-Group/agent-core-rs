@@ -210,8 +210,8 @@ First refusal wins, in this order (the module docs carry the same table):
 - The organisation workspace manager and write policy (`teams/<id>/`, `shared/`, `summary/`, git init/commit lock, conflict strategy) plus `workspace_rail.py` enforcement.
 - `TransportAPI` negotiation/handshake and the organisation event bus beyond the in-process `OrgTaskEvent`/`OrgMessage` values.
 - The LLM-facing organisation tool wrappers (`tools.py`: control, task-pool, summary and inbox tools) and their prompt packs.
-- LLM-generated compaction: Python asks the model to summarise; `compact_transcript` and `compact_with_template` emit the deterministic template summary line instead.
-- Harness-side compaction and a runtime swarmflow lane: `compact_transcript`, `compact_with_template` and `SwarmflowRunner` are pure seams of this module, and `src/harness/`/`src/runtime/` do not call them yet.
+- LLM-generated compaction: Python's `fork_compact.compact_context` asks the model for the summary and writes it back into the live context; this port's `fork_compact::compact_transcript` and `compact_template::compact_with_template` produce a deterministic template summary instead and have no runtime caller.
+- The missing runtime integration: neither compaction entry point is adopted by `src/harness/` or `src/runtime/`, the fork path carries a blueprint (`ForkedMemberSpec`) so nothing in this crate captures a member transcript, Python's `ForkContext.messages` → `create_new_context_engine(messages=…)` hand-off has no counterpart, and `SwarmflowRunner` has no runtime lane.
 - Swarmflow's external host/bridge (`external_swarmflow_host.py`), worktree lanes and in-runner review gate (`tool_swarmflow.py`).
 - Org-level task lease/expiry: `TaskRecord` carries no lease column, so staleness stays the board's `updated_at` policy.
 
@@ -260,5 +260,5 @@ The leader loop in `src/runtime/leader.rs` reads `OrgBinding::unread(team)` (ove
 - `swarmflow` deliberately does not depend on `crate::runtime`; keeping the lane seam injectable is what makes the runner testable with fakes and keeps the fan-out policy independent of how a member is spawned.
 - `fork_compact` is pure and reusable outside the team runtime: it has no store, no clock and no session dependency, so the harness can call the compaction step on any transcript.
 - `task_pool.rs` and `compact_template.rs` are the sanctioned long files; `task_pool_tests.rs` (1368 lines), `compact_template_tests.rs` (691 lines) and `fork_compact_tests.rs` (809 lines) are comprehensive suites rather than policy code.
-- `compact_transcript` keeps its "last N non-system messages" heuristic and has no caller; only `compact_with_template` models Python's `split_at` + `direction` contract, so a new fork path should adopt the template entry point rather than grow the old heuristic.
+- `compact_transcript` and `compact_with_template` are both uncalled: the former keeps its "last N non-system messages" heuristic while only the template entry point models Python's `split_at` + `direction` contract, because this crate never captures a member transcript to hand to either; a new fork path should adopt `compact_with_template` rather than grow the other heuristic.
 - The template path never re-emits stripped system messages by default and never truncates the compressed side, so a summary can only disappear through the monotonicity guard or the budget — both are reported on `TemplateCompaction` (`summary_omitted`).

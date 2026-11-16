@@ -142,4 +142,4 @@ Broadcast tokens are recognized before roster resolution; `resolve_targets` is p
 - Python mints `intr_<uuid>` per interaction; `ToolApprovalRequest::to_interaction` derives `intr_team_tool_approval_<tool_call_id>` so re-rendering the same interrupted call is idempotent.
 - Python's `ToolApprovalResultEvent` carries `feedback` and `auto_confirm`; this crate's schema event does not, so `approval_result_event` carries only team/member/tool-call/verdict (schema is out of this node's scope).
 - `HumanAgentInbox::new()` starts disabled (`enable_hitt` is opt-in); the runtime must call `set_enabled(true)` before `require_enabled()` succeeds. `push` itself does not re-check enablement.
-- `ExternalTeamEvent` is data-only: the runtime answers it with `DeliverResult::unsupported("external_team")` because distributed transports are deferred.
+- `ExternalTeamEvent` is data-only: the runtime rejects it as `DeliverResult::unsupported("external_team_transport")` (`unsupported:external_team_transport`) because this build ships no distributed transport.
