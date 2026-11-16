@@ -502,6 +502,183 @@ async fn a_store_without_a_token_sends_anonymous_requests() {
     }
 }
 
+/// The same 2048-bit PKCS#8 RSA key the crate's GCS unit tests sign assertions with.
+const SERVICE_ACCOUNT_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDWEwu1E3LIrY/1
+ukZXqTj+8wVh/tbtgPgivj104Ox3FLpvj3jhRu3QRibNMN6DM4Fi13J6IE2WRdxF
+qiwyVX9lg98zpl6msySu3EYewibFHWPyW0OaKzm1GqNjzvFev/O7CqvA6KJUtgfj
+rneYOGBqpl//ojbdO7d9/kq1ivXmaM6lvx+JSssHnYbvdfmH3PtSGfdtODuNSrrI
+yDyAycSKmi6DIxojI3hJGXZm9oMX0Dh39sXOvTk+s66b59cDqq2TZfFoUD4Z9wtj
+7b34kAZj4pGKk36OT+TDXzmypKvFbf7lHYSf+P4RN9EasunktpoRSQRlpXElNkKd
+qgkZft/hAgMBAAECggEAds7TLIfCqIVK5EGhUH1mWHhfgGeCuQVesUmLqhY6pkwm
+vEuP9tb6nSCR4EdC9uXa5RRVQFo1NTVIbpFnPfgdYCWz9mJbHYFG1pUBhYiTI8qP
+8a2c8y8SM+S40WfEpaU6i4/8im+RyBnOfxoQ3bZMLGRx2toYQOgnihFbPS4GEv0L
+8NTdj0XGNw09cy9ckIosHaZjF7MvNleeJjSR0l4Bl6HbCAS8DAxmrwXzEX6tRXdp
+rYrjkqSP6qvC4+S7L4q6OpPNqRSl4urTC9ubFhtyfmo3FlMBC9w7uHLEghyfbSAF
+WrHYjTxgRZnifeb9RfPfxButnQ4Y2lExmBysuaQzUQKBgQDmQ4tvP6wKHFwxljzG
+ioyhJlWNsekJ306IVvLPd7fGfosJOIyVe/s1CJJa8hbNETZuW4TqyNVwBBKJYFHd
+qBvJbOO5uxCb3kd9SoVR5GKM/XJm1344G1bBNil2fize+meza3YIs9bFP1DdJFeL
+xxtIhfAAsehpsiaXLdO49/Cs/wKBgQDuAEc9DeIO5f6MuTijS2uvR8MrRcCap0PC
+hYWjfeibYrg3jMAZuGmIEDY8UMwDIyTC5adsgnvbBwa9kuu1QJoOQkgpynSncdHq
+rWRui1Vreqzwjwgo+vlPjP7UCNmmmsX5h4Lq/piKZRoNDHJuYbrsP4GLHYqXu708
+nYriQn0THwKBgD+/s3q5RggGkf+oeGr/MK/szQLNnpb9G+DjMZX+rwJlRljnLwSz
+rnigRuSm4Wkkus0SyVm3AGBiwD8IS6HySL8bRnDFOXPtth0Z5I8ni6E9Cc8vGeKu
+rvYO6KvFgua4rL0foy4FnBA/10NiLFqmZQdPDYMjvhSFHen85gDvo9JBAoGAErlq
+4V7KPinSEPgxgIdafXvD2w+ty30FU7R1gxtQxYjKvXQRWPStOMstuSkSI90L81lm
+Bp9tZxnyac+5Q5VFiYGlc8Q90T6fKTti/19u5PnNyU83cSHto1iQY9YeaYEbujnz
+DtHg5mJ13jjwd8awkg2c/3jfgnh+ttoeJxbcCDkCgYEA1wWLpUIeRchZHOqbYFoM
+QEDRqvnHYqrd0cp9hTp+uyoCz9e8C8n54wKzgWEtkxsAfO3Pami4T+z+NiYeFpWn
++1SJIbJWbPf2elxD60UjEa8OeelSGiu5X5KlfPvyuVgX4qs9vUYQQiTHDZbzmDlV
+I1Ru6xykeZLm6JI5YG+U0zg=
+-----END PRIVATE KEY-----
+";
+
+/// The bearer token the mocked token endpoint mints.
+const MINTED_TOKEN: &str = "ya29.minted-token";
+
+/// Writes a complete service-account key file whose `token_uri` is `token_uri`.
+fn write_service_account_key(directory: &tempfile::TempDir, token_uri: &str) -> std::path::PathBuf {
+    let path = directory.path().join("service-account.json");
+    let document = json!({
+        "type": "service_account",
+        "project_id": "demo-project",
+        "private_key_id": "0123456789abcdef",
+        "private_key": SERVICE_ACCOUNT_PEM,
+        "client_email": "symphony@demo-project.iam.gserviceaccount.com",
+        "token_uri": token_uri,
+        "universe_domain": "googleapis.com",
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&document).expect("serialize the key file"),
+    )
+    .expect("write the key file");
+    path
+}
+
+/// A service-account key file end to end: one minted token, sent on every artifact request.
+///
+/// The key file is real (the crate's RSA fixture), so the store signs an RS256 JWT assertion and
+/// exchanges it at the key's `token_uri` — a loopback wiremock endpoint. The GCS endpoint is the
+/// stateful emulator, which lets the test prove both object operations actually completed rather
+/// than only that they carried a header. Two operations must mint exactly one token (the cached
+/// one is reused) and every storage request must carry that token as a bearer credential.
+#[tokio::test]
+async fn a_service_account_key_mints_one_bearer_token_for_the_artifact_path() {
+    // The key's `token_uri`, answering with the OAuth reply the token source expects.
+    let token_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": MINTED_TOKEN,
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        })))
+        .mount(&token_server)
+        .await;
+
+    // The GCS endpoint, with the bucket the test writes into already present.
+    let (server, state) = emulator(2).await;
+    state
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .buckets
+        .insert("artifacts".to_string(), BTreeMap::new());
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let key_path = write_service_account_key(&directory, &format!("{}/token", token_server.uri()));
+
+    let store =
+        GcsObjectStore::from_service_account_file_with(GcsConfig::new(server.uri()), &key_path)
+            .expect("build a store from the key file");
+    // The key file's `project_id` fills in the configuration's missing project.
+    assert_eq!(store.config().project.as_deref(), Some("demo-project"));
+
+    store
+        .put(
+            "artifacts",
+            "graph/versions/v1/graph.json",
+            Bytes::from_static(b"{\"v\":1}"),
+        )
+        .await
+        .expect("the first object is signed with the minted token");
+    store
+        .put(
+            "artifacts",
+            "graph/current.json",
+            Bytes::from_static(b"{\"v\":1,\"current\":true}"),
+        )
+        .await
+        .expect("the second object reuses the cached token");
+
+    // Both writes really landed, through the authenticated path.
+    assert_eq!(
+        keys(&state, "artifacts"),
+        vec![
+            "graph/current.json".to_string(),
+            "graph/versions/v1/graph.json".to_string(),
+        ]
+    );
+
+    // (a) One mint serves both operations: the token source caches it.
+    let token_requests: Vec<Request> = token_server
+        .received_requests()
+        .await
+        .expect("token server is running");
+    assert_eq!(
+        token_requests.len(),
+        1,
+        "two object operations mint exactly one token: {:?}",
+        token_requests
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect::<Vec<_>>()
+    );
+    let exchange = &token_requests[0];
+    assert_eq!(exchange.url.path(), "/token");
+    assert_eq!(
+        header(exchange, "content-type"),
+        "application/x-www-form-urlencoded",
+        "the assertion travels as a form field"
+    );
+    let form = String::from_utf8_lossy(&exchange.body);
+    assert!(
+        form.contains("grant_type=") && form.contains("jwt-bearer"),
+        "the exchange uses the JWT-bearer grant: {form}"
+    );
+    assert!(
+        form.contains("assertion=") && !form.contains(SERVICE_ACCOUNT_PEM),
+        "a signed assertion is posted, and the private key never leaves the process"
+    );
+
+    // (b) Every storage request carries the minted token, including both uploads.
+    let storage_requests: Vec<Request> = server
+        .received_requests()
+        .await
+        .expect("the emulator is running")
+        .into_iter()
+        .filter(|request| !request.url.path().starts_with("/token"))
+        .collect();
+    assert!(
+        !storage_requests.is_empty(),
+        "the object operations reach the GCS endpoint"
+    );
+    for request in &storage_requests {
+        assert_eq!(
+            header(request, "authorization"),
+            format!("Bearer {MINTED_TOKEN}"),
+            "every artifact request is authenticated: {} {}",
+            request.method,
+            request.url
+        );
+    }
+    let uploads = storage_requests
+        .iter()
+        .filter(|request| request.url.path().starts_with("/upload/"))
+        .count();
+    assert_eq!(uploads, 2, "both `put`s reach the upload endpoint signed");
+}
+
 #[tokio::test]
 async fn a_bucket_create_conflict_is_a_success_and_sends_the_project() {
     let server = MockServer::start().await;
