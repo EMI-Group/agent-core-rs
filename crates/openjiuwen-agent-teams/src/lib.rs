@@ -98,7 +98,7 @@ pub use experts::{
     bind_group, clear_process_expert_catalog, compose_template_member, get_process_expert_catalog,
     load_agent_group, render_persona, set_process_expert_catalog, AgentGroupCard,
     AgentGroupMemberCard, AgentTemplateCard, BoundAgentGroup, BoundGroupMember, ExpertCatalog,
-    ExpertRef, LoadedAgentGroupPackage, LocalizedText, PackageLocation,
+    ExpertRef, LoadedAgentGroupPackage, LocalizedText, PackageLocation, SkipReason, SkippedMember,
 };
 // --- persistence -----------------------------------------------------------
 pub use storage::*;
@@ -118,9 +118,9 @@ pub use member::*;
 // --- human-in-the-loop -----------------------------------------------------
 pub use interaction::{
     approval_result_event, parse_confirm, parse_interact_str, resolve_targets, ConfirmPayload,
-    DeliverResult, DeliverResult as InteractDeliverResult, GodViewMessage, GroupChatMessage,
-    HumanAgentInbox, HumanAgentMessage, HumanAgentToolCall, InteractGate, InteractPayload,
-    OperatorMessage, Route, ToolApprovalRequest,
+    DeliverResult, DeliverResult as InteractDeliverResult, ExternalTeamEvent, GodViewMessage,
+    GroupChatMessage, HumanAgentInbox, HumanAgentMessage, HumanAgentToolCall, InteractGate,
+    InteractPayload, OperatorMessage, Route, ToolApprovalRequest,
 };
 // --- runtime ---------------------------------------------------------------
 pub use runtime::{

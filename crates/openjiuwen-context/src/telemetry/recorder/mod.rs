@@ -13,6 +13,7 @@ mod metrics;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::SystemTime;
 
@@ -29,6 +30,10 @@ use crate::telemetry::state::{
     ContextCompressionModifiedMessage, ContextCompressionState, ContextCompressionUsage,
     CONTEXT_COMPRESSION_STATE_TYPE,
 };
+use crate::tokenizers::{SelectedTokenizer, TokenizerSource};
+use crate::tokens::count_messages;
+use crate::usage::context_tokens::STRING_LENGTH_NOTE;
+use crate::usage::source_name;
 
 pub use self::metrics::format_timestamp;
 
@@ -40,6 +45,165 @@ pub const DEFAULT_HISTORY_LIMIT: usize = 100;
 /// The index a compression-state frame is published at, matching Python's
 /// `OutputSchema(type=..., index=0, payload=...)`.
 const STREAM_INDEX: i64 = 0;
+
+/// Characters per token of the string-length fallback, Python's `len(text) // 3`.
+const ESTIMATE_CHARS_PER_TOKEN: usize = 3;
+
+/// What a recorder knows about how its token numbers are produced.
+///
+/// A record's `tokens` value is only useful if the reader knows whether it is a
+/// count or an estimate, so every measurement carries this alongside it and the
+/// record states both facts (`estimated` and `tokens_source`).
+/// The vocabulary is shared with the crate's other honesty carriers:
+/// [`TokenProvenance::source`] is [`source_name`] of a [`TokenizerSource`] (or the
+/// recorded `string_length_estimate` fallback), and
+/// [`TokenProvenance::note`] is that source's [`TokenizerSource::estimation_note`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenProvenance {
+    /// Whether the count is an estimate rather than an exact count.
+    estimated: bool,
+    /// The counting strategy's wire name, when one can be named.
+    source: Option<String>,
+    /// Why the count is an estimate, when it is one.
+    note: Option<String>,
+}
+
+impl TokenProvenance {
+    /// A count produced by a counter that counts exactly and can name itself.
+    #[must_use]
+    pub fn counted(tokenizer: impl Into<String>) -> Self {
+        Self {
+            estimated: false,
+            source: Some(tokenizer.into()),
+            note: None,
+        }
+    }
+
+    /// An estimate, naming the strategy and why it estimates.
+    #[must_use]
+    pub fn estimated(source: impl Into<String>, note: impl Into<String>) -> Self {
+        Self {
+            estimated: true,
+            source: Some(source.into()),
+            note: Some(note.into()),
+        }
+    }
+
+    /// The provenance of a tokenizer source.
+    ///
+    /// Only [`TokenizerSource::NativeTokenizer`] is exact; every other source
+    /// estimates, and the source's own note explains why.
+    #[must_use]
+    pub fn from_source(source: TokenizerSource) -> Self {
+        Self {
+            estimated: !source.is_native(),
+            source: Some(source_name(source).to_owned()),
+            note: source.estimation_note().map(str::to_owned),
+        }
+    }
+
+    /// The provenance of an already-resolved tokenizer selection.
+    ///
+    /// The selection owns the artefact and model identities, while the record's
+    /// `tokens_source` names the strategy, so this is
+    /// [`TokenProvenance::from_source`] of the strategy the selector chose.
+    #[must_use]
+    pub fn of_selected(selected: &SelectedTokenizer) -> Self {
+        Self::from_source(selected.source())
+    }
+
+    /// The provenance of the recorder's `ceil(characters / 3)` fallback.
+    #[must_use]
+    pub fn string_length_estimate() -> Self {
+        Self::estimated(
+            STRING_LENGTH_NOTE,
+            "estimated from the character count at three characters per token",
+        )
+    }
+
+    /// A count from a counter whose provenance cannot be inspected.
+    ///
+    /// A boxed [`TokenCounter`] cannot describe itself, so an undeclared counter
+    /// is reported as an unnamed estimate rather than guessed exact.
+    #[must_use]
+    pub fn unverified(note: impl Into<String>) -> Self {
+        Self {
+            estimated: true,
+            source: None,
+            note: Some(note.into()),
+        }
+    }
+
+    /// Whether the count is an estimate.
+    #[must_use]
+    pub fn is_estimated(&self) -> bool {
+        self.estimated
+    }
+
+    /// The counting strategy's name, when one can be named.
+    #[must_use]
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    /// Why the count is an estimate, when it is one.
+    #[must_use]
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref()
+    }
+}
+
+impl Default for TokenProvenance {
+    /// The safe default: an unnamed estimate, because nothing is known yet.
+    fn default() -> Self {
+        Self::unverified("the recorder's token counter does not declare how it counts")
+    }
+}
+
+/// One measured token count together with how it was produced.
+///
+/// The recorder builds one of these per measured history, so a reader of a
+/// `context.compression_state` record can tell a real count from an estimate
+/// without re-measuring: `tokens` is the number the record publishes and
+/// `provenance` says which counter produced it and whether that number is an
+/// estimate.
+#[derive(Debug, Clone)]
+pub struct MeasuredTokens {
+    /// The measured or estimated total.
+    pub tokens: usize,
+    /// How `tokens` was produced.
+    pub provenance: TokenProvenance,
+}
+
+/// The counter a recorder measures with, plus what it knows about it.
+#[derive(Clone, Default)]
+struct CounterBinding {
+    /// The configured counter; `None` means the string-length fallback runs.
+    counter: Option<Arc<dyn TokenCounter + Send + Sync>>,
+    /// How the counter produces its numbers.
+    provenance: TokenProvenance,
+    /// Whether a caller set the counter, in which case the engine must not
+    /// replace it.
+    caller_set: bool,
+}
+
+// The counter has no `Debug` representation; the presence flag reports it.
+#[allow(clippy::missing_fields_in_debug)]
+impl fmt::Debug for CounterBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CounterBinding")
+            .field("has_counter", &self.counter.is_some())
+            .field("provenance", &self.provenance)
+            .field("caller_set", &self.caller_set)
+            .finish()
+    }
+}
+
+/// The `ceil(characters / 3)` counter of the fallback path.
+fn estimate_counter() -> ApproxTokenCounter {
+    ApproxTokenCounter::with_chars_per_token(ESTIMATE_CHARS_PER_TOKEN)
+}
 
 /// Where a recorder hands its finished records.
 ///
@@ -282,6 +446,13 @@ impl<'a> ContextProcessorStateInput<'a> {
 /// The recorder is `Send + Sync` and shared as `Arc`; the sink, session, and
 /// token counter can be replaced at any time, and no lock is held across an
 /// `await`.
+///
+/// A record's `before`/`after` token counts are measured here, so they are only
+/// as good as the recorder's counter: with one installed they carry the
+/// counter's provenance, and without one every count is the
+/// `ceil(characters / 3)` string-length estimate, published with
+/// `estimated = true` and `tokens_source = "string_length_estimate"`. The first
+/// such measurement of an instance logs one warning naming the missing counter.
 pub struct ContextProcessorStateRecorder {
     session_id: String,
     context_id: String,
@@ -289,7 +460,8 @@ pub struct ContextProcessorStateRecorder {
     history: RwLock<Vec<ContextCompressionState>>,
     sink: RwLock<Option<Arc<dyn CompressionStateSink>>>,
     session: RwLock<Option<Arc<dyn Session>>>,
-    token_counter: RwLock<Option<Arc<dyn TokenCounter + Send + Sync>>>,
+    counter: RwLock<CounterBinding>,
+    estimate_warned: AtomicBool,
 }
 
 // The three trait-object fields have no `Debug` representation; the presence
@@ -306,6 +478,7 @@ impl fmt::Debug for ContextProcessorStateRecorder {
             .field("has_sink", &self.sink().is_some())
             .field("has_session", &self.session().is_some())
             .field("has_token_counter", &self.token_counter().is_some())
+            .field("token_provenance", &self.token_provenance())
             .finish()
     }
 }
@@ -321,7 +494,8 @@ impl ContextProcessorStateRecorder {
             history: RwLock::new(Vec::new()),
             sink: RwLock::new(None),
             session: RwLock::new(None),
-            token_counter: RwLock::new(None),
+            counter: RwLock::new(CounterBinding::default()),
+            estimate_warned: AtomicBool::new(false),
         }
     }
 
@@ -347,9 +521,37 @@ impl ContextProcessorStateRecorder {
     }
 
     /// Attaches the token counter used to measure messages and build statistics.
+    ///
+    /// A counter attached this way reports an unnamed estimate
+    /// ([`TokenProvenance::default`]) until its provenance is declared with
+    /// [`ContextProcessorStateRecorder::with_token_provenance`], because a boxed
+    /// [`TokenCounter`] cannot describe itself.
     #[must_use]
     pub fn with_token_counter(self, counter: Arc<dyn TokenCounter + Send + Sync>) -> Self {
         self.set_token_counter(Some(counter));
+        self
+    }
+
+    /// Attaches the token counter together with how it produces its numbers.
+    #[must_use]
+    pub fn with_token_counter_provenance(
+        self,
+        counter: Arc<dyn TokenCounter + Send + Sync>,
+        provenance: TokenProvenance,
+    ) -> Self {
+        self.set_token_counter_with_provenance(counter, provenance);
+        self
+    }
+
+    /// Declares how the configured counter produces its numbers.
+    ///
+    /// This is the declaration the record's `estimated`/`tokens_source` pair is
+    /// published from; [`TokenProvenance::from_source`] and
+    /// [`TokenProvenance::of_selected`] derive it from the crate's tokenizer
+    /// selection, so the record names the same strategy the counter uses.
+    #[must_use]
+    pub fn with_token_provenance(self, provenance: TokenProvenance) -> Self {
+        self.set_token_provenance(provenance);
         self
     }
 
@@ -382,11 +584,66 @@ impl ContextProcessorStateRecorder {
     }
 
     /// Replaces the token counter used for measurement and statistics.
+    ///
+    /// A counter set this way is caller-owned: the engine never replaces it, and
+    /// its provenance resets to [`TokenProvenance::default`] (an unnamed
+    /// estimate) unless [`ContextProcessorStateRecorder::set_token_provenance`]
+    /// declares it. `None` returns to the string-length fallback and lets a later
+    /// engine installation install its own counter.
     pub fn set_token_counter(&self, counter: Option<Arc<dyn TokenCounter + Send + Sync>>) {
-        *self
-            .token_counter
+        let mut binding = self.counter.write().unwrap_or_else(PoisonError::into_inner);
+        binding.caller_set = counter.is_some();
+        binding.provenance = TokenProvenance::default();
+        binding.counter = counter;
+    }
+
+    /// Replaces the counter and its provenance together.
+    pub fn set_token_counter_with_provenance(
+        &self,
+        counter: Arc<dyn TokenCounter + Send + Sync>,
+        provenance: TokenProvenance,
+    ) {
+        let mut binding = self.counter.write().unwrap_or_else(PoisonError::into_inner);
+        binding.counter = Some(counter);
+        binding.provenance = provenance;
+        binding.caller_set = true;
+    }
+
+    /// Declares how the configured counter produces its numbers.
+    pub fn set_token_provenance(&self, provenance: TokenProvenance) {
+        self.counter
             .write()
-            .unwrap_or_else(PoisonError::into_inner) = counter;
+            .unwrap_or_else(PoisonError::into_inner)
+            .provenance = provenance;
+    }
+
+    /// How the configured counter produces its numbers.
+    #[must_use]
+    pub fn token_provenance(&self) -> TokenProvenance {
+        self.counter_binding().provenance
+    }
+
+    /// Installs the engine's counter unless a caller already set one.
+    ///
+    /// The engine measures its contexts with the counter it hands to the
+    /// pipeline, and the pipeline computes the record's per-role statistic with
+    /// that same counter; installing it here makes the record's `before`/`after`
+    /// counts equal to the statistic by construction.
+    /// Precedence: a counter the caller set ([`ContextProcessorStateRecorder::with_token_counter`],
+    /// [`ContextProcessorStateRecorder::set_token_counter`], or
+    /// [`ContextProcessorStateRecorder::set_token_counter_with_provenance`]) wins
+    /// and is never replaced.
+    pub(crate) fn install_token_counter(
+        &self,
+        counter: Arc<dyn TokenCounter + Send + Sync>,
+        provenance: TokenProvenance,
+    ) {
+        let mut binding = self.counter.write().unwrap_or_else(PoisonError::into_inner);
+        if binding.caller_set {
+            return;
+        }
+        binding.counter = Some(counter);
+        binding.provenance = provenance;
     }
 
     /// Every record kept so far, oldest first.
@@ -487,6 +744,8 @@ impl ContextProcessorStateRecorder {
             operation_id = %state.operation_id,
             before_messages = state.before.messages,
             before_tokens = state.before.tokens,
+            before_tokens_estimated = state.before.estimated,
+            before_tokens_source = state.before.tokens_source.as_deref(),
             after_messages = state.after.as_ref().map(|metric| metric.messages),
             after_tokens = state.after.as_ref().map(|metric| metric.tokens),
             "context compression state"
@@ -571,7 +830,11 @@ impl ContextProcessorStateRecorder {
     }
 
     fn token_counter(&self) -> Option<Arc<dyn TokenCounter + Send + Sync>> {
-        self.token_counter
+        self.counter_binding().counter
+    }
+
+    fn counter_binding(&self) -> CounterBinding {
+        self.counter
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -602,28 +865,62 @@ impl ContextProcessorStateRecorder {
         context_max: Option<u32>,
         observed_at: Option<SystemTime>,
     ) -> ContextCompressionMetric {
-        let tokens = self.measure(messages);
+        let measured = self.measure(messages);
         ContextCompressionMetric {
             time: observed_at.map(format_timestamp),
             messages: messages.len(),
-            tokens,
-            context_percent: context_percent(tokens, context_max),
+            tokens: measured.tokens,
+            context_percent: context_percent(measured.tokens, context_max),
+            estimated: measured.provenance.is_estimated(),
+            tokens_source: measured.provenance.source().map(str::to_owned),
         }
     }
 
-    /// Measures with the configured counter, or `ceil(characters / 3)`.
-    fn measure(&self, messages: &[BaseMessage]) -> usize {
-        if let Some(counter) = self.token_counter() {
-            return counter.count_messages(messages);
+    /// Measures with the configured counter, or with the string-length estimate.
+    fn measure(&self, messages: &[BaseMessage]) -> MeasuredTokens {
+        let (counter, provenance) = self.measurement_source();
+        let tokens = counter.map_or_else(
+            || count_messages(&estimate_counter(), messages),
+            |counter| counter.count_messages(messages),
+        );
+        MeasuredTokens { tokens, provenance }
+    }
+
+    /// The counter the next measurement uses, plus how it produces its numbers.
+    ///
+    /// Without a counter this is the `ceil(characters / 3)` fallback, which is
+    /// announced once per recorder instance rather than once per pass.
+    fn measurement_source(&self) -> (Option<Arc<dyn TokenCounter + Send + Sync>>, TokenProvenance) {
+        let binding = self.counter_binding();
+        if let Some(counter) = binding.counter {
+            (Some(counter), binding.provenance)
+        } else {
+            self.warn_about_estimated_tokens();
+            (None, TokenProvenance::string_length_estimate())
         }
-        let characters: usize = messages
-            .iter()
-            .map(|message| message.content.to_plain_text().chars().count())
-            .sum();
-        characters.div_ceil(3)
+    }
+
+    /// Warns once per recorder instance that its counts are estimates.
+    fn warn_about_estimated_tokens(&self) {
+        if self.estimate_warned.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        tracing::warn!(
+            session_id = %self.session_id,
+            context_id = %self.context_id,
+            tokens_source = STRING_LENGTH_NOTE,
+            "publishing estimated context compression state: this recorder has no token counter, \
+             so every `tokens` value is the ceil(characters / 3) string-length estimate and is \
+             flagged `estimated`; install a counter with `with_token_counter` (and declare how it \
+             counts with `with_token_provenance`) to make the numbers exact and equal to the \
+             per-role statistic"
+        );
     }
 
     fn statistic(&self, input: &ContextProcessorStateInput<'_>) -> ContextStats {
+        // A caller that already computed the per-role counts owns them, including
+        // their provenance: the processor pipeline measures with the context's own
+        // counter, which this recorder cannot inspect.
         if let Some(stats) = input
             .stats_after
             .clone()
@@ -632,10 +929,12 @@ impl ContextProcessorStateRecorder {
             return stats;
         }
         let messages = input.after.unwrap_or(input.before);
-        match self.token_counter() {
+        let (counter, provenance) = self.measurement_source();
+        let stats = match counter {
             Some(counter) => compute_stats(messages, counter.as_ref()),
-            None => compute_stats(messages, &ApproxTokenCounter::with_chars_per_token(3)),
-        }
+            None => compute_stats(messages, &estimate_counter()),
+        };
+        stats.with_estimated(provenance.is_estimated())
     }
 }
 

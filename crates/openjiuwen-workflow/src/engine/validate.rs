@@ -2,8 +2,11 @@
 //!
 //! Ports the checks Python's `Workflow` performs while building and before compiling:
 //! component ids, the start/end shape, edge endpoints, streaming capability, the
-//! `wait_for_all` rule for collect/transform nodes, declared abilities, and overlapping
-//! input/output schema keys.
+//! `wait_for_all` rule for collect/transform nodes, declared abilities, overlapping
+//! input/output schema keys, and each component's own configuration check
+//! ([`Component::validate_config`](crate::component::Component::validate_config)), which is
+//! how a `loop`, `loop_group` or `advanced_loop` reports a missing bound (`101030`) before
+//! any run instead of failing at invoke time.
 //!
 //! [`validate`] never stops at the first problem: every rule contributes a coded message
 //! and all messages are joined with `"; "` into a single [`Error::Workflow`], so a caller
@@ -42,7 +45,10 @@ use super::definition::{EdgeKind, WorkflowDefinition};
 /// - `wait_for_all: Some(false)` is rejected on a node selected as `Collect`/`Transform`;
 /// - a declared ability the component does not implement is rejected;
 /// - `inputs_schema`/`stream_inputs_schema` and `outputs_schema`/`stream_outputs_schema`
-///   may not share a flattened key.
+///   may not share a flattened key;
+/// - every component accepts its own configuration
+///   ([`crate::component::Component::validate_config`]), so a
+///   loop without a bound or without a terminator is reported here.
 ///
 /// # Errors
 ///
@@ -308,6 +314,9 @@ fn check_nodes(def: &WorkflowDefinition, workflow: &str, problems: &mut Vec<Stri
             }
         }
 
+        if let Err(error) = entry.component.validate_config() {
+            record(problems, error);
+        }
         let node = &entry.node;
         check_schema_overlap(
             id,

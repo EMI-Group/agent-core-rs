@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use super::*;
 use crate::tune::base::EvaluatedCase;
-use crate::tune::prompt_search::{JsonlPromptMemory, NullDriftJudge};
-use crate::tune::{DeterministicEvaluator, PromptMemory};
+use crate::tune::prompt_search::{CaseResult, JsonlPromptMemory, NullDriftJudge};
+use crate::tune::{DeterministicEvaluator, EvaluatedRun, PromptMemory, RunTelemetry, ToolTrace};
 
 fn case(id: &str, question: &str, answer: &str) -> Case {
     let mut inputs = BTreeMap::new();
@@ -573,4 +573,174 @@ fn run_id_is_deterministic_and_task_sensitive() {
         PromptSearchOptimizer::run_id(0, &more_cases)
     );
     assert_eq!(PromptSearchOptimizer::run_id(0, &task).len(), 16 + 1 + 8);
+}
+
+/// Reports a fixed score plus per-case telemetry: `c1` costs 10 ms and 3+4
+/// tokens, every other case 5 ms and 1+1.
+struct Measured;
+
+impl Measured {
+    /// The telemetry attributed to `case`.
+    fn telemetry(case: &Case) -> RunTelemetry {
+        if case.case_id == "c1" {
+            RunTelemetry::default()
+                .with_latency_ms(10.0)
+                .with_prompt_tokens(3)
+                .with_completion_tokens(4)
+        } else {
+            RunTelemetry::default()
+                .with_latency_ms(5.0)
+                .with_prompt_tokens(1)
+                .with_completion_tokens(1)
+        }
+    }
+}
+
+#[async_trait]
+impl CaseEvaluator for Measured {
+    async fn evaluate(&self, prompt: &str, case: &Case) -> Result<EvaluatedCase> {
+        Ok(self.evaluate_run(prompt, case).await?.evaluated)
+    }
+
+    async fn evaluate_run(&self, _prompt: &str, case: &Case) -> Result<EvaluatedRun> {
+        let mut answer = BTreeMap::new();
+        answer.insert(
+            "output".to_owned(),
+            Value::String("complete answer".to_owned()),
+        );
+        let evaluated = EvaluatedCase::new(case.clone(), answer, 0.8, "measured")?;
+        Ok(EvaluatedRun::new(
+            evaluated,
+            ToolTrace::default(),
+            Self::telemetry(case),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn each_case_keeps_its_own_telemetry_and_the_execution_sums_them() {
+    let candidate = PromptCandidate::new(SEED, "measured");
+    let outcome = execute_candidate(&Measured, candidate, &cases(), &[false, true]).await;
+    let execution = &outcome.execution;
+
+    assert_eq!(execution.results.len(), 2);
+    assert_eq!(execution.results[0].telemetry.latency_ms, Some(10.0));
+    assert_eq!(execution.results[0].telemetry.prompt_tokens, Some(3));
+    assert_eq!(execution.results[0].telemetry.total_tokens(), Some(7));
+    assert!(execution.results[1].hidden);
+    assert_eq!(execution.results[1].telemetry.latency_ms, Some(5.0));
+    assert_eq!(execution.results[1].telemetry.total_tokens(), Some(2));
+
+    // The execution's telemetry is the sum over its cases.
+    assert_eq!(execution.telemetry.latency_ms, Some(15.0));
+    assert_eq!(execution.telemetry.prompt_tokens, Some(4));
+    assert_eq!(execution.telemetry.completion_tokens, Some(5));
+    assert_eq!(execution.telemetry.total_tokens(), Some(9));
+    // The legacy wire fields mirror the measured totals.
+    assert_eq!(execution.latency_ms, 15.0);
+    assert_eq!(execution.total_tokens, 9);
+    assert!((execution.measured_latency_s() - 0.015).abs() < 1e-12);
+    assert_eq!(execution.measured_total_tokens(), 9);
+    assert_eq!(outcome.evaluated.len(), 2);
+}
+
+#[tokio::test]
+async fn a_telemetry_less_evaluator_keeps_the_legacy_fields_zero() {
+    let candidate = PromptCandidate::new(SEED, "fixed");
+    let outcome =
+        execute_candidate(&Fixed { score: 0.8 }, candidate, &cases(), &[false, false]).await;
+    let execution = &outcome.execution;
+
+    assert!(execution.telemetry.is_empty());
+    assert_eq!(execution.latency_ms, 0.0);
+    assert_eq!(execution.total_tokens, 0);
+    assert!(execution.results.iter().all(|r| r.telemetry.is_empty()));
+    // Everything else is unchanged by the telemetry plumbing.
+    assert_eq!(execution.results.len(), 2);
+    assert_eq!(execution.results[0].output, "complete answer");
+    assert_eq!(execution.results[0].case_id, "case-0");
+    assert!(!execution.results[0].hidden);
+    assert!(execution.results.iter().all(CaseResult::ok));
+    assert!((execution.results[0].score - 0.8).abs() < 1e-12);
+    assert!(execution.error.is_none());
+    assert_eq!(outcome.evaluated.len(), 2);
+}
+
+#[tokio::test]
+async fn execute_candidates_carries_telemetry_per_candidate() {
+    let candidates = vec![
+        PromptCandidate::new("first prompt", "first"),
+        PromptCandidate::new("second prompt", "second"),
+    ];
+    let outcomes = execute_candidates(&Measured, &candidates, &cases(), &[false, false], 2).await;
+    assert_eq!(outcomes.len(), 2);
+    // Input order is preserved.
+    assert_eq!(outcomes[0].execution.candidate.prompt(), "first prompt");
+    assert_eq!(outcomes[1].execution.candidate.prompt(), "second prompt");
+    for outcome in &outcomes {
+        assert_eq!(outcome.execution.telemetry.latency_ms, Some(15.0));
+        assert_eq!(outcome.execution.telemetry.total_tokens(), Some(9));
+        assert_eq!(outcome.execution.latency_ms, 15.0);
+        assert_eq!(outcome.execution.total_tokens, 9);
+    }
+}
+
+#[tokio::test]
+async fn telemetry_does_not_change_the_chosen_prompt_or_score() {
+    /// The same answer and score as [`Fixed`], with a measured cost attached.
+    ///
+    /// Cost carries no reward weight (`default_weights` gives it `0.0`), so this
+    /// is a telemetry-carrying run whose reward is unchanged by construction.
+    struct Priced;
+
+    #[async_trait]
+    impl CaseEvaluator for Priced {
+        async fn evaluate(&self, _prompt: &str, case: &Case) -> Result<EvaluatedCase> {
+            let mut answer = BTreeMap::new();
+            answer.insert(
+                "output".to_owned(),
+                Value::String("complete answer".to_owned()),
+            );
+            EvaluatedCase::new(case.clone(), answer, 0.8, "fixed")
+        }
+
+        async fn evaluate_run(&self, prompt: &str, case: &Case) -> Result<EvaluatedRun> {
+            let evaluated = self.evaluate(prompt, case).await?;
+            Ok(EvaluatedRun::new(
+                evaluated,
+                ToolTrace::default(),
+                RunTelemetry::default().with_cost(0.25),
+            ))
+        }
+    }
+
+    let plain = PromptSearchOptimizer::new()
+        .with_evaluator(Arc::new(Fixed { score: 0.8 }))
+        .optimize(SEED, &cases())
+        .await
+        .unwrap();
+    let priced = PromptSearchOptimizer::new()
+        .with_evaluator(Arc::new(Priced))
+        .optimize(SEED, &cases())
+        .await
+        .unwrap();
+    // Same answers, same scores: the search reaches the same decision.
+    assert_eq!(priced.best_prompt, plain.best_prompt);
+    assert!(
+        (priced.score - plain.score).abs() < 1e-12,
+        "priced {} vs plain {}",
+        priced.score,
+        plain.score
+    );
+    assert_eq!(priced.iterations, plain.iterations);
+    assert_eq!(priced.records.len(), plain.records.len());
+
+    // A measured latency/token run keeps the same chosen prompt; only the
+    // latency and token-usage reward terms move.
+    let measured = PromptSearchOptimizer::new()
+        .with_evaluator(Arc::new(Measured))
+        .optimize(SEED, &cases())
+        .await
+        .unwrap();
+    assert_eq!(measured.best_prompt, plain.best_prompt);
 }

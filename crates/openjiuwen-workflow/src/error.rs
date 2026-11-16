@@ -68,6 +68,8 @@ pub const EXPRESSION_SYNTAX_ERROR: u32 = 101_024;
 pub const EXPRESSION_EVAL_ERROR: u32 = 101_025;
 /// The Python status code of [`loop_param_invalid`].
 pub const COMPONENT_LOOP_PARAM_INVALID: u32 = 101_030;
+/// The Python status code of [`loop_set_var_param_invalid`].
+pub const COMPONENT_LOOP_SET_VAR_PARAM_INVALID: u32 = 101_031;
 /// The Python status code of [`loop_execution_error`].
 pub const COMPONENT_LOOP_EXECUTION_ERROR: u32 = 101_040;
 /// The Python status code of [`knowledge_retrieval_invoke_call_failed`].
@@ -287,6 +289,14 @@ pub fn loop_param_invalid(reason: &str) -> Error {
     )
 }
 
+/// The loop-variable assignment of a `loop_set_variable` component is invalid
+/// (Python `COMPONENT_LOOP_SET_VAR_PARAM_INVALID`).
+pub fn loop_set_var_param_invalid(reason: &str) -> Error {
+    coded(
+        COMPONENT_LOOP_SET_VAR_PARAM_INVALID,
+        format!("loop set_var params invalid, error='{reason}'"),
+    )
+}
 /// A loop iteration failed (Python `COMPONENT_LOOP_EXECUTION_ERROR`).
 pub fn loop_execution_error(reason: &str, comp: &str) -> Error {
     coded(
@@ -411,6 +421,7 @@ mod tests {
         assert_eq!(EXPRESSION_SYNTAX_ERROR, 101_024);
         assert_eq!(EXPRESSION_EVAL_ERROR, 101_025);
         assert_eq!(COMPONENT_LOOP_PARAM_INVALID, 101_030);
+        assert_eq!(COMPONENT_LOOP_SET_VAR_PARAM_INVALID, 101_031);
         assert_eq!(COMPONENT_LOOP_EXECUTION_ERROR, 101_040);
         assert_eq!(COMPONENT_KNOWLEDGE_RETRIEVAL_INVOKE_CALL_FAILED, 101_100);
         assert_eq!(COMPONENT_KNOWLEDGE_RETRIEVAL_INPUT_PARAM_ERROR, 101_102);

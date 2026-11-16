@@ -520,6 +520,7 @@ async fn tool_result_processor_offloads_into_the_session_store() {
         cancellation: &cancellation,
         recall: None,
         session_memory: None,
+        session_memory_agent: None,
     };
 
     let event = processor

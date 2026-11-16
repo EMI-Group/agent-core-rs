@@ -11,11 +11,15 @@
 //! - **Sub-workflow** — a `SubWorkflowSession` built from a host `NodeSession`
 //!   keeps the host's executable id, re-parents to the host's parent, overrides
 //!   only its workflow placement, and merges its end output into the host lane.
-//! - **Router** — every read passes through, every write is a deliberate no-op,
-//!   interaction and sink installation are `Unsupported`.
+//! - **Router** — every read passes through; every write (state, component
+//!   state, streams, restores, interaction resolution) is `Unsupported` with a
+//!   reason naming the rejected operation, while `end_stream`/`close` stay
+//!   deliberate lifecycle no-ops so a nested router never ends the parent's
+//!   stream; interaction requests and sink installation are `Unsupported` too.
 //! - **Trace hook** — installing a sink reroutes spans started afterwards;
-//!   `otel::install_trace_sink` is a documented no-op without the `otel`
-//!   feature and installs with it.
+//!   `otel::try_install_trace_sink` reports `Installed` with the `otel` feature
+//!   and `FeatureDisabled` without it, while the compatibility wrapper
+//!   `otel::install_trace_sink` keeps its always-`Ok(())` shape.
 //!
 //! Everything is offline and deterministic; the only time-based assertions are
 //! short bounded "nothing arrives" guards.
@@ -286,7 +290,7 @@ async fn router_reads_pass_through_and_identity_is_forwarded() {
 }
 
 #[tokio::test]
-async fn router_updates_are_deliberate_noops() {
+async fn router_updates_are_rejected() {
     let workflow = Arc::new(WorkflowSession::new("s1"));
     workflow.update_state(json!({ "step": 1 })).await.unwrap();
     let node = workflow.create_node_session("branch");
@@ -295,43 +299,80 @@ async fn router_updates_are_deliberate_noops() {
         .unwrap();
     let router = RouterSession::new(Arc::new(node) as Arc<dyn Session>);
 
-    router.update_state(json!({ "step": 99 })).await.unwrap();
-    router
+    let error = router
+        .update_state(json!({ "step": 99 }))
+        .await
+        .expect_err("a router never writes global state");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let message = error.to_string();
+    assert!(message.contains("read-only"), "{message}");
+    assert!(message.contains("global state updates"), "{message}");
+    assert!(
+        message.contains("RouterSession::inner()"),
+        "the message points at the write-through path: {message}"
+    );
+
+    let error = router
         .update_component_state("route", json!("right"))
         .await
-        .unwrap();
+        .expect_err("a router never writes component state");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let message = error.to_string();
+    assert!(message.contains("read-only"), "{message}");
+    assert!(message.contains("component state updates"), "{message}");
 
+    // The rejected writes left the wrapped session untouched.
     assert_eq!(workflow.get_state("step").await.unwrap(), Some(json!(1)));
     assert_eq!(
         workflow.get_component_state("branch.route").await.unwrap(),
         Some(json!("left"))
     );
+
+    // Writing through `inner()` is the documented escape hatch.
+    router
+        .inner()
+        .update_state(json!({ "step": 2 }))
+        .await
+        .unwrap();
+    assert_eq!(workflow.get_state("step").await.unwrap(), Some(json!(2)));
 }
 
 #[tokio::test]
-async fn router_stream_writes_reach_nothing() {
+async fn router_stream_writes_are_rejected() {
     let workflow = Arc::new(WorkflowSession::new("s1"));
     let router = RouterSession::new(Arc::clone(&workflow) as Arc<dyn Session>);
     let mut events = workflow.subscribe();
 
-    router
+    let error = router
         .write_stream(StreamItem::output_at("chunk", 0, json!({ "x": 1 })))
         .await
-        .unwrap();
+        .expect_err("a router never publishes frames");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let message = error.to_string();
+    assert!(message.contains("read-only"), "{message}");
+    assert!(message.contains("stream writes"), "{message}");
     assert!(
         tokio::time::timeout(RECV_TIMEOUT, events.next())
             .await
             .is_err(),
-        "a router session never publishes frames"
+        "a rejected router write publishes nothing"
     );
     assert!(
         router.subscribe().next().await.is_none(),
         "a router session exposes an empty stream"
     );
 
+    // `end_stream`/`close` stay deliberate lifecycle no-ops: a nested router
+    // must never end the parent run's stream.
     router.end_stream().await.unwrap();
     router.close().await.unwrap();
     assert!(!workflow.writers().unwrap().is_closed());
+    assert!(
+        tokio::time::timeout(RECV_TIMEOUT, events.next())
+            .await
+            .is_err(),
+        "no end marker reaches the parent hub"
+    );
 }
 
 #[tokio::test]
@@ -350,10 +391,17 @@ async fn router_interaction_is_unsupported() {
             .contains("router sessions cannot interact"),
         "unexpected message: {error}"
     );
-    assert!(router
+    let error = router
         .resolve_interaction(openjiuwen_session::interaction::InteractionResponse::cancel(""))
         .await
-        .is_ok());
+        .expect_err("a router cannot resolve interactions");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let message = error.to_string();
+    assert!(message.contains("read-only"), "{message}");
+    assert!(
+        message.contains("interactions cannot be resolved"),
+        "{message}"
+    );
 }
 
 #[tokio::test]
@@ -373,7 +421,7 @@ async fn router_hides_shared_handles() {
 }
 
 #[tokio::test]
-async fn router_snapshot_forwards_and_restore_is_ignored() {
+async fn router_snapshot_forwards_and_restore_is_rejected() {
     let workflow = Arc::new(WorkflowSession::new("s1"));
     workflow.update_state(json!({ "step": 1 })).await.unwrap();
     let router = RouterSession::new(Arc::clone(&workflow) as Arc<dyn Session>);
@@ -384,7 +432,14 @@ async fn router_snapshot_forwards_and_restore_is_ignored() {
     assert_eq!(snapshot.global, json!({ "step": 1 }));
 
     snapshot.global = json!({ "injected": true });
-    router.restore(snapshot).await.unwrap();
+    let error = router
+        .restore(snapshot)
+        .await
+        .expect_err("a router never restores state");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let message = error.to_string();
+    assert!(message.contains("read-only"), "{message}");
+    assert!(message.contains("state restores"), "{message}");
     assert_eq!(workflow.get_state("injected").await.unwrap(), None);
     assert_eq!(workflow.get_state("step").await.unwrap(), Some(json!(1)));
 }
@@ -513,15 +568,26 @@ fn swappable_sink_defaults_to_a_noop_and_delegates_positions() {
     assert_eq!(memory.position().map(|p| p.frame_count), Some(3));
 }
 
-/// The `otel` helper is a documented no-op without the feature: it returns
-/// `Ok(())` and leaves the session's sink untouched.
+/// The `otel` helper is a documented no-op without the feature, and the no-op
+/// is observable: `try_install_trace_sink` reports `FeatureDisabled` while the
+/// compatibility wrapper keeps returning `Ok(())`.
 #[cfg(not(feature = "otel"))]
 #[tokio::test]
 async fn otel_helper_is_a_noop_without_the_feature() {
     let workflow = WorkflowSession::new("s1");
     let sink = Arc::new(MemoryTraceSink::new());
 
+    assert!(
+        !otel::is_enabled(),
+        "the `otel` feature is off in this build"
+    );
+    assert_eq!(
+        otel::try_install_trace_sink(&workflow, sink.clone()).unwrap(),
+        otel::TraceSinkInstall::FeatureDisabled
+    );
     otel::install_trace_sink(&workflow, sink.clone()).unwrap();
+    // The session's own stream sink reports only frames a subscriber received.
+    let _events = workflow.subscribe();
     let span = workflow
         .tracer()
         .expect("tracer")
@@ -539,13 +605,20 @@ async fn otel_helper_is_a_noop_without_the_feature() {
     );
 }
 
-/// With the `otel` feature the same helper forwards to the session hook.
+/// With the `otel` feature the same helper forwards to the session hook and
+/// reports the installation.
 #[cfg(feature = "otel")]
 #[tokio::test]
 async fn otel_helper_installs_the_sink_with_the_feature() {
     let workflow = WorkflowSession::new("s1");
     let sink = Arc::new(MemoryTraceSink::new());
 
+    assert!(otel::is_enabled(), "the `otel` feature is on in this build");
+    assert_eq!(
+        otel::try_install_trace_sink(&workflow, sink.clone()).unwrap(),
+        otel::TraceSinkInstall::Installed
+    );
+    assert!(otel::TraceSinkInstall::Installed.is_installed());
     otel::install_trace_sink(&workflow, sink.clone()).unwrap();
     let span = workflow
         .tracer()
@@ -557,7 +630,8 @@ async fn otel_helper_installs_the_sink_with_the_feature() {
     assert_eq!(workflow.trace().position().map(|p| p.frame_count), Some(1));
 }
 
-/// With the `otel` feature a read-only session still rejects installation.
+/// With the `otel` feature a read-only session still rejects installation, and
+/// the observable variant reports the same rejection.
 #[cfg(feature = "otel")]
 #[tokio::test]
 async fn otel_helper_propagates_router_rejection() {
@@ -565,6 +639,22 @@ async fn otel_helper_propagates_router_rejection() {
     let router = RouterSession::new(Arc::clone(&workflow) as Arc<dyn Session>);
     let error = otel::install_trace_sink(&router, Arc::new(MemoryTraceSink::new())).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let error =
+        otel::try_install_trace_sink(&router, Arc::new(MemoryTraceSink::new())).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+}
+
+#[test]
+fn otel_install_outcome_wire_names_are_snake_case() {
+    assert_eq!(
+        serde_json::to_value(otel::TraceSinkInstall::Installed).unwrap(),
+        json!("installed")
+    );
+    assert_eq!(
+        serde_json::to_value(otel::TraceSinkInstall::FeatureDisabled).unwrap(),
+        json!("feature_disabled")
+    );
+    assert!(!otel::TraceSinkInstall::FeatureDisabled.is_installed());
 }
 
 /// The `Session` default leaves minimal sessions unchanged: a session that does
@@ -655,4 +745,17 @@ async fn default_session_install_reports_unsupported() {
             .contains("session does not support installing a trace sink"),
         "unexpected message: {error}"
     );
+}
+
+/// The feature-state accessor mirrors the compiled feature, and the
+/// compatibility wrapper keeps its `Ok(())` shape in both builds.
+#[tokio::test]
+async fn otel_feature_state_matches_the_wrapper_outcome() {
+    let workflow = WorkflowSession::new("s1");
+    assert_eq!(otel::is_enabled(), cfg!(feature = "otel"));
+
+    otel::install_trace_sink(&workflow, Arc::new(MemoryTraceSink::new())).unwrap();
+    let outcome =
+        otel::try_install_trace_sink(&workflow, Arc::new(MemoryTraceSink::new())).unwrap();
+    assert_eq!(outcome.is_installed(), cfg!(feature = "otel"));
 }

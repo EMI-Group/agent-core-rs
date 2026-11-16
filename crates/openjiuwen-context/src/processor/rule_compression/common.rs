@@ -5,10 +5,12 @@
 //! (`extract_file_path_argument`, `is_source_file_path`), the tool display
 //! prefix strippers and the `ERROR_RE` word matcher.
 //!
-//! Python uses `re`; this crate has no regex engine, so every matcher here is
-//! hand-rolled over bytes. Matching is ASCII-only (Python's `\d`/`\s` also accept
-//! non-ASCII digits and spaces), which keeps the compressors deterministic and
-//! dependency-free; the difference only shows up on non-ASCII numerals.
+//! Python uses `re`; rule compression compiles no regular expression of its own —
+//! the crate depends on `regex` only for its tokenizer nodes, never here — so
+//! every matcher in this module is hand-rolled over bytes. Matching is ASCII-only
+//! (Python's `\d`/`\s` also accept non-ASCII digits and spaces), which keeps the
+//! compressors deterministic and dependency-free; the difference only shows up on
+//! non-ASCII numerals.
 use super::types::RuleContext;
 use serde_json::Value;
 /// Argument keys whose string value names the single file a tool call reads.

@@ -16,6 +16,12 @@
 //!
 //! The root state of every run carries a reserved `"inputs"` key with the original
 //! inputs, so both `${query}` (root reference) and `${start.query}` resolve.
+//!
+//! Stream delivery is explicit: [`WorkflowRunOptions::stream_delivery`] defaults to
+//! [`StreamDelivery::Buffered`], this crate's composition model, while
+//! [`StreamDelivery::Interleaved`] (Python's live `stream_actor`) is refused by
+//! [`check_delivery`] before any session mutation — a run never silently buffers frames a
+//! caller asked to have interleaved.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +35,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 
 use crate::engine::node::RunScope;
-use crate::engine::{CompiledWorkflow, WorkflowRunOptions};
+use crate::engine::{CompiledWorkflow, StreamDelivery, WorkflowRunOptions};
 use crate::interrupt::{find_interrupt, InteractionState};
 use crate::output::{
     output_chunk, FrameCollector, FrameWriter, OutputFrame, WorkflowChunk, WorkflowExecutionState,
@@ -51,7 +57,8 @@ impl CompiledWorkflow {
     ///
     /// # Errors
     ///
-    /// Propagates state, compilation, graph, timeout, and cancellation failures.
+    /// Returns `Error::Unsupported` for [`StreamDelivery::Interleaved`], then propagates
+    /// state, compilation, graph, timeout, and cancellation failures.
     pub async fn invoke(
         &self,
         inputs: Value,
@@ -69,8 +76,9 @@ impl CompiledWorkflow {
     /// with one `workflow_final` frame carrying the end component's output (omitted when
     /// that output is `null`); a run interrupted for human input ends quietly after the
     /// interaction frames it already yielded; any other failure yields exactly one
-    /// [`Err`]. Dropping the stream aborts the in-flight run and keeps the graph snapshot
-    /// when a checkpointer is configured.
+    /// [`Err`], including a rejected [`StreamDelivery::Interleaved`] (refused before any
+    /// session state changes). Dropping the stream aborts the in-flight run and keeps the
+    /// graph snapshot when a checkpointer is configured.
     #[allow(clippy::too_many_lines)] // one linear pipeline reads better than fragments
     pub fn stream(
         &self,
@@ -80,6 +88,9 @@ impl CompiledWorkflow {
     ) -> futures::stream::BoxStream<'static, Result<WorkflowChunk>> {
         let workflow = self.clone();
         let stream = async_stream::try_stream! {
+            // Fail fast, before any session mutation or graph compile; the generator turns
+            // the error into the stream's single `Err` item.
+            check_delivery(&options)?;
             let workflow_id = workflow.inner.card.id.clone();
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
             let writer = Arc::new(FrameWriter::new(Some(sender), Arc::clone(&session)));
@@ -176,8 +187,9 @@ impl CompiledWorkflow {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Workflow`] when the session has no checkpointer, and otherwise
-    /// propagates the same failures as [`CompiledWorkflow::invoke`].
+    /// Returns [`Error::Workflow`] when the session has no checkpointer,
+    /// `Error::Unsupported` for [`StreamDelivery::Interleaved`], and otherwise propagates
+    /// the same failures as [`CompiledWorkflow::invoke`].
     pub async fn resume(
         &self,
         interactive: openjiuwen_session::InteractiveInput,
@@ -205,6 +217,9 @@ async fn run_blocking(
     session: Arc<dyn Session>,
     options: WorkflowRunOptions,
 ) -> Result<WorkflowOutput> {
+    // The one funnel `invoke` and `resume` share, so an unsupported delivery mode is
+    // refused before any session mutation or graph compile.
+    check_delivery(&options)?;
     let inner = &workflow.inner;
     if !options.resume && inputs.is_object() {
         session.update_state(inputs.clone()).await?;
@@ -308,6 +323,29 @@ pub(crate) fn interaction_wires(interactions: &InteractionState) -> Vec<Value> {
         .collect()
 }
 
+/// Refuses a stream delivery mode this engine cannot provide.
+///
+/// [`StreamDelivery::Buffered`] is this crate's documented composition model, so it always
+/// runs. [`StreamDelivery::Interleaved`] is Python's live `graph.stream_actor` interleaving,
+/// which `openjiuwen-graph` deliberately does not port; buffering those frames instead would
+/// misreport what the run does, so it is a typed `Error::Unsupported` naming the gap.
+///
+/// Called at the top of [`run_blocking`] and of [`CompiledWorkflow::stream`], i.e. before any
+/// session mutation, interaction seeding, or graph compilation.
+fn check_delivery(options: &WorkflowRunOptions) -> Result<()> {
+    match options.stream_delivery {
+        StreamDelivery::Buffered => Ok(()),
+        StreamDelivery::Interleaved => Err(Error::unsupported(
+            "StreamDelivery::Interleaved is unsupported: it requests Python's live \
+             stream_actor interleaving, where a streaming producer feeds its consumer while \
+             both run, and openjiuwen-graph does not port stream_actor (this engine composes \
+             buffered producer frames instead); use StreamDelivery::Buffered, which is the \
+             default and reproduces Python's observable text and frame order for finite \
+             streams",
+        )),
+    }
+}
+
 /// The graph store backing this run, when the session is checkpointed.
 fn store_for(session: &Arc<dyn Session>, workflow_id: &str) -> Option<Arc<dyn GraphStore>> {
     session.checkpointer().map(|checkpointer| {
@@ -383,6 +421,25 @@ mod tests {
     fn abort_guard_tolerates_being_dropped_twice() {
         let guard = AbortOnDrop(None);
         drop(guard);
+    }
+
+    #[test]
+    fn buffered_delivery_is_accepted_and_interleaved_is_typed_unsupported() {
+        assert!(check_delivery(&WorkflowRunOptions::default()).is_ok());
+
+        let failure = check_delivery(
+            &WorkflowRunOptions::default().with_stream_delivery(StreamDelivery::Interleaved),
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.kind(),
+            openjiuwen_common::error::ErrorKind::Unsupported
+        );
+        assert!(failure.message().contains("stream_actor"), "{failure}");
+        assert!(
+            failure.message().contains("StreamDelivery::Buffered"),
+            "{failure}"
+        );
     }
 
     #[test]

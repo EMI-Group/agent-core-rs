@@ -9,7 +9,8 @@
 //! ordering. File persistence is verified separately because only the
 //! local-filesystem backend can be reopened.
 
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
 
@@ -18,11 +19,19 @@ use crate::store::{InMemoryKvStore, KvStore, KvValue, LocalFileKvStore};
 /// A payload that is not valid UTF-8, to prove byte values stay byte values.
 const BINARY: [u8; 4] = [0x00, 0xff, 0xfe, 0x80];
 
-/// How long the contract lets a TTL entry stay live.
+/// How long the contract lets a TTL entry stay live before it is expected to be gone.
 const TTL: Duration = Duration::from_millis(40);
 
 /// How long the contract waits for that entry to expire (a 20ms margin).
 const PAST_TTL: Duration = Duration::from_millis(60);
+
+/// A lease deadline so far away that "still live" assertions cannot race it.
+///
+/// Several contract steps write a lease and then assert that it is visible and that
+/// writers are refused. A sub-second TTL makes that assertion depend on how quickly
+/// the test thread is scheduled, which flaked under parallel load; a one-minute
+/// deadline does not.
+const LIVE_TTL: Duration = Duration::from_secs(60);
 
 #[tokio::test]
 async fn in_memory_satisfies_the_kv_contract() {
@@ -47,12 +56,10 @@ async fn local_file_persists_values_and_ttls_across_a_reopen() {
             .set("bytes", KvValue::bytes(BINARY.to_vec()))
             .await
             .unwrap();
+        // A deadline a minute away keeps the lease live across the reopen below; a
+        // sub-second window could elapse while the store is reopened under load.
         assert!(store
-            .exclusive_set(
-                "lock",
-                KvValue::text("held"),
-                Some(Duration::from_millis(300))
-            )
+            .exclusive_set("lock", KvValue::text("held"), Some(LIVE_TTL))
             .await
             .unwrap());
     }
@@ -73,16 +80,58 @@ async fn local_file_persists_values_and_ttls_across_a_reopen() {
         .await
         .unwrap());
 
-    tokio::time::sleep(Duration::from_millis(350)).await;
-    assert!(!reopened.exists("lock").await.unwrap());
-    assert!(reopened
+    // Expire the lease by backdating its stored deadline rather than sleeping out a
+    // real TTL window: the envelope keeps an absolute epoch-millisecond `expiry_ms`,
+    // so a store reopened after the rewrite takes exactly the elapsed-TTL path.
+    backdate_local_file_deadline(&root, "lock").await;
+
+    let expired = LocalFileKvStore::new(&root).await.unwrap();
+    assert!(!expired.exists("lock").await.unwrap());
+    assert!(expired
         .exclusive_set("lock", KvValue::text("reacquired"), None)
         .await
         .unwrap());
     assert_eq!(
-        reopened.get("lock").await.unwrap(),
+        expired.get("lock").await.unwrap(),
         Some(KvValue::text("reacquired"))
     );
+}
+
+/// Backdates the stored deadline of `key` in a local-filesystem store.
+///
+/// `LocalFileKvStore` keeps one JSON envelope per key below `<root>/entries/` and
+/// stores its TTL as an absolute epoch-millisecond `expiry_ms`; rewriting that field
+/// reproduces the elapsed-TTL path without waiting on a real-time window that
+/// parallel test load can stretch past the deadline.
+async fn backdate_local_file_deadline(root: &Path, key: &str) {
+    let entries = root.join("entries");
+    let mut directory = tokio::fs::read_dir(&entries).await.unwrap();
+    while let Some(entry) = directory.next_entry().await.unwrap() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = tokio::fs::read(&path).await.unwrap();
+        let mut envelope: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        if envelope["key"] != serde_json::json!(key) {
+            continue;
+        }
+        envelope["expiry_ms"] = serde_json::json!(past_epoch_ms());
+        tokio::fs::write(&path, serde_json::to_vec(&envelope).unwrap())
+            .await
+            .unwrap();
+        return;
+    }
+    panic!("no envelope for key `{key}` below {}", entries.display());
+}
+
+/// Epoch milliseconds safely in the past.
+fn past_epoch_ms() -> i64 {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    i64::try_from(now_ms).unwrap_or(i64::MAX) - 1_000
 }
 
 /// Verifies the whole [`KvStore`] contract against one open store.
@@ -143,8 +192,10 @@ async fn overwrite_and_delete(store: &dyn KvStore) {
 }
 
 async fn exclusive_set_expires(store: &dyn KvStore) {
+    // A lease whose deadline is a minute away stays live, so the refusal and the
+    // stored value below cannot race it however the test thread is scheduled.
     assert!(store
-        .exclusive_set("contract:lock", KvValue::text("first"), Some(TTL))
+        .exclusive_set("contract:lock", KvValue::text("first"), Some(LIVE_TTL))
         .await
         .unwrap());
     assert!(!store
@@ -155,20 +206,27 @@ async fn exclusive_set_expires(store: &dyn KvStore) {
         store.get("contract:lock").await.unwrap(),
         Some(KvValue::text("first"))
     );
+    store.delete("contract:lock").await.unwrap();
 
-    tokio::time::sleep(PAST_TTL).await;
-    assert!(!store.exists("contract:lock").await.unwrap());
+    // A short lease is only inspected once it is certainly over: the sleep starts
+    // after the write, so nothing here assumes the entry is still live.
     assert!(store
-        .exclusive_set("contract:lock", KvValue::text("second"), None)
+        .exclusive_set("contract:short-lock", KvValue::text("first"), Some(TTL))
+        .await
+        .unwrap());
+    tokio::time::sleep(PAST_TTL).await;
+    assert!(!store.exists("contract:short-lock").await.unwrap());
+    assert!(store
+        .exclusive_set("contract:short-lock", KvValue::text("second"), None)
         .await
         .unwrap());
     assert_eq!(
-        store.get("contract:lock").await.unwrap(),
+        store.get("contract:short-lock").await.unwrap(),
         Some(KvValue::text("second"))
     );
     // Without a TTL the reacquired key stays live.
     assert!(!store
-        .exclusive_set("contract:lock", KvValue::text("third"), None)
+        .exclusive_set("contract:short-lock", KvValue::text("third"), None)
         .await
         .unwrap());
 }
@@ -183,6 +241,9 @@ async fn set_clears_ttl(store: &dyn KvStore) {
         .await
         .unwrap();
 
+    // `set` clears the TTL either way, and the sleep starts after the write, so the
+    // old deadline has certainly passed when it returns; nothing here assumes the
+    // lease is still live in between.
     tokio::time::sleep(PAST_TTL).await;
     assert_eq!(
         store.get("contract:renewed").await.unwrap(),

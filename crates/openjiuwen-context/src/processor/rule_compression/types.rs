@@ -6,6 +6,7 @@
 //! reports. Every type is `serde`-serializable because the pipeline copies
 //! `details` into message metadata (`rule_compression_details`), which is
 //! persisted and replayed on resume.
+use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -15,6 +16,73 @@ use std::collections::BTreeSet;
 /// rule-compression budgets are character-derived proxies, never real model
 /// token budgets.
 pub const CHARACTERS_PER_TOKEN: usize = 3;
+/// Which tier of an offload pass may rewrite an oversized tool result.
+///
+/// Ports Python's `OffloadStrategy` (`message_offloader.py`), which the reference
+/// keeps as a module constant; here it is a serde configuration so a caller can
+/// choose the trade-off:
+///
+/// - [`RuleCompressionStrategy::RuleThenTruncate`] (the default, Python's current
+///   behaviour) compresses deterministically first and, when the result still
+///   exceeds the budget, falls through to the summary/offload tier,
+/// - [`RuleCompressionStrategy::RuleOnly`] keeps the rule-compressed body even
+///   when it still exceeds the budget and never summarises or offloads a
+///   candidate the rule tier did not accept,
+/// - [`RuleCompressionStrategy::TruncateOnly`] skips rule compression entirely and
+///   goes straight to the summary/offload tier.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleCompressionStrategy {
+    /// Compress, then summarise/offload whatever is still too large.
+    #[default]
+    RuleThenTruncate,
+    /// Compress and keep the result, never summarising or offloading.
+    RuleOnly,
+    /// Skip rule compression; summarise and offload directly.
+    TruncateOnly,
+}
+impl RuleCompressionStrategy {
+    /// The wire spelling (`rule_then_truncate`, `rule_only`, `truncate_only`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RuleThenTruncate => "rule_then_truncate",
+            Self::RuleOnly => "rule_only",
+            Self::TruncateOnly => "truncate_only",
+        }
+    }
+    /// Whether the rule tier runs under this strategy.
+    #[must_use]
+    pub fn runs_rule_compression(self) -> bool {
+        !matches!(self, Self::TruncateOnly)
+    }
+    /// Whether the summary/offload tier runs under this strategy.
+    #[must_use]
+    pub fn runs_fallback_offload(self) -> bool {
+        !matches!(self, Self::RuleOnly)
+    }
+    /// Whether a rule-compressed body that still exceeds the budget is summarised.
+    #[must_use]
+    pub fn truncates_rule_preview(self) -> bool {
+        matches!(self, Self::RuleThenTruncate)
+    }
+    /// Parses a wire spelling, rejecting anything else with [`Error::Config`].
+    ///
+    /// Serde already refuses an unknown variant when a configuration is
+    /// deserialized, so a misspelt strategy is a load error rather than a silent
+    /// default; this is the typed-error path for callers holding a string.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim() {
+            "rule_then_truncate" => Ok(Self::RuleThenTruncate),
+            "rule_only" => Ok(Self::RuleOnly),
+            "truncate_only" => Ok(Self::TruncateOnly),
+            other => Err(Error::config(format!(
+                "unknown rule-compression strategy {other:?}; expected \"rule_then_truncate\", \
+                 \"rule_only\" or \"truncate_only\""
+            ))),
+        }
+    }
+}
 /// What kind of content a rule compressor is looking at.
 ///
 /// Wire values keep Python's upper-case spelling because the label lands in
@@ -193,7 +261,9 @@ impl RuleContext {
 /// `content` is the input verbatim whenever the compressor declined; callers key
 /// off `modified`, never off equality. `lossy` describes an accepted candidate:
 /// `true` means information was dropped, `false` means the rewrite preserves the
-/// meaning (CSV/JSONL/compact JSON).
+/// meaning (CSV/JSONL/compact JSON). The pipeline stamps the accepted value into
+/// message metadata (`rule_compression_lossy`), so a downstream reader can tell a
+/// digest from a faithful rewrite without re-running the compressor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuleCompressionResult {
     /// The compressed text, or the input when nothing was applied.
@@ -209,6 +279,9 @@ pub struct RuleCompressionResult {
 }
 impl RuleCompressionResult {
     /// A result that leaves `content` untouched.
+    ///
+    /// `details` start empty; attach a reason with [`Self::with_details`] (or use
+    /// [`Self::declined`]) when the caller needs to know why nothing was done.
     #[must_use]
     pub fn unchanged(content: &str, content_type: ContentType) -> Self {
         Self {
@@ -218,6 +291,15 @@ impl RuleCompressionResult {
             lossy: false,
             details: None,
         }
+    }
+    /// The same result, carrying `details`; `None` keeps it bare.
+    ///
+    /// This is the attribution seam every constructor shares: a decline can name
+    /// its `reason` without changing what the compressor returned.
+    #[must_use]
+    pub fn with_details(mut self, details: Option<Value>) -> Self {
+        self.details = details;
+        self
     }
     /// A result that declined, carrying the `details` a caller may still read.
     #[must_use]
@@ -245,5 +327,51 @@ impl RuleCompressionResult {
             lossy,
             details,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn strategies_parse_strictly_and_round_trip_through_serde() {
+        for strategy in [
+            RuleCompressionStrategy::RuleThenTruncate,
+            RuleCompressionStrategy::RuleOnly,
+            RuleCompressionStrategy::TruncateOnly,
+        ] {
+            assert_eq!(
+                RuleCompressionStrategy::parse(strategy.as_str()).expect("parse"),
+                strategy
+            );
+            let json = serde_json::to_string(&strategy).expect("serde");
+            assert_eq!(json, format!("\"{}\"", strategy.as_str()));
+            let parsed: RuleCompressionStrategy = serde_json::from_str(&json).expect("serde");
+            assert_eq!(parsed, strategy);
+        }
+        assert_eq!(
+            RuleCompressionStrategy::default(),
+            RuleCompressionStrategy::RuleThenTruncate
+        );
+    }
+    #[test]
+    fn an_unknown_strategy_is_a_typed_config_error() {
+        let error = RuleCompressionStrategy::parse("rule_and_truncate").expect_err("unknown");
+        assert!(matches!(error, Error::Config(_)));
+        assert!(error.to_string().contains("rule_and_truncate"));
+        // Serde refuses the same value instead of falling back to the default.
+        assert!(serde_json::from_str::<RuleCompressionStrategy>("\"rule_and_truncate\"").is_err());
+    }
+    #[test]
+    fn strategy_gates_match_pythons_three_helpers() {
+        assert!(RuleCompressionStrategy::RuleThenTruncate.runs_rule_compression());
+        assert!(RuleCompressionStrategy::RuleThenTruncate.runs_fallback_offload());
+        assert!(RuleCompressionStrategy::RuleThenTruncate.truncates_rule_preview());
+        assert!(RuleCompressionStrategy::RuleOnly.runs_rule_compression());
+        assert!(!RuleCompressionStrategy::RuleOnly.runs_fallback_offload());
+        assert!(!RuleCompressionStrategy::RuleOnly.truncates_rule_preview());
+        assert!(!RuleCompressionStrategy::TruncateOnly.runs_rule_compression());
+        assert!(RuleCompressionStrategy::TruncateOnly.runs_fallback_offload());
+        assert!(!RuleCompressionStrategy::TruncateOnly.truncates_rule_preview());
     }
 }

@@ -44,16 +44,30 @@
 //! cursor here (page cursors, the notice cursor, the observed paths) is a field on the
 //! toolkit, so two toolkits never share state and a test never has to clear a global.
 //!
+//! # Index baseline
+//!
+//! A result's `index_state` describes the [`IndexBaseline`] that was in force *before* the
+//! call: `missing` when the toolkit holds none, `fresh` when it was recorded over the
+//! catalog in hand, and `stale` when it was recorded over a different snapshot. The toolkit
+//! records a baseline over its current catalog after every result it produces
+//! ([`SkillIndexToolkit::record_index_baseline`]), so the first result on a fresh toolkit
+//! reports `missing` and the next identical call over the same immutable catalog reports
+//! `fresh`. A caller observes `stale` only by handing a baseline recorded from an earlier
+//! catalog snapshot to a toolkit over a newer one — through
+//! [`SkillIndexToolkit::new_with_baseline`], [`SkillIndexToolkit::with_index_baseline`],
+//! [`SkillIndexToolkit::set_index_baseline`], or a baseline persisted from an earlier
+//! process. A result's `skillfs_layout` is derived from the catalog shape (see
+//! [`layout_for_records`](crate::discovery::directory_toolkit::layout::layout_for_records))
+//! rather than read from a pinned index artifact, which this port does not have.
+//!
 //! Everything is offline and deterministic: no clock, no randomness, no hash-map
 //! iteration order.
 
 use std::collections::BTreeSet;
 
-use base64::Engine as _;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::discovery::settings::DiscoverySettings;
 use crate::discovery::toolkit::{
@@ -62,6 +76,8 @@ use crate::discovery::toolkit::{
 use crate::discovery::SkillFs;
 use crate::error::{validation, Result};
 
+use super::cursor::{CursorState, CursorStore};
+use super::layout::{index_state_for, skillfs_layout, IndexBaseline, IndexState};
 use super::ops;
 use super::render::{
     append_note, candidate_tokens, compact, empty_message, fit_rows, row_count, ListView,
@@ -86,12 +102,6 @@ pub const CURSOR_MAX_CHARS: usize = 128;
 
 /// The characters reserved for the `[next]` footer while fitting rows.
 pub const CURSOR_FOOTER_CHARS: usize = 96;
-
-/// The schema version the cursor token hashes.
-pub const CURSOR_STATE_VERSION: u64 = 1;
-
-/// The bytes of the SHA-256 digest a cursor token keeps.
-pub const CURSOR_TOKEN_BYTES: usize = 16;
 
 /// The operations the model-facing tool accepts.
 pub const MODEL_OPERATIONS: [Operation; 2] = [Operation::List, Operation::Search];
@@ -122,12 +132,6 @@ const CURSOR_DESCRIPTION: &str = "Copy [next] unchanged. To change query/categor
 
 /// The keys the model-facing tool accepts.
 const ACCEPTED_KEYS: [&str; 4] = ["operation", "category", "query", "cursor"];
-
-/// The `skillfs_layout` a result reports; the port has no pinned index snapshot.
-const LAYOUT_FLAT: &str = "flat";
-
-/// The `index_state` a result reports; the port builds no persistent index snapshot.
-const INDEX_MISSING: &str = "missing";
 
 /// One toolkit's configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -234,10 +238,16 @@ pub struct SkillIndexResult {
     pub next_cursor: Option<String>,
     /// The output budget the response was fitted into; `None` when truncation is off.
     pub effective_max_output_chars: Option<usize>,
-    /// The catalog layout; always `LAYOUT_FLAT`.
+    /// The catalog layout derived from its records (`SkillFsLayout::as_str()`).
     pub skillfs_layout: String,
-    /// The index state; always `INDEX_MISSING`.
+    /// The index state in force before this call (`IndexState::as_str()`).
     pub index_state: String,
+    /// The catalog's current inventory fingerprint
+    /// ([`SkillInventory::fingerprint`](crate::discovery::models::SkillInventory::fingerprint)).
+    pub inventory_fingerprint: String,
+    /// The [`index_fingerprint`](super::layout::index_fingerprint) of the baseline in force
+    /// for this call; `None` when no baseline was in force.
+    pub index_baseline_fingerprint: Option<String>,
     /// How many Skills the catalog holds.
     pub candidate_count: usize,
     /// The estimated model tokens of the catalog's candidate lines.
@@ -265,6 +275,8 @@ pub struct SkillIndexToolkit {
     observed_meta_paths: BTreeSet<String>,
     /// The Skill ids an earlier result observed.
     observed_skills: BTreeSet<String>,
+    /// The index baseline in force; set by the caller or by the toolkit's own last result.
+    index_baseline: Option<IndexBaseline>,
 }
 
 impl SkillIndexToolkit {
@@ -277,6 +289,23 @@ impl SkillIndexToolkit {
     /// [`MIN_OUTPUT_CHARS`]`..=`[`MAX_OUTPUT_CHARS`], and naming
     /// `incremental_notice_max_chars` when it is zero.
     pub fn new(catalog: SkillFs, config: SkillIndexConfig) -> Result<Self> {
+        Self::new_with_baseline(catalog, config, None)
+    }
+
+    /// Opens a toolkit over `catalog` with an index baseline already in force.
+    ///
+    /// A baseline recorded over a different catalog snapshot makes the first result report
+    /// `stale`; `None` makes it report `missing`. [`SkillIndexToolkit::new`] is this with
+    /// `None`.
+    ///
+    /// # Errors
+    ///
+    /// The same failures as [`SkillIndexToolkit::new`].
+    pub fn new_with_baseline(
+        catalog: SkillFs,
+        config: SkillIndexConfig,
+        baseline: Option<IndexBaseline>,
+    ) -> Result<Self> {
         let scope = config.session_scope.trim();
         if scope.is_empty() {
             return Err(validation("session_scope", "must be non-empty"));
@@ -307,7 +336,44 @@ impl SkillIndexToolkit {
             cursors: CursorStore::default(),
             observed_meta_paths: BTreeSet::new(),
             observed_skills: BTreeSet::new(),
+            index_baseline: baseline,
         })
+    }
+
+    /// Sets the index baseline in force (an infallible builder; see
+    /// [`SkillIndexToolkit::set_index_baseline`]).
+    #[must_use]
+    pub fn with_index_baseline(mut self, baseline: IndexBaseline) -> Self {
+        self.index_baseline = Some(baseline);
+        self
+    }
+
+    /// Replaces the index baseline in force; `None` makes the next result report `missing`.
+    pub fn set_index_baseline(&mut self, baseline: Option<IndexBaseline>) {
+        self.index_baseline = baseline;
+    }
+
+    /// The index baseline in force, when the caller or an earlier result set one.
+    #[must_use]
+    pub fn index_baseline(&self) -> Option<&IndexBaseline> {
+        self.index_baseline.as_ref()
+    }
+
+    /// Records a baseline over the current catalog and stores it as the baseline in force.
+    ///
+    /// Deterministic ([`IndexBaseline::from_catalog`]), so two consecutive calls over an
+    /// unchanged catalog return equal baselines.
+    pub fn record_index_baseline(&mut self) -> IndexBaseline {
+        let baseline = IndexBaseline::from_catalog(&self.catalog);
+        self.index_baseline = Some(baseline.clone());
+        baseline
+    }
+
+    /// How the baseline in force relates to the current catalog
+    /// ([`index_state_for`]).
+    #[must_use]
+    pub fn index_state(&self) -> IndexState {
+        index_state_for(&self.catalog, self.index_baseline.as_ref())
     }
 
     /// The per-session tool id.
@@ -757,6 +823,18 @@ unchanged.",
             rows.iter().take(fitted.shown_count).cloned().collect()
         };
         let records = self.catalog.records();
+        let candidate_count = records.len();
+        let estimated_candidate_tokens = candidate_tokens(records);
+        let reported_state = index_state_for(&self.catalog, self.index_baseline.as_ref());
+        let reported_baseline_fingerprint = self
+            .index_baseline
+            .as_ref()
+            .map(|baseline| baseline.index_fingerprint.clone());
+        let layout = skillfs_layout(&self.catalog);
+        let inventory_fingerprint = self.catalog.inventory().fingerprint.clone();
+        // The reported state describes the baseline in force *before* this call, so the
+        // toolkit records the current catalog only once that state is captured.
+        self.record_index_baseline();
         Ok(SkillIndexResult {
             content,
             model_content,
@@ -770,97 +848,14 @@ unchanged.",
             result_complete: !has_more && complete && !fitted.shortened,
             next_cursor,
             effective_max_output_chars: budget,
-            skillfs_layout: LAYOUT_FLAT.to_string(),
-            index_state: INDEX_MISSING.to_string(),
-            candidate_count: records.len(),
-            estimated_candidate_tokens: candidate_tokens(records),
+            skillfs_layout: layout.as_str().to_string(),
+            index_state: reported_state.as_str().to_string(),
+            inventory_fingerprint,
+            index_baseline_fingerprint: reported_baseline_fingerprint,
+            candidate_count,
+            estimated_candidate_tokens,
             candidate_budget_tokens: DiscoverySettings::default().candidate_budget_tokens(),
         })
-    }
-}
-
-/// One page cursor's continuation state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CursorState {
-    /// The operation the page belongs to.
-    operation: Operation,
-    /// The category scope, when one was named.
-    category: Option<String>,
-    /// The validated search queries; empty for a list.
-    queries: Vec<String>,
-    /// The offset the next page starts at.
-    offset: usize,
-    /// The page size the original request used.
-    page_size: usize,
-    /// The catalog fingerprint the page was minted against.
-    fingerprint: String,
-}
-
-impl CursorState {
-    /// The deterministic token for this state.
-    ///
-    /// The URL-safe unpadded base64 of the first [`CURSOR_TOKEN_BYTES`] of SHA-256 over
-    /// the canonical JSON of `{v, operation, category, queries, offset, page_size,
-    /// fingerprint}`. The field order is fixed and the document holds no maps, so the
-    /// bytes — and therefore the token — are identical for identical states.
-    fn token(&self) -> String {
-        let document = json!({
-            "v": CURSOR_STATE_VERSION,
-            "operation": self.operation.as_str(),
-            "category": self.category,
-            "queries": self.queries,
-            "offset": self.offset,
-            "page_size": self.page_size,
-            "fingerprint": self.fingerprint,
-        });
-        let canonical = document.to_string();
-        let digest = Sha256::digest(canonical.as_bytes());
-        let head = digest
-            .get(..CURSOR_TOKEN_BYTES)
-            .unwrap_or(digest.as_slice());
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(head)
-    }
-}
-
-/// The page cursors, ordered least recently used first.
-#[derive(Debug, Default, Clone)]
-struct CursorStore {
-    /// `(token, state)` pairs, the most recently used last.
-    entries: Vec<(String, CursorState)>,
-}
-
-impl CursorStore {
-    /// The state behind `token`, when it is still held.
-    fn get(&self, token: &str) -> Option<&CursorState> {
-        self.entries
-            .iter()
-            .find(|(held, _)| held == token)
-            .map(|(_, state)| state)
-    }
-
-    /// Stores `state` under `token`, evicting the least recently used past
-    /// [`MAX_CURSORS`].
-    fn push(&mut self, token: String, state: CursorState) {
-        self.entries.retain(|(held, _)| held != &token);
-        self.entries.push((token, state));
-        while self.entries.len() > MAX_CURSORS {
-            self.entries.remove(0);
-        }
-    }
-
-    /// Drops `token` from the store.
-    fn remove(&mut self, token: &str) {
-        self.entries.retain(|(held, _)| held != token);
-    }
-
-    /// How many cursors the store holds.
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Drops every cursor.
-    fn clear(&mut self) {
-        self.entries.clear();
     }
 }
 

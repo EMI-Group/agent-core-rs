@@ -202,10 +202,11 @@ async fn the_session_limit_caps_the_iteration_count() {
 
 // port of tests/unit_tests/core/component/test_loop_comp.py::test_loop_number
 #[tokio::test]
-async fn a_missing_loop_number_is_a_loop_execution_error() {
+async fn a_missing_loop_number_is_a_build_time_parameter_error() {
     // Python raises `COMPONENT_LOOP_PARAM_INVALID` (`101030`) while parsing the loop
-    // config; this component validates at invoke time and reports the shared loop
-    // execution code (`101040`).
+    // config; `crate::Component::validate_config` reports the same code at build time, so
+    // a run that could never terminate is refused before it starts. `invoke` compiles
+    // first, so both entry points agree.
     let workflow = loop_workflow(
         "loop-missing",
         LoopConfig::new(LoopType::Number),
@@ -213,15 +214,18 @@ async fn a_missing_loop_number_is_a_loop_execution_error() {
         json!({}),
     );
 
-    let failure = workflow
+    let build_failure = workflow.build().unwrap_err();
+    let invoke_failure = workflow
         .invoke(json!({}), session("loop-missing"))
         .await
         .unwrap_err();
 
-    assert_eq!(failure.kind(), ErrorKind::Workflow);
-    assert!(failure.message().contains("[101040]"), "{failure}");
-    assert!(
-        failure.message().contains("loop_number variable not found"),
-        "{failure}"
-    );
+    for failure in [build_failure, invoke_failure] {
+        assert_eq!(failure.kind(), ErrorKind::Workflow);
+        assert!(failure.message().contains("[101030]"), "{failure}");
+        assert!(
+            failure.message().contains("loop_number variable not found"),
+            "{failure}"
+        );
+    }
 }

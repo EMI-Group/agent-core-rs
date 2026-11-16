@@ -6,9 +6,17 @@
 //!
 //! The document is loaded lazily on the first operation, from a filesystem path
 //! (`.json`, `.yaml`, `.yml`, or sniffed) or from an `http(s)` URL, and is then
-//! cached until [`McpClient::disconnect`]. Calls are plain HTTP requests against
-//! `servers[0].url` (or the `params.base_url` override); nothing here speaks
-//! JSON-RPC, so [`McpClient::list_resources`], [`McpClient::read_resource`],
+//! cached until [`McpClient::disconnect`]. Loading also pulls in every document
+//! the spec references: `refs` resolves local `#/...` pointers, local files
+//! relative to the declaring document, and `http(s)` URLs, and the resolved
+//! documents are cached with the spec.
+//!
+//! Calls are plain HTTP requests against `servers[0].url` (or the
+//! `params.base_url` override): path parameters substitute the path template,
+//! query and header parameters are sent as such, cookie parameters are joined
+//! into one `Cookie` header, and an `application/json` request body carries the
+//! remaining arguments. Nothing here speaks JSON-RPC, so
+//! [`McpClient::list_resources`], [`McpClient::read_resource`],
 //! [`McpClient::take_notifications`] and [`McpClient::supports_server_stream`]
 //! keep their trait defaults.
 //!
@@ -27,6 +35,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 pub(crate) mod call;
+pub(crate) mod refs;
 pub(crate) mod spec;
 
 pub use spec::{OpenApiOperation, OpenApiParameter, OpenApiSpec};

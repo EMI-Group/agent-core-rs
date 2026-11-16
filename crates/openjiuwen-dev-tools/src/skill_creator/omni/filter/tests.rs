@@ -14,6 +14,19 @@ fn jpeg(size: usize) -> Vec<u8> {
     bytes
 }
 
+/// A `png` payload with a real `IHDR` header for `width`x`height`, padded with
+/// zero bytes to exactly `size` bytes when that is larger than the header.
+fn png_body(width: u32, height: u32, size: usize) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend_from_slice(&13u32.to_be_bytes());
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&[8, 2, 0, 0, 0]);
+    bytes.resize(size.max(bytes.len()), 0);
+    bytes
+}
+
 /// A candidate carrying a downloaded payload.
 fn downloaded(url: &str, bytes: Vec<u8>) -> ImageCandidate {
     ImageCandidate::new(url, "").with_bytes(bytes)
@@ -88,6 +101,23 @@ fn icon_heuristics_by_dimension() {
 }
 
 #[test]
+fn icon_heuristics_by_min_dimension_pair() {
+    let url = "https://example.com/assets/chart.png";
+    // Python's `width < 80 and height < 80` rule needs both known axes.
+    assert!(is_probable_icon(url, Some(79), Some(79)));
+    assert!(is_probable_icon(url, Some(10), Some(79)));
+    assert!(!is_probable_icon(url, Some(80), Some(80)));
+    assert!(!is_probable_icon(url, Some(1200), Some(60)));
+    assert!(!is_probable_icon(url, Some(80), Some(10)));
+    assert!(!is_probable_icon(url, Some(79), None));
+    assert!(!is_probable_icon(url, None, Some(79)));
+    // The spacer rule is independent of the pair rule and fires on one axis.
+    assert!(is_probable_icon(url, Some(1), Some(79)));
+    assert!(is_probable_icon(url, Some(2), None));
+    assert!(is_probable_icon(url, None, Some(2)));
+}
+
+#[test]
 fn icon_heuristics_by_url() {
     for url in [
         "https://example.com/spacer.gif",
@@ -143,6 +173,82 @@ fn filter_drops_unknown_binary_formats() {
         downloaded("https://example.com/text.bin", b"not an image".repeat(128)),
     ];
     assert_eq!(filter_images(&images), Vec::<ImageCandidate>::new());
+}
+
+#[test]
+fn filter_drops_decorative_images_by_payload_dimensions() {
+    let images = [
+        downloaded("https://example.com/spacer.png", png_body(1, 1, 2048)),
+        downloaded("https://example.com/bullet.png", png_body(79, 79, 2048)),
+        downloaded("https://example.com/chart.png", png_body(80, 80, 2048)),
+        downloaded("https://example.com/banner.png", png_body(1200, 60, 2048)),
+        downloaded("https://example.com/photo.png", png_body(640, 480, 2048)),
+    ];
+    assert_eq!(
+        urls(&filter_images(&images)),
+        [
+            "https://example.com/chart.png",
+            "https://example.com/banner.png",
+            "https://example.com/photo.png",
+        ]
+    );
+}
+
+#[test]
+fn filter_dimension_gate_reads_every_supported_container() {
+    let mut gif = b"GIF89a".to_vec();
+    gif.extend_from_slice(&16u16.to_le_bytes());
+    gif.extend_from_slice(&16u16.to_le_bytes());
+    gif.resize(2048, 0);
+
+    let mut jpeg_bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00];
+    jpeg_bytes.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08]);
+    jpeg_bytes.extend_from_slice(&600u16.to_be_bytes());
+    jpeg_bytes.extend_from_slice(&800u16.to_be_bytes());
+    jpeg_bytes.resize(4096, 0);
+
+    let images = [
+        downloaded("https://example.com/tiny.gif", gif),
+        downloaded("https://example.com/photo.jpg", jpeg_bytes),
+    ];
+    assert_eq!(
+        urls(&filter_images(&images)),
+        ["https://example.com/photo.jpg"]
+    );
+}
+
+#[test]
+fn filter_keeps_unparseable_headers_that_pass_the_other_rules() {
+    // `png(2048)` carries the signature but no `IHDR`, so its dimensions are
+    // unknown: only the format, size and URL rules decide.
+    let images = [
+        downloaded("https://example.com/unlabelled.png", png(2048)),
+        downloaded("https://example.com/spacer.png", png(2048)),
+    ];
+    assert_eq!(
+        urls(&filter_images(&images)),
+        ["https://example.com/unlabelled.png"]
+    );
+}
+
+#[test]
+fn dimension_gate_preserves_first_seen_order_and_dedupe() {
+    let payload = png_body(800, 600, 2048);
+    let images = [
+        downloaded("https://example.com/first.png", payload.clone()),
+        downloaded("https://example.com/dot.png", png_body(40, 40, 2048)),
+        downloaded("https://example.com/second.png", payload.clone()),
+        downloaded("https://example.com/third.png", png_body(1200, 60, 2048)),
+    ];
+    let kept = filter_images(&images);
+    assert_eq!(
+        urls(&kept),
+        [
+            "https://example.com/first.png",
+            "https://example.com/third.png"
+        ]
+    );
+    assert_eq!(filter_images(&kept), kept);
 }
 
 #[test]

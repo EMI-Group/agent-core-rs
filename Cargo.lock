@@ -1831,6 +1831,7 @@ dependencies = [
  "openjiuwen-foundation",
  "openjiuwen-session",
  "openjiuwen-test-support",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
@@ -1839,6 +1840,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "unicode-normalization",
  "uuid",
  "wiremock",
 ]
@@ -1954,7 +1956,6 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "reqwest",
- "rmcp",
  "serde",
  "serde_json",
  "sha2",
@@ -1962,7 +1963,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-stream",
+ "tokio-rustls",
  "tokio-util",
  "tower",
  "tracing",
@@ -1970,6 +1971,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-roots",
  "wiremock",
 ]
 
@@ -1986,6 +1988,7 @@ dependencies = [
  "futures-util",
  "indexmap",
  "jsonschema",
+ "nix",
  "once_cell",
  "openjiuwen-common",
  "openjiuwen-macros",
@@ -2003,11 +2006,13 @@ dependencies = [
  "thiserror",
  "tiktoken-rs",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tracing",
  "url",
  "uuid",
+ "webpki-roots",
  "wiremock",
 ]
 
@@ -2285,6 +2290,7 @@ dependencies = [
  "openjiuwen-common",
  "openjiuwen-foundation",
  "parking_lot",
+ "rustls",
  "schemars",
  "serde",
  "serde_json",
@@ -2292,9 +2298,11 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2310,6 +2318,7 @@ dependencies = [
  "openjiuwen-graph",
  "openjiuwen-retrieval",
  "openjiuwen-session",
+ "rsa",
  "schemars",
  "serde",
  "serde_json",
@@ -2386,6 +2395,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -2953,6 +2963,7 @@ version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",

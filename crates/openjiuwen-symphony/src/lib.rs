@@ -67,6 +67,8 @@ pub fn crate_name() -> &'static str {
 
 pub use openjiuwen_common::error::{Error, Result};
 
+/// Agent-facing browsing and search tools over the capability-tree index.
+pub mod agent;
 /// Immutable, atomically published capability-graph revisions.
 pub mod artifact;
 /// API-shaped stub for the one Python area that requires a GPU inference stack.

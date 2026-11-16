@@ -103,6 +103,34 @@ sink on the `otel` build and an uninhabited stand-in otherwise.
 Re-exported engine items are *not* re-exported here; callers reach them through
 `openjiuwen_memory::team`.
 
+Extraction is batched and explicit: `on_turn`/`on_turn_message` only buffer a turn into the engine's
+hooks, `flush` extracts the whole buffer, writes it in one batch with deterministic ids and clears
+the buffer, and a failed pass keeps the buffer so a retry converges on the same rows.
+The runtime drives those two calls at the settled-run boundary and again on `stop`.
+
+Test-only seam (`#[cfg(test)]`, `src/memory/test_support.rs`; not public API):
+
+```rust
+pub(crate) const SCRIPTED_FAILURE: &str = "scripted store failure";
+pub(crate) struct FailingTeamMemoryStore;         // in-memory store whose upsert refuses while armed
+impl FailingTeamMemoryStore {
+    pub(crate) fn new() -> Self;                  // armed
+    pub(crate) fn shared() -> Arc<Self>;
+    pub(crate) fn is_failing(&self) -> bool;
+    pub(crate) fn set_failing(&self, failing: bool);
+    pub(crate) fn stop_failing(&self);
+}
+#[cfg(test)]
+impl TeamMemoryWiring {
+    pub(crate) async fn with_store_for_tests(
+        team_id: impl Into<String>,
+        config: MemoryConfig,
+        workspace_root: impl Into<PathBuf>,
+        store: Arc<dyn TeamMemoryStore>,
+    ) -> Result<Arc<Self>>;
+}
+```
+
 ## Metadata contract
 
 `spec.metadata["memory"]` is optional and tolerant, in the style of
@@ -129,8 +157,12 @@ Re-exported engine items are *not* re-exported here; callers reach them through
 
 ## Observability bridge
 
-`TeamMemoryWiring::build` asks `trace::facade(team_id, config)` for the facade, which selects the
-store, then chains `.with_observer(observer)` when `trace::observer_for` answered one.
+`TeamMemoryWiring::assemble` asks `trace::facade(team_id, config)` for the facade, which selects the
+store and hands it to `trace::facade_over`, which chains `.with_observer(observer)` when
+`trace::observer_for` answered one.
+The test constructor `TeamMemoryWiring::with_store_for_tests` builds the facade over its own
+`Arc<dyn TeamMemoryStore>` and passes it to the same `facade_over`, so the observer choice is one
+code path on both.
 `openjiuwen_memory::team::TeamMemory::with_observer` consumes the facade, so the observer is only
 attachable at construction — never later.
 The observer is `observability::memory::memory_observer(team_id)`, plus
@@ -183,21 +215,25 @@ Caveats, stated because they are visible from this node:
 - A disabled config (`enabled: false`) touches nothing: no hook call, no buffered turn, no session,
   no export, no observer, and `flush` answers an empty `TeamMemoryFlush`.
 - `tracing` only; no `println!`/`eprintln!`; log target `openjiuwen_agent_teams::memory`.
-- Files around ≤1000 lines; `wiring.rs` (1281 lines, about two thirds inline tests) is the one justified exception: it owns a single contract (the per-team handle), and splitting the tests out would scatter the lifecycle ordering assertions from the code they pin.
+- Files around ≤1000 lines; `wiring.rs` (1352 lines, about two thirds inline tests) is the one justified exception: it owns a single contract (the per-team handle), and splitting the tests out would scatter the lifecycle ordering assertions from the code they pin.
+- Test-only code lives in `test_support.rs` (the failing store and its flush suite), so a new failure-path test does not grow `wiring.rs`.
 
 ## Routing Table
 
 - `./config.rs` → `MEMORY_METADATA_KEY`, `MemoryConfig` (with `trace`, the skipped `otel_sink` and
   the skipped caller-supplied `observer`), `MemoryStoreConfig`, `MemoryExtractorKind`, `validate()`
   and the tolerant `metadata["memory"]` parser `memory_config`
-- `./trace.rs` → `observer_for` and `facade`: the one place the team-memory observer is chosen and
-  attached to the facade (`enabled` → `trace` → supplied observer → built-in bridge), plus the
-  `OtelSpanSink` re-export and its uninhabited stand-in
+- `./trace.rs` → `observer_for`, `facade` and `facade_over`: the one place the team-memory observer is
+  chosen and attached to the facade (`enabled` → `trace` → supplied observer → built-in bridge), plus
+  the `OtelSpanSink` re-export and its uninhabited stand-in
 - `./wiring.rs` → `TeamMemoryWiring` and `TEAM_MEMORY_FILE`: facade + hooks + per-member toolkit
-  cache + lifecycle pass-throughs + `TEAM_MEMORY.md` export/import + the observer handle and its
-  `open_with_observer` constructor
+  cache + lifecycle pass-throughs (buffering `on_turn`, the batched extracting `flush`) +
+  `TEAM_MEMORY.md` export/import + the observer handle, `open_with_observer`, and the `#[cfg(test)]`
+  `with_store_for_tests` constructor over an injected store
 - `./tools.rs` → `TeamMemoryTool` and `team_memory_tools`: the four `MemberMemoryToolkit` tools as
   `openjiuwen_foundation::tool::Tool` handles
+- `./test_support.rs` → `#[cfg(test)]` `FailingTeamMemoryStore` (+ `SCRIPTED_FAILURE`) and the flush
+  failure/retry suite over `TeamMemoryWiring::with_store_for_tests`
 
 ## Notes for Agents
 
@@ -225,6 +261,19 @@ Caveats, stated because they are visible from this node:
   cancellation token; callers that need a deadline drive `hooks()` directly.
 - `on_turn_message(from, to, content, at)` is the `TeamTurn` shorthand; `to: None` addresses the
   whole team.
+- `on_turn` and `on_turn_message` only buffer: nothing is extracted and no record is written until
+  `flush()`, which runs the extractor over the whole buffer, writes it in one batch with
+  deterministic ids, and clears the buffer. `flush` is the only extraction point in this node.
+- A failed `flush` returns the engine's error unchanged (`Error::Memory` for a store failure,
+  `Error::Validation` for an invalid extracted record) and keeps the buffer, so a retry after the
+  cause clears converges on the same rows instead of duplicating them; a third `flush` after a
+  successful retry answers an empty `TeamMemoryFlush` and stores nothing.
+- Failure-path seam: `TeamMemoryWiring::with_store_for_tests` (`#[cfg(test)]`) builds the wiring over
+  any `Arc<dyn TeamMemoryStore>` through the same `assemble` path (same validation, same
+  `trace::facade_over` observer choice, same document import), and `FailingTeamMemoryStore` armed
+  makes `upsert` answer `Error::Memory("scripted store failure")` while every read keeps working.
+  The failure is store-level (`upsert`), not extractor-level: the rule extractor succeeds and the
+  batch write refuses.
 - The wiring installs no `TeamMemoryObserver` of its own beyond the trace bridge; a caller that
   builds its own `TeamMemory` keeps the observer seam available, and a caller that wants its own
   observer in a wiring supplies `MemoryConfig::observer` or uses `open_with_observer`.

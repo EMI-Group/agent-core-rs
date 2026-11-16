@@ -450,10 +450,13 @@ async fn document_store_connect_validates_pings_and_reports_unreachable_hosts() 
     );
     strict.shutdown().await;
 
-    // TLS stays deferred.
-    let error = RedisDocumentStore::connect(url_config("rediss://localhost:6379"))
+    // `rediss://` performs a real TLS handshake, so a plain RESP peer fails it.
+    let plain = FakeRedis::start().await;
+    let error = RedisDocumentStore::connect(url_config(&format!("rediss://{}/0", plain.addr())))
         .await
         .err()
-        .expect("TLS is not supported");
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
+        .expect("a plain listener cannot complete a TLS handshake");
+    assert_eq!(error.kind(), ErrorKind::Transport);
+    assert!(error.message().contains("TLS"), "unexpected: {error}");
+    plain.shutdown().await;
 }

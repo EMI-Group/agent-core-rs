@@ -12,19 +12,39 @@
 //! 1. Normalizes the item type: the sources' [`ItemSources::item_type`](crate::retrieval::build::scanner::ItemSources::item_type) wins, the
 //!    configuration's `item_type` is the fallback, and anything but `skill`/`plugin` is a
 //!    validation error.
-//! 2. Groups the scanned items ([`group_items`](crate::retrieval::build::grouping::group_items))
-//!    and assembles the node list
+//! 2. Places the scanned items. The [`build`](crate::retrieval::build::workflows::IndexBuilder::build)
+//!    path calls the synchronous [`group_items`](crate::retrieval::build::grouping::group_items),
+//!    which is where a strategy that needs a model or an embedder stays a typed
+//!    deferral; [`build_with_runtime`](crate::retrieval::build::workflows::IndexBuilder::build_with_runtime)
+//!    awaits [`group_items_with`](crate::retrieval::build::grouping::group_items_with) over
+//!    the caller's [`GroupingRuntime`](crate::retrieval::build::grouping::GroupingRuntime), so
+//!    `llm_grouping`, `faiss_kmeans` and `kmeans` place items there. Either way the
+//!    provenance of the placements is reported as
+//!    [`BuildReport::grouping_provenance`](crate::retrieval::build::workflows::BuildReport::grouping_provenance).
+//! 3. Optionally shapes those placements with one of the model stages
+//!    ([`BuildOptions::shaping`](crate::retrieval::build::workflows::BuildOptions::shaping)):
+//!    `one_shot`, `expansion` and `equivalence` run *before* assembly through
+//!    [`apply`](crate::retrieval::build::tree::shaping::apply), and `repair` runs *after* the
+//!    schema check below. `None` — the default — calls no stage at all.
+//! 4. Assembles the node list
 //!    ([`build_nodes`](crate::retrieval::build::tree::build_nodes)) — the deterministic,
 //!    model-free tree of Python's fallback path.
-//! 3. Checks the tree ([`TreeSchema::validate`](crate::retrieval::build::schema::TreeSchema::validate)).
+//! 5. Checks the tree ([`TreeSchema::validate`](crate::retrieval::build::schema::TreeSchema::validate)).
 //!    A `blank_cid`, `duplicate_cid`, `missing_parent`, `cycle`, `excessive_depth` or
 //!    `too_many_nodes` aborts the build before a byte is written, because each of them
 //!    describes a tree this builder must not publish; every other code (`excessive_fan_out`,
 //!    `blank_label`, `missing_worker_id`) is advisory — kept in the report and logged.
-//! 4. Derives one catalog record per leaf that carries a `worker_id`, joined to its scanned
+//!    With [`ShapingMode::Repair`](crate::retrieval::build::tree::shaping::ShapingMode::Repair)
+//!    configured, a fatal finding is instead handed to
+//!    [`repair`](crate::retrieval::build::tree::shaping::repair::repair) and the repaired node
+//!    list is re-validated: a tree that passes is published, one that still fails
+//!    aborts in the same `Error::Validation` shape as an un-repaired build.
+//! 6. Derives one catalog record per leaf that carries a `worker_id`, joined to its scanned
 //!    item by that id ([`catalog_record`](crate::retrieval::build::catalog::catalog_record)).
-//! 5. Publishes the three artifacts atomically through
-//!    [`write_index`](crate::retrieval::artifacts::write_index).
+//! 7. Publishes the three artifacts atomically through
+//!    [`write_index`](crate::retrieval::artifacts::write_index) and, only when
+//!    [`BuildOptions::write_html`](crate::retrieval::build::workflows::BuildOptions::write_html)
+//!    asks for it, the opt-in `tree_index.html` visualizer after them.
 //!
 //! # Incremental patches
 //!
@@ -37,6 +57,17 @@
 //! [`rebuild_subtree`](crate::retrieval::build::workflows::IndexBuilder::rebuild_subtree)
 //! re-derives one branch from the records below it. Each patch reports what it changed and
 //! whether the change was large enough that a full rebuild is worthwhile.
+//! [`add_with_runtime`](crate::retrieval::build::workflows::IndexBuilder::add_with_runtime)
+//! is the runtime counterpart of `add`, and both share one placement path.
+//!
+//! # The opt-in visualizer
+//!
+//! `tree_index.html` sits outside the three-artifact contract: a build writes it only when
+//! [`BuildOptions::write_html`](crate::retrieval::build::workflows::BuildOptions::write_html)
+//! is set, it is written after the three artifacts are in place, and it is replaced
+//! atomically through a temp sibling plus rename, so a failed render cannot corrupt a
+//! published index. No search path reads it back, and with the flag off the published bytes
+//! are exactly the three files.
 //!
 //! # Deviations from the Python workflows
 //!
@@ -48,8 +79,17 @@
 //! - A subtree rebuild is deterministic instead of model-driven: Python asks an LLM to
 //!   repair the branch, the port re-runs the grouping and assembly stages over the branch's
 //!   own catalog records, so the result is reproducible offline.
-//! - Python renders `tree_index.html` for humans; the port writes only the three artifacts
-//!   its retrieval runtime reads.
+//! - A patch is placement-only: the shaping stages run on a full build, never on
+//!   [`add`](crate::retrieval::build::workflows::IndexBuilder::add) or
+//!   [`add_with_runtime`](crate::retrieval::build::workflows::IndexBuilder::add_with_runtime),
+//!   so a patch changes the items it is given and nothing else.
+//! - A repair is reported coarsely:
+//!   [`repair`](crate::retrieval::build::tree::shaping::repair::repair) answers only the
+//!   repaired node list, so
+//!   [`BuildReport::shaping_provenance`](crate::retrieval::build::workflows::BuildReport::shaping_provenance)
+//!   is `Model` when a model was supplied with a non-zero call budget and
+//!   `DeterministicFallback` otherwise, without knowing which of the two paths produced the
+//!   accepted tree.
 //! - No clock is read and no map iteration order reaches an output: nodes sort by
 //!   `(depth, cid)` and records by `cid`.
 
@@ -63,11 +103,14 @@ use tokio::fs;
 use tracing::{debug, warn};
 
 use crate::error::{validation, Error, Result};
+use crate::llm::CompletionModel;
 use crate::retrieval::artifacts::{catalog_content_hash, load_index, parse_tree_yaml, write_index};
 use crate::retrieval::build::catalog::{
     catalog_record, records_for_nodes, rekey_record, sort_records, sorted_records,
 };
-use crate::retrieval::build::grouping::{self, GroupingConfig};
+use crate::retrieval::build::grouping::{
+    self, GroupAssignment, GroupingConfig, GroupingProvenance, GroupingRuntime,
+};
 use crate::retrieval::build::presets::TreePreset;
 use crate::retrieval::build::scanner::{
     self, ItemSources, SourceDiagnostic, SourceItem, JSONL_PATH_PREFIX,
@@ -77,6 +120,9 @@ use crate::retrieval::build::schema::{
     DIAGNOSTIC_EXCESSIVE_DEPTH, DIAGNOSTIC_MISSING_PARENT, DIAGNOSTIC_TOO_MANY_NODES,
 };
 use crate::retrieval::build::tree;
+use crate::retrieval::build::tree::shaping::repair::repair as repair_tree;
+use crate::retrieval::build::tree::shaping::{self, ShapingConfig, ShapingMode, ShapingProvenance};
+use crate::retrieval::build::tree::visualizer;
 use crate::retrieval::build::tree_text::{slug_term, sort_nodes};
 use crate::retrieval::types::{
     CatalogRecord, IndexManifest, IndexNode, RetrieverItem, DEFAULT_ITEM_TYPE, META_CONTENT,
@@ -107,11 +153,28 @@ const FATAL_TREE_CODES: [&str; 6] = [
     DIAGNOSTIC_TOO_MANY_NODES,
 ];
 
+/// Opt-in extras beyond the three-artifact publish contract.
+///
+/// The default — no visualizer, [`ShapingMode::None`] — keeps a build to the deterministic
+/// stages of the three artifacts, so a caller that asks for nothing publishes exactly what
+/// it published before either option existed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", default)]
+pub struct BuildOptions {
+    /// Also render `tree_index.html` next to the three artifacts.
+    ///
+    /// The document is derived from the published node list and catalog, no reader opens
+    /// it, and it is written after the three artifacts, so this flag only adds a file.
+    pub write_html: bool,
+    /// How the LLM tree-shaping stage refines the deterministic placements.
+    pub shaping: ShapingConfig,
+}
+
 /// Build-time configuration: the offline knobs of Python's `BuildConfig`.
 ///
 /// Python's full configuration also carries the LLM client, model, timeouts, worker counts
-/// and the S3 upload target; the port keeps the four settings its deterministic stages read
-/// plus the optional curated preset.
+/// and the S3 upload target; the port keeps the four settings its deterministic stages read,
+/// the optional curated preset and the opt-in extras [`BuildOptions`] collects.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]
 pub struct BuildConfig {
@@ -125,11 +188,13 @@ pub struct BuildConfig {
     pub escalation_ratio: f64,
     /// A caller-supplied curated taxonomy; its paths win over the derived grouping paths.
     pub preset: Option<TreePreset>,
+    /// The opt-in extras: the visualizer and the tree-shaping stage.
+    pub options: BuildOptions,
 }
 
 impl Default for BuildConfig {
     /// Returns a skill build with the default grouping, the default schema, a
-    /// [`DEFAULT_ESCALATION_RATIO`] escalation and no preset.
+    /// [`DEFAULT_ESCALATION_RATIO`] escalation, no preset and no opt-in extra.
     fn default() -> Self {
         Self {
             grouping: GroupingConfig::default(),
@@ -137,6 +202,7 @@ impl Default for BuildConfig {
             item_type: DEFAULT_ITEM_TYPE.to_string(),
             escalation_ratio: DEFAULT_ESCALATION_RATIO,
             preset: None,
+            options: BuildOptions::default(),
         }
     }
 }
@@ -180,6 +246,22 @@ impl BuildConfig {
     #[must_use]
     pub fn with_preset(mut self, preset: TreePreset) -> Self {
         self.preset = Some(preset);
+        self
+    }
+
+    /// Replaces the opt-in extras: the visualizer flag and the shaping stage.
+    #[must_use]
+    pub fn with_options(mut self, options: BuildOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Turns the `tree_index.html` visualizer on or off.
+    ///
+    /// The rest of [`BuildConfig::options`] — the shaping configuration — is kept.
+    #[must_use]
+    pub fn with_html(mut self, write_html: bool) -> Self {
+        self.options.write_html = write_html;
         self
     }
 
@@ -261,6 +343,12 @@ pub struct BuildReport {
     pub diagnostics: Vec<SourceDiagnostic>,
     /// The advisory schema findings; a fatal one aborted the build instead.
     pub tree_diagnostics: Vec<TreeDiagnostic>,
+    /// How the placements were derived: the rule, the embedder, the model or a fallback.
+    pub grouping_provenance: GroupingProvenance,
+    /// Where the shaping stage's placements came from; `Skipped` when it never ran.
+    pub shaping_provenance: ShapingProvenance,
+    /// Whether the build also rendered `tree_index.html` beside the three artifacts.
+    pub html_written: bool,
 }
 
 /// What one incremental patch changed.
@@ -323,12 +411,17 @@ impl IndexBuilder {
         }
     }
 
-    /// Runs a deterministic full build and publishes it as [`MODE_FULL`].
+    /// Runs a full build and publishes it as [`MODE_FULL`].
     ///
     /// The item type comes from the sources, falling back to `config`; the effective
-    /// grouping places every item; the assembled tree is checked before anything is
-    /// written; and one catalog record per leaf carrying a `worker_id` is derived from the
-    /// item with that id.
+    /// grouping places every item; the optional shaping stage refines those placements; the
+    /// assembled tree is checked before anything is written; and one catalog record per leaf
+    /// carrying a `worker_id` is derived from the item with that id.
+    ///
+    /// Placement runs the *synchronous* grouping path, which is where the deferral of the
+    /// three runtime strategies lives: `llm_grouping`, `faiss_kmeans` and `kmeans` fail with
+    /// [`Error::Unsupported`] here instead of silently degrading to the deterministic rule.
+    /// Use [`IndexBuilder::build_with_runtime`] to run them.
     ///
     /// # Errors
     ///
@@ -339,6 +432,45 @@ impl IndexBuilder {
         sources: ItemSources,
         output_dir: impl AsRef<Path>,
         config: BuildConfig,
+    ) -> Result<BuildReport> {
+        Self::run(sources, output_dir, config, None).await
+    }
+
+    /// Runs a full build whose placement and shaping stages may use `runtime`.
+    ///
+    /// [`IndexBuilder::build`] with a [`GroupingRuntime`]: the placement stage awaits
+    /// [`group_items_with`](crate::retrieval::build::grouping::group_items_with), so the
+    /// runtime strategies (`llm_grouping`, `faiss_kmeans`, `kmeans`) place the items, and
+    /// the same runtime supplies the completion model the
+    /// [`BuildOptions::shaping`] stage asks. A rule strategy still places items exactly as it
+    /// does in [`IndexBuilder::build`], and the runtime's fallback mode decides whether a
+    /// missing or failing model degrades to the deterministic rule or surfaces an error.
+    ///
+    /// # Errors
+    ///
+    /// The same failures as [`IndexBuilder::build`], plus the runtime strategy's own errors:
+    /// [`Error::Config`] for a missing model or embedder under
+    /// [`FallbackMode::Error`](crate::llm::FallbackMode::Error), the model's
+    /// [`Error::Llm`], and the shaping stage's errors — a repair that cannot fix the tree is
+    /// [`Error::Validation`] naming [`TREE_INDEX_FILENAME`].
+    pub async fn build_with_runtime(
+        sources: ItemSources,
+        output_dir: impl AsRef<Path>,
+        config: BuildConfig,
+        runtime: &GroupingRuntime,
+    ) -> Result<BuildReport> {
+        Self::run(sources, output_dir, config, Some(runtime)).await
+    }
+
+    /// The one full-build path both public entry points share.
+    ///
+    /// `runtime: None` keeps the synchronous placement path (and its typed deferral);
+    /// `runtime: Some` awaits the runtime strategies and supplies the shaping model.
+    async fn run(
+        sources: ItemSources,
+        output_dir: impl AsRef<Path>,
+        config: BuildConfig,
+        runtime: Option<&GroupingRuntime>,
     ) -> Result<BuildReport> {
         config.validate()?;
         let ItemSources {
@@ -353,12 +485,52 @@ impl IndexBuilder {
             tree_diagnostics.extend(check_tree(config.schema.validate_preset(preset))?);
         }
         let grouping = config.effective_grouping();
-        let assignments = grouping::group_items(&items, &grouping)?;
-        let nodes = tree::build_nodes(&items, &assignments, &grouping.root_segment)?;
-        tree_diagnostics.extend(check_tree(config.schema.validate(&nodes))?);
+        let (mut assignments, grouping_provenance) =
+            Self::place(&items, &grouping, runtime).await?;
+        let shaping = &config.options.shaping;
+        let model = runtime.and_then(GroupingRuntime::model);
+        let mut shaping_provenance = ShapingProvenance::Skipped;
+        // `Repair` refuses to run before assembly: it needs the node list and the schema
+        // findings, so it runs below instead.
+        if matches!(
+            shaping.mode,
+            ShapingMode::OneShot | ShapingMode::Expansion | ShapingMode::Equivalence
+        ) {
+            let outcome = shaping::apply(
+                shaping.mode,
+                &items,
+                &assignments,
+                &grouping,
+                shaping,
+                model,
+            )
+            .await?;
+            assignments = outcome.assignments;
+            shaping_provenance = outcome.provenance;
+        }
+        let mut nodes = tree::build_nodes(&items, &assignments, &grouping.root_segment)?;
+        let findings = config.schema.validate(&nodes);
+        let fatal = findings
+            .iter()
+            .any(|diagnostic| FATAL_TREE_CODES.contains(&diagnostic.code.as_str()));
+        if fatal && shaping.mode == ShapingMode::Repair {
+            nodes = repair_tree(&nodes, &findings, &config.schema, shaping, model)
+                .await
+                .map_err(|error| {
+                    validation(
+                        TREE_INDEX_FILENAME,
+                        format!("tree shaping repair failed: {error}"),
+                    )
+                })?;
+            shaping_provenance = repair_provenance(model, shaping);
+            tree_diagnostics.extend(check_tree(config.schema.validate(&nodes))?);
+        } else {
+            tree_diagnostics.extend(check_tree(findings)?);
+        }
         let records = records_for_nodes(&nodes, &items);
 
         let output_dir = output_dir.as_ref().to_path_buf();
+        let html_written = config.options.write_html;
         let builder = Self {
             nodes,
             records,
@@ -375,7 +547,30 @@ impl IndexBuilder {
             manifest,
             diagnostics,
             tree_diagnostics,
+            grouping_provenance,
+            shaping_provenance,
+            html_written,
         })
+    }
+
+    /// Places `items` through the synchronous rule or through `runtime`, with provenance.
+    ///
+    /// `None` is [`group_items`](crate::retrieval::build::grouping::group_items): the rule
+    /// strategies place the items and the runtime strategies keep their typed deferral.
+    /// `Some` is [`group_items_with`](crate::retrieval::build::grouping::group_items_with).
+    async fn place(
+        items: &[SourceItem],
+        grouping: &GroupingConfig,
+        runtime: Option<&GroupingRuntime>,
+    ) -> Result<(Vec<GroupAssignment>, GroupingProvenance)> {
+        let Some(runtime) = runtime else {
+            return Ok((
+                grouping::group_items(items, grouping)?,
+                GroupingProvenance::Rule,
+            ));
+        };
+        let outcome = grouping::group_items_with(items, grouping, runtime).await?;
+        Ok((outcome.assignments, outcome.provenance))
     }
 
     /// Hydrates a builder from an already published index directory.
@@ -463,6 +658,8 @@ impl IndexBuilder {
     /// A patch is all or nothing: every item is placed with the grouping stage *before*
     /// the first node or record is touched, so a strategy that cannot run offline leaves
     /// the builder exactly as it was instead of dropping the item it failed on.
+    /// Placement runs the synchronous grouping path, so a runtime strategy keeps its typed
+    /// [`Error::Unsupported`] here; use [`IndexBuilder::add_with_runtime`] for those.
     ///
     /// The item paths of `sources` are appended to the builder's inventory with
     /// order-preserving dedupe.
@@ -471,6 +668,38 @@ impl IndexBuilder {
     ///
     /// [`Error::Validation`] for an invalid configuration, and the grouping stage's errors.
     pub async fn add(&mut self, sources: &ItemSources) -> Result<IncrementalReport> {
+        self.patch(sources, None).await
+    }
+
+    /// Adds or replaces items, placing every one of them through `runtime`.
+    ///
+    /// [`IndexBuilder::add`] with a [`GroupingRuntime`]: each item is placed with
+    /// [`group_items_with`](crate::retrieval::build::grouping::group_items_with), so the
+    /// runtime strategies work per item. The patch stays all-or-nothing — every item is
+    /// placed before the first node or record is touched — and it is placement-only: the
+    /// shaping stage runs on a full build, never on a patch.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Validation`] for an invalid configuration, and the runtime strategy's
+    /// placement errors (see [`IndexBuilder::build_with_runtime`]).
+    pub async fn add_with_runtime(
+        &mut self,
+        sources: &ItemSources,
+        runtime: &GroupingRuntime,
+    ) -> Result<IncrementalReport> {
+        self.patch(sources, Some(runtime)).await
+    }
+
+    /// The one patch path both add entry points share.
+    ///
+    /// `runtime: None` keeps the synchronous placement path (and its typed deferral);
+    /// `runtime: Some` places each item through it.
+    async fn patch(
+        &mut self,
+        sources: &ItemSources,
+        runtime: Option<&GroupingRuntime>,
+    ) -> Result<IncrementalReport> {
         self.config.validate()?;
         let records_before = self.records.len();
         let grouping = self.config.effective_grouping();
@@ -485,7 +714,8 @@ impl IndexBuilder {
         // first; the mutations below cannot fail.
         let mut placements: Vec<(&SourceItem, Vec<String>)> = Vec::with_capacity(ordered.len());
         for item in ordered {
-            let assignments = grouping::group_items(std::slice::from_ref(item), &grouping)?;
+            let (assignments, _) =
+                Self::place(std::slice::from_ref(item), &grouping, runtime).await?;
             let path = assignments
                 .first()
                 .map_or_else(Vec::new, |assignment| assignment.path.clone());
@@ -702,6 +932,11 @@ impl IndexBuilder {
     /// validates the set before touching it, and replaces each file through a temp sibling
     /// plus rename, so a failed write leaves the previous index in place.
     ///
+    /// When [`BuildOptions::write_html`] is set, the `tree_index.html` visualizer is written
+    /// after those three files, through its own temp sibling plus rename; a failure there
+    /// propagates but cannot corrupt the index already in place, and with the flag off the
+    /// published bytes are exactly the three files.
+    ///
     /// # Errors
     ///
     /// [`Error::Validation`] for an invalid configuration, an unusable item type, or a
@@ -716,6 +951,15 @@ impl IndexBuilder {
         let mut manifest = self.manifest(mode);
         manifest.item_type = item_type;
         write_index(output_dir.as_ref(), &nodes, &records, &manifest).await?;
+        if self.config.options.write_html {
+            visualizer::write_tree_html(
+                output_dir.as_ref(),
+                &nodes,
+                &records,
+                &self.config.grouping.root_segment,
+            )
+            .await?;
+        }
         Ok(manifest)
     }
 
@@ -779,6 +1023,24 @@ fn check_tree(diagnostics: Vec<TreeDiagnostic>) -> Result<Vec<TreeDiagnostic>> {
         advisories.push(diagnostic);
     }
     Ok(advisories)
+}
+
+/// The provenance a post-assembly repair reports.
+///
+/// [`repair`](crate::retrieval::build::tree::shaping::repair::repair) answers only the
+/// repaired node list, so which of its two paths produced the accepted tree is not
+/// observable here: a model that was supplied together with a non-zero call budget is
+/// reported as [`ShapingProvenance::Model`], everything else as
+/// [`ShapingProvenance::DeterministicFallback`].
+fn repair_provenance(
+    model: Option<&dyn CompletionModel>,
+    shaping: &ShapingConfig,
+) -> ShapingProvenance {
+    if model.is_some() && shaping.max_calls > 0 {
+        ShapingProvenance::Model
+    } else {
+        ShapingProvenance::DeterministicFallback
+    }
 }
 
 /// The item type a build records: the sources' type when it names one, else `config`'s.
@@ -846,13 +1108,19 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
+    use std::sync::Arc;
+
+    use openjiuwen_retrieval::{HashEmbedding, StaticCompletionModel};
     use tempfile::tempdir;
 
     use super::*;
     use crate::error::ErrorKind;
+    use crate::llm::FallbackMode;
+    use crate::retrieval::build::grouping::GroupingStrategy;
     use crate::retrieval::build::presets::PresetNode;
     use crate::retrieval::types::{
         CatalogRecord, CATALOG_FILENAME, MANIFEST_FILENAME, MODE_INCREMENTAL, NODE_TYPE_BRANCH,
+        TREE_HTML_FILENAME,
     };
 
     fn item(worker_id: &str, name: &str, classification: &str) -> SourceItem {
@@ -1421,5 +1689,461 @@ mod tests {
             IndexBuilder::new(BuildConfig::default()).nodes(),
             &[] as &[IndexNode]
         );
+    }
+
+    /// A build with a runtime the k-means strategy needs clusters through the embedder.
+    #[tokio::test]
+    async fn build_with_runtime_clusters_with_kmeans_and_reports_embedding_provenance() {
+        let dir = tempdir().unwrap();
+        let config = BuildConfig::new().with_grouping(
+            GroupingConfig::default()
+                .with_strategy(GroupingStrategy::Kmeans)
+                .with_clusters(Some(2)),
+        );
+        let runtime = GroupingRuntime::new().with_embedding(Arc::new(HashEmbedding::new(8)));
+        let report = IndexBuilder::build_with_runtime(
+            sources(three_items()),
+            dir.path(),
+            config.clone(),
+            &runtime,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.grouping_provenance, GroupingProvenance::Embedding);
+        assert_eq!(report.record_count, 3, "every item keeps a record");
+        assert_eq!(
+            report.node_count, 6,
+            "the root, two cluster branches, three leaves"
+        );
+        assert_eq!(report.shaping_provenance, ShapingProvenance::Skipped);
+        assert!(!report.html_written);
+
+        let builder = IndexBuilder::open(dir.path(), config).await.unwrap();
+        let paths: BTreeSet<Vec<String>> = builder
+            .records()
+            .iter()
+            .map(|record| record.branch_path.clone())
+            .collect();
+        assert_eq!(paths.len(), 2, "two clusters cluster the items: {paths:?}");
+        assert!(
+            paths.iter().all(|path| path.len() == 2),
+            "a cluster is one branch below the root: {paths:?}"
+        );
+
+        let deterministic = tempdir().unwrap();
+        IndexBuilder::build(
+            sources(three_items()),
+            deterministic.path(),
+            BuildConfig::new(),
+        )
+        .await
+        .unwrap();
+        let reference = IndexBuilder::open(deterministic.path(), BuildConfig::new())
+            .await
+            .unwrap();
+        for record in builder.records() {
+            let expected = reference
+                .records()
+                .iter()
+                .find(|other| other.worker_id == record.worker_id)
+                .expect("the deterministic build indexed the same item");
+            assert_ne!(
+                record.cid, expected.cid,
+                "{} kept the deterministic leaf",
+                record.worker_id
+            );
+        }
+
+        let loaded = load_index(dir.path()).await.unwrap();
+        assert_eq!(loaded.records.len(), 3);
+        assert_eq!(loaded.manifest.count, 3);
+    }
+
+    /// A build with a model runtime places every item where the reply says.
+    #[tokio::test]
+    async fn build_with_runtime_llm_grouping_places_items_with_the_model() {
+        let dir = tempdir().unwrap();
+        let model = Arc::new(StaticCompletionModel::single(
+            r#"{"groups":[{"path":["tools"],"worker_ids":["DocRead","PdfFill","WebSearch"]}]}"#,
+        ));
+        let runtime = GroupingRuntime::new().with_model(model.clone());
+        let config = BuildConfig::new()
+            .with_grouping(GroupingConfig::default().with_strategy(GroupingStrategy::LlmGrouping));
+        let report = IndexBuilder::build_with_runtime(
+            sources(three_items()),
+            dir.path(),
+            config.clone(),
+            &runtime,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.grouping_provenance, GroupingProvenance::Model);
+        assert_eq!(report.record_count, 3);
+        assert_eq!(model.call_count(), 1, "one prompt places the inventory");
+
+        let builder = IndexBuilder::open(dir.path(), config).await.unwrap();
+        for record in builder.records() {
+            assert_eq!(
+                record.branch_path,
+                vec!["Skills".to_string(), "tools".to_string()],
+                "{}",
+                record.worker_id
+            );
+            assert!(record.cid.starts_with("Skills.tools."), "{}", record.cid);
+        }
+        assert!(cids(&builder).contains(&"Skills.tools".to_string()));
+    }
+
+    /// An unusable reply degrades to the deterministic placements under the default mode.
+    #[tokio::test]
+    async fn build_with_runtime_llm_grouping_falls_back_on_an_unusable_reply() {
+        let dir = tempdir().unwrap();
+        let model = Arc::new(StaticCompletionModel::single("not json"));
+        let runtime = GroupingRuntime::new().with_model(model.clone());
+        let config = BuildConfig::new()
+            .with_grouping(GroupingConfig::default().with_strategy(GroupingStrategy::LlmGrouping));
+        let report =
+            IndexBuilder::build_with_runtime(sources(three_items()), dir.path(), config, &runtime)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            report.grouping_provenance,
+            GroupingProvenance::DeterministicFallback
+        );
+        assert_eq!(model.call_count(), 1, "the model was asked once");
+
+        let deterministic = tempdir().unwrap();
+        IndexBuilder::build(
+            sources(three_items()),
+            deterministic.path(),
+            BuildConfig::new(),
+        )
+        .await
+        .unwrap();
+        for name in [TREE_INDEX_FILENAME, CATALOG_FILENAME, MANIFEST_FILENAME] {
+            let fallback = fs::read(dir.path().join(name)).await.unwrap();
+            let reference = fs::read(deterministic.path().join(name)).await.unwrap();
+            assert_eq!(
+                fallback, reference,
+                "{name} differs from the deterministic build"
+            );
+        }
+    }
+
+    /// `build` keeps the synchronous placement path, so a runtime strategy stays deferred.
+    #[tokio::test]
+    async fn build_with_a_runtime_strategy_still_reports_the_sync_deferral() {
+        for (strategy, feature) in [
+            (GroupingStrategy::Kmeans, "k-means tree grouping"),
+            (GroupingStrategy::FaissKmeans, "faiss k-means tree grouping"),
+            (GroupingStrategy::LlmGrouping, "LLM-guided tree grouping"),
+        ] {
+            let dir = tempdir().unwrap();
+            let config =
+                BuildConfig::new().with_grouping(GroupingConfig::default().with_strategy(strategy));
+            let error = IndexBuilder::build(sources(three_items()), dir.path(), config)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{strategy:?}");
+            let message = error.message();
+            assert!(message.contains(feature), "{strategy:?}: {message}");
+            assert!(message.contains("deferred"), "{strategy:?}: {message}");
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                0,
+                "{strategy:?} published an artifact"
+            );
+        }
+    }
+
+    /// A patch places its item through the runtime, under a k-means index.
+    #[tokio::test]
+    async fn add_with_runtime_places_an_item_under_a_kmeans_index() {
+        let dir = tempdir().unwrap();
+        let config = BuildConfig::new()
+            .with_grouping(GroupingConfig::default().with_strategy(GroupingStrategy::Kmeans));
+        let runtime = GroupingRuntime::new().with_embedding(Arc::new(HashEmbedding::new(8)));
+        IndexBuilder::build_with_runtime(
+            sources(three_items()),
+            dir.path(),
+            config.clone(),
+            &runtime,
+        )
+        .await
+        .unwrap();
+        let mut builder = IndexBuilder::open(dir.path(), config).await.unwrap();
+
+        let patch = builder
+            .add_with_runtime(
+                &sources(vec![item("ImageGen", "Image Generator", "media/images")]),
+                &runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(patch.added, vec!["ImageGen"]);
+        assert!(patch.escalated, "one of three records exceeds 0.25");
+        assert_eq!(builder.records().len(), 4);
+        assert_eq!(
+            builder
+                .nodes()
+                .iter()
+                .filter(|node| node.is_leaf() && node.worker_id == "ImageGen")
+                .count(),
+            1,
+            "exactly one leaf carries the new worker id"
+        );
+        assert_eq!(
+            builder
+                .records()
+                .iter()
+                .filter(|record| record.worker_id == "ImageGen")
+                .count(),
+            1
+        );
+
+        builder.write(dir.path(), MODE_INCREMENTAL).await.unwrap();
+        let loaded = load_index(dir.path()).await.unwrap();
+        assert_eq!(loaded.records.len(), 4);
+        assert!(loaded
+            .records
+            .iter()
+            .any(|record| record.worker_id == "ImageGen"));
+    }
+
+    /// A pre-assembly shaping stage replaces the deterministic placements.
+    #[tokio::test]
+    async fn shaping_one_shot_changes_the_placements_and_keeps_every_worker_id() {
+        let dir = tempdir().unwrap();
+        let model = Arc::new(StaticCompletionModel::single(
+            r#"{"assignments":[
+                {"worker_id":"DocRead","path":["reading"]},
+                {"worker_id":"PdfFill","path":["reading"]},
+                {"worker_id":"WebSearch","path":["web","lookup"]}
+            ]}"#,
+        ));
+        let runtime = GroupingRuntime::new().with_model(model);
+        let config = BuildConfig::new().with_options(BuildOptions {
+            write_html: false,
+            shaping: ShapingConfig::new().with_mode(ShapingMode::OneShot),
+        });
+        let report = IndexBuilder::build_with_runtime(
+            sources(three_items()),
+            dir.path(),
+            config.clone(),
+            &runtime,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.shaping_provenance, ShapingProvenance::Model);
+        assert_eq!(report.grouping_provenance, GroupingProvenance::Rule);
+        assert_eq!(report.record_count, 3);
+
+        let builder = IndexBuilder::open(dir.path(), config).await.unwrap();
+        let node_cids = cids(&builder);
+        assert!(
+            node_cids.contains(&"Skills.reading".to_string()),
+            "{node_cids:?}"
+        );
+        assert!(
+            node_cids.contains(&"Skills.web.lookup".to_string()),
+            "{node_cids:?}"
+        );
+        let workers: BTreeSet<String> = builder
+            .records()
+            .iter()
+            .map(|record| record.worker_id.clone())
+            .collect();
+        assert_eq!(
+            workers,
+            ["DocRead", "PdfFill", "WebSearch"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<BTreeSet<String>>(),
+            "shaping must never lose an item"
+        );
+    }
+
+    /// The post-assembly repair path publishes a tree the schema had rejected.
+    #[tokio::test]
+    async fn shaping_repair_fixes_a_tree_the_schema_rejected() {
+        let schema = TreeSchema::new().with_max_depth(2);
+        let fatal = tempdir().unwrap();
+        let error = IndexBuilder::build(
+            sources(three_items()),
+            fatal.path(),
+            BuildConfig::new().with_schema(schema),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            ErrorKind::Validation,
+            "the unrepaired tree really is fatal: {}",
+            error.message()
+        );
+        assert!(error.message().contains(TREE_INDEX_FILENAME));
+
+        let dir = tempdir().unwrap();
+        let model = Arc::new(StaticCompletionModel::single(
+            r#"{"nodes":[
+                {"cid":"Skills","type":"branch"},
+                {"cid":"Skills.pdffill","type":"leaf","worker_id":"PdfFill"},
+                {"cid":"Skills.docread","type":"leaf","worker_id":"DocRead"},
+                {"cid":"Skills.websearch","type":"leaf","worker_id":"WebSearch"}
+            ]}"#,
+        ));
+        let runtime = GroupingRuntime::new().with_model(model);
+        let config = BuildConfig::new()
+            .with_schema(schema)
+            .with_options(BuildOptions {
+                write_html: false,
+                shaping: ShapingConfig::new().with_mode(ShapingMode::Repair),
+            });
+        let report = IndexBuilder::build_with_runtime(
+            sources(three_items()),
+            dir.path(),
+            config.clone(),
+            &runtime,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.shaping_provenance, ShapingProvenance::Model);
+        assert_eq!(report.record_count, 3);
+        let builder = IndexBuilder::open(dir.path(), config).await.unwrap();
+        assert!(
+            schema.validate(builder.nodes()).is_empty(),
+            "the published tree satisfies the same schema"
+        );
+        assert!(cids(&builder).contains(&"Skills.pdffill".to_string()));
+    }
+
+    /// A repair the model cannot perform aborts in the established validation shape.
+    #[tokio::test]
+    async fn shaping_repair_aborts_typed_when_the_model_cannot_fix_the_tree() {
+        let dir = tempdir().unwrap();
+        let model = Arc::new(StaticCompletionModel::single("not a JSON object"));
+        let runtime = GroupingRuntime::new().with_model(model);
+        let config = BuildConfig::new()
+            .with_schema(TreeSchema::new().with_max_depth(2))
+            .with_options(BuildOptions {
+                write_html: false,
+                shaping: ShapingConfig::new()
+                    .with_mode(ShapingMode::Repair)
+                    .with_fallback(FallbackMode::Error),
+            });
+        let error =
+            IndexBuilder::build_with_runtime(sources(three_items()), dir.path(), config, &runtime)
+                .await
+                .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(
+            error.message().contains(TREE_INDEX_FILENAME),
+            "{}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("tree shaping repair failed"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "a failed repair publishes nothing"
+        );
+    }
+
+    /// The visualizer is an opt-in extra next to an unchanged three-artifact set.
+    #[tokio::test]
+    async fn write_html_publishes_the_visualizer_beside_the_three_artifacts() {
+        let dir = tempdir().unwrap();
+        let report = IndexBuilder::build(
+            sources(three_items()),
+            dir.path(),
+            BuildConfig::new().with_html(true),
+        )
+        .await
+        .unwrap();
+        assert!(report.html_written);
+
+        let html = fs::read_to_string(dir.path().join(TREE_HTML_FILENAME))
+            .await
+            .unwrap();
+        assert!(html.contains("<!DOCTYPE html>"), "{html:.80}");
+        assert!(
+            html.contains("PDF Fill") && html.contains("Doc Reader"),
+            "the visualizer lists the items"
+        );
+        for name in [TREE_INDEX_FILENAME, CATALOG_FILENAME, MANIFEST_FILENAME] {
+            assert!(dir.path().join(name).exists(), "{name} was not written");
+        }
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(
+                !std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp")),
+                "{name} was left behind"
+            );
+        }
+
+        let plain = tempdir().unwrap();
+        let plain_report =
+            IndexBuilder::build(sources(three_items()), plain.path(), BuildConfig::new())
+                .await
+                .unwrap();
+        assert!(!plain_report.html_written);
+        for name in [TREE_INDEX_FILENAME, CATALOG_FILENAME, MANIFEST_FILENAME] {
+            let with_html = fs::read(dir.path().join(name)).await.unwrap();
+            let without_html = fs::read(plain.path().join(name)).await.unwrap();
+            assert_eq!(with_html, without_html, "{name} differs");
+        }
+    }
+
+    /// The default configuration publishes exactly the three artifacts.
+    #[tokio::test]
+    async fn write_html_false_publishes_exactly_the_three_artifacts() {
+        let dir = tempdir().unwrap();
+        let report = IndexBuilder::build(sources(three_items()), dir.path(), BuildConfig::new())
+            .await
+            .unwrap();
+        assert!(!report.html_written, "the visualizer is opt-in");
+
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![CATALOG_FILENAME, MANIFEST_FILENAME, TREE_INDEX_FILENAME]
+        );
+    }
+
+    /// The options round-trip through JSON and take their defaults when absent.
+    #[test]
+    fn build_options_round_trip_and_tolerate_a_missing_options_key() {
+        let config = BuildConfig::new().with_options(BuildOptions {
+            write_html: true,
+            shaping: ShapingConfig::new().with_mode(ShapingMode::OneShot),
+        });
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: BuildConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, config);
+        assert!(parsed.options.write_html);
+        assert_eq!(parsed.options.shaping.mode, ShapingMode::OneShot);
+
+        let legacy: BuildConfig =
+            serde_json::from_str(r#"{"item_type":"skill","escalation_ratio":0.25}"#).unwrap();
+        assert_eq!(legacy.options, BuildOptions::default());
+        assert!(!legacy.options.write_html);
+        assert_eq!(legacy.options.shaping.mode, ShapingMode::None);
     }
 }

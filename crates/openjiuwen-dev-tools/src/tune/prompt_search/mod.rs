@@ -3,8 +3,8 @@
 //! Ports the data/reward/memory half of
 //! `openjiuwen/dev_tools/tune/optimizer/prompt_search/`: the task and execution
 //! vocabulary, the composite reward model, convergence detection, the drift
-//! judge, the prompt memory, and the history compressor. The optimization loop
-//! itself (policy, environment, run log, service) lives above this node; this
+//! judge, the prompt memory, the history compressor, and the JSONL run log. The
+//! optimization loop itself (policy, environment) lives above this node; this
 //! module is the vocabulary and the deterministic mechanics it builds on.
 //!
 //! - [`PromptTaskSpec`]/[`PromptTaskCase`] describe what is optimized for, with
@@ -21,6 +21,10 @@
 //!   [`JsonlPromptMemory`] as the dependency-free default.
 //! - [`OptimizationHistory`] and [`HistoryCompressor`] turn iterations into a
 //!   budgeted textual "policy update".
+//! - [`RunLog`] records one [`RunLogRecord`] per optimization round, with
+//!   [`JsonlRunLog`] appending to a file, [`InMemoryRunLog`] keeping the records
+//!   for tests, and [`NullRunLog`] discarding; [`read_run_log`] and
+//!   [`read_run_log_limited`] read a log back tolerantly.
 //!
 //! Everything here is deterministic and offline: identifiers come from
 //! [`candidate_id`] (FNV-1a) instead of `uuid4`, timestamps are caller-supplied,
@@ -30,14 +34,13 @@
 //! model.
 //!
 //! This node supplies the vocabulary — models, rewards, convergence, drift,
-//! memory, and history — that the bounded optimization loop in
+//! memory, history, and the run-log sink — that the bounded optimization loop in
 //! `crate::tune::optimizer::search` drives.
 //! Still unported from Python (see the crate `CONTEXT.md`): `policy.py` (LLM
 //! multi-candidate generation), `environment.py` (LLM/callable environments),
-//! `run_log.py` (the JSONL run logger), and `service.py`, because candidate
-//! generation here is the deterministic mutation bank plus one model rewrite per
-//! round, candidates execute through the caller's `CaseEvaluator`, and there is
-//! no run-log sink.
+//! and `service.py`, because candidate generation here is the deterministic
+//! mutation bank plus one model rewrite per round and candidates execute
+//! through the caller's `CaseEvaluator`.
 //! Python's LLM-backed history buckets, embedding-backed memory, and LLM
 //! correctness judge are likewise replaced by deterministic equivalents, and a
 //! model answer never fails a run: an unusable answer degrades to a documented
@@ -69,6 +72,12 @@ mod history;
 mod memory;
 mod models;
 mod reward;
+mod run_log;
+
+pub use run_log::{
+    read_run_log, read_run_log_limited, InMemoryRunLog, JsonlRunLog, NullRunLog, RunLog,
+    RunLogRecord,
+};
 
 pub use convergence::{population_variance, ConvergenceDetector, ConvergenceState};
 pub use drift::{DriftJudge, LexicalDriftJudge, ModelDriftJudge, NullDriftJudge};

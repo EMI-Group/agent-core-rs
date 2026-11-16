@@ -9,8 +9,15 @@
 //! through the transports in `super::http`), while tests substitute
 //! `FakeMcpClient`. Connections are lazy — the first operation connects — and
 //! transport failures are retried with the reconnect policy below.
+//!
+//! Resource subscriptions (`resources/subscribe`) are optional in MCP, so they
+//! are defaulted on the trait ([`McpClient::subscribe_resource`],
+//! [`McpClient::unsubscribe_resource`], [`McpClient::supports_resource_subscriptions`])
+//! and gated on the capability the server negotiated in its `initialize` result;
+//! the gate and the request construction live in `client::subscription`.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,12 +33,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
 
-#[cfg(test)]
-use std::collections::HashMap;
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+mod subscription;
 
-use super::http::{ServerStreamState, SseTransport, StreamableHttpTransport};
+use super::http::sse::SseTransport;
+use super::http::{ServerStreamState, StreamableHttpTransport};
 use super::result::{normalize_call_tool_result, McpToolResult};
 
 /// The kind of transport used to reach an MCP server.
@@ -410,6 +415,56 @@ pub trait McpClient: Send + Sync + 'static {
         ))
     }
 
+    /// Subscribes to update notifications for the resource `uri`.
+    ///
+    /// Python parity: the `resources/subscribe` request of the MCP resource
+    /// specification. Subscribing is optional in MCP, so this is a defaulted
+    /// method: the default reports [`Error::Unsupported`] naming the transport,
+    /// and implementations that speak the request additionally report
+    /// [`McpClient::supports_resource_subscriptions`].
+    ///
+    /// The server must have advertised `capabilities.resources.subscribe` in its
+    /// `initialize` result; a server that did not is an [`Error::Unsupported`]
+    /// naming the missing capability, raised without sending the request.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] for a transport (or a server) without the
+    /// capability, [`Error::Validation`] for a blank URI, [`Error::Transport`]
+    /// when the session cannot be (re)established, and [`Error::Mcp`] when the
+    /// server rejects the request.
+    async fn subscribe_resource(&self, uri: &str) -> Result<()> {
+        let _ = uri;
+        Err(Error::unsupported(
+            "this MCP transport does not support resource subscriptions: no \
+             resources/subscribe request is implemented for it",
+        ))
+    }
+
+    /// Cancels the update subscription of the resource `uri`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`McpClient::subscribe_resource`]; the default reports
+    /// [`Error::Unsupported`] naming the transport.
+    async fn unsubscribe_resource(&self, uri: &str) -> Result<()> {
+        let _ = uri;
+        Err(Error::unsupported(
+            "this MCP transport does not support resource subscriptions: no \
+             resources/unsubscribe request is implemented for it",
+        ))
+    }
+
+    /// Reports whether the server negotiated the `resources/subscribe` capability.
+    ///
+    /// This is the negotiated capability, not a property of the transport: it is
+    /// `false` before a session is established, when the server's `initialize`
+    /// result does not advertise `capabilities.resources.subscribe`, and for
+    /// transports without the request (the default).
+    fn supports_resource_subscriptions(&self) -> bool {
+        false
+    }
+
     /// Drains the notifications the server pushed over its server-initiated stream.
     ///
     /// Notifications are removed by the call, oldest first, so each one is
@@ -540,6 +595,12 @@ pub struct RmcpClient {
     connection: Mutex<Option<RunningService<RoleClient, ()>>>,
     connect_lock: Mutex<()>,
     server_stream: parking_lot::Mutex<Option<ServerStreamState>>,
+    /// The `resources.subscribe` capability negotiated by the held session.
+    ///
+    /// Cached when the session is established because
+    /// [`McpClient::supports_resource_subscriptions`] is synchronous while the
+    /// session lives behind an async mutex; cleared whenever the session drops.
+    resource_subscriptions: AtomicBool,
 }
 
 impl RmcpClient {
@@ -572,6 +633,7 @@ impl RmcpClient {
             connection: Mutex::new(None),
             connect_lock: Mutex::new(()),
             server_stream: parking_lot::Mutex::new(None),
+            resource_subscriptions: AtomicBool::new(false),
         })
     }
 
@@ -584,7 +646,8 @@ impl RmcpClient {
     /// Builds and initializes a fresh `rmcp` session.
     ///
     /// Returns the session together with the server-initiated stream handle when
-    /// the transport has one (`streamable_http` only).
+    /// the transport has one (`streamable_http` only). The `initialize` result is
+    /// read here to record the negotiated `resources.subscribe` capability.
     async fn spawn_session(
         &self,
     ) -> Result<(RunningService<RoleClient, ()>, Option<ServerStreamState>)> {
@@ -594,37 +657,44 @@ impl RmcpClient {
             "connecting MCP server"
         );
         let failure = |error: String| Error::transport(format!("MCP connect failed: {error}"));
-        match self.config.client_type {
+        let established = match self.config.client_type {
             McpClientType::Stdio => {
                 let transport = build_stdio(&self.config)?;
-                let session = serve_client((), transport)
+                serve_client((), transport)
                     .await
-                    .map_err(|error| failure(error.to_string()))?;
-                Ok((session, None))
+                    .map_err(|error| failure(error.to_string()))
+                    .map(|session| (session, None))
             }
             McpClientType::StreamableHttp => {
                 let transport = StreamableHttpTransport::new(&self.config)?;
                 let state = transport.server_stream();
-                let session = serve_client((), transport)
+                serve_client((), transport)
                     .await
-                    .map_err(|error| failure(error.to_string()))?;
-                Ok((session, Some(state)))
+                    .map_err(|error| failure(error.to_string()))
+                    .map(|session| (session, Some(state)))
             }
             McpClientType::Sse => {
                 let transport = SseTransport::new(&self.config)?;
-                let session = serve_client((), transport)
+                serve_client((), transport)
                     .await
-                    .map_err(|error| failure(error.to_string()))?;
-                Ok((session, None))
+                    .map_err(|error| failure(error.to_string()))
+                    .map(|session| (session, None))
             }
             McpClientType::OpenApi | McpClientType::Playwright => {
                 Err(unsupported_transport(self.config.client_type))
             }
-        }
+        }?;
+        let (session, stream_state) = established;
+        self.resource_subscriptions.store(
+            subscription::advertises_subscriptions(session.peer().peer_info()),
+            Ordering::SeqCst,
+        );
+        Ok((session, stream_state))
     }
 
     /// Drops the held session, cancelling its worker and clearing the stream state.
     async fn drop_session(&self) {
+        self.resource_subscriptions.store(false, Ordering::SeqCst);
         let state = {
             let mut guard = self.server_stream.lock();
             guard.take()
@@ -803,6 +873,37 @@ impl McpClient for RmcpClient {
         .await
     }
 
+    async fn subscribe_resource(&self, uri: &str) -> Result<()> {
+        let params = subscription::subscribe_params(uri)?;
+        self.with_reconnect("subscribe_resource", |peer| {
+            let params = params.clone();
+            async move {
+                subscription::ensure_capability(peer.peer_info(), subscription::METHOD_SUBSCRIBE)?;
+                peer.subscribe(params).await.map_err(map_service_error)
+            }
+        })
+        .await
+    }
+
+    async fn unsubscribe_resource(&self, uri: &str) -> Result<()> {
+        let params = subscription::unsubscribe_params(uri)?;
+        self.with_reconnect("unsubscribe_resource", |peer| {
+            let params = params.clone();
+            async move {
+                subscription::ensure_capability(
+                    peer.peer_info(),
+                    subscription::METHOD_UNSUBSCRIBE,
+                )?;
+                peer.unsubscribe(params).await.map_err(map_service_error)
+            }
+        })
+        .await
+    }
+
+    fn supports_resource_subscriptions(&self) -> bool {
+        self.resource_subscriptions.load(Ordering::SeqCst)
+    }
+
     // Draining the buffer needs no I/O and never creates a session.
     #[allow(clippy::unused_async_trait_impl)]
     async fn take_notifications(&self) -> Result<Vec<McpNotification>> {
@@ -842,145 +943,8 @@ fn build_stdio(config: &McpServerConfig) -> Result<TokioChildProcess> {
     })
 }
 
-/// An in-memory [`McpClient`] for tests: records calls, returns scripted results.
 #[cfg(test)]
-#[derive(Debug, Default)]
-pub struct FakeMcpClient {
-    server_id: String,
-    server_name: String,
-    include_image_content: bool,
-    tools: Mutex<Vec<McpRemoteTool>>,
-    replies: Mutex<HashMap<String, FakeReply>>,
-    calls: Mutex<Vec<FakeCall>>,
-    connected: AtomicBool,
-    connect_count: AtomicUsize,
-}
-
-/// One recorded [`FakeMcpClient`] call.
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq)]
-pub struct FakeCall {
-    /// Tool that was called.
-    pub tool_name: String,
-    /// Arguments passed through.
-    pub arguments: Value,
-    /// Per-call deadline.
-    pub timeout: Option<Duration>,
-    /// Whether image blocks were requested as multimodal data.
-    pub include_image_content: bool,
-}
+mod fake;
 
 #[cfg(test)]
-#[derive(Debug, Clone)]
-enum FakeReply {
-    Result(McpToolResult),
-    Failure(String),
-}
-
-#[cfg(test)]
-impl FakeMcpClient {
-    /// Creates a fake client for `server_id`/`server_name` with no tools.
-    #[must_use]
-    pub fn new(server_id: impl Into<String>, server_name: impl Into<String>) -> Self {
-        Self {
-            server_id: server_id.into(),
-            server_name: server_name.into(),
-            include_image_content: false,
-            tools: Mutex::new(Vec::new()),
-            replies: Mutex::new(HashMap::new()),
-            calls: Mutex::new(Vec::new()),
-            connected: AtomicBool::new(false),
-            connect_count: AtomicUsize::new(0),
-        }
-    }
-
-    /// Sets the tools this client advertises.
-    pub async fn set_tools(&self, tools: Vec<McpRemoteTool>) {
-        *self.tools.lock().await = tools;
-    }
-
-    /// Scripts a successful reply for `tool_name`.
-    pub async fn set_result(&self, tool_name: &str, result: McpToolResult) {
-        self.replies
-            .lock()
-            .await
-            .insert(tool_name.to_owned(), FakeReply::Result(result));
-    }
-
-    /// Scripts a failure reply for `tool_name`.
-    pub async fn set_failure(&self, tool_name: &str, message: impl Into<String>) {
-        self.replies
-            .lock()
-            .await
-            .insert(tool_name.to_owned(), FakeReply::Failure(message.into()));
-    }
-
-    /// Returns the recorded calls, oldest first.
-    pub async fn calls(&self) -> Vec<FakeCall> {
-        self.calls.lock().await.clone()
-    }
-
-    /// Returns how many times [`McpClient::connect`] established a session.
-    #[must_use]
-    pub fn connect_count(&self) -> usize {
-        self.connect_count.load(Ordering::SeqCst)
-    }
-}
-
-#[cfg(test)]
-#[async_trait]
-impl McpClient for FakeMcpClient {
-    fn server_name(&self) -> &str {
-        &self.server_name
-    }
-
-    fn server_id(&self) -> &str {
-        &self.server_id
-    }
-
-    fn include_image_content(&self) -> bool {
-        self.include_image_content
-    }
-
-    async fn connect(&self) -> Result<()> {
-        if !self.connected.swap(true, Ordering::SeqCst) {
-            self.connect_count.fetch_add(1, Ordering::SeqCst);
-        }
-        Ok(())
-    }
-
-    async fn disconnect(&self) -> Result<()> {
-        self.connected.store(false, Ordering::SeqCst);
-        Ok(())
-    }
-
-    async fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
-    }
-
-    async fn list_tools(&self) -> Result<Vec<McpRemoteTool>> {
-        self.connect().await?;
-        Ok(self.tools.lock().await.clone())
-    }
-
-    async fn call_tool_with(
-        &self,
-        tool_name: &str,
-        arguments: Value,
-        timeout: Option<Duration>,
-        include_image_content: bool,
-    ) -> Result<McpToolResult> {
-        self.connect().await?;
-        self.calls.lock().await.push(FakeCall {
-            tool_name: tool_name.to_owned(),
-            arguments,
-            timeout,
-            include_image_content,
-        });
-        match self.replies.lock().await.get(tool_name).cloned() {
-            Some(FakeReply::Result(result)) => Ok(result),
-            Some(FakeReply::Failure(message)) => Err(Error::mcp(message)),
-            None => Ok(McpToolResult::success(Map::new())),
-        }
-    }
-}
+pub use fake::{FakeCall, FakeMcpClient, FakeSubscriptionAction, FakeSubscriptionCall};

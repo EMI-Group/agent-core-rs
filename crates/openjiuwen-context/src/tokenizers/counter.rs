@@ -20,6 +20,9 @@ use super::spec::ModelEncoding;
 /// Characters per token used by the counters when a BPE is unavailable.
 const BPE_FALLBACK_CHARS_PER_TOKEN: usize = 4;
 
+/// The note reported for an estimate whose strategy cannot name itself.
+const DEFAULT_ESTIMATION_NOTE: &str = "estimated by an approximate strategy";
+
 /// How a token measurement was produced.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,9 +52,57 @@ impl TokenizerSource {
             _ => None,
         }
     }
+
+    /// Whether this source is a model's own native tokenizer.
+    ///
+    /// Only [`TokenizerSource::NativeTokenizer`] counts with the vocabulary the
+    /// model was trained on; every other source approximates it, which is why
+    /// [`TokenMeasurement::estimated`] is `true` for all of them.
+    #[must_use]
+    pub fn is_native(self) -> bool {
+        matches!(self, Self::NativeTokenizer)
+    }
+
+    /// A human-readable explanation of why counts from this source are estimates.
+    ///
+    /// `None` for [`TokenizerSource::NativeTokenizer`], the only exact kind, so
+    /// a caller can publish the note next to a count without deciding whether
+    /// the count is exact.
+    #[must_use]
+    pub fn estimation_note(self) -> Option<&'static str> {
+        match self {
+            Self::NativeTokenizer => None,
+            Self::FamilyTokenizerFallback => Some(
+                "estimated with a sibling model's tokenizer; this model's own vocabulary is not loaded",
+            ),
+            Self::Tiktoken => {
+                Some("estimated with a tiktoken vocabulary rather than the model's own tokenizer")
+            }
+            Self::TiktokenFallback => Some(
+                "estimated with an assumed tiktoken vocabulary; the model's own vocabulary could not be resolved",
+            ),
+            Self::StringLengthFallback => {
+                Some("estimated from the string length at three characters per token")
+            }
+        }
+    }
 }
 
 /// The result of measuring one text or one conversation.
+///
+/// Two provenance facts ride every measurement, and they answer different
+/// questions:
+///
+/// - [`TokenMeasurement::estimated`] is the broad one: the count is `true` for
+///   every source but [`TokenizerSource::NativeTokenizer`], so a `tiktoken`
+///   vocabulary is an estimate even though it is exact for that vocabulary.
+/// - [`TokenMeasurement::fallback_reason`] is the narrow one: it names a
+///   degraded strategy (`tiktoken_unavailable`, `model_not_registered`,
+///   `native_tokenizer_unavailable`, ...), so it is empty when a known strategy
+///   was resolved and always set when a strategy had to stand in.
+/// - [`TokenMeasurement::estimation_note`] carries the prose explanation of the
+///   estimate, so the "why" survives even for a resolved estimator that has no
+///   `fallback_reason`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct TokenMeasurement {
@@ -60,6 +111,9 @@ pub struct TokenMeasurement {
     /// Which strategy produced the count.
     pub source: TokenizerSource,
     /// Whether the count is an estimate rather than a native tokenizer result.
+    ///
+    /// Any non-native source is an estimate, including an exact `tiktoken`
+    /// vocabulary of a known model.
     pub estimated: bool,
     /// The tokenizer used, when one can be named.
     pub tokenizer: Option<String>,
@@ -81,11 +135,27 @@ impl TokenMeasurement {
         Self {
             tokens,
             source,
-            estimated: source != TokenizerSource::NativeTokenizer,
+            estimated: !source.is_native(),
             tokenizer,
             model,
             fallback_reason,
         }
+    }
+
+    /// A human-readable explanation of why this count is an estimate.
+    ///
+    /// `None` when the count came from a native tokenizer; otherwise the prose
+    /// names the strategy behind the estimate.
+    #[must_use]
+    pub fn estimation_note(&self) -> Option<&'static str> {
+        if !self.estimated {
+            return None;
+        }
+        Some(
+            self.source
+                .estimation_note()
+                .unwrap_or(DEFAULT_ESTIMATION_NOTE),
+        )
     }
 }
 
@@ -278,12 +348,21 @@ impl ModelTokenCounter {
     }
 
     /// Whether the produced count is an estimate.
+    ///
+    /// All but a native artifact count as an estimate, so a resolved `tiktoken`
+    /// vocabulary is `true` here while [`ModelTokenCounter::fallback_reason`]
+    /// stays empty: nothing degraded, the vocabulary is simply not the model's
+    /// own tokenizer.
     #[must_use]
     pub fn estimated(&self) -> bool {
-        self.source() != TokenizerSource::NativeTokenizer
+        !self.source().is_native()
     }
 
     /// Why the count uses a fallback vocabulary, when it does.
+    ///
+    /// A vocabulary that cannot be built reports `tiktoken_unavailable` and the
+    /// count degrades to the four-characters-per-token estimate; an unresolvable
+    /// model reports `model_not_registered` and keeps `cl100k_base`.
     #[must_use]
     pub fn fallback_reason(&self) -> Option<&str> {
         if bpe_for(self.encoding).is_none() {
@@ -303,6 +382,22 @@ impl ModelTokenCounter {
     #[must_use]
     pub fn measure_messages(&self, messages: &[BaseMessage]) -> TokenMeasurement {
         self.measurement(self.count_messages(messages))
+    }
+
+    /// A human-readable explanation of why counts from this counter are estimates.
+    ///
+    /// `None` when the counter would count exactly, which no `tiktoken`-backed
+    /// counter ever does.
+    #[must_use]
+    pub fn estimation_note(&self) -> Option<&'static str> {
+        if !self.estimated() {
+            return None;
+        }
+        Some(
+            self.source()
+                .estimation_note()
+                .unwrap_or(DEFAULT_ESTIMATION_NOTE),
+        )
     }
 
     /// Builds a measurement for an already-computed count.
@@ -476,12 +571,20 @@ impl SelectedTokenizer {
     }
 
     /// Whether the produced count is an estimate.
+    ///
+    /// Every source but [`TokenizerSource::NativeTokenizer`] is an estimate; a
+    /// family vocabulary additionally carries a `fallback_reason` because it
+    /// belongs to a sibling model.
     #[must_use]
     pub fn estimated(&self) -> bool {
-        self.source() != TokenizerSource::NativeTokenizer
+        !self.source().is_native()
     }
 
     /// Why a fallback strategy was used, when one was.
+    ///
+    /// A `tiktoken` vocabulary that cannot be built reports
+    /// `tiktoken_unavailable` and the count degrades to the
+    /// three-characters-per-token estimate.
     #[must_use]
     pub fn fallback_reason(&self) -> Option<&str> {
         match &self.backing {
@@ -502,6 +605,22 @@ impl SelectedTokenizer {
     #[must_use]
     pub fn measure_messages(&self, messages: &[BaseMessage]) -> TokenMeasurement {
         self.measurement(self.count_messages(messages))
+    }
+
+    /// A human-readable explanation of why counts from this selection are estimates.
+    ///
+    /// `None` for a native artifact; otherwise the prose names the strategy the
+    /// selector fell back to.
+    #[must_use]
+    pub fn estimation_note(&self) -> Option<&'static str> {
+        if !self.estimated() {
+            return None;
+        }
+        Some(
+            self.source()
+                .estimation_note()
+                .unwrap_or(DEFAULT_ESTIMATION_NOTE),
+        )
     }
 
     /// Builds a measurement for an already-computed count.

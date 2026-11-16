@@ -36,8 +36,8 @@ opentelemetry_sdk = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
-rmcp = { workspace = true, optional = true }
-tokio-stream = { workspace = true, optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
+webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
 wiremock.workspace = true
@@ -55,9 +55,9 @@ otel = [
     "dep:tracing-subscriber",
     "dep:chrono",
 ]
-mcp = ["dep:rmcp", "dep:tokio-stream"]
+mcp = ["openjiuwen-foundation/mcp"]
 sqlite = ["dep:sqlx", "openjiuwen-foundation/sqlite", "openjiuwen-session/sqlite"]
-redis = []
+redis = ["dep:tokio-rustls", "dep:webpki-roots"]
 pulsar = []
 live-tests = []
 

@@ -17,7 +17,8 @@
 //! The `redis` backend stores every value as a one-byte kind tag followed by the
 //! payload so a [`KvValue`] keeps its `Text`/`Bytes` variant across a round trip;
 //! that is an intentional deviation from Python's `RedisStore`, which writes the
-//! bare payload. TLS (`rediss://`) and cluster slot routing stay deferred.
+//! bare payload. The Redis adapters accept `rediss://` (TLS) and
+//! `redis[s]+cluster://` (cluster redirection) through the crate's own `redis` client.
 //!
 //! Every factory takes a [`StoreBackend`] so callers can select a backend from
 //! configuration (see [`StoreBackend::from_json`]) and hand it to
@@ -32,14 +33,18 @@ use url::Url;
 pub mod elasticsearch;
 #[cfg(feature = "redis")]
 pub mod redis;
+#[cfg(feature = "sqlite")]
+pub mod sqlite_vector;
 pub use openjiuwen_core::foundation::store::{
     CollectionSchema, Document, DocumentStore, ElasticsearchConfig, ElasticsearchDocumentStore,
-    InMemoryDocumentStore, InMemoryKvStore, InMemoryVectorStore, KvStore, KvValue,
+    FieldSchema, InMemoryDocumentStore, InMemoryKvStore, InMemoryVectorStore, KvStore, KvValue,
     LocalFileDocumentStore, LocalFileKvStore, LocalFileVectorStore, Metric, Query, SortOrder,
-    VectorQuery, VectorSearchResult, VectorStore,
+    VectorDataType, VectorQuery, VectorSearchResult, VectorStore,
 };
 #[cfg(feature = "sqlite")]
 pub use openjiuwen_core::foundation::store::{SqliteDocumentStore, SqliteKvStore};
+#[cfg(feature = "sqlite")]
+pub use sqlite_vector::SqliteVectorStore;
 /// The index-prefix default shared by the configuration decoders and the
 /// `Elasticsearch` backend (Python's `ElasticsearchVectorStore` default).
 fn default_index_prefix() -> String {
@@ -277,31 +282,39 @@ pub async fn build_document_store(backend: &StoreBackend) -> Result<Arc<dyn Docu
 /// Builds a vector store from `backend`.
 ///
 /// `StoreBackend` carries no vector dimension, so the `elasticsearch` backend
-/// uses its own default (`768`).
+/// uses its own default (`768`). Its `url`, `index_prefix`, `username`,
+/// `password`, and `api_key` are forwarded, so a secured cluster authenticates
+/// for vectors exactly as it does for documents.
 ///
 /// # Errors
 ///
-/// Returns the kernel's construction error for the `file` backend and
-/// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
-/// for `sqlite` (the kernel has no SQLite vector backend), the `redis`
-/// backend's configuration and connection errors (a missing `url` is a
-/// validation error, and a disabled `redis` feature is
+/// Returns the kernel's construction error for the `file` backend, the
+/// connection error of the brute-force `sqlite` backend (an unavailable `sqlite`
+/// feature is reported as
+/// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)),
+/// the `redis` backend's configuration and connection errors (a missing `url` is
+/// a validation error, and a disabled `redis` feature is
 /// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)),
 /// plus the `elasticsearch` backend's own construction error.
 pub async fn build_vector_store(backend: &StoreBackend) -> Result<Arc<dyn VectorStore>> {
     match backend {
         StoreBackend::Memory => Ok(Arc::new(InMemoryVectorStore::new())),
         StoreBackend::File { root } => Ok(Arc::new(LocalFileVectorStore::new(root).await?)),
-        StoreBackend::Sqlite { .. } => Err(Error::unsupported(
-            "sqlite has no vector store backend; use the in-memory or file vector store",
-        )),
+        StoreBackend::Sqlite { url } => sqlite_vector_store(url).await,
         StoreBackend::Redis { url } => redis_vector_store(url.as_deref()).await,
         StoreBackend::Elasticsearch {
-            url, index_prefix, ..
+            url,
+            index_prefix,
+            username,
+            password,
+            api_key,
         } => {
             let config = elasticsearch::ElasticsearchVectorStoreConfig {
                 url: url.clone(),
                 index_prefix: index_prefix.clone(),
+                username: username.clone(),
+                password: password.clone(),
+                api_key: api_key.clone(),
                 ..elasticsearch::ElasticsearchVectorStoreConfig::default()
             };
             elasticsearch::ElasticsearchVectorStore::connect(config).await
@@ -361,23 +374,20 @@ fn elasticsearch_document_config(
     api_key: Option<&str>,
 ) -> Result<ElasticsearchConfig> {
     let parsed = elasticsearch_url(url)?;
-    let userinfo_username = (!parsed.username().is_empty()).then(|| parsed.username().to_string());
-    let userinfo_password = parsed.password().map(str::to_string);
-    let username = username.map(str::to_string).or(userinfo_username);
-    let password = match (password.map(str::to_string), username.is_some()) {
-        (Some(explicit), _) => Some(explicit),
-        (None, true) => Some(userinfo_password.unwrap_or_default()),
-        (None, false) => None,
-    };
-    let mut config = ElasticsearchConfig::new(endpoint_without_userinfo(&parsed))
-        .with_index_prefix(index_prefix);
-    if let Some(username) = username {
+    let credentials = elasticsearch::credentials::ElasticsearchCredentials::resolve(
+        &parsed, username, password, api_key,
+    );
+    let mut config = ElasticsearchConfig::new(
+        elasticsearch::credentials::endpoint_without_userinfo(&parsed),
+    )
+    .with_index_prefix(index_prefix);
+    if let Some(username) = credentials.username {
         config = config.with_username(username);
     }
-    if let Some(password) = password {
+    if let Some(password) = credentials.password {
         config = config.with_password(password);
     }
-    if let Some(api_key) = api_key {
+    if let Some(api_key) = credentials.api_key {
         config = config.with_api_key(api_key);
     }
     Ok(config)
@@ -409,16 +419,6 @@ fn elasticsearch_url(url: &str) -> Result<Url> {
     Ok(parsed)
 }
 
-/// The endpoint without userinfo, query, fragment, or trailing slash.
-fn endpoint_without_userinfo(parsed: &Url) -> String {
-    let mut stripped = parsed.clone();
-    let _ = stripped.set_username("");
-    let _ = stripped.set_password(None);
-    stripped.set_query(None);
-    stripped.set_fragment(None);
-    stripped.as_str().trim_end_matches('/').to_string()
-}
-
 /// Builds the SQLite key-value store, or reports the missing feature.
 #[cfg(feature = "sqlite")]
 async fn sqlite_kv_store(url: &str) -> Result<Arc<dyn KvStore>> {
@@ -447,6 +447,24 @@ async fn sqlite_document_store(_url: &str) -> Result<Arc<dyn DocumentStore>> {
         "sqlite document store backend is unavailable; enable the `sqlite` feature or use the in-memory or file backend",
     ))
 }
+/// Builds the SQLite vector store: a brute-force backend that keeps each
+/// collection's schema, metric, documents, and little-endian `f32` embedding
+/// blobs in the database (see [`sqlite_vector`] for the layout).
+#[cfg(feature = "sqlite")]
+async fn sqlite_vector_store(url: &str) -> Result<Arc<dyn VectorStore>> {
+    Ok(Arc::new(SqliteVectorStore::connect(url).await?))
+}
+
+/// Reports that the `sqlite` feature is off; keeps the factory match arms
+/// uniform.
+#[cfg(not(feature = "sqlite"))]
+#[allow(clippy::unused_async)] // mirrors the async SQLite helper
+async fn sqlite_vector_store(_url: &str) -> Result<Arc<dyn VectorStore>> {
+    Err(Error::unsupported(
+        "sqlite has no vector store backend; use the in-memory or file vector store",
+    ))
+}
+
 /// Builds the Redis key-value store, or reports a missing `url`.
 #[cfg(feature = "redis")]
 async fn redis_kv_store(url: Option<&str>) -> Result<Arc<dyn KvStore>> {

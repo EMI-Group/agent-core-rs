@@ -500,21 +500,25 @@ mod tests {
             let store = LocalFileKvStore::new(store_dir(&dir)).await.unwrap();
             // A long TTL keeps the lock held for the whole test, whatever the load.
             assert!(store
-                .exclusive_set("held", KvValue::text("a"), Some(Duration::from_secs(30)))
+                .exclusive_set("held", KvValue::text("a"), Some(Duration::from_secs(60)))
                 .await
                 .unwrap());
             assert!(!store
                 .exclusive_set("held", KvValue::text("b"), None)
                 .await
                 .unwrap());
-            // A short TTL has expired by the time the store is reopened.
+            // A deadline a minute away is still live when the store is reopened
+            // below; a sub-second window could elapse on the way there.
             assert!(store
-                .exclusive_set("lock", KvValue::text("a"), Some(Duration::from_millis(20)))
+                .exclusive_set("lock", KvValue::text("a"), Some(Duration::from_secs(60)))
                 .await
                 .unwrap());
         }
 
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        // Expire the lease by backdating its stored deadline instead of sleeping out
+        // a real TTL window: the envelope keeps an absolute epoch-millisecond
+        // `expiry_ms`, so the reopened store takes exactly the elapsed-TTL path.
+        backdate_deadline(&store_dir(&dir), "lock").await;
 
         let reopened = LocalFileKvStore::new(store_dir(&dir)).await.unwrap();
         assert_eq!(reopened.get("lock").await.unwrap(), None);
@@ -527,6 +531,26 @@ mod tests {
             reopened.get("lock").await.unwrap(),
             Some(KvValue::text("c"))
         );
+        // Only the backdated entry expired; the other lease is untouched.
+        assert!(reopened.exists("held").await.unwrap());
+    }
+
+    /// Rewrites a stored entry's absolute deadline into the past.
+    ///
+    /// The envelope lives at `entries/<key-hash>.json` and keeps `expiry_ms` as an
+    /// absolute epoch-millisecond deadline, so the reopened store sees an elapsed TTL
+    /// deterministically instead of waiting on a real-time window.
+    async fn backdate_deadline(root: &Path, key: &str) {
+        let path = root
+            .join(ENTRIES_DIR)
+            .join(format!("{}.{ENTRY_EXT}", key_hash(key)));
+        let raw = tokio::fs::read(&path).await.unwrap();
+        let mut envelope: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(envelope["key"], serde_json::json!(key));
+        envelope["expiry_ms"] = serde_json::json!(now_epoch_ms() - 1_000);
+        tokio::fs::write(&path, serde_json::to_vec(&envelope).unwrap())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

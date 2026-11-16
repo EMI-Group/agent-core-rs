@@ -25,10 +25,11 @@ use openjiuwen_symphony::retrieval::artifacts::{
 };
 use openjiuwen_symphony::retrieval::build::scanner::ItemSources;
 use openjiuwen_symphony::retrieval::build::scanner::SourceItem;
+use openjiuwen_symphony::retrieval::build::tree::visualizer::{render_tree_html, write_tree_html};
 use openjiuwen_symphony::retrieval::build::workflows::{BuildConfig, IndexBuilder};
 use openjiuwen_symphony::retrieval::types::{
     CatalogRecord, IndexManifest, IndexNode, RetrieverItem, CATALOG_FILENAME, DEFAULT_ITEM_TYPE,
-    MANIFEST_FILENAME, MODE_FULL, ROOT_NODE_ID, TREE_INDEX_FILENAME,
+    MANIFEST_FILENAME, MODE_FULL, ROOT_NODE_ID, TREE_HTML_FILENAME, TREE_INDEX_FILENAME,
 };
 
 /// The nine keys one `catalog.jsonl` line carries.
@@ -831,4 +832,373 @@ fn a_non_empty_tree_index_keeps_its_pinned_layout() {
         parse_tree_yaml(&render_tree_yaml(&nodes)).unwrap().len(),
         nodes.len()
     );
+}
+
+// --------------------------------------------------------------------------------------
+// 10. The optional `tree_index.html` visualizer artifact
+//
+// `tree_index.html` is outside the three-artifact contract: it is written only when
+// `BuildOptions::write_html` asks for it, and nothing reads it back. The suites below pin
+// that boundary at the artifact level — the default build still publishes exactly three
+// entries, the opt-in build adds the fourth next to unchanged artifacts, and the rendered
+// bytes are deterministic, escaped and cid-ordered when they come from a real published
+// tree and catalog. The renderer's own unit-level rules live beside
+// `retrieval::build::tree::visualizer`.
+// --------------------------------------------------------------------------------------
+
+/// The three default artifact names, sorted, as owned strings.
+fn default_artifacts() -> Vec<String> {
+    ARTIFACTS.iter().map(|name| (*name).to_string()).collect()
+}
+
+/// The four names an index directory holds when the visualizer is on, sorted.
+fn artifacts_with_html() -> Vec<String> {
+    let mut names = default_artifacts();
+    names.push(TREE_HTML_FILENAME.to_string());
+    names.sort();
+    names
+}
+
+/// `true` when `dir` holds a file whose name ends in `.tmp`.
+fn has_temporary_sibling(dir: &Path) -> bool {
+    fs::read_dir(dir).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
+    })
+}
+
+/// Reads the visualizer document of an index directory.
+fn read_html(dir: &Path) -> String {
+    read_artifact(dir, TREE_HTML_FILENAME)
+}
+
+/// The published tree and catalog of `dir`, read back through their own parsers.
+fn published_tree(dir: &Path) -> (Vec<IndexNode>, Vec<CatalogRecord>) {
+    let nodes = parse_tree_yaml(&read_artifact(dir, TREE_INDEX_FILENAME)).unwrap();
+    let records = catalog_records(&read_artifact(dir, CATALOG_FILENAME));
+    (nodes, records)
+}
+
+/// Two skills whose names and descriptions carry every HTML metacharacter.
+fn escaped_fixture() -> Vec<SourceItem> {
+    vec![
+        item("Ampersand", "PDF & Fill <beta>", "documents/pdf"),
+        item("Quoted", "Quote \"double\" and 'single'", "documents/pdf"),
+    ]
+}
+
+#[tokio::test]
+async fn the_visualizer_is_an_opt_in_fourth_artifact() {
+    let plain = tempfile::tempdir().unwrap();
+    let plain_report = IndexBuilder::build(sources(fixture()), plain.path(), BuildConfig::new())
+        .await
+        .unwrap();
+
+    assert!(!plain_report.html_written, "the visualizer is opt-in");
+    assert_eq!(
+        directory_entries(plain.path()),
+        default_artifacts(),
+        "a default build writes the three artifacts and nothing else"
+    );
+    assert!(
+        !plain.path().join(TREE_HTML_FILENAME).exists(),
+        "a default build leaves no stray {TREE_HTML_FILENAME}"
+    );
+    assert!(!has_temporary_sibling(plain.path()));
+
+    let with_html = tempfile::tempdir().unwrap();
+    let report = IndexBuilder::build(
+        sources(fixture()),
+        with_html.path(),
+        BuildConfig::new().with_html(true),
+    )
+    .await
+    .unwrap();
+
+    assert!(report.html_written, "the flag is reported on the build");
+    assert_eq!(
+        directory_entries(with_html.path()),
+        artifacts_with_html(),
+        "the opt-in build adds exactly one file"
+    );
+    assert!(
+        !has_temporary_sibling(with_html.path()),
+        "the visualizer write leaves no `*.tmp` sibling behind"
+    );
+    assert_eq!(report.node_count, 7);
+    assert_eq!(report.record_count, 3);
+
+    // The extra file is derived data: the loader reads the three artifacts only, so the
+    // index contract is unchanged by the flag.
+    let loaded = load_index(with_html.path()).await.unwrap();
+    let plain_loaded = load_index(plain.path()).await.unwrap();
+    assert_eq!(loaded.manifest.count, plain_loaded.manifest.count);
+    assert_eq!(
+        loaded.manifest.content_hash, plain_loaded.manifest.content_hash,
+        "the visualizer does not change the catalog the manifest hashes"
+    );
+    assert_eq!(loaded.records, plain_loaded.records);
+    assert_eq!(loaded.root, plain_loaded.root);
+}
+
+#[tokio::test]
+async fn the_visualizer_lists_the_published_tree_in_cid_order() {
+    let dir = tempfile::tempdir().unwrap();
+    IndexBuilder::build(
+        sources(fixture()),
+        dir.path(),
+        BuildConfig::new().with_html(true),
+    )
+    .await
+    .unwrap();
+
+    let html = read_html(dir.path());
+    assert!(html.starts_with("<!DOCTYPE html>\n<html lang=\"en\">\n"));
+    assert!(html.ends_with("</html>\n"));
+    assert!(html.contains("<h1>Skills</h1>"));
+    assert!(
+        html.contains("<p class=\"summary\">4 branches, 3 items</p>"),
+        "the summary counts the published nodes"
+    );
+
+    for (cid, name) in [
+        ("Skills.documents.pdf.docread", "Doc Reader"),
+        ("Skills.documents.pdf.pdffill", "PDF Fill"),
+        ("Skills.web.websearch", "Web Search"),
+    ] {
+        assert!(
+            html.contains(&format!(
+                "<span class=\"leaf-name\">{name}</span><code class=\"cid\">{cid}</code>"
+            )),
+            "{cid} is listed with its catalog name"
+        );
+        assert!(
+            html.contains(&format!(
+                "<p class=\"description\">{name} routes matching requests.</p>"
+            )),
+            "{cid} is listed with its catalog description"
+        );
+    }
+
+    let ordered = [
+        "Skills.documents.pdf",
+        "Skills.documents.pdf.docread",
+        "Skills.documents.pdf.pdffill",
+        "Skills.web.websearch",
+    ];
+    let positions: Vec<usize> = ordered
+        .iter()
+        .map(|cid| {
+            html.find(&format!("<code class=\"cid\">{cid}</code>"))
+                .unwrap_or_else(|| panic!("{cid} is not rendered"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "the document reflects the published cid order: {positions:?}"
+    );
+}
+
+#[tokio::test]
+async fn writing_the_visualizer_into_a_published_index_is_byte_identical_and_atomic() {
+    let dir = tempfile::tempdir().unwrap();
+    IndexBuilder::build(sources(fixture()), dir.path(), BuildConfig::new())
+        .await
+        .unwrap();
+    let (nodes, records) = published_tree(dir.path());
+    assert_eq!(nodes.len(), 7, "the published tree is the render input");
+    assert_eq!(records.len(), 3);
+
+    let expected = render_tree_html(&nodes, &records, "Skills");
+    assert_eq!(
+        expected,
+        render_tree_html(&nodes, &records, "Skills"),
+        "rendering the same input twice is byte identical"
+    );
+
+    write_tree_html(dir.path(), &nodes, &records, "Skills")
+        .await
+        .unwrap();
+    assert_eq!(
+        read_html(dir.path()),
+        expected,
+        "the written bytes are the rendered bytes"
+    );
+
+    write_tree_html(dir.path(), &nodes, &records, "Skills")
+        .await
+        .unwrap();
+    assert_eq!(
+        read_html(dir.path()),
+        expected,
+        "rewriting over the existing document is idempotent"
+    );
+
+    assert_eq!(
+        directory_entries(dir.path()),
+        artifacts_with_html(),
+        "the visualizer sits beside the untouched three artifacts"
+    );
+    assert!(
+        !has_temporary_sibling(dir.path()),
+        "an atomic write leaves no `*.tmp` sibling behind"
+    );
+    let html = read_html(dir.path());
+    for record in &records {
+        assert!(
+            html.contains(&format!("<code class=\"cid\">{}</code>", record.cid)),
+            "the published leaf {} is reachable in the document",
+            record.cid
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_visualizer_escapes_every_published_name_and_description() {
+    let dir = tempfile::tempdir().unwrap();
+    IndexBuilder::build(
+        sources(escaped_fixture()),
+        dir.path(),
+        BuildConfig::new().with_html(true),
+    )
+    .await
+    .unwrap();
+
+    let html = read_html(dir.path());
+
+    assert!(!html.contains("<beta>"), "no raw tag survives the render");
+    assert!(
+        html.contains("PDF &amp; Fill &lt;beta&gt;"),
+        "the catalog name is escaped"
+    );
+    assert!(
+        html.contains("PDF &amp; Fill &lt;beta&gt; routes matching requests."),
+        "the catalog description is escaped"
+    );
+    assert!(
+        html.contains("Quote &quot;double&quot; and &#39;single&#39;"),
+        "both quote characters are escaped"
+    );
+    assert!(
+        !html.contains("&amp;amp;"),
+        "the escaper never double escapes"
+    );
+    assert!(
+        html.contains("<code class=\"cid\">Skills.documents.pdf.ampersand</code>"),
+        "the escaped skill still publishes its slug-derived cid"
+    );
+}
+
+#[test]
+fn rendering_is_independent_of_node_and_record_order() {
+    let nodes = vec![
+        IndexNode::branch("Skills").with_description("All skills"),
+        IndexNode::branch("Skills.web").with_description("Web capabilities."),
+        IndexNode::leaf("Skills.web.zeta", "Zeta"),
+        IndexNode::leaf("Skills.web.alpha", "Alpha"),
+        IndexNode::leaf("Skills.docread", "DocRead"),
+    ];
+    let records = vec![
+        CatalogRecord::new("DocRead", "Skills.docread").with_name("Doc Reader"),
+        CatalogRecord::new("Zeta", "Skills.web.zeta").with_name("Zeta"),
+        CatalogRecord::new("Alpha", "Skills.web.alpha").with_name("Alpha"),
+    ];
+
+    let sorted = render_tree_html(&nodes, &records, "Skills");
+    let mut shuffled = nodes.clone();
+    shuffled.reverse();
+    let mut shuffled_records = records.clone();
+    shuffled_records.reverse();
+
+    assert_eq!(
+        sorted,
+        render_tree_html(&shuffled, &shuffled_records, "Skills"),
+        "input order does not reach the document"
+    );
+
+    let ordered = [
+        "Skills.docread",
+        "Skills.web",
+        "Skills.web.alpha",
+        "Skills.web.zeta",
+    ];
+    let positions: Vec<usize> = ordered
+        .iter()
+        .map(|cid| {
+            sorted
+                .find(&format!("<code class=\"cid\">{cid}</code>"))
+                .unwrap_or_else(|| panic!("{cid} is not rendered"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "branches and leaves share one cid order: {positions:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_index_still_renders_a_sane_visualizer_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = IndexBuilder::build(
+        ItemSources::new("skill"),
+        dir.path(),
+        BuildConfig::new().with_html(true),
+    )
+    .await
+    .unwrap();
+
+    assert!(report.html_written);
+    assert_eq!(
+        report.node_count, 1,
+        "an empty build still publishes the bare root branch"
+    );
+    assert_eq!(report.record_count, 0);
+    assert_eq!(
+        directory_entries(dir.path()),
+        artifacts_with_html(),
+        "an empty build publishes the same four names"
+    );
+    assert!(!has_temporary_sibling(dir.path()));
+
+    let html = read_html(dir.path());
+    assert!(html.starts_with("<!DOCTYPE html>\n<html lang=\"en\">\n"));
+    assert!(html.ends_with("</html>\n"));
+    assert!(html.contains("<h1>Skills</h1>"));
+    assert!(
+        html.contains("<p class=\"summary\">1 branch, 0 items</p>"),
+        "the summary counts the bare root branch"
+    );
+    assert!(html.contains("<code class=\"cid\">Skills</code>"));
+    assert!(
+        !html.contains("class=\"leaf"),
+        "an empty catalog renders no leaf"
+    );
+    assert!(
+        !html.contains("Unplaced items"),
+        "an empty catalog has nothing unplaced"
+    );
+
+    // A zero-node input — no root branch at all — still renders a valid document.
+    let headless = render_tree_html(&[], &[], "Skills");
+    assert!(headless.starts_with("<!DOCTYPE html>\n<html lang=\"en\">\n"));
+    assert!(headless.ends_with("</html>\n"));
+    assert!(headless.contains("<p class=\"summary\">0 branches, 0 items</p>"));
+    assert!(headless.contains("No capabilities are indexed in this tree."));
+    assert!(
+        !headless.contains("<ul"),
+        "an empty tree has no list markup"
+    );
+
+    write_tree_html(dir.path(), &[], &[], "Skills")
+        .await
+        .unwrap();
+    assert_eq!(
+        read_html(dir.path()),
+        headless,
+        "a zero-node rewrite publishes the empty document"
+    );
+    assert_eq!(directory_entries(dir.path()), artifacts_with_html());
 }

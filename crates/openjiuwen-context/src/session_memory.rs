@@ -273,9 +273,30 @@ fn tool_round_end(messages: &[BaseMessage], index: usize) -> Option<usize> {
     }
 }
 
+/// The index of the message the notes' anchor refers to, when it resolves.
+///
+/// The anchor is read from [`SessionMemoryNotes::anchor_message_id`] and looked
+/// up through [`CONTEXT_MESSAGE_ID_KEY`]. `None` means the notes are stale for
+/// `messages`: the message they cover has left the history, so they cannot
+/// replace a prefix of it.
+#[must_use]
+pub fn notes_anchor_index(messages: &[BaseMessage], notes: &SessionMemoryNotes) -> Option<usize> {
+    let anchor_id = notes
+        .anchor_message_id
+        .as_deref()
+        .filter(|anchor| !anchor.is_empty())?;
+    messages.iter().position(|message| {
+        message
+            .metadata
+            .get(CONTEXT_MESSAGE_ID_KEY)
+            .and_then(Value::as_str)
+            == Some(anchor_id)
+    })
+}
+
 /// Replaces the notes-covered prefix of `messages` with a boundary + summary.
 ///
-/// The anchor is resolved through [`CONTEXT_MESSAGE_ID_KEY`]; everything up to
+/// The anchor is resolved through [`notes_anchor_index`]; everything up to
 /// and including it is replaced, and the messages after it are kept untouched.
 /// When the anchor sits inside a round containing a tool exchange it moves
 /// forward to the end of that round, so a tool result is never orphaned.
@@ -292,17 +313,7 @@ pub fn reinject_session_memory(
     if notes.is_empty() {
         return None;
     }
-    let anchor_id = notes
-        .anchor_message_id
-        .as_deref()
-        .filter(|anchor| !anchor.is_empty())?;
-    let anchor = messages.iter().position(|message| {
-        message
-            .metadata
-            .get(CONTEXT_MESSAGE_ID_KEY)
-            .and_then(Value::as_str)
-            == Some(anchor_id)
-    })?;
+    let anchor = notes_anchor_index(messages, notes)?;
     let anchor = tool_round_end(messages, anchor).unwrap_or(anchor);
 
     // Two synthesized messages replace the covered prefix; a one- or two-message

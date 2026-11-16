@@ -7,9 +7,16 @@
 //! so assertions are deterministic without background tasks).
 //!
 //! Scripted modes: [`FakeOptions::auth_required`] demands `AUTH` before any other
-//! command, [`FakeOptions::moved_everything`] answers every non-handshake command
-//! with `-MOVED 3999 127.0.0.1:7000`, and [`FakeOptions::with_command_delay`] makes
-//! every command slow enough to exercise client timeouts.
+//! command, [`FakeOptions::moved_to`] and [`FakeOptions::ask_to`] answer every
+//! non-handshake command with `-MOVED`/`-ASK` pointing at another node (start a
+//! second [`FakeRedis`] for that target), [`FakeOptions::cluster`] reports this node
+//! as a cluster node through `CLUSTER INFO`/`CLUSTER SLOTS`, and
+//! [`FakeOptions::with_command_delay`] makes every command slow enough to exercise
+//! client timeouts.
+//!
+//! Every accepted connection keeps its own command log, so a test can prove that a
+//! redirection was followed exactly once and that `ASKING` preceded the redirected
+//! command.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -29,16 +36,39 @@ use tokio::time::Instant;
 mod commands;
 mod support;
 
+/// A scripted `-MOVED`/`-ASK` redirection.
+#[derive(Debug, Clone)]
+pub(crate) struct Redirect {
+    /// The hash slot reported by the redirection.
+    pub(crate) slot: u16,
+    /// The node the redirection points at.
+    pub(crate) target: SocketAddr,
+    /// `true` for `-ASK` (which requires an `ASKING` prefix), `false` for `-MOVED`.
+    pub(crate) ask: bool,
+}
+
 /// Scripted behavior for a [`FakeRedis`] instance.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FakeOptions {
     /// When set, every connection must `AUTH` with this `(username, password)`.
     pub(crate) require_auth: Option<(Option<String>, String)>,
-    /// When set, answer every non-handshake command with a `MOVED` redirection.
-    pub(crate) moved_everything: bool,
+    /// When set, answer every non-handshake command with this redirection.
+    pub(crate) redirect: Option<Redirect>,
     /// Artificial delay applied before every command is executed.
     pub(crate) command_delay: Option<Duration>,
+    /// When set, `CLUSTER INFO`/`CLUSTER SLOTS` report a cluster owning every slot.
+    pub(crate) cluster: Option<ClusterMode>,
 }
+
+/// How a fake node reports itself through `CLUSTER INFO`/`CLUSTER SLOTS`.
+#[derive(Debug, Clone)]
+pub(crate) enum ClusterMode {
+    /// Every slot is owned by this node.
+    SelfOwned,
+    /// Every slot is owned by the given node (used to prove slot pre-seeding).
+    OwnedBy(String, u16),
+}
+
 impl FakeOptions {
     /// Requires `AUTH` with the given user/password before any other command.
     #[must_use]
@@ -48,14 +78,51 @@ impl FakeOptions {
             ..Self::default()
         }
     }
-    /// Answers every non-handshake command with a `MOVED` redirection.
+
+    /// Answers every non-handshake command with `-MOVED <slot> <target>`.
     #[must_use]
-    pub(crate) fn moved_everything() -> Self {
+    pub(crate) fn moved_to(slot: u16, target: SocketAddr) -> Self {
         Self {
-            moved_everything: true,
+            redirect: Some(Redirect {
+                slot,
+                target,
+                ask: false,
+            }),
             ..Self::default()
         }
     }
+
+    /// Answers every non-handshake command with `-ASK <slot> <target>`.
+    #[must_use]
+    pub(crate) fn ask_to(slot: u16, target: SocketAddr) -> Self {
+        Self {
+            redirect: Some(Redirect {
+                slot,
+                target,
+                ask: true,
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// Reports this node as a cluster node owning every slot.
+    #[must_use]
+    pub(crate) fn cluster() -> Self {
+        Self {
+            cluster: Some(ClusterMode::SelfOwned),
+            ..Self::default()
+        }
+    }
+
+    /// Reports a cluster whose slots are all owned by `host`:`port`.
+    #[must_use]
+    pub(crate) fn cluster_owned_by(host: &str, port: u16) -> Self {
+        Self {
+            cluster: Some(ClusterMode::OwnedBy(host.to_owned(), port)),
+            ..Self::default()
+        }
+    }
+
     /// Adds an artificial delay before every command is executed.
     #[must_use]
     pub(crate) fn with_command_delay(mut self, delay: Duration) -> Self {
@@ -83,7 +150,7 @@ impl FakeRedis {
         let addr = listener
             .local_addr()
             .expect("bound loopback listener has a local address");
-        let state = Arc::new(ServerState::new(options));
+        let state = Arc::new(ServerState::new(options, addr));
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let accept_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
@@ -92,8 +159,12 @@ impl FakeRedis {
                     _ = &mut shutdown_rx => break,
                     accepted = listener.accept() => {
                         let Ok((stream, _peer)) = accepted else { break };
+                        let index = accept_state.connections.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut logs) = accept_state.connection_commands.lock() {
+                            logs.push(Vec::new());
+                        }
                         let connection_state = Arc::clone(&accept_state);
-                        tokio::spawn(serve_connection(stream, connection_state));
+                        tokio::spawn(serve_connection(stream, connection_state, index));
                     }
                 }
             }
@@ -192,13 +263,31 @@ impl StateHandle {
     pub(crate) fn auth_attempts(&self) -> usize {
         self.inner.auth_attempts.load(Ordering::Relaxed)
     }
-    /// Upper-cased command names received so far, in order.
+    /// Upper-cased command names received so far, in order, across connections.
     pub(crate) fn commands(&self) -> Vec<String> {
         self.inner
             .commands
             .lock()
             .expect("fake redis command log mutex is not poisoned")
             .clone()
+    }
+    /// Upper-cased command names per accepted connection, in connection order.
+    ///
+    /// A closed connection keeps its log, so a test can assert that a redirection
+    /// reached this node exactly once and that `ASKING` preceded the command.
+    pub(crate) fn connection_commands(&self) -> Vec<Vec<String>> {
+        self.inner
+            .connection_commands
+            .lock()
+            .expect("fake redis per-connection log mutex is not poisoned")
+            .clone()
+    }
+    /// The command log of the first accepted connection (empty when none arrived).
+    pub(crate) fn first_connection_commands(&self) -> Vec<String> {
+        self.connection_commands()
+            .into_iter()
+            .next()
+            .unwrap_or_default()
     }
     /// Runs `read` against freshly expired-entry-purged state.
     fn with_data<T>(&self, read: impl FnOnce(&mut Data) -> T) -> T {
@@ -214,16 +303,22 @@ impl StateHandle {
 /// Shared server state.
 struct ServerState {
     options: FakeOptions,
+    /// The loopback address this server was bound to.
+    addr: SocketAddr,
     data: StdMutex<Data>,
     connections: AtomicUsize,
     auth_attempts: AtomicUsize,
     commands: StdMutex<Vec<String>>,
+    /// One command log per accepted connection, indexed by connection number.
+    connection_commands: StdMutex<Vec<Vec<String>>>,
 }
 /// Per-connection state.
 struct ConnState {
     authed: bool,
     #[allow(dead_code)]
     db: Option<i64>,
+    /// Index of this connection in [`ServerState::connection_commands`].
+    index: usize,
 }
 /// Stored data with lazy TTL expiry.
 #[derive(Default)]
@@ -271,13 +366,13 @@ impl Data {
     }
 }
 /// Accepts connections until the listener is shut down.
-async fn serve_connection(mut stream: TcpStream, state: Arc<ServerState>) {
-    state.connections.fetch_add(1, Ordering::Relaxed);
+async fn serve_connection(mut stream: TcpStream, state: Arc<ServerState>, index: usize) {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut connection = ConnState {
         authed: state.options.require_auth.is_none(),
         db: None,
+        index,
     };
     loop {
         let Ok(parsed) = parse_reply(&buffer) else {

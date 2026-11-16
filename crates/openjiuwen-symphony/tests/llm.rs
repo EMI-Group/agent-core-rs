@@ -11,16 +11,23 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use openjiuwen_symphony::error::ErrorKind;
 use openjiuwen_symphony::evaluation::{EvaluationInput, Metric};
 use openjiuwen_symphony::graph::CAN_FEED;
-use openjiuwen_symphony::llm::fingerprint::FingerprintExtractor;
-use openjiuwen_symphony::llm::judge::{LlmJudgeMetric, DEFAULT_RUBRIC};
+use openjiuwen_symphony::llm::fingerprint::{
+    FingerprintConfig, FingerprintExtractor, FingerprintOutcome,
+};
+use openjiuwen_symphony::llm::judge::{JudgeVerdict, LlmJudgeMetric, DEFAULT_RUBRIC};
 use openjiuwen_symphony::llm::ontology::{OntologyConfig, OntologyMatcher, METHOD_CONSENSUS};
 use openjiuwen_symphony::llm::scoring::LlmSemanticScorer;
 use openjiuwen_symphony::llm::tree::{
-    RetrieverItem, RetrieverNode, TreeRetriever, TreeSearchRequest,
+    RetrieverItem, RetrieverNode, TreeRetriever, TreeRetrieverConfig, TreeSearchOutcome,
+    TreeSearchRequest,
 };
-use openjiuwen_symphony::llm::{CompletionModel, FallbackMode, ModelConfig, StaticCompletionModel};
+use openjiuwen_symphony::llm::{
+    CompletionModel, FallbackMode, MatchedVerdict, ModelConfig, SemanticScores, StageProvenance,
+    StaticCompletionModel,
+};
 use openjiuwen_symphony::model::{CapabilityDescriptor, CapabilityIo, SemanticProfile};
 use openjiuwen_symphony::orchestration::planner::SemanticScorer;
 use openjiuwen_symphony::orchestration::{LexicalSemanticScorer, MatchStrategy, RelationCandidate};
@@ -740,4 +747,342 @@ async fn model_names_are_visible_through_the_seams() {
     let metric: Arc<dyn Metric> = Arc::new(LlmJudgeMetric::default());
     assert_eq!(metric.name(), "llm_judge");
     assert_eq!(LlmJudgeMetric::default().rubric(), DEFAULT_RUBRIC);
+}
+
+// --- stage provenance, end to end ----------------------------------------
+
+/// Asserts one stage reported `expected`, naming the stage and the case that failed.
+fn assert_provenance(stage: &str, expected: StageProvenance, actual: StageProvenance) {
+    assert_eq!(
+        actual, expected,
+        "{stage}: expected {expected:?}, got {actual:?}"
+    );
+}
+
+/// Asserts a stage surfaced the typed [`ErrorKind::Llm`] failure that
+/// [`FallbackMode::Error`] promises instead of its deterministic fallback.
+fn assert_llm_error(stage: &str, error: &openjiuwen_symphony::Error) {
+    assert_eq!(
+        error.kind(),
+        ErrorKind::Llm,
+        "{stage}: expected a typed llm error, got {error}"
+    );
+}
+
+/// Builds a retriever over [`translate_tree`] with `config`.
+fn tree_retriever(config: TreeRetrieverConfig) -> TreeRetriever {
+    TreeRetriever::new(config).with_root(translate_tree())
+}
+
+#[tokio::test]
+async fn tree_stage_reports_no_model_model_and_fallback_provenance() {
+    let request = TreeSearchRequest::default();
+
+    let outcome = tree_retriever(TreeRetrieverConfig::default())
+        .search_detailed("translate", &request)
+        .await
+        .unwrap();
+    assert_provenance(
+        "tree/no model",
+        StageProvenance::NoModel,
+        outcome.provenance,
+    );
+    assert_eq!(outcome.fallback_branches, 0);
+
+    let scripted_model = scripted(&["c1", "i_child"]);
+    let outcome = tree_retriever(TreeRetrieverConfig::default().with_model(scripted_model.clone()))
+        .search_detailed("translate text", &request)
+        .await
+        .unwrap();
+    assert_provenance("tree/model", StageProvenance::Model, outcome.provenance);
+    assert_eq!(outcome.result.payloads, vec!["child_payload".to_string()]);
+    assert_eq!(scripted_model.call_count(), 2);
+    assert_eq!(outcome.fallback_branches, 0);
+
+    // An unusable reply makes that branch lexical. This stage has no `FallbackMode`
+    // switch, so a blank reply and a failing model both fall back rather than error.
+    let outcome = tree_retriever(TreeRetrieverConfig::default().with_model(model("   ")))
+        .search_detailed("translate", &request)
+        .await
+        .unwrap();
+    assert_provenance(
+        "tree/blank reply",
+        StageProvenance::DeterministicFallback,
+        outcome.provenance,
+    );
+    assert_eq!(outcome.fallback_branches, 1);
+    assert_eq!(outcome.result.method, "lexical_fallback");
+
+    let failing: Arc<dyn CompletionModel> = Arc::new(FailingModel);
+    let outcome = tree_retriever(TreeRetrieverConfig::default().with_model(failing))
+        .search_detailed("translate", &request)
+        .await
+        .unwrap();
+    assert_provenance(
+        "tree/failing model",
+        StageProvenance::DeterministicFallback,
+        outcome.provenance,
+    );
+}
+
+#[tokio::test]
+async fn ontology_stage_reports_no_model_model_and_fallback_provenance() {
+    let candidates = [candidate(MatchStrategy::ExactIo, 1.0)];
+
+    let verdicts = OntologyMatcher::new(ontology_catalog())
+        .with_config(OntologyConfig::new().with_consensus(false))
+        .match_candidates_detailed(&candidates)
+        .await
+        .unwrap();
+    assert_provenance(
+        "ontology/no model",
+        StageProvenance::NoModel,
+        verdicts[0].provenance,
+    );
+
+    let verdicts = OntologyMatcher::new(ontology_catalog())
+        .with_config(
+            OntologyConfig::new()
+                .with_consensus(false)
+                .with_model(model(
+                    r#"{"matches":[{"id":"c1","direction":"forward","confidence":0.9}]}"#,
+                )),
+        )
+        .match_candidates_detailed(&candidates)
+        .await
+        .unwrap();
+    assert_provenance(
+        "ontology/model",
+        StageProvenance::Model,
+        verdicts[0].provenance,
+    );
+    assert!(verdicts[0].accepted());
+
+    let verdicts = OntologyMatcher::new(ontology_catalog())
+        .with_config(
+            OntologyConfig::new()
+                .with_consensus(false)
+                .with_model(model("no json here")),
+        )
+        .match_candidates_detailed(&candidates)
+        .await
+        .unwrap();
+    assert_provenance(
+        "ontology/fallback",
+        StageProvenance::DeterministicFallback,
+        verdicts[0].provenance,
+    );
+
+    let error = OntologyMatcher::new(ontology_catalog())
+        .with_config(
+            OntologyConfig::new()
+                .with_consensus(false)
+                .with_fallback(FallbackMode::Error)
+                .with_model(model("no json here")),
+        )
+        .match_candidates_detailed(&candidates)
+        .await
+        .expect_err("an unusable reply must surface under FallbackMode::Error");
+    assert_llm_error("ontology", &error);
+}
+
+#[tokio::test]
+async fn semantic_scoring_stage_reports_no_model_model_and_fallback_provenance() {
+    let catalog = scoring_catalog();
+
+    let scores = LlmSemanticScorer::new(ModelConfig::new())
+        .score_with_provenance("translate", &catalog)
+        .await
+        .unwrap();
+    assert_provenance(
+        "scoring/no model",
+        StageProvenance::NoModel,
+        scores.provenance,
+    );
+
+    // A request that needs no model is `NoModel` even when one is configured.
+    let idle = model("{}");
+    let empty = LlmSemanticScorer::new(ModelConfig::new().with_model(idle.clone()))
+        .score_with_provenance("translate", &[])
+        .await
+        .unwrap();
+    assert_provenance(
+        "scoring/no capabilities",
+        StageProvenance::NoModel,
+        empty.provenance,
+    );
+    assert!(empty.scores.is_empty());
+    assert_eq!(idle.call_count(), 0);
+
+    let scores = LlmSemanticScorer::new(ModelConfig::new().with_model(model(
+        r#"{"judgements":[{"candidate_id":"tool:b","score":0.75}]}"#,
+    )))
+    .score_with_provenance("translate", &catalog)
+    .await
+    .unwrap();
+    assert_provenance("scoring/model", StageProvenance::Model, scores.provenance);
+    assert_eq!(scores.scores.get("tool:b"), Some(&0.75));
+
+    let scores = LlmSemanticScorer::new(ModelConfig::new().with_model(model("not json")))
+        .score_with_provenance("translate", &catalog)
+        .await
+        .unwrap();
+    assert_provenance(
+        "scoring/fallback",
+        StageProvenance::DeterministicFallback,
+        scores.provenance,
+    );
+
+    let error = LlmSemanticScorer::new(
+        ModelConfig::new()
+            .with_model(model("not json"))
+            .with_fallback(FallbackMode::Error),
+    )
+    .score_with_provenance("translate", &catalog)
+    .await
+    .expect_err("FallbackMode::Error must surface the model failure");
+    assert_llm_error("scoring", &error);
+}
+
+#[tokio::test]
+async fn fingerprint_stage_reports_no_model_model_and_fallback_provenance() {
+    let descriptor = fingerprint_capability();
+
+    let outcome = FingerprintExtractor::new()
+        .extract_with_provenance(&descriptor)
+        .await
+        .unwrap();
+    assert_provenance(
+        "fingerprint/no model",
+        StageProvenance::NoModel,
+        outcome.provenance,
+    );
+    assert_eq!(outcome.profile.summary, "Extracts text");
+
+    let outcome = FingerprintExtractor::new()
+        .with_model(model(
+            json!({"semantic_profile": {"summary": "Model summary"}}).to_string(),
+        ))
+        .extract_with_provenance(&descriptor)
+        .await
+        .unwrap();
+    assert_provenance(
+        "fingerprint/model",
+        StageProvenance::Model,
+        outcome.provenance,
+    );
+    assert_eq!(outcome.profile.summary, "Model summary");
+
+    let outcome = FingerprintExtractor::new()
+        .with_model(model("not json"))
+        .extract_with_provenance(&descriptor)
+        .await
+        .unwrap();
+    assert_provenance(
+        "fingerprint/fallback",
+        StageProvenance::DeterministicFallback,
+        outcome.provenance,
+    );
+    assert_eq!(outcome.profile.summary, "Extracts text");
+
+    let error = FingerprintExtractor::new()
+        .with_model(model("not json"))
+        .with_config(FingerprintConfig::new().with_fallback(FallbackMode::Error))
+        .extract_with_provenance(&descriptor)
+        .await
+        .expect_err("FallbackMode::Error must surface the model failure");
+    assert_llm_error("fingerprint", &error);
+}
+
+#[tokio::test]
+async fn judge_stage_reports_no_model_model_and_fallback_provenance() {
+    let input = judged_input();
+
+    let verdict = LlmJudgeMetric::new("quality", "card quality")
+        .evaluate_with_provenance(&input)
+        .await
+        .unwrap();
+    assert_provenance(
+        "judge/no model",
+        StageProvenance::NoModel,
+        verdict.provenance,
+    );
+    assert!(verdict.passed());
+
+    let verdict = LlmJudgeMetric::new("quality", "card quality")
+        .with_model(model(r#"{"score":1,"reason":"ok"}"#))
+        .evaluate_with_provenance(&input)
+        .await
+        .unwrap();
+    assert_provenance("judge/model", StageProvenance::Model, verdict.provenance);
+    assert_eq!(verdict.score.score, Some(1.0));
+    assert_eq!(verdict.score.detail.as_deref(), Some("ok"));
+
+    let verdict = LlmJudgeMetric::new("quality", "card quality")
+        .with_model(model("not json"))
+        .evaluate_with_provenance(&input)
+        .await
+        .unwrap();
+    assert_provenance(
+        "judge/fallback",
+        StageProvenance::DeterministicFallback,
+        verdict.provenance,
+    );
+
+    let error = LlmJudgeMetric::new("quality", "card quality")
+        .with_model(model("not json"))
+        .with_fallback(FallbackMode::Error)
+        .evaluate_with_provenance(&input)
+        .await
+        .expect_err("FallbackMode::Error must surface the model failure");
+    assert_llm_error("judge", &error);
+}
+
+#[test]
+fn records_without_the_provenance_field_default_to_no_model() {
+    assert_eq!(StageProvenance::default(), StageProvenance::NoModel);
+
+    // Every stage record written before provenance existed carries no `provenance`
+    // key; `serde(default)` must supply the documented `NoModel` marker.
+    let outcome: TreeSearchOutcome = serde_json::from_value(json!({
+        "result": {"payloads": ["p"], "method": "lexical_fallback", "elapsed_ms": 0},
+        "fallback_branches": 0
+    }))
+    .unwrap();
+    assert_eq!(outcome.provenance, StageProvenance::NoModel);
+    assert_eq!(outcome.result.payloads, vec!["p".to_string()]);
+
+    let verdict: MatchedVerdict = serde_json::from_value(json!({
+        "verdict": {
+            "source_id": "tool:a",
+            "target_id": "tool:b",
+            "relation": CAN_FEED,
+            "confidence": 0.9,
+            "method": "deterministic_fallback",
+            "reasons": [],
+            "accepted": true
+        }
+    }))
+    .unwrap();
+    assert_eq!(verdict.provenance, StageProvenance::NoModel);
+    assert_eq!(verdict.verdict.source_id, "tool:a");
+    assert!(verdict.accepted());
+
+    let scores: SemanticScores =
+        serde_json::from_value(json!({"scores": {"tool:a": 0.5}})).unwrap();
+    assert_eq!(scores.provenance, StageProvenance::NoModel);
+    assert_eq!(scores.scores.get("tool:a"), Some(&0.5));
+
+    let fingerprint: FingerprintOutcome =
+        serde_json::from_value(json!({"profile": {"summary": "Extracts text"}})).unwrap();
+    assert_eq!(fingerprint.provenance, StageProvenance::NoModel);
+    assert_eq!(fingerprint.profile.summary, "Extracts text");
+
+    let judged: JudgeVerdict = serde_json::from_value(json!({
+        "score": {"metric": "quality", "score": 1.0, "passed": true, "detail": null}
+    }))
+    .unwrap();
+    assert_eq!(judged.provenance, StageProvenance::NoModel);
+    assert_eq!(judged.score.metric, "quality");
+    assert!(judged.passed());
 }

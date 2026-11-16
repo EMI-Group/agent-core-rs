@@ -72,6 +72,50 @@ fn default_config_matches_python_defaults() {
     assert_eq!(config.url, "");
     assert_eq!(config.index_prefix, "agent_vector");
     assert_eq!(config.dimension, 768);
+    assert_eq!(config.username, None);
+    assert_eq!(config.password, None);
+    assert_eq!(config.api_key, None);
+}
+
+/// The vector store and the document store share one credential-resolution
+/// rule set, so this pins the precedence the shared helper implements.
+#[test]
+fn credentials_resolve_the_documented_precedence() {
+    use super::credentials::ElasticsearchCredentials;
+    use url::Url;
+
+    // Userinfo only: both halves come from the URL.
+    let userinfo = Url::parse("http://alice:wonderland@127.0.0.1:9200").unwrap();
+    let resolved = ElasticsearchCredentials::resolve(&userinfo, None, None, None);
+    assert_eq!(resolved.username.as_deref(), Some("alice"));
+    assert_eq!(resolved.password.as_deref(), Some("wonderland"));
+    assert_eq!(resolved.basic_auth(), Some(("alice", "wonderland")));
+    assert_eq!(resolved.api_key, None);
+
+    // Explicit fields win over the userinfo field by field: the explicit user
+    // name keeps the userinfo password.
+    let resolved =
+        ElasticsearchCredentials::resolve(&userinfo, Some("bob"), None, Some("api-key-123"));
+    assert_eq!(resolved.username.as_deref(), Some("bob"));
+    assert_eq!(resolved.password.as_deref(), Some("wonderland"));
+    assert_eq!(resolved.basic_auth(), Some(("bob", "wonderland")));
+    assert_eq!(resolved.api_key.as_deref(), Some("api-key-123"));
+
+    // A user name without a password sends an empty password.
+    let bare = Url::parse("http://alice@127.0.0.1:9200").unwrap();
+    let resolved = ElasticsearchCredentials::resolve(&bare, None, None, None);
+    assert_eq!(resolved.username.as_deref(), Some("alice"));
+    assert_eq!(resolved.password.as_deref(), Some(""));
+    assert_eq!(resolved.basic_auth(), Some(("alice", "")));
+
+    // A password without a user name is kept but never sent, so the API key
+    // applies instead.
+    let plain = Url::parse("http://127.0.0.1:9200").unwrap();
+    let resolved = ElasticsearchCredentials::resolve(&plain, None, Some("orphan"), Some("api-key"));
+    assert_eq!(resolved.username, None);
+    assert_eq!(resolved.password.as_deref(), Some("orphan"));
+    assert_eq!(resolved.basic_auth(), None);
+    assert_eq!(resolved.api_key.as_deref(), Some("api-key"));
 }
 
 #[test]

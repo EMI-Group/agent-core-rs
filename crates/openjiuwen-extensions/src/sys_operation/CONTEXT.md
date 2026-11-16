@@ -41,7 +41,7 @@ pub fn register_remote_providers(registry: &SandboxProviderRegistry) -> Result<(
 
 /// Registers every factory present in `providers` under `sandbox_type`.
 pub fn register(registry: &SandboxProviderRegistry, sandbox_type: &str, providers: SandboxProviderSet) -> Result<()>;
-/// Compatibility no-op: registers nothing, logs at debug, never fails.
+/// Registers every type in `REMOTE_SANDBOX_TYPES` the registry does not already hold.
 pub async fn register_deferred(registry: &SandboxProviderRegistry) -> Result<()>;
 
 /// The sandbox types with at least one registered provider, sorted.
@@ -70,7 +70,9 @@ pub async fn shutdown_remote_all() -> Result<Vec<TeardownReport>>;
 - Registration is keyed by `(sandbox_type, operation)` exactly like Python's `SandboxRegistry.provider(sandbox_type, operation_type)`; duplicate registration is the kernel's `Error::SysOp`, not replaced silently.
 - Registration is synchronous, offline, and cheap: the factories capture configuration, and the transport contacts the container only when an operation runs.
 - Registration is not transactional: a set that fails part-way (duplicate or kernel error) leaves the factories registered before the failure in place.
-- `register_deferred` stays `async` to mirror the Python async setup path, performs no I/O, and exists only so old call sites keep compiling; the Python sandbox types are real providers now, so registration goes through `register_remote_providers` / `register_remote`.
+- `register_deferred` is the idempotent setup path: it registers every type in `REMOTE_SANDBOX_TYPES` that `registered_types` does not already report, through `register_remote`, so an empty registry ends up with all three and a registry that already holds some (or all) of them is left untouched.
+- `register_deferred` stays `async` to mirror the Python async setup path, and provider construction is lazy, so it performs no I/O and contacts no container.
+- `register_deferred` only fails when a registration it attempts fails (the kernel's `ErrorKind::SysOp` for an already-registered factory under a type it is filling in, or a kernel registration error).
 - `is_deferred(t)` is `!REMOTE_SANDBOX_TYPES.contains(&t)`, so `is_deferred("aio") == false` and any unknown name is deferred.
 - `SandboxProviderSet::deferred(sandbox_type)` is kept for host-defined sandbox types that are configured but not implemented: its factories return `Error::Unsupported("sandbox provider '<type>' is deferred; register a provider with sys_operation::register")`.
 - `register_gateway_provider` exists so a host can plug its own transport (or a mock in tests) without this crate shipping a protocol; it binds the supplied `SandboxGatewayConfig` into every registered factory, so the configuration passed to `create_fs`/`create_shell`/`create_code` is ignored for those registrations.
@@ -106,6 +108,7 @@ All three providers are always compiled — no Cargo feature gates them — and 
 - AIO has no container-delete API (the gateway owns the container lifetime and reaps idle containers), so `shutdown_remote("aio", ..)` is `ErrorKind::Unsupported` naming the gateway — no endpoint is invented and no request is issued.
 - Selection is by `shared_key`, `sandbox_id`, base URL, or `all()` (drain the whole process cache); a `sandbox_id`-only selector is `Unsupported` for YuanRong, because an ADX environment id carries no base URL to send the delete to. A cache-key miss with a `sandbox_id` still deletes through that key's base URL.
 - The cache entry is popped before the request, so a failed delete never leaves a stale id behind; a backend instance that already resolved an id keeps its own copy (Python's per-instance `_sandbox_id`), so its next operation recreates the container.
+- Rebuilding a popped entry's delete client can fail (the cached base URL no longer parses); that path records a `TeardownFailure` naming the client build instead of dropping the entry silently, so every popped container is either in `deleted` or in `failed`.
 - `shutdown_remote_all` never fails on AIO: it reports the gateway reason in that report's `unsupported` field and tears the other two down.
 
 ## Conditional Writes
@@ -165,7 +168,7 @@ All three providers are always compiled — no Cargo feature gates them — and 
 
 ## Test Strategy
 
-- `mod.rs` unit tests cover the facade: empty `DEFERRED_SANDBOX_TYPES`, the three `REMOTE_SANDBOX_TYPES`, a complete factory set per remote type, unknown-type rejection messages, `is_deferred` semantics, duplicate registration, `register_gateway_provider` binding, and the `register_deferred` no-op.
+- `mod.rs` unit tests cover the facade: empty `DEFERRED_SANDBOX_TYPES`, the three `REMOTE_SANDBOX_TYPES`, a complete factory set per remote type, unknown-type rejection messages, `is_deferred` semantics, duplicate registration, `register_gateway_provider` binding, and `register_deferred` installing all three types idempotently, both before and after `register_remote_providers`.
 - `remote/transport.rs` tests cover base-URL joining, `auth_headers`/`auth_query_params` injection, bearer tokens, timeouts, status rendering, hex/base64 round-trips, and `gateway_failure` producing `199007` with the Python message.
 - `remote/semantics.rs` and `remote/local_io.rs` test the pure host-side helpers: line selection and its mutual-exclusion errors, newline transforms, chunking, POSIX quoting, sorting/filtering, and host reads/writes with `overwrite`/`create_parent_dirs`.
 - `remote/backend/tests.rs` drives the generic wrappers through a recording fake backend: every `FsOperation`/`ShellOperation`/`CodeOperation` method, stream termination, capability propagation, and error-code mapping; `remote/backend/tests/conditional.rs` covers the conditional path (capability opt-in, no lock for a plain write, `create_if_absent` success/refusal, digest match/mismatch/absent, incompatible combinations with zero reads and zero writes).

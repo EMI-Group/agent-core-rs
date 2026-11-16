@@ -11,8 +11,9 @@
 //! stepping by 20, typed input variables (`constant` or `ref` with their
 //! `extra.index`), nested `object` output schemas, prompt templates, plugin
 //! defaults, branch comparisons, intent lists, and code exception settings.
-//! Python's `uuid`-generated ids are replaced by deterministic ids, and an
-//! unknown node type is an error instead of a silently skipped node.
+//! Python's `uuid4` intent ids are reproduced as-is, so a generated intent id
+//! differs between two conversions, and an unknown node type is an error
+//! instead of a silently skipped node.
 //!
 //! [`PlatformWorkflow::to_value`] applies Python's null-dropping conversion, so
 //! unset optionals leave no key behind, and

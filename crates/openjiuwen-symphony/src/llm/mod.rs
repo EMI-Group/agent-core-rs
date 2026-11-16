@@ -20,8 +20,8 @@
 //! [`complete_json`](crate::llm::complete_json) is the shared call helper: it renders the system/user prompt,
 //! invokes the model, extracts the JSON object with
 //! [`extract_json_object`](openjiuwen_retrieval::extract_json_object), and turns a reply
-//! that carries no parseable object into a soft `None` (with a `tracing::warn!`). A
-//! model *invocation* failure stays an error, so a caller can apply
+//! that carries no parseable object into a soft `None` (after a per-reply
+//! `tracing::debug!`). A model *invocation* failure stays an error, so a caller can apply
 //! the configured [`ModelConfig`](crate::llm::ModelConfig) fallback.
 //!
 //! # Fallbacks
@@ -29,15 +29,42 @@
 //! [`FallbackMode`](crate::llm::FallbackMode) is the single switch: [`FallbackMode::Deterministic`](crate::llm::FallbackMode) (the default)
 //! degrades to the stage's offline rule, while [`FallbackMode::Error`](crate::llm::FallbackMode) surfaces the
 //! model failure. Every fallback is deterministic and documented on the stage that owns
-//! it:
+//! it, and every stage reports where its answer came from:
 //!
-//! | Module | LLM stage | Deterministic fallback |
-//! | --- | --- | --- |
-//! | [`tree`](crate::llm::tree) | progressive tree walk | lexical query-term coverage |
-//! | [`ontology`](crate::llm::ontology) | `can_feed` validation | the candidate rule's own confidence |
-//! | [`scoring`](crate::llm::scoring) | semantic plan scores | [`crate::orchestration::LexicalSemanticScorer`] |
-//! | [`fingerprint`](crate::llm::fingerprint) | semantic profile extraction | a profile derived from the card |
-//! | [`judge`](crate::llm::judge) | LLM-judged metric | a static description/IO rubric |
+//! | Module | LLM stage | Deterministic fallback | Provenance marker |
+//! | --- | --- | --- | --- |
+//! | [`tree`](crate::llm::tree) | progressive tree walk | lexical query-term coverage | `TreeSearchOutcome::provenance` |
+//! | [`ontology`](crate::llm::ontology) | `can_feed` validation | the candidate rule's own confidence | `MatchedVerdict::provenance` |
+//! | [`scoring`](crate::llm::scoring) | semantic plan scores | [`crate::orchestration::LexicalSemanticScorer`] | `SemanticScores::provenance` |
+//! | [`fingerprint`](crate::llm::fingerprint) | semantic profile extraction | a profile derived from the card | `FingerprintOutcome::provenance` |
+//! | [`judge`](crate::llm::judge) | LLM-judged metric | a static description/IO rubric | `JudgeVerdict::provenance` |
+//!
+//! # Provenance
+//!
+//! Because every stage silently answers from an offline rule when no model is wired, each
+//! stage's result carries a `StageProvenance` so a caller can
+//! tell a model verdict from a rule: `Model` means a configured model answered and its
+//! reply was usable, `DeterministicFallback` means a model was configured but the call
+//! failed or the reply was unusable so the documented rule answered, and `NoModel` means
+//! no model produced the answer (none is configured, or the request needed none).
+//!
+//! # Logging policy
+//!
+//! Every stage emits exactly one record per invocation that had no usable model, naming
+//! the stage and the fallback rule it used:
+//!
+//! - No model configured: exactly one `tracing::debug!`. That is the documented offline
+//!   default, so a warning per offline call would be noise; the provenance marker on the
+//!   result is the primary signal and log level is left to the caller.
+//! - A configured model that failed or answered unusably under
+//!   [`FallbackMode::Deterministic`](crate::llm::FallbackMode): exactly one `tracing::warn!`.
+//! - [`FallbackMode::Error`](crate::llm::FallbackMode): the typed
+//!   `Error::Llm` is returned instead, so nothing is logged as
+//!   a fallback (the error itself carries the reason).
+//!
+//! A stage's own reply-validation diagnostics (a malformed judgement, a missing
+//! `semantic_profile`, an unknown candidate id) stay per-item `tracing::warn!`s: they
+//! describe the reply, not the fallback decision.
 //!
 //! # Contracts
 //!
@@ -67,6 +94,7 @@ pub mod identity;
 pub mod judge;
 /// LLM-validated `can_feed` ontology matching.
 pub mod ontology;
+mod ontology_request;
 /// LLM-scored semantic relevance for the planner.
 pub mod scoring;
 /// LLM-guided progressive capability-tree retrieval.
@@ -75,21 +103,21 @@ pub mod tree;
 pub use openjiuwen_retrieval::{extract_json_object, CompletionModel, StaticCompletionModel};
 
 pub use cache::{cache_key, CachedMatch, MatchCache, CACHE_SCHEMA_VERSION};
-pub use fingerprint::{FingerprintConfig, FingerprintExtractor};
+pub use fingerprint::{FingerprintConfig, FingerprintExtractor, FingerprintOutcome};
 pub use foundation::FoundationCompletionModel;
 pub use identity::{
     canonical_json, endpoint_sha256, graph_identity_sha256, sanitize_metadata,
     stable_metadata_sha256, ModelIdentity, IDENTITY_VERSION, MAX_METADATA_DEPTH,
 };
-pub use judge::{LlmJudgeMetric, DEFAULT_JUDGE_NAME, DEFAULT_RUBRIC};
+pub use judge::{JudgeVerdict, LlmJudgeMetric, DEFAULT_JUDGE_NAME, DEFAULT_RUBRIC};
 pub use ontology::{
-    MatchOptions, OntologyConfig, OntologyMatch, OntologyMatcher, MATCHER_VERSION,
+    MatchOptions, MatchedVerdict, OntologyConfig, OntologyMatch, OntologyMatcher, MATCHER_VERSION,
     MATCH_SCHEMA_VERSION, PROMPT_VERSION,
 };
-pub use scoring::{DeterministicScorer, LlmSemanticScorer};
+pub use scoring::{DeterministicScorer, LlmSemanticScorer, SemanticScores};
 pub use tree::{
     LlmTreeRetriever, RetrieverItem, RetrieverNode, TreeRetriever, TreeRetrieverConfig,
-    TreeSearchRequest, TreeSearchResult,
+    TreeSearchOutcome, TreeSearchRequest, TreeSearchResult,
 };
 
 /// Chooses what a stage does when the configured model fails or answers unusably.
@@ -101,6 +129,91 @@ pub enum FallbackMode {
     Deterministic,
     /// Surface the model failure as an error instead of falling back.
     Error,
+}
+
+/// Where a stage's answer came from.
+///
+/// Every stage in this module answers from its deterministic rule when no model is
+/// wired, so the answer alone cannot tell a caller whether a model was involved. Each
+/// stage reports this marker on the outcome type it returns (see the module docs for the
+/// per-stage location).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StageProvenance {
+    /// A configured model answered and its reply was usable.
+    Model,
+    /// A model was configured but the call failed or the reply was unusable, so the
+    /// stage returned its documented deterministic rule instead.
+    DeterministicFallback,
+    /// No model produced the answer: none is configured, or the request needed none.
+    #[default]
+    NoModel,
+}
+
+impl StageProvenance {
+    /// The `snake_case` wire name (`"model"`, `"deterministic_fallback"`, `"no_model"`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::DeterministicFallback => "deterministic_fallback",
+            Self::NoModel => "no_model",
+        }
+    }
+
+    /// Whether a model produced the answer.
+    #[must_use]
+    pub fn is_model(self) -> bool {
+        matches!(self, Self::Model)
+    }
+
+    /// Whether an offline rule produced the answer (both non-model variants).
+    #[must_use]
+    pub fn is_deterministic(self) -> bool {
+        !self.is_model()
+    }
+
+    /// Whether this provenance is logged at `warn` rather than `debug`.
+    ///
+    /// Only [`StageProvenance::DeterministicFallback`] is: a configured model that was
+    /// unusable is a degradation worth a warning, while running with no model is the
+    /// documented offline default.
+    #[must_use]
+    pub fn is_warning(self) -> bool {
+        matches!(self, Self::DeterministicFallback)
+    }
+}
+
+impl fmt::Display for StageProvenance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Records that a stage ran without any model: the documented offline default.
+///
+/// This is a `debug!` record (not a warning) because a stage with no model is the
+/// expected offline path; the structured [`StageProvenance`] on the stage's result is the
+/// primary signal and a warning per offline call would make the default noisy.
+pub(crate) fn note_no_model(stage: &str, fallback: &str) {
+    tracing::debug!(
+        stage,
+        fallback,
+        "llm stage ran without a model; reporting the deterministic fallback"
+    );
+}
+
+/// Records that a configured model was unusable, so the deterministic rule answered.
+///
+/// This is the stage's single `warn!`: it names the stage and the fallback rule. The
+/// [`FallbackMode::Error`] path returns the typed error instead and does not double-log.
+pub(crate) fn note_fallback(stage: &str, fallback: &str, error: &crate::error::Error) {
+    tracing::warn!(
+        stage,
+        fallback,
+        %error,
+        "llm stage model was unusable; reporting the deterministic fallback"
+    );
 }
 
 /// The model and sampling settings one stage uses.
@@ -202,9 +315,11 @@ pub fn render_prompt(system: &str, user: &str) -> String {
 ///
 /// `model: None` answers `Ok(None)` without calling anything — the stage then takes its
 /// deterministic path. A reply with no extractable JSON object (or JSON that is not an
-/// object) also answers `Ok(None)`, after a `tracing::warn!`: that is the "soft failure"
-/// every Python stage tolerates. A model *invocation* error is returned unchanged so the
-/// caller can apply [`ModelConfig::fallback`].
+/// object) also answers `Ok(None)`, after a `tracing::debug!`: that is the "soft failure"
+/// every Python stage tolerates. A soft reply failure is only a per-reply diagnostic at
+/// `debug` level, because the calling stage then emits its own single `warn!`/`debug!`
+/// naming itself and the fallback rule it used. A model *invocation* error is returned
+/// unchanged so the caller can apply [`ModelConfig::fallback`].
 ///
 /// # Errors
 ///
@@ -223,19 +338,22 @@ pub async fn complete_json(
 }
 
 /// Parses one model reply into a JSON object, treating anything else as a soft failure.
+///
+/// Every rejection is a per-reply `debug!` diagnostic, not a warning: the calling stage
+/// reports the fallback decision itself, exactly once per invocation.
 fn parse_json_reply(reply: &str) -> Option<Value> {
     let Some(object) = extract_json_object(reply) else {
-        tracing::warn!("model reply contains no JSON object; treating it as a soft failure");
+        tracing::debug!("model reply contains no JSON object; treating it as a soft failure");
         return None;
     };
     match serde_json::from_str::<Value>(object) {
         Ok(value) if value.is_object() => Some(value),
         Ok(_) => {
-            tracing::warn!("model reply JSON is not an object; treating it as a soft failure");
+            tracing::debug!("model reply JSON is not an object; treating it as a soft failure");
             None
         }
         Err(error) => {
-            tracing::warn!(%error, "model reply JSON could not be parsed; treating it as a soft failure");
+            tracing::debug!(%error, "model reply JSON could not be parsed; treating it as a soft failure");
             None
         }
     }
@@ -359,5 +477,61 @@ mod tests {
         assert!(rendered.contains("static-completion-model"));
         assert!(rendered.contains("Deterministic"));
         assert!(config.is_configured());
+    }
+
+    #[test]
+    fn stage_provenance_reports_its_wire_name_and_classification() {
+        let cases = [
+            (StageProvenance::Model, "model", true, false, false),
+            (
+                StageProvenance::DeterministicFallback,
+                "deterministic_fallback",
+                false,
+                true,
+                true,
+            ),
+            (StageProvenance::NoModel, "no_model", false, true, false),
+        ];
+        for (provenance, wire, is_model, is_deterministic, is_warning) in cases {
+            assert_eq!(provenance.as_str(), wire);
+            assert_eq!(provenance.to_string(), wire);
+            assert_eq!(provenance.is_model(), is_model, "{wire}");
+            assert_eq!(provenance.is_deterministic(), is_deterministic, "{wire}");
+            assert_eq!(provenance.is_warning(), is_warning, "{wire}");
+        }
+    }
+
+    #[test]
+    fn stage_provenance_defaults_to_no_model() {
+        assert_eq!(StageProvenance::default(), StageProvenance::NoModel);
+        assert!(!StageProvenance::default().is_model());
+    }
+
+    #[test]
+    fn stage_provenance_round_trips_through_serde() {
+        for provenance in [
+            StageProvenance::Model,
+            StageProvenance::DeterministicFallback,
+            StageProvenance::NoModel,
+        ] {
+            let json = serde_json::to_string(&provenance).unwrap();
+            assert_eq!(json, format!("\"{}\"", provenance.as_str()));
+            assert_eq!(
+                serde_json::from_str::<StageProvenance>(&json).unwrap(),
+                provenance
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<StageProvenance>("\"model\"").unwrap(),
+            StageProvenance::Model
+        );
+        assert_eq!(
+            serde_json::from_str::<StageProvenance>("\"deterministic_fallback\"").unwrap(),
+            StageProvenance::DeterministicFallback
+        );
+        assert_eq!(
+            serde_json::from_str::<StageProvenance>("\"no_model\"").unwrap(),
+            StageProvenance::NoModel
+        );
     }
 }

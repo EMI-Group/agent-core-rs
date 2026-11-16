@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use openjiuwen_common::error::ErrorKind;
 use openjiuwen_session::checkpoint::redis::DEFAULT_REDIS_KEY_PREFIX;
+use openjiuwen_session::checkpoint::resp::RespConnection;
 use openjiuwen_session::checkpoint::{
     create_checkpointer, Checkpoint, CheckpointMeta, CheckpointNamespace, Checkpointer,
     CheckpointerConfig, CheckpointerKind,
@@ -322,13 +323,16 @@ async fn factory_rejects_a_missing_url() {
 }
 
 #[tokio::test]
-async fn connect_rejects_malformed_and_unsupported_urls() {
+async fn connect_rejects_malformed_urls() {
     for malformed in [
         String::new(),
         "http://127.0.0.1:6379".to_string(),
         "127.0.0.1:6379".to_string(),
         "redis://127.0.0.1:not-a-port".to_string(),
         "redis://127.0.0.1:6379/not-a-database".to_string(),
+        "rediss://127.0.0.1:not-a-port".to_string(),
+        "rediss://127.0.0.1:6379/not-a-database".to_string(),
+        "rediss://".to_string(),
     ] {
         let error = RedisCheckpointer::connect(malformed.clone())
             .await
@@ -340,11 +344,10 @@ async fn connect_rejects_malformed_and_unsupported_urls() {
             "unexpected error for {malformed:?}: {error}"
         );
     }
-    let error = RedisCheckpointer::connect("rediss://127.0.0.1:6379")
-        .await
-        .expect_err("TLS URLs are not supported");
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert!(error.to_string().contains("rediss"), "{error}");
+    // `rediss://` became a real TLS transport, so it is no longer refused as an
+    // unsupported feature; see `checkpoint_redis_tls.rs` for the TLS coverage.
+    assert!(!RespConnection::uses_tls("redis://127.0.0.1:6379").unwrap());
+    assert!(RespConnection::uses_tls("rediss://127.0.0.1:6379").unwrap());
 }
 
 #[tokio::test]
@@ -428,9 +431,7 @@ async fn prunes_expired_documents_from_the_index() {
     .await;
     // Delete the document behind the index's back, as an expiring TTL would.
     let document = format!("{DEFAULT_REDIS_KEY_PREFIX}:session:session-stale:checkpoint:cp-stale");
-    let mut raw = openjiuwen_session::checkpoint::resp::RespConnection::connect(&server.url())
-        .await
-        .unwrap();
+    let mut raw = RespConnection::connect(&server.url()).await.unwrap();
     raw.command(&["DEL", &document]).await.unwrap();
     assert_eq!(
         checkpointer.list("session-stale").await.unwrap(),

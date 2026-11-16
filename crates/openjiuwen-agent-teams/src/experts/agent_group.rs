@@ -1045,10 +1045,15 @@ fn discover_shared_skills(
         if !directory {
             continue;
         }
+        let label = child.file_name().to_string_lossy().into_owned();
         if !std::fs::metadata(path.join("SKILL.md")).is_ok_and(|metadata| metadata.is_file()) {
+            tracing::debug!(
+                package = %package_dir.display(),
+                skill = %label,
+                "AgentGroup skill candidate has no SKILL.md; not mounting it"
+            );
             continue;
         }
-        let label = child.file_name().to_string_lossy().into_owned();
         let validated = validate_shared_skill(package_dir, &path, &label)?;
         if seen.contains(&validated) {
             continue;

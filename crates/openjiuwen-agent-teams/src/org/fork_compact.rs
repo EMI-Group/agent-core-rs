@@ -39,6 +39,14 @@ use crate::schema::{
     DeepAgentSpec, ModelRef, TeamAgentSpec, TeamMemberSpec, ToolSpec, WorkspaceSpec,
 };
 
+// The template-driven entry point lives in the sibling [`super::compact_template`] module and is
+// re-exported here so `fork_compact` keeps presenting the whole compaction surface.
+pub use super::compact_template::{
+    compact_with_template, BudgetTier, CompactDirection, CompactTemplate, CompactionSide,
+    SummaryFact, SummaryOmission, SummaryRetention, TemplateCompaction, DEFAULT_BUDGET_PRIORITY,
+    DEFAULT_EXCERPT_CHARS, DEFAULT_TEMPLATE_MAX_FACTS,
+};
+
 /// Prefix of the single summary message compaction emits.
 pub const SUMMARY_PREFIX: &str = "[compacted] ";
 
@@ -476,7 +484,7 @@ impl TranscriptMessage {
     }
 
     /// Renders the message as one line: `[role] content`, or `[tool:<name>] content`.
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         match (self.role, self.tool_name.as_deref()) {
             (CompactRole::Tool, Some(name)) if !name.is_empty() => {
                 format!("[tool:{name}] {}", self.content)
@@ -713,10 +721,24 @@ pub fn compact_transcript(
 /// Counts are fixed-order (`user`, `assistant`, `tool`) and zero categories are omitted, so the
 /// same input always renders the same line.
 fn summary_line(dropped: &[&TranscriptMessage]) -> String {
+    let total = dropped.len();
+    let noun = if total == 1 { "message" } else { "messages" };
+    format!(
+        "{SUMMARY_PREFIX}{total} earlier {noun} dropped ({})",
+        role_count_parts(dropped)
+    )
+}
+
+/// Renders the role counts of `messages` as `"3 user, 5 assistant"`.
+///
+/// The order is fixed (`user`, `assistant`, `tool`) and zero categories are omitted, so the same
+/// input always renders the same text. Shared by [`summary_line`] and the template-driven summary
+/// of [`super::compact_template`].
+pub(crate) fn role_count_parts(messages: &[&TranscriptMessage]) -> String {
     let mut user = 0;
     let mut assistant = 0;
     let mut tool = 0;
-    for message in dropped {
+    for message in messages {
         match message.role {
             CompactRole::User => user += 1,
             CompactRole::Assistant => assistant += 1,
@@ -731,20 +753,18 @@ fn summary_line(dropped: &[&TranscriptMessage]) -> String {
             parts.push(format!("{count} {label}"));
         }
     }
-
-    let total = dropped.len();
-    let noun = if total == 1 { "message" } else { "messages" };
-    format!(
-        "{SUMMARY_PREFIX}{total} earlier {noun} dropped ({})",
-        parts.join(", ")
-    )
+    parts.join(", ")
 }
 
 /// Cuts `content` to `max_bytes` on a `char` boundary and appends `suffix`.
 ///
 /// Returns `None` when nothing should change: the content already fits, or the cut would not make
 /// it shorter (a tiny budget with a long suffix), which keeps compaction monotone.
-fn shortened_tool_content(content: &str, max_bytes: usize, suffix: &str) -> Option<String> {
+pub(crate) fn shortened_tool_content(
+    content: &str,
+    max_bytes: usize,
+    suffix: &str,
+) -> Option<String> {
     if content.len() <= max_bytes {
         return None;
     }

@@ -13,9 +13,9 @@ use serde_json::{json, Value};
 
 use openjiuwen_retrieval::HashEmbedding;
 use openjiuwen_symphony::experience::{
-    cluster_traces, ExperienceBank, ExperienceCollector, ExperienceIndex, ExperienceRanking,
-    ExperienceSink, TraceRecord, TraceStore, TraceToolCall, PENDING_FLUSH_THRESHOLD,
-    QUERY_EXAMPLES_COUNT,
+    cluster_traces, cluster_traces_with_embedding, ClusterConfig, ExperienceBank,
+    ExperienceCollector, ExperienceIndex, ExperienceRanking, ExperienceSink, TraceRecord,
+    TraceStore, TraceToolCall, PENDING_FLUSH_THRESHOLD, QUERY_EXAMPLES_COUNT,
 };
 
 /// Writes one session directory (`metadata.json` and, when given, `history.json`).
@@ -352,7 +352,7 @@ async fn clear_removes_records_and_the_processed_index() {
 }
 
 #[tokio::test]
-async fn clustering_groups_by_skill_set_then_similarity() {
+async fn clustering_groups_by_skill_set_then_embedding_kmeans() {
     let records = vec![
         record("t1", "deploy the kubernetes cluster", &["ops"], true),
         record("t2", "deploy the kubernetes cluster now", &["ops"], true),
@@ -374,7 +374,9 @@ async fn clustering_groups_by_skill_set_then_similarity() {
     assert_eq!(clusters[1].members, vec!["t3"]);
     assert_eq!(clusters[2].skill_ids, vec!["ops"]);
     assert_eq!(clusters[2].members, vec!["t1", "t2"]);
-    assert_eq!(clusters[2].pattern, "deploy the kubernetes cluster now");
+    // The three ["ops"] traces split into two k-means clusters, and a cluster's pattern is
+    // the member whose vector sits closest to the cluster's mean, which t1's short query is.
+    assert_eq!(clusters[2].pattern, "deploy the kubernetes cluster");
     assert_eq!(
         clusters[2].query_examples,
         vec![
@@ -385,6 +387,40 @@ async fn clustering_groups_by_skill_set_then_similarity() {
 
     // Deterministic: the same input always yields the same output.
     assert_eq!(clusters, cluster_traces(&records));
+}
+
+#[tokio::test]
+async fn the_explicit_embedding_entry_point_matches_the_hash_embedding_path() {
+    let records = vec![
+        record("t1", "deploy the kubernetes cluster", &["ops"], true),
+        record("t2", "deploy the kubernetes cluster now", &["ops"], true),
+        record("t3", "bake a chocolate cake", &["ops"], true),
+        record("t4", "summarize the report", &["summary"], true),
+        record("t5", "   ", &["summary"], true),
+    ];
+    let implicit = cluster_traces(&records);
+    // `cluster_traces` is documented as the `HashEmbedding` path, so handing the same
+    // embedder to the explicit entry point reproduces it exactly — the two entry points
+    // differ in the embedder only, never in the algorithm.
+    let explicit = cluster_traces_with_embedding(
+        &records,
+        &HashEmbedding::default(),
+        &ClusterConfig::default(),
+    )
+    .await
+    .expect("cluster with the hash embedding");
+    assert_eq!(explicit, implicit);
+    // Two skill groups: the three ["ops"] traces split in two, and the blank ["summary"]
+    // query shares its group's only list.
+    assert_eq!(explicit.len(), 3);
+    assert_eq!(
+        explicit
+            .iter()
+            .find(|cluster| cluster.skill_ids == vec!["summary"])
+            .expect("summary cluster")
+            .members,
+        vec!["t4", "t5"]
+    );
 }
 
 #[tokio::test]

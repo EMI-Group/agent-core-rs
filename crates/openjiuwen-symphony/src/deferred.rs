@@ -19,17 +19,21 @@
 //! module, because each of those types keeps working offline and only one entry point
 //! reports the gap:
 //!
-//! - [`ExperienceIndex::open_with_algorithm`](crate::experience::ExperienceIndex::open_with_algorithm)
-//!   rejects every `ivf*` vector algorithm (`faiss IVF index training`).
 //! - [`GroupingStrategy`](crate::retrieval::build::grouping::GroupingStrategy)'s
-//!   `FaissKmeans`, `Kmeans` and `LlmGrouping` variants fail a build through
-//!   [`IndexBuilder::build`](crate::retrieval::build::workflows::IndexBuilder::build)
-//!   (`faiss k-means tree grouping`, `k-means tree grouping`, `LLM-guided tree grouping`).
-//! - [`GcsObjectStore::from_service_account_file`](crate::object_artifact::GcsObjectStore::from_service_account_file)
-//!   refuses a service-account key file (`Google Cloud Storage service-account JSON
-//!   credentials`), and
-//!   [`AzureBlobStore::from_client_credentials`](crate::object_artifact::AzureBlobStore::from_client_credentials)
-//!   refuses the Azure AD client-credential flow (`Azure AD client-credential OAuth`).
+//!   `FaissKmeans`, `Kmeans` and `LlmGrouping` variants are supported at runtime: they are
+//!   the strategies [`GroupingStrategy::requires_runtime`](crate::retrieval::build::grouping::GroupingStrategy::requires_runtime)
+//!   returns `true` for, and
+//!   [`group_items_with`](crate::retrieval::build::grouping::group_items_with) runs them
+//!   through a [`GroupingRuntime`](crate::retrieval::build::grouping::GroupingRuntime). Only
+//!   the synchronous [`group_items`](crate::retrieval::build::grouping::group_items) entry
+//!   point — and therefore
+//!   [`IndexBuilder::build`](crate::retrieval::build::workflows::IndexBuilder::build) — reports
+//!   `Error::Unsupported`, because a synchronous stage cannot await an embedding or completion
+//!   model (`faiss k-means tree grouping`, `k-means tree grouping`, `LLM-guided tree
+//!   grouping`); use `group_items_with` for those three.
+//! - [`AzureBlobStore::from_client_credentials`](crate::object_artifact::AzureBlobStore::from_client_credentials)
+//!   refuses the Azure AD client-credential flow (`Azure AD client-credential OAuth`); a
+//!   storage account shared key, a SAS token and anonymous access cover every artifact path.
 //!
 //! A `transformers` or `vLLM` model cannot be expressed without a native ML/GPU stack, which
 //! an offline build does not ship. Rather than dropping it silently, it keeps its public

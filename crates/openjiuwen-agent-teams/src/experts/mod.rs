@@ -10,7 +10,8 @@
 //!   exposed its display cards;
 //! * **assembly** — [`compose_template_member`] turns a template into a
 //!   [`DeepAgentSpec`](crate::schema::DeepAgentSpec), and
-//!   [`bind_group`] describes the spawnable members of a loaded group.
+//!   [`bind_group`] describes the spawnable members of a loaded group, recording every roster
+//!   member it did not bind in [`BoundAgentGroup::skipped`].
 //!
 //! The process-wide catalog ([`set_process_expert_catalog`] / [`get_process_expert_catalog`]) is
 //! one of the crate's two documented singletons; clear it in tests.
@@ -43,4 +44,5 @@ pub use catalog::{
 };
 pub use template::{
     bind_group, compose_template_member, render_persona, BoundAgentGroup, BoundGroupMember,
+    SkipReason, SkippedMember,
 };

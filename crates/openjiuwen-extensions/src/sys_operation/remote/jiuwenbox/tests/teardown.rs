@@ -440,3 +440,30 @@ async fn a_shared_key_miss_with_a_sandbox_id_deletes_through_the_key_base_url() 
         vec![container_path(&sandbox_id)]
     );
 }
+#[tokio::test]
+async fn an_unbuildable_fallback_client_is_recorded_as_a_failure() {
+    let _serial = crate::sys_operation::remote::teardown_guard().lock().await;
+    // A shared key whose base-URL half is empty: the entry is not cached, so the
+    // release would have to rebuild its client — and that rebuild fails, because
+    // there is no endpoint to send the delete to. Dropping the failure would
+    // leave `failed` empty, claiming a release that never happened.
+    let sandbox_id = "sb-unbuildable-client";
+    let selector = SandboxSelector {
+        shared_key: Some(format!("|{}", unique_isolation_key())),
+        sandbox_id: Some(sandbox_id.to_string()),
+        ..SandboxSelector::default()
+    };
+    let report = teardown(&selector).await.unwrap();
+    assert!(
+        report.released_keys.is_empty(),
+        "{:?}",
+        report.released_keys
+    );
+    assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+    assert_eq!(report.failed[0].container_id, sandbox_id);
+    assert!(
+        report.failed[0].reason.contains("delete client"),
+        "{}",
+        report.failed[0].reason
+    );
+}

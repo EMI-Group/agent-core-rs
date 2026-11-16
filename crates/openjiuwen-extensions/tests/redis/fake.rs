@@ -8,9 +8,9 @@
 //! Requests are parsed with the crate's own `codec::parse_reply`, replies are
 //! hand-encoded (`encode_command` only writes requests), and expiry is lazy, so no
 //! task or clock is involved. Dropping the [`Server`] signals the accept loop,
-//! which drops the listener and releases the port. [`Server::start_moved`] answers
-//! `-MOVED 3999 127.0.0.1:7000` so the cluster-routing test can assert the
-//! redirection path.
+//! which drops the listener and releases the port. [`Server::start_moved_to`]
+//! answers `-MOVED 3999 <target>` so the cluster-redirection test can point it at a
+//! second, live [`Server`].
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -34,13 +34,13 @@ pub(crate) struct Server {
 impl Server {
     /// Starts a server that answers every supported command.
     pub(crate) async fn start() -> Self {
-        Self::start_with(false).await
+        Self::start_with(None).await
     }
-    /// Starts a server answering `-MOVED 3999 127.0.0.1:7000` after the handshake.
-    pub(crate) async fn start_moved() -> Self {
-        Self::start_with(true).await
+    /// Starts a server answering `-MOVED 3999 <target>` after the handshake.
+    pub(crate) async fn start_moved_to(target: SocketAddr) -> Self {
+        Self::start_with(Some(target)).await
     }
-    async fn start_with(moved: bool) -> Self {
+    async fn start_with(redirect: Option<SocketAddr>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let data = Arc::new(Mutex::new(Data::default()));
@@ -53,7 +53,7 @@ impl Server {
                     accepted = listener.accept() => match accepted {
                         Ok((stream, _peer)) => {
                             let connection = Arc::clone(&accept_data);
-                            tokio::spawn(serve(stream, connection, moved));
+                            tokio::spawn(serve(stream, connection, redirect));
                         }
                         Err(_) => break,
                     },
@@ -66,6 +66,10 @@ impl Server {
             state: State { data },
             stop: Some(stop),
         }
+    }
+    /// The loopback address this server listens on.
+    pub(crate) fn addr(&self) -> SocketAddr {
+        self.addr
     }
     /// A `redis://` URL pointing at this server, database `0`.
     pub(crate) fn url(&self) -> String {
@@ -167,7 +171,7 @@ impl Data {
     }
 }
 /// Accepts one connection and answers requests until it closes.
-async fn serve(mut stream: TcpStream, state: Arc<Mutex<Data>>, moved: bool) {
+async fn serve(mut stream: TcpStream, state: Arc<Mutex<Data>>, redirect: Option<SocketAddr>) {
     let mut buffer: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -176,7 +180,7 @@ async fn serve(mut stream: TcpStream, state: Arc<Mutex<Data>>, moved: bool) {
                 buffer.drain(..consumed);
                 let reply = request_args(&request).map_or_else(
                     || error("ERR Protocol error: not an array"),
-                    |args| execute(&state, &args, moved),
+                    |args| execute(&state, &args, redirect),
                 );
                 if send_reply(&mut stream, &reply).await.is_err() {
                     return;
@@ -221,12 +225,14 @@ macro_rules! at_least {
 }
 /// Executes one command against the shared state.
 #[allow(clippy::too_many_lines)]
-fn execute(state: &Arc<Mutex<Data>>, args: &[Vec<u8>], moved: bool) -> Reply {
+fn execute(state: &Arc<Mutex<Data>>, args: &[Vec<u8>], redirect: Option<SocketAddr>) -> Reply {
     let Some(name) = args.first().map(|arg| upper(arg)) else {
         return error("ERR Protocol error: empty command");
     };
-    if moved && !matches!(name.as_str(), "AUTH" | "SELECT" | "HELLO") {
-        return error("MOVED 3999 127.0.0.1:7000");
+    if let Some(target) = redirect {
+        if !matches!(name.as_str(), "AUTH" | "SELECT" | "HELLO" | "ASKING") {
+            return error(&format!("MOVED 3999 {target}"));
+        }
     }
     let mut guard = state.lock().expect("the fake state mutex is not poisoned");
     guard.purge();

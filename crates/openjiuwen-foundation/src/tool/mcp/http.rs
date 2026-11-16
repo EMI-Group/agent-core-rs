@@ -14,7 +14,10 @@
 //!   `GET` event stream (see [`ServerStreamState`]); server notifications and
 //!   server requests arrive on it.
 //! - [`SseTransport`] opens one `GET` event stream, learns the POST endpoint from
-//!   its `endpoint` event, and receives every reply on that stream.
+//!   its `endpoint` event, and receives every reply on that stream. It reopens the
+//!   stream when the body ends or fails, replaying `Last-Event-ID` from the last
+//!   event it accepted (see [`sse::sse_stream_headers`]); a stream it cannot resume is
+//!   reported to the next send as a typed [`HttpTransportError`].
 //!
 //! Configured `auth_headers` are sent with every request and
 //! `auth_query_params` are appended to the endpoint URL, so servers that
@@ -35,11 +38,12 @@ use rmcp::service::TxJsonRpcMessage;
 use rmcp::{transport::Transport, RoleClient};
 use serde_json::Value;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::client::{reconnect_attempt_budget, reconnect_delay, McpNotification, McpServerConfig};
+
+pub(crate) mod sse;
 
 /// Header carrying the MCP session id in streamable-HTTP responses.
 const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
@@ -47,8 +51,6 @@ const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
 const EVENT_STREAM_MIME_TYPE: &str = "text/event-stream";
 /// MIME type of a single JSON-RPC response body.
 const JSON_MIME_TYPE: &str = "application/json";
-/// How long an SSE transport waits for the server's `endpoint` event.
-const SSE_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Header carrying the MCP protocol version negotiated with the server.
 const HEADER_PROTOCOL_VERSION: &str = "MCP-Protocol-Version";
 /// Header carrying the id of the last event the client accepted.
@@ -677,181 +679,6 @@ fn handle_server_stream_frame(
         }
     }
     let _ = outbound.send(message);
-}
-
-/// A legacy HTTP+SSE transport.
-pub(crate) struct SseTransport {
-    endpoint: Endpoint,
-    post_endpoint: Arc<Mutex<Option<String>>>,
-    endpoint_ready: Arc<Notify>,
-    started: Arc<AtomicBool>,
-    inbound: UnboundedReceiver<ServerJsonRpcMessage>,
-    outbound: UnboundedSender<ServerJsonRpcMessage>,
-    cancellation: CancellationToken,
-}
-
-impl SseTransport {
-    /// Creates a transport for `config`; the event stream opens on first use.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Validation`] when the URL or the auth headers are invalid.
-    pub(crate) fn new(config: &McpServerConfig) -> Result<Self> {
-        let (outbound, inbound) = unbounded_channel();
-        Ok(Self {
-            endpoint: Endpoint::new(config)?,
-            post_endpoint: Arc::new(Mutex::new(None)),
-            endpoint_ready: Arc::new(Notify::new()),
-            started: Arc::new(AtomicBool::new(false)),
-            inbound,
-            outbound,
-            cancellation: CancellationToken::new(),
-        })
-    }
-}
-
-impl Transport<RoleClient> for SseTransport {
-    type Error = HttpTransportError;
-
-    fn send(
-        &mut self,
-        item: TxJsonRpcMessage<RoleClient>,
-    ) -> impl std::future::Future<Output = std::result::Result<(), Self::Error>> + Send + 'static
-    {
-        let endpoint = self.endpoint.clone();
-        let post_endpoint = self.post_endpoint.clone();
-        let endpoint_ready = self.endpoint_ready.clone();
-        let started = self.started.clone();
-        let outbound = self.outbound.clone();
-        let cancellation = self.cancellation.clone();
-        async move {
-            if cancellation.is_cancelled() {
-                return Err(HttpTransportError::protocol("transport closed"));
-            }
-            if !started.swap(true, Ordering::SeqCst) {
-                spawn_sse_stream(
-                    endpoint.clone(),
-                    post_endpoint.clone(),
-                    endpoint_ready.clone(),
-                    started.clone(),
-                    outbound,
-                    cancellation.clone(),
-                );
-            }
-            let target = wait_post_endpoint(post_endpoint, endpoint_ready).await?;
-            let target = resolve_endpoint(&endpoint.url, &target)?;
-            let body = serde_json::to_string(&item)
-                .map_err(|error| HttpTransportError::protocol(error.to_string()))?;
-            let response = endpoint
-                .client
-                .post(target)
-                .header(CONTENT_TYPE, JSON_MIME_TYPE)
-                .headers(endpoint.headers.clone())
-                .body(body)
-                .send()
-                .await?;
-            let status = response.status();
-            if status.is_success() {
-                return Ok(());
-            }
-            Err(HttpTransportError::Status(status.as_u16()))
-        }
-    }
-
-    async fn receive(&mut self) -> Option<ServerJsonRpcMessage> {
-        self.inbound.recv().await
-    }
-
-    // No `.await` is needed here, but the transport contract is async.
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn close(&mut self) -> std::result::Result<(), Self::Error> {
-        self.cancellation.cancel();
-        Ok(())
-    }
-}
-
-/// Resolves the (possibly relative) POST endpoint against the SSE URL.
-fn resolve_endpoint(base: &str, endpoint: &str) -> std::result::Result<String, HttpTransportError> {
-    let base = Url::parse(base)?;
-    let resolved = base.join(endpoint.trim())?;
-    Ok(resolved.to_string())
-}
-
-/// Waits for the SSE `endpoint` event, bounded by [`SSE_ENDPOINT_TIMEOUT`].
-async fn wait_post_endpoint(
-    post_endpoint: Arc<Mutex<Option<String>>>,
-    endpoint_ready: Arc<Notify>,
-) -> std::result::Result<String, HttpTransportError> {
-    let deadline = tokio::time::Instant::now() + SSE_ENDPOINT_TIMEOUT;
-    loop {
-        if let Some(endpoint) = post_endpoint.lock().ok().and_then(|slot| slot.clone()) {
-            return Ok(endpoint);
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(HttpTransportError::protocol(
-                "timed out waiting for the MCP SSE endpoint event",
-            ));
-        }
-        let _ = tokio::time::timeout(remaining, endpoint_ready.notified()).await;
-    }
-}
-
-/// Spawns the long-lived GET event stream of an SSE transport.
-fn spawn_sse_stream(
-    endpoint: Endpoint,
-    post_endpoint: Arc<Mutex<Option<String>>>,
-    endpoint_ready: Arc<Notify>,
-    started: Arc<AtomicBool>,
-    outbound: UnboundedSender<ServerJsonRpcMessage>,
-    cancellation: CancellationToken,
-) {
-    tokio::spawn(async move {
-        let request = endpoint
-            .client
-            .get(&endpoint.url)
-            .header(ACCEPT, EVENT_STREAM_MIME_TYPE)
-            .headers(endpoint.headers.clone());
-        let response = match request.send().await {
-            Ok(response) if response.status().is_success() => response,
-            Ok(response) => {
-                tracing::debug!(
-                    status = response.status().as_u16(),
-                    "MCP SSE endpoint rejected the event stream"
-                );
-                return;
-            }
-            Err(error) => {
-                tracing::debug!(%error, "MCP SSE endpoint could not be reached");
-                return;
-            }
-        };
-        let mut stream = response.bytes_stream();
-        let mut parser = SseParser::default();
-        loop {
-            tokio::select! {
-                () = cancellation.cancelled() => break,
-                chunk = stream.next() => match chunk {
-                    Some(Ok(bytes)) => {
-                        for frame in parser.push(&bytes) {
-                            forward_frame(&frame, &outbound, Some(&post_endpoint));
-                        }
-                        endpoint_ready.notify_waiters();
-                    }
-                    Some(Err(error)) => {
-                        tracing::debug!(%error, "MCP SSE event stream failed");
-                        break;
-                    }
-                    None => break,
-                },
-            }
-        }
-        // Let the next send start a fresh stream.
-        if let Ok(mut slot) = post_endpoint.lock() {
-            *slot = None;
-        }
-        started.store(false, Ordering::SeqCst);
-    });
 }
 
 /// One parsed Server-Sent-Events frame.

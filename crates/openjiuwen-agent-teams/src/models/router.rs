@@ -81,14 +81,23 @@ impl RouterStrategy {
 }
 
 impl From<ModelPoolStrategy> for RouterStrategy {
-    /// Maps the build-time allocation strategy onto the per-request strategy of the same name.
+    /// Maps the build-time allocation strategy onto its per-request counterpart.
     ///
-    /// `RoundRobin` → [`RouterStrategy::RoundRobin`], `ByModelName` → [`RouterStrategy::ByName`]:
-    /// a team configured to spread members over the pool also spreads its requests, and a team
-    /// configured by name keeps honouring the requested name.
+    /// `RoundRobin` becomes [`RouterStrategy::RoundRobin`] because a team configured to spread
+    /// members over the pool also spreads its requests.
+    /// `ByModelName` becomes [`RouterStrategy::ByName`] because a team configured by name keeps
+    /// honouring the requested name.
+    /// `IntelliRouter` also becomes [`RouterStrategy::RoundRobin`], because [`RouterStrategy`] has
+    /// no `IntelliRouter` behaviour in this port and rotation is the closest honest per-request
+    /// policy.
+    /// That fallback never silently degrades a team: a team actually configured with
+    /// [`ModelPoolStrategy::IntelliRouter`] fails earlier, at allocation, with a typed
+    /// [`Error::Unsupported`] owned by `crate::runtime::allocator`.
     fn from(strategy: ModelPoolStrategy) -> Self {
         match strategy {
-            ModelPoolStrategy::RoundRobin => Self::RoundRobin,
+            // Rotation is both the pool's spread policy and the honest stand-in for an
+            // `IntelliRouter` team, which fails earlier at allocation.
+            ModelPoolStrategy::RoundRobin | ModelPoolStrategy::IntelliRouter => Self::RoundRobin,
             ModelPoolStrategy::ByModelName => Self::ByName,
         }
     }

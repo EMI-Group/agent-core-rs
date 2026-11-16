@@ -23,6 +23,11 @@ tiktoken-rs.workspace = true
 uuid.workspace = true
 base64.workspace = true
 sha2.workspace = true
+regex.workspace = true
+# Pinned inline (not a `[workspace.dependencies]` entry) exactly like `tower` elsewhere:
+# `unicode-normalization 0.1.26` is already locked through `stringprep`/`sqlx-postgres`,
+# so this is an offline-available direct dependency for the NFC/NFD/NFKC/NFKD normalizers.
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 openjiuwen-test-support.workspace = true

@@ -20,18 +20,20 @@ use openjiuwen_foundation::prompt::{ApproxTokenCounter, BaseMessage, TokenCounte
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::tokenizers::{TokenMeasurement, TokenizerSource};
+use crate::tokenizers::TokenMeasurement;
 
 pub use super::analyzer_options::{
     AnalysisInput, PromptSection, SnapshotOptions, WindowSignatures,
 };
-use super::context_tokens::{canonical_json, count_tools_tokens};
+use super::context_tokens::{
+    canonical_json, count_tools_tokens_with_provenance, ContextTokenCount,
+};
 use super::models::{
     is_fallback_source, ContextCategory, ContextPartUsage, ContextUsageMeasurement,
     ContextUsageSnapshot, ContextWindowTokenReport, ContextWindowUsage, CounterIdentity,
-    MeasurementCacheInfo, CONTEXT_USAGE_EVENT_TYPE, CONTEXT_USAGE_SCHEMA_VERSION,
-    MEASUREMENT_KEY_VERSION, MEASUREMENT_VERSION, NOT_REPORTED, SOURCE_PROVIDER_USAGE,
-    SOURCE_PROVIDER_USAGE_PROPORTIONAL, SOURCE_PROVIDER_USAGE_RESIDUAL,
+    CounterProvenance, MeasurementCacheInfo, CONTEXT_USAGE_EVENT_TYPE,
+    CONTEXT_USAGE_SCHEMA_VERSION, MEASUREMENT_KEY_VERSION, MEASUREMENT_VERSION, NOT_REPORTED,
+    SOURCE_PROVIDER_USAGE, SOURCE_PROVIDER_USAGE_PROPORTIONAL, SOURCE_PROVIDER_USAGE_RESIDUAL,
     SOURCE_PROVIDER_USAGE_UNATTRIBUTED,
 };
 use super::parts::{
@@ -247,12 +249,23 @@ impl Default for MeasurementCache {
     }
 }
 
+/// The fallback reason published for a native claim the analyzer cannot verify.
+const UNVERIFIED_NATIVE_IDENTITY_REASON: &str = "unverified_native_tokenizer_identity";
+
+/// The fallback reason published when a declared identity disagrees with the
+/// counter that runs.
+const DISAGREEING_IDENTITY_REASON: &str = "declared_identity_disagrees_with_counter";
+
 /// Computes local category estimates and reconciles them with provider totals.
 pub struct ContextUsageAnalyzer {
     /// The counter every category count comes from.
     counter: Arc<dyn TokenCounter + Send + Sync>,
     /// The counting strategy and its cache-key identity.
     identity: CounterIdentity,
+    /// Whether `identity` was derived from `counter` rather than supplied.
+    identity_verified: bool,
+    /// The identity a caller declared when it disagreed with the counter.
+    declared_identity: Option<CounterIdentity>,
     /// The model the request is sent to, when known.
     model: String,
     /// The context-window limit, when one is configured.
@@ -293,15 +306,85 @@ impl ContextUsageAnalyzer {
     ///
     /// The identity names the counting strategy; it is part of every
     /// measurement-cache key and selects the reconciliation method.
+    ///
+    /// The pairing is *declared*, not verified: this constructor cannot see what
+    /// `counter` really is, so a native identity is published as an estimate
+    /// (with the `unverified_native_tokenizer_identity` reason) until the caller either
+    /// builds the analyzer with [`Self::from_counter`] or vouches for the
+    /// pairing with [`Self::with_verified_identity`].
     #[must_use]
     pub fn new(counter: Arc<dyn TokenCounter + Send + Sync>, identity: CounterIdentity) -> Self {
+        Self::assemble(counter, identity, false, None)
+    }
+
+    /// Creates an analyzer whose published identity comes from `counter`.
+    ///
+    /// The identity is derived from the counter through
+    /// [`CounterProvenance`], so the estimate flag and the published source
+    /// always describe the counter that actually runs: an approximate counter
+    /// publishes an estimate and a native artifact publishes an exact count.
+    #[must_use]
+    pub fn from_counter<C>(counter: Arc<C>) -> Self
+    where
+        C: CounterProvenance + TokenCounter + Send + Sync + 'static,
+    {
+        let identity = counter.counter_identity();
+        Self::assemble(counter, identity, true, None)
+    }
+
+    /// Creates an analyzer for `counter` that records a disagreeing `declared` identity.
+    ///
+    /// The counter's own provenance wins, because it is what actually runs; the
+    /// disagreement is logged at `debug` and republished as
+    /// `declared_identity_disagrees_with_counter` in every measurement's
+    /// `fallback_reason`.
+    #[must_use]
+    pub fn from_counter_with<C>(counter: Arc<C>, declared: CounterIdentity) -> Self
+    where
+        C: CounterProvenance + TokenCounter + Send + Sync + 'static,
+    {
+        let executed = counter.counter_identity();
+        let disagreement = (executed != declared).then(|| declared.clone());
+        if disagreement.is_some() {
+            tracing::debug!(
+                target: "openjiuwen_context::usage",
+                executed = %executed.identity_string(),
+                executed_source = executed.source_name(),
+                declared = %declared.identity_string(),
+                declared_source = declared.source_name(),
+                "declared counter identity disagrees with the counter that runs; the counter wins"
+            );
+        }
+        Self::assemble(counter, executed, true, disagreement)
+    }
+
+    /// Assembles an analyzer from its counter, identity and verification state.
+    fn assemble(
+        counter: Arc<dyn TokenCounter + Send + Sync>,
+        identity: CounterIdentity,
+        identity_verified: bool,
+        declared_identity: Option<CounterIdentity>,
+    ) -> Self {
         Self {
             counter,
             identity,
+            identity_verified,
+            declared_identity,
             model: String::new(),
             context_window_limit: None,
             measurement_cache: Mutex::new(MeasurementCache::default()),
         }
+    }
+
+    /// Declares that the supplied identity really describes the counter.
+    ///
+    /// [`Self::new`] cannot check the pairing, so a native claim is published as
+    /// an estimate. Call this when the counter is a custom adapter over a native
+    /// tokenizer and the identity is known to be right.
+    #[must_use]
+    pub fn with_verified_identity(mut self) -> Self {
+        self.identity_verified = true;
+        self
     }
 
     /// Sets the model name reported in the snapshot and used in cache keys.
@@ -338,9 +421,75 @@ impl ContextUsageAnalyzer {
     }
 
     /// The counting strategy identity.
+    ///
+    /// This is the declared or derived identity itself; use
+    /// [`Self::published_identity`] for the identity a measurement really
+    /// carries, which additionally names an unverified native claim.
     #[must_use]
     pub fn counter_identity(&self) -> &CounterIdentity {
         &self.identity
+    }
+
+    /// The counter the analyzer measures with.
+    #[must_use]
+    pub fn counter(&self) -> &Arc<dyn TokenCounter + Send + Sync> {
+        &self.counter
+    }
+
+    /// Whether the identity was derived from the counter instead of supplied.
+    #[must_use]
+    pub fn identity_verified(&self) -> bool {
+        self.identity_verified
+    }
+
+    /// The identity published with every measurement.
+    ///
+    /// The source and tokenizer are the identity's; the fallback reason names an
+    /// unverified native claim or a disagreement with the counter, so a reader
+    /// can never mistake either for an exact count.
+    #[must_use]
+    pub fn published_identity(&self) -> CounterIdentity {
+        let mut identity = self.identity.clone();
+        identity.fallback_reason = self.published_reason();
+        identity
+    }
+
+    /// Whether the count this analyzer produces is an estimate.
+    ///
+    /// Derived from the counter that actually runs: the declared source decides
+    /// for a verified pairing, and an unverified native claim is an estimate
+    /// because nothing can prove it.
+    fn counted_estimated(&self) -> bool {
+        self.identity.estimated() || !self.identity_verified
+    }
+
+    /// The fallback reason published with every measurement.
+    fn published_reason(&self) -> Option<String> {
+        if self.declared_identity.is_some() {
+            return Some(DISAGREEING_IDENTITY_REASON.to_owned());
+        }
+        if !self.identity_verified && self.identity.source.is_native() {
+            return Some(UNVERIFIED_NATIVE_IDENTITY_REASON.to_owned());
+        }
+        self.identity.fallback_reason.clone()
+    }
+
+    /// A copy of this analyzer that reports `limit` as its context-window limit.
+    ///
+    /// The counter, its identity, its verification state, the model and the
+    /// measurement-cache capacity are kept, so only the window changes.
+    #[must_use]
+    pub(crate) fn with_derived_limit(&self, limit: u64) -> Self {
+        let mut derived = Self::assemble(
+            Arc::clone(&self.counter),
+            self.identity.clone(),
+            self.identity_verified,
+            self.declared_identity.clone(),
+        );
+        derived.model.clone_from(&self.model);
+        derived.context_window_limit = Some(limit);
+        derived.measurement_cache = Mutex::new(MeasurementCache::new(self.lock_cache().capacity()));
+        derived
     }
 
     /// The current number of memoized measurements.
@@ -745,12 +894,20 @@ impl ContextUsageAnalyzer {
     }
 
     /// Measures the serialized tool definitions.
+    ///
+    /// The sizing helper reports its own provenance, so a count that had to be
+    /// estimated stays an estimate here too; with the analyzer's counter present
+    /// the counter's identity decides.
     fn measure_tools(&self, tools: &[Value], tracker: &mut CacheTracker) -> TokenMeasurement {
         self.measure_cached(
             ContextCategory::Tools.as_str(),
             &Value::Array(tools.to_vec()),
             tracker,
-            || self.measurement(count_tools_tokens(tools, Some(self.counter.as_ref()))),
+            || {
+                let counted =
+                    count_tools_tokens_with_provenance(tools, Some(self.counter.as_ref()));
+                self.measurement_with(counted)
+            },
         )
     }
 
@@ -810,15 +967,33 @@ impl ContextUsageAnalyzer {
         hex
     }
 
-    /// Builds a measurement from a token count and the counter identity.
+    /// Builds a measurement from a count helper's provenance.
+    ///
+    /// The analyzer's own counter is the executed counter, so its identity wins;
+    /// a helper that had to estimate without a counter still forces `estimated`
+    /// and carries its own note.
+    fn measurement_with(&self, counted: ContextTokenCount) -> TokenMeasurement {
+        let mut measurement = self.measurement(counted.tokens);
+        if counted.estimated {
+            measurement.estimated = true;
+            measurement.fallback_reason = counted.note;
+        }
+        measurement
+    }
+
+    /// Builds a measurement from a token count and the counter that ran.
+    ///
+    /// Both provenance facts come from what the analyzer can vouch for, never
+    /// from an unverified claim: an approximate counter behind a native identity
+    /// is published as an estimate naming the reason.
     fn measurement(&self, tokens: u64) -> TokenMeasurement {
         TokenMeasurement {
             tokens: usize::try_from(tokens).unwrap_or(usize::MAX),
             source: self.identity.source,
-            estimated: self.identity.source != TokenizerSource::NativeTokenizer,
+            estimated: self.counted_estimated(),
             tokenizer: self.identity.tokenizer.clone(),
             model: self.identity.fallback_tokenizer_model.clone(),
-            fallback_reason: self.identity.fallback_reason.clone(),
+            fallback_reason: self.published_reason(),
         }
     }
 }

@@ -542,6 +542,7 @@ fn processor_context<'a>(
         cancellation,
         recall: None,
         session_memory: None,
+        session_memory_agent: None,
     }
 }
 

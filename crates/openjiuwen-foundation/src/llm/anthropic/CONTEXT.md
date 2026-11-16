@@ -7,12 +7,33 @@ Ports `openjiuwen/core/foundation/llm/model_clients/anthropic_model_client.py`.
 
 ## API Surface
 
-- `AnthropicClient` — `new(ModelClientConfig, ModelRequestConfig)`, `with_http_client`, `client_config`, `request_config`, `base_url`, `impl Model` (`invoke`, `stream`, `provider`, `model_name`).
+- `AnthropicClient` — `new(ModelClientConfig, ModelRequestConfig)`, `with_http_client`, `client_config`, `request_config`, `base_url`, `stream_with_state`, `complete_turn`, `impl Model` (`invoke`, `stream`, `provider`, `model_name`).
+- `AnthropicClient::stream_with_state(messages, request) -> (BoxStream<'static, Result<StreamChunk>>, Arc<Mutex<AnthropicStreamState>>)` — the stream plus the accumulator that preserves its thinking blocks; `Model::stream` is `.0` only.
+- `AnthropicClient::complete_turn(&[BaseMessage], &ModelRequestConfig) -> Result<AssistantTurn>` — drains the stream, accumulates it, and attaches the preserved thinking blocks to the message.
+- `AnthropicStreamState` — `new`, `handle_event`, `finish`, `message_id`, `model`, `thinking_blocks`, `apply_thinking_blocks`.
 - `build_messages_body(&[BaseMessage], &ModelRequestConfig, stream) -> Result<Value>` — pure request projection for the `anthropic` provider.
 - `build_messages_body_with_provider(&[BaseMessage], &ModelRequestConfig, stream, provider, api_base: Option<&str>) -> Result<Value>` — the same projection with the client's provider name and endpoint, which select the reasoning profile.
 - `build_messages_body_with_endpoint(&[BaseMessage], &ModelRequestConfig, stream, provider, endpoint_profile: Option<&str>, api_base: Option<&str>) -> Result<Value>` — the same projection with the client's `endpoint_profile` as well; the client calls this one, and `_with_provider` delegates with no profile.
 - `normalize_api_base(&str) -> String` — strips a pasted `/v1/messages` or `/v1` suffix.
 - `parse_messages_response`, `parse_anthropic_usage`, `AnthropicStreamState` — response and stream conversion.
+- `THINKING_BLOCKS_METADATA_KEY` (`"anthropic_thinking_blocks"`) — the `BaseMessage::metadata` key holding the raw `thinking`/`redacted_thinking` blocks preserved from a response.
+
+## Extended Thinking (`response.rs`, `stream.rs`, `convert.rs`)
+
+A `thinking` block appends its `thinking` text to the assistant message's `reasoning_content` (adjacent blocks concatenate in order); `reasoning_content` stays `None` when no thinking block carried text.
+Every replayable block — a `thinking` block with a non-empty `signature`, a `redacted_thinking` block with non-empty `data` — is preserved verbatim, in response order, as a JSON array under `BaseMessage::metadata[THINKING_BLOCKS_METADATA_KEY]`.
+A block without that provider proof is dropped with a `tracing::warn!` and never stored: the client never invents a signature.
+One rule decides replayability for both paths: `response::replayable_block` validates and returns the verbatim block, and `response::attach_thinking_blocks` writes the metadata key, so a streamed turn and an invoked turn carry identical metadata.
+The assistant projection reads the same key and emits those blocks first, verbatim and in order, ahead of the text and `tool_use` blocks, because the Messages API requires the original signed blocks on a follow-up `tool_use` turn.
+A turn without survivable blocks keeps the plain string `content` it always had; a turn with them always sends a block array.
+The key is caller-writable, so the projection re-validates every entry (`type` plus `signature`/`data`) and silently drops anything else instead of forwarding a block the API would reject.
+
+## Streamed Thinking (`stream.rs`)
+
+`AnthropicStreamState` buffers one block per content-block index: `content_block_start` opens a `thinking`/`redacted_thinking` block (taking any `thinking`, `signature` or `data` it already carries), `thinking_delta` appends text, `signature_delta` appends the signature, a `data` delta appends redacted data, and `content_block_stop` seals the block.
+A sealed block is validated with the shared `replayable_block` rule and kept only when the provider vouched for it; `finish` (and `message_stop`) seals anything the server never stopped, so a fully signed block still survives a truncated event list while an unsigned one is dropped with the same warning.
+`thinking_blocks()` returns the preserved blocks by block index (stream order, not stop order) and `apply_thinking_blocks(&mut BaseMessage)` writes them under `THINKING_BLOCKS_METADATA_KEY`; `AnthropicClient::complete_turn` is `StreamAccumulator` + that call, so a streamed thinking turn is replayed exactly like an invoked one.
+The thinking text keeps flowing to `StreamChunk::Delta::reasoning` (the stream chunk surface is unchanged and carries no metadata); the shared state lives in the returned `Arc<Mutex<AnthropicStreamState>>` instead.
 
 ## Request Projection (`request.rs`)
 
@@ -68,22 +89,22 @@ Inline turns carry plain text as their `content`; neighbours are read from the p
 - `./request.rs` → body assembly, reasoning-plan wiring and legacy-control precedence, `max_tokens` caps, `normalize_api_base`
 - `./convert.rs` → message projection, mid-conversation system partition, tools/tool_choice, images
 - `./cache.rs` → cache-control marker, the three anchors, transient-tail detection, `extra` knobs
-- `./response.rs` → non-streaming response parsing (`content` blocks → `BaseMessage`, `stop_reason`, usage)
+- `./response.rs` → non-streaming response parsing (`content` blocks → `BaseMessage`, preserved thinking blocks, `stop_reason`, usage)
 - `./stream.rs` → SSE event state machine (`content_block_*`, `message_*`, tool-input buffering)
+- `./stream/thinking.rs` → extended-thinking block buffering and sealing (`ThinkingBlocks`) plus its unit tests
 - `./request/tests.rs` → body projection tests
 - `./request/cache_tests.rs` → cache-anchor tests
 - `./request/reasoning_tests.rs` → reasoning-plan wiring tests (`thinking`/`output_config` shapes, legacy precedence, validation)
-- `./tests.rs` → wiremock client tests (headers, body, error mapping, streaming)
+- `./tests.rs` → wiremock client tests (headers, body, error mapping, streaming, streamed thinking-block replay)
 
 ## Test Strategy
 
 `request/tests.rs` and `request/cache_tests.rs` assert exact JSON for every projection and anchor: single/multiple system turns, marker placement on tool_use/tool_result/image/plain-text anchors, the transient-tail skip, `disable_cache_control`, `cache_control_ttl`, and inline-vs-hoisted system placement.
 `request/reasoning_tests.rs` asserts the reasoning body shapes for a profiled model (`claude-sonnet-4-5*`), an unlisted model, and a host-hint-routed vendor, plus every legacy control key, the nested `extra_body` form, the consumed keys, and the validation errors for malformed intents.
-`cache.rs` unit-tests the marker/walk-back primitives; `tests.rs` asserts the wire body, headers, retry/auth error mapping, streamed assembly, and that `invoke`/`stream` send the resolved reasoning plan against wiremock.
+`cache.rs` unit-tests the marker/walk-back primitives; `stream/thinking.rs` unit-tests thinking-block accumulation (signed, unsigned, redacted `data` fragments, stop order vs. block order, sealing at `finish`); `tests.rs` asserts the wire body, headers, retry/auth error mapping, streamed assembly, that `invoke`/`stream` send the resolved reasoning plan, and that a streamed thinking turn reaches the next request body with its signature (and that an unsigned one reaches it not at all) against wiremock.
 No test needs a network or a credential.
 
 ## Known Gaps
 
 - No `cache_control` breakpoints beyond the three automatic anchors (no per-message caller control, no `clear`/`auto` caching modes).
-- `thinking` blocks are ignored in non-streaming responses; only streaming maps `thinking_delta` onto `reasoning`.
 - Mid-conversation system turns are text-only, and the supported-family list is a fixed substring match (no capability query).

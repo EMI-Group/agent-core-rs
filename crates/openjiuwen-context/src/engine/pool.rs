@@ -10,16 +10,43 @@ use std::sync::Arc;
 use openjiuwen_common::error::Result;
 use openjiuwen_session::Session;
 
+use crate::config::{ContextConfig, TokenCounterKind};
 use crate::context::{ConversationContext, ModelContext};
 use crate::processor::{ContextPipeline, PipelineDeps, ProcessorConfig};
 use crate::recall::{InMemoryRecallArchiveStore, RecallArchiveStore};
 use crate::session_memory::{InMemorySessionMemoryStore, SessionMemoryStore};
+use crate::telemetry::recorder::TokenProvenance;
+use crate::tokenizers::TokenizerSource;
 
 use super::{ContextEngine, ContextOptions, DEFAULT_SESSION_ID};
 
 /// Python's `context_id.replace(".", "_")`: the pool identity of a context.
 fn normalize_context_id(context_id: &str) -> String {
     context_id.replace('.', "_")
+}
+
+/// How the configuration's own token counter produces its numbers.
+///
+/// The kinds this crate builds itself are known exactly, so the record can name
+/// them; [`TokenCounterKind::Model`] resolves through the tokenizer selector,
+/// whose outcome (a native artefact, a `tiktoken` vocabulary, or the string-length
+/// estimate) is not visible through a boxed counter, so it is reported as an
+/// unnamed estimate instead of being guessed exact.
+fn config_counter_provenance(config: &ContextConfig) -> TokenProvenance {
+    match config.token_counter.kind {
+        TokenCounterKind::Approx => TokenProvenance::estimated(
+            "approx_token_counter",
+            "estimated by the approximate characters-per-token counter",
+        ),
+        TokenCounterKind::Characters => TokenProvenance::estimated(
+            "characters_token_counter",
+            "estimated from the character count of every message",
+        ),
+        TokenCounterKind::Tiktoken => TokenProvenance::from_source(TokenizerSource::Tiktoken),
+        TokenCounterKind::Model => TokenProvenance::unverified(
+            "the model-aware tokenizer selection is not introspectable through a boxed counter",
+        ),
+    }
 }
 
 impl ContextEngine {
@@ -83,9 +110,9 @@ impl ContextEngine {
         }
 
         let model = options.model;
-        let counter = options
-            .token_counter
-            .unwrap_or_else(|| self.config.token_counter());
+        let caller_counter = options.token_counter;
+        let counter_supplied = caller_counter.is_some();
+        let counter = caller_counter.unwrap_or_else(|| self.config.token_counter());
         let configs = options
             .processors
             .unwrap_or_else(|| self.config.processors.clone());
@@ -114,6 +141,22 @@ impl ContextEngine {
         // A per-context recorder/analyzer wins over the engine default; when
         // both are unset the context stays uninstrumented.
         let recorder = options.recorder.or_else(|| self.recorder.clone());
+        // The record's `before`/`after` counts are measured by the recorder while
+        // the per-role statistic comes from the pipeline, which counts with this
+        // same counter; installing it here keeps the two totals equal by
+        // construction. A counter the caller set on the recorder wins and is
+        // never replaced, and a counter supplied per context cannot describe
+        // itself, so its provenance is reported as an unnamed estimate.
+        if let Some(recorder) = recorder.as_ref() {
+            let provenance = if counter_supplied {
+                TokenProvenance::unverified(
+                    "the counter was supplied for this context and does not declare how it counts",
+                )
+            } else {
+                config_counter_provenance(&self.config)
+            };
+            recorder.install_token_counter(Arc::clone(&counter), provenance);
+        }
         let usage_analyzer = options
             .usage_analyzer
             .or_else(|| self.usage_analyzer.clone());

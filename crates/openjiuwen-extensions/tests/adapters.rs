@@ -186,3 +186,51 @@ async fn pulsar_queue_is_deferred() {
     let error = expect_error(pulsar::start_with_retry(config, 3, Duration::from_millis(1)).await);
     assert_eq!(error.kind(), ErrorKind::Unsupported);
 }
+
+// The SQLite vector arm of the factory: a typed deferral in a default build (see
+// `openjiuwen_extensions::store::sqlite_vector`) and a live brute-force store
+// behind the `sqlite` feature.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_vector_store_factory_round_trips_a_search() {
+    use openjiuwen_extensions::store::{
+        build_vector_store, CollectionSchema, FieldSchema, VectorDataType, VectorQuery,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite://{}", dir.path().join("store.db").display());
+    let backend = StoreBackend::Sqlite { url };
+    let store = build_vector_store(&backend).await.unwrap();
+
+    let schema = CollectionSchema::new(vec![
+        FieldSchema {
+            is_primary: true,
+            ..FieldSchema::new("id", VectorDataType::Varchar)
+        },
+        FieldSchema {
+            dim: Some(2),
+            ..FieldSchema::new("embedding", VectorDataType::FloatVector)
+        },
+    ]);
+    store.create_collection("docs", schema).await.unwrap();
+    let documents = vec![
+        json!({"id": "near", "embedding": [1.0, 0.0]}),
+        json!({"id": "far", "embedding": [0.0, 1.0]}),
+    ]
+    .into_iter()
+    .filter_map(|document| document.as_object().cloned())
+    .collect();
+    assert_eq!(store.add_docs("docs", documents).await.unwrap(), 2);
+
+    let hits = store
+        .search("docs", &VectorQuery::new(vec![1.0, 0.0]))
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].fields["id"], "near");
+    assert!(hits[0].score > hits[1].score);
+    assert_eq!(
+        store.list_collection_names().await.unwrap(),
+        vec!["docs".to_string()]
+    );
+}

@@ -211,6 +211,13 @@ impl RewardComponent for CompletenessReward {
 }
 
 /// Rewards lower latency; `half_life_s` is where the score reaches `0.5`.
+///
+/// The latency is [`Execution::measured_latency_s`], so a run that reported
+/// telemetry scores on the measured value while a run that reported nothing
+/// falls back to the legacy caller-supplied `latency_ms`.
+/// Absent telemetry therefore keeps the component constant exactly as before
+/// (0 ms scores `1.0`), and a measured-but-zero latency also scores `1.0`, so
+/// the two are indistinguishable.
 #[derive(Debug, Clone, Copy)]
 pub struct LatencyReward {
     /// The latency at which the score is `0.5`, in seconds.
@@ -245,11 +252,19 @@ impl RewardComponent for LatencyReward {
     }
 
     fn score(&self, execution: &Execution, _task: &PromptTaskSpec) -> f64 {
-        1.0 / (1.0 + execution.latency_s() / self.half_life_s)
+        1.0 / (1.0 + execution.measured_latency_s() / self.half_life_s)
     }
 }
 
 /// Rewards fewer tokens; `half_life_tokens` is where the score reaches `0.5`.
+///
+/// The count is [`Execution::measured_total_tokens`], so a run that reported
+/// prompt or completion telemetry scores on the measured total (a missing side
+/// counts as zero) while a run that reported neither falls back to the legacy
+/// caller-supplied `total_tokens`.
+/// Absent telemetry therefore keeps the component constant exactly as before
+/// (0 tokens scores `1.0`), and a measured-but-zero count also scores `1.0`, so
+/// the two are indistinguishable.
 #[derive(Debug, Clone, Copy)]
 pub struct TokenUsageReward {
     /// The token count at which the score is `0.5`.
@@ -284,11 +299,18 @@ impl RewardComponent for TokenUsageReward {
     }
 
     fn score(&self, execution: &Execution, _task: &PromptTaskSpec) -> f64 {
-        1.0 / (1.0 + execution.total_tokens as f64 / self.half_life_tokens)
+        1.0 / (1.0 + execution.measured_total_tokens() as f64 / self.half_life_tokens)
     }
 }
 
 /// Rewards lower monetary cost, priced per million tokens.
+///
+/// The cost is [`Execution::measured_cost`] when the caller reported one;
+/// otherwise it is derived from [`Execution::measured_total_tokens`] at
+/// `price_per_mtok`.
+/// Absent telemetry therefore keeps the component constant as before when the
+/// derived cost is zero (0 tokens scores `1.0`), and a measured-but-zero cost
+/// also scores `1.0`, so the two are indistinguishable.
 #[derive(Debug, Clone, Copy)]
 pub struct CostReward {
     /// Currency per one million tokens.
@@ -333,7 +355,10 @@ impl RewardComponent for CostReward {
     }
 
     fn score(&self, execution: &Execution, _task: &PromptTaskSpec) -> f64 {
-        let cost = execution.total_tokens as f64 / 1_000_000.0 * self.price_per_mtok;
+        let cost = match execution.measured_cost() {
+            Some(cost) => cost,
+            None => execution.measured_total_tokens() as f64 / 1_000_000.0 * self.price_per_mtok,
+        };
         1.0 / (1.0 + cost / self.half_life_cost)
     }
 }

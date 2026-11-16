@@ -1,9 +1,13 @@
 //! `OpenAPI` request building and response mapping.
 //!
 //! Turns one [`OpenApiOperation`] plus the caller's arguments into an HTTP
-//! request (URL, query, headers, JSON body) and maps the response onto
-//! [`McpToolResult`]. The builders are pure so they can be unit-tested without a
-//! server; only [`execute`] performs I/O.
+//! request (URL, query, headers, one merged `Cookie` header, JSON body) and maps
+//! the response onto [`McpToolResult`]. The builders are pure so they can be
+//! unit-tested without a server; only [`execute`] performs I/O.
+//!
+//! Cookie parameters are never folded into the query string or the body: they are
+//! percent-encoded per RFC 6265 and merged into a single `Cookie` header, adding
+//! to a caller-supplied `Cookie` header instead of replacing it.
 
 use std::time::Duration;
 
@@ -43,7 +47,7 @@ pub(crate) async fn execute(
     })?;
     let mut request = HttpRequest::new(method.clone(), url.clone())
         .queries(query_pairs(operation, args, config))
-        .with_headers(header_pairs(operation, args, config));
+        .with_headers(header_pairs(operation, args, config)?);
     if let Some(body) = json_body(operation, args) {
         request = request.json(&body)?;
     }
@@ -128,15 +132,21 @@ pub(crate) fn query_pairs(
     pairs
 }
 
-/// Collects declared header parameters plus the configured auth headers.
+/// Collects declared header parameters, the configured auth headers, and one
+/// merged `Cookie` header for the operation's cookie parameters.
 ///
 /// When the call carries a JSON body, `Content-Type` and `Accept` are set to
 /// `application/json` unless a parameter or auth header already names them.
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] naming the parameter when a required cookie
+/// parameter has no argument.
 pub(crate) fn header_pairs(
     operation: &OpenApiOperation,
     args: &Map<String, Value>,
     config: &McpServerConfig,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>> {
     let mut pairs = Vec::new();
     for parameter in &operation.parameters {
         if parameter.location != "header" {
@@ -152,6 +162,22 @@ pub(crate) fn header_pairs(
             .iter()
             .map(|(name, value)| (name.clone(), value.clone())),
     );
+    if let Some(cookies) = cookie_header(operation, args)? {
+        match pairs
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+        {
+            // A caller-supplied `Cookie` header keeps its own pairs and gains ours.
+            Some(existing) => {
+                if existing.1.trim().is_empty() {
+                    existing.1 = cookies;
+                } else {
+                    existing.1 = format!("{}; {cookies}", existing.1.trim());
+                }
+            }
+            None => pairs.push(("Cookie".to_owned(), cookies)),
+        }
+    }
     if json_body(operation, args).is_some() {
         for (name, value) in [
             ("Content-Type", "application/json"),
@@ -165,7 +191,63 @@ pub(crate) fn header_pairs(
             }
         }
     }
-    pairs
+    Ok(pairs)
+}
+
+/// Builds the `Cookie` header value from the operation's cookie parameters.
+///
+/// Parameters are rendered in declaration order as `name=value` and joined with
+/// `; `; values are percent-encoded outside the RFC 6265 `cookie-octet` set. A
+/// missing optional parameter is omitted, and a missing required one is an
+/// [`Error::Validation`] naming the parameter. Cookie values never travel in the
+/// query string or the JSON body.
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] naming the parameter when a required cookie
+/// parameter has no argument (or is JSON null).
+pub(crate) fn cookie_header(
+    operation: &OpenApiOperation,
+    args: &Map<String, Value>,
+) -> Result<Option<String>> {
+    let mut cookies: Vec<String> = Vec::new();
+    for parameter in &operation.parameters {
+        if parameter.location != "cookie" {
+            continue;
+        }
+        match args.get(&parameter.name).and_then(value_text) {
+            Some(text) => {
+                let name = parameter.name.trim();
+                cookies.push(format!("{name}={}", cookie_encode(&text)));
+            }
+            None if parameter.required => {
+                return Err(Error::validation(format!(
+                    "openapi tool `{}` requires cookie parameter `{}`",
+                    operation.name, parameter.name
+                )));
+            }
+            None => {}
+        }
+    }
+    Ok((!cookies.is_empty()).then(|| cookies.join("; ")))
+}
+
+/// Percent-encodes everything outside the RFC 6265 `cookie-octet` set.
+fn cookie_encode(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'!' | b'#'..=b'+' | b'-'..=b':' | b'<'..=b'[' | b']'..=b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(hex_digit(byte >> 4));
+                encoded.push(hex_digit(byte & 0x0F));
+            }
+        }
+    }
+    encoded
 }
 
 /// Builds the JSON request body of `operation` from `args`.

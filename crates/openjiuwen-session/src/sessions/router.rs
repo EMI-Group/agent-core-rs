@@ -7,21 +7,32 @@
 //! writes, interaction, configuration lookups (`get_workflow_config`,
 //! `get_agent_config`, `get_env`), and `base()`.
 //!
-//! The Rust port is a thin `Arc<dyn Session>` wrapper with the same shape:
+//! The Rust port is a thin `Arc<dyn Session>` wrapper with the same shape, but
+//! a rejected write is a typed error rather than a silent no-op: a routing
+//! callback that tries to mutate state, publish a frame, or restore a snapshot
+//! gets [`ErrorKind::Unsupported`] naming the operation, instead of believing a
+//! write it never performed succeeded.
 //!
 //! | Operation | Behavior |
 //! | --- | --- |
 //! | `id`, `parent_id`, `get_state`, `get_component_state`, `trace`, `snapshot` | delegate to the inner session |
-//! | `update_state`, `update_component_state`, `write_stream`, `restore` | deliberate no-ops returning `Ok(())` (logged at debug) |
+//! | `update_state`, `update_component_state`, `write_stream`, `restore`, `resolve_interaction` | [`ErrorKind::Unsupported`], with a per-method reason saying the router is read-only and pointing at [`RouterSession::inner`] |
+//! | `end_stream`, `close` | deliberate `Ok(())` lifecycle no-ops: a router is a *nested* view, so ending or closing it would end the parent run's stream |
 //! | `subscribe` | an immediately empty stream (a router never consumes the run's output) |
-//! | `request_interaction` | `ErrorKind::Unsupported` (`"router sessions cannot interact"`) |
-//! | `install_trace_sink` | `ErrorKind::Unsupported` (`"router sessions are read-only"`) |
+//! | `request_interaction` | [`ErrorKind::Unsupported`] (`"router sessions cannot interact"`) |
+//! | `install_trace_sink` | [`ErrorKind::Unsupported`] (`"router sessions are read-only"`) |
 //! | `config`, `writers`, `checkpointer`, `tracer` | `None` |
 //! | `metadata` | forwarded, with `kind` forced to [`SessionType::Node`] |
 //!
 //! A routing callback can therefore inspect the state a branch decision needs
 //! without being able to mutate it, close the run's stream, or swap the trace
-//! sink out from under the workflow.
+//! sink out from under the workflow. `end_stream`/`close` stay silent successes
+//! on purpose — they are lifecycle bookkeeping the surrounding workflow may run
+//! over every session it holds, and a nested router must never close a stream it
+//! does not own; the write paths have no such excuse, so they report the
+//! rejection.
+//!
+//! [`ErrorKind::Unsupported`]: openjiuwen_common::error::ErrorKind::Unsupported
 
 use std::sync::Arc;
 
@@ -104,39 +115,29 @@ impl Session for RouterSession {
         self.inner.get_state(key).await
     }
 
-    async fn update_state(&self, patch: Value) -> Result<()> {
-        tracing::debug!(
-            target: "openjiuwen_session::sessions::router",
-            session_id = self.inner.id(),
-            patch = %patch,
-            "router session ignores a global state update"
-        );
-        Ok(())
+    async fn update_state(&self, _patch: Value) -> Result<()> {
+        Err(Error::unsupported(
+            "router sessions are read-only: global state updates are rejected; use \
+             RouterSession::inner() to write through",
+        ))
     }
 
     async fn get_component_state(&self, component_id: &str) -> Result<Option<Value>> {
         self.inner.get_component_state(component_id).await
     }
 
-    async fn update_component_state(&self, component_id: &str, patch: Value) -> Result<()> {
-        tracing::debug!(
-            target: "openjiuwen_session::sessions::router",
-            session_id = self.inner.id(),
-            component_id,
-            patch = %patch,
-            "router session ignores a component state update"
-        );
-        Ok(())
+    async fn update_component_state(&self, _component_id: &str, _patch: Value) -> Result<()> {
+        Err(Error::unsupported(
+            "router sessions are read-only: component state updates are rejected; use \
+             RouterSession::inner() to write through",
+        ))
     }
 
-    async fn write_stream(&self, item: StreamItem) -> Result<()> {
-        tracing::debug!(
-            target: "openjiuwen_session::sessions::router",
-            session_id = self.inner.id(),
-            item_type = item.item_type,
-            "router session ignores a stream write"
-        );
-        Ok(())
+    async fn write_stream(&self, _item: StreamItem) -> Result<()> {
+        Err(Error::unsupported(
+            "router sessions are read-only: stream writes are rejected; use \
+             RouterSession::inner() to publish through",
+        ))
     }
 
     async fn request_interaction(
@@ -181,13 +182,25 @@ impl Session for RouterSession {
     }
 
     async fn resolve_interaction(&self, _response: InteractionResponse) -> Result<()> {
-        Ok(())
+        Err(Error::unsupported(
+            "router sessions are read-only: interactions cannot be resolved on a router session",
+        ))
     }
 
+    /// A deliberate lifecycle no-op.
+    ///
+    /// A router is a nested view over a live run, so ending the stream here
+    /// would end the *parent* session's stream; the run's owner decides when
+    /// that happens. Returns `Ok(())` and publishes nothing.
     async fn end_stream(&self) -> Result<()> {
         Ok(())
     }
 
+    /// A deliberate lifecycle no-op.
+    ///
+    /// Like [`Session::end_stream`], closing a router must not close the shared
+    /// hub of the session it wraps. Returns `Ok(())` and leaves the inner
+    /// session untouched.
     async fn close(&self) -> Result<()> {
         Ok(())
     }
@@ -199,12 +212,10 @@ impl Session for RouterSession {
     }
 
     async fn restore(&self, _snapshot: SessionSnapshot) -> Result<()> {
-        tracing::debug!(
-            target: "openjiuwen_session::sessions::router",
-            session_id = self.inner.id(),
-            "router session ignores a state restore"
-        );
-        Ok(())
+        Err(Error::unsupported(
+            "router sessions are read-only: state restores are rejected; use \
+             RouterSession::inner() to restore",
+        ))
     }
 }
 
@@ -218,7 +229,7 @@ mod tests {
     use serde_json::json;
 
     use super::RouterSession;
-    use crate::interaction::{InteractionKind, InteractionRequest};
+    use crate::interaction::{InteractionKind, InteractionRequest, InteractionResponse};
     use crate::session::{Session, SessionType};
     use crate::sessions::workflow::WorkflowSession;
     use crate::stream::StreamItem;
@@ -228,7 +239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_pass_through_and_writes_are_ignored() {
+    async fn reads_pass_through_and_writes_are_rejected() {
         let workflow = Arc::new(WorkflowSession::new("s1"));
         workflow.update_state(json!({ "step": 1 })).await.unwrap();
         let node = workflow.create_node_session("r");
@@ -246,11 +257,30 @@ mod tests {
             Some(json!("left"))
         );
 
-        router.update_state(json!({ "step": 99 })).await.unwrap();
-        router
+        let error = router
+            .update_state(json!({ "step": 99 }))
+            .await
+            .expect_err("a router cannot write global state");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Unsupported
+        );
+        assert!(
+            error.to_string().contains("global state updates"),
+            "{error}"
+        );
+        let error = router
             .update_component_state("branch", json!("right"))
             .await
-            .unwrap();
+            .expect_err("a router cannot write component state");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Unsupported
+        );
+        assert!(
+            error.to_string().contains("component state updates"),
+            "{error}"
+        );
         assert_eq!(workflow.get_state("step").await.unwrap(), Some(json!(1)));
         assert_eq!(
             workflow.get_component_state("r.branch").await.unwrap(),
@@ -264,15 +294,20 @@ mod tests {
         let router = router_over(&workflow);
         let mut events = workflow.subscribe();
 
-        router
+        let error = router
             .write_stream(StreamItem::output_at("chunk", 0, json!({ "x": 1 })))
             .await
-            .unwrap();
+            .expect_err("a router cannot publish frames");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Unsupported
+        );
+        assert!(error.to_string().contains("stream writes"), "{error}");
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), events.next())
                 .await
                 .is_err(),
-            "a router write must not reach the session stream"
+            "a rejected router write must not reach the session stream"
         );
         assert!(router.subscribe().next().await.is_none());
 
@@ -284,7 +319,17 @@ mod tests {
             error.kind(),
             openjiuwen_common::error::ErrorKind::Unsupported
         );
+        let error = router
+            .resolve_interaction(InteractionResponse::cancel("intr_1"))
+            .await
+            .expect_err("a router cannot resolve interactions");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Unsupported
+        );
+        assert!(error.to_string().contains("read-only"), "{error}");
         assert!(router.end_stream().await.is_ok());
+        assert!(router.close().await.is_ok());
         assert!(!workflow.writers().unwrap().is_closed());
         assert_eq!(router.parent_id(), None);
         assert_eq!(router.session_type(), SessionType::Node);
@@ -305,7 +350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_forwards_and_restore_is_ignored() {
+    async fn snapshot_forwards_and_restore_is_rejected() {
         let workflow = Arc::new(WorkflowSession::new("s1"));
         workflow.update_state(json!({ "step": 1 })).await.unwrap();
         let router = router_over(&workflow);
@@ -314,7 +359,15 @@ mod tests {
         assert_eq!(snapshot.session_id, "s1");
         assert_eq!(snapshot.kind, SessionType::Node);
         snapshot.global = json!({ "injected": true });
-        router.restore(snapshot).await.unwrap();
+        let error = router
+            .restore(snapshot)
+            .await
+            .expect_err("a router cannot restore state");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Unsupported
+        );
+        assert!(error.to_string().contains("state restores"), "{error}");
         assert_eq!(workflow.get_state("injected").await.unwrap(), None);
         assert_eq!(workflow.get_state("step").await.unwrap(), Some(json!(1)));
     }

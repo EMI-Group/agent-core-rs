@@ -919,12 +919,27 @@ impl CounterIdentity {
 
     /// Whether the count is a fallback estimate rather than a model tokenizer.
     ///
-    /// A fallback counter carries the same measurement error in every category,
-    /// so the analyzer scales all categories proportionally instead of keeping
-    /// the non-message categories fixed.
+    /// This is Python's narrow `_fallback` suffix rule, which selects the
+    /// reconciliation method: a fallback counter carries the same measurement
+    /// error in every category, so the analyzer scales all categories
+    /// proportionally instead of keeping the non-message categories fixed.
+    ///
+    /// [`CounterIdentity::estimated`] is the broader honesty flag: it is `true`
+    /// for everything but a native tokenizer, so a resolved `tiktoken` identity
+    /// is estimated without being a fallback.
     #[must_use]
     pub fn is_fallback(&self) -> bool {
         is_fallback_source(self.source_name())
+    }
+
+    /// Whether a count produced under this identity is an estimate.
+    ///
+    /// `true` for every source but [`TokenizerSource::NativeTokenizer`], so an
+    /// exact `tiktoken` vocabulary and a string-length estimate are both
+    /// estimates while only a loaded native artifact counts exactly.
+    #[must_use]
+    pub fn estimated(&self) -> bool {
+        !self.source.is_native()
     }
 
     /// A stable `class:tokenizer` identity string for reports.
@@ -935,6 +950,46 @@ impl CounterIdentity {
             self.class,
             self.tokenizer.as_deref().unwrap_or_default()
         )
+    }
+}
+
+/// A counter that can name its own counting strategy.
+///
+/// [`CounterIdentity`] is normally supplied by the caller, which means the
+/// analyzer cannot tell whether it really describes the counter that runs, and a
+/// native identity over an approximate counter would publish an approximate
+/// count as exact.
+/// Implementing this trait lets [`super::analyzer::ContextUsageAnalyzer::from_counter`]
+/// derive the identity from the counter itself, so the estimate flag can never
+/// be wrong.
+pub trait CounterProvenance {
+    /// The identity of the counts this counter produces.
+    fn counter_identity(&self) -> CounterIdentity;
+}
+
+impl CounterProvenance for openjiuwen_foundation::prompt::ApproxTokenCounter {
+    /// An approximate counter is always a string-length estimate.
+    ///
+    /// A deliberately configured characters-per-token counter
+    /// (`TokenCounterKind::Characters`) reports the same identity: the count is
+    /// exact by configuration but still an estimate of the model's tokens, so it
+    /// keeps `estimated = true` rather than claiming a native vocabulary.
+    fn counter_identity(&self) -> CounterIdentity {
+        CounterIdentity::approx()
+    }
+}
+
+impl CounterProvenance for ModelTokenCounter {
+    /// A model counter names its resolved vocabulary and degradation reason.
+    fn counter_identity(&self) -> CounterIdentity {
+        CounterIdentity::model(self)
+    }
+}
+
+impl CounterProvenance for SelectedTokenizer {
+    /// A selection names its resolved strategy and degradation reason.
+    fn counter_identity(&self) -> CounterIdentity {
+        CounterIdentity::selected(self)
     }
 }
 

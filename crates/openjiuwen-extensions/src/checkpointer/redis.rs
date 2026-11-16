@@ -1,4 +1,4 @@
-//! Redis checkpointer (single-node, live backend).
+//! Redis checkpointer (live backend over the in-tree RESP client).
 //!
 //! Ports `openjiuwen/extensions/checkpointer/redis/` (v0.1.20): Python's
 //! `RedisCheckpointerProvider` registers the `redis` checkpointer kind, and
@@ -26,18 +26,17 @@
 //!
 //! # Entry points
 //!
-//! The kernel's `CheckpointerKind` has no Redis variant, so
-//! [`crate::checkpointer::build_checkpointer`] cannot select this backend:
-//! construct it with [`RedisCheckpointer::new`] (lazy connect) or
+//! The kernel factory's `CheckpointerKind::Redis` builds the kernel's own Redis
+//! checkpointer, so [`crate::checkpointer::build_checkpointer`] never returns
+//! this backend: construct it with [`RedisCheckpointer::new`] (lazy connect) or
 //! [`RedisCheckpointer::connect`] / [`RedisCheckpointer::create`] (eager connect,
 //! which also verifies the server answers `PING`).
 //!
-//! # Deferred
+//! # Transport
 //!
-//! `rediss://` needs a TLS stack the workspace does not vendor, and cluster
-//! slot routing is not implemented; both return
-//! [`openjiuwen_common::error::ErrorKind::Unsupported`] with a reason instead of
-//! silently degrading.
+//! `rediss://` (TLS, verified against the web PKI) and `redis[s]+cluster://`
+//! (a seed verified as a cluster node, with `MOVED`/`ASK` redirections followed)
+//! are handled by [`crate::redis`], so both URL families work here unchanged.
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -318,9 +317,9 @@ impl RedisCheckpointer {
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for an
-    /// invalid configuration, `Unsupported` for `rediss://` (no TLS stack) or a
-    /// cluster `MOVED`/`ASK` redirection, and `Transport`/`Timeout` when the
-    /// server cannot be reached.
+    /// invalid configuration (including cluster mode against a node that is not a
+    /// cluster node), and `Transport`/`Timeout` when the server cannot be reached
+    /// or a `rediss://` TLS handshake fails.
     pub async fn connect(config: RedisCheckpointerConfig) -> Result<Arc<dyn Checkpointer>> {
         let checkpointer = Self::new(config)?;
         checkpointer.client().await?.ping().await?;

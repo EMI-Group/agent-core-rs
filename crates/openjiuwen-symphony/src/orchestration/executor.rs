@@ -37,9 +37,19 @@
 //! # Outcome records
 //!
 //! Each node writes exactly one top-level state key, the step id, holding
-//! `{"success": bool, "output": Value, "error": Option<String>, "duration_ms": u64}`.
-//! The duration comes from a monotonic [`std::time::Instant`]. A failed runner call
-//! still writes its record before the failure propagates.
+//! `{"success": bool, "output": Value, "error": Option<String>, "error_kind":
+//! Option<String>, "deferred": bool, "duration_ms": u64}`. The duration comes from a
+//! monotonic [`std::time::Instant`]. A failed runner call still writes its record before
+//! the failure propagates.
+//!
+//! `error_kind` is the runner failure's [`ErrorKind`] as its stable `snake_case` name
+//! ([`ErrorKind::as_str`]) and stays `null` on success, so a caller tells a genuine
+//! runtime failure (`"tool"`, `"timeout"`, `"graph"`, …) from a typed capability gap
+//! (`"unsupported"`) without parsing the message. `deferred` is `true` exactly when a
+//! failed step's `error_kind` is `"unsupported"`: the step names a capability the port
+//! does not implement (see the crate's deferred scope), which is a typed gap rather than
+//! a runtime error. Both fields deserialize with defaults, so a payload written before
+//! them (or by a hand-built record) reads back as `error_kind: None, deferred: false`.
 //!
 //! # Failure semantics
 //!
@@ -54,9 +64,31 @@
 //! [`ErrorKind::Unsupported`] (a deferred capability) keeps `ErrorKind::Unsupported`
 //! while keeping the same message shape.
 //!
-//! With `fail_fast = false` every step runs, a failing step records
-//! `success: false` plus its error, and the run returns `Ok(PlanExecution)`; callers use
-//! [`PlanExecution::failed_steps`] to inspect the failures.
+//! With `fail_fast = false` every step runs and the run returns `Ok(PlanExecution)`; a
+//! failing step records `success: false` plus its message and its `error_kind`, so the
+//! returned value still names every degradation. Callers use
+//! [`PlanExecution::failed_steps`] for all failures and
+//! [`PlanExecution::deferred_steps`] / [`PlanExecution::has_deferrals`] to isolate the
+//! typed capability gaps; a deferred step is a failure too, never a silent success.
+//!
+//! # Strict deferral mode
+//!
+//! [`ExecutorConfig::fail_on_deferral`] (default `false`) promotes the first deferred
+//! step to a run-level [`ErrorKind::Unsupported`]: the node returns
+//! ``step `<id>` deferred: <runner message>``, so a caller that opts in never receives a
+//! partial [`PlanExecution`] in which some capabilities silently did not run. It applies
+//! whether or not [`ExecutorConfig::fail_fast`] is set, because it is about the typed gap
+//! rather than generic failure handling; other runner failures keep the `fail_fast`
+//! behaviour.
+//!
+//! # Recorded degradations
+//!
+//! No degraded invocation is absorbed silently: a step whose required inputs remain
+//! unfilled after the overlay, a non-object caller seed, a declared predecessor with no
+//! state record, and a recorded-but-failed predecessor each emit a `tracing::warn!`
+//! naming the step and the inputs. A step that never produced a state record is
+//! reported as `success: false` with `error_kind: "graph"` (an engine-level
+//! inconsistency, not a runner failure) and logs its own warning.
 //!
 //! # Seeding caller inputs
 //!
@@ -84,7 +116,7 @@ use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{validation, Error, ErrorKind, Result};
-use crate::model::{normalize_name_key, CapabilityDescriptor};
+use crate::model::{normalize_name_key, CapabilityDescriptor, CapabilityIo};
 use crate::orchestration::plan::{OrchestrationPlan, PlanStep};
 
 /// The default cap on a plan's step count.
@@ -99,6 +131,10 @@ const RECORD_SUCCESS: &str = "success";
 const RECORD_OUTPUT: &str = "output";
 /// The state-key member holding a step record's error message.
 const RECORD_ERROR: &str = "error";
+/// The state-key member holding a step record's failure kind (`ErrorKind::as_str`).
+const RECORD_ERROR_KIND: &str = "error_kind";
+/// The state-key member holding a step record's deferred flag.
+const RECORD_DEFERRED: &str = "deferred";
 /// The state-key member holding a step record's monotonic duration.
 const RECORD_DURATION_MS: &str = "duration_ms";
 
@@ -181,15 +217,25 @@ pub struct ExecutorConfig {
     pub node_timeout_ms: Option<u64>,
     /// Whether the first step failure aborts the run.
     pub fail_fast: bool,
+    /// Whether the first deferred step aborts the run with a typed
+    /// [`ErrorKind::Unsupported`].
+    ///
+    /// Defaults to `false`, which records deferrals in the returned
+    /// [`PlanExecution`] and keeps running (subject to [`Self::fail_fast`] for other
+    /// failures). Set it to `true` to never receive a partial plan silently: the run
+    /// then fails with ``step `<id>` deferred: <runner message>``.
+    pub fail_on_deferral: bool,
 }
 
 impl Default for ExecutorConfig {
-    /// Returns `max_steps = 32`, no per-step timeout, and `fail_fast = true`.
+    /// Returns `max_steps = 32`, no per-step timeout, `fail_fast = true`, and
+    /// `fail_on_deferral = false`.
     fn default() -> Self {
         Self {
             max_steps: DEFAULT_MAX_STEPS,
             node_timeout_ms: None,
             fail_fast: true,
+            fail_on_deferral: false,
         }
     }
 }
@@ -197,7 +243,8 @@ impl Default for ExecutorConfig {
 /// What one plan step did.
 ///
 /// `step_id` is the qualified capability id, and `duration_ms` measures the runner call
-/// with a monotonic clock.
+/// with a monotonic clock. `error_kind` and `deferred` classify a failure so a caller
+/// can tell a typed capability gap from a runtime error without parsing `error`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct StepOutcome {
@@ -211,6 +258,19 @@ pub struct StepOutcome {
     pub output: Value,
     /// The failure message; `None` when the step succeeded.
     pub error: Option<String>,
+    /// The failure's [`ErrorKind`] as its stable `snake_case` name
+    /// ([`ErrorKind::as_str`]); `None` when the step succeeded.
+    ///
+    /// A runner failure records its own kind (`"tool"`, `"timeout"`, …), a deferred
+    /// capability records `"unsupported"`, and a step the graph never recorded records
+    /// `"graph"`.
+    pub error_kind: Option<String>,
+    /// Whether the step failed because its capability is a typed capability gap.
+    ///
+    /// `true` exactly when the step failed with [`ErrorKind::Unsupported`]; such a step
+    /// is still a failure for [`PlanExecution::failed_steps`] but is reported separately
+    /// by [`PlanExecution::deferred_steps`].
+    pub deferred: bool,
     /// The runner call's monotonic duration in milliseconds.
     pub duration_ms: u64,
 }
@@ -233,12 +293,33 @@ pub struct PlanExecution {
 
 impl PlanExecution {
     /// Returns the failed steps, ordered by step id.
+    ///
+    /// Deferred steps are failures too, so they appear here; use
+    /// [`Self::deferred_steps`] to isolate the typed capability gaps.
     #[must_use]
     pub fn failed_steps(&self) -> Vec<&StepOutcome> {
         self.steps.values().filter(|step| !step.success).collect()
     }
 
+    /// Returns the deferred steps, ordered by step id.
+    ///
+    /// A deferred step names a capability the port does not implement (a typed
+    /// capability gap, [`ErrorKind::Unsupported`]), not a runtime error. The list is
+    /// empty when every step either succeeded or failed for a runtime reason.
+    #[must_use]
+    pub fn deferred_steps(&self) -> Vec<&StepOutcome> {
+        self.steps.values().filter(|step| step.deferred).collect()
+    }
+
+    /// Reports whether any step failed with a typed capability gap.
+    #[must_use]
+    pub fn has_deferrals(&self) -> bool {
+        self.steps.values().any(|step| step.deferred)
+    }
+
     /// Reports whether every recorded step succeeded (true for a plan with no steps).
+    ///
+    /// A deferred step does not count as a success.
     #[must_use]
     pub fn succeeded(&self) -> bool {
         self.steps.values().all(|step| step.success)
@@ -312,7 +393,7 @@ impl PlanExecutor {
                 step_id: step.step_id.clone(),
                 capability: (*capability).clone(),
                 runner: Arc::clone(&self.runner),
-                input_names: step.inputs.iter().map(|io| io.name.clone()).collect(),
+                inputs: step.inputs.clone(),
                 predecessors: predecessors
                     .get(&step.step_id)
                     .map(|steps| {
@@ -330,6 +411,7 @@ impl PlanExecutor {
                     })
                     .unwrap_or_default(),
                 fail_fast: self.config.fail_fast,
+                fail_on_deferral: self.config.fail_on_deferral,
             };
             builder = builder.node_with(step.step_id.clone(), node, options.clone());
         }
@@ -359,8 +441,10 @@ impl PlanExecutor {
     ///
     /// Returns the [`PlanExecutor::compile`] validation errors, and with
     /// [`ExecutorConfig::fail_fast`] the first runner failure as an [`ErrorKind::Graph`]
-    /// error (see the module docs for the preserved kinds). Engine-level failures such as
-    /// a node timeout or a cancellation are returned unchanged.
+    /// error (see the module docs for the preserved kinds). With
+    /// [`ExecutorConfig::fail_on_deferral`] the first deferred step is returned as an
+    /// [`ErrorKind::Unsupported`] error naming the step and the runner's reason. Engine-level
+    /// failures such as a node timeout or a cancellation are returned unchanged.
     pub async fn execute(
         &self,
         plan: &OrchestrationPlan,
@@ -412,24 +496,33 @@ impl PlanExecutor {
         let mut records = plan.steps.clone();
         records.sort_by(|left, right| left.step_id.cmp(&right.step_id));
         for step in &records {
-            let outcome = match run.state.get(&step.step_id) {
-                Some(record) => {
-                    let mut outcome: StepOutcome =
-                        serde_json::from_value(record.clone()).map_err(|error| {
-                            validation("step_outcome", format!("step `{}`: {error}", step.step_id))
-                        })?;
-                    outcome.step_id.clone_from(&step.step_id);
-                    outcome.capability_type.clone_from(&step.capability_type);
-                    outcome
-                }
-                None => StepOutcome {
+            let outcome = if let Some(record) = run.state.get(&step.step_id) {
+                let mut outcome: StepOutcome =
+                    serde_json::from_value(record.clone()).map_err(|error| {
+                        validation("step_outcome", format!("step `{}`: {error}", step.step_id))
+                    })?;
+                outcome.step_id.clone_from(&step.step_id);
+                outcome.capability_type.clone_from(&step.capability_type);
+                // Keep the two failure-class fields consistent even for a hand-built
+                // or older record: `deferred` mirrors `error_kind` on a failure.
+                outcome.deferred = !outcome.success
+                    && outcome.error_kind.as_deref() == Some(ErrorKind::Unsupported.as_str());
+                outcome
+            } else {
+                tracing::warn!(
+                    step = %step.step_id,
+                    "plan step produced no state record; recording it as a failed step"
+                );
+                StepOutcome {
                     step_id: step.step_id.clone(),
                     capability_type: step.capability_type.clone(),
                     success: false,
                     output: Value::Null,
                     error: Some(MISSING_RECORD_ERROR.to_string()),
+                    error_kind: Some(ErrorKind::Graph.as_str().to_string()),
+                    deferred: false,
                     duration_ms: 0,
-                },
+                }
             };
             if outcome.success {
                 outputs.insert(step.step_id.clone(), outcome.output.clone());
@@ -531,19 +624,23 @@ fn seed_state(inputs: Value) -> Value {
 /// The engine reports a node failure as
 /// ``node `<id>` failed at superstep <n>: <node error>``. The executor owns the node
 /// error, so it trims that engine context back off using the failing step's own
-/// ``step `<id>` failed: `` marker: the caller then sees exactly the documented message
-/// and the error keeps its kind. A failure without a marker (a timeout, a cancellation,
-/// a channel error) is returned unchanged.
+/// ``step `<id>` failed: `` or ``step `<id>` deferred: `` marker: the caller then sees
+/// exactly the documented message and the error keeps its kind. A failure without a
+/// marker (a timeout, a cancellation, a channel error) is returned unchanged.
 fn trim_engine_context(plan: &OrchestrationPlan, error: Error) -> Error {
     let message = error.message().into_owned();
     for step in &plan.steps {
-        let marker = format!("step `{}` failed: ", step.step_id);
-        if let Some(index) = message.find(&marker) {
-            let trimmed = message[index..].to_string();
-            return match error.kind() {
-                ErrorKind::Unsupported => Error::unsupported(trimmed),
-                _ => Error::graph(trimmed),
-            };
+        for marker in [
+            format!("step `{}` failed: ", step.step_id),
+            format!("step `{}` deferred: ", step.step_id),
+        ] {
+            if let Some(index) = message.find(&marker) {
+                let trimmed = message[index..].to_string();
+                return match error.kind() {
+                    ErrorKind::Unsupported => Error::unsupported(trimmed),
+                    _ => Error::graph(trimmed),
+                };
+            }
         }
     }
     error
@@ -565,26 +662,40 @@ struct StepNode {
     capability: CapabilityDescriptor,
     /// The host's invocation strategy.
     runner: Arc<dyn CapabilityRunner>,
-    /// The step's declared input names, in plan order.
-    input_names: Vec<String>,
+    /// The step's declared inputs, in plan order.
+    inputs: Vec<CapabilityIo>,
     /// The step's predecessors, sorted by step id.
     predecessors: Vec<Predecessor>,
-    /// Whether a runner error aborts the run.
+    /// Whether a non-deferral runner error aborts the run.
     fail_fast: bool,
+    /// Whether a deferred (unsupported) runner error aborts the run.
+    fail_on_deferral: bool,
 }
 
 impl StepNode {
     /// Builds the invocation payload: the caller seed overlaid with predecessor outputs.
+    ///
+    /// Every degradation is logged: a non-object seed, a declared predecessor that never
+    /// recorded an outcome, a failed predecessor whose output is `null`, and required
+    /// declared inputs left unfilled by the overlay.
     fn collect_inputs(&self, state: &GraphState) -> Value {
         let mut inputs: Map<String, Value> = match state.get(SEED_INPUTS_KEY) {
             Some(Value::Object(map)) => map.clone(),
-            _ => Map::new(),
+            Some(other) => {
+                tracing::warn!(
+                    step = %self.step_id,
+                    seed = %other,
+                    "ignoring a non-object step-input seed"
+                );
+                Map::new()
+            }
+            None => Map::new(),
         };
 
         let input_keys: Vec<(&str, String)> = self
-            .input_names
+            .inputs
             .iter()
-            .map(|name| (name.as_str(), normalize_name_key(name)))
+            .map(|io| (io.name.as_str(), normalize_name_key(&io.name)))
             .collect();
         let mut filled: BTreeSet<String> = input_keys
             .iter()
@@ -594,12 +705,33 @@ impl StepNode {
 
         for predecessor in &self.predecessors {
             let Some(record) = state.get(&predecessor.step_id) else {
+                tracing::warn!(
+                    step = %self.step_id,
+                    predecessor = %predecessor.step_id,
+                    "declared predecessor recorded no outcome; nothing to overlay"
+                );
                 continue;
             };
             let Some(output) = record.get(RECORD_OUTPUT) else {
+                tracing::warn!(
+                    step = %self.step_id,
+                    predecessor = %predecessor.step_id,
+                    "declared predecessor recorded no output; nothing to overlay"
+                );
                 continue;
             };
             if output.is_null() {
+                if record
+                    .get(RECORD_SUCCESS)
+                    .and_then(Value::as_bool)
+                    .is_some_and(|success| !success)
+                {
+                    tracing::warn!(
+                        step = %self.step_id,
+                        predecessor = %predecessor.step_id,
+                        "predecessor failed; its output contributes nothing to the overlay"
+                    );
+                }
                 continue;
             }
             let resolved = resolve_outputs(output, &predecessor.output_names);
@@ -629,17 +761,46 @@ impl StepNode {
             }
         }
 
+        let missing: Vec<&str> = self
+            .inputs
+            .iter()
+            .filter(|io| io.required != Some(false) && !inputs.contains_key(io.name.as_str()))
+            .map(|io| io.name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            tracing::warn!(
+                step = %self.step_id,
+                missing = ?missing,
+                "required step inputs are unfilled; invoking the runner with a partial payload"
+            );
+        }
+
         Value::Object(inputs)
     }
 
     /// Builds the state record this step writes.
-    fn record(success: bool, output: Value, error: Option<String>, duration_ms: u64) -> Value {
+    ///
+    /// A failure records its message plus its [`ErrorKind`] name, and flags a deferred
+    /// (`unsupported`) failure so [`PlanExecution::deferred_steps`] can report it.
+    fn record(success: bool, output: Value, error: Option<&Error>, duration_ms: u64) -> Value {
         let mut record = Map::new();
         record.insert(RECORD_SUCCESS.to_string(), Value::Bool(success));
         record.insert(RECORD_OUTPUT.to_string(), output);
         record.insert(
             RECORD_ERROR.to_string(),
-            error.map_or(Value::Null, Value::String),
+            error.map_or(Value::Null, |error| {
+                Value::String(error.message().into_owned())
+            }),
+        );
+        record.insert(
+            RECORD_ERROR_KIND.to_string(),
+            error.map_or(Value::Null, |error| {
+                Value::String(error.kind().as_str().to_string())
+            }),
+        );
+        record.insert(
+            RECORD_DEFERRED.to_string(),
+            Value::Bool(error.is_some_and(|error| error.kind() == ErrorKind::Unsupported)),
         );
         record.insert(RECORD_DURATION_MS.to_string(), Value::from(duration_ms));
         Value::Object(record)
@@ -675,15 +836,22 @@ impl Node for StepNode {
                 Ok(NodeOutcome::Continue)
             }
             Err(error) => {
+                let kind = error.kind();
                 let message = error.message().into_owned();
                 state.set(
                     self.step_id.clone(),
-                    Self::record(false, Value::Null, Some(message.clone()), duration_ms),
+                    Self::record(false, Value::Null, Some(&error), duration_ms),
                 );
+                if kind == ErrorKind::Unsupported && self.fail_on_deferral {
+                    return Err(Error::unsupported(format!(
+                        "step `{}` deferred: {message}",
+                        self.step_id
+                    )));
+                }
                 if !self.fail_fast {
                     return Ok(NodeOutcome::Continue);
                 }
-                Err(match error.kind() {
+                Err(match kind {
                     ErrorKind::Cancelled => Error::cancelled(),
                     ErrorKind::Unsupported => {
                         Error::unsupported(format!("step `{}` failed: {message}", self.step_id))
@@ -778,4 +946,307 @@ fn endpoints(
         .collect();
     ids.sort();
     ids
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
+mod tests {
+    use super::*;
+    use crate::orchestration::plan::{PlanEdge, PlanStatus};
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    /// Builds a capability card with no inputs or outputs.
+    fn capability(id: &str) -> CapabilityDescriptor {
+        CapabilityDescriptor::new("tool", id, format!("cap tool:{id}"))
+    }
+
+    /// Builds a plan step whose capability type is taken from its qualified id.
+    fn step(step_id: &str) -> PlanStep {
+        PlanStep {
+            step_id: step_id.to_string(),
+            capability_type: "tool".to_string(),
+            name: format!("cap {step_id}"),
+            ..PlanStep::default()
+        }
+    }
+
+    /// Builds a ready plan over `steps`, linked by `edges`.
+    fn plan(steps: Vec<PlanStep>, edges: Vec<(&str, &str)>) -> OrchestrationPlan {
+        OrchestrationPlan::new("plan-test", "q", "en")
+            .with_status(PlanStatus::Ready)
+            .with_steps(steps)
+            .with_edges(
+                edges
+                    .into_iter()
+                    .map(|(source, target)| PlanEdge {
+                        source: source.to_string(),
+                        target: target.to_string(),
+                    })
+                    .collect(),
+            )
+    }
+
+    /// What a scripted fake runner does for one capability.
+    enum Behavior {
+        /// Returns this value.
+        Output(Value),
+        /// Returns an [`Error::tool`] with this message.
+        Fail(&'static str),
+        /// Returns the crate's typed deferred-scope error.
+        Deferred,
+    }
+
+    /// Replays one scripted behavior per qualified capability id.
+    struct FakeRunner {
+        behaviors: BTreeMap<String, Behavior>,
+    }
+
+    #[async_trait]
+    impl CapabilityRunner for FakeRunner {
+        async fn invoke(
+            &self,
+            capability: &CapabilityDescriptor,
+            _inputs: Value,
+            _context: &RunnerContext,
+        ) -> Result<Value> {
+            match self.behaviors.get(&capability.qualified_id()) {
+                Some(Behavior::Output(value)) => Ok(value.clone()),
+                Some(Behavior::Fail(message)) => Err(Error::tool(*message)),
+                Some(Behavior::Deferred) => Err(crate::error::unsupported("test capability")),
+                None => Ok(Value::Null),
+            }
+        }
+    }
+
+    #[test]
+    fn config_defaults_never_fail_on_a_deferral() {
+        let config = ExecutorConfig::default();
+        assert!(!config.fail_on_deferral);
+        assert!(config.fail_fast);
+        // A payload written before the field existed reads back with the default.
+        let legacy: ExecutorConfig = serde_json::from_value(
+            json!({"max_steps": 2, "node_timeout_ms": null, "fail_fast": false}),
+        )
+        .expect("legacy config");
+        assert_eq!(legacy.max_steps, 2);
+        assert_eq!(legacy.node_timeout_ms, None);
+        assert!(!legacy.fail_fast);
+        assert!(!legacy.fail_on_deferral);
+    }
+
+    #[tokio::test]
+    async fn all_deferred_steps_are_classified_not_silently_failed() {
+        let capabilities = vec![capability("a"), capability("b")];
+        let plan = plan(
+            vec![step("tool:a"), step("tool:b")],
+            vec![("tool:a", "tool:b")],
+        );
+        let executor = PlanExecutor::with_config(
+            ExecutorConfig {
+                fail_fast: false,
+                ..ExecutorConfig::default()
+            },
+            Arc::new(UnsupportedRunner::new()),
+        );
+
+        let execution = executor
+            .execute(&plan, &capabilities, None)
+            .await
+            .expect("the lenient run returns a PlanExecution");
+
+        assert!(!execution.succeeded());
+        let failed: Vec<&str> = execution
+            .failed_steps()
+            .iter()
+            .map(|step| step.step_id.as_str())
+            .collect();
+        assert_eq!(failed, ["tool:a", "tool:b"]);
+        let deferred: Vec<&str> = execution
+            .deferred_steps()
+            .iter()
+            .map(|step| step.step_id.as_str())
+            .collect();
+        assert_eq!(deferred, ["tool:a", "tool:b"]);
+        assert!(execution.has_deferrals());
+        for step_id in ["tool:a", "tool:b"] {
+            let outcome = &execution.steps[step_id];
+            assert!(!outcome.success);
+            assert_eq!(outcome.error_kind.as_deref(), Some("unsupported"));
+            assert!(outcome.deferred);
+            assert_eq!(execution.state[step_id]["error_kind"], json!("unsupported"));
+            assert_eq!(execution.state[step_id]["deferred"], json!(true));
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_mode_turns_the_first_deferral_into_a_typed_error() {
+        let capabilities = vec![capability("a"), capability("b")];
+        let plan = plan(
+            vec![step("tool:a"), step("tool:b")],
+            vec![("tool:a", "tool:b")],
+        );
+
+        for fail_fast in [false, true] {
+            let executor = PlanExecutor::with_config(
+                ExecutorConfig {
+                    fail_fast,
+                    fail_on_deferral: true,
+                    ..ExecutorConfig::default()
+                },
+                Arc::new(UnsupportedRunner::new()),
+            );
+            let error = executor
+                .execute(&plan, &capabilities, None)
+                .await
+                .expect_err("strict mode must abort on the first deferral");
+            assert_eq!(
+                error.kind(),
+                ErrorKind::Unsupported,
+                "fail_fast = {fail_fast}"
+            );
+            assert!(
+                error
+                    .message()
+                    .starts_with("step `tool:a` deferred: capability execution"),
+                "unexpected message: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn genuine_tool_failures_keep_the_graph_mapping() {
+        let capabilities = vec![capability("b")];
+        let plan = plan(vec![step("tool:b")], Vec::new());
+        let runner = FakeRunner {
+            behaviors: BTreeMap::from([("tool:b".to_string(), Behavior::Fail("boom"))]),
+        };
+
+        let strict = PlanExecutor::with_config(
+            ExecutorConfig {
+                fail_on_deferral: true,
+                ..ExecutorConfig::default()
+            },
+            Arc::new(runner),
+        );
+        let error = strict
+            .execute(&plan, &capabilities, None)
+            .await
+            .expect_err("a tool failure aborts under fail_fast");
+        assert_eq!(error.kind(), ErrorKind::Graph);
+        assert_eq!(error.message(), "step `tool:b` failed: boom");
+
+        let lenient = PlanExecutor::with_config(
+            ExecutorConfig {
+                fail_fast: false,
+                ..ExecutorConfig::default()
+            },
+            Arc::new(FakeRunner {
+                behaviors: BTreeMap::from([("tool:b".to_string(), Behavior::Fail("boom"))]),
+            }),
+        );
+        let execution = lenient
+            .execute(&plan, &capabilities, None)
+            .await
+            .expect("lenient run");
+        let outcome = &execution.steps["tool:b"];
+        assert_eq!(outcome.error_kind.as_deref(), Some("tool"));
+        assert!(!outcome.deferred);
+        assert!(!execution.has_deferrals());
+        assert!(execution.deferred_steps().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mixed_plan_keeps_success_and_deferral_distinct() {
+        let capabilities = vec![capability("ok"), capability("deferred")];
+        let plan = plan(vec![step("tool:ok"), step("tool:deferred")], Vec::new());
+        let runner = FakeRunner {
+            behaviors: BTreeMap::from([
+                (
+                    "tool:ok".to_string(),
+                    Behavior::Output(json!({"done": true})),
+                ),
+                ("tool:deferred".to_string(), Behavior::Deferred),
+            ]),
+        };
+        let executor = PlanExecutor::with_config(
+            ExecutorConfig {
+                fail_fast: false,
+                ..ExecutorConfig::default()
+            },
+            Arc::new(runner),
+        );
+
+        let execution = executor
+            .execute(&plan, &capabilities, None)
+            .await
+            .expect("run");
+        let ok = &execution.steps["tool:ok"];
+        assert!(ok.success);
+        assert_eq!(ok.error, None);
+        assert_eq!(ok.error_kind, None);
+        assert!(!ok.deferred);
+        assert_eq!(execution.outputs["tool:ok"], json!({"done": true}));
+
+        let deferred = &execution.steps["tool:deferred"];
+        assert!(!deferred.success);
+        assert_eq!(deferred.error_kind.as_deref(), Some("unsupported"));
+        assert!(deferred.deferred);
+        assert!(!execution.outputs.contains_key("tool:deferred"));
+        assert_eq!(
+            execution
+                .failed_steps()
+                .iter()
+                .map(|step| step.step_id.as_str())
+                .collect::<Vec<_>>(),
+            ["tool:deferred"]
+        );
+    }
+
+    #[test]
+    fn legacy_payloads_default_the_new_fields() {
+        let legacy_outcome: StepOutcome = serde_json::from_value(json!({
+            "step_id": "tool:a",
+            "capability_type": "tool",
+            "success": false,
+            "output": null,
+            "error": "boom",
+            "duration_ms": 3,
+        }))
+        .expect("legacy outcome");
+        assert_eq!(legacy_outcome.error.as_deref(), Some("boom"));
+        assert_eq!(legacy_outcome.error_kind, None);
+        assert!(!legacy_outcome.deferred);
+
+        let execution: PlanExecution = serde_json::from_value(json!({
+            "plan_id": "plan-test",
+            "graph_id": "plan-test",
+            "steps": {"tool:a": legacy_outcome},
+            "outputs": {},
+            "state": {},
+        }))
+        .expect("legacy execution");
+        assert_eq!(execution.failed_steps().len(), 1);
+        assert!(execution.deferred_steps().is_empty());
+        assert!(!execution.has_deferrals());
+
+        let deferred: StepOutcome = serde_json::from_value(json!({
+            "step_id": "tool:d",
+            "capability_type": "tool",
+            "success": false,
+            "output": null,
+            "error": "deferred",
+            "error_kind": "unsupported",
+            "deferred": true,
+            "duration_ms": 0,
+        }))
+        .expect("deferred outcome");
+        let encoded = serde_json::to_value(&deferred).expect("serialize");
+        assert_eq!(encoded["error_kind"], json!("unsupported"));
+        assert_eq!(encoded["deferred"], json!(true));
+        assert_eq!(
+            serde_json::from_value::<StepOutcome>(encoded).expect("round trip"),
+            deferred
+        );
+    }
 }

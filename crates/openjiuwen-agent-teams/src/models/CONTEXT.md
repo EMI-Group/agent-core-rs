@@ -29,7 +29,7 @@ impl ModelPool {
 #[derive(Debug, Clone, Copy, Default /* RoundRobin */, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RouterStrategy { ByName, RoundRobin, LeastBusy, RuleBased }   // by_name | round_robin | least_busy | rule_based
 impl RouterStrategy { pub const fn as_str(self) -> &'static str; }
-impl From<ModelPoolStrategy> for RouterStrategy;   // RoundRobin -> RoundRobin, ByModelName -> ByName
+impl From<ModelPoolStrategy> for RouterStrategy;   // RoundRobin -> RoundRobin, ByModelName -> ByName, IntelliRouter -> RoundRobin
 pub enum Complexity { Low, Medium, High }                             // Ord, snake_case
 pub struct RequestHint { pub model_name: Option<String>, pub role: Option<TeamRole>,
                          pub task_kind: Option<String>, pub complexity: Option<Complexity>,
@@ -143,7 +143,9 @@ Definition of done (all green): `cargo fmt -p openjiuwen-agent-teams`, `cargo te
 
 ## Deferred
 
-- IntelliRouter client-side reliable router and the `intelli_router` provider (`IntelliRouterConfig`, `IntelliRouterDeployment`, `INTELLI_ROUTER_PROVIDER`, `INTELLI_ROUTER_UNIFIED_MODEL` as public API, `RouterAllocator`, `IntelliRouterAllocator`, `CliModelCatalog`): needs the vendor router SDK/client and its deployment-probing loop, which this port does not carry; the model-group *label* is kept because it is display-only.
+- The IntelliRouter client-side reliable router and route-group service (`IntelliRouterConfig`, `IntelliRouterDeployment`, `INTELLI_ROUTER_PROVIDER`, `INTELLI_ROUTER_UNIFIED_MODEL` as public API, `RouterAllocator`, `IntelliRouterAllocator`, `CliModelCatalog`): needs the vendor router SDK/client and its deployment-probing loop, which this port does not carry; the model-group *label* is kept because it is display-only.
+- `ModelPoolStrategy::IntelliRouter` itself is modelled: its `intelli_router` wire value round-trips and `src/runtime/allocator.rs` refuses it at allocation with a typed `Error::Unsupported`, so the deferral is a documented refusal rather than a parse failure.
+- This module's `From<ModelPoolStrategy> for RouterStrategy` sends `IntelliRouter` to `RouterStrategy::RoundRobin`, which is safe because that conversion is never the path that silently degrades a team: an IntelliRouter team fails earlier, at allocation.
 - Vendor CLI model catalogs (`resolve_cli_models`, `CliModelAllocation`): requires invoking the vendor `claude`/`codex` binaries, whose harness providers are deferred in `openjiuwen-harness-providers`.
 - `ModelRouterConfig` expansion (one endpoint serving many names) and `inherit_pool_ids` (bit-exact `model_id` carry-over on pool refresh): both are spec-build/pool-refresh concerns of `schema`/`runtime`, not request routing; the pool here validates and preserves entries only.
 - Weighted, LRU and affinity/KV-cache strategies: no persisted weight or affinity model exists in this module (cache identity and its registry live in `../kv_cache/`), so the four shipped strategies are the full surface.

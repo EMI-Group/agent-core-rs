@@ -795,10 +795,44 @@ async fn component_routing_short_circuits_the_routers() {
 #[test]
 fn to_mermaid_renders_nodes_and_edges() {
     let workflow = CompiledWorkflow::build(linear(echo(), NodeConfig::default())).unwrap();
-    let rendered = workflow.to_mermaid();
+    let rendered = workflow.to_mermaid().unwrap();
     assert!(rendered.contains("start"), "{rendered}");
     assert!(rendered.contains("mid"), "{rendered}");
     assert!(rendered.contains("end"), "{rendered}");
+}
+
+#[test]
+fn rendering_an_uncompilable_definition_reports_the_compile_error() {
+    // `order` names a component that was never inserted, so validation passes but the graph
+    // cannot be compiled. `CompiledWorkflow` is immutable, which is why the test shapes the
+    // definition before building it.
+    let mut definition = linear(echo(), NodeConfig::default());
+    definition.order.push("ghost".to_owned());
+    let workflow = CompiledWorkflow::build(definition).unwrap();
+
+    let mermaid = workflow.to_mermaid().unwrap_err();
+    assert_eq!(mermaid.kind(), ErrorKind::Workflow);
+    assert!(mermaid.message().contains("ghost"), "{mermaid}");
+    assert!(
+        !mermaid.to_string().contains("could not be compiled"),
+        "no placeholder comment is produced: {mermaid}"
+    );
+    assert!(
+        !mermaid.to_string().contains("%%"),
+        "no Mermaid text leaks into the error: {mermaid}"
+    );
+
+    let svg = workflow.to_svg().unwrap_err();
+    assert_eq!(svg.kind(), ErrorKind::Workflow);
+    assert!(svg.message().contains("ghost"), "{svg}");
+    assert!(
+        !svg.to_string().contains("<?xml"),
+        "no SVG document is fabricated: {svg}"
+    );
+    assert!(
+        !svg.to_string().contains("could not be compiled"),
+        "no error document is fabricated: {svg}"
+    );
 }
 
 #[test]
@@ -810,6 +844,7 @@ fn run_options_are_chainable_and_permissive() {
     assert!(options.stream_modes.is_none());
     assert!(options.max_supersteps.is_none());
     assert!(!options.cancellation.is_cancelled());
+    assert_eq!(options.stream_delivery, StreamDelivery::Buffered);
 
     let token = CancellationToken::new();
     token.cancel();
@@ -821,11 +856,17 @@ fn run_options_are_chainable_and_permissive() {
         .with_interactive(interactive)
         .with_resume(true)
         .with_stream_modes(vec![StreamMode::Trace])
-        .with_max_supersteps(3);
+        .with_max_supersteps(3)
+        .with_stream_delivery(StreamDelivery::Interleaved);
     assert!(configured.cancellation.is_cancelled());
     assert_eq!(configured.timeout, Some(Duration::from_secs(1)));
     assert!(configured.interactive.is_some());
     assert!(configured.resume);
     assert_eq!(configured.stream_modes, Some(vec![StreamMode::Trace]));
     assert_eq!(configured.max_supersteps, Some(3));
+    assert_eq!(
+        configured.stream_delivery,
+        StreamDelivery::Interleaved,
+        "the delivery mode is recorded verbatim for the run funnel to check"
+    );
 }

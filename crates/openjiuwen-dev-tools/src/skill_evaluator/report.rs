@@ -197,9 +197,12 @@ pub struct FunctionalReport {
     pub skill_path: String,
     /// Run timestamp in epoch milliseconds, supplied by the caller.
     ///
-    /// Deviation from Python, which writes an ISO-8601 `"YYYY-MM-DDTHH:MM:SSZ"`
-    /// string: the Rust artifact keeps an integer so no clock or date-formatting
-    /// logic lives in the library.
+    /// This stays an integer because the value is the caller's input contract:
+    /// the library never reads the clock, so the caller passes epoch
+    /// milliseconds (or a fixed value in tests) and the serialized artifact
+    /// keeps `timestamp` numeric.
+    /// [`timestamp_iso`](Self::timestamp_iso) renders Python's ISO-8601 UTC
+    /// form, `"YYYY-MM-DDTHH:MM:SSZ"`, from it.
     pub timestamp: i64,
     /// Aggregate counts over [`results`](Self::results).
     pub summary: CaseSummary,
@@ -207,6 +210,21 @@ pub struct FunctionalReport {
     pub results: Vec<CaseResult>,
     /// Free-form next steps for the skill author.
     pub recommendations: Vec<String>,
+}
+
+impl FunctionalReport {
+    /// Renders the report `timestamp` as Python's ISO-8601 UTC string.
+    ///
+    /// The result is `"YYYY-MM-DDTHH:MM:SSZ"` at second precision (milliseconds
+    /// are truncated toward negative infinity); see
+    /// [`iso8601_utc`](super::timestamp::iso8601_utc). The [`timestamp`] field
+    /// itself stays an integer, so this is purely additive.
+    ///
+    /// [`timestamp`]: Self::timestamp
+    #[must_use]
+    pub fn timestamp_iso(&self) -> String {
+        super::timestamp::iso8601_utc(self.timestamp)
+    }
 }
 
 /// One hazard found by the safety scan.
@@ -565,6 +583,35 @@ mod tests {
         assert_eq!(grade_for(0.0), "F");
         assert_eq!(grade_for(-0.1), "F");
         assert_eq!(grade_for(f64::NAN), "F");
+    }
+
+    #[test]
+    fn timestamp_iso_renders_python_iso8601() {
+        let mut report = FunctionalReport::default();
+        assert_eq!(report.timestamp_iso(), "1970-01-01T00:00:00Z");
+
+        report.timestamp = 1_700_000_000_000;
+        assert_eq!(report.timestamp_iso(), "2023-11-14T22:13:20Z");
+
+        report.timestamp = 1_700_000_000_999;
+        assert_eq!(report.timestamp_iso(), "2023-11-14T22:13:20Z");
+
+        report.timestamp = -1;
+        assert_eq!(report.timestamp_iso(), "1969-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn the_serialized_timestamp_stays_an_integer() {
+        let mut report = EvaluationReport::default();
+        report.functional.timestamp = 1_700_000_000_000;
+
+        let json = report.to_json().expect("to_json");
+        assert_eq!(json["functional"]["timestamp"], 1_700_000_000_000_i64);
+        assert_eq!(
+            report.functional.timestamp_iso(),
+            "2023-11-14T22:13:20Z",
+            "the accessor renders what the integer field carries"
+        );
     }
 
     #[test]

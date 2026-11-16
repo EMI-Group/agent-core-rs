@@ -142,9 +142,11 @@ pub fn render_svg(spec: &WorkflowSpec, card: &WorkflowCard, options: &SvgOptions
 
 /// Renders a minimal standalone SVG document carrying `message`.
 ///
-/// Rendering a workflow never fails; when the definition cannot be compiled, the compiled
-/// entry point degrades to this document so a caller still receives valid SVG. `message`
-/// is word-wrapped and XML-escaped.
+/// This is a utility for callers who explicitly want an error document to show (a UI
+/// rendering a failed build, for example). The compiled engine does **not** use it:
+/// [`CompiledWorkflow::to_svg`](crate::engine::CompiledWorkflow::to_svg) returns the compile
+/// error instead of fabricating a document, so a caller never mistakes a rendered failure for
+/// a diagram. `message` is word-wrapped and XML-escaped.
 #[must_use]
 pub fn error_svg(message: &str) -> String {
     const WIDTH: u32 = 560;

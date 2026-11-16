@@ -168,16 +168,14 @@ pub fn parse_sequence_reference(value: &str) -> Option<(&str, usize)> {
 /// where that guess went wrong.
 ///
 /// Each element is re-serialized compactly, matching Python's
-/// `separators=(",", ":")`; `serde_json::to_string` writes the same form.
+/// `separators=(",", ":")`; `Value`'s `Display` is that compact form and cannot
+/// fail, so no element is ever replaced by an empty string.
 #[must_use]
 pub fn split_elements(value: &str) -> Vec<String> {
     let Ok(Value::Array(parsed)) = serde_json::from_str::<Value>(value) else {
         return Vec::new();
     };
-    parsed
-        .iter()
-        .map(|element| serde_json::to_string(element).unwrap_or_default())
-        .collect()
+    parsed.iter().map(ToString::to_string).collect()
 }
 /// Returns the attribute value a sequence of elements states.
 ///

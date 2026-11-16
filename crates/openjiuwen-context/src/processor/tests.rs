@@ -133,6 +133,7 @@ fn context<'a>(
         cancellation,
         recall: None,
         session_memory: None,
+        session_memory_agent: None,
     }
 }
 
@@ -201,6 +202,7 @@ async fn run_propagates_errors_and_checks_cancellation() {
         cancellation: &cancelled,
         recall: None,
         session_memory: None,
+        session_memory_agent: None,
     };
     let error = pipeline.run(&mut messages, &cx).await.unwrap_err();
     assert!(matches!(error, Error::Cancelled));

@@ -31,7 +31,10 @@
 //! - [`creator`] — [`SkillSpec`], [`SkillRequest`], [`SkillCreator`].
 //! - [`omni`] — the `skill_omni_creation` pipeline: URL → scraped page → assets
 //!   → skill bundle ([`OmniCreation`], also reached through
-//!   [`SkillCreator::create_from_url`]).
+//!   [`SkillCreator::create_from_url`]). The page may be HTML, an unpacked
+//!   `tar`/`zip`/`gzip` archive, an office/`PDF` document, or plain text, and
+//!   [`omni::GenerationProvenance`] reports whether the drafting model or the
+//!   deterministic template renderer produced the document.
 
 pub mod bundle;
 pub mod creator;

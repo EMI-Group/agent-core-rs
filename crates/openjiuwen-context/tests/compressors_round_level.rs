@@ -106,6 +106,7 @@ impl Fixture {
             cancellation: &self.cancellation,
             recall: None,
             session_memory: None,
+            session_memory_agent: None,
         }
     }
 
@@ -126,6 +127,7 @@ impl Fixture {
             cancellation: &self.cancellation,
             recall: None,
             session_memory: None,
+            session_memory_agent: None,
         }
     }
 }

@@ -1,9 +1,10 @@
 //! Anthropic Messages transport.
 //!
 //! Handles the Anthropic-specific message projection (system hoisting,
-//! `tool_use`/`tool_result` blocks, base64/URL images, content-block cache
-//! breakpoints) and the event-oriented SSE stream. Request, response, and stream
-//! conversion live in the private submodules and are re-exported from here.
+//! `tool_use`/`tool_result` blocks, preserved extended-thinking blocks,
+//! base64/URL images, content-block cache breakpoints) and the event-oriented
+//! SSE stream. Request, response, and stream conversion live in the private
+//! submodules and are re-exported from here.
 
 mod cache;
 mod convert;
@@ -17,9 +18,10 @@ pub use request::{
     build_messages_body, build_messages_body_with_endpoint, build_messages_body_with_provider,
     normalize_api_base,
 };
-pub use response::{parse_anthropic_usage, parse_messages_response};
+pub use response::{parse_anthropic_usage, parse_messages_response, THINKING_BLOCKS_METADATA_KEY};
 pub use stream::AnthropicStreamState;
 
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -32,9 +34,9 @@ use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::http::{HttpClient, HttpRequest, HttpStream};
 
 use crate::llm::config::{ModelClientConfig, ModelRequestConfig};
-use crate::llm::model::{ChatResponse, Model, StreamChunk};
+use crate::llm::model::{AssistantTurn, ChatResponse, Model, StreamAccumulator, StreamChunk};
 use crate::llm::provider::{provider_profile, ProviderFlavor, ANTHROPIC_VERSION};
-use crate::llm::sse::SseDecoder;
+use crate::llm::sse::{SseDecoder, SseEvent};
 use crate::prompt::BaseMessage;
 
 use super::transport::{error_for_status, join_url};
@@ -175,6 +177,151 @@ impl AnthropicClient {
 
         request.json(body)
     }
+
+    /// Streams one turn and returns the chunks plus the accumulator state.
+    ///
+    /// [`Model::stream`] is this function without the second element. The state
+    /// preserves the turn's `thinking`/`redacted_thinking` blocks (signatures
+    /// included), which the [`StreamChunk`] surface deliberately does not carry:
+    /// drain the stream, build the message with
+    /// [`StreamAccumulator`](crate::llm::model::StreamAccumulator), then call
+    /// [`apply_thinking_blocks`](AnthropicStreamState::apply_thinking_blocks) on
+    /// it. That makes a streamed extended-thinking turn replayable on the next
+    /// request exactly like the non-streaming parser's message;
+    /// [`complete_turn`](Self::complete_turn) performs the three steps at once.
+    ///
+    /// The returned handle is empty until the stream is drained, because the one
+    /// copy of the state lives inside the stream.
+    pub fn stream_with_state(
+        &self,
+        messages: Vec<BaseMessage>,
+        request: ModelRequestConfig,
+    ) -> (
+        BoxStream<'static, Result<StreamChunk>>,
+        Arc<Mutex<AnthropicStreamState>>,
+    ) {
+        let state = Arc::new(Mutex::new(AnthropicStreamState::new()));
+        let stream = self.stream_inner(messages, request, Arc::clone(&state));
+        (stream, state)
+    }
+
+    /// Streams one turn and returns the accumulated assistant turn.
+    ///
+    /// This is the streaming counterpart of [`Model::invoke`] with the
+    /// replayability of the non-streaming parser: the returned message carries
+    /// its reasoning text *and* the turn's preserved thinking blocks under
+    /// [`THINKING_BLOCKS_METADATA_KEY`], so it can be sent back verbatim on a
+    /// follow-up turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider's own error for a rejected request and
+    /// [`Error::Llm`] for a malformed or failed event stream.
+    pub async fn complete_turn(
+        &self,
+        messages: &[BaseMessage],
+        request: &ModelRequestConfig,
+    ) -> Result<AssistantTurn> {
+        let (mut stream, state) = self.stream_with_state(messages.to_vec(), request.clone());
+        let mut accumulator = StreamAccumulator::new();
+        while let Some(chunk) = stream.next().await {
+            accumulator.push(&chunk?);
+        }
+
+        let mut turn = accumulator.finish();
+        lock_state(&state).apply_thinking_blocks(&mut turn.message);
+        Ok(turn)
+    }
+
+    /// Builds the SSE chunk stream that folds every event into `state`.
+    fn stream_inner(
+        &self,
+        messages: Vec<BaseMessage>,
+        request: ModelRequestConfig,
+        state: Arc<Mutex<AnthropicStreamState>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        let prepared = build_messages_body_with_endpoint(
+            &messages,
+            &request,
+            true,
+            self.client.provider.as_str(),
+            self.client.endpoint_profile.as_deref(),
+            Some(&self.base_url),
+        )
+        .and_then(|body| self.build_http_request(&body));
+        let http_request = match prepared {
+            Ok(http_request) => http_request,
+            Err(error) => return Box::pin(futures::stream::once(async move { Err(error) })),
+        };
+
+        let http = self.http.clone();
+        let first_chunk_timeout = self.client.stream_first_chunk_timeout;
+        let idle_timeout = self.client.stream_idle_timeout;
+
+        Box::pin(async_stream::try_stream! {
+            let response = http.stream(http_request).await?;
+            let status = response.status;
+            let url = response.url;
+            let mut body = response.body;
+
+            if !(200..300).contains(&status) {
+                let detail = read_error_body(&mut body).await?;
+                Err(error_for_status(status, &url, &detail))?;
+            }
+
+            let mut decoder = SseDecoder::new();
+            let mut first_token_seen = false;
+
+            loop {
+                let timeout = if first_token_seen { idle_timeout } else { first_chunk_timeout };
+                let Some(bytes) = next_chunk(&mut body, timeout).await? else {
+                    break;
+                };
+                for event in decoder.push(&bytes) {
+                    for chunk in feed_event(&state, &event)? {
+                        if is_first_token(&chunk) {
+                            first_token_seen = true;
+                        }
+                        yield chunk;
+                    }
+                }
+            }
+
+            if let Some(event) = decoder.finish() {
+                for chunk in feed_event(&state, &event)? {
+                    yield chunk;
+                }
+            }
+
+            for chunk in finish_state(&state) {
+                yield chunk;
+            }
+        })
+    }
+}
+
+/// Locks the shared stream state, recovering from a poisoned lock.
+///
+/// The lock is held for a single event, so a panic elsewhere cannot leave a
+/// half-updated state that matters; recovering keeps the caller's stream alive
+/// instead of turning the lock into a second failure.
+fn lock_state(state: &Mutex<AnthropicStreamState>) -> MutexGuard<'_, AnthropicStreamState> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Folds one event into the shared state and returns the chunks it produced.
+///
+/// The lock is taken and released inside this function so no guard ever reaches
+/// the streaming generator's state (a guard is not `Send`).
+fn feed_event(state: &Mutex<AnthropicStreamState>, event: &SseEvent) -> Result<Vec<StreamChunk>> {
+    lock_state(state).handle_event(event)
+}
+
+/// Seals the shared state at the end of the response body and returns `Done`.
+fn finish_state(state: &Mutex<AnthropicStreamState>) -> Vec<StreamChunk> {
+    lock_state(state).finish()
 }
 
 #[async_trait]
@@ -225,64 +372,7 @@ impl Model for AnthropicClient {
         messages: Vec<BaseMessage>,
         request: ModelRequestConfig,
     ) -> BoxStream<'static, Result<StreamChunk>> {
-        let prepared = build_messages_body_with_endpoint(
-            &messages,
-            &request,
-            true,
-            self.client.provider.as_str(),
-            self.client.endpoint_profile.as_deref(),
-            Some(&self.base_url),
-        )
-        .and_then(|body| self.build_http_request(&body));
-        let http_request = match prepared {
-            Ok(http_request) => http_request,
-            Err(error) => return Box::pin(futures::stream::once(async move { Err(error) })),
-        };
-
-        let http = self.http.clone();
-        let first_chunk_timeout = self.client.stream_first_chunk_timeout;
-        let idle_timeout = self.client.stream_idle_timeout;
-
-        Box::pin(async_stream::try_stream! {
-            let response = http.stream(http_request).await?;
-            let status = response.status;
-            let url = response.url;
-            let mut body = response.body;
-
-            if !(200..300).contains(&status) {
-                let detail = read_error_body(&mut body).await?;
-                Err(error_for_status(status, &url, &detail))?;
-            }
-
-            let mut decoder = SseDecoder::new();
-            let mut state = AnthropicStreamState::new();
-            let mut first_token_seen = false;
-
-            loop {
-                let timeout = if first_token_seen { idle_timeout } else { first_chunk_timeout };
-                let Some(bytes) = next_chunk(&mut body, timeout).await? else {
-                    break;
-                };
-                for event in decoder.push(&bytes) {
-                    for chunk in state.handle_event(&event)? {
-                        if is_first_token(&chunk) {
-                            first_token_seen = true;
-                        }
-                        yield chunk;
-                    }
-                }
-            }
-
-            if let Some(event) = decoder.finish() {
-                for chunk in state.handle_event(&event)? {
-                    yield chunk;
-                }
-            }
-
-            for chunk in state.finish() {
-                yield chunk;
-            }
-        })
+        self.stream_with_state(messages, request).0
     }
 }
 

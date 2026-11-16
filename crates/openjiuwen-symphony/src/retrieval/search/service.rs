@@ -74,10 +74,12 @@ use crate::retrieval::search::config::{
     DisclosureConfig, EmbeddingScoringConfig, ProgressiveSearchConfig, SelectionMode,
 };
 use crate::retrieval::search::flat::FlatRetriever;
+use crate::retrieval::search::flow::SelectionProvenance;
 use crate::retrieval::search::progressive::{
     validate_query, ProgressiveRetriever, ProgressiveSearchResult, METHOD_LEXICAL_FALLBACK,
     METHOD_PROGRESSIVE,
 };
+use crate::retrieval::search::selector::{trace_degraded_selections, trace_selection_provenance};
 use crate::retrieval::search::truncation::ScoreTruncationConfig;
 use crate::retrieval::types::{
     CatalogRecord, LoadedIndex, RetrieverCandidate, RetrieverTraceEvent,
@@ -336,6 +338,16 @@ pub struct RetrievalResult {
     pub trace_events: Vec<RetrieverTraceEvent>,
     /// How many nodes the walk visited.
     pub steps: usize,
+    /// The provenance of the walk's last selection ([`SelectionProvenance::Lexical`] when the
+    /// walk recorded no selection), so a caller that never reads logs still learns whether the
+    /// configured model produced the answer.
+    pub selection_provenance: SelectionProvenance,
+    /// How many selections degraded away from the configured model (a missing model in
+    /// generate mode, a failed model call or an unusable reply).
+    pub degraded_selections: usize,
+    /// Whether an over-large `SearchRequest::top_k` was clamped to
+    /// [`RetrieverConfig::top_k`].
+    pub top_k_clamped: bool,
 }
 
 /// A model bound to a [`Retriever`].
@@ -501,9 +513,21 @@ impl Retriever {
         request: &SearchRequest,
     ) -> Result<RetrievalResult> {
         validate_query(query)?;
-        let top_k = self.resolve_top_k(request.top_k);
+        let requested = request.top_k;
+        let top_k = self.resolve_top_k(requested);
+        let top_k_clamped = matches!(
+            requested,
+            Some(value) if value != 0 && value > self.runtime_config.top_k
+        );
+        if top_k_clamped {
+            tracing::warn!(
+                requested = ?requested,
+                configured = self.runtime_config.top_k,
+                "the requested top_k exceeds the configured bound; clamping it"
+            );
+        }
         let result = self.progressive()?.search(query, Some(top_k)).await?;
-        Ok(self.publicize(&result, top_k))
+        Ok(self.publicize(&result, top_k, top_k_clamped))
     }
 
     /// The loaded index the retriever serves.
@@ -542,6 +566,33 @@ impl Retriever {
             METHOD_PROGRESSIVE
         } else {
             METHOD_LEXICAL_FALLBACK
+        }
+    }
+
+    /// The provenance the next search's selections will report.
+    ///
+    /// [`SelectionProvenance::LexicalNoModel`] means
+    /// [`SelectionMode::Generate`](crate::retrieval::search::config::SelectionMode) is
+    /// configured but no model is wired, so every selection will degrade to the lexical
+    /// scorer (and warn once per runtime). [`SelectionProvenance::EmbeddingBlend`] means the
+    /// lexical ranking is blended with the wired embedder and its positive weight.
+    #[must_use]
+    pub fn selection_provenance(&self) -> SelectionProvenance {
+        match self.config.generation.mode {
+            SelectionMode::Generate => {
+                if self.model.is_some() {
+                    SelectionProvenance::Model
+                } else {
+                    SelectionProvenance::LexicalNoModel
+                }
+            }
+            SelectionMode::Lexical => {
+                if self.embedding.is_some() && self.config.embedding_weight > 0.0 {
+                    SelectionProvenance::EmbeddingBlend
+                } else {
+                    SelectionProvenance::Lexical
+                }
+            }
         }
     }
 
@@ -623,8 +674,14 @@ impl Retriever {
     /// The rules are documented at the module level: resolve the payload through the
     /// catalog, dedupe by payload (then worker id), re-rank from `1`, mark the first row
     /// selected, trim to `top_k` (`0` = unlimited) and derive the ids, summary lines and
-    /// selected row from the trimmed rows.
-    fn publicize(&self, result: &ProgressiveSearchResult, top_k: usize) -> RetrievalResult {
+    /// selected row from the trimmed rows. The selection provenance is carried over from the
+    /// walk's trace, so a degraded selection is visible on the public result too.
+    fn publicize(
+        &self,
+        result: &ProgressiveSearchResult,
+        top_k: usize,
+        top_k_clamped: bool,
+    ) -> RetrievalResult {
         let mut rows: Vec<CandidateRecord> = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for candidate in &result.candidates {
@@ -672,6 +729,10 @@ impl Retriever {
             summary_lines,
             trace_events: result.trace.events().to_vec(),
             steps: result.steps,
+            selection_provenance: trace_selection_provenance(&result.trace)
+                .unwrap_or_else(|| self.selection_provenance()),
+            degraded_selections: trace_degraded_selections(&result.trace),
+            top_k_clamped,
         }
     }
 

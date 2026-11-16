@@ -19,6 +19,14 @@
 //! so both the body and a condition expression can read the loop position. The hard cap
 //! is `min(config.max_iterations, session.loop_number_max_limit)`; exceeding it is a
 //! `COMPONENT_LOOP_EXECUTION_ERROR` (`101040`).
+//!
+//! The iteration plan, the cap, and the body driver are shared with the loop containers
+//! ([`crate::components::LoopGroupComponent`], [`crate::components::AdvancedLoopComponent`])
+//! and live in `crate::components::loop_driver`. The body is also where the loop-body
+//! control components take effect: a break request stops the loop and the interrupted
+//! round is not recorded. Missing or contradictory configuration is reported by
+//! `Component::validate_config` at build time with `COMPONENT_LOOP_PARAM_INVALID`
+//! (`101030`), before any run.
 
 use std::fmt;
 use std::sync::Arc;
@@ -26,17 +34,13 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::error::Result;
 
 use crate::ability::ComponentAbility;
 use crate::component::{Component, ComponentCard};
-use crate::condition::Condition;
 use crate::context::ComponentContext;
-use crate::error::loop_execution_error;
-use crate::reference;
 
-/// Python's `LOOP_NUMBER_MAX_LIMIT_DEFAULT`.
-const DEFAULT_MAX_ITERATIONS: u64 = 1000;
+use crate::components::loop_driver::{self, BoundParams};
 
 /// How a [`LoopComponent`] decides how many iterations to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -96,7 +100,7 @@ impl Default for LoopConfig {
             loop_number: None,
             loop_array: None,
             bool_expression: None,
-            max_iterations: DEFAULT_MAX_ITERATIONS,
+            max_iterations: loop_driver::DEFAULT_MAX_ITERATIONS,
         }
     }
 }
@@ -178,207 +182,14 @@ impl LoopComponent {
         self.body.len()
     }
 
-    /// The effective iteration cap: the tighter of the component and session limits.
-    fn effective_limit(&self, ctx: &ComponentContext) -> u64 {
-        let Some(config) = ctx.session().config() else {
-            return self.config.max_iterations;
-        };
-        let session_limit = config.read().loop_number_max_limit;
-        self.config.max_iterations.min(session_limit)
-    }
-
-    /// The error returned when a loop would run more than `limit` iterations.
-    fn exceeds_limit(limit: u64, ctx: &ComponentContext) -> Error {
-        loop_execution_error(
-            &format!("loop_number exceeds maximum limit {limit}"),
-            ctx.component_id(),
+    /// The bound parameters of this component's configuration.
+    fn bound_params(&self) -> BoundParams<'_> {
+        BoundParams::new(
+            self.config.loop_number,
+            self.config.loop_array.as_deref(),
+            self.config.bool_expression.as_deref(),
         )
     }
-
-    /// Builds the iteration plan, validating the type-specific configuration.
-    fn iteration_plan(
-        &self,
-        base: &Value,
-        limit: u64,
-        ctx: &ComponentContext,
-    ) -> Result<IterationPlan> {
-        match self.config.loop_type {
-            LoopType::Number => {
-                let count = self.config.loop_number.ok_or_else(|| {
-                    loop_execution_error(
-                        "loop_number variable not found or is None",
-                        ctx.component_id(),
-                    )
-                })?;
-                if count > limit {
-                    return Err(Self::exceeds_limit(limit, ctx));
-                }
-                Ok(IterationPlan::Count(count))
-            }
-            LoopType::Array => {
-                let spec = self.config.loop_array.as_deref().ok_or_else(|| {
-                    loop_execution_error(
-                        "loop_array variable not found or is None",
-                        ctx.component_id(),
-                    )
-                })?;
-                let Value::Array(items) = resolve_array(base, spec) else {
-                    return Err(loop_execution_error(
-                        "loop_array is not an array",
-                        ctx.component_id(),
-                    ));
-                };
-                let length = u64::try_from(items.len()).unwrap_or(u64::MAX);
-                if length > limit {
-                    return Err(Self::exceeds_limit(limit, ctx));
-                }
-                Ok(IterationPlan::Items(items))
-            }
-            LoopType::Condition => {
-                let expression = self.config.bool_expression.as_deref().ok_or_else(|| {
-                    loop_execution_error(
-                        "bool_expression variable not found or is None",
-                        ctx.component_id(),
-                    )
-                })?;
-                let condition = Condition::new(expression)
-                    .map_err(|error| loop_execution_error(&error.message(), ctx.component_id()))?;
-                Ok(IterationPlan::Condition(condition))
-            }
-        }
-    }
-
-    /// Runs the plan and collects one output per iteration.
-    async fn run_plan(
-        &self,
-        plan: IterationPlan,
-        base: &Value,
-        limit: u64,
-        ctx: &ComponentContext,
-    ) -> Result<Vec<Value>> {
-        match plan {
-            IterationPlan::Count(count) => self.run_count(count, base, ctx).await,
-            IterationPlan::Items(items) => self.run_items(&items, base, ctx).await,
-            IterationPlan::Condition(condition) => {
-                self.run_condition(&condition, base, limit, ctx).await
-            }
-        }
-    }
-
-    /// Runs `count` iterations with a null item.
-    async fn run_count(
-        &self,
-        count: u64,
-        base: &Value,
-        ctx: &ComponentContext,
-    ) -> Result<Vec<Value>> {
-        let mut results = Vec::new();
-        let mut previous = Value::Null;
-        for index in 0..count {
-            ctx.check_cancelled()?;
-            let inputs = iteration_inputs(base, index, Value::Null, &previous);
-            previous = self.run_body(inputs, ctx).await?;
-            results.push(previous.clone());
-        }
-        Ok(results)
-    }
-
-    /// Runs one iteration per array element.
-    async fn run_items(
-        &self,
-        items: &[Value],
-        base: &Value,
-        ctx: &ComponentContext,
-    ) -> Result<Vec<Value>> {
-        let mut results = Vec::new();
-        let mut previous = Value::Null;
-        for (index, item) in (0u64..).zip(items) {
-            ctx.check_cancelled()?;
-            let inputs = iteration_inputs(base, index, item.clone(), &previous);
-            previous = self.run_body(inputs, ctx).await?;
-            results.push(previous.clone());
-        }
-        Ok(results)
-    }
-
-    /// Runs while the condition holds, failing when it would exceed `limit`.
-    async fn run_condition(
-        &self,
-        condition: &Condition,
-        base: &Value,
-        limit: u64,
-        ctx: &ComponentContext,
-    ) -> Result<Vec<Value>> {
-        let mut results = Vec::new();
-        let mut previous = Value::Null;
-        let mut index = 0u64;
-        loop {
-            ctx.check_cancelled()?;
-            let inputs = iteration_inputs(base, index, Value::Null, &previous);
-            if !Self::evaluate(condition, &inputs, ctx)? {
-                break;
-            }
-            if index >= limit {
-                return Err(Self::exceeds_limit(limit, ctx));
-            }
-            previous = self.run_body(inputs, ctx).await?;
-            results.push(previous.clone());
-            index += 1;
-        }
-        Ok(results)
-    }
-
-    /// Evaluates `condition`, mapping condition failures onto the loop error.
-    fn evaluate(condition: &Condition, source: &Value, ctx: &ComponentContext) -> Result<bool> {
-        condition
-            .evaluate(source)
-            .map_err(|error| loop_execution_error(&error.message(), ctx.component_id()))
-    }
-
-    /// Runs the body sequentially and returns the last component's output.
-    async fn run_body(&self, inputs: Value, ctx: &ComponentContext) -> Result<Value> {
-        let mut current = inputs;
-        for component in &self.body {
-            current = component.invoke(current, ctx).await?;
-        }
-        Ok(current)
-    }
-}
-
-/// The three iteration plans of a [`LoopComponent`].
-enum IterationPlan {
-    /// A fixed iteration count.
-    Count(u64),
-    /// One iteration per element.
-    Items(Vec<Value>),
-    /// Iterate while the condition holds.
-    Condition(Condition),
-}
-
-/// Resolves the `loop_array` specification to a JSON value.
-///
-/// A whole-string reference (`"${items}"`) is resolved against the input object; any
-/// other string is looked up as a top-level input key. A missing key resolves to `null`
-/// and fails the subsequent array check.
-fn resolve_array(base: &Value, spec: &str) -> Value {
-    if reference::is_ref_path(spec) {
-        return reference::extract_origin_key(spec)
-            .and_then(|path| reference::resolve_path(base, path))
-            .unwrap_or(Value::Null);
-    }
-    base.get(spec).cloned().unwrap_or(Value::Null)
-}
-
-/// Builds one iteration's inputs: the base object overlaid with the loop variables.
-fn iteration_inputs(base: &Value, index: u64, item: Value, previous: &Value) -> Value {
-    let mut merged = match base {
-        Value::Object(map) => map.clone(),
-        _ => Map::new(),
-    };
-    merged.insert("index".to_owned(), Value::from(index));
-    merged.insert("item".to_owned(), item);
-    merged.insert("previous".to_owned(), previous.clone());
-    Value::Object(merged)
 }
 
 #[async_trait::async_trait]
@@ -395,21 +206,30 @@ impl Component for LoopComponent {
         "loop"
     }
 
+    /// Rejects a missing or malformed bound before any run.
+    ///
+    /// The cap checked here is the component's own `max_iterations`; the session's
+    /// `loop_number_max_limit` can only tighten it further at run time.
+    fn validate_config(&self) -> Result<()> {
+        loop_driver::validate_bound(
+            self.config.loop_type.into(),
+            self.bound_params(),
+            self.config.max_iterations,
+        )
+    }
+
     async fn invoke(&self, inputs: Value, ctx: &ComponentContext) -> Result<Value> {
-        let base = match inputs {
-            Value::Object(map) => Value::Object(map),
-            Value::Null => Value::Object(Map::new()),
-            _ => {
-                return Err(loop_execution_error(
-                    "inputs must be an object",
-                    ctx.component_id(),
-                ))
-            }
-        };
-        let limit = self.effective_limit(ctx);
-        let plan = self.iteration_plan(&base, limit, ctx)?;
-        let results = self.run_plan(plan, &base, limit, ctx).await?;
-        Ok(json!({"loop_results": results}))
+        let base = loop_driver::object_inputs(inputs, ctx)?;
+        let limit = loop_driver::effective_limit(self.config.max_iterations, ctx);
+        let spec = loop_driver::plan(
+            self.config.loop_type.into(),
+            self.bound_params(),
+            &base,
+            limit,
+            ctx.component_id(),
+        )?;
+        let run = loop_driver::run_spec(&spec, &self.body, &base, Map::new(), limit, ctx).await?;
+        Ok(json!({"loop_results": run.results}))
     }
 }
 

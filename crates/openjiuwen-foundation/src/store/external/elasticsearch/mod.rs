@@ -24,15 +24,21 @@
 //! # Schema round-trip
 //!
 //! Elasticsearch mappings cannot carry every member of a
-//! [`CollectionSchema`] (the primary-key flag, `auto_id`, `max_length`,
-//! `enable_dynamic_field`), so `create_index_body` stores the serialized
-//! schema as a JSON string under the reserved index-metadata key
-//! `_meta.openjiuwen_schema` in addition to the derived `properties` mapping.
-//! `schema_from_index` prefers that marker, which restores the exact schema;
-//! an index without it (created by someone else) is reconstructed from
-//! `mappings.properties` by `schema_from_properties`, which synthesizes the
-//! `id` primary key the mapping cannot declare.
+//! [`CollectionSchema`](crate::store::vector::CollectionSchema) (the
+//! primary-key flag, `auto_id`, `max_length`, `enable_dynamic_field`), so
+//! `create_index_body` stores the serialized schema as a JSON string under the
+//! reserved index-metadata key `_meta.openjiuwen_schema` in addition to the
+//! derived `properties` mapping. `schema_from_index` prefers that marker, which
+//! restores the exact schema; an index without it (created by someone else) is
+//! reconstructed from `mappings.properties` by `schema_from_properties`, which
+//! synthesizes the `id` primary key the mapping cannot declare.
+//!
+//! Mapping code — the schema ↔ `properties` conversion and the exhaustive
+//! Elasticsearch dtype → [`FieldSchema`](crate::store::vector::FieldSchema)
+//! table — lives in the private `mapping` module so this file stays a client
+//! plus the shared helpers.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -43,15 +49,18 @@ use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::http::{HttpClient, HttpClientConfig, HttpRequest, HttpResponse};
 use openjiuwen_common::security::SecretString;
 
-use crate::store::document::{validate_collection, ID_FIELD};
-use crate::store::vector::{CollectionSchema, FieldSchema, Metric, VectorDataType};
+use crate::store::document::{validate_collection, SortOrder};
+use crate::store::vector::Metric;
 
 pub mod document;
+mod mapping;
 pub mod query;
 pub mod vector;
 
 pub use document::ElasticsearchDocumentStore;
 pub use vector::ElasticsearchVectorStore;
+
+pub(crate) use mapping::{create_index_body, schema_from_index};
 
 /// Default total timeout of one Elasticsearch request.
 const fn default_timeout() -> Duration {
@@ -63,17 +72,21 @@ fn default_index_prefix() -> String {
     "openjiuwen".to_string()
 }
 
-/// Index-metadata key holding the serialized [`CollectionSchema`].
-const SCHEMA_META_KEY: &str = "openjiuwen_schema";
-
-/// Number of documents read per page while collecting ids for a filtered delete.
-pub(crate) const FILTER_DELETE_PAGE: usize = 500;
+/// Number of documents requested per page of a paginated read or a filter scan.
+pub(crate) const SEARCH_PAGE_SIZE: usize = 500;
 
 /// Maximum number of response-body characters echoed in an error message.
 pub(crate) const ERROR_BODY_EXCERPT: usize = 200;
 
-/// Bounded result window of a document query without an explicit `limit`.
-pub(crate) const DEFAULT_QUERY_LIMIT: usize = 10_000;
+/// Hard cap on the documents a single document-store read may assemble.
+///
+/// A read that would need more fails with a typed error instead of returning a
+/// silently truncated result; the cap is Elasticsearch's default
+/// `index.max_result_window`.
+pub(crate) const MAX_SCAN_DOCUMENTS: usize = 10_000;
+
+/// `tracing` target of the warnings of both adapters.
+const LOG_TARGET: &str = "openjiuwen_foundation::store::external::elasticsearch";
 
 /// Configuration of an Elasticsearch backend.
 ///
@@ -329,6 +342,109 @@ impl ElasticsearchClient {
             Err(failure(&response, context))
         }
     }
+
+    /// Runs one [`SearchScan`], handing every page of fresh hits to `on_page`.
+    ///
+    /// Every request asks for at most [`SEARCH_PAGE_SIZE`] documents sorted by
+    /// the scan's `sort` and continues from the `sort` values of the previous
+    /// page, so a deep read costs one request per page instead of deep
+    /// `from`/`size` paging. Hits repeated across pages are dropped before
+    /// `on_page` sees them, and a missing index (404) reads as no documents.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Validation` when a full page carries no `sort` values (paging
+    /// cannot continue) or repeats documents (the cursor does not advance), and
+    /// `Error::Unsupported` — after a `tracing::warn!` naming the cap and the
+    /// filter — when the scan would need more than [`MAX_SCAN_DOCUMENTS`]
+    /// documents, rather than reporting the matches of a truncated window.
+    pub(crate) async fn scan<F>(&self, scan: SearchScan<'_>, mut on_page: F) -> Result<()>
+    where
+        F: FnMut(Vec<SearchHit>) -> Result<()>,
+    {
+        let SearchScan {
+            index,
+            query,
+            sort,
+            needed,
+            filter,
+        } = scan;
+        let path = self.path(index, "/_search");
+        // The read stops one document past the cap, which is what tells "exactly
+        // the cap" apart from "more than the cap".
+        let stop = needed
+            .unwrap_or(usize::MAX)
+            .min(MAX_SCAN_DOCUMENTS.saturating_add(1));
+        let mut gathered = 0usize;
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut cursor: Option<Value> = None;
+        while gathered < stop {
+            let size = SEARCH_PAGE_SIZE.min(stop - gathered);
+            let mut body = json!({
+                "query": &query,
+                "_source": true,
+                "size": size,
+                "sort": &sort,
+            });
+            if let (Some(cursor), Some(object)) = (&cursor, body.as_object_mut()) {
+                object.insert("search_after".to_string(), cursor.clone());
+            }
+            let response = self
+                .send_raw(HttpRequest::post(self.url(&path)).json(&body)?)
+                .await?;
+            match response.status {
+                404 => break,
+                200..=299 => {}
+                _ => return Err(failure(&response, "paging documents")),
+            }
+            let (page, next) = search_hits(&response.json()?)?;
+            let page_len = page.len();
+            let fresh: Vec<SearchHit> = page
+                .into_iter()
+                .filter(|hit| seen.insert(hit.id.clone()))
+                .collect();
+            let fresh_len = fresh.len();
+            if !fresh.is_empty() {
+                on_page(fresh)?;
+            }
+            gathered += fresh_len;
+            if page_len < size {
+                // A short page is the last one.
+                break;
+            }
+            if gathered >= stop {
+                break;
+            }
+            if fresh_len == 0 {
+                return Err(Error::validation(format!(
+                    "Elasticsearch paging of index `{index}` did not advance: the page after \
+                     `search_after` {cursor:?} repeated documents (filter: {filter})"
+                )));
+            }
+            let Some(next) = next else {
+                return Err(Error::validation(format!(
+                    "Elasticsearch paging of index `{index}` cannot continue: a full page carries \
+                     no `sort` values for `search_after` (filter: {filter})"
+                )));
+            };
+            cursor = Some(next);
+        }
+        if gathered > MAX_SCAN_DOCUMENTS {
+            tracing::warn!(
+                target: LOG_TARGET,
+                index = %index,
+                cap = MAX_SCAN_DOCUMENTS,
+                filter = %filter,
+                "an Elasticsearch read reached the supported document cap",
+            );
+            return Err(Error::unsupported(format!(
+                "Elasticsearch read of index `{index}` needs more than the supported cap of \
+                 {MAX_SCAN_DOCUMENTS} documents for filter {filter}; narrow the filter or pass an \
+                 explicit `limit`"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Trims and checks the endpoint, and rejects an empty index prefix.
@@ -343,251 +459,6 @@ fn checked_endpoint(config: &ElasticsearchConfig) -> Result<String> {
         ));
     }
     Ok(endpoint)
-}
-
-/// Maps a [`Metric`] onto the Elasticsearch `dense_vector` similarity name.
-pub(crate) fn similarity_for(metric: Metric) -> &'static str {
-    match metric {
-        Metric::Cosine => "cosine",
-        Metric::Dot => "dot_product",
-        Metric::Euclidean => "l2_norm",
-    }
-}
-
-/// The Elasticsearch mapping of one schema field, using `metric` as the
-/// similarity of a `dense_vector` field.
-///
-/// # Errors
-///
-/// Returns [`Error::Validation`](openjiuwen_common::error::Error) for a vector
-/// field without a positive `dim` and for a top-level `ARRAY` field, which an
-/// Elasticsearch mapping cannot represent.
-pub(crate) fn field_mapping_with(field: &FieldSchema, metric: Metric) -> Result<Value> {
-    let mapping = match field.dtype {
-        VectorDataType::FloatVector => {
-            let dim = field.dim.filter(|dim| *dim > 0).ok_or_else(|| {
-                Error::validation(format!(
-                    "Elasticsearch mapping of vector field {:?} needs a positive `dim`, got {:?}",
-                    field.name, field.dim
-                ))
-            })?;
-            json!({
-                "type": "dense_vector",
-                "dims": dim,
-                "index": true,
-                "similarity": similarity_for(metric),
-            })
-        }
-        VectorDataType::Varchar => match field.max_length {
-            Some(max_length) => json!({"type": "keyword", "ignore_above": max_length}),
-            None => json!({"type": "keyword"}),
-        },
-        VectorDataType::Int64 => json!({"type": "long"}),
-        VectorDataType::Int32 => json!({"type": "integer"}),
-        VectorDataType::Float => json!({"type": "float"}),
-        VectorDataType::Double => json!({"type": "double"}),
-        VectorDataType::Bool => json!({"type": "boolean"}),
-        VectorDataType::Json => json!({"type": "object"}),
-        VectorDataType::Array => {
-            return Err(Error::validation(format!(
-                "Elasticsearch mappings cannot represent a top-level ARRAY field; \
-                 field {:?} must be a JSON or scalar field",
-                field.name
-            )));
-        }
-    };
-    Ok(mapping)
-}
-
-/// The `properties` mapping of every field of `schema`, keyed by field name.
-///
-/// # Errors
-///
-/// Propagates [`field_mapping_with`]'s validation errors. The caller validates
-/// the schema itself with [`CollectionSchema::validate`].
-pub(crate) fn properties_for(schema: &CollectionSchema, metric: Metric) -> Result<Value> {
-    let mut properties = Map::new();
-    for field in &schema.fields {
-        properties.insert(field.name.clone(), field_mapping_with(field, metric)?);
-    }
-    Ok(Value::Object(properties))
-}
-
-/// The body of the `PUT /{index}` that creates an index for `schema`.
-///
-/// The mapping holds the derived `properties` plus the serialized schema under
-/// `_meta.openjiuwen_schema`, which is what makes [`schema_from_index`] restore
-/// the exact [`CollectionSchema`] instead of a reconstructed approximation.
-///
-/// # Errors
-///
-/// Propagates [`properties_for`]'s validation errors.
-pub(crate) fn create_index_body(schema: &CollectionSchema, metric: Metric) -> Result<Value> {
-    let serialized = serde_json::to_string(schema).map_err(Error::external)?;
-    let properties = properties_for(schema, metric)?;
-    Ok(json!({
-        "mappings": {
-            "_meta": { (SCHEMA_META_KEY): serialized },
-            "properties": properties,
-        },
-    }))
-}
-
-/// Reads a [`CollectionSchema`] back out of a `GET /{index}` response body.
-///
-/// Both response shapes are accepted: `{"<index>": {"mappings": {..}}}` (the
-/// `get index` API) and a bare `{"mappings": {..}}`. The `_meta` marker written
-/// by [`create_index_body`] wins; without it the schema is reconstructed from
-/// `mappings.properties`. `Ok(None)` means the payload describes no mapping at
-/// all (a missing index, or an index without properties).
-///
-/// # Errors
-///
-/// Returns [`Error::Validation`](openjiuwen_common::error::Error) when the
-/// marker is not a readable schema or a property has an unsupported type.
-pub(crate) fn schema_from_index(payload: &Value) -> Result<Option<CollectionSchema>> {
-    let Some(mappings) = mappings_of(payload) else {
-        return Ok(None);
-    };
-    if let Some(stored) = mappings
-        .get("_meta")
-        .and_then(Value::as_object)
-        .and_then(|meta| meta.get(SCHEMA_META_KEY))
-    {
-        let raw = stored.as_str().ok_or_else(|| {
-            Error::validation(format!(
-                "Elasticsearch index metadata `_meta.{SCHEMA_META_KEY}` must hold the \
-                 serialized collection schema as a JSON string, found {stored}"
-            ))
-        })?;
-        let schema = serde_json::from_str(raw).map_err(|err| {
-            Error::validation(format!(
-                "Elasticsearch index metadata `_meta.{SCHEMA_META_KEY}` holds an \
-                 unreadable collection schema: {err}"
-            ))
-        })?;
-        return Ok(Some(schema));
-    }
-    match mappings.get("properties").and_then(Value::as_object) {
-        Some(properties) if !properties.is_empty() => {
-            schema_from_properties(&Value::Object(properties.clone())).map(Some)
-        }
-        _ => Ok(None),
-    }
-}
-
-/// The `mappings` object of an index-metadata payload, wrapped or bare.
-fn mappings_of(payload: &Value) -> Option<&Map<String, Value>> {
-    let object = payload.as_object()?;
-    if let Some(mappings) = object.get("mappings").and_then(Value::as_object) {
-        return Some(mappings);
-    }
-    let mut names: Vec<&String> = object.keys().collect();
-    names.sort();
-    names
-        .into_iter()
-        .find_map(|name| object.get(name)?.get("mappings")?.as_object())
-}
-
-/// Reconstructs a [`CollectionSchema`] from bare `mappings.properties`.
-///
-/// A field named [`ID_FIELD`] becomes the primary key; when the mapping has no
-/// such field, a `VARCHAR` primary-key field named `id` is synthesized, so the
-/// schema always validates with exactly one primary key.
-///
-/// # Errors
-///
-/// Returns [`Error::Validation`](openjiuwen_common::error::Error) when
-/// `properties` is not an object, a property has no `type` or an unsupported
-/// type, or the `id` field cannot be a primary key.
-pub(crate) fn schema_from_properties(properties: &Value) -> Result<CollectionSchema> {
-    let entries = properties.as_object().ok_or_else(|| {
-        Error::validation(format!(
-            "Elasticsearch index mappings `properties` must be an object, found {properties}"
-        ))
-    })?;
-    let mut fields = Vec::with_capacity(entries.len() + 1);
-    let mut has_id = false;
-    for (name, mapping) in entries {
-        let mut field = field_from_mapping(name, mapping)?;
-        if name == ID_FIELD {
-            if matches!(
-                field.dtype,
-                VectorDataType::FloatVector | VectorDataType::Array
-            ) {
-                return Err(Error::validation(format!(
-                    "Elasticsearch index field {ID_FIELD:?} has type {:?} and cannot be the \
-                     primary key",
-                    field.dtype
-                )));
-            }
-            field.is_primary = true;
-            has_id = true;
-        }
-        fields.push(field);
-    }
-    if !has_id {
-        fields.insert(
-            0,
-            FieldSchema {
-                is_primary: true,
-                ..FieldSchema::new(ID_FIELD, VectorDataType::Varchar)
-            },
-        );
-    }
-    Ok(CollectionSchema::new(fields))
-}
-
-/// Converts one `mappings.properties` entry into a [`FieldSchema`].
-fn field_from_mapping(name: &str, mapping: &Value) -> Result<FieldSchema> {
-    let dtype_name = mapping.get("type").and_then(Value::as_str).ok_or_else(|| {
-        Error::validation(format!(
-            "Elasticsearch index mapping of field {name:?} has no string `type`, found {mapping}"
-        ))
-    })?;
-    let unsupported = || {
-        Error::validation(format!(
-            "Elasticsearch index mapping of field {name:?} has unsupported type {dtype_name:?}"
-        ))
-    };
-    let mut field = match dtype_name {
-        "dense_vector" => {
-            let dim = mapping
-                .get("dims")
-                .and_then(Value::as_u64)
-                .and_then(|dim| usize::try_from(dim).ok())
-                .filter(|dim| *dim > 0)
-                .ok_or_else(|| {
-                    Error::validation(format!(
-                        "Elasticsearch index mapping of vector field {name:?} has no positive \
-                         `dims`, found {mapping}"
-                    ))
-                })?;
-            FieldSchema {
-                dim: Some(dim),
-                ..FieldSchema::new(name, VectorDataType::FloatVector)
-            }
-        }
-        "keyword" | "text" => {
-            let max_length = mapping
-                .get("ignore_above")
-                .and_then(Value::as_u64)
-                .and_then(|limit| usize::try_from(limit).ok());
-            FieldSchema {
-                max_length,
-                ..FieldSchema::new(name, VectorDataType::Varchar)
-            }
-        }
-        "long" => FieldSchema::new(name, VectorDataType::Int64),
-        "integer" => FieldSchema::new(name, VectorDataType::Int32),
-        "float" => FieldSchema::new(name, VectorDataType::Float),
-        "double" => FieldSchema::new(name, VectorDataType::Double),
-        "boolean" => FieldSchema::new(name, VectorDataType::Bool),
-        "object" | "nested" => FieldSchema::new(name, VectorDataType::Json),
-        _ => return Err(unsupported()),
-    };
-    field.name = name.to_string();
-    Ok(field)
 }
 
 /// The index names of a `GET /{prefix}__*` listing response, sorted.
@@ -681,34 +552,117 @@ pub(crate) fn encode_segment(segment: &str) -> String {
     encoded
 }
 
+/// One hit of a `_search` response, reduced to what both adapters need.
+pub(crate) struct SearchHit {
+    /// The document key, i.e. Elasticsearch's `_id`.
+    pub(crate) id: String,
+    /// The stored document, i.e. its `_source` object.
+    pub(crate) source: Map<String, Value>,
+}
+
+/// One `search_after` scan over one index, run by
+/// [`ElasticsearchClient::scan`].
+///
+/// Both adapters page through the shared scan, so the page size, the hard cap
+/// and the non-progress guards cannot drift between them.
+pub(crate) struct SearchScan<'a> {
+    /// Index the scan reads.
+    pub(crate) index: &'a str,
+    /// Query DSL of every request: a translated filter or `{"match_all":{}}`.
+    pub(crate) query: Value,
+    /// Total order of the scan; its last criterion must be unique per document.
+    pub(crate) sort: Value,
+    /// Documents the caller needs; `None` reads until the index is exhausted.
+    pub(crate) needed: Option<usize>,
+    /// The store-level filter, interpolated into the error messages.
+    pub(crate) filter: &'a Value,
+}
+
+/// The sort clause of a paged `_search` request: the caller's criteria plus
+/// the keyword key field as the stable tiebreaker.
+///
+/// `search_after` needs a total order that does not shift between requests, so
+/// `key_field` closes the clause whenever the caller's criteria do not already
+/// name it. Every criterion keeps its direction and places documents missing the
+/// field first for [`SortOrder::Asc`] and last for [`SortOrder::Desc`], which is
+/// the order [`run_query`](crate::store::document::run_query) produces.
+pub(crate) fn stable_sort(order_by: &[(String, SortOrder)], key_field: &str) -> Value {
+    let mut criteria: Vec<Value> = order_by
+        .iter()
+        .map(|(field, order)| {
+            let (order, missing) = match order {
+                SortOrder::Asc => ("asc", "_first"),
+                SortOrder::Desc => ("desc", "_last"),
+            };
+            let mut criterion = Map::new();
+            criterion.insert(
+                field.clone(),
+                json!({"order": order, "missing": missing, "unmapped_type": "keyword"}),
+            );
+            Value::Object(criterion)
+        })
+        .collect();
+    if !order_by.iter().any(|(field, _)| field == key_field) {
+        criteria.push(
+            json!({key_field: {"order": "asc", "missing": "_last", "unmapped_type": "keyword"}}),
+        );
+    }
+    Value::Array(criteria)
+}
+
+/// The hits of a `_search` response and the `search_after` cursor of its last
+/// hit, in the order the server returned them.
+///
+/// The cursor is the hit's `sort` value array, which is exactly what the next
+/// request has to send back; it is `None` when the server returned no `sort`
+/// values (a response that cannot be continued). A hit without an `_id` or
+/// without an object `_source` is a malformed response and fails with
+/// [`Error::Validation`].
+pub(crate) fn search_hits(payload: &Value) -> Result<(Vec<SearchHit>, Option<Value>)> {
+    let Some(hits) = payload
+        .get("hits")
+        .and_then(|hits| hits.get("hits"))
+        .and_then(Value::as_array)
+    else {
+        return Ok((Vec::new(), None));
+    };
+    let mut page: Vec<SearchHit> = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let id = hit.get("_id").and_then(Value::as_str).ok_or_else(|| {
+            Error::validation(format!(
+                "Elasticsearch search hit is missing its `_id`: {}",
+                excerpt(&hit.to_string())
+            ))
+        })?;
+        let source = hit
+            .get("_source")
+            .and_then(Value::as_object)
+            .cloned()
+            .ok_or_else(|| {
+                Error::validation(format!(
+                    "Elasticsearch search hit {id:?} has no object `_source`: {}",
+                    excerpt(&hit.to_string())
+                ))
+            })?;
+        page.push(SearchHit {
+            id: id.to_string(),
+            source,
+        });
+    }
+    let cursor = hits
+        .last()
+        .and_then(|hit| hit.get("sort"))
+        .filter(|sort| sort.is_array())
+        .cloned();
+    Ok((page, cursor))
+}
+
 #[cfg(test)]
 mod tests {
     use openjiuwen_common::error::ErrorKind;
+    use serde_json::json;
 
     use super::*;
-
-    fn schema() -> CollectionSchema {
-        CollectionSchema {
-            fields: vec![
-                FieldSchema {
-                    is_primary: true,
-                    auto_id: true,
-                    max_length: Some(64),
-                    ..FieldSchema::new("id", VectorDataType::Varchar)
-                },
-                FieldSchema {
-                    dim: Some(3),
-                    ..FieldSchema::new("embedding", VectorDataType::FloatVector)
-                },
-                FieldSchema::new("title", VectorDataType::Varchar),
-                FieldSchema::new("count", VectorDataType::Int64),
-                FieldSchema::new("ratio", VectorDataType::Double),
-                FieldSchema::new("payload", VectorDataType::Json),
-            ],
-            description: Some("docs".to_string()),
-            enable_dynamic_field: true,
-        }
-    }
 
     #[test]
     fn config_defaults_are_stable() {
@@ -870,205 +824,6 @@ mod tests {
             ElasticsearchClient::new(ElasticsearchConfig::new("http://es:9200")).expect("client");
         let request = anonymous.apply(HttpRequest::get("http://es:9200/_cluster/health"));
         assert!(!request.headers().contains_key("authorization"));
-    }
-
-    #[test]
-    fn similarity_names_follow_the_metric() {
-        assert_eq!(similarity_for(Metric::Cosine), "cosine");
-        assert_eq!(similarity_for(Metric::Dot), "dot_product");
-        assert_eq!(similarity_for(Metric::Euclidean), "l2_norm");
-    }
-
-    #[test]
-    fn field_mapping_covers_every_data_type() {
-        let vector = FieldSchema {
-            dim: Some(4),
-            ..FieldSchema::new("embedding", VectorDataType::FloatVector)
-        };
-        assert_eq!(
-            field_mapping_with(&vector, Metric::Dot).expect("mapping"),
-            json!({"type": "dense_vector", "dims": 4, "index": true, "similarity": "dot_product"})
-        );
-        assert_eq!(
-            field_mapping_with(&vector, Metric::Cosine).expect("mapping")["similarity"],
-            json!("cosine")
-        );
-
-        let varchar = FieldSchema {
-            max_length: Some(32),
-            ..FieldSchema::new("title", VectorDataType::Varchar)
-        };
-        assert_eq!(
-            field_mapping_with(&varchar, Metric::Cosine).expect("mapping"),
-            json!({"type": "keyword", "ignore_above": 32})
-        );
-        assert_eq!(
-            field_mapping_with(
-                &FieldSchema::new("title", VectorDataType::Varchar),
-                Metric::Cosine,
-            )
-            .expect("mapping"),
-            json!({"type": "keyword"})
-        );
-
-        for (dtype, expected) in [
-            (VectorDataType::Int64, "long"),
-            (VectorDataType::Int32, "integer"),
-            (VectorDataType::Float, "float"),
-            (VectorDataType::Double, "double"),
-            (VectorDataType::Bool, "boolean"),
-            (VectorDataType::Json, "object"),
-        ] {
-            assert_eq!(
-                field_mapping_with(&FieldSchema::new("field", dtype), Metric::Cosine)
-                    .expect("mapping"),
-                json!({"type": expected}),
-                "dtype {dtype:?}"
-            );
-        }
-
-        let array = FieldSchema::new("tags", VectorDataType::Array);
-        let error = field_mapping_with(&array, Metric::Cosine).expect_err("ARRAY is rejected");
-        assert_eq!(error.kind(), ErrorKind::Validation);
-        assert!(error.to_string().contains("\"tags\""), "message: {error}");
-    }
-
-    #[test]
-    fn field_mapping_requires_a_positive_dim() {
-        for dim in [None, Some(0)] {
-            let field = FieldSchema {
-                dim,
-                ..FieldSchema::new("embedding", VectorDataType::FloatVector)
-            };
-            let error = field_mapping_with(&field, Metric::Cosine).expect_err("dim is required");
-            assert_eq!(error.kind(), ErrorKind::Validation);
-            assert!(error.to_string().contains("dim"), "message: {error}");
-        }
-    }
-
-    #[test]
-    fn properties_use_later_fields_on_duplicate_names() {
-        let schema = CollectionSchema::new(vec![
-            FieldSchema::new("id", VectorDataType::Varchar),
-            FieldSchema::new("id", VectorDataType::Int64),
-        ]);
-        let properties = properties_for(&schema, Metric::Cosine).expect("properties");
-        assert_eq!(properties, json!({"id": {"type": "long"}}));
-    }
-
-    #[test]
-    fn schema_round_trips_through_the_index_metadata() {
-        let schema = schema();
-        let body = create_index_body(&schema, Metric::Euclidean).expect("body");
-        assert_eq!(
-            body["mappings"]["properties"]["embedding"],
-            json!({"type": "dense_vector", "dims": 3, "index": true, "similarity": "l2_norm"})
-        );
-        assert_eq!(
-            body["mappings"]["properties"]["id"],
-            json!({"type": "keyword", "ignore_above": 64})
-        );
-        assert!(body["mappings"]["_meta"][SCHEMA_META_KEY].is_string());
-
-        // The `get index` shape wraps the mappings in the index name.
-        let wrapped = json!({"openjiuwen__docs": body.clone()});
-        assert_eq!(
-            schema_from_index(&wrapped).expect("schema"),
-            Some(schema.clone())
-        );
-        // A bare `{"mappings": {..}}` body works too.
-        assert_eq!(schema_from_index(&body).expect("schema"), Some(schema));
-    }
-
-    #[test]
-    fn schema_from_index_reports_absent_and_broken_metadata() {
-        assert_eq!(schema_from_index(&json!({})).expect("no mappings"), None);
-        assert_eq!(
-            schema_from_index(&json!({"openjiuwen__docs": {"settings": {}}})).expect("no mappings"),
-            None
-        );
-        assert_eq!(
-            schema_from_index(&json!({"mappings": {"properties": {}}})).expect("empty"),
-            None
-        );
-
-        let error =
-            schema_from_index(&json!({"mappings": {"_meta": {SCHEMA_META_KEY: "not json"}}}))
-                .expect_err("broken schema");
-        assert_eq!(error.kind(), ErrorKind::Validation);
-
-        let error = schema_from_index(&json!({"mappings": {"_meta": {SCHEMA_META_KEY: 7}}}))
-            .expect_err("non-string schema");
-        assert_eq!(error.kind(), ErrorKind::Validation);
-    }
-
-    #[test]
-    fn schema_from_properties_reconstructs_and_synthesizes_the_primary_key() {
-        let properties = json!({
-            "id": {"type": "keyword", "ignore_above": 128},
-            "embedding": {"type": "dense_vector", "dims": 2, "similarity": "dot_product"},
-            "title": {"type": "text"},
-            "count": {"type": "long"},
-            "small": {"type": "integer"},
-            "weight": {"type": "float"},
-            "ratio": {"type": "double"},
-            "active": {"type": "boolean"},
-            "payload": {"type": "object"},
-            "nested": {"type": "nested"},
-        });
-        let schema = schema_from_properties(&properties).expect("schema");
-        let primary = schema.primary_key().expect("primary key");
-        assert_eq!(primary.name, "id");
-        assert!(primary.is_primary);
-        assert_eq!(primary.dtype, VectorDataType::Varchar);
-        assert_eq!(primary.max_length, Some(128));
-        assert!(!primary.auto_id);
-        assert_eq!(schema.fields.len(), 10);
-        assert_eq!(
-            schema.vector_field("embedding").expect("vector field").dim,
-            Some(2)
-        );
-        assert_eq!(
-            schema
-                .fields
-                .iter()
-                .find(|field| field.name == "title")
-                .expect("title")
-                .dtype,
-            VectorDataType::Varchar
-        );
-        assert_eq!(
-            schema
-                .fields
-                .iter()
-                .find(|field| field.name == "nested")
-                .expect("nested")
-                .dtype,
-            VectorDataType::Json
-        );
-
-        // Without an `id` property, one is synthesized in front.
-        let schema =
-            schema_from_properties(&json!({"value": {"type": "keyword"}})).expect("schema");
-        assert_eq!(schema.fields.len(), 2);
-        assert_eq!(schema.fields[0].name, ID_FIELD);
-        assert!(schema.fields[0].is_primary);
-        assert_eq!(schema.fields[0].dtype, VectorDataType::Varchar);
-
-        // An `id` field that cannot be a primary key is rejected.
-        let error = schema_from_properties(&json!({"id": {"type": "dense_vector", "dims": 2}}))
-            .expect_err("vector id");
-        assert_eq!(error.kind(), ErrorKind::Validation);
-
-        // Unknown types and untyped properties are rejected.
-        let error =
-            schema_from_properties(&json!({"value": {"type": "ip"}})).expect_err("unknown type");
-        assert_eq!(error.kind(), ErrorKind::Validation);
-        assert!(error.to_string().contains("\"value\""), "message: {error}");
-        let error = schema_from_properties(&json!({"value": {}})).expect_err("untyped");
-        assert_eq!(error.kind(), ErrorKind::Validation);
-        let error = schema_from_properties(&json!([])).expect_err("not an object");
-        assert_eq!(error.kind(), ErrorKind::Validation);
     }
 
     #[test]

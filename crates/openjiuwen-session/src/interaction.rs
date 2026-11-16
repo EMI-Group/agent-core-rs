@@ -57,7 +57,7 @@ use tokio_util::sync::CancellationToken;
 
 use openjiuwen_common::error::{Error, Result};
 
-use crate::stream::{StreamItem, StreamWriterManager};
+use crate::stream::{StreamItem, StreamSendOutcome, StreamWriterManager};
 
 /// Frame type of a human-in-the-loop interaction output frame.
 ///
@@ -639,9 +639,22 @@ impl InteractionBroker {
         }
 
         let index = self.inner.index.fetch_add(1, Ordering::SeqCst);
-        if let Err(error) = writer.write(request.to_stream_item(index)).await {
-            self.remove_pending(&request.id);
-            return Err(error);
+        match writer.write(request.to_stream_item(index)).await {
+            Ok(StreamSendOutcome::Delivered { .. }) => {}
+            Ok(outcome) => {
+                // The request still waits for `resolve_interaction`; an
+                // undelivered frame means no transport saw it, so say so before
+                // the request runs into its timeout.
+                tracing::debug!(
+                    interaction_id = request.id.as_str(),
+                    ?outcome,
+                    "interaction frame was not delivered to a subscriber"
+                );
+            }
+            Err(error) => {
+                self.remove_pending(&request.id);
+                return Err(error);
+            }
         }
 
         let timeout = request

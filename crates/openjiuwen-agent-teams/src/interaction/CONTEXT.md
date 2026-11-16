@@ -131,7 +131,7 @@ Broadcast tokens are recognized before roster resolution; `resolve_targets` is p
 - `gate.rs`: FIFO admit/try_admit, drain, `not_active`, `gate_closed` after close (including after close+drain), close idempotence.
 - `approval.rs`: `to_interaction` kind/id/question, `parse_confirm` happy path/defaults/malformed, `approval_result_event` shape and `tool_approval_result` event type.
 - `inbox.rs`: FIFO push/drain, `msg_` id format, enabled/disabled `require_enabled`, builder field resolution.
-- Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` (the last one is currently blocked by the unimplemented sibling placeholder modules).
+- Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings`.
 
 ## Notes for Agents
 
@@ -142,4 +142,4 @@ Broadcast tokens are recognized before roster resolution; `resolve_targets` is p
 - Python mints `intr_<uuid>` per interaction; `ToolApprovalRequest::to_interaction` derives `intr_team_tool_approval_<tool_call_id>` so re-rendering the same interrupted call is idempotent.
 - Python's `ToolApprovalResultEvent` carries `feedback` and `auto_confirm`; this crate's schema event does not, so `approval_result_event` carries only team/member/tool-call/verdict (schema is out of this node's scope).
 - `HumanAgentInbox::new()` starts disabled (`enable_hitt` is opt-in); the runtime must call `set_enabled(true)` before `require_enabled()` succeeds. `push` itself does not re-check enablement.
-- `ExternalTeamEvent` is data-only: the runtime answers it with `DeliverResult::unsupported("external_team")` because distributed transports are deferred.
+- `ExternalTeamEvent` is data-only: the runtime rejects it as `DeliverResult::unsupported("external_team_transport")` (`unsupported:external_team_transport`) because this build ships no distributed transport.

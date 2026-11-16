@@ -5,6 +5,8 @@
 //! the projected body, and the mapping of provider failures onto the shared
 //! error kinds. No test needs a network, a credential, or a Claude model.
 
+use std::fmt::Write as _;
+
 use futures::StreamExt;
 use serde_json::json;
 use wiremock::matchers::{body_json, header, method, path};
@@ -15,7 +17,7 @@ use openjiuwen_common::security::SecretString;
 
 use super::*;
 use crate::llm::config::{ModelClientConfig, ModelRequestConfig};
-use crate::llm::model::{FinishReason, Model, ModelExt, StreamChunk};
+use crate::llm::model::{FinishReason, Model, ModelExt, StreamAccumulator, StreamChunk};
 use crate::prompt::{BaseMessage, Usage};
 
 const MODEL: &str = "claude-sonnet-4";
@@ -520,4 +522,388 @@ fn a_non_object_extra_leaves_the_body_unchanged() {
         let request = ModelRequestConfig::new(MODEL).with_extra(extra.clone());
         assert_eq!(pure_body(&request), plain, "extra {extra} is ignored");
     }
+}
+
+/// A canned Messages response carrying extended-thinking blocks.
+fn thinking_response() -> serde_json::Value {
+    json!({
+        "id": "msg_think",
+        "type": "message",
+        "role": "assistant",
+        "model": MODEL,
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": "Paris is in France.",
+                "signature": "sig-thinking",
+            },
+            {"type": "redacted_thinking", "data": "opaque-blob"},
+            {"type": "text", "text": "checking"},
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "get_weather",
+                "input": {"city": "Paris"},
+            },
+        ],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 10, "output_tokens": 4},
+    })
+}
+
+#[tokio::test]
+async fn invoke_decodes_and_preserves_thinking_blocks() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(thinking_response()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = build_client(&server, ModelRequestConfig::new(MODEL));
+    let response = client
+        .invoke(
+            &[BaseMessage::user("weather in Paris?")],
+            &ModelRequestConfig::new(MODEL),
+        )
+        .await
+        .expect("the response parses");
+    let message = response.message().expect("one choice");
+
+    assert_eq!(
+        message.reasoning_content.as_deref(),
+        Some("Paris is in France."),
+        "the thinking text becomes the reasoning content"
+    );
+    assert_eq!(message.text(), "checking");
+    assert_eq!(message.tool_calls.len(), 1);
+    assert_eq!(
+        message.metadata.get(THINKING_BLOCKS_METADATA_KEY).cloned(),
+        Some(json!([
+            {
+                "type": "thinking",
+                "thinking": "Paris is in France.",
+                "signature": "sig-thinking",
+            },
+            {"type": "redacted_thinking", "data": "opaque-blob"},
+        ])),
+        "the raw blocks are preserved in their original order"
+    );
+}
+
+#[test]
+fn preserved_thinking_blocks_are_replayed_first_in_the_next_request() {
+    let answer = parse_messages_response(&thinking_response()).expect("valid response");
+    let assistant = answer.message().expect("one choice").clone();
+    let call_id = assistant.tool_calls[0]
+        .id
+        .clone()
+        .expect("the tool call carries an id");
+
+    let body = build_messages_body(
+        &[
+            BaseMessage::user("weather in Paris?"),
+            assistant,
+            BaseMessage::tool(call_id, "sunny"),
+        ],
+        &ModelRequestConfig::new(MODEL),
+        false,
+    )
+    .expect("the body builds");
+
+    assert_eq!(
+        body["messages"][1]["content"],
+        json!([
+            {
+                "type": "thinking",
+                "thinking": "Paris is in France.",
+                "signature": "sig-thinking",
+            },
+            {"type": "redacted_thinking", "data": "opaque-blob"},
+            {"type": "text", "text": "checking"},
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "get_weather",
+                "input": {"city": "Paris"},
+            },
+        ]),
+        "thinking blocks come first, in order, with their signatures"
+    );
+}
+
+#[test]
+fn a_thinking_block_without_a_signature_is_never_replayed() {
+    let answer = parse_messages_response(&json!({
+        "content": [
+            {"type": "thinking", "thinking": "unsigned"},
+            {"type": "redacted_thinking"},
+            {"type": "text", "text": "done"},
+        ],
+        "stop_reason": "end_turn",
+    }))
+    .expect("valid response");
+    let assistant = answer.message().expect("one choice").clone();
+
+    assert_eq!(
+        assistant.reasoning_content.as_deref(),
+        Some("unsigned"),
+        "the reasoning text is still reported"
+    );
+    assert!(
+        !assistant
+            .metadata
+            .contains_key(THINKING_BLOCKS_METADATA_KEY),
+        "an unreplayable block is not preserved"
+    );
+
+    let body = build_messages_body(
+        &[
+            BaseMessage::user("hi"),
+            assistant,
+            BaseMessage::user("and?"),
+        ],
+        &ModelRequestConfig::new(MODEL),
+        false,
+    )
+    .expect("the body builds");
+    assert_eq!(
+        body["messages"][1]["content"],
+        json!("done"),
+        "a turn with nothing to replay keeps its plain string content"
+    );
+}
+
+#[test]
+fn caller_supplied_metadata_cannot_smuggle_an_unreplayable_block() {
+    let assistant = BaseMessage::assistant("done").with_metadata(
+        THINKING_BLOCKS_METADATA_KEY,
+        json!([
+            {"type": "thinking", "thinking": "unsigned"},
+            {"type": "text", "text": "not a thinking block"},
+            {"type": "redacted_thinking", "data": ""},
+        ]),
+    );
+
+    let body = build_messages_body(
+        &[
+            BaseMessage::user("hi"),
+            assistant,
+            BaseMessage::user("and?"),
+        ],
+        &ModelRequestConfig::new(MODEL),
+        false,
+    )
+    .expect("the body builds");
+    assert_eq!(body["messages"][1]["content"], json!("done"));
+}
+
+/// Mounts `body` as the only `POST /v1/messages` event-stream response.
+async fn mount_event_stream(server: &MockServer, body: String) {
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(server)
+        .await;
+}
+
+/// The `content_block_*` events of one `thinking` block.
+///
+/// `signature` mirrors the provider's `signature_delta`; `None` leaves the block
+/// unsigned, which is what a truncated or misbehaving stream looks like.
+fn thinking_block_events(signature: Option<&str>) -> String {
+    let mut events = concat!(
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Paris is in France.\"}}\n\n",
+    )
+    .to_owned();
+    if let Some(signature) = signature {
+        let _ = write!(
+            events,
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"signature_delta\",\"signature\":\"{signature}\"}}}}\n\n"
+        );
+    }
+    events.push_str(
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    );
+    events
+}
+
+/// A whole Messages stream whose first block is `first` and whose text is `checking`.
+fn turn_event_stream(first: &str) -> String {
+    let mut stream = String::from(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_think\",\"model\":\"claude-sonnet-4\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+    );
+    stream.push_str(first);
+    stream.push_str(concat!(
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"checking\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ));
+    stream
+}
+
+#[tokio::test]
+async fn complete_turn_preserves_streamed_thinking_blocks() {
+    let server = MockServer::start().await;
+    mount_event_stream(
+        &server,
+        turn_event_stream(&thinking_block_events(Some("sig-thinking"))),
+    )
+    .await;
+
+    let client = build_client(&server, ModelRequestConfig::new(MODEL));
+    let turn = client
+        .complete_turn(
+            &[BaseMessage::user("weather in Paris?")],
+            &ModelRequestConfig::new(MODEL),
+        )
+        .await
+        .expect("the stream completes");
+
+    assert_eq!(
+        turn.message.reasoning_content.as_deref(),
+        Some("Paris is in France."),
+        "the thinking text still arrives as reasoning content"
+    );
+    assert_eq!(turn.message.text(), "checking");
+    assert_eq!(turn.finish_reason, Some(FinishReason::Stop));
+    assert_eq!(
+        turn.message
+            .metadata
+            .get(THINKING_BLOCKS_METADATA_KEY)
+            .cloned(),
+        Some(json!([{
+            "type": "thinking",
+            "thinking": "Paris is in France.",
+            "signature": "sig-thinking",
+        }])),
+        "a streamed thinking block is preserved exactly like an invoked one"
+    );
+
+    let body = build_messages_body(
+        &[
+            BaseMessage::user("weather in Paris?"),
+            turn.message,
+            BaseMessage::user("and tomorrow?"),
+        ],
+        &ModelRequestConfig::new(MODEL),
+        false,
+    )
+    .expect("the body builds");
+    assert_eq!(
+        body["messages"][1]["content"],
+        json!([
+            {
+                "type": "thinking",
+                "thinking": "Paris is in France.",
+                "signature": "sig-thinking",
+            },
+            {"type": "text", "text": "checking"},
+        ]),
+        "the next request re-emits the block first, with its signature"
+    );
+}
+
+#[tokio::test]
+async fn a_streamed_thinking_block_without_a_signature_is_never_replayed() {
+    let server = MockServer::start().await;
+    mount_event_stream(&server, turn_event_stream(&thinking_block_events(None))).await;
+
+    let client = build_client(&server, ModelRequestConfig::new(MODEL));
+    let (mut stream, state) = client.stream_with_state(
+        vec![BaseMessage::user("weather in Paris?")],
+        ModelRequestConfig::new(MODEL),
+    );
+    let mut accumulator = StreamAccumulator::new();
+    while let Some(item) = stream.next().await {
+        accumulator.push(&item.expect("every chunk decodes"));
+    }
+    let mut turn = accumulator.finish();
+    state
+        .lock()
+        .expect("the stream state lock")
+        .apply_thinking_blocks(&mut turn.message);
+
+    assert_eq!(
+        turn.message.reasoning_content.as_deref(),
+        Some("Paris is in France."),
+        "the reasoning text is still reported"
+    );
+    assert!(
+        !turn
+            .message
+            .metadata
+            .contains_key(THINKING_BLOCKS_METADATA_KEY),
+        "an unsigned streamed block is not preserved"
+    );
+
+    let body = build_messages_body(
+        &[
+            BaseMessage::user("hi"),
+            turn.message,
+            BaseMessage::user("and?"),
+        ],
+        &ModelRequestConfig::new(MODEL),
+        false,
+    )
+    .expect("the body builds");
+    assert_eq!(
+        body["messages"][1]["content"],
+        json!("checking"),
+        "nothing is emitted on the wire for a block without a signature"
+    );
+}
+
+#[tokio::test]
+async fn a_streamed_redacted_thinking_block_keeps_its_data() {
+    let server = MockServer::start().await;
+    let redacted = concat!(
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-blob\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    );
+    mount_event_stream(&server, turn_event_stream(redacted)).await;
+
+    let client = build_client(&server, ModelRequestConfig::new(MODEL));
+    let turn = client
+        .complete_turn(
+            &[BaseMessage::user("weather in Paris?")],
+            &ModelRequestConfig::new(MODEL),
+        )
+        .await
+        .expect("the stream completes");
+
+    assert_eq!(turn.message.reasoning_content, None);
+    assert_eq!(
+        turn.message
+            .metadata
+            .get(THINKING_BLOCKS_METADATA_KEY)
+            .cloned(),
+        Some(json!([{"type": "redacted_thinking", "data": "opaque-blob"}]))
+    );
+
+    let body = build_messages_body(
+        &[
+            BaseMessage::user("weather in Paris?"),
+            turn.message,
+            BaseMessage::user("and tomorrow?"),
+        ],
+        &ModelRequestConfig::new(MODEL),
+        false,
+    )
+    .expect("the body builds");
+    assert_eq!(
+        body["messages"][1]["content"],
+        json!([
+            {"type": "redacted_thinking", "data": "opaque-blob"},
+            {"type": "text", "text": "checking"},
+        ])
+    );
 }

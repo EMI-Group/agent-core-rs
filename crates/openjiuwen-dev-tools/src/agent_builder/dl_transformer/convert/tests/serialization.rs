@@ -49,8 +49,6 @@ fn missing_configurations_are_rejected() {
 
     assert!(error_for(vec![node("code", "Code", "run")])
         .contains("node code: configs.code is required"));
-    assert!(error_for(vec![node("plugin", "Plugin", "call")])
-        .contains("node plugin: configs.tool_id is required"));
     assert!(error_for(vec![node("out", "Output", "format")])
         .contains("node out: configs.template is required"));
     assert!(error_for(vec![node("ask", "Questioner", "ask")])

@@ -22,7 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
 tokio-util.workspace = true
 futures.workspace = true
 parking_lot.workspace = true
@@ -30,7 +30,7 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 tempfile.workspace = true
-rmcp = { workspace = true, optional = true }
+rmcp = { workspace = true, optional = true, features = ["transport-io"] }
 clap.workspace = true
 sqlx = { workspace = true, optional = true }
 which.workspace = true

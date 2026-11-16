@@ -46,12 +46,12 @@
 //! Redis executes a batch in order, so a queued `get` observes an earlier
 //! queued `set`; the queue is cleared once a batch has been executed.
 //!
-//! # Deferred
+//! # Transport
 //!
-//! `rediss://` (TLS) and real cluster slot routing stay deferred and are
-//! reported by [`crate::redis`] as [`Error::Unsupported`]. This module is a
-//! key-value store only; documents and vectors live in [`super::document`] and
-//! [`super::vector`].
+//! `rediss://` (TLS, verified against the web PKI) and `redis[s]+cluster://`
+//! (verified seed plus `MOVED`/`ASK` redirection) are handled by
+//! [`crate::redis`]. This module is a key-value store only; documents and
+//! vectors live in [`super::document`] and [`super::vector`].
 //!
 //! Python counterpart tests:
 //! `tests/unit_tests/extensions/checkpointer/test_redis_checkpointer.py`

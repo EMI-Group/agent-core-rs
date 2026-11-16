@@ -7,6 +7,7 @@
 //! constant.
 
 use super::*;
+use crate::skill_creator::omni::archive::ArchiveEntryKind;
 use openjiuwen_common::error::ErrorKind;
 
 /// The size of one `tar` header or data block.
@@ -266,16 +267,23 @@ fn a_gzip_wrapped_tar_unpacks_through_detection() {
 fn a_gzip_wrapped_zip_unpacks_through_detection() {
     use crate::skill_creator::omni::archive::ArchiveWriter;
 
+    // The zip writer declares a Unix mode per entry kind, and the reader reports
+    // it, so the round trip reproduces the modes as well as the contents.
     let entries = vec![
         ArchiveEntry {
             path: "notes/readme.txt".to_owned(),
             bytes: b"hello zip\n".to_vec(),
             is_dir: false,
+            mode: Some(0o100_644),
+            ..ArchiveEntry::default()
         },
         ArchiveEntry {
             path: "assets/".to_owned(),
             bytes: Vec::new(),
             is_dir: true,
+            kind: ArchiveEntryKind::Directory,
+            mode: Some(0o040_755),
+            ..ArchiveEntry::default()
         },
     ];
     let zip = ArchiveWriter::write_stored(&entries).expect("writes a stored zip");

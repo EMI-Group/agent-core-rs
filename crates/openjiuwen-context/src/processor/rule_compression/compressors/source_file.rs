@@ -12,6 +12,9 @@
 //! nothing from the digest is returned verbatim. Dropped content stays
 //! retrievable when the offloader then offloads the original.
 //!
+//! Every exit reports its `digest_stage` (`comments`, `structure`, or `none` for
+//! blank content, which also carries `reason: "blank_content"`).
+//!
 //! [`fits_budget_and_saves`]: crate::processor::rule_compression::common::fits_budget_and_saves
 use super::{RuleCompressionResult, RuleCompressor};
 use crate::processor::rule_compression::common::{
@@ -148,7 +151,26 @@ pub struct SourceFileCompressor;
 impl RuleCompressor for SourceFileCompressor {
     fn compress(&self, content: &str, ctx: &RuleContext) -> RuleCompressionResult {
         if content.trim().is_empty() {
-            return RuleCompressionResult::unchanged(content, ContentType::SourceFile);
+            // Every other exit names its `digest_stage`; blank content has none to
+            // run, so it reports `none` plus the reason instead of a bare no-op.
+            tracing::debug!(
+                reason = "blank_content",
+                file_path = ctx.file_path.as_deref().unwrap_or(""),
+                "rule compression: source file declined as blank"
+            );
+            return RuleCompressionResult::declined(
+                content,
+                ContentType::SourceFile,
+                Some(json!({
+                    "digest_stage": "none",
+                    "reason": "blank_content",
+                    "original_line_count": content.split('\n').count(),
+                    "compressed_line_count": 0,
+                    "omitted_comment_lines": 0,
+                    "omitted_blank_lines": 0,
+                    "query_term_hits": 0,
+                })),
+            );
         }
         let style = comment_style(ctx.file_path.as_deref());
         let original_lines = content.split('\n').count();

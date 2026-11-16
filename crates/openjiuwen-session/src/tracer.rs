@@ -48,7 +48,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::stream::{StreamItem, StreamWriterManager};
+use crate::stream::{StreamItem, StreamSendOutcome, StreamWriterManager};
 
 /// The position of the last emitted trace frame within a session.
 ///
@@ -511,8 +511,12 @@ impl TraceSink for MemoryTraceSink {
 ///
 /// The sink also tracks the position of the frames it publishes, so a session
 /// snapshot (and therefore a session checkpoint) carries the trace position.
-/// Clones share the position state; a frame only advances it when the stream
-/// write succeeded.
+/// Clones share the position state; the position advances only when the frame
+/// actually reached a subscriber ([`StreamSendOutcome::Delivered`]). A frame
+/// nobody observed (`NoSubscribers`), a closed hub (`Closed`), and a mode the
+/// writer does not route (`ModeDisabled`) are logged at debug level and leave
+/// the position untouched, so a checkpoint never claims frames no consumer
+/// saw.
 #[derive(Debug, Clone)]
 pub struct StreamTraceSink {
     writer: Arc<StreamWriterManager>,
@@ -559,14 +563,30 @@ impl TraceSink for StreamTraceSink {
                 return;
             }
         };
-        if let Err(error) = self.writer.write_now(item) {
+        let outcome = match self.writer.write_now(item) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::debug!(
+                    item_type = item_type.as_str(),
+                    %error,
+                    "dropping trace frame: stream write failed"
+                );
+                return;
+            }
+        };
+        let StreamSendOutcome::Delivered { subscribers } = outcome else {
             tracing::debug!(
                 item_type = item_type.as_str(),
-                %error,
-                "dropping trace frame: stream write failed"
+                ?outcome,
+                "trace frame was not delivered; the trace position does not advance"
             );
             return;
-        }
+        };
+        tracing::trace!(
+            item_type = item_type.as_str(),
+            subscribers,
+            "trace frame delivered"
+        );
         let mut state = self.state.lock();
         if !trace_id.is_empty() {
             state.trace_id = Some(trace_id);
@@ -948,7 +968,9 @@ mod tests {
     use crate::checkpoint::MemoryCheckpointer;
     use crate::session::Session;
     use crate::sessions::{WorkflowSession, WorkflowSessionOptions};
-    use crate::stream::{StreamHub, StreamWriterManager};
+    use openjiuwen_common::error::Result;
+
+    use crate::stream::{StreamEvent, StreamHub, StreamWriterManager};
 
     #[test]
     fn elapsed_is_none_without_a_start_time() {
@@ -1008,20 +1030,30 @@ mod tests {
         assert_eq!(TraceSpanKind::default(), TraceSpanKind::Agent);
     }
 
-    fn stream_sink() -> Arc<StreamTraceSink> {
-        Arc::new(StreamTraceSink::new(StreamWriterManager::new(
-            StreamHub::new(),
-        )))
+    /// Builds a sink over a hub with one live subscriber, so every frame it
+    /// publishes is `Delivered` and therefore advances the position. The
+    /// returned stream must stay alive: dropping it removes the subscriber.
+    fn stream_sink() -> (
+        Arc<StreamTraceSink>,
+        futures::stream::BoxStream<'static, Result<StreamEvent>>,
+    ) {
+        let hub = StreamHub::new();
+        let events = hub.subscribe();
+        (
+            Arc::new(StreamTraceSink::new(StreamWriterManager::new(hub))),
+            events,
+        )
     }
 
     #[test]
     fn stream_sink_reports_no_position_before_any_frame() {
-        assert_eq!(stream_sink().position(), None);
+        let (sink, _events) = stream_sink();
+        assert_eq!(sink.position(), None);
     }
 
     #[test]
     fn stream_sink_counts_emitted_frames_and_the_last_invoke_id() {
-        let sink = stream_sink();
+        let (sink, _events) = stream_sink();
         let tracer = Tracer::with_sink("s-stream", "trace-stream", sink.clone());
 
         let first = tracer.start_span("first", InvokeType::Llm);
@@ -1036,8 +1068,34 @@ mod tests {
     }
 
     #[test]
+    fn stream_sink_position_advances_only_on_delivery() {
+        // An unobserved run: the hub accepts the frame but nobody consumes it.
+        let hub = StreamHub::new();
+        let sink = Arc::new(StreamTraceSink::new(StreamWriterManager::new(hub.clone())));
+        let tracer = Tracer::with_sink("s-undelivered", "trace-undelivered", sink.clone());
+
+        let span = tracer.start_span("unobserved", InvokeType::Llm);
+        span.finish(serde_json::json!({}));
+        assert_eq!(
+            sink.position(),
+            None,
+            "a frame no subscriber received must not advance the trace position"
+        );
+
+        // A subscriber appears: the next frame is delivered and counts.
+        let _events = hub.subscribe();
+        let span = tracer.start_span("observed", InvokeType::Llm);
+        span.finish(serde_json::json!({}));
+        let position = sink
+            .position()
+            .expect("the delivered frame yields a position");
+        assert_eq!(position.frame_count, 1);
+        assert_eq!(position.last_invoke_id, Some(span.id()));
+    }
+
+    #[test]
     fn stream_sink_set_position_rebases_the_frame_count() {
-        let sink = stream_sink();
+        let (sink, _events) = stream_sink();
         sink.set_position(TracePosition {
             trace_id: "trace-rebase".to_owned(),
             last_invoke_id: Some("inv-prev".to_owned()),
@@ -1077,6 +1135,8 @@ mod tests {
             checkpointer: Some(Arc::new(MemoryCheckpointer::new())),
             ..WorkflowSessionOptions::default()
         });
+        // A session's own sink only counts frames a subscriber consumed.
+        let _events = session.subscribe();
         let span = session
             .tracer()
             .expect("a concrete session owns a tracer")

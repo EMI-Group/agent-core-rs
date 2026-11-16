@@ -201,7 +201,7 @@ pub enum DispatchMode { Autonomous, Scheduled }             // default Autonomou
 pub enum MemberMode { BuildMode, PlanMode }                 // default BuildMode
 pub enum SpawnMode { InProcess, Process }                   // "inprocess" | "process"; default InProcess
 pub enum BootstrapMode { Leader, Framework }                // default Leader
-pub enum ModelPoolStrategy { RoundRobin, ByModelName }      // default RoundRobin
+pub enum ModelPoolStrategy { RoundRobin, ByModelName, IntelliRouter }   // "round_robin" | "by_model_name" | "intelli_router"; default RoundRobin
 pub enum Language { Cn, Cf, En }                            // "cn"|"cf"|"en"; default Cn
 impl Language { pub const fn as_str(self) -> &'static str;
                 pub fn resolve(value: Option<&str>) -> &'static str; }   // None/unknown => DEFAULT_LANGUAGE
@@ -242,6 +242,9 @@ impl TeamAgentSpec {
     pub fn is_member_name_valid(name: &str) -> bool;                // ^[a-z][a-z0-9_-]*$
 }
 ```
+
+`ModelPoolStrategy::IntelliRouter` is Python's `intelli_router` strategy and round-trips as that wire value, but its client-side reliable router and the route-group service it talks to are not ported, so allocating a member on it is a typed `Error::Unsupported` refusal owned by the allocator; the variant exists so the Python value deserializes instead of failing.
+An absent `model_pool_strategy` still defaults to `RoundRobin`, and an explicit `null` is a shape error because the field is not optional.
 
 `validate` returns `Error::validation` with these messages (Python text kept verbatim where quoted):
 - `agents dict must contain a 'leader' key`

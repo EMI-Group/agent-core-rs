@@ -6,12 +6,14 @@
 //! surface and dispatches [`build_checkpointer`] to the kernel factory.
 //!
 //! The Redis backend lives in the `redis` submodule behind the `redis` feature.
-//! It is a live single-node implementation over this crate's in-tree `RESP`
-//! client; TLS (`rediss://`) and cluster slot routing remain deferred and report
-//! [`openjiuwen_common::error::ErrorKind::Unsupported`] with a reason. The kernel
-//! `CheckpointerKind` has no Redis variant, so [`build_checkpointer`] cannot
-//! select it: construct one with `checkpointer::redis::RedisCheckpointer::new`
-//! (lazy connect) or `connect`/`create` (eager connect).
+//! It is a live implementation over this crate's in-tree `RESP` client, which
+//! handles `rediss://` (TLS) and cluster redirection. Two Redis backends are
+//! therefore reachable: [`build_checkpointer`] forwards `CheckpointerKind::Redis`
+//! to the kernel factory (the kernel's own Redis checkpointer, with the URL read
+//! from `extra["url"]` or `path`), while this crate's backend over the in-tree
+//! client is constructed directly with
+//! `checkpointer::redis::RedisCheckpointer::new` (lazy connect) or
+//! `connect`/`create` (eager connect).
 //!
 //! ```
 //! use openjiuwen_extensions::checkpointer::{build_checkpointer, CheckpointerConfig,
@@ -44,15 +46,17 @@ pub mod redis;
 /// Builds the checkpointer selected by `config.kind`.
 ///
 /// Delegates to [`openjiuwen_core::session::checkpoint::create_checkpointer`]:
-/// `InMemory`, `File`, and (with the `sqlite` feature) `Sqlite` are built by the
-/// kernel; the Redis backend in `redis` is reached through
-/// `RedisCheckpointer::connect`/`create` because `CheckpointerKind` has no Redis
-/// variant.
+/// `InMemory`, `File`, `Redis`, and (with the `sqlite` feature) `Sqlite` are
+/// built by the kernel. The Redis backend under `redis` is this crate's own
+/// implementation over the in-tree `RESP` client and is reached through
+/// `RedisCheckpointer::connect`/`create` instead, because the kernel factory
+/// builds the kernel's Redis checkpointer for `CheckpointerKind::Redis`.
 ///
 /// # Errors
 ///
 /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] when `File` or
-/// `Sqlite` is requested without a `path`, and
+/// `Sqlite` is requested without a `path`, or `Redis` without a URL (in
+/// `extra["url"]` or `path`), and
 /// [`openjiuwen_common::error::ErrorKind::Unsupported`] when `Sqlite` is
 /// requested but the kernel crate was built without its `sqlite` feature.
 pub async fn build_checkpointer(config: &CheckpointerConfig) -> Result<Arc<dyn Checkpointer>> {

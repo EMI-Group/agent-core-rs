@@ -22,7 +22,17 @@
 //!
 //! - **Session memory** — when a [`SessionMemoryStore`] holds non-empty notes
 //!   and its anchor resolves, the notes replace the prefix they cover and the
-//!   messages after the anchor stay verbatim. This costs no model call.
+//!   messages after the anchor stay verbatim. When the store holds no usable
+//!   notes — none at all, an empty set, or notes anchored on a message that has
+//!   left the history — the configured
+//!   [`SessionMemoryAgent`]
+//!   extracts a note set over the active history, commits it to the store, and
+//!   the branch continues with it. The model call this costs is the reason the
+//!   branch is preferred at all: it replaces the whole active history with a
+//!   short notes block. A branch that cannot run at all (no store, no agent, no
+//!   replaceable prefix) reports
+//!   `FullCompactProcessor::refuse_session_memory`'s reason and the summary
+//!   path below takes over.
 //! - **Model summary** — otherwise the active part is trimmed to
 //!   [`FullCompactProcessorConfig::compression_call_max_tokens`] by dropping whole
 //!   leading API rounds, summarised by the configured model, and replaced by the
@@ -61,7 +71,10 @@ use crate::processor::compressor::{
 };
 use crate::processor::impl_processor_state;
 use crate::processor::{ContextProcessor, ProcessorContext, ProcessorState};
-use crate::session_memory::{reinject_session_memory, SessionMemoryStore, RECENT_MESSAGES_NOTICE};
+use crate::session_memory::{
+    notes_anchor_index, reinject_session_memory, SessionMemoryStore, RECENT_MESSAGES_NOTICE,
+};
+use crate::session_memory_agent::{SessionMemoryAgent, SessionMemoryOutcome};
 use crate::tokens::count_messages;
 
 /// The marker that opens a full-compaction boundary message.
@@ -92,6 +105,24 @@ const FALLBACK_SUMMARY_CHARS: usize = 8_000;
 
 /// Characters per token the prompt budget assumes.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+
+/// Why the session-memory branch could not run: nothing to read the notes from.
+const NO_SESSION_MEMORY_STORE: &str =
+    "no session-memory store is mounted on the full-compaction processor";
+
+/// Why the branch could not run: the notes are missing and nothing can write them.
+const NO_SESSION_MEMORY_AGENT: &str = "the session-memory notes are missing and no \
+session-memory agent is configured to extract them";
+
+/// Why the branch could not run: the notes cover too little history.
+const NO_REPLACEABLE_PREFIX: &str = "the session-memory notes do not cover a replaceable prefix";
+
+/// Checkpoint key carrying the last reason the session-memory branch could not run.
+const STATE_REFUSAL: &str = "session_memory_refusal";
+/// Checkpoint counter of the refusals the session-memory branch reported.
+const STATE_REFUSALS: &str = "session_memory_refusals";
+/// Checkpoint key naming the producer of the notes the last pass used.
+const STATE_SOURCE: &str = "session_memory_source";
 
 /// Configuration of [`FullCompactProcessor`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +332,12 @@ pub struct FullCompactProcessor {
     pub model: Option<Arc<dyn Model>>,
     /// Session-memory notes preferred over a model summary.
     pub session_memory: Option<Arc<dyn SessionMemoryStore>>,
+    /// Agent that extracts the notes the store does not hold yet.
+    ///
+    /// `None` means the session-memory branch can only reinject committed notes;
+    /// when the store is empty it then reports
+    /// `NO_SESSION_MEMORY_AGENT` instead of doing nothing.
+    pub session_memory_agent: Option<Arc<SessionMemoryAgent>>,
     /// Host-rendered state sections reinjected after an accepted compaction.
     pub reinjection: Option<Arc<SnapshotRegistry>>,
     /// Cross-run counters, persisted through the context checkpoint.
@@ -313,6 +350,10 @@ impl std::fmt::Debug for FullCompactProcessor {
             .field("config", &self.config)
             .field("has_model", &self.model.is_some())
             .field("has_session_memory", &self.session_memory.is_some())
+            .field(
+                "has_session_memory_agent",
+                &self.session_memory_agent.is_some(),
+            )
             .field("has_reinjection", &self.reinjection.is_some())
             .finish_non_exhaustive()
     }
@@ -331,6 +372,7 @@ impl FullCompactProcessor {
             config,
             model,
             session_memory,
+            session_memory_agent: None,
             reinjection: None,
             state: ProcessorState::default(),
         }
@@ -341,6 +383,48 @@ impl FullCompactProcessor {
     pub fn with_session_memory(mut self, store: Arc<dyn SessionMemoryStore>) -> Self {
         self.session_memory = Some(store);
         self
+    }
+
+    /// Sets the agent that extracts session-memory notes the store lacks.
+    ///
+    /// The agent is only consulted when the store holds no usable notes — they
+    /// are missing, empty, or anchored on a message that has left the history —
+    /// and only while [`FullCompactProcessorConfig::session_memory_enabled`] is
+    /// on. A [`ProcessorContext::session_memory_agent`] supplied for one request
+    /// wins over it.
+    #[must_use]
+    pub fn with_session_memory_agent(mut self, agent: Arc<SessionMemoryAgent>) -> Self {
+        self.session_memory_agent = Some(agent);
+        self
+    }
+
+    /// The agent this pass may extract notes with.
+    ///
+    /// Precedence: the per-request [`ProcessorContext::session_memory_agent`],
+    /// then the processor's own agent, then none.
+    fn effective_agent<'a>(
+        &'a self,
+        cx: &'a ProcessorContext<'_>,
+    ) -> Option<&'a SessionMemoryAgent> {
+        cx.session_memory_agent
+            .as_deref()
+            .or(self.session_memory_agent.as_deref())
+    }
+
+    /// Reports why the session-memory branch could not run.
+    ///
+    /// The reason reaches a host twice: as a structured [`tracing::warn!`] and
+    /// through the processor checkpoint ([`STATE_REFUSAL`] plus the
+    /// [`STATE_REFUSALS`] counter), because a processor that returns no event
+    /// has no other reporting channel. The branch itself falls through to the
+    /// model or offline summary.
+    fn refuse_session_memory(&self, reason: &str) {
+        tracing::warn!(
+            reason,
+            "full compaction could not use session memory; falling back to the summary path"
+        );
+        self.state.set_text(STATE_REFUSAL, reason);
+        self.state.bump(STATE_REFUSALS);
     }
 
     /// Sets the registry of state sections reinjected after an accepted
@@ -424,33 +508,97 @@ impl FullCompactProcessor {
     }
 
     /// The session-memory candidate, when the notes cover part of `active`.
+    ///
+    /// The notes are taken from the store when they are usable — non-empty and
+    /// anchored on a message still in `active`. Otherwise the branch refreshes
+    /// them: an agent (see [`FullCompactProcessor::effective_agent`]) extracts a
+    /// new note set over `active` and the result is committed to the store before
+    /// the reinjection runs.
+    ///
+    /// The second element of the result is the reason the branch could not run,
+    /// `None` when it did. A caller reports it through
+    /// [`FullCompactProcessor::refuse_session_memory`]; the summary path then
+    /// takes over.
     async fn session_memory_candidate(
         &self,
         cx: &ProcessorContext<'_>,
         prefix: &[BaseMessage],
-        active: &[BaseMessage],
-    ) -> Result<Option<(Vec<BaseMessage>, String)>> {
+        active: &mut [BaseMessage],
+    ) -> Result<(Option<(Vec<BaseMessage>, String)>, Option<String>)> {
         if !self.config.session_memory_enabled {
-            return Ok(None);
+            return Ok((None, None));
         }
         let Some(store) = self.session_memory.as_ref() else {
-            return Ok(None);
+            return Ok((None, Some(NO_SESSION_MEMORY_STORE.to_owned())));
         };
-        let Some(notes) = store.get(cx.scope).await? else {
-            return Ok(None);
+        let stored = store.get(cx.scope).await?;
+        let usable = stored
+            .as_ref()
+            .filter(|notes| !notes.is_empty() && notes_anchor_index(active, notes).is_some());
+        let notes = if let Some(usable) = usable {
+            self.state.set_text(STATE_SOURCE, "store");
+            usable.clone()
+        } else {
+            // The notes are missing, empty, or anchored on a message that
+            // has left the history: only an extraction can make them usable.
+            let Some(agent) = self.effective_agent(cx) else {
+                return Ok((None, Some(NO_SESSION_MEMORY_AGENT.to_owned())));
+            };
+            let current = stored.unwrap_or_default();
+            let model = cx.model.or(self.model.as_ref());
+            let outcome = agent.update(active, &current, model).await;
+            let written = match outcome {
+                SessionMemoryOutcome::Written {
+                    source,
+                    notes,
+                    directives_applied,
+                    model_failure,
+                } => {
+                    if let Some(failure) = model_failure {
+                        tracing::warn!(
+                            failure,
+                            "session-memory extraction used the offline extractor"
+                        );
+                    }
+                    self.state.set_text(STATE_SOURCE, source.as_str());
+                    self.state.set_u64(
+                        "session_memory_directives",
+                        u64::try_from(directives_applied).unwrap_or(u64::MAX),
+                    );
+                    self.state.bump("session_memory_extractions");
+                    tracing::debug!(
+                        source = source.as_str(),
+                        directives_applied,
+                        "full compaction extracted new session-memory notes"
+                    );
+                    // A write failure costs durability, not this pass: the
+                    // notes in hand are still the ones this compaction uses.
+                    if let Err(error) = store.put(cx.scope, notes.clone()).await {
+                        tracing::warn!(
+                            error = %error,
+                            "could not persist the extracted session-memory notes"
+                        );
+                    }
+                    notes
+                }
+                outcome => {
+                    let reason = outcome
+                        .reason()
+                        .unwrap_or("the session-memory agent produced no notes and no reason");
+                    return Ok((
+                        None,
+                        Some(format!("session memory could not be extracted: {reason}")),
+                    ));
+                }
+            };
+            written
         };
-        if notes.is_empty() {
-            return Ok(None);
-        }
         if cx.cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
         let mut replaced = active.to_vec();
         if reinject_session_memory(&mut replaced, &notes).is_none() {
-            tracing::debug!(
-                "full compaction skipped the session-memory candidate: the anchor does not resolve"
-            );
-            return Ok(None);
+            return Ok((None, Some(NO_REPLACEABLE_PREFIX.to_owned())));
         }
         let mut candidate = prefix.to_vec();
         candidate.extend(replaced);
@@ -458,9 +606,9 @@ impl FullCompactProcessor {
             tracing::debug!(
                 "full compaction rejected the session-memory candidate: over the trigger budget"
             );
-            return Ok(None);
+            return Ok((None, None));
         }
-        Ok(Some((candidate, notes.notes)))
+        Ok((Some((candidate, notes.notes)), None))
     }
 
     /// Trims `active` to the summary call budget by dropping leading API rounds.
@@ -565,7 +713,7 @@ impl ContextProcessor for FullCompactProcessor {
             return Ok(None);
         }
         let original_len = messages.len();
-        let (prefix, active) = match Self::boundary_index(messages) {
+        let (prefix, mut active) = match Self::boundary_index(messages) {
             Some(index) => (messages[..index].to_vec(), messages[index + 1..].to_vec()),
             None => (Vec::new(), messages.clone()),
         };
@@ -573,15 +721,21 @@ impl ContextProcessor for FullCompactProcessor {
             return Ok(None);
         }
 
-        // Session memory first; a model summary only when it cannot apply.
-        let (mut candidate, summary, from_session_memory) = if let Some((candidate, notes)) =
-            self.session_memory_candidate(cx, &prefix, &active).await?
-        {
-            (candidate, notes, true)
-        } else {
-            let (candidate, summary) = self.summary_candidate(cx, &prefix, &active).await;
-            (candidate, summary, false)
-        };
+        // Session memory first; a model summary only when it cannot apply. A
+        // branch that cannot apply says why before the summary takes over.
+        let (session_memory, refusal) = self
+            .session_memory_candidate(cx, &prefix, active.as_mut_slice())
+            .await?;
+        if let Some(reason) = refusal.as_deref() {
+            self.refuse_session_memory(reason);
+        }
+        let (mut candidate, summary, from_session_memory) =
+            if let Some((candidate, notes)) = session_memory {
+                (candidate, notes, true)
+            } else {
+                let (candidate, summary) = self.summary_candidate(cx, &prefix, &active).await;
+                (candidate, summary, false)
+            };
         // Both paths put the summary user message right after the boundary, so
         // the recall marker of the replaced `active` history lands at its end.
         let marker = archive_replaced_messages(cx, &active).await;

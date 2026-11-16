@@ -21,6 +21,26 @@
 //! by an earlier or the current node. A blank `id` is reported against the id the
 //! document carries (the empty string), so every node-level issue names a node.
 //!
+//! # Variable list checks
+//!
+//! Every node whose `parameters.inputs` or `parameters.outputs` is checked —
+//! Start (outputs), End and Output (inputs), LLM, Questioner, Plugin and Code
+//! (both), and `IntentDetection` (inputs) — also inspects the declared variables,
+//! node by node and variable by variable:
+//!
+//! - a name repeated inside one list is [`ReflectionIssueKind::DuplicateVariable`];
+//! - an input without a `value` and an output without a `description` are
+//!   `MissingField` issues whose field names the offending variable;
+//! - an input `value` holding more than one `${...}` placeholder is
+//!   [`ReflectionIssueKind::MultiPlaceholderValue`];
+//! - an input `value` whose single placeholder is not a `"{node_id}.{output_name}"`
+//!   string declared by an earlier or the current node is
+//!   [`ReflectionIssueKind::UndeclaredReference`].
+//!
+//! A non-string `value` is treated as declared and is never scanned for
+//! placeholders. Python's `available_variable_types` set and its optional
+//! `check_type` flag are not ported, so a `type` key is never validated.
+//!
 //! After the walk every non-blank `next` link — the node's own `next` and each
 //! condition's `next` — that does not name an existing node id records
 //! `DanglingEdge`. The message names the missing id; the issue's `node_id` is the
@@ -42,7 +62,9 @@ use std::collections::BTreeSet;
 use serde_json::Value;
 
 use super::{DlValidation, ReflectionIssue, ReflectionIssueKind};
-use crate::agent_builder::dl_transformer::model::{DlCondition, DlDocument, DlNode, DlNodeType};
+use crate::agent_builder::dl_transformer::model::{
+    DlCondition, DlDocument, DlNode, DlNodeType, DlVariable,
+};
 
 /// The branch operators Python's `Reflector` accepts as the second token.
 const BRANCH_OPERATORS: [&str; 10] = [
@@ -175,17 +197,113 @@ impl Checks {
         }
     }
 
-    /// Requires a non-empty `parameters.inputs` list.
+    /// Requires a non-empty `parameters.inputs` list, then checks its variables.
     fn check_inputs(&mut self, node: &DlNode) {
         if node.parameters.inputs.is_empty() {
             self.missing(node, "parameters.inputs", "must be a non-empty list");
+            return;
+        }
+        let mut names = BTreeSet::new();
+        for (index, input) in node.parameters.inputs.iter().enumerate() {
+            self.check_duplicate_name(node, "inputs", &mut names, &input.name);
+            self.check_input_value(node, index, input);
         }
     }
 
-    /// Requires a non-empty `parameters.outputs` list.
+    /// Requires a non-empty `parameters.outputs` list, then checks its variables.
     fn check_outputs(&mut self, node: &DlNode) {
         if node.parameters.outputs.is_empty() {
             self.missing(node, "parameters.outputs", "must be a non-empty list");
+            return;
+        }
+        self.check_output_variables(node);
+    }
+
+    /// Checks the names and descriptions of a node's declared outputs.
+    ///
+    /// Start declares outputs without requiring a non-empty list, so it runs this
+    /// check directly instead of going through [`Self::check_outputs`].
+    fn check_output_variables(&mut self, node: &DlNode) {
+        let mut names = BTreeSet::new();
+        for (index, output) in node.parameters.outputs.iter().enumerate() {
+            self.check_duplicate_name(node, "outputs", &mut names, &output.name);
+            let described = output
+                .description
+                .as_deref()
+                .is_some_and(|description| !description.trim().is_empty());
+            if !described {
+                let name = &output.name;
+                self.missing(
+                    node,
+                    &format!("parameters.outputs[{index}].description"),
+                    &format!("is missing for the output `{name}`"),
+                );
+            }
+        }
+    }
+
+    /// Records a `DuplicateVariable` issue when `name` repeats inside one list.
+    fn check_duplicate_name(
+        &mut self,
+        node: &DlNode,
+        list: &str,
+        seen: &mut BTreeSet<String>,
+        name: &str,
+    ) {
+        if !seen.insert(name.to_string()) {
+            self.node_issue(
+                ReflectionIssueKind::DuplicateVariable,
+                node,
+                format!(
+                    "node `{}`: `parameters.{list}` declares the name `{name}` more than once",
+                    node.id
+                ),
+            );
+        }
+    }
+
+    /// Checks one input's `value`: presence, placeholder count, and references.
+    fn check_input_value(&mut self, node: &DlNode, index: usize, input: &DlVariable) {
+        let name = &input.name;
+        let Some(value) = input.value.as_ref() else {
+            self.missing(
+                node,
+                &format!("parameters.inputs[{index}].value"),
+                &format!("is missing for the input `{name}`"),
+            );
+            return;
+        };
+        let Some(text) = value.as_str() else {
+            return;
+        };
+
+        let references = placeholders(text);
+        let count = references.len();
+        if count > 1 {
+            self.node_issue(
+                ReflectionIssueKind::MultiPlaceholderValue,
+                node,
+                format!(
+                    "node `{}`: input `{name}` `value` holds {count} reference variables; \
+                     at most one is allowed",
+                    node.id
+                ),
+            );
+            return;
+        }
+        let Some(reference) = references.first() else {
+            return;
+        };
+        if !self.declared_outputs.contains(*reference) {
+            self.node_issue(
+                ReflectionIssueKind::UndeclaredReference,
+                node,
+                format!(
+                    "node `{}`: input `{name}` `value` references the undeclared variable \
+                     `${{{reference}}}`",
+                    node.id
+                ),
+            );
         }
     }
 
@@ -211,8 +329,9 @@ impl Checks {
         }
     }
 
-    /// Checks a Start node: the `query` output and the `next` link.
+    /// Checks a Start node: the output variables, the `query` output, and `next`.
     fn check_start(&mut self, node: &DlNode) {
+        self.check_output_variables(node);
         let has_query = node.parameters.outputs.iter().any(|output| {
             output.name == "query" && output.description.as_deref() == Some(START_QUERY_DESCRIPTION)
         });

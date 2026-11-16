@@ -46,12 +46,16 @@ use openjiuwen_common::error::{Error, Result};
 use openjiuwen_core::foundation::store::{CollectionSchema, FieldSchema, Metric, VectorDataType};
 use serde_json::{json, Map, Value};
 
+use super::credentials::ElasticsearchCredentials;
+
 /// The similarity metric of every index this backend creates.
 ///
 /// [`CollectionSchema`] carries no metric field and the backend keeps no
 /// per-collection metric registry, so every index uses cosine similarity — the
 /// kernel's default [`Metric`].
 const STORE_METRIC: Metric = Metric::Cosine;
+/// `tracing` target for transport-level diagnostics.
+const LOG_TARGET: &str = "openjiuwen_extensions::store::elasticsearch";
 
 /// The `dense_vector.similarity` Elasticsearch expects for a kernel [`Metric`].
 pub(crate) fn similarity_for(metric: Metric) -> &'static str {
@@ -78,17 +82,18 @@ pub(crate) struct Hit {
 /// A minimal Elasticsearch REST client over the configured endpoint.
 ///
 /// The client is single-node: it never sniffs the cluster, follows cloud ids, or
-/// retries behind the caller's back. Credentials from the URL userinfo become
-/// an HTTP Basic `Authorization` header and never appear in the base URL (so a
-/// `reqwest` error message can never leak them).
+/// retries behind the caller's back. Resolved credentials ([`ElasticsearchCredentials`])
+/// become an HTTP Basic `Authorization` header when both halves are present and
+/// an `Authorization: ApiKey <key>` header otherwise, and they never appear in
+/// the base URL (so a `reqwest` error message can never leak them).
 #[derive(Clone)]
 pub(crate) struct RestClient {
     /// Shared HTTP connection pool.
     http: reqwest::Client,
     /// Endpoint without userinfo, query, fragment, or trailing slash.
     base_url: String,
-    /// Basic-auth credentials parsed from the URL userinfo.
-    auth: Option<(String, String)>,
+    /// Credentials resolved from the URL userinfo and the explicit fields.
+    credentials: ElasticsearchCredentials,
 }
 
 impl fmt::Debug for RestClient {
@@ -97,7 +102,8 @@ impl fmt::Debug for RestClient {
             .debug_struct("RestClient")
             .field("http", &self.http)
             .field("base_url", &self.base_url)
-            .field("basic_auth", &self.auth.is_some())
+            .field("basic_auth", &self.credentials.basic_auth().is_some())
+            .field("api_key", &self.credentials.api_key.is_some())
             .finish()
     }
 }
@@ -105,7 +111,7 @@ impl fmt::Debug for RestClient {
 impl RestClient {
     /// Builds a client for `base_url` (already stripped of userinfo and
     /// trailing slash).
-    pub(crate) fn new(base_url: String, auth: Option<(String, String)>) -> Result<Self> {
+    pub(crate) fn new(base_url: String, credentials: ElasticsearchCredentials) -> Result<Self> {
         let http = reqwest::Client::builder().build().map_err(|error| {
             Error::config(format!(
                 "elasticsearch HTTP client could not be built: {error}"
@@ -114,7 +120,7 @@ impl RestClient {
         Ok(Self {
             http,
             base_url,
-            auth,
+            credentials,
         })
     }
 
@@ -123,9 +129,12 @@ impl RestClient {
         let request = self
             .http
             .request(method, format!("{}{path}", self.base_url));
-        match &self.auth {
-            Some((username, password)) => request.basic_auth(username, Some(password)),
-            None => request,
+        if let Some((username, password)) = self.credentials.basic_auth() {
+            request.basic_auth(username, Some(password))
+        } else if let Some(api_key) = &self.credentials.api_key {
+            request.header(reqwest::header::AUTHORIZATION, format!("ApiKey {api_key}"))
+        } else {
+            request
         }
     }
 
@@ -484,10 +493,20 @@ fn property(field: &FieldSchema, dimension: usize) -> Value {
 /// property named `id` (or else the first non-vector property) becomes the
 /// primary key, and `dynamic != "strict"` becomes `enable_dynamic_field`.
 /// Returns `None` only when the mapping declares no `properties` object.
+///
+/// A stored schema that does not decode is reported at `warn` and then rebuilt
+/// from `properties`: the index exists either way, so failing would strand a
+/// readable collection, and reconstructing silently would hide a corrupt schema
+/// (the rebuilt one loses fields the mapping cannot describe).
 pub(crate) fn schema_from_mappings(mappings: &Value) -> Option<CollectionSchema> {
     if let Some(stored) = mappings.pointer("/_meta/openjiuwen_schema") {
-        if let Ok(schema) = serde_json::from_value::<CollectionSchema>(stored.clone()) {
-            return Some(schema);
+        match serde_json::from_value::<CollectionSchema>(stored.clone()) {
+            Ok(schema) => return Some(schema),
+            Err(error) => tracing::warn!(
+                target: LOG_TARGET,
+                %error,
+                "the stored openjiuwen schema does not decode; reconstructing it from the index mapping"
+            ),
         }
     }
     let properties = mappings.get("properties")?.as_object()?;
@@ -734,9 +753,27 @@ fn range_query(field: &str, bound: &str, value: &Value) -> Value {
 }
 
 /// Maps a non-2xx response onto the kernel error taxonomy.
+///
+/// The response body carries the server's explanation, so a body that cannot be
+/// read is named in the error instead of degrading into "no response body".
 async fn response_error(response: reqwest::Response, operation: &str) -> Error {
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::debug!(
+                target: LOG_TARGET,
+                operation,
+                %error,
+                "the elasticsearch error response body could not be read"
+            );
+            return status_error(
+                status.as_u16(),
+                operation,
+                &format!("<the response body could not be read: {error}>"),
+            );
+        }
+    };
     status_error(status.as_u16(), operation, &body)
 }
 

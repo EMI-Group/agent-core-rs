@@ -9,6 +9,9 @@
 //! # Process contract
 //!
 //! * One JSON object per line, every line flushed, exactly as the protocol module requires.
+//! * The transport is the process's own stdin/stdout through `tokio::io::stdin`/`tokio::io::stdout`
+//!   (tokio's `io-std` feature), so the served member works on every target and no stdio path is
+//!   platform-gated.
 //! * stdout carries protocol frames only; every human-readable diagnostic goes to stderr, and a
 //!   failure to write stderr is ignored (a closed diagnostic stream must not panic the server).
 //! * `start` builds and starts the member, then answers `ready` followed by exactly one `state`
@@ -61,7 +64,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::error::Result;
 use openjiuwen_harness_protocol::HarnessState;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -218,22 +221,17 @@ impl ServeContext {
 /// `MODEL_PROVIDER`/`MODEL_NAME`/`API_KEY`/`API_BASE` through
 /// [`EnvModelResolver`](crate::harness::EnvModelResolver).
 ///
-/// Returns the process exit code: `0` after `stop` or end of input, `1` when the member cannot be
-/// built or started (or the process streams cannot be opened), and `1` on non-Unix targets, where
-/// `/dev/stdin` and `/dev/stdout` are unavailable without tokio's `io-std` feature.
+/// Returns the process exit code: `0` after `stop` or end of input, and `1` when the member cannot
+/// be built or started. The process's own stdin/stdout carry the protocol on every target, so there
+/// is no platform-specific stdio path left to fail.
 pub async fn serve_stdio() -> i32 {
     serve_stdio_with(Arc::new(NativeMemberFactory::from_env())).await
 }
 
 /// [`serve_stdio`] with an injectable factory, for callers that own their own model resolution.
 async fn serve_stdio_with(factory: Arc<dyn MemberHarnessFactory>) -> i32 {
-    match process_streams().await {
-        Ok((input, output)) => serve_with(input, output, factory).await,
-        Err(error) => {
-            diagnostic(&format!("cannot open the process stdin/stdout: {error}"));
-            1
-        }
-    }
+    let (input, output) = process_streams();
+    serve_with(input, output, factory).await
 }
 
 /// Serves one member over `input`/`output`, reading the identity from the process environment.
@@ -493,30 +491,13 @@ fn diagnostic(message: &str) {
     let _ = writeln!(std::io::stderr(), "team-member serve: {message}");
 }
 
-/// Opens the process's stdin/stdout as async streams.
+/// Hands back the process's stdin/stdout as async streams.
 ///
-/// The workspace does not enable tokio's `io-std` feature (see
-/// [`crate::mcp::stdio`]), so the process streams are reopened as `tokio::fs::File`s, the same
-/// pattern the MCP stdio transport uses.
-#[cfg(unix)]
-async fn process_streams() -> Result<(tokio::fs::File, tokio::fs::File)> {
-    let input = tokio::fs::File::open("/dev/stdin")
-        .await
-        .map_err(|error| Error::config(format!("cannot open /dev/stdin: {error}")))?;
-    let output = tokio::fs::File::options()
-        .write(true)
-        .open("/dev/stdout")
-        .await
-        .map_err(|error| Error::config(format!("cannot open /dev/stdout: {error}")))?;
-    Ok((input, output))
-}
-
-/// Reports the missing stdio transport on targets without `/dev/stdin`/`/dev/stdout`.
-#[cfg(not(unix))]
-async fn process_streams() -> Result<(tokio::fs::File, tokio::fs::File)> {
-    Err(Error::unsupported(
-        "team-member serve stdio transport (/dev/stdin, /dev/stdout)",
-    ))
+/// [`tokio::io::Stdin`] and [`tokio::io::Stdout`] implement `AsyncRead`/`AsyncWrite`, which is all
+/// the serving loop needs, so one platform-independent path serves the member on every target —
+/// no `/dev/stdin`/`/dev/stdout` reopening and no non-Unix refusal.
+fn process_streams() -> (tokio::io::Stdin, tokio::io::Stdout) {
+    (tokio::io::stdin(), tokio::io::stdout())
 }
 
 #[cfg(test)]

@@ -11,9 +11,11 @@ use openjiuwen_common::error::ErrorKind;
 use openjiuwen_common::http::HttpClientConfig;
 use serde_json::json;
 use wiremock::matchers::{body_json, body_string_contains, header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use crate::store::vector::Metric;
+
+use super::super::{MAX_SCAN_DOCUMENTS, SEARCH_PAGE_SIZE};
 
 /// The index name of the `docs` collection below.
 const INDEX: &str = "openjiuwen__docs";
@@ -855,22 +857,38 @@ async fn delete_docs_by_filters_uses_delete_by_query() {
 #[tokio::test]
 async fn delete_docs_by_filters_pages_and_filters_locally_without_a_translation() {
     let server = MockServer::start().await;
-    mount_exists(&server, true).await;
+    mount_schema(&server, &schema()).await;
     Mock::given(method("POST"))
         .and(path("/openjiuwen__docs/_search"))
         .and(body_json(json!({
             "query": {"match_all": {}},
             "_source": true,
-            "size": FILTER_DELETE_PAGE,
-            "from": 0,
-            "sort": ["_doc"],
+            "size": SEARCH_PAGE_SIZE,
+            // The keyword primary key is the stable `search_after` order.
+            "sort": [{"id": {
+                "order": "asc",
+                "missing": "_last",
+                "unmapped_type": "keyword",
+            }}],
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "hits": {
                 "hits": [
-                    {"_id": "a", "_source": {"id": "a", "meta": {"owner": "ada"}}},
-                    {"_id": "b", "_source": {"id": "b", "meta": {"owner": "bob"}}},
-                    {"_id": "c", "_source": {"meta": {"owner": "ada"}}},
+                    {
+                        "_id": "a",
+                        "_source": {"id": "a", "meta": {"owner": "ada"}},
+                        "sort": ["a"],
+                    },
+                    {
+                        "_id": "b",
+                        "_source": {"id": "b", "meta": {"owner": "bob"}},
+                        "sort": ["b"],
+                    },
+                    {
+                        "_id": "c",
+                        "_source": {"meta": {"owner": "ada"}},
+                        "sort": ["c"],
+                    },
                 ],
             },
         })))
@@ -901,6 +919,168 @@ async fn delete_docs_by_filters_pages_and_filters_locally_without_a_translation(
         recorded_body(&server, "/_bulk").await,
         "{\"delete\":{\"_id\":\"a\"}}\n{\"delete\":{\"_id\":\"c\"}}\n"
     );
+}
+
+#[tokio::test]
+async fn collect_matching_ids_pages_with_search_after_until_the_index_is_exhausted() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/openjiuwen__docs/_search"))
+        .respond_with(paged_index(1_200))
+        .mount(&server)
+        .await;
+
+    let ids = store(&server)
+        .collect_matching_ids(INDEX, &schema(), &json!({"meta.owner": "ada"}))
+        .await
+        .expect("scan");
+    // Half of the documents belong to `ada`; the scan read all of them.
+    assert_eq!(ids.len(), 600);
+    assert!(ids.contains("doc-000000"), "ids: {ids:?}");
+    assert!(ids.contains("doc-001198"), "ids: {ids:?}");
+
+    // Three pages, each continuing from the previous page's `sort` values and
+    // never falling back to `from`/`offset` deep paging.
+    let bodies: Vec<Value> = server
+        .received_requests()
+        .await
+        .expect("requests")
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).expect("request body"))
+        .collect();
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(bodies[0]["size"], json!(SEARCH_PAGE_SIZE));
+    assert_eq!(bodies[0]["sort"][0]["id"]["order"], json!("asc"));
+    assert!(bodies[0].get("search_after").is_none());
+    assert!(bodies[0].get("from").is_none());
+    assert_eq!(bodies[1]["search_after"], json!(["doc-000499"]));
+    assert_eq!(bodies[2]["search_after"], json!(["doc-000999"]));
+}
+
+#[tokio::test]
+async fn collect_matching_ids_fails_instead_of_truncating_at_the_document_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/openjiuwen__docs/_search"))
+        .respond_with(paged_index(MAX_SCAN_DOCUMENTS + 5_000))
+        .mount(&server)
+        .await;
+
+    let error = store(&server)
+        .collect_matching_ids(INDEX, &schema(), &json!({"meta.owner": "ada"}))
+        .await
+        .expect_err("the cap must fail the scan");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let message = error.to_string();
+    assert!(
+        message.contains(&MAX_SCAN_DOCUMENTS.to_string()),
+        "message: {message}"
+    );
+    assert!(message.contains("meta.owner"), "message: {message}");
+    assert!(message.contains("explicit `limit`"), "message: {message}");
+
+    // One page per `SEARCH_PAGE_SIZE` documents plus the probe past the cap.
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), MAX_SCAN_DOCUMENTS / SEARCH_PAGE_SIZE + 1);
+}
+
+#[tokio::test]
+async fn a_repeated_page_is_rejected_instead_of_looping() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/openjiuwen__docs/_search"))
+        .respond_with(frozen_page())
+        .mount(&server)
+        .await;
+
+    let error = store(&server)
+        .collect_matching_ids(INDEX, &schema(), &json!({"meta.owner": "ada"}))
+        .await
+        .expect_err("a stuck cursor must fail the scan");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let message = error.to_string();
+    assert!(message.contains("did not advance"), "message: {message}");
+    assert!(message.contains("openjiuwen__docs"), "message: {message}");
+    assert!(message.contains("meta.owner"), "message: {message}");
+    // The first page and the probe that repeats it.
+    assert_eq!(server.received_requests().await.expect("requests").len(), 2);
+}
+
+#[tokio::test]
+async fn a_full_page_without_sort_values_is_rejected() {
+    let server = MockServer::start().await;
+    let hits: Vec<Value> = (0..SEARCH_PAGE_SIZE)
+        .map(|index| {
+            let id = format!("doc-{index:06}");
+            json!({"_id": id, "_source": {"id": id}})
+        })
+        .collect();
+    Mock::given(method("POST"))
+        .and(path("/openjiuwen__docs/_search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "hits": {"total": {"value": SEARCH_PAGE_SIZE, "relation": "eq"}, "hits": hits},
+        })))
+        .mount(&server)
+        .await;
+
+    let error = store(&server)
+        .collect_matching_ids(INDEX, &schema(), &json!({"meta.owner": "ada"}))
+        .await
+        .expect_err("paging cannot continue without `sort` values");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(
+        error.to_string().contains("search_after"),
+        "message: {error}"
+    );
+}
+
+/// A `_search` responder that serves `total` documents through `search_after`.
+///
+/// Documents are named `doc-000000`, `doc-000001`, … and every even one belongs
+/// to `ada`; the responder honours the requested `size` and the `search_after`
+/// cursor and returns the `sort` values of every hit, so a paged scan can be
+/// exercised end to end.
+fn paged_index(total: usize) -> impl Respond + 'static {
+    move |request: &Request| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let size = body.get("size").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let start = body
+            .get("search_after")
+            .and_then(Value::as_array)
+            .and_then(|cursor| cursor.first())
+            .and_then(Value::as_str)
+            .and_then(|id| id.strip_prefix("doc-"))
+            .and_then(|index| index.parse::<usize>().ok())
+            .map_or(0, |index| index + 1);
+        let hits: Vec<Value> = (start..total.min(start + size))
+            .map(|index| {
+                let id = format!("doc-{index:06}");
+                let owner = if index % 2 == 0 { "ada" } else { "bob" };
+                json!({
+                    "_id": id,
+                    "_source": {"id": id, "meta": {"owner": owner}},
+                    "sort": [id],
+                })
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "hits": {"total": {"value": total, "relation": "eq"}, "hits": hits},
+        }))
+    }
+}
+
+/// A `_search` responder that ignores the cursor and always serves the same
+/// full page, i.e. a cursor that never advances.
+fn frozen_page() -> impl Respond + 'static {
+    move |_request: &Request| {
+        let hits: Vec<Value> = (0..SEARCH_PAGE_SIZE)
+            .map(|index| {
+                let id = format!("doc-{index:06}");
+                json!({"_id": id, "_source": {"id": id}, "sort": [id]})
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({"hits": {"hits": hits}}))
+    }
 }
 
 #[tokio::test]

@@ -4,8 +4,9 @@
 
 Author, validate, template, and persist portable skill bundles for the `openjiuwen` harness, and derive them from a documentation URL.
 Ports `openjiuwen.dev_tools.skill_creator`: a typed skill definition, `SKILL.md` frontmatter rendering/parsing, text resources, model-assisted drafting, and the `skill_omni_creation` script pipeline (scrape → download → generate → save).
-Python's scrape/download/filter stages are replaced by an injected fetcher, rule-based HTML extraction, and deterministic filters; a `SkillSpec` (deterministic) or a natural-language `SkillRequest`/URL (model-assisted or rule-based) supplies the content.
-Everything here is deterministic and offline-safe except the single model round trips in `SkillCreator::create_with_model`, `SkillCreator::create_from_url`, and `OmniCreation::generate_with_model`.
+Python's scrape/download/filter stages are replaced by an injected fetcher, rule-based HTML extraction, in-process archive unpacking, the kernel's retrieval loaders for office/PDF documents, and deterministic filters; a `SkillSpec` (deterministic) or a natural-language `SkillRequest`/URL (model-assisted or rule-based) supplies the content.
+Everything here is deterministic and offline-safe except the single model round trips in `SkillCreator::create_with_model`, `SkillCreator::create_from_url` (through `OmniCreation::generate_with_model_profiled`), and `OmniCreation::generate_with_model`.
+Every URL-derived skill reports whether the model or the deterministic template renderer produced it, via `GenerationProvenance`.
 
 ## API Surface
 
@@ -21,7 +22,8 @@ Everything here is deterministic and offline-safe except the single model round 
 - `SkillSpec` — deterministic input: identity, instruction template, `variables`, `resources`, `version`, `metadata`; builders `new/with_variable/with_resource/with_version`.
 - `SkillRequest` — natural-language input: `request`, `resource_hints`, `language` (`"zh-CN"` default, `"en-US"` alternative); builders `new/with_language/with_resource_hints`.
 - `SkillCreator::new/with_model/has_model/create/create_with_model/write/read`, plus `Default`.
-- `SkillCreator::create_from_url(fetcher: Arc<dyn Fetcher>, url, root) -> Result<OmniOutcome>` — the URL → bundle path, reusing the creator's model when attached.
+- `SkillCreator::create_from_url(fetcher: Arc<dyn Fetcher>, url, root) -> Result<OmniOutcome>` — the URL → bundle path, reusing the creator's model when attached; the outcome's `provenance` says whether the model or the deterministic template renderer drafted the document.
+- `omni::GenerationProvenance` (`Deterministic`/`Model`, `as_str`/`Display`) and `omni::GeneratedSkill { definition, provenance }` — which generator produced a document.
 - `omni::{OmniConfig, OmniCreation, OmniOutcome}` re-exported here; every omni type/function is re-exported from `skill_creator::omni` (see `omni/CONTEXT.md`).
 - Module re-exports at `openjiuwen_dev_tools::skill_creator`: `SkillBundle`, `SkillCreator`, `SkillRequest`, `SkillSpec`, `SkillDefinition`, `SkillFrontmatter`, `SkillResource`, `parse_markdown`, `render_markdown`, `OmniConfig`, `OmniCreation`, `OmniOutcome`.
 - Submodules `definition`, `template`, `bundle`, `creator`, `omni` are public; `NAME_PATTERN`, `MAX_NAME_LENGTH`, `SKILL_DOCUMENT` are public constants.
@@ -38,12 +40,12 @@ Resource paths must be relative, `/`-separated, free of empty/`.`/`..` component
 ## Constraints
 
 - Only files under `skill_creator/` are edited here; the crate manifest, `src/lib.rs`, `src/util.rs`, and `docs/` belong to other nodes.
-- Errors are `openjiuwen_common::error::Error`: `Error::validation` for bad input, malformed documents, missing template variables, and unsupported languages; `From<std::io::Error>` (`Error::external`) for filesystem failures; model failures propagate unchanged (`Error::llm`).
+- Errors are `openjiuwen_common::error::Error`: `Error::validation` for bad input, malformed documents, missing template variables, unsupported languages, and a page or document that yields nothing; `Error::unsupported` for a `bzip2`/`xz`/`zstd` page input or an archive capability the in-crate reader does not ship (the message names the codec or encryption scheme); `From<std::io::Error>` (`Error::external`) for filesystem failures; model failures propagate unchanged (`Error::llm`) from `create_with_model`, while `create_from_url` falls back to the deterministic renderer.
 - Public data types derive `Debug, Clone, Default, PartialEq, Serialize, Deserialize`, use `#[serde(rename_all = "snake_case", default)]`, and tolerate unknown fields; `SkillDefinition`, `SkillResource`, and `SkillFrontmatter` also derive `schemars::JsonSchema`.
 - No `unsafe`, no `unwrap`/`expect`/`panic!` outside tests, no stdout printing; `tracing` only.
 - Bundle IO uses `tokio::fs`; both entry points are `async`.
 - Rustdoc is required on every public item (workspace `missing_docs`, clippy pedantic + `-D warnings`).
-- The `omni` subtree adds no dependencies: HTTP is `openjiuwen_common::http`, and HTML/tar parsing, image sniffing, hashing, and URL resolution are implemented in-crate.
+- The `omni` subtree adds no dependencies: HTTP is `openjiuwen_common::http`, HTML/tar/ZIP/gzip parsing, image sniffing and header-only dimension parsing, hashing, and URL resolution are implemented in-crate, and non-text documents (PDF/DOCX/XLSX/PPTX/ODT plus text/Markdown/CSV/TSV/JSON) are extracted by `openjiuwen_core::retrieval::loaders::AutoLoader` from the crate's existing `openjiuwen-core` dependency.
 
 ## Design Decisions
 
@@ -59,15 +61,19 @@ Resource paths must be relative, `/`-separated, free of empty/`.`/`..` component
 - `SkillCreator` stores `Option<Arc<dyn Model>>` so the caller owns provider configuration and no builder reads the environment.
 - The URL path (`omni`) reuses these same definition/bundle seams instead of a parallel writer: `OmniCreation::save` appends validated text resources and delegates to `SkillBundle::write`.
 - URL-derived skills are deterministic first: name from `slugify(title)`, description from the meta description or first paragraph, instructions rendered from headings/text/code blocks; the model, when attached, only re-drafts the document and a deterministic fallback always exists.
+- Provenance is never silent: a model answer is reported as `GenerationProvenance::Model` and the template path as `GenerationProvenance::Deterministic`, on both `GeneratedSkill` and `OmniOutcome::provenance`.
+- The no-model run logs exactly one `openjiuwen_common::logging::warn!` naming the URL and pointing at `OmniCreation::with_model`, and an unusable model answer logs its cause before falling back, so a caller can check the provenance instead of reading logs.
+- A model failure never fails `create_from_url`: an attached model is optional drafting help, and the deterministic renderer always produces the bundle.
 - Filtering happens inside `OmniCreation::download`, so there is no public filter stage that could be skipped accidentally.
 - Images are recorded as URLs, never written as binary resources, because the bundle format is text-only.
 
 ## Deferred
 
-- Zip and gzip archive unpacking stops at the in-crate subset: `tar`, classic 32-bit zip (stored/DEFLATE) and gzip (DEFLATE) unpack; ZIP64, encrypted entries, and other compression methods are `Error::unsupported` (`omni/archive`).
+- Archive decoding stops at the in-crate codecs: `tar` (including PAX and GNU long-name/link records), `zip` (classic and ZIP64, stored/DEFLATE, `ZipCrypto` via `UnpackOptions`), and `gzip` (DEFLATE, including gzip-wrapped `tar`/`zip`); `bzip2`/`xz`/`zstd`, `WinZip` AES, PKWARE strong encryption, an encrypted central directory, and every other compression method are `Error::unsupported` naming the codec or method (`omni/archive`).
+- The ZIP writer stays stored-only, so nothing here writes a compressed or encrypted ZIP entry.
 - Playwright browser automation, JS rendering, stealth user agents, and cookie-banner handling for scraping: replaced by the `Fetcher` seam plus static rule-based HTML extraction.
-- Pillow image decoding and the Python 80 px dimension gate, plus the LLM image-relevance judge (stage 3): replaced by magic sniffing, byte bounds, url-hint icon heuristics, and content/url deduplication.
-- Non-text resource extraction (PDF/DOCX parsing, OCR, video URLs and frame extraction) and Python's LLM "web plugin" scrape fallback: not ported.
+- Pixel-level image decoding (Python's Pillow pipeline) and the LLM image-relevance judge (stage 3): image pixels are never decoded, dimensions come from header parsing only, and relevance is decided by the deterministic filter rules plus url-hint icon heuristics.
+- OCR for scanned PDFs, video URLs and frame extraction, and Python's LLM "web plugin" scrape fallback: not ported (office/PDF text extraction itself is implemented through the retrieval loaders).
 - Binary resources, per-resource media-type persistence, and asset naming conventions are out of scope.
 - The Python multi-stage LLM clarifier/designer/reflector pipeline and cycle checker are replaced by a single fenced-JSON round trip.
 
@@ -78,7 +84,8 @@ Resource paths must be relative, `/`-separated, free of empty/`.`/`..` component
 - `template` covers strict missing-variable errors, whitespace trimming, literal empty/brace runs, single-pass substitution, nested braces, unicode, and placeholder listing.
 - `bundle` round-trips through `openjiuwen_test_support::TempWorkspace` with a nested `references/guide.md`, asserts the exact on-disk `SKILL.md`, and checks that non-UTF-8 files and symlinks are skipped.
 - `creator` drives `openjiuwen_test_support::ScriptedModel` (fenced JSON, plain text, incomplete payloads, language selection, `call_count` assertions), covers the no-model, unsupported-language, and invalid-hint errors, and exercises `create_from_url` against a `ScriptedFetcher` bundle.
-- `omni` tests are documented in `omni/CONTEXT.md`: loopback TCP HTTP tests, HTML fixtures, an in-test ustar builder, filter/dedupe matrices, and URL → bundle end-to-end runs through `ScriptedFetcher`, `TempWorkspace`, and `ScriptedModel`.
+- `creator`'s `create_from_url` tests assert the provenance matrix: no model → `Deterministic`, an accepted model answer → `Model`, an unusable answer → `Deterministic` after one call, and an `OmniOutcome` JSON without the `provenance` field → `Deterministic` (legacy default).
+- `omni` tests are documented in `omni/CONTEXT.md`: loopback TCP HTTP tests, HTML fixtures, an in-test ustar builder, archive/document page inputs, filter/dedupe matrices, and URL → bundle end-to-end runs through `ScriptedFetcher`, `TempWorkspace`, and `ScriptedModel`.
 - Everything is offline and deterministic: no network, no environment reads, no wall-clock dependence.
 
 ## Routing Table
@@ -86,6 +93,6 @@ Resource paths must be relative, `/`-separated, free of empty/`.`/`..` component
 - `./definition.rs` → `SkillDefinition`, `SkillResource`, `SkillFrontmatter`, name/path validation, markdown codec
 - `./template.rs` → strict `{{name}}` rendering and placeholder listing
 - `./bundle.rs` → `SkillBundle::write`/`read`, `SKILL.md` + resource tree on disk
-- `./creator.rs` → `SkillSpec`, `SkillRequest`, `SkillCreator`, model-assisted drafting, prompt wording, `create_from_url`
+- `./creator.rs` → `SkillSpec`, `SkillRequest`, `SkillCreator`, model-assisted drafting, prompt wording, `create_from_url` (returning the provenance-bearing `OmniOutcome`)
 - `./omni/` → the URL → bundle pipeline: fetch seam, HTML extraction, archives, filters, stages, rendering (`omni/CONTEXT.md`)
 - `./mod.rs` → module tree, crate-level re-exports, usage example

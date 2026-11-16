@@ -24,6 +24,8 @@
 //! | [`health`] | [`TeamHealth`] / [`MemberHealth`]: the member-liveness projection of a team |
 //! | [`initial_input`] | [`parse_initial_input`]: caller request → leader query + deliveries |
 //! | [`backend`] | [`TeamBackend`]: members, mail, events, task board and snapshot facade |
+//! | `tool_dispatch` | the four member-facing team tools answered against a [`TeamBackend`] |
+//! | `member_roles` | role capabilities: which roles own a local harness and which cannot spawn |
 //! | [`build`] | the blueprint → runtime build path (`SpecBuild::build` / `build_with`) |
 //! | [`spawner`] | [`TeamMemberSpawner`]: the harness-backed `MemberSpawner` |
 //! | [`team_agent`] | [`TeamAgent`] and [`SpecBuild`] |
@@ -56,6 +58,8 @@ pub mod initial_input;
 pub mod leader;
 /// Process-wide and local runtime management.
 pub mod manager;
+/// Role capabilities: which roles own a local harness and which cannot be spawned.
+pub(crate) mod member_roles;
 /// Team-memory resolution and the lifecycle hooks the runtime drives.
 pub(crate) mod memory_bind;
 /// Observability hooks and the optional monitor sink, fanned out from one place.
@@ -72,6 +76,8 @@ pub mod routing;
 pub mod spawner;
 /// The team agent: one type for the leader and every teammate.
 pub mod team_agent;
+/// The in-process team-tool dispatcher shared by delivery and attach hosting.
+pub(crate) mod tool_dispatch;
 
 /// Spec-metadata keys and their parsers.
 pub mod spec_meta;

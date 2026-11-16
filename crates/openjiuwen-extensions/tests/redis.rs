@@ -630,26 +630,30 @@ async fn factory_builds_live_redis_document_and_vector_stores() {
     assert!(vectors.collection_exists("embeddings").await.unwrap());
 }
 #[tokio::test]
-async fn tls_urls_are_unsupported_and_name_tls() {
-    let tls_url = || "rediss://127.0.0.1:6379".to_owned();
+async fn tls_urls_perform_a_handshake_and_name_tls() {
+    // `rediss://` really uses TLS: against a plain RESP peer the handshake fails as a
+    // transport error naming TLS, never as an unsupported feature.
+    let fake = Server::start().await;
+    let tls_url = format!("rediss://{}/0", fake.addr());
     let store = RedisStore::connect(RedisStoreConfig {
-        url: Some(tls_url()),
+        url: Some(tls_url.clone()),
         ..RedisStoreConfig::default()
     });
-    let config = RedisCheckpointerConfig::new(RedisConnectionConfig::new(tls_url()));
+    let config = RedisCheckpointerConfig::new(RedisConnectionConfig::new(&tls_url));
     let errors = [
         expect_error(store.await),
         expect_error(RedisCheckpointer::connect(config).await),
     ];
     for error in errors {
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(error.kind(), ErrorKind::Transport);
         let message = error.message().to_ascii_lowercase();
         assert!(message.contains("tls"), "unexpected: {error}");
     }
 }
 #[tokio::test]
-async fn cluster_redirections_are_unsupported_and_name_slot_routing() {
-    let fake = Server::start_moved().await;
+async fn cluster_mode_is_verified_against_the_seed_node() {
+    // A standalone node is no longer accepted in cluster mode.
+    let fake = Server::start().await;
     let cluster_url = fake.url().replacen("redis://", "redis+cluster://", 1);
     let store = RedisStore::connect(RedisStoreConfig {
         url: Some(cluster_url),
@@ -660,14 +664,26 @@ async fn cluster_redirections_are_unsupported_and_name_slot_routing() {
     let checkpointer = RedisCheckpointer::connect(RedisCheckpointerConfig::new(connection));
     let errors = [expect_error(store.await), expect_error(checkpointer.await)];
     for error in errors {
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-        let message = error.message().to_ascii_lowercase();
-        assert!(message.contains("cluster"), "unexpected: {error}");
-        assert!(
-            message.contains("moved") || message.contains("ask"),
-            "unexpected: {error}"
-        );
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        let message = error.message();
+        assert!(message.contains("cluster_enabled:1"), "unexpected: {error}");
     }
+}
+
+#[tokio::test]
+async fn cluster_redirections_are_followed_to_the_reported_node() {
+    // The seed reports `MOVED` for every command; the client must re-issue the command
+    // on the reported node so the write lands there.
+    let owner = Server::start().await;
+    let seed = Server::start_moved_to(owner.addr()).await;
+    let client = Client::from_url(&seed.url()).await.unwrap();
+    let written = client.command_str(&["SET", "redirected", "value"]).await;
+    assert_eq!(written.unwrap(), Reply::Simple("OK".to_owned()));
+    assert_eq!(
+        owner.state().get("redirected"),
+        Some(b"value".to_vec()),
+        "the command must run on the redirected node"
+    );
 }
 #[tokio::test]
 async fn a_closed_port_is_a_transport_error() {
@@ -920,18 +936,18 @@ async fn document_store_rejects_invalid_names_and_unreachable_peers() {
     );
     let missing = expect_error(RedisDocumentStore::new(RedisStoreConfig::default()));
     assert_eq!(missing.kind(), ErrorKind::Validation);
-    // TLS is rejected when connecting, since construction performs no I/O.
-    let tls = RedisDocumentStore::connect(url_config("rediss://127.0.0.1:6379"))
+    let fake = Server::start().await;
+    // `rediss://` performs a real TLS handshake when connecting, so a plain RESP peer
+    // fails it with a transport error naming TLS (construction performs no I/O).
+    let tls = RedisDocumentStore::connect(url_config(&format!("rediss://{}/0", fake.addr())))
         .await
         .err()
-        .expect("TLS is unsupported");
-    assert_eq!(tls.kind(), ErrorKind::Unsupported);
+        .expect("a plain listener cannot complete a TLS handshake");
+    assert_eq!(tls.kind(), ErrorKind::Transport);
     assert!(
         tls.message().to_ascii_lowercase().contains("tls"),
         "unexpected: {tls}"
     );
-
-    let fake = Server::start().await;
     let store = connect_documents(&fake).await;
     // The kernel's collection-name rule is replicated once and shared, so both
     // stores reject the same names with a validation error naming the collection.

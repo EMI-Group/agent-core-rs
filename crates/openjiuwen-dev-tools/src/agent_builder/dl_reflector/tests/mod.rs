@@ -6,9 +6,10 @@
 //!
 //! The suite is grouped by concern: `graph` (deterministic graph repair),
 //! `repair` (reflection vocabulary, debug output, and the optional model
-//! revision), `node_rules` (basic and per-node-type field validation), and
-//! `branch_rules` (intent and branch conditions). Shared fixtures live in
-//! `support`.
+//! revision), `node_rules` (basic and per-node-type field validation),
+//! `branch_rules` (intent and branch conditions), and `variable_rules`
+//! (duplicate names, input values, references, and output descriptions). Shared
+//! fixtures live in `support`.
 
 mod support;
 
@@ -16,3 +17,4 @@ mod branch_rules;
 mod graph;
 mod node_rules;
 mod repair;
+mod variable_rules;

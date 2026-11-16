@@ -53,9 +53,19 @@ impl LoadedAgentGroupPackage {
 pub fn load_agent_group(dir: impl AsRef<Path>) -> Result<LoadedAgentGroupPackage>;
 
 // template.rs
-pub struct BoundAgentGroup { pub name: String, pub members: Vec<BoundGroupMember> }
+pub struct BoundAgentGroup { pub name: String, pub members: Vec<BoundGroupMember>,
+                             pub skipped: Vec<SkippedMember> }
+impl BoundAgentGroup { pub fn new(name) -> Self;
+                       pub fn member(&self, name: &str) -> Option<&BoundGroupMember>;
+                       pub fn member_names(&self) -> Vec<&str>;
+                       pub fn is_complete(&self) -> bool;          // no non-leader skip
+                       pub fn skipped_names(&self) -> Vec<&str>;
+                       pub fn skipped_reason(&self, name: &str) -> Option<&str>; }
 pub struct BoundGroupMember { pub name: String, pub display_name: String, pub desc: String,
                               pub persona: String, pub external_cli: bool }
+pub struct SkippedMember { pub name: String, pub reason: String, pub kind: SkipReason }
+pub enum SkipReason { Leader, EmptyPersona, PersonaUnreadable }  // snake_case wire names
+impl SkipReason { pub fn as_str(self) -> &'static str; }         // leader|empty_persona|persona_unreadable
 pub fn bind_group(package: &LoadedAgentGroupPackage) -> BoundAgentGroup;
 pub fn compose_template_member(base: &DeepAgentSpec, template: &AgentTemplateCard,
                                persona: &str, language: Option<&str>) -> DeepAgentSpec;
@@ -112,6 +122,10 @@ Shared skills:
 - every other `DeepAgentSpec` field is preserved.
 `render_persona` substitutes `{{language}}`, `{{workspace}}` (the base workspace root, `""` when absent) and `{{persona}}` in one non-recursive pass; `{{persona}}` expands once to the unrendered text.
 `bind_group` returns the spawnable (non-leader) members, ordered by member name; it re-reads each persona from the package and skips members whose persona is empty or no longer readable, so one broken member does not hide the rest.
+Every skip is observable, never silent: `bind_group` logs it with the package and member identity (`debug!` for the leader, `warn!` for a persona failure) and appends a `SkippedMember { name, reason, kind }` to `BoundAgentGroup::skipped`.
+The leader is the one expected filter (`SkipReason::Leader`, so `is_complete()` stays `true` for a healthy package); `EmptyPersona` and `PersonaUnreadable` mark a package the caller's input no longer fully backs, and `reason` always names the member and the failing condition.
+`skipped` keeps `bind_group` infallible and its signature unchanged: a broken member degrades to a recorded skip instead of a typed error, and the caller decides whether to abort.
+`agent_group.rs`'s skill discovery logs the one remaining silent filter at `debug!`: a directory under `<group>/skills/` without `SKILL.md` is not mounted (Python's behaviour), while non-Markdown persona files are excluded by the package format itself.
 A member with `runtime = "external"` is flagged `external_cli = true`; its launch configuration stays on the template card.
 
 ## Constraints
@@ -142,7 +156,7 @@ A member with `runtime = "external"` is flagged `external_cli = true`; its launc
 
 ## Test Strategy
 
-Unit tests live in `#[cfg(test)] mod tests` beside each definition (21 tests), using `tempfile::tempdir()` and the shared fixtures in `test_support.rs`:
+Unit tests live in `#[cfg(test)] mod tests` beside each definition (25 tests), using `tempfile::tempdir()` and the shared fixtures in `test_support.rs`:
 `agent_group.rs` exceeds the 1000-line baseline by design — the package format and its fixture-driven tests are one cohesive unit, and the file carries a top-of-file note saying so.
 - happy path: leader + two members, localized group/member text, instruction trimming, roster order independence, persona loading;
 - name/directory mismatch, empty roster, missing leader, invalid/kebab/snake roster names, wrong `package_type`, missing `persona.dir`;
@@ -151,17 +165,19 @@ Unit tests live in `#[cfg(test)] mod tests` beside each definition (21 tests), u
 - `LocalizedText` string/object deserialization, `zh` alias, `cn` fallback, `zh` map key;
 - shared-skill declaration + auto-discovery merge and missing-`SKILL.md` failure;
 - external runtime recording and leader rejection;
-- `bind_group` leader exclusion, display/desc resolution, external flag, persona content;
+- `bind_group` leader exclusion, display/desc resolution, external flag, persona content, the leader `SkippedMember` (`kind`/`as_str`/`reason` naming the member), a member skipped for an empty persona and one skipped for an unreadable persona (`is_complete()` false, `skipped_reason` populated), and `SkippedMember`/`BoundAgentGroup` serde round-trip plus default-fill for a payload written before `skipped` existed;
 - `compose_template_member` language precedence, placeholder rendering, skill union/dedup/sort, prompt prepending, idempotence, field preservation;
 - catalog set/get/clear, fake catalog listing/locating, `ExpertRef::label`/`to_value`, `PackageLocation` path-as-string round-trip.
-Definition of done: `cargo test -p openjiuwen-agent-teams --lib`, `cargo test -p openjiuwen-agent-teams --no-default-features --lib`, `cargo fmt -p openjiuwen-agent-teams -- --check`, and clippy clean for `src/experts/` (the empty sibling placeholder modules currently trip `missing_docs`, which belongs to the crate root node).
+Definition of done: `cargo test -p openjiuwen-agent-teams --lib`, `cargo test -p openjiuwen-agent-teams --no-default-features --lib`, `cargo fmt -p openjiuwen-agent-teams -- --check`, and clippy clean for `src/experts/`.
 
 ## Notes for Agents
 
 - Python's `group_capabilities` and its card `tags` are merged into `AgentGroupCard::tags` here; use `capabilities()` for the Python `LoadedAgentGroupPackage.capabilities` behaviour.
 - Python requires a leader `AGENT.md`; the Rust loader makes it optional (packages authored without leader rules stay loadable).
 - Python preserves skill order and mounts prompt sections; the Rust port sorts the composed skill list and leaves persona text flat.
-- `LoadedAgentGroupPackage::templates` is a `BTreeMap`, so member iteration is alphabetical, not roster order; `bind_group` inherits that order.
+- `BoundAgentGroup::skipped` and its `SkippedMember`/`SkipReason` types are reachable as `openjiuwen_agent_teams::experts::…`; the crate root (`src/lib.rs`) still lists `experts` exports item by item and does not re-export them (that file belongs to another node).
+- Binding never reports a broken member as an error: `bind_group` stays infallible, and a caller that needs strictness fails on `!bound.is_complete()` (or on any `SkipReason` other than `Leader`).
+- `LoadedAgentGroupPackage::templates` is a `BTreeMap`, so member iteration is alphabetical, not roster order; `bind_group` inherits that order for both `members` and `skipped`.
 - Localized maps in published Python packages often use `zh`, not `cn`; `resolve` accepts both.
 - `ExpertCatalog::locate_*` returns `Ok(None)` for a missing package; Python raises `ValueError`. Callers that need an error map it to `Error::not_found`.
 - Never hold the process-catalog read lock across `.await`: `get_process_expert_catalog` clones the `Arc` and releases it before returning.

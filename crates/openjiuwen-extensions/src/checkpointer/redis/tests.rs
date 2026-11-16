@@ -1,8 +1,8 @@
 //! Unit-test matrix for the Redis checkpointer.
 //!
 //! Covers save/load/list/latest/delete/release/`session_exists`, TTL handling on
-//! save and on read, and the documented deferrals (TLS rejection, cluster
-//! redirection).
+//! save and on read, the TLS handshake failure against a plain listener, and the
+//! cluster-mode verification of the seed node.
 //! The tests are intentionally kept in one file because they share the
 //! `FakeRedis` fixtures and the configuration helpers defined below.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)] // `assert!(x.is_empty())` states the expectation directly
@@ -687,42 +687,50 @@ async fn connect_and_create_reach_a_live_server() {
 }
 
 #[tokio::test]
-async fn tls_urls_are_unsupported() {
+async fn tls_urls_attempt_a_handshake_and_fail_on_a_plain_peer() {
+    // `rediss://` really uses TLS now: against a plain RESP listener the handshake
+    // fails as a transport error naming TLS, never as an unsupported feature.
+    let fake = FakeRedis::start().await;
+    let url = format!("rediss://{}/0", fake.addr());
     let error = RedisCheckpointer::connect(RedisCheckpointerConfig::new(
-        RedisConnectionConfig::new("rediss://127.0.0.1:6379"),
+        RedisConnectionConfig::new(&url),
     ))
     .await
     .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert_eq!(error.kind(), ErrorKind::Transport);
     assert!(
         error.to_string().to_lowercase().contains("tls"),
         "unexpected: {error}"
     );
 
     // The cluster TLS scheme is normalised to `rediss://` and fails the same way.
+    let cluster_url = format!("rediss+cluster://{}/0", fake.addr());
     let error = RedisCheckpointer::create(&RedisCheckpointerConfig::new(
-        RedisConnectionConfig::new("rediss+cluster://127.0.0.1:7000"),
+        RedisConnectionConfig::new(&cluster_url),
     ))
     .await
     .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert_eq!(error.kind(), ErrorKind::Transport);
+    fake.shutdown().await;
 }
 
 #[tokio::test]
-async fn cluster_mode_against_a_redirecting_server_is_unsupported() {
-    let fake = FakeRedis::start_with(FakeOptions::moved_everything()).await;
+async fn cluster_mode_against_a_standalone_server_is_rejected() {
+    let fake = FakeRedis::start().await;
     let config = RedisCheckpointerConfig::new(RedisConnectionConfig::new(format!(
         "redis+cluster://{}",
         fake.addr()
     )));
 
     let error = RedisCheckpointer::connect(config).await.unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert_eq!(error.kind(), ErrorKind::Validation);
     let message = error.to_string();
+    assert!(message.contains("cluster"), "unexpected: {message}");
     assert!(
-        message.contains("cluster") && message.contains("MOVED"),
+        message.contains("cluster_enabled:1"),
         "unexpected: {message}"
     );
+    fake.shutdown().await;
 }
 
 #[tokio::test]

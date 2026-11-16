@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::tune::base::Case;
-use crate::tune::tool::{RunOutcome, ToolCallRecord, ToolStubs, ToolTrace};
+use crate::tune::tool::{RunOutcome, RunTelemetry, ToolCallRecord, ToolStubs, ToolTrace};
 use crate::util::extract_json_fence;
 
 /// How many tool rounds [`ModelPromptRunner`] runs before it accepts the
@@ -107,8 +108,9 @@ pub trait PromptRunner: Send + Sync {
 
     /// Runs `prompt` for `case` and reports the tool calls behind the answer.
     ///
-    /// The default runs [`run`](Self::run) and reports an empty trace, so a
-    /// runner that executes no tools needs no change.
+    /// The default runs [`run`](Self::run) and reports an empty trace and absent
+    /// telemetry, so a runner that executes no tools and measures nothing needs
+    /// no change.
     ///
     /// # Errors
     ///
@@ -135,6 +137,11 @@ pub trait PromptRunner: Send + Sync {
 /// bounded by [`max_tool_rounds`](Self::with_max_tool_rounds): once that many
 /// rounds ran, the model's current text is accepted as the answer (usually the
 /// empty text of a tool-calling turn).
+///
+/// Every run also measures its own [`RunTelemetry`]: the wall-clock latency of
+/// the whole run, plus the prompt and completion tokens every model call
+/// reported, summed over the run. Cost stays absent because pricing is the
+/// caller's decision.
 pub struct ModelPromptRunner {
     /// The model consulted for every case.
     model: Arc<dyn Model>,
@@ -235,29 +242,40 @@ impl PromptRunner for ModelPromptRunner {
             ));
         }
         let request = self.request_for(case)?;
+        let started = Instant::now();
         let mut messages = vec![
             BaseMessage::system(prompt.to_owned()),
             BaseMessage::user(render_case_inputs(case)),
         ];
         let mut trace = ToolTrace::default();
         let mut rounds = 0_usize;
+        let mut prompt_tokens = 0_u64;
+        let mut completion_tokens = 0_u64;
         loop {
             let completion = self.model.invoke(&messages, &request).await?;
+            prompt_tokens = prompt_tokens.saturating_add(completion.usage.input_tokens);
+            completion_tokens = completion_tokens.saturating_add(completion.usage.output_tokens);
             let Some(message) = completion.message() else {
                 return Err(Error::llm(
                     "prompt runner model returned no choices; expected an answer message",
                 ));
             };
             if message.tool_calls.is_empty() {
-                return Ok(RunOutcome::with_trace(
+                return Ok(measured_outcome(
                     answer_to_map(&message.text()),
                     trace,
+                    started,
+                    prompt_tokens,
+                    completion_tokens,
                 ));
             }
             if rounds >= self.max_tool_rounds {
-                return Ok(RunOutcome::with_trace(
+                return Ok(measured_outcome(
                     answer_to_map(&message.text()),
                     trace,
+                    started,
+                    prompt_tokens,
+                    completion_tokens,
                 ));
             }
             rounds += 1;
@@ -301,6 +319,26 @@ impl PromptRunner for ModelPromptRunner {
             }
         }
     }
+}
+
+/// Wraps a finished run's answer and trace with what the run measured.
+///
+/// The latency is the wall-clock time since `started` (the moment before the
+/// first model call), and the token counters are the totals summed over every
+/// model call of the run. Cost is never inferred from tokens, so it stays
+/// absent.
+fn measured_outcome(
+    answer: BTreeMap<String, Value>,
+    trace: ToolTrace,
+    started: Instant,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> RunOutcome {
+    let telemetry = RunTelemetry::default()
+        .with_latency_ms(started.elapsed().as_secs_f64() * 1000.0)
+        .with_prompt_tokens(prompt_tokens)
+        .with_completion_tokens(completion_tokens);
+    RunOutcome::with_trace(answer, trace).with_telemetry(telemetry)
 }
 
 /// Locks `mutex`, recovering the guard when a previous holder panicked.

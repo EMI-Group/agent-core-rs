@@ -50,6 +50,7 @@ use tracing::{debug, warn};
 
 use super::checkpoints::{member_card_id, wire_runtime};
 use super::deps::TeamBuildDeps;
+use super::member_roles;
 use super::routing::TeamModelRouter;
 use super::spec_meta::{checkpoint_config, fork_directive, spawn_options, ForkDirective};
 use crate::harness::{HarnessMemberRuntime, MemberHarnessContext};
@@ -300,7 +301,8 @@ impl TeamMemberSpawner {
             .insert(member_name.to_owned(), forked.clone());
         Ok(Some(forked))
     }
-    /// Resolves the effective blueprint for `member_name`: fork child spec, then routed model.
+    /// Resolves the effective blueprint for `member_name`: fork child spec, then the routed model.
+    /// The member's own [`TeamRole`] reaches the router; the selection is memoized per member name.
     fn effective_spec(
         &self,
         member_name: &str,
@@ -308,15 +310,12 @@ impl TeamMemberSpawner {
         forked: Option<&ForkedMemberSpec>,
     ) -> Result<DeepAgentSpec> {
         let base = forked.map_or_else(|| blueprint.clone(), |child| child.spec.clone());
-        let requested = self
-            .member_spec(member_name)
-            .and_then(|member| member.base.model_name);
-        let (effective, selection) = self.routing.effective_spec_for(
-            member_name,
-            &base,
-            requested.as_deref(),
-            TeamRole::Teammate,
-        )?;
+        let entry = self.member_spec(member_name);
+        let role = entry.as_ref().map_or(TeamRole::Teammate, |m| m.role_type);
+        let requested = entry.and_then(|m| m.base.model_name);
+        let (effective, selection) =
+            self.routing
+                .effective_spec_for(member_name, &base, requested.as_deref(), role)?;
         debug!(
             team = self.team_name(),
             member = member_name,
@@ -434,7 +433,7 @@ impl MemberSpawner for TeamMemberSpawner {
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] when the member has no blueprint, [`Error::Unsupported`] for a
-    /// role that cannot run in-process, and propagates the factory's or the child spawner's error.
+    /// role without a local harness (e.g. passive human), and the factory's or the child's error.
     async fn spawn(&self, request: MemberSpawnRequest) -> Result<Arc<dyn MemberRuntime>> {
         if !request.options.kind.is_in_process() {
             return self.spawn_child(request).await;
@@ -446,14 +445,10 @@ impl MemberSpawner for TeamMemberSpawner {
                 self.team_name()
             )));
         };
-        if let Some(member) = self.member_spec(&member_name) {
-            if member.role_type != TeamRole::Teammate {
-                return Err(Error::unsupported(format!(
-                    "member '{member_name}' has role '{}'; \
-                     only teammate members can be spawned in-process",
-                    member.role_type.as_str()
-                )));
-            }
+        let entry = self.member_spec(&member_name);
+        let role = entry.as_ref().map_or(TeamRole::Teammate, |m| m.role_type);
+        if !member_roles::has_local_harness(role) {
+            return Err(member_roles::in_process_refusal(&member_name, role));
         }
         let forked = self.forked_context(&member_name)?;
         let spec = self.effective_spec(&member_name, blueprint, forked.as_ref())?;
@@ -948,22 +943,36 @@ mod tests {
         assert_eq!(factory.calls(), Vec::new(), "the factory was not called");
     }
 
-    #[tokio::test]
-    async fn spawn_rejects_a_non_teammate_role() {
-        let mut spec = spec();
-        spec.predefined_members = vec![PredefinedMemberSpec::HumanAgent(MemberSpecBase {
+    fn alice_base() -> MemberSpecBase {
+        MemberSpecBase {
             member_name: "alice".to_owned(),
             ..MemberSpecBase::default()
-        })];
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_builds_a_human_agent_harness() {
+        let mut spec = spec();
+        spec.predefined_members = vec![PredefinedMemberSpec::HumanAgent(alice_base())];
         let factory = RecordingFactory::new();
         let spawner = TeamMemberSpawner::new(spec, deps(Arc::clone(&factory)), "session-1");
-        let error = spawn_error(spawner.spawn(request("alice")).await, "a human");
+        let runtime = spawner.spawn(request("alice")).await;
+        runtime.expect("a human agent owns a local harness");
+        assert_eq!(factory.calls().len(), 1, "the factory built the harness");
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_a_passive_human() {
+        let mut spec = spec();
+        spec.predefined_members = vec![PredefinedMemberSpec::PassiveHuman(alice_base())];
+        let factory = RecordingFactory::new();
+        let spawner = TeamMemberSpawner::new(spec, deps(Arc::clone(&factory)), "session-1");
+        let error = spawn_error(spawner.spawn(request("alice")).await, "a passive human");
         assert_eq!(error.kind(), ErrorKind::Unsupported);
-        assert_eq!(
-            error.message(),
-            "member 'alice' has role 'human_agent'; \
-             only teammate members can be spawned in-process"
-        );
+        let expected = "member 'alice' has role 'passive_human'; Python's TeamRole.\
+             PASSIVE_HUMAN has no local harness, so no startup, restart or recovery path may \
+             spawn a runtime for it";
+        assert_eq!(error.message(), expected);
         assert_eq!(factory.calls(), Vec::new(), "the factory was not called");
     }
 

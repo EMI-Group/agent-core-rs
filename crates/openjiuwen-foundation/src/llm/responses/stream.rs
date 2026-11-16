@@ -41,12 +41,18 @@ struct StreamedCall {
 /// HTTP body ends. A stream produces exactly one [`StreamChunk::Done`], whether the
 /// provider sent `response.completed` or simply closed the connection, and any
 /// event after the terminator is ignored.
+///
+/// The state also remembers the provider response id
+/// ([`response_id`](Self::response_id)), which the transport stores per
+/// conversation for a later `previous_response_id`.
 #[derive(Debug, Clone, Default)]
 pub struct ResponsesStreamState {
     /// Whether the terminal `Done` chunk has already been produced.
     done: bool,
     /// Arguments already emitted, keyed by provider response item id.
     streamed_calls: BTreeMap<String, StreamedCall>,
+    /// Provider response id seen so far, if any event carried one.
+    response_id: Option<String>,
 }
 
 impl ResponsesStreamState {
@@ -54,6 +60,16 @@ impl ResponsesStreamState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The provider response id the stream reported, when it reported one.
+    ///
+    /// The id travels on any event that carries a `response` object
+    /// (`response.created`, `response.completed`, `response.incomplete`), and it is
+    /// the value a follow-up call passes as `previous_response_id`.
+    #[must_use]
+    pub fn response_id(&self) -> Option<&str> {
+        self.response_id.as_deref()
     }
 
     /// Decodes one SSE `data` payload into zero or more chunks.
@@ -105,6 +121,8 @@ impl ResponsesStreamState {
             .or_else(|| object.get("event").and_then(Value::as_str))
             .unwrap_or_default();
 
+        self.capture_response_id(object);
+
         match event_type {
             "response.output_text.delta" | "response.refusal.delta" => {
                 Ok(text_delta(object, false))
@@ -132,6 +150,24 @@ impl ResponsesStreamState {
         }
         self.done = true;
         vec![StreamChunk::Done]
+    }
+
+    /// Records the provider response id an event carries, when it carries one.
+    ///
+    /// Both lifecycle events repeat the same id, so the last one simply wins; a
+    /// blank id never overwrites a known one.
+    fn capture_response_id(&mut self, event: &serde_json::Map<String, Value>) {
+        let Some(id) = event
+            .get("response")
+            .and_then(Value::as_object)
+            .and_then(|response| response.get("id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        self.response_id = Some(id.to_owned());
     }
 
     /// Handles `response.output_item.added` for a function call.

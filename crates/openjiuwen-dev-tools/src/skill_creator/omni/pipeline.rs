@@ -2,12 +2,16 @@
 //!
 //! Ports stages 1–5 of the Python `skill_omni_creation/scripts/` without browser
 //! automation, image decoding, or binary storage: [`OmniCreation::scrape`] turns
-//! an HTML, plain-text, or `tar` page into a [`ScrapedPage`];
+//! an HTML, plain-text, `tar`, or binary-document page into a [`ScrapedPage`]
+//! (the document route lives in `documents`);
 //! [`OmniCreation::download`] fetches the bounded image and subpage candidates
 //! and applies the deterministic [`super::filter`] rules there (there is no
 //! separate filtering stage that could be skipped); [`OmniCreation::generate`]
 //! renders a `SKILL.md` deterministically while [`OmniCreation::generate_with_model`]
-//! asks a model once and falls back on any failure; and
+//! asks a model once and falls back on any failure, and the profiled variants
+//! ([`OmniCreation::generate_profiled`],
+//! [`OmniCreation::generate_with_model_profiled`]) report the
+//! [`GenerationProvenance`] that produced the document; and
 //! [`OmniCreation::text_resources`] / [`OmniCreation::save`] write the text
 //! assets beside the document.
 //!
@@ -49,6 +53,7 @@ use crate::skill_creator::{SkillBundle, SkillDefinition, SkillResource};
 use crate::util::extract_json_fence;
 
 use self::assets::{image_resource, image_target};
+use self::documents::{document_page, is_document};
 use self::page::{archive_page, html_page};
 use super::archive::{self, ArchiveFormat, ArchiveUnpacker};
 use super::fetch::Fetcher;
@@ -305,7 +310,62 @@ impl DownloadedResource {
     }
 }
 
+/// Which generator produced a skill document.
+///
+/// The deterministic template renderer always succeeds for a usable page, while
+/// the model-assisted generator may be unusable (model error, no fenced JSON,
+/// malformed payload, instructions that are blank once hallucinated image
+/// references are removed, or an invalid definition) and then falls back to the
+/// deterministic renderer. The provenance makes that choice observable instead
+/// of only being logged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationProvenance {
+    /// The deterministic template renderer produced the document.
+    #[default]
+    Deterministic,
+    /// The attached drafting model produced the document.
+    Model,
+}
+
+impl GenerationProvenance {
+    /// The stable `snake_case` token of this provenance (`"deterministic"` or `"model"`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deterministic => "deterministic",
+            Self::Model => "model",
+        }
+    }
+}
+
+impl fmt::Display for GenerationProvenance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A generated skill document together with the generator that produced it.
+///
+/// Returned by [`OmniCreation::generate_profiled`] and
+/// [`OmniCreation::generate_with_model_profiled`], so a caller of the generation
+/// stage can tell a model-drafted document from the deterministic template
+/// fallback without inspecting the log stream.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct GeneratedSkill {
+    /// The generated skill, including every text resource of the run.
+    pub definition: SkillDefinition,
+    /// Which generator produced [`definition`](Self::definition).
+    pub provenance: GenerationProvenance,
+}
+
 /// The artifact of one successful [`OmniCreation::run`].
+///
+/// [`provenance`](Self::provenance) records whether the drafting model produced
+/// the document or the deterministic template renderer did — check it instead of
+/// assuming the attached model was used, because the model-assisted generator
+/// falls back to the deterministic renderer on any unusable answer.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct OmniOutcome {
@@ -319,6 +379,13 @@ pub struct OmniOutcome {
     pub resources: Vec<String>,
     /// The skill directory under the requested root.
     pub bundle_path: PathBuf,
+    /// Which generator produced [`definition`](Self::definition).
+    ///
+    /// [`GenerationProvenance::Model`] means the attached drafting model drafted
+    /// the document; [`GenerationProvenance::Deterministic`] means the
+    /// deterministic template renderer produced it — either because no model was
+    /// attached or because the model answer was unusable.
+    pub provenance: GenerationProvenance,
 }
 
 /// The staged URL-to-skill pipeline.
@@ -389,19 +456,31 @@ impl OmniCreation {
     ///
     /// HTML pages become title, description, text, headings, links, images, and
     /// code blocks, with every link and image resolved to an absolute `http(s)`
-    /// URL. A `tar` body is unpacked and read as markdown: file entries with
-    /// valid UTF-8 and no NUL byte in their first 512 bytes contribute text,
-    /// ATX headings (`#`…`######` plus a space), and fenced code blocks; the
-    /// title is the first level-1 heading. Any other body is treated as plain
-    /// text.
+    /// URL. A `tar` body is unpacked and read as markdown: only file entries
+    /// (never directory, symlink, or hardlink entries, whose link targets are
+    /// not followed) with valid UTF-8 and no NUL byte in their first 512 bytes
+    /// contribute text, ATX headings (`#`…`######` plus a space), and fenced
+    /// code blocks; the title is the first level-1 heading. The archive format
+    /// is sniffed by magic bytes first and by the URL suffix second, so a
+    /// `bzip2`/`xz`/`zstd` container is recognized (and refused for its missing
+    /// decoder) even when its body carries no usable signature. A resource that
+    /// names a document the kernel's retrieval loaders read (`PDF`, `DOCX`,
+    /// `XLSX`, `PPTX`, `ODT`, and the text, Markdown, `CSV`/`TSV`, and `JSON`
+    /// formats — by URL suffix, else by `content-type`) is extracted by
+    /// `documents` instead, so a usable page can come from a
+    /// binary document. An office document is a `ZIP` container, so such a
+    /// resource is dispatched to its loader before the archive reader unpacks the
+    /// package parts as text. Any other body is treated as plain text.
     ///
     /// # Errors
     ///
     /// Returns [`Error::validation`](openjiuwen_common::error::Error::validation)
-    /// for an invalid configuration or a page with no text, headings, links, or
-    /// images; [`Error::unsupported`](openjiuwen_common::error::Error::unsupported)
-    /// for a `zip` or `gzip` page input (the message names the format); and
-    /// whatever the [`Fetcher`] reports.
+    /// for an invalid configuration, a page with no text, headings, links, or
+    /// images, or a declared document format whose loader and plain-text
+    /// fallback both carry nothing (the message names the URL and the format);
+    /// [`Error::unsupported`](openjiuwen_common::error::Error::unsupported) for a
+    /// `bzip2`, `xz`, or `zstd` page input, whose decoder is not bundled (the
+    /// message names the codec); and whatever the [`Fetcher`] reports.
     pub async fn scrape(&self, url: &str) -> Result<ScrapedPage> {
         self.config.validate()?;
         let resource = self.fetcher.fetch(url).await?;
@@ -410,19 +489,51 @@ impl OmniCreation {
         } else {
             resource.final_url.clone()
         };
-        let page = match archive::detect(&resource.body) {
-            // `tar` is unpacked in-process; `zip`/`gzip` propagate the typed
-            // `Unsupported` error naming the format from `unpack_auto`.
-            Some(ArchiveFormat::Tar | ArchiveFormat::Zip | ArchiveFormat::Gzip) => {
-                let entries = ArchiveUnpacker::unpack_auto(&resource.body)?;
+        let page = match archive::detect_named(&final_url, &resource.body) {
+            // An office document (`DOCX`/`XLSX`/`PPTX`/`ODT`) is itself a ZIP
+            // container, so a resource that names one is handed to its document
+            // loader instead of having the package parts unpacked as text. The
+            // archive route below stays the fallback when the name is ambiguous.
+            Some(ArchiveFormat::Zip)
+                if is_document(&final_url, resource.content_type.as_deref()) =>
+            {
+                if let Some(page) = document_page(&resource, &final_url).await? {
+                    page
+                } else {
+                    let entries = ArchiveUnpacker::unpack(ArchiveFormat::Zip, &resource.body)?;
+                    archive_page(&final_url, &entries)
+                }
+            }
+            // `tar` is unpacked in-process; `zip`/`gzip` propagate their typed
+            // validation errors from `unpack`, and `bzip2`/`xz`/`zstd`
+            // propagate its typed `Unsupported` error naming the codec instead
+            // of being read as plain text. The format is the one the sniff
+            // settled on, so a body whose signature is unrecognized but whose
+            // URL names a `bzip2`/`xz`/`zstd` container still reports that
+            // codec's capability error instead of a generic parse failure.
+            Some(
+                format @ (ArchiveFormat::Tar
+                | ArchiveFormat::Zip
+                | ArchiveFormat::Gzip
+                | ArchiveFormat::Bzip2
+                | ArchiveFormat::Xz
+                | ArchiveFormat::Zstd),
+            ) => {
+                let entries = ArchiveUnpacker::unpack(format, &resource.body)?;
                 archive_page(&final_url, &entries)
             }
             None if resource.is_html() => html_page(&resource, &final_url),
-            None => ScrapedPage {
-                url: final_url,
-                text: resource.text(),
-                ..ScrapedPage::default()
-            },
+            None => {
+                if let Some(page) = document_page(&resource, &final_url).await? {
+                    page
+                } else {
+                    ScrapedPage {
+                        url: final_url,
+                        text: resource.text(),
+                        ..ScrapedPage::default()
+                    }
+                }
+            }
         };
         if page.is_blank() {
             return Err(Error::validation(format!(
@@ -550,6 +661,28 @@ impl OmniCreation {
 
     /// Renders the deterministic skill for `page` and `resources`.
     ///
+    /// This is [`OmniCreation::generate_profiled`] without the provenance: the
+    /// result is exactly the [`GeneratedSkill::definition`] of the deterministic
+    /// rendering, which always reports
+    /// [`GenerationProvenance::Deterministic`]. Use the profiled variant when the
+    /// caller must distinguish a model-drafted document from this fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::validation`](openjiuwen_common::error::Error::validation)
+    /// when the rendered definition does not validate (an empty name, a blank
+    /// description or body, or an unsafe resource path).
+    pub fn generate(
+        &self,
+        page: &ScrapedPage,
+        resources: &[DownloadedResource],
+    ) -> Result<SkillDefinition> {
+        self.generate_profiled(page, resources)
+            .map(|generated| generated.definition)
+    }
+
+    /// Renders the deterministic skill for `page` and `resources`, with provenance.
+    ///
     /// The name is [`slugify`](super::filter::slugify) of the title, then of the URL host (or the URL
     /// itself), then `scraped-skill`. The description is the page description,
     /// else the first non-empty text line, capped at 300 characters on a
@@ -565,16 +698,20 @@ impl OmniCreation {
     /// persisted images are not text resources, they are written beside them by
     /// [`OmniCreation::save_with_images`].
     ///
+    /// The returned provenance is always
+    /// [`GenerationProvenance::Deterministic`], because no model is consulted
+    /// here; this is the path a caller can trust to work offline.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::validation`](openjiuwen_common::error::Error::validation)
     /// when the rendered definition does not validate (an empty name, a blank
     /// description or body, or an unsafe resource path).
-    pub fn generate(
+    pub fn generate_profiled(
         &self,
         page: &ScrapedPage,
         resources: &[DownloadedResource],
-    ) -> Result<SkillDefinition> {
+    ) -> Result<GeneratedSkill> {
         let name = skill_name(page);
         let description = skill_description(page);
         let text_resources = self.text_resources(page, resources);
@@ -589,7 +726,10 @@ impl OmniCreation {
         let mut definition = SkillDefinition::new(name, description, instructions);
         definition.resources = text_resources;
         definition.validate()?;
-        Ok(definition)
+        Ok(GeneratedSkill {
+            definition,
+            provenance: GenerationProvenance::Deterministic,
+        })
     }
 
     /// Writes `definition` plus `resources` as a bundle under `root`.
@@ -738,8 +878,14 @@ impl OmniCreation {
     /// Any failure after a model is attached — a model error, an answer without
     /// a JSON fence, a malformed or incomplete payload, instructions that are
     /// blank once the hallucinated image references are removed, or a definition
-    /// that does not validate — is logged with [`tracing::warn`] and replaced by
-    /// the deterministic rendering, so the stage stays productive offline.
+    /// that does not validate — is logged with
+    /// `openjiuwen_common::logging::warn!` (recording
+    /// `provenance = Deterministic` beside the cause) and replaced by the
+    /// deterministic rendering, so the stage stays productive offline. The
+    /// returned definition does not say which path produced it: use
+    /// [`OmniCreation::generate_with_model_profiled`] (or
+    /// [`OmniCreation::run`], whose [`OmniOutcome::provenance`] is set) when that
+    /// distinction matters.
     ///
     /// # Errors
     ///
@@ -751,6 +897,31 @@ impl OmniCreation {
         page: &ScrapedPage,
         resources: &[DownloadedResource],
     ) -> Result<SkillDefinition> {
+        self.generate_with_model_profiled(page, resources)
+            .await
+            .map(|generated| generated.definition)
+    }
+
+    /// Drafts the skill with one model call and reports which path produced it.
+    ///
+    /// The drafting rules are exactly [`OmniCreation::generate_with_model`]. The
+    /// returned provenance is [`GenerationProvenance::Model`] when the model
+    /// answer was usable and [`GenerationProvenance::Deterministic`] when the
+    /// answer was unusable and the deterministic renderer took over; that
+    /// fallback warns with `openjiuwen_common::logging::warn!`, recording the
+    /// cause and `provenance = Deterministic`, so a caller can either observe
+    /// the returned value or the log stream.
+    ///
+    /// # Errors
+    ///
+    /// The only error that escapes is
+    /// [`Error::validation`](openjiuwen_common::error::Error::validation) when no
+    /// model is attached (the message names `OmniCreation::with_model`).
+    pub async fn generate_with_model_profiled(
+        &self,
+        page: &ScrapedPage,
+        resources: &[DownloadedResource],
+    ) -> Result<GeneratedSkill> {
         let Some(model) = self.model.as_ref() else {
             return Err(Error::validation(
                 "model-assisted omni creation requires a pipeline built with \
@@ -758,13 +929,17 @@ impl OmniCreation {
             ));
         };
         match self.model_definition(model, page, resources).await {
-            Ok(definition) => Ok(definition),
+            Ok(definition) => Ok(GeneratedSkill {
+                definition,
+                provenance: GenerationProvenance::Model,
+            }),
             Err(error) => {
-                tracing::warn!(
+                openjiuwen_common::logging::warn!(
                     %error,
+                    provenance = %GenerationProvenance::Deterministic,
                     "model-assisted skill generation failed; using the deterministic generator"
                 );
-                self.generate(page, resources)
+                self.generate_profiled(page, resources)
             }
         }
     }
@@ -773,29 +948,43 @@ impl OmniCreation {
     ///
     /// The drafting model is used when attached (with its deterministic
     /// fallback); otherwise the deterministic generator consumes the downloaded
-    /// resources. The bundle keeps both the text resources and every downloaded
-    /// image, and [`OmniOutcome::resources`] lists the text paths first, then the
-    /// image paths.
+    /// resources and exactly one `openjiuwen_common::logging::warn!` names `url`
+    /// and states that no drafting model is attached, so the deterministic
+    /// template generator produced the skill (and that
+    /// [`OmniCreation::with_model`] enables model drafting). The bundle keeps
+    /// both the text resources and every downloaded image,
+    /// [`OmniOutcome::resources`] lists the text paths first and then the image
+    /// paths, and [`OmniOutcome::provenance`] names the generator that produced
+    /// the document.
     ///
     /// # Errors
     ///
     /// Returns every error of [`OmniCreation::scrape`],
-    /// [`OmniCreation::download`], [`OmniCreation::generate`], and
+    /// [`OmniCreation::download`], [`OmniCreation::generate_profiled`], and
     /// [`OmniCreation::save_with_images`]; a model failure is never one of them
     /// because the model-assisted generator falls back.
     pub async fn run(&self, url: &str, root: &Path) -> Result<OmniOutcome> {
         self.config.validate()?;
         let page = self.scrape(url).await?;
         let downloaded = self.download(&page).await?;
-        let definition = if self.model.is_some() {
-            self.generate_with_model(&page, &downloaded).await?
+        let generated = if self.model.is_some() {
+            self.generate_with_model_profiled(&page, &downloaded)
+                .await?
         } else {
-            self.generate(&page, &downloaded)?
+            openjiuwen_common::logging::warn!(
+                %url,
+                provenance = %GenerationProvenance::Deterministic,
+                "no drafting model is attached, so the deterministic template generator \
+                 produced the skill; build the pipeline with OmniCreation::with_model \
+                 to enable model drafting"
+            );
+            self.generate_profiled(&page, &downloaded)?
         };
         let bundle_path = self
-            .save_with_images(&definition, &[], &downloaded, root)
+            .save_with_images(&generated.definition, &[], &downloaded, root)
             .await?;
-        let mut resources: Vec<String> = definition
+        let mut resources: Vec<String> = generated
+            .definition
             .resources
             .iter()
             .map(|resource| resource.path.clone())
@@ -806,9 +995,10 @@ impl OmniCreation {
                 .filter_map(|image| image.saved_path.clone()),
         );
         Ok(OmniOutcome {
-            definition,
+            definition: generated.definition,
             resources,
             bundle_path,
+            provenance: generated.provenance,
         })
     }
 
@@ -907,6 +1097,7 @@ impl OmniCreation {
 }
 
 pub(crate) mod assets;
+pub(crate) mod documents;
 pub(crate) mod page;
 
 #[cfg(test)]

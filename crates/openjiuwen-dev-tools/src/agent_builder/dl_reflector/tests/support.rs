@@ -58,6 +58,24 @@ pub(super) fn dl_variable(name: &str, description: Option<&str>) -> DlVariable {
     }
 }
 
+/// An input variable bound to a literal `value`.
+pub(super) fn dl_input(name: &str) -> DlVariable {
+    DlVariable {
+        name: name.to_string(),
+        value: Some(json!("literal")),
+        ..DlVariable::default()
+    }
+}
+
+/// An input variable bound to the `${...}` reference `value`.
+pub(super) fn dl_reference(name: &str, value: &str) -> DlVariable {
+    DlVariable {
+        name: name.to_string(),
+        value: Some(json!(value)),
+        ..DlVariable::default()
+    }
+}
+
 /// The Start node's required `query` output.
 pub(super) fn query_output() -> DlVariable {
     dl_variable("query", Some("用户输入"))
@@ -85,7 +103,7 @@ pub(super) fn dl_start(next: &str) -> DlNode {
 pub(super) fn dl_llm(id: &str, next: &str) -> DlNode {
     let mut node = dl_node(id, "LLM");
     node.next = Some(next.to_string());
-    node.parameters.inputs = vec![dl_variable("query", None)];
+    node.parameters.inputs = vec![dl_input("query")];
     node.parameters.outputs = vec![dl_variable("result", Some("the answer"))];
     node.parameters.configs = BTreeMap::from([
         ("system_prompt".to_string(), json!("system")),
@@ -98,7 +116,7 @@ pub(super) fn dl_llm(id: &str, next: &str) -> DlNode {
 pub(super) fn dl_questioner(id: &str, next: &str) -> DlNode {
     let mut node = dl_node(id, "Questioner");
     node.next = Some(next.to_string());
-    node.parameters.inputs = vec![dl_variable("query", None)];
+    node.parameters.inputs = vec![dl_input("query")];
     node.parameters.outputs = vec![dl_variable("answer", Some("the answer"))];
     node.parameters.configs = BTreeMap::from([("prompt".to_string(), json!("Ask the user"))]);
     node
@@ -108,7 +126,7 @@ pub(super) fn dl_questioner(id: &str, next: &str) -> DlNode {
 pub(super) fn dl_plugin(id: &str, next: &str) -> DlNode {
     let mut node = dl_node(id, "Plugin");
     node.next = Some(next.to_string());
-    node.parameters.inputs = vec![dl_variable("query", None)];
+    node.parameters.inputs = vec![dl_input("query")];
     node.parameters.outputs = vec![dl_variable("result", Some("the result"))];
     node.parameters.configs = BTreeMap::from([("tool_id".to_string(), json!("tool-1"))]);
     node
@@ -118,7 +136,7 @@ pub(super) fn dl_plugin(id: &str, next: &str) -> DlNode {
 pub(super) fn dl_code(id: &str, next: &str) -> DlNode {
     let mut node = dl_node(id, "Code");
     node.next = Some(next.to_string());
-    node.parameters.inputs = vec![dl_variable("query", None)];
+    node.parameters.inputs = vec![dl_input("query")];
     node.parameters.outputs = vec![dl_variable("result", Some("the result"))];
     node.parameters.configs = BTreeMap::from([("code".to_string(), json!("return 1"))]);
     node
@@ -128,7 +146,7 @@ pub(super) fn dl_code(id: &str, next: &str) -> DlNode {
 pub(super) fn dl_output(id: &str, next: &str) -> DlNode {
     let mut node = dl_node(id, "Output");
     node.next = Some(next.to_string());
-    node.parameters.inputs = vec![dl_variable("result", None)];
+    node.parameters.inputs = vec![dl_input("result")];
     node.parameters.configs =
         BTreeMap::from([("template".to_string(), json!("answer: {{result}}"))]);
     node
@@ -137,7 +155,7 @@ pub(super) fn dl_output(id: &str, next: &str) -> DlNode {
 /// An End node with inputs and `template`.
 pub(super) fn dl_end() -> DlNode {
     let mut node = dl_node("end", "End");
-    node.parameters.inputs = vec![dl_variable("result", None)];
+    node.parameters.inputs = vec![dl_input("result")];
     node.parameters.configs = BTreeMap::from([("template".to_string(), json!("{{result}}"))]);
     node
 }
@@ -176,7 +194,7 @@ pub(super) fn dl_branch() -> DlNode {
 /// An `IntentDetection` node with a non-default and a default intent.
 pub(super) fn dl_intent(id: &str) -> DlNode {
     let mut node = dl_node(id, "IntentDetection");
-    node.parameters.inputs = vec![dl_variable("query", None)];
+    node.parameters.inputs = vec![dl_input("query")];
     node.parameters.configs = BTreeMap::from([("prompt".to_string(), json!("Detect the intent"))]);
     node.parameters.conditions = vec![
         dl_condition(

@@ -13,7 +13,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::client::{connect_mcp_server, McpClient, McpClientType, McpServerConfig};
 use super::openapi::call::build_url;
-use super::openapi::spec::resolve_ref;
 use super::openapi::{OpenApiClient, OpenApiSpec};
 
 /// The document used by the naming/schema tests: it covers every naming rule,
@@ -233,18 +232,23 @@ fn input_schemas_flatten_parameters_and_json_bodies() {
             "properties": {
                 "petId": {"type": "string", "description": "Pet identifier"},
                 "verbose": {"type": "boolean", "description": "Verbose output"},
-                "X-Trace": {"type": "string"}
+                "X-Trace": {"type": "string"},
+                "session": {"type": "string"}
             },
             "required": ["petId"]
         })
     );
     assert_eq!(get_pets.method, "GET");
     assert_eq!(get_pets.path, "/pets/{petId}");
-    // Cookie parameters are skipped.
-    assert!(get_pets
+    // Cookie parameters are collected like any other input; they travel in the
+    // `Cookie` header at call time instead of the query string or the body.
+    let cookie = get_pets
         .parameters
         .iter()
-        .all(|parameter| parameter.location != "cookie"));
+        .find(|parameter| parameter.location == "cookie")
+        .unwrap();
+    assert_eq!(cookie.name, "session");
+    assert!(!cookie.required);
 
     let create_pet = operation(&spec, "createPet");
     assert!(create_pet.body_required);
@@ -280,18 +284,25 @@ fn input_schemas_flatten_parameters_and_json_bodies() {
 #[test]
 fn local_refs_resolve_and_cycles_are_rejected() {
     let spec = OpenApiSpec::from_str(NAMING_SPEC).unwrap();
-    let pet = resolve_ref(spec.document(), "#/components/schemas/Pet").unwrap();
+    let pet = spec.resolve("#/components/schemas/Pet").unwrap();
     assert_eq!(pet.get("type"), Some(&json!("object")));
 
-    let error = resolve_ref(spec.document(), "#/components/schemas/CycleA").unwrap_err();
+    let error = spec.resolve("#/components/schemas/CycleA").unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Validation);
     assert!(error.to_string().contains("cyclic"));
 
-    let missing = resolve_ref(spec.document(), "#/components/schemas/Missing").unwrap_err();
+    let missing = spec.resolve("#/components/schemas/Missing").unwrap_err();
     assert_eq!(missing.kind(), ErrorKind::Validation);
+    assert!(missing.to_string().contains("Missing"), "{missing}");
 
-    let external = resolve_ref(spec.document(), "other.yaml#/Pet").unwrap_err();
+    // An inline document has no file or URL base, so an external reference is a
+    // validation error instead of a silent skip.
+    let external = spec.resolve("other.yaml#/Pet").unwrap_err();
     assert_eq!(external.kind(), ErrorKind::Validation);
+    assert!(
+        external.to_string().contains("other.yaml#/Pet"),
+        "{external}"
+    );
 
     // A document that references the cycle is rejected while being collected.
     let mut document: serde_json::Value = serde_json::from_str(NAMING_SPEC).unwrap();
@@ -493,6 +504,401 @@ fn client_type_parses_and_serializes_the_new_spellings() {
     for spelling in ["stdio", "sse", "streamable-http", "openapi", "playwright"] {
         assert!(error.to_string().contains(spelling), "{error}");
     }
+}
+
+/// An external document holding one reusable parameter and one reusable schema.
+///
+/// It is deliberately not a complete `OpenAPI` document (`components` only): a
+/// referenced document is resolved as written, only the root needs `servers`.
+const COMMON_YAML: &str = r"
+components:
+  parameters:
+    Session:
+      name: x-session
+      in: cookie
+      required: false
+      description: Session cookie
+      schema:
+        type: string
+  schemas:
+    Pet:
+      type: object
+      properties:
+        name:
+          type: string
+";
+
+/// A document whose single operation carries the `$ref` `reference` verbatim.
+fn ref_spec(base: &str, reference: &str) -> String {
+    serde_json::to_string_pretty(&json!({
+        "openapi": "3.0.3",
+        "servers": [{"url": base}],
+        "paths": {
+            "/pets": {
+                "get": {
+                    "operationId": "getPets",
+                    "parameters": [{"$ref": reference}],
+                    "responses": {"200": {"description": "ok"}}
+                }
+            }
+        }
+    }))
+    .unwrap()
+}
+
+/// A document whose `GET /pets` operation declares exactly `parameters`.
+fn parameter_spec(base: &str, parameters: serde_json::Value) -> String {
+    serde_json::to_string_pretty(&json!({
+        "openapi": "3.0.3",
+        "servers": [{"url": base}],
+        "paths": {
+            "/pets": {
+                "get": {
+                    "operationId": "session",
+                    "parameters": parameters,
+                    "responses": {"200": {"description": "ok"}}
+                }
+            }
+        }
+    }))
+    .unwrap()
+}
+
+/// The two cookie parameters used by the header tests.
+fn cookie_parameters() -> serde_json::Value {
+    json!([
+        {"name": "x-session", "in": "cookie", "schema": {"type": "string"}},
+        {"name": "theme", "in": "cookie", "schema": {"type": "string"}}
+    ])
+}
+
+#[test]
+fn multipart_request_bodies_stay_ignored_and_documented() {
+    let spec = OpenApiSpec::from_str(
+        r#"{"servers":[{"url":"https://api.example.test"}],
+            "paths":{"/upload":{"post":{"operationId":"upload","requestBody":{
+              "required":true,
+              "content":{"multipart/form-data":{"schema":{"type":"object","properties":{"file":{"type":"string"}}}}}
+            },"responses":{"200":{"description":"ok"}}}}}}"#,
+    )
+    .unwrap();
+    let upload = operation(&spec, "upload");
+    // Only `application/json` bodies are mapped onto tool arguments; the other
+    // media types are ignored with a `tracing::warn!` and no input properties.
+    assert!(upload.body_schema.is_none());
+    assert!(upload.body_required);
+    assert_eq!(
+        upload.input_schema,
+        json!({"type": "object", "properties": {}, "required": []})
+    );
+}
+
+#[tokio::test]
+async fn remote_file_refs_resolve_against_the_declaring_document() {
+    let dir = tempfile::tempdir().unwrap();
+    write_spec(&dir, "common.yaml", COMMON_YAML);
+    let spec_path = write_spec(
+        &dir,
+        "openapi.json",
+        &ref_spec(
+            "https://api.example.test",
+            "./common.yaml#/components/parameters/Session",
+        ),
+    );
+
+    let spec = OpenApiSpec::load(&spec_path).await.unwrap();
+    let get = operation(&spec, "getPets");
+    assert_eq!(get.parameters.len(), 1);
+    assert_eq!(get.parameters[0].name, "x-session");
+    assert_eq!(get.parameters[0].location, "cookie");
+    assert_eq!(
+        get.parameters[0].description.as_deref(),
+        Some("Session cookie")
+    );
+    assert_eq!(
+        get.input_schema["properties"]["x-session"]["type"],
+        json!("string")
+    );
+    // The resolved document is reachable through the public accessor too.
+    let session = spec
+        .resolve("./common.yaml#/components/parameters/Session")
+        .unwrap();
+    assert_eq!(session["name"], json!("x-session"));
+
+    // A relative path climbs out of the spec directory with `..`.
+    let nested = dir.path().join("specs");
+    std::fs::create_dir(&nested).unwrap();
+    let nested_spec = write_spec(
+        &dir,
+        "specs/openapi.json",
+        &ref_spec(
+            "https://api.example.test",
+            "../common.yaml#/components/parameters/Session",
+        ),
+    );
+    let spec = OpenApiSpec::load(&nested_spec).await.unwrap();
+    assert_eq!(operation(&spec, "getPets").parameters[0].name, "x-session");
+
+    // An absolute file path and a whole-document ref both resolve.
+    let absolute = write_spec(
+        &dir,
+        "absolute.json",
+        &ref_spec(
+            "https://api.example.test",
+            &format!(
+                "{}#/components/parameters/Session",
+                dir.path().join("common.yaml").display()
+            ),
+        ),
+    );
+    let spec = OpenApiSpec::load(&absolute).await.unwrap();
+    assert_eq!(operation(&spec, "getPets").parameters[0].name, "x-session");
+}
+
+#[tokio::test]
+async fn http_refs_resolve_and_relative_urls_join_the_spec_url() {
+    let server = MockServer::start().await;
+    let base = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/specs/openapi.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ref_spec(
+            &base,
+            "../common.yaml#/components/parameters/Session",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/common.yaml"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(COMMON_YAML))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/shared/common.yaml"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(COMMON_YAML))
+        .mount(&server)
+        .await;
+
+    let spec = OpenApiSpec::load(&format!("{base}/specs/openapi.json"))
+        .await
+        .unwrap();
+    assert_eq!(
+        spec.source_url(),
+        Some(format!("{base}/specs/openapi.json").as_str())
+    );
+    assert_eq!(spec.base_url(), base);
+    assert_eq!(operation(&spec, "getPets").parameters[0].name, "x-session");
+    // `../common.yaml` is joined against the spec URL, not the cwd.
+    assert_eq!(
+        spec.resolve("../common.yaml#/components/parameters/Session")
+            .unwrap()["name"],
+        json!("x-session")
+    );
+
+    // An absolute `http(s)` reference in a file-loaded spec is fetched too.
+    let dir = tempfile::tempdir().unwrap();
+    let spec_path = write_spec(
+        &dir,
+        "openapi.json",
+        &ref_spec(
+            &base,
+            &format!("{base}/shared/common.yaml#/components/schemas/Pet"),
+        ),
+    );
+    let spec = OpenApiSpec::load(&spec_path).await.unwrap();
+    assert_eq!(
+        spec.resolve(&format!(
+            "{base}/shared/common.yaml#/components/schemas/Pet"
+        ))
+        .unwrap()["type"],
+        json!("object")
+    );
+}
+
+#[tokio::test]
+async fn cyclic_and_unresolvable_remote_refs_are_validation_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    write_spec(&dir, "a.yaml", "x:\n  $ref: \"b.yaml#/y\"\n");
+    write_spec(&dir, "b.yaml", "y:\n  $ref: \"a.yaml#/x\"\n");
+    let cyclic = write_spec(
+        &dir,
+        "cycle.json",
+        &ref_spec("https://api.example.test", "./a.yaml#/x"),
+    );
+    let error = OpenApiSpec::load(&cyclic).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let message = error.to_string();
+    assert!(message.contains("cyclic"), "{message}");
+    assert!(message.contains("./a.yaml#/x"), "{message}");
+    assert!(message.contains("a.yaml"), "{message}");
+    assert!(message.contains("#/x"), "{message}");
+
+    let missing = write_spec(
+        &dir,
+        "missing.json",
+        &ref_spec(
+            "https://api.example.test",
+            "./nope.yaml#/components/parameters/Session",
+        ),
+    );
+    let error = OpenApiSpec::load(&missing).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let message = error.to_string();
+    assert!(
+        message.contains("./nope.yaml#/components/parameters/Session"),
+        "{message}"
+    );
+    assert!(message.contains("nope.yaml"), "{message}");
+    assert!(message.contains("missing.json"), "{message}");
+
+    // A pointer that does not exist inside an existing document is reported with
+    // the document and the pointer.
+    let dangling = write_spec(
+        &dir,
+        "dangling.json",
+        &ref_spec("https://api.example.test", "./a.yaml#/nope"),
+    );
+    let error = OpenApiSpec::load(&dangling).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let message = error.to_string();
+    assert!(message.contains("./a.yaml#/nope"), "{message}");
+    assert!(message.contains("a.yaml"), "{message}");
+    assert!(message.contains("does not resolve"), "{message}");
+
+    // A non-`http(s)` scheme is refused rather than followed.
+    let scheme = write_spec(
+        &dir,
+        "scheme.json",
+        &ref_spec("https://api.example.test", "file:///etc/passwd#/x"),
+    );
+    let error = OpenApiSpec::load(&scheme).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.to_string().contains("file:"), "{error}");
+}
+
+#[tokio::test]
+async fn cookie_parameters_are_sent_as_one_cookie_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/pets"))
+        .and(header("cookie", "x-session=abc; theme=dark"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pets"))
+        .and(header("cookie", "theme=dark"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": "optional"})))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let spec_path = write_spec(
+        &dir,
+        "openapi.json",
+        &parameter_spec(&server.uri(), cookie_parameters()),
+    );
+    let client = OpenApiClient::new(&openapi_config(&spec_path)).unwrap();
+
+    let result = client
+        .call_tool(
+            "session",
+            json!({"x-session": "abc", "theme": "dark"}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(result.success);
+    assert_eq!(result.data.get("ok"), Some(&json!(true)));
+
+    // A missing optional cookie parameter is omitted instead of sent empty.
+    let result = client
+        .call_tool("session", json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+    assert!(result.success);
+    assert_eq!(result.data.get("ok"), Some(&json!("optional")));
+}
+
+#[tokio::test]
+async fn cookie_values_are_percent_encoded() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/pets"))
+        .and(header("cookie", "x-session=a%20b%3Bc%0A; theme=dark"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let spec_path = write_spec(
+        &dir,
+        "openapi.json",
+        &parameter_spec(&server.uri(), cookie_parameters()),
+    );
+    let client = OpenApiClient::new(&openapi_config(&spec_path)).unwrap();
+
+    let result = client
+        .call_tool(
+            "session",
+            json!({"x-session": "a b;c\n", "theme": "dark"}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(result.success);
+}
+
+#[tokio::test]
+async fn missing_required_cookie_parameters_are_validation_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec_path = write_spec(
+        &dir,
+        "openapi.json",
+        &parameter_spec(
+            "http://127.0.0.1:1",
+            json!([{"name": "x-session", "in": "cookie", "required": true, "schema": {"type": "string"}}]),
+        ),
+    );
+    let client = OpenApiClient::new(&openapi_config(&spec_path)).unwrap();
+
+    let error = client
+        .call_tool("session", json!({}), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let message = error.to_string();
+    assert!(message.contains("session"), "{message}");
+    assert!(message.contains("x-session"), "{message}");
+}
+
+#[tokio::test]
+async fn cookie_parameters_merge_into_a_caller_supplied_cookie_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/pets"))
+        .and(header("cookie", "base=1; x-session=abc; theme=dark"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let spec_path = write_spec(
+        &dir,
+        "openapi.json",
+        &parameter_spec(&server.uri(), cookie_parameters()),
+    );
+    let config = openapi_config(&spec_path).with_auth_header("Cookie", "base=1");
+    let client = OpenApiClient::new(&config).unwrap();
+
+    let result = client
+        .call_tool(
+            "session",
+            json!({"x-session": "abc", "theme": "dark"}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(result.success);
 }
 
 #[test]

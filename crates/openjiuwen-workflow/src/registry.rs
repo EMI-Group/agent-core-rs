@@ -4,8 +4,9 @@
 //! the seam for callers that serialize component configuration (cards, workflow specs,
 //! the CLI) and need to construct components from a name plus a JSON config.
 //!
-//! [`ComponentRegistry::builtin`] registers the five dependency-free control-flow
-//! components: `start`, `end`, `branch`, `loop`, and `http_request`. The leaf components
+//! [`ComponentRegistry::builtin`] registers the nine dependency-free control-flow
+//! components: `start`, `end`, `branch`, `loop`, `loop_group`, `advanced_loop`,
+//! `loop_break`, `loop_set_variable`, and `http_request`. The leaf components
 //! (`llm`, `tool`, `retrieval`, `memory`) own runtime collaborators (models, tools,
 //! knowledge bases, memory stores) and are therefore registered by the caller with
 //! [`ComponentRegistry::register_component`] or [`ComponentRegistry::register`].
@@ -27,8 +28,10 @@ use openjiuwen_common::error::{Error, Result};
 
 use crate::component::Component;
 use crate::components::{
-    BranchComponent, EndComponent, EndConfig, HttpComponentConfig, HttpRequestComponent,
-    LoopComponent, LoopConfig, StartComponent,
+    AdvancedLoopComponent, AdvancedLoopConfig, BranchComponent, EndComponent, EndConfig,
+    HttpComponentConfig, HttpRequestComponent, LoopBreakComponent, LoopBreakConfig, LoopComponent,
+    LoopConfig, LoopGroupComponent, LoopGroupConfig, LoopSetVariableComponent,
+    LoopSetVariableConfig, StartComponent,
 };
 use crate::condition::{Branch, BranchRouter, Condition};
 use crate::error::{
@@ -54,8 +57,9 @@ impl ComponentRegistry {
         Self::default()
     }
 
-    /// A registry holding the five control-flow built-ins: `start`, `end`, `branch`,
-    /// `loop`, and `http_request`.
+    /// A registry holding the nine control-flow built-ins: `start`, `end`, `branch`,
+    /// `loop`, `loop_group`, `advanced_loop`, `loop_break`, `loop_set_variable`, and
+    /// `http_request`.
     ///
     /// Every built-in parses its JSON configuration; see [`Self::create`]. `start`
     /// ignores its configuration, `end`, `loop`, and `http_request` accept `null` or `{}`
@@ -68,6 +72,22 @@ impl ComponentRegistry {
         registry.insert("end", factory(|config| Ok(boxed(build_end(config)?))));
         registry.insert("branch", factory(|config| Ok(boxed(build_branch(config)?))));
         registry.insert("loop", factory(|config| Ok(boxed(build_loop(config)?))));
+        registry.insert(
+            "loop_group",
+            factory(|config| Ok(boxed(build_loop_group(config)?))),
+        );
+        registry.insert(
+            "advanced_loop",
+            factory(|config| Ok(boxed(build_advanced_loop(config)?))),
+        );
+        registry.insert(
+            "loop_break",
+            factory(|config| Ok(boxed(build_loop_break(config)?))),
+        );
+        registry.insert(
+            "loop_set_variable",
+            factory(|config| Ok(boxed(build_loop_set_variable(config)?))),
+        );
         registry.insert(
             "http_request",
             factory(|config| Ok(boxed(build_http_request(config)?))),
@@ -244,7 +264,8 @@ fn build_branch(config: Value) -> Result<BranchComponent> {
 ///
 /// A registry-built loop has an empty body: body components are attached
 /// programmatically through [`LoopComponent::new`], so an empty body echoes the iteration
-/// inputs.
+/// inputs. The parsed configuration is validated, so a loop without a bound is rejected
+/// here with `[101030]` instead of failing at invoke time.
 fn build_loop(config: Value) -> Result<LoopComponent> {
     let config = if config.is_null() {
         LoopConfig::default()
@@ -252,7 +273,65 @@ fn build_loop(config: Value) -> Result<LoopComponent> {
         serde_json::from_value::<LoopConfig>(config)
             .map_err(|error| loop_param_invalid(&format!("conf is invalid, {error}")))?
     };
-    Ok(LoopComponent::new(config, Vec::new()))
+    let component = LoopComponent::new(config, Vec::new());
+    component.validate_config()?;
+    Ok(component)
+}
+
+/// Parses a [`LoopGroupConfig`]; `null` selects the default configuration.
+///
+/// A registry-built group has an empty body and no way to add one, so only the bounds are
+/// checked here: a configuration that cannot run or cannot terminate is rejected with
+/// `[101030]`.
+fn build_loop_group(config: Value) -> Result<LoopGroupComponent> {
+    let config = if config.is_null() {
+        LoopGroupConfig::default()
+    } else {
+        serde_json::from_value::<LoopGroupConfig>(config)
+            .map_err(|error| loop_param_invalid(&format!("conf is invalid, {error}")))?
+    };
+    let component = LoopGroupComponent::new(config, Vec::new());
+    component.validate_config()?;
+    Ok(component)
+}
+
+/// Parses an [`AdvancedLoopConfig`]; `null` selects the default configuration.
+fn build_advanced_loop(config: Value) -> Result<AdvancedLoopComponent> {
+    let config = if config.is_null() {
+        AdvancedLoopConfig::default()
+    } else {
+        serde_json::from_value::<AdvancedLoopConfig>(config)
+            .map_err(|error| loop_param_invalid(&format!("conf is invalid, {error}")))?
+    };
+    let component = AdvancedLoopComponent::new(config, Vec::new());
+    component.validate_config()?;
+    Ok(component)
+}
+
+/// Parses a [`LoopBreakConfig`]; `null` selects the default (unconditional) configuration.
+fn build_loop_break(config: Value) -> Result<LoopBreakComponent> {
+    let config = if config.is_null() {
+        LoopBreakConfig::default()
+    } else {
+        serde_json::from_value::<LoopBreakConfig>(config)
+            .map_err(|error| loop_param_invalid(&format!("conf is invalid, {error}")))?
+    };
+    let component = LoopBreakComponent::with_config(config);
+    component.validate_config()?;
+    Ok(component)
+}
+
+/// Parses a [`LoopSetVariableConfig`]; `null` is rejected because the mapping is required.
+fn build_loop_set_variable(config: Value) -> Result<LoopSetVariableComponent> {
+    let config = if config.is_null() {
+        LoopSetVariableConfig::default()
+    } else {
+        serde_json::from_value::<LoopSetVariableConfig>(config)
+            .map_err(|error| loop_param_invalid(&format!("conf is invalid, {error}")))?
+    };
+    let component = LoopSetVariableComponent::with_config(config);
+    component.validate_config()?;
+    Ok(component)
 }
 
 #[cfg(test)]
@@ -275,19 +354,33 @@ mod tests {
     #[test]
     fn builtin_registers_the_control_flow_components() {
         let registry = ComponentRegistry::builtin();
-        assert_eq!(registry.len(), 5);
+        assert_eq!(registry.len(), 9);
         assert!(!registry.is_empty());
         assert_eq!(
             registry.names(),
             vec![
+                "advanced_loop".to_owned(),
                 "branch".to_owned(),
                 "end".to_owned(),
                 "http_request".to_owned(),
                 "loop".to_owned(),
+                "loop_break".to_owned(),
+                "loop_group".to_owned(),
+                "loop_set_variable".to_owned(),
                 "start".to_owned()
             ]
         );
-        for name in ["start", "end", "branch", "loop", "http_request"] {
+        for name in [
+            "start",
+            "end",
+            "branch",
+            "loop",
+            "loop_group",
+            "advanced_loop",
+            "loop_break",
+            "loop_set_variable",
+            "http_request",
+        ] {
             assert!(registry.contains(name), "missing builtin '{name}'");
         }
         assert!(!registry.contains("llm"));
@@ -316,6 +409,22 @@ mod tests {
                 "loop",
                 json!({"loop_type": "number", "loop_number": 2}),
                 "loop",
+            ),
+            (
+                "loop_group",
+                json!({"loop_type": "number", "loop_number": 2}),
+                "loop_group",
+            ),
+            ("advanced_loop", json!({"loop_number": 2}), "advanced_loop"),
+            (
+                "loop_break",
+                json!({"condition": "${index} > 1"}),
+                "loop_break",
+            ),
+            (
+                "loop_set_variable",
+                json!({"variable_mapping": {"${loop.count}": "${index}"}}),
+                "loop_set_variable",
             ),
         ];
         for (name, config, expected) in cases {
@@ -449,11 +558,18 @@ mod tests {
     }
 
     #[test]
-    fn loop_config_accepts_null_and_rejects_bad_shapes() {
+    fn loop_config_rejects_a_missing_bound_and_bad_shapes() {
         let registry = ComponentRegistry::builtin();
+        // `null` selects the default configuration, which has no bound: the construction
+        // path validates, so the gap is reported here as `[101030]`.
+        let error = registry.create("loop", Value::Null).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::Workflow);
+        assert!(error.message().contains("[101030]"), "{error}");
+        assert!(error.message().contains("loop_number variable not found"));
+        // A bounded configuration is accepted.
         assert_eq!(
             registry
-                .create("loop", Value::Null)
+                .create("loop", json!({"loop_number": 2}))
                 .unwrap()
                 .component_type(),
             "loop"
@@ -488,6 +604,95 @@ mod tests {
         let error = registry.create("llm", json!({})).err().unwrap();
         assert_eq!(error.kind(), ErrorKind::NotFound);
         assert_eq!(error.message(), "component 'llm' is not registered");
+    }
+
+    #[test]
+    fn loop_group_factory_parses_bounds_and_rejects_bad_ones() {
+        let registry = ComponentRegistry::builtin();
+        let group = registry
+            .create(
+                "loop_group",
+                json!({
+                    "loop_type": "array",
+                    "loop_array": "${start.items}",
+                    "max_iterations": 4,
+                    "loop_variables": {"total": 0},
+                }),
+            )
+            .unwrap();
+        assert_eq!(group.component_type(), "loop_group");
+
+        // An unbounded group needs a break component, which a config-only factory cannot
+        // attach, so it is rejected.
+        let error = registry
+            .create("loop_group", json!({"loop_type": "until_break"}))
+            .err()
+            .unwrap();
+        assert!(error.message().contains("cannot terminate"), "{error}");
+
+        let error = registry
+            .create("loop_group", json!({"loop_type": "condition"}))
+            .err()
+            .unwrap();
+        assert!(error
+            .message()
+            .contains("bool_expression variable not found"));
+    }
+
+    #[test]
+    fn loop_break_factory_parses_its_condition() {
+        let registry = ComponentRegistry::builtin();
+        let component = registry
+            .create("loop_break", json!({"condition": "${index} > 1"}))
+            .unwrap();
+        assert_eq!(component.component_type(), "loop_break");
+        assert_eq!(
+            registry
+                .create("loop_break", Value::Null)
+                .unwrap()
+                .component_type(),
+            "loop_break"
+        );
+        let error = registry
+            .create("loop_break", json!({"condition": "${index} >"}))
+            .err()
+            .unwrap();
+        assert!(
+            error.message().contains("break condition is invalid"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn loop_set_variable_factory_requires_a_mapping() {
+        let registry = ComponentRegistry::builtin();
+        let component = registry
+            .create(
+                "loop_set_variable",
+                json!({"variable_mapping": {"${loop.count}": "${index}"}}),
+            )
+            .unwrap();
+        assert_eq!(component.component_type(), "loop_set_variable");
+
+        for config in [Value::Null, json!({}), json!({"variable_mapping": {}})] {
+            let error = registry.create("loop_set_variable", config).err().unwrap();
+            assert_eq!(error.kind(), ErrorKind::Workflow);
+            assert!(error.message().contains("[101031]"), "{error}");
+        }
+    }
+
+    #[test]
+    fn advanced_loop_factory_parses_bounds() {
+        let registry = ComponentRegistry::builtin();
+        let component = registry
+            .create(
+                "advanced_loop",
+                json!({"loop_condition": "${total} < 3", "loop_number_max_limit": 5}),
+            )
+            .unwrap();
+        assert_eq!(component.component_type(), "advanced_loop");
+        let error = registry.create("advanced_loop", json!({})).err().unwrap();
+        assert!(error.message().contains("cannot terminate"), "{error}");
     }
 
     #[test]

@@ -10,32 +10,55 @@
 //! | --- | --- |
 //! | `meta.json` (`_KnowledgeMeta`) | `meta.json` ([`ExperienceIndexMeta`]) |
 //! | `scalar/metadata.jsonl` | `scalar/metadata.jsonl` (one item JSON per line) |
-//! | `vector/faiss_index.bin` + `vector/embeddings.npy` | `vector/embeddings.json` |
+//! | `vector/embeddings.npy` | `vector/embeddings.json` |
+//! | `vector/faiss_index.bin` | `vector/ivf.json` (IVF only; flat needs no separate index) |
 //!
 //! The vector file is `{"dimension": n, "ids": [...], "rows": [[f32, ...], ...]}`. An exact
 //! flat index is just a matrix plus an exhaustive rank, so the crate stores the matrix and
 //! scores it with the crate's own `rank_by_embedding` helper (faiss' inner product over
-//! L2-normalized vectors is the same cosine). JSON is the
-//! persisted form because an offline build has neither numpy nor faiss to read or write
-//! their binary formats.
+//! L2-normalized vectors is the same cosine). JSON is the persisted form because an offline
+//! build has neither numpy nor faiss to read or write their binary formats.
+//!
+//! # Two search shapes: flat and IVF
+//!
+//! `"flat"` (any case) is the exact index: every stored vector is scored and the best
+//! `top_k` come back. An IVF name (`"ivf"`, `"ivfflat"`, `"ivf4096"`, `"IVF4096,PQ16"`, ...)
+//! adds the coarse-quantiser geometry: a deterministic k-means trains `nlist` centroids
+//! (`DEFAULT_IVF_NLIST` = 64 when the name does not say, clamped to the item count), every item
+//! is assigned to the list of its nearest centroid, and a query
+//! 1. is embedded and L2-normalised,
+//! 2. probes the [`ExperienceIndex::nprobe`] lists whose centroids have the highest inner
+//!    product with the query (ties by list index, effective probe clamped to
+//!    `1..=nlist`), and
+//! 3. ranks exactly the gathered candidates with the very same flat cosine helper, so
+//!    skill filters, `top_k` (`0` = unlimited), `min_score`-after-truncation, and tie-on-id
+//!    ordering are unchanged.
+//!
+//! Probing fewer lists is a recall trade-off only: `nprobe >= nlist` probes every list and
+//! therefore returns exactly the flat neighbour list, in the same order. A flat index ignores
+//! `nlist` and `nprobe` entirely.
+//!
+//! **Product quantisation is parsed and recorded only.** The `pq<m>` part of a name survives
+//! in the canonical name and in `meta.json`, but no vector is compressed: probed candidates
+//! are scored against their exact stored vectors. Compressing them would need faiss' PQ code
+//! books and would make every score an approximation, which this port does not do silently.
 //!
 //! # Intentional differences from Python
 //!
-//! - **One vector file instead of a faiss index plus an `.npy` matrix.** The matrix *is*
-//!   the exact index, so there is nothing else to keep in step; `meta.json` therefore has
-//!   no `vector_sha256` counterpart, only `embeddings_sha256` and `scalar_sha256`.
-//! - **Only the flat algorithm.** `"flat"` (any case) is implemented. Every IVF variant
-//!   (`ivf`, `ivfpq`, `IVF4096,PQ16`, ...) needs faiss to train k-means centroids and fill
-//!   inverted lists, so [`ExperienceIndex::open_with_algorithm`] reports it as a typed
-//!   [`Error::Unsupported`](crate::error::Error::Unsupported) and the caller can fall back
-//!   to flat cosine search, which returns exactly the same neighbours exhaustively.
+//! - **One vector file instead of an `.npy` matrix.** The matrix *is* the exact index, so
+//!   there is nothing else to keep in step; `meta.json` therefore has no `vector_sha256`
+//!   counterpart, only `embeddings_sha256`, `scalar_sha256` and (for IVF) `ivf_sha256`.
+//! - **A deterministic coarse quantiser instead of faiss' randomized k-means.** The seeding,
+//!   the Lloyd cap and the tie-breaks are specified in [`crate::experience::index`]'s
+//!   `ivf` module, so two builds over the same vectors produce byte-identical centroids,
+//!   lists and digests.
 //! - **Loud corruption instead of a `_backup` restore.** Python snapshots the four live
 //!   files into `_backup/` before each publish and restores them when the manifest
 //!   disagrees with the data. This port writes each file through a temp sibling plus a
-//!   rename (vectors, then scalar, then manifest) and **rejects** an inconsistent
-//!   directory with a precise error naming the offending file; a caller decides whether to
-//!   rebuild, delete, or repair. Silent restore is the one thing a knowledge base must not
-//!   do, because the restored snapshot may be older than the query that follows.
+//!   rename (vectors, then scalar, then coarse quantiser, then manifest) and **rejects** an
+//!   inconsistent directory with a precise error naming the offending file; a caller decides
+//!   whether to rebuild, delete, or repair. Silent restore is the one thing a knowledge base
+//!   must not do, because the restored snapshot may be older than the query that follows.
 //! - **The embedded text is the whole record.** [`ExperienceItem::search_text`] (pattern,
 //!   examples, skill ids) is embedded, where Python's `create_item` embeds only the query
 //!   pattern. The examples carry the vocabulary a later query is phrased in, and
@@ -45,46 +68,67 @@
 //!   skill set) merges into the record stored first, exactly like
 //!   [`ExperienceBank`](crate::experience::ExperienceBank); Python's list would keep both.
 //!
-//! `persist` (in `persist.rs`) owns the directory layout, the digests, and the load
-//! validation; this module owns the catalog and its API.
+//! `algorithm` (in `algorithm.rs`) owns the factory-name grammar, `ivf` (in `ivf.rs`) the
+//! coarse quantiser, and `persist` (in `persist.rs`) the directory layout, the digests, and
+//! the load validation; this module owns the catalog, its search path and its API.
 //!
 //! # Locking and write order
 //!
 //! The catalog lives behind a [`std::sync::RwLock`] that is only held for map operations,
 //! never across an `.await`: items are embedded first, then applied, then persisted. A
 //! persist failure rolls the touched entries back, so the in-memory catalog never claims a
-//! change the directory does not hold.
+//! change the directory does not hold. The trained coarse quantiser is cached behind its own
+//! lock, built lazily on the first IVF search and dropped on every mutation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use openjiuwen_retrieval::Embedding;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{unsupported, validation, Result};
+use crate::error::{validation, Result};
 use crate::experience::ranking::{
     rank_by_embedding, rank_lexically, ExperienceHit, ExperienceRanking,
 };
 use crate::experience::{merge_item, ordinal_of, AddOutcome, ExperienceItem, ID_DIGITS, ID_PREFIX};
 
+mod algorithm;
+mod ivf;
 mod persist;
+
+use self::algorithm::{effective_nlist, AlgorithmSpec};
+use self::ivf::CoarseIndex;
 
 /// The manifest schema version written by [`ExperienceIndex::persist`].
 pub const MANIFEST_VERSION: u32 = 1;
 
-/// The only vector algorithm this crate implements: exact flat cosine search.
+/// The canonical name of the exact flat cosine index ([`ExperienceIndex::new`]'s default).
 pub const FLAT_VECTOR_ALGORITHM: &str = "flat";
+
+/// The number of coarse lists an IVF index builds when its name does not say.
+///
+/// The *effective* count is [`ExperienceIndex::nlist`]: this default clamped to the current
+/// item count, and at least one whenever the index is non-empty.
+pub(crate) const DEFAULT_IVF_NLIST: usize = 64;
+
+/// The number of coarse lists an IVF query probes by default.
+///
+/// The *effective* probe is this value clamped to `1..=nlist`; a flat index ignores it.
+pub(crate) const DEFAULT_IVF_NPROBE: usize = 8;
 
 /// The integrity manifest of a persisted index (`meta.json`).
 ///
 /// Mirrors Python's `_KnowledgeMeta`: a schema version, the number of stored vectors, the
-/// vector algorithm, the vector dimension, and the SHA-256 hex digests of the two data
-/// files. The digests cover the exact bytes on disk, so a hand-edited scalar file or a
-/// truncated vector file is detected instead of being loaded as a smaller catalog.
+/// vector algorithm, the vector dimension, and the SHA-256 hex digests of the data files.
+/// The digests cover the exact bytes on disk, so a hand-edited scalar file or a truncated
+/// vector file is detected instead of being loaded as a smaller catalog.
+///
+/// `ivf_sha256` covers `vector/ivf.json` and is present only for an IVF index; a flat index
+/// omits the field entirely, so a manifest written before IVF support still parses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]
 pub struct ExperienceIndexMeta {
@@ -92,7 +136,7 @@ pub struct ExperienceIndexMeta {
     pub version: u32,
     /// The number of items, which is also the number of embedding rows.
     pub vector_count: usize,
-    /// The vector algorithm; [`FLAT_VECTOR_ALGORITHM`].
+    /// The canonical vector algorithm ([`FLAT_VECTOR_ALGORITHM`], or an `ivf` name).
     pub vector_algorithm: String,
     /// The length of every embedding row (`0` when the index is empty).
     pub vector_dimension: usize,
@@ -100,6 +144,9 @@ pub struct ExperienceIndexMeta {
     pub embeddings_sha256: String,
     /// The SHA-256 hex digest of `scalar/metadata.jsonl`.
     pub scalar_sha256: String,
+    /// The SHA-256 hex digest of `vector/ivf.json`, `None` for a flat index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ivf_sha256: Option<String>,
 }
 
 impl Default for ExperienceIndexMeta {
@@ -111,6 +158,7 @@ impl Default for ExperienceIndexMeta {
             vector_dimension: 0,
             embeddings_sha256: String::new(),
             scalar_sha256: String::new(),
+            ivf_sha256: None,
         }
     }
 }
@@ -120,6 +168,10 @@ impl Default for ExperienceIndexMeta {
 /// Without a directory ([`ExperienceIndex::new`]) the index is a purely in-memory
 /// embedding catalog; with one ([`ExperienceIndex::open`]) every mutation is written
 /// through `persist` so a reopen rehydrates the exact same vectors.
+///
+/// An IVF index additionally keeps a lazily trained `CoarseIndex` behind its own lock: the
+/// first IVF search after a mutation trains it, and the persist immediately after a mutation
+/// stores the trained state so a reopen reuses it instead of retraining.
 pub struct ExperienceIndex {
     /// The index directory, or `None` for an in-memory index.
     dir: Option<PathBuf>,
@@ -129,8 +181,12 @@ pub struct ExperienceIndex {
     items: RwLock<BTreeMap<String, ExperienceItem>>,
     /// The next generated-id ordinal; `exp_NNNN` is rendered from it.
     next_ordinal: AtomicU64,
-    /// The canonical vector algorithm; always [`FLAT_VECTOR_ALGORITHM`] today.
-    algorithm: String,
+    /// The canonical vector algorithm ([`FLAT_VECTOR_ALGORITHM`] or an `ivf` name).
+    algorithm: AlgorithmSpec,
+    /// The number of coarse lists a query probes, before clamping.
+    nprobe: AtomicUsize,
+    /// The trained coarse quantiser, or `None` before the first IVF search/persist.
+    coarse: RwLock<Option<Arc<CoarseIndex>>>,
     /// The manifest of the last successful load or persist.
     meta: RwLock<ExperienceIndexMeta>,
 }
@@ -141,7 +197,8 @@ impl fmt::Debug for ExperienceIndex {
             .debug_struct("ExperienceIndex")
             .field("dir", &self.dir)
             .field("items", &self.count())
-            .field("algorithm", &self.algorithm)
+            .field("algorithm", &self.algorithm.canonical())
+            .field("nprobe", &self.nprobe())
             .field("embedding", &self.embedding.model_name())
             .finish_non_exhaustive()
     }
@@ -151,18 +208,39 @@ impl ExperienceIndex {
     /// Builds an empty in-memory index that never touches a directory.
     ///
     /// Items keep their vectors in memory only; call [`Self::persist`] after opening a
-    /// directory-backed index to write them out.
+    /// directory-backed index to write them out. The algorithm is
+    /// [`FLAT_VECTOR_ALGORITHM`]; use [`Self::new_with_algorithm`] for IVF.
     #[must_use]
     pub fn new(embedding: Arc<dyn Embedding>) -> Self {
-        Self::empty(None, embedding, FLAT_VECTOR_ALGORITHM.to_string())
+        Self::empty(None, embedding, AlgorithmSpec::flat())
+    }
+
+    /// Builds an empty in-memory index with an explicit vector algorithm.
+    ///
+    /// Accepts the same names as [`Self::open_with_algorithm`]: `flat`, `ivf`, `ivfflat`, or
+    /// an IVF factory name such as `ivf4096` or `IVF4096,PQ16`. An IVF index trains its
+    /// coarse quantiser lazily on the first search or [`Self::persist`]; product
+    /// quantisation is parsed and recorded only, so vectors are never compressed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`](crate::error::Error::Validation) naming
+    /// `vector_algorithm` for a blank or unimplemented name, or a zero `nlist`/`pq` count.
+    pub fn new_with_algorithm(
+        embedding: Arc<dyn Embedding>,
+        algorithm: impl Into<String>,
+    ) -> Result<Self> {
+        let spec = AlgorithmSpec::parse(&algorithm.into())?;
+        Ok(Self::empty(None, embedding, spec))
     }
 
     /// Opens the index under `dir`, or starts an empty one when `dir` holds no index files.
     ///
-    /// An existing index is loaded all-or-nothing: the manifest is read first, both data
-    /// files are digest-checked against it, and the stored vectors are rehydrated instead
-    /// of being recomputed. The generated-id counter resumes past the highest `exp_NNNN`
-    /// id, so a reopened index never reuses an id.
+    /// An existing index is loaded all-or-nothing: the manifest is read first, every data
+    /// file is digest-checked against it, and the stored vectors (and, for an IVF index, the
+    /// trained coarse quantiser) are rehydrated instead of being recomputed. The
+    /// generated-id counter resumes past the highest `exp_NNNN` id, so a reopened index never
+    /// reuses an id.
     ///
     /// # Errors
     ///
@@ -177,13 +255,13 @@ impl ExperienceIndex {
 
     /// Opens the index under `dir` with an explicit vector algorithm.
     ///
-    /// `"flat"` in any case selects the exact flat cosine index this crate implements.
-    /// Every IVF variant (`"ivf"`, `"ivfpq"`, anything starting with `ivf`) needs faiss to
-    /// train k-means centroids and populate inverted lists — a GPU/ML stack an offline
-    /// build does not ship — so it is reported as a typed
-    /// [`Error::Unsupported`](crate::error::Error::Unsupported) whose message names the
-    /// deferred feature. Any other value is an [`Error::Validation`](crate::error::Error::Validation) naming
-    /// `vector_algorithm`.
+    /// `"flat"` in any case selects the exact flat cosine index; `"ivf"`, `"ivfflat"`,
+    /// `"ivf<nlist>"` and `"IVF<nlist>,PQ<m>"` select IVF probe search. The requested
+    /// algorithm must be the one the directory was built with — an IVF directory holds a
+    /// `vector/ivf.json` trained for exactly that name, so opening it as `flat` (or as a
+    /// different IVF name) is an [`Error::Validation`](crate::error::Error::Validation)
+    /// naming `meta.json` rather than a silent rebuild. Any other name is an
+    /// [`Error::Validation`](crate::error::Error::Validation) naming `vector_algorithm`.
     ///
     /// # Errors
     ///
@@ -193,7 +271,7 @@ impl ExperienceIndex {
         embedding: Arc<dyn Embedding>,
         algorithm: impl Into<String>,
     ) -> Result<Self> {
-        let algorithm = normalize_algorithm(&algorithm.into())?;
+        let algorithm = AlgorithmSpec::parse(&algorithm.into())?;
         persist::load(dir.as_ref(), embedding, algorithm).await
     }
 
@@ -209,10 +287,53 @@ impl ExperienceIndex {
         self.dir.as_deref()
     }
 
-    /// The canonical vector algorithm of this index ([`FLAT_VECTOR_ALGORITHM`]).
+    /// The canonical vector algorithm of this index ([`FLAT_VECTOR_ALGORITHM`] or `ivf…`).
     #[must_use]
     pub fn algorithm(&self) -> &str {
-        &self.algorithm
+        self.algorithm.canonical()
+    }
+
+    /// The effective number of coarse lists, `0` for a flat or empty index.
+    ///
+    /// The value is derived from the *current* catalog: the requested count (from the
+    /// algorithm name, 64 when it names none) clamped to the item count,
+    /// and at least one whenever the index is non-empty. A loaded index reports the count it
+    /// was persisted with, and an index whose items changed reports the count the next
+    /// search or persist will train.
+    #[must_use]
+    pub fn nlist(&self) -> usize {
+        if let Some(coarse) = self.read_coarse().as_ref() {
+            return coarse.nlist();
+        }
+        if !self.is_ivf() {
+            return 0;
+        }
+        effective_nlist(self.algorithm.nlist_request(), self.count())
+    }
+
+    /// The number of coarse lists a query probes (8 unless set).
+    ///
+    /// The effective probe is this value clamped to `1..=nlist` at query time; a flat index
+    /// ignores it.
+    #[must_use]
+    pub fn nprobe(&self) -> usize {
+        self.nprobe.load(Ordering::SeqCst)
+    }
+
+    /// Sets the number of coarse lists a query probes.
+    ///
+    /// The index is meant to be shared behind an `Arc`, so the value lives in an atomic and
+    /// this takes `&self`. `0` is accepted and probes one list; a value above
+    /// [`Self::nlist`] probes every list, which reproduces the flat result.
+    pub fn set_nprobe(&self, nprobe: usize) {
+        self.nprobe.store(nprobe, Ordering::SeqCst);
+    }
+
+    /// Sets the probe count on a builder, before the index is shared.
+    #[must_use]
+    pub fn with_nprobe(self, nprobe: usize) -> Self {
+        self.set_nprobe(nprobe);
+        self
     }
 
     /// The manifest of the last successful load or persist.
@@ -377,8 +498,10 @@ impl ExperienceIndex {
         let Some(previous) = self.write_items().remove(id) else {
             return Ok(false);
         };
+        self.invalidate_coarse();
         if let Err(error) = self.persist().await {
             self.write_items().insert(id.to_string(), previous);
+            self.invalidate_coarse();
             return Err(error);
         }
         Ok(true)
@@ -386,12 +509,13 @@ impl ExperienceIndex {
 
     /// Writes the catalog to its directory and refreshes [`Self::meta`].
     ///
-    /// The three artifacts are written in dependency order — `vector/embeddings.json`,
-    /// then `scalar/metadata.jsonl`, then the `meta.json` that vouches for both — each
-    /// through a temp sibling plus a rename, so a reader never observes a partial file.
-    /// The call is idempotent: persisting an unchanged catalog rewrites the same bytes and
-    /// the same digests. An in-memory index ([`Self::dir`] is `None`) writes nothing but
-    /// still refreshes the manifest.
+    /// The artifacts are written in dependency order — `vector/embeddings.json`, then
+    /// `scalar/metadata.jsonl`, then `vector/ivf.json` for an IVF index, then the `meta.json`
+    /// that vouches for them — each through a temp sibling plus a rename, so a reader never
+    /// observes a partial file. The call is idempotent: persisting an unchanged catalog
+    /// rewrites the same bytes and the same digests, an IVF index's coarse quantiser
+    /// included, because training is deterministic. An in-memory index ([`Self::dir`] is
+    /// `None`) writes nothing but still refreshes the manifest and the cached quantiser.
     ///
     /// # Errors
     ///
@@ -403,6 +527,7 @@ impl ExperienceIndex {
         if let Some(dir) = &self.dir {
             persist::write(dir, &encoded).await?;
         }
+        *self.write_coarse() = encoded.coarse;
         *self.write_meta() = encoded.meta;
         Ok(())
     }
@@ -410,15 +535,23 @@ impl ExperienceIndex {
     /// Searches the index, returning at most `ranking.top_k` hits (`0` means unlimited).
     ///
     /// The query is embedded with the index's model and the hits are ranked by cosine
-    /// similarity through the crate's `rank_by_embedding` helper, so ties break
-    /// on id and `min_score` is applied after truncation, exactly like
+    /// similarity through the crate's `rank_by_embedding` helper, so ties break on id and
+    /// `min_score` is applied after truncation, exactly like
     /// [`ExperienceBank::search`](crate::experience::ExperienceBank::search). A blank query
     /// falls back to the deterministic lexical ranking, because embedding providers reject
     /// blank input.
     ///
+    /// A flat index scores every stored vector. An IVF index first probes
+    /// [`Self::nprobe`] lists with the normalised query (see `coarse_candidates`) and then
+    /// ranks exactly those candidates with the same helper, so every filter and ordering rule
+    /// is identical; `nprobe >= nlist` probes everything and therefore reproduces the flat
+    /// result exactly.
+    ///
     /// # Errors
     ///
-    /// Returns the embedding model's error when the query cannot be embedded.
+    /// Returns the embedding model's error when the query cannot be embedded, and a
+    /// [`Error::Validation`](crate::error::Error::Validation) error when the stored vectors
+    /// of an IVF index cannot be quantised (a dimension mismatch or a missing embedding).
     pub async fn search(
         &self,
         query: &str,
@@ -433,7 +566,11 @@ impl ExperienceIndex {
             return Ok(rank_lexically(&items, query, &options));
         }
         let query_vector = self.embedding.embed_query(query).await?;
-        Ok(rank_by_embedding(&items, &query_vector, &options))
+        if !self.is_ivf() {
+            return Ok(rank_by_embedding(&items, &query_vector, &options));
+        }
+        let candidates = self.ivf_candidates(&items, &query_vector)?;
+        Ok(rank_by_embedding(&candidates, &query_vector, &options))
     }
 
     /// Returns the distinct skill ids of the hits, in first-seen order.
@@ -460,8 +597,12 @@ impl ExperienceIndex {
         Ok(skill_ids)
     }
 
-    /// Creates an empty catalog over `dir` (when given) with the given manifest.
-    fn empty(dir: Option<PathBuf>, embedding: Arc<dyn Embedding>, algorithm: String) -> Self {
+    /// Creates an empty catalog over `dir` (when given) with the given algorithm.
+    fn empty(
+        dir: Option<PathBuf>,
+        embedding: Arc<dyn Embedding>,
+        algorithm: AlgorithmSpec,
+    ) -> Self {
         Self::from_parts(
             dir,
             embedding,
@@ -469,6 +610,7 @@ impl ExperienceIndex {
             1,
             algorithm,
             ExperienceIndexMeta::default(),
+            None,
         )
     }
 
@@ -478,8 +620,9 @@ impl ExperienceIndex {
         embedding: Arc<dyn Embedding>,
         items: BTreeMap<String, ExperienceItem>,
         next_ordinal: u64,
-        algorithm: String,
+        algorithm: AlgorithmSpec,
         meta: ExperienceIndexMeta,
+        coarse: Option<Arc<CoarseIndex>>,
     ) -> Self {
         Self {
             dir,
@@ -487,8 +630,60 @@ impl ExperienceIndex {
             items: RwLock::new(items),
             next_ordinal: AtomicU64::new(next_ordinal),
             algorithm,
+            nprobe: AtomicUsize::new(DEFAULT_IVF_NPROBE),
+            coarse: RwLock::new(coarse),
             meta: RwLock::new(meta),
         }
+    }
+
+    /// Reports whether the index uses the IVF probe path.
+    fn is_ivf(&self) -> bool {
+        self.algorithm.is_ivf()
+    }
+
+    /// The candidates an IVF query has to score, in id order.
+    ///
+    /// The trained quantiser comes from the cache, or is trained from the current catalog on
+    /// the first search after a mutation. Training is synchronous and the catalog is only
+    /// locked to take a snapshot, so no lock is held across an `.await`.
+    fn ivf_candidates(
+        &self,
+        items: &[ExperienceItem],
+        query_vector: &[f32],
+    ) -> Result<Vec<ExperienceItem>> {
+        let Some(coarse) = self.coarse_state()? else {
+            return Ok(items.to_vec());
+        };
+        let probe = self.nprobe().clamp(1, coarse.nlist().max(1));
+        Ok(coarse_candidates(&coarse, items, query_vector, probe))
+    }
+
+    /// The cached coarse quantiser, training it when the catalog changed.
+    fn coarse_state(&self) -> Result<Option<Arc<CoarseIndex>>> {
+        if let Some(cached) = self.read_coarse().clone() {
+            return Ok(Some(cached));
+        }
+        let items = self.items();
+        if items.is_empty() {
+            return Ok(None);
+        }
+        let ids: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
+        let vectors: Vec<Vec<f32>> = items.iter().map(|item| item.embedding.clone()).collect();
+        let nlist = effective_nlist(self.algorithm.nlist_request(), ids.len());
+        let coarse = Arc::new(CoarseIndex::build(&ids, &vectors, nlist)?);
+        let mut cache = self.write_coarse();
+        // Another search may have trained it while this one was building; keep whichever
+        // state landed first so every caller sees the same lists.
+        if let Some(existing) = cache.as_ref() {
+            return Ok(Some(existing.clone()));
+        }
+        *cache = Some(coarse.clone());
+        Ok(Some(coarse))
+    }
+
+    /// Drops the cached coarse quantiser after the catalog changed.
+    fn invalidate_coarse(&self) {
+        *self.write_coarse() = None;
     }
 
     /// Reports whether `item` still needs its vector computed.
@@ -564,6 +759,7 @@ impl ExperienceIndex {
                 let merged_id = existing.id.clone();
                 drop(items);
                 self.note_ordinal(&merged_id);
+                self.invalidate_coarse();
                 return Ok((
                     AddOutcome::merged_into(merged_id.clone()),
                     (merged_id, Some(previous)),
@@ -590,6 +786,7 @@ impl ExperienceIndex {
         let previous = items.insert(id.clone(), item);
         drop(items);
         self.note_ordinal(&id);
+        self.invalidate_coarse();
         Ok((AddOutcome::inserted(id.clone()), (id, previous)))
     }
 
@@ -606,6 +803,8 @@ impl ExperienceIndex {
                 }
             }
         }
+        drop(items);
+        self.invalidate_coarse();
     }
 
     /// The stored item whose dedupe key matches `dedupe_key`.
@@ -643,6 +842,16 @@ impl ExperienceIndex {
     fn write_meta(&self) -> RwLockWriteGuard<'_, ExperienceIndexMeta> {
         self.meta.write().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Locks the cached coarse quantiser for reading, recovering from a poisoned lock.
+    fn read_coarse(&self) -> RwLockReadGuard<'_, Option<Arc<CoarseIndex>>> {
+        self.coarse.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Locks the cached coarse quantiser for writing, recovering from a poisoned lock.
+    fn write_coarse(&self) -> RwLockWriteGuard<'_, Option<Arc<CoarseIndex>>> {
+        self.coarse.write().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl Default for ExperienceIndex {
@@ -653,37 +862,34 @@ impl Default for ExperienceIndex {
     }
 }
 
-/// Normalizes a requested vector algorithm.
-///
-/// `"flat"` in any case is the exact flat index this crate implements. Every IVF variant
-/// (`"ivf"`, `"ivfpq"`, `"IVF4096,PQ16"`, ...) needs faiss to train k-means centroids and
-/// populate inverted lists: that is a GPU/ML stack an offline build does not ship, so the
-/// name is reported as a typed [`Error::Unsupported`] and the caller can fall back to flat
-/// cosine search, which returns the same neighbours exhaustively.
-fn normalize_algorithm(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(validation("vector_algorithm", "must not be blank"));
-    }
-    let lowered = trimmed.to_ascii_lowercase();
-    if lowered == FLAT_VECTOR_ALGORITHM {
-        return Ok(FLAT_VECTOR_ALGORITHM.to_string());
-    }
-    if lowered.starts_with("ivf") {
-        return Err(unsupported("faiss IVF index training"));
-    }
-    Err(validation(
-        "vector_algorithm",
-        format!("{trimmed:?} is not supported: only {FLAT_VECTOR_ALGORITHM:?} is implemented"),
-    ))
-}
-
 /// Rejects an item whose normalized pattern is blank.
 fn validate_pattern(item: &ExperienceItem) -> Result<()> {
     if item.normalized_pattern().is_empty() {
         return Err(validation("query_pattern", "must not be blank"));
     }
     Ok(())
+}
+
+/// The items living in the `probe` lists nearest to `query_vector`, in id order.
+///
+/// Every id of those lists is resolved against the id-sorted catalog; an id the quantiser
+/// knows but the catalog no longer holds is skipped rather than scored as a zero vector.
+fn coarse_candidates(
+    coarse: &CoarseIndex,
+    items: &[ExperienceItem],
+    query_vector: &[f32],
+    probe: usize,
+) -> Vec<ExperienceItem> {
+    coarse
+        .probed_ids(query_vector, probe)
+        .into_iter()
+        .filter_map(|id| {
+            items
+                .binary_search_by(|item| item.id.as_str().cmp(id))
+                .ok()
+                .map(|position| items[position].clone())
+        })
+        .collect()
 }
 
 /// Generates an id that is not already taken, advancing `counter` as it goes.
@@ -701,7 +907,7 @@ fn fresh_id(counter: &AtomicU64, items: &BTreeMap<String, ExperienceItem>) -> St
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 mod tests {
     use super::*;
-    use crate::error::{is_unsupported, ErrorKind};
+    use crate::error::ErrorKind;
 
     #[test]
     fn the_manifest_defaults_to_the_flat_algorithm() {
@@ -712,6 +918,7 @@ mod tests {
         assert_eq!(meta.vector_dimension, 0);
         assert!(meta.embeddings_sha256.is_empty());
         assert!(meta.scalar_sha256.is_empty());
+        assert!(meta.ivf_sha256.is_none());
     }
 
     #[test]
@@ -724,6 +931,8 @@ mod tests {
             ..ExperienceIndexMeta::default()
         };
         let mut document = serde_json::to_value(&meta).expect("serialize");
+        // A flat manifest carries no ivf digest at all.
+        assert!(document.get("ivf_sha256").is_none());
         document["unknown_field"] = serde_json::json!(true);
         let parsed: ExperienceIndexMeta = serde_json::from_value(document).expect("deserialize");
         assert_eq!(parsed, meta);
@@ -733,39 +942,38 @@ mod tests {
         assert_eq!(partial.vector_count, 2);
         assert_eq!(partial.version, MANIFEST_VERSION);
         assert_eq!(partial.vector_algorithm, FLAT_VECTOR_ALGORITHM);
+        assert_eq!(partial.ivf_sha256, None);
+
+        // A manifest written after IVF support round-trips its digest.
+        let ivf = ExperienceIndexMeta {
+            vector_algorithm: "ivf4".to_string(),
+            ivf_sha256: Some("cc".to_string()),
+            ..ExperienceIndexMeta::default()
+        };
+        let document = serde_json::to_value(&ivf).expect("serialize ivf");
+        assert_eq!(document["ivf_sha256"], serde_json::json!("cc"));
+        assert_eq!(
+            serde_json::from_value::<ExperienceIndexMeta>(document).expect("deserialize ivf"),
+            ivf
+        );
     }
 
     #[test]
-    fn flat_is_case_insensitive() {
-        for raw in ["flat", "Flat", "FLAT", " flat "] {
-            assert_eq!(
-                normalize_algorithm(raw).expect("flat"),
-                FLAT_VECTOR_ALGORITHM
-            );
-        }
-    }
-
-    #[test]
-    fn ivf_algorithms_are_reported_as_deferred() {
-        for raw in ["ivf", "IVF", "ivfpq", "IVF4096,PQ16", "  IvfFlat  "] {
-            let error = normalize_algorithm(raw).expect_err("ivf must not be accepted");
-            assert_eq!(error.kind(), ErrorKind::Unsupported, "{raw}");
-            assert!(is_unsupported(&error), "{raw}");
-            assert!(error.message().contains("faiss IVF"), "{raw}");
-            assert!(error.message().contains("deferred"), "{raw}");
-        }
-    }
-
-    #[test]
-    fn unknown_and_blank_algorithms_are_validation_errors() {
-        let unknown = normalize_algorithm("hnsw").expect_err("unknown");
+    fn the_algorithms_parse_into_their_canonical_names() {
+        assert_eq!(
+            AlgorithmSpec::parse(" FLAT ").expect("flat").canonical(),
+            FLAT_VECTOR_ALGORITHM
+        );
+        assert_eq!(
+            AlgorithmSpec::parse("IVF4096,PQ16")
+                .expect("ivf")
+                .canonical(),
+            "ivf4096,pq16"
+        );
+        let unknown = AlgorithmSpec::parse("hnsw").expect_err("unknown");
         assert_eq!(unknown.kind(), ErrorKind::Validation);
         assert!(unknown.message().contains("vector_algorithm"));
         assert!(unknown.message().contains("hnsw"));
-
-        let blank = normalize_algorithm("   ").expect_err("blank");
-        assert_eq!(blank.kind(), ErrorKind::Validation);
-        assert!(blank.message().contains("vector_algorithm"));
     }
 
     #[tokio::test]
@@ -779,7 +987,63 @@ mod tests {
         assert!(!index.exist(&[]));
         assert_eq!(index.generate_id(), "exp_0001");
         assert_eq!(index.generate_id(), "exp_0002");
+        // A flat index has no coarse lists and ignores the probe setting.
+        assert_eq!(index.nlist(), 0);
+        assert_eq!(index.nprobe(), DEFAULT_IVF_NPROBE);
+        index.set_nprobe(3);
+        assert_eq!(index.nprobe(), 3);
         assert!(index.persist().await.is_ok());
         assert_eq!(index.meta().vector_count, 0);
+        assert!(index.meta().ivf_sha256.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_ivf_index_reports_its_effective_list_count() {
+        let index = ExperienceIndex::new_with_algorithm(
+            Arc::new(openjiuwen_retrieval::HashEmbedding::new(4)),
+            "IVF4096",
+        )
+        .expect("ivf");
+        assert_eq!(index.algorithm(), "ivf4096");
+        // Nothing to quantise yet.
+        assert_eq!(index.nlist(), 0);
+        for (ordinal, pattern) in ["alpha", "beta", "gamma"].iter().enumerate() {
+            let mut item = ExperienceItem::new(*pattern);
+            item.id = format!("exp_{:04}", ordinal + 1);
+            item.embedding = vec![1.0, 0.0, 0.0, 0.0];
+            index.add(item).await.expect("add");
+        }
+        // The requested 4096 lists clamp to the three stored vectors.
+        assert_eq!(index.nlist(), 3);
+        assert_eq!(index.nprobe(), DEFAULT_IVF_NPROBE);
+        // The probe is clamped to the list count at query time, not stored: `0` probes one
+        // list, so only the items living there are scored.
+        index.set_nprobe(0);
+        assert_eq!(index.nprobe(), 0);
+        let probed = index
+            .search("alpha", &ExperienceRanking::new(0))
+            .await
+            .expect("search");
+        assert!(!probed.is_empty());
+        assert!(probed.len() <= 3);
+        // An over-large probe is clamped to `nlist`, so every list is searched.
+        index.set_nprobe(usize::MAX);
+        let hits = index
+            .search("alpha", &ExperienceRanking::new(0))
+            .await
+            .expect("search");
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn the_with_nprobe_builder_sets_the_probe_count() {
+        let index = ExperienceIndex::new_with_algorithm(
+            Arc::new(openjiuwen_retrieval::HashEmbedding::new(4)),
+            "ivf",
+        )
+        .expect("ivf")
+        .with_nprobe(2);
+        assert_eq!(index.nprobe(), 2);
+        assert_eq!(index.nlist(), 0);
     }
 }

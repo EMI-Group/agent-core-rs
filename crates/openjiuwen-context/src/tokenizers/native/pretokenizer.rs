@@ -1,13 +1,19 @@
 //! Pre-tokenization: how a normalized text is split before the model sees it.
 //!
-//! The `BERT`, whitespace, punctuation, digit, byte-level, metaspace and literal-split pre-tokenizers are reproduced, plus the `Sequence` node that chains them.
-//! Byte-level pre-tokenization applies the GPT-2/Llama byte mapping, so a byte-level vocabulary sees the printable scalars it was trained on.
-//! A `Split` node with a regex pattern cannot be reproduced without a regex engine, so it is reported as a warning and degraded to whitespace splitting; a token count stays useful.
+//! The `BERT`, whitespace, punctuation, digit, byte-level, metaspace, `Split` (literal or regex), `Replace`, `CharDelimiterSplit` and Unicode-wrapper nodes are reproduced, plus the `Sequence` node that chains them.
+//! Byte-level pre-tokenization runs the GPT-2 split over the raw text and byte-maps each resulting piece afterwards, which is `HuggingFace`'s order: `hi there!` becomes `hi`, `Ġthere`, `!`.
+//! A `Split` or `Replace` node's `{"Regex": ...}` pattern is compiled with `regex`; a pattern that does not compile is recorded as a warning naming the pattern and the error and degrades to whitespace splitting (or to no pre-tokenization), so a token count stays useful instead of the load failing.
+//! A pipeline node this loader does not implement is recorded as a warning naming the node and leaves the text unsplit.
 
+use std::sync::{Arc, OnceLock};
+
+use regex::Regex;
 use serde_json::Value;
+use unicode_normalization::UnicodeNormalization;
 
-use super::bytes;
 use super::hf_json::{bool_of, kind_of, literal_pattern, pattern_is_regex, str_of};
+
+mod gpt2;
 
 /// The default metaspace replacement character.
 const DEFAULT_METASPACE_REPLACEMENT: char = '\u{2581}';
@@ -36,6 +42,31 @@ pub(crate) enum SplitBehavior {
     MergedWithNext,
     /// Consecutive delimiters merge into one piece.
     Contiguous,
+}
+
+/// The Unicode normalization a wrapper pre-tokenizer applies before splitting on whitespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnicodeForm {
+    /// Canonical composition (`NFC`).
+    Nfc,
+    /// Canonical decomposition (`NFD`).
+    Nfd,
+    /// Compatibility composition (`NFKC`).
+    Nfkc,
+    /// Compatibility decomposition (`NFKD`).
+    Nfkd,
+}
+
+impl UnicodeForm {
+    /// Rewrites `text` in this normalization form.
+    fn apply(self, text: &str) -> String {
+        match self {
+            Self::Nfc => text.nfc().collect(),
+            Self::Nfd => text.nfd().collect(),
+            Self::Nfkc => text.nfkc().collect(),
+            Self::Nfkd => text.nfkd().collect(),
+        }
+    }
 }
 
 /// A pre-tokenization step.
@@ -74,13 +105,39 @@ pub(crate) enum Pretokenizer {
         split: bool,
     },
     /// Split on a literal pattern.
-    Split {
+    SplitLiteral {
         /// The literal delimiter.
         pattern: String,
         /// What happens to the delimiter.
         behavior: SplitBehavior,
         /// Whether the pattern marks the pieces instead of the delimiters.
         invert: bool,
+    },
+    /// Split on a regex pattern.
+    SplitRegex {
+        /// The compiled pattern.
+        regex: Arc<Regex>,
+        /// What happens to the delimiter.
+        behavior: SplitBehavior,
+        /// Whether the pattern marks the pieces instead of the delimiters.
+        invert: bool,
+    },
+    /// Replace every regex match; the whole rewritten text stays one piece.
+    Replace {
+        /// The compiled pattern.
+        regex: Arc<Regex>,
+        /// What every match is replaced with.
+        content: String,
+    },
+    /// Split on a delimiter character, dropping it.
+    CharDelimiterSplit {
+        /// The delimiter.
+        delimiter: char,
+    },
+    /// Normalize to a Unicode form, then split on whitespace.
+    UnicodeNormalize {
+        /// The normalization form.
+        form: UnicodeForm,
     },
 }
 
@@ -148,33 +205,21 @@ impl Pretokenizer {
                 },
                 split: bool_of(value, "split", true),
             },
-            "Split" => {
-                if pattern_is_regex(value, "pattern") {
-                    warnings.push(
-                        "pre_tokenizer Split uses a regex pattern, which this loader cannot apply; falling back to whitespace splitting"
-                            .to_owned(),
-                    );
-                    return Self::Whitespace;
-                }
-                let Some(pattern) = literal_pattern(value, "pattern") else {
-                    warnings.push(
-                        "pre_tokenizer Split declares no literal pattern; the text is not pre-tokenized"
-                            .to_owned(),
-                    );
-                    return Self::Identity;
-                };
-                Self::Split {
-                    pattern,
-                    behavior: match str_of(value, "behavior").unwrap_or("Isolated") {
-                        "Removed" => SplitBehavior::Removed,
-                        "MergedWithPrevious" => SplitBehavior::MergedWithPrevious,
-                        "MergedWithNext" => SplitBehavior::MergedWithNext,
-                        "Contiguous" => SplitBehavior::Contiguous,
-                        _ => SplitBehavior::Isolated,
-                    },
-                    invert: bool_of(value, "invert", false),
-                }
-            }
+            "Split" => Self::split_node(value, warnings),
+            "Replace" => Self::replace_node(value, warnings),
+            "CharDelimiterSplit" => Self::char_delimiter_node(value, warnings),
+            "NFC" => Self::UnicodeNormalize {
+                form: UnicodeForm::Nfc,
+            },
+            "NFD" => Self::UnicodeNormalize {
+                form: UnicodeForm::Nfd,
+            },
+            "NFKC" => Self::UnicodeNormalize {
+                form: UnicodeForm::Nfkc,
+            },
+            "NFKD" => Self::UnicodeNormalize {
+                form: UnicodeForm::Nfkd,
+            },
             other => {
                 warnings.push(format!(
                     "pre_tokenizer `{other}` is not implemented; the text is not pre-tokenized"
@@ -182,6 +227,88 @@ impl Pretokenizer {
                 Self::Identity
             }
         }
+    }
+
+    /// Decodes a `Split` node, which carries either a literal or a regex pattern.
+    fn split_node(value: &Value, warnings: &mut Vec<String>) -> Self {
+        let behavior = split_behavior(value);
+        let invert = bool_of(value, "invert", false);
+        if let Some(source) = regex_pattern(value, "pattern") {
+            return match Regex::new(&source) {
+                Ok(regex) => Self::SplitRegex {
+                    regex: Arc::new(regex),
+                    behavior,
+                    invert,
+                },
+                Err(error) => {
+                    warnings.push(format!(
+                        "pre_tokenizer Split pattern `{source}` is not a usable regex ({error}); falling back to whitespace splitting"
+                    ));
+                    Self::Whitespace
+                }
+            };
+        }
+        let Some(pattern) = literal_pattern(value, "pattern") else {
+            warnings.push(
+                "pre_tokenizer Split declares neither a literal nor a regex pattern; the text is not pre-tokenized"
+                    .to_owned(),
+            );
+            return Self::Identity;
+        };
+        Self::SplitLiteral {
+            pattern,
+            behavior,
+            invert,
+        }
+    }
+
+    /// Decodes a `Replace` node, whose pattern must be a regex.
+    fn replace_node(value: &Value, warnings: &mut Vec<String>) -> Self {
+        let Some(source) = regex_pattern(value, "pattern") else {
+            warnings.push(
+                "pre_tokenizer Replace declares no regex pattern; the text is not pre-tokenized"
+                    .to_owned(),
+            );
+            return Self::Identity;
+        };
+        match Regex::new(&source) {
+            Ok(regex) => Self::Replace {
+                regex: Arc::new(regex),
+                // An absent content deletes every match, which is a valid `Replace`.
+                content: str_of(value, "content").unwrap_or("").to_owned(),
+            },
+            Err(error) => {
+                warnings.push(format!(
+                    "pre_tokenizer Replace pattern `{source}` is not a usable regex ({error}); the text is not pre-tokenized"
+                ));
+                Self::Identity
+            }
+        }
+    }
+
+    /// Decodes a `CharDelimiterSplit` node, whose `delimiter` is a single character.
+    fn char_delimiter_node(value: &Value, warnings: &mut Vec<String>) -> Self {
+        let Some(delimiter) = str_of(value, "delimiter") else {
+            warnings.push(
+                "pre_tokenizer CharDelimiterSplit declares no delimiter; the text is not pre-tokenized"
+                    .to_owned(),
+            );
+            return Self::Identity;
+        };
+        let mut chars = delimiter.chars();
+        let Some(first) = chars.next() else {
+            warnings.push(
+                "pre_tokenizer CharDelimiterSplit declares an empty delimiter; the text is not pre-tokenized"
+                    .to_owned(),
+            );
+            return Self::Identity;
+        };
+        if chars.next().is_some() {
+            warnings.push(format!(
+                "pre_tokenizer CharDelimiterSplit delimiter `{delimiter}` is not a single character; splitting on `{first}`"
+            ));
+        }
+        Self::CharDelimiterSplit { delimiter: first }
     }
 
     /// Splits `text` into the pieces the model will encode.
@@ -212,19 +339,7 @@ impl Pretokenizer {
             Self::ByteLevel {
                 add_prefix_space,
                 use_regex,
-            } => {
-                let prepared = if *add_prefix_space && !segment.starts_with(char::is_whitespace) {
-                    format!(" {segment}")
-                } else {
-                    segment.to_owned()
-                };
-                let mapped = bytes::encode(&prepared);
-                if *use_regex {
-                    gpt2_split(&mapped)
-                } else {
-                    vec![mapped]
-                }
-            }
+            } => gpt2::byte_level_split(segment, *add_prefix_space, *use_regex),
             Self::Punctuation => punctuation_split(segment),
             Self::Digits { individual_digits } => digits_split(segment, *individual_digits),
             Self::Metaspace {
@@ -232,13 +347,60 @@ impl Pretokenizer {
                 prepend,
                 split,
             } => metaspace_split(segment, *replacement, *prepend, *split, first),
-            Self::Split {
+            Self::SplitLiteral {
                 pattern,
                 behavior,
                 invert,
             } => split_literal(segment, pattern, *behavior, *invert),
+            Self::SplitRegex {
+                regex,
+                behavior,
+                invert,
+            } => {
+                let matches: Vec<(usize, usize)> = regex
+                    .find_iter(segment)
+                    .map(|found| (found.start(), found.end()))
+                    .collect();
+                assemble_split(segment, &matches, *behavior, *invert)
+            }
+            Self::Replace { regex, content } => {
+                vec![regex.replace_all(segment, content.as_str()).into_owned()]
+            }
+            Self::CharDelimiterSplit { delimiter } => segment
+                .split(*delimiter)
+                .filter(|piece| !piece.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            Self::UnicodeNormalize { form } => form
+                .apply(segment)
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
         }
     }
+}
+
+/// The `behavior` member of a `Split` node, defaulting to `Isolated`.
+fn split_behavior(value: &Value) -> SplitBehavior {
+    match str_of(value, "behavior").unwrap_or("Isolated") {
+        "Removed" => SplitBehavior::Removed,
+        "MergedWithPrevious" => SplitBehavior::MergedWithPrevious,
+        "MergedWithNext" => SplitBehavior::MergedWithNext,
+        "Contiguous" => SplitBehavior::Contiguous,
+        _ => SplitBehavior::Isolated,
+    }
+}
+
+/// The regex source of a `{"Regex": "..."}` pattern.
+fn regex_pattern(value: &Value, key: &str) -> Option<String> {
+    if !pattern_is_regex(value, key) {
+        return None;
+    }
+    value
+        .get(key)
+        .and_then(|pattern| pattern.get("Regex"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 /// Applies the metaspace rewrite and split.
@@ -351,36 +513,54 @@ fn split_literal(
     if pattern.is_empty() {
         return vec![segment.to_owned()];
     }
+    let matches: Vec<(usize, usize)> = segment
+        .match_indices(pattern)
+        .map(|(start, found)| (start, start + found.len()))
+        .collect();
+    assemble_split(segment, &matches, behavior, invert)
+}
+
+/// Turns byte ranges into pieces according to `behavior`, shared by the literal and regex splits.
+///
+/// With `invert` set the matches are the pieces and everything between them is the delimiter.
+fn assemble_split(
+    text: &str,
+    matches: &[(usize, usize)],
+    behavior: SplitBehavior,
+    invert: bool,
+) -> Vec<String> {
     let mut pieces = Vec::new();
     let mut current = String::new();
-    let mut rest = segment;
-    while let Some(index) = rest.find(pattern) {
-        let before = &rest[..index];
-        rest = &rest[index + pattern.len()..];
+    let mut cursor = 0;
+    for &(start, end) in matches {
         if invert {
-            // The complement is the delimiter, so every match is a piece on its own.
-            push_piece(&mut pieces, pattern.to_owned());
+            push_piece(&mut pieces, text[start..end].to_owned());
             continue;
         }
-        current.push_str(before);
+        current.push_str(&text[cursor..start]);
+        let delimiter = &text[start..end];
         match behavior {
             SplitBehavior::Removed => push_piece(&mut pieces, std::mem::take(&mut current)),
             SplitBehavior::Isolated => {
                 push_piece(&mut pieces, std::mem::take(&mut current));
-                push_piece(&mut pieces, pattern.to_owned());
+                push_piece(&mut pieces, delimiter.to_owned());
             }
             SplitBehavior::MergedWithPrevious => {
-                current.push_str(pattern);
+                current.push_str(delimiter);
                 push_piece(&mut pieces, std::mem::take(&mut current));
             }
             SplitBehavior::MergedWithNext => {
                 push_piece(&mut pieces, std::mem::take(&mut current));
-                current.push_str(pattern);
+                current.push_str(delimiter);
             }
-            SplitBehavior::Contiguous => current.push_str(pattern),
+            SplitBehavior::Contiguous => current.push_str(delimiter),
         }
+        cursor = end;
     }
-    current.push_str(rest);
+    if invert {
+        return pieces;
+    }
+    current.push_str(&text[cursor..]);
     push_piece(&mut pieces, current);
     pieces
 }
@@ -394,86 +574,51 @@ fn push_piece(pieces: &mut Vec<String>, piece: String) {
 
 /// Whether a character counts as punctuation.
 ///
-/// Without Unicode general categories this treats every non-alphanumeric, non-whitespace, non-control character as punctuation, which matches `BERT`'s ASCII set and covers the common Latin punctuation.
+/// ASCII punctuation is the printable, non-alphanumeric, non-space ASCII range; a non-ASCII character counts when it is in the Unicode `P` category, which `\p{P}` reports.
 fn is_punctuation(ch: char) -> bool {
-    !ch.is_alphanumeric() && !ch.is_whitespace() && !ch.is_control()
+    if ch.is_ascii() {
+        return ch.is_ascii_punctuation();
+    }
+    match punctuation_pattern() {
+        Some(pattern) => {
+            let mut buffer = [0_u8; 4];
+            pattern.is_match(ch.encode_utf8(&mut buffer))
+        }
+        None => !ch.is_alphanumeric() && !ch.is_whitespace() && !ch.is_control(),
+    }
 }
 
-/// Splits `text` the way GPT-2's pre-tokenization pattern does.
-fn gpt2_split(text: &str) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut pieces = Vec::new();
-    let mut position = 0;
-    while position < chars.len() {
-        let length = gpt2_match(&chars, position).max(1);
-        pieces.push(chars[position..position + length].iter().collect());
-        position += length;
-    }
-    pieces
-}
-
-/// The length of the GPT-2 alternative that matches at `position`, or `0` when none does.
-fn gpt2_match(chars: &[char], position: usize) -> usize {
-    const CONTRACTIONS: [&str; 7] = ["s", "t", "re", "ve", "m", "ll", "d"];
-    if chars[position] == '\'' {
-        for suffix in CONTRACTIONS {
-            let suffix_chars: Vec<char> = suffix.chars().collect();
-            let end = position + 1 + suffix_chars.len();
-            if end <= chars.len() && chars[position + 1..end] == suffix_chars[..] {
-                return end - position;
-            }
-        }
-    }
-    for class in [
-        char::is_alphabetic as fn(char) -> bool,
-        char::is_numeric,
-        is_gpt2_other,
-    ] {
-        if let Some(length) = spaced_run(chars, position, class) {
-            return length;
-        }
-    }
-    if chars[position].is_whitespace() {
-        let mut end = position;
-        while end < chars.len() && chars[end].is_whitespace() {
-            end += 1;
-        }
-        let run = end - position;
-        if end == chars.len() || run == 1 {
-            return run;
-        }
-        return run - 1;
-    }
-    0
-}
-
-/// A character class of the GPT-2 pattern outside letters, numbers and whitespace.
-fn is_gpt2_other(ch: char) -> bool {
-    !ch.is_whitespace() && !ch.is_alphabetic() && !ch.is_numeric()
-}
-
-/// The length of ` ?<class>+` at `position`.
-fn spaced_run(chars: &[char], position: usize, class: fn(char) -> bool) -> Option<usize> {
-    let start =
-        if chars[position] == ' ' && position + 1 < chars.len() && class(chars[position + 1]) {
-            position + 1
-        } else {
-            position
-        };
-    if !class(chars[start]) {
-        return None;
-    }
-    let mut end = start;
-    while end < chars.len() && class(chars[end]) {
-        end += 1;
-    }
-    Some(end - position)
+/// The Unicode punctuation category, compiled once.
+fn punctuation_pattern() -> Option<&'static Regex> {
+    static PUNCTUATION: OnceLock<Option<Regex>> = OnceLock::new();
+    PUNCTUATION
+        .get_or_init(|| Regex::new(r"\p{P}").ok())
+        .as_ref()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Decodes a pre-tokenizer node and its warnings.
+    fn decode(value: Value) -> (Pretokenizer, Vec<String>) {
+        let mut warnings = Vec::new();
+        let pretokenizer = Pretokenizer::from_json(Some(&value), &mut warnings);
+        (pretokenizer, warnings)
+    }
+
+    /// Decodes a `Split` node with a regex pattern.
+    fn regex_split(pattern: &str, behavior: &str, invert: bool) -> Pretokenizer {
+        let (pretokenizer, warnings) = decode(json!({
+            "type": "Split",
+            "pattern": {"Regex": pattern},
+            "behavior": behavior,
+            "invert": invert
+        }));
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        pretokenizer
+    }
 
     #[test]
     fn bert_splits_punctuation_and_whitespace() {
@@ -485,21 +630,20 @@ mod tests {
 
     #[test]
     fn whitespace_split_drops_whitespace() {
-        let mut warnings = Vec::new();
-        let pretokenizer =
-            Pretokenizer::from_json(Some(&json!({"type": "Whitespace"})), &mut warnings);
+        let (pretokenizer, warnings) = decode(json!({"type": "Whitespace"}));
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(pretokenizer.apply(" a  b\tc "), vec!["a", "b", "c"]);
     }
 
     #[test]
     fn metaspace_prefixes_and_splits() {
-        let mut warnings = Vec::new();
-        let pretokenizer = Pretokenizer::from_json(
-            Some(
-                &json!({"type": "Metaspace", "replacement": "\u{2581}", "prepend_scheme": "always", "split": true}),
-            ),
-            &mut warnings,
-        );
+        let (pretokenizer, warnings) = decode(json!({
+            "type": "Metaspace",
+            "replacement": "\u{2581}",
+            "prepend_scheme": "always",
+            "split": true
+        }));
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(
             pretokenizer.apply("hello world"),
             vec!["\u{2581}hello", "\u{2581}world"]
@@ -507,49 +651,231 @@ mod tests {
     }
 
     #[test]
-    fn byte_level_maps_bytes_and_splits_with_the_gpt2_pattern() {
-        let mut warnings = Vec::new();
-        let pretokenizer = Pretokenizer::from_json(
-            Some(&json!({"type": "ByteLevel", "add_prefix_space": false, "use_regex": true})),
-            &mut warnings,
+    fn byte_level_splits_before_it_maps() {
+        let (pretokenizer, warnings) = decode(json!({
+            "type": "ByteLevel",
+            "add_prefix_space": false,
+            "use_regex": true
+        }));
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(
+            pretokenizer.apply("hi there!"),
+            vec!["hi", "\u{0120}there", "!"]
         );
-        let pieces = pretokenizer.apply("hi there!");
-        assert_eq!(pieces, vec!["hi\u{0120}there", "!"]);
+        assert_eq!(
+            pretokenizer.apply("Hello my friend, how is your day going?"),
+            vec![
+                "Hello",
+                "\u{0120}my",
+                "\u{0120}friend",
+                ",",
+                "\u{0120}how",
+                "\u{0120}is",
+                "\u{0120}your",
+                "\u{0120}day",
+                "\u{0120}going",
+                "?"
+            ]
+        );
     }
 
     #[test]
-    fn regex_splits_degrade_to_whitespace_with_a_warning() {
-        let mut warnings = Vec::new();
-        let pretokenizer = Pretokenizer::from_json(
-            Some(&json!({"type": "Split", "pattern": {"Regex": "\\w+"}, "behavior": "Isolated"})),
-            &mut warnings,
+    fn regex_splits_honour_every_behavior() {
+        assert_eq!(
+            regex_split("\\s+", "Removed", false).apply("a  b"),
+            vec!["a", "b"]
         );
+        assert_eq!(
+            regex_split("\\s+", "Isolated", false).apply("a  b"),
+            vec!["a", "  ", "b"]
+        );
+        assert_eq!(
+            regex_split("\\s+", "MergedWithPrevious", false).apply("a  b"),
+            vec!["a  ", "b"]
+        );
+        assert_eq!(
+            regex_split("\\s+", "MergedWithNext", false).apply("a  b"),
+            vec!["a", "  b"]
+        );
+        assert_eq!(
+            regex_split("\\s+", "Contiguous", false).apply("a  b"),
+            vec!["a  b"]
+        );
+    }
+
+    #[test]
+    fn regex_split_inverts_to_the_matches() {
+        assert_eq!(
+            regex_split("\\w+", "Removed", true).apply("a b"),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            regex_split("[0-9]+", "Isolated", true).apply("a12b34"),
+            vec!["12", "34"]
+        );
+    }
+
+    #[test]
+    fn a_regex_that_does_not_compile_warns_with_the_pattern_and_the_error() {
+        let (pretokenizer, warnings) = decode(json!({
+            "type": "Split",
+            "pattern": {"Regex": "(unclosed"},
+            "behavior": "Isolated"
+        }));
         assert!(matches!(pretokenizer, Pretokenizer::Whitespace));
         assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("(unclosed"),
+            "the warning must name the pattern: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].to_lowercase().contains("regex"),
+            "the warning must carry the regex error: {}",
+            warnings[0]
+        );
+        assert_eq!(pretokenizer.apply("a  b"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn replace_rewrites_every_match_into_one_piece() {
+        let (pretokenizer, warnings) = decode(json!({
+            "type": "Replace",
+            "pattern": {"Regex": "\\s+"},
+            "content": "_"
+        }));
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(pretokenizer.apply("a  b"), vec!["a_b"]);
+    }
+
+    #[test]
+    fn replace_can_delete_matches_and_warns_on_a_bad_pattern() {
+        let (pretokenizer, _warnings) = decode(json!({
+            "type": "Replace",
+            "pattern": {"Regex": "[aeiou]"}
+        }));
+        assert_eq!(pretokenizer.apply("hello"), vec!["hll"]);
+
+        let (identity, warnings) = decode(json!({
+            "type": "Replace",
+            "pattern": {"Regex": "*"},
+            "content": "_"
+        }));
+        assert!(matches!(identity, Pretokenizer::Identity));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains('*'));
+    }
+
+    #[test]
+    fn char_delimiter_split_removes_the_delimiter() {
+        let (pretokenizer, warnings) = decode(json!({
+            "type": "CharDelimiterSplit",
+            "delimiter": "-"
+        }));
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(pretokenizer.apply("a-b--c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn char_delimiter_split_warns_on_a_missing_or_multi_character_delimiter() {
+        let (identity, warnings) = decode(json!({"type": "CharDelimiterSplit"}));
+        assert!(matches!(identity, Pretokenizer::Identity));
+        assert_eq!(warnings.len(), 1);
+
+        let (identity, warnings) = decode(json!({"type": "CharDelimiterSplit", "delimiter": ""}));
+        assert!(matches!(identity, Pretokenizer::Identity));
+        assert_eq!(warnings.len(), 1);
+
+        let (pretokenizer, warnings) = decode(json!({
+            "type": "CharDelimiterSplit",
+            "delimiter": "--"
+        }));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--"));
+        assert_eq!(pretokenizer.apply("a-b-c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn unicode_wrapper_nodes_normalize_and_split_on_whitespace() {
+        let (pretokenizer, warnings) = decode(json!({"type": "NFC"}));
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(pretokenizer.apply("e\u{301} frank"), vec!["é", "frank"]);
+
+        let (pretokenizer, _warnings) = decode(json!({"type": "NFD"}));
+        assert_eq!(pretokenizer.apply("é frank"), vec!["e\u{301}", "frank"]);
+
+        let (pretokenizer, _warnings) = decode(json!({"type": "NFKC"}));
+        assert_eq!(pretokenizer.apply("ﬁ x"), vec!["fi", "x"]);
+
+        let (pretokenizer, _warnings) = decode(json!({"type": "NFKD"}));
+        assert_eq!(pretokenizer.apply("①"), vec!["1"]);
+    }
+
+    #[test]
+    fn punctuation_follows_the_ascii_and_unicode_categories() {
+        // ASCII symbols are punctuation.
+        assert_eq!(
+            punctuation_split("a$b+c=d"),
+            vec!["a", "$", "b", "+", "c", "=", "d"]
+        );
+        // `©` is a symbol (So) rather than punctuation, while the em dash is `Pd`.
+        assert_eq!(punctuation_split("a©b—c"), vec!["a©b", "—", "c"]);
+        assert!(!is_punctuation('中'));
+        assert!(is_punctuation('。'));
+        assert!(is_punctuation('!'));
+        assert!(!is_punctuation(' '));
+        assert!(!is_punctuation('a'));
     }
 
     #[test]
     fn literal_splits_honour_the_behavior() {
-        let mut warnings = Vec::new();
-        let pretokenizer = Pretokenizer::from_json(
-            Some(
-                &json!({"type": "Split", "pattern": {"String": "-"}, "behavior": "MergedWithPrevious"}),
-            ),
-            &mut warnings,
-        );
+        let (pretokenizer, warnings) = decode(json!({
+            "type": "Split",
+            "pattern": {"String": "-"},
+            "behavior": "MergedWithPrevious"
+        }));
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(pretokenizer.apply("a-b-c"), vec!["a-", "b-", "c"]);
     }
 
     #[test]
+    fn a_split_without_a_pattern_is_identity_with_a_warning() {
+        let (pretokenizer, warnings) = decode(json!({"type": "Split", "behavior": "Isolated"}));
+        assert!(matches!(pretokenizer, Pretokenizer::Identity));
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn unknown_nodes_warn_and_leave_the_text_unsplit() {
+        let (pretokenizer, warnings) = decode(json!({"type": "Fancy"}));
+        assert!(matches!(pretokenizer, Pretokenizer::Identity));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Fancy"));
+    }
+
+    #[test]
     fn sequences_chain_splitters() {
-        let mut warnings = Vec::new();
-        let pretokenizer = Pretokenizer::from_json(
-            Some(&json!({"type": "Sequence", "pretokenizers": [
+        let (pretokenizer, warnings) = decode(json!({
+            "type": "Sequence",
+            "pretokenizers": [
                 {"type": "Whitespace"},
                 {"type": "Digits"}
-            ]})),
-            &mut warnings,
-        );
+            ]
+        }));
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(pretokenizer.apply("ab12 cd"), vec!["ab", "12", "cd"]);
+    }
+
+    #[test]
+    fn sequences_chain_a_replace_into_a_regex_split() {
+        let (pretokenizer, warnings) = decode(json!({
+            "type": "Sequence",
+            "pretokenizers": [
+                {"type": "Replace", "pattern": {"Regex": "\\s+"}, "content": "_"},
+                {"type": "Split", "pattern": {"Regex": "_"}, "behavior": "Removed"}
+            ]
+        }));
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(pretokenizer.apply("ab cd"), vec!["ab", "cd"]);
     }
 }

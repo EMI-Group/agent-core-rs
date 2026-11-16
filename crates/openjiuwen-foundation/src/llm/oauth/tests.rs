@@ -521,11 +521,24 @@ async fn access_token_without_a_refresh_token_reports_relogin() {
 }
 
 #[tokio::test]
-async fn access_token_never_refreshes_a_token_without_a_resolvable_expiry() {
+async fn access_token_refreshes_a_token_without_a_resolvable_expiry() {
     let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=old-refresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "fresh-access",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
     let store = InMemoryTokenStore::new();
-    // A token whose expiry nothing can resolve: no recorded `expires_at`, and an
-    // access token that is not a JWT.
+    // A token whose expiry nothing can resolve: no recorded `expires_at`, no
+    // `expires_in`, no inherited expiry, and an access token that is not a JWT.
+    // Such a credential has no known lifetime, so it is refreshed before use.
     store
         .save(&OAuthToken::new("opaque-access").with_refresh_token("old-refresh"))
         .await
@@ -534,16 +547,19 @@ async fn access_token_never_refreshes_a_token_without_a_resolvable_expiry() {
     let token = oauth_client(&server)
         .access_token(&store, false)
         .await
-        .expect("the usable token");
+        .expect("the refreshed token");
 
-    assert_eq!(token.access_token.expose_secret(), "opaque-access");
+    assert_eq!(token.access_token.expose_secret(), "fresh-access");
     assert!(
-        server
-            .received_requests()
-            .await
-            .expect("the recorded requests")
-            .is_empty(),
-        "an unresolvable expiry never triggers a refresh"
+        token.expires_at.expect("the refresh reported a lifetime") > Utc::now(),
+        "the refreshed expiry is stored"
+    );
+    let stored = store.load().await.expect("the reload").expect("the token");
+    assert_eq!(stored.access_token.expose_secret(), "fresh-access");
+    assert_eq!(
+        stored.expires_at.map(|at| at.timestamp()),
+        token.expires_at.map(|at| at.timestamp()),
+        "the refreshed expiry is persisted"
     );
 }
 

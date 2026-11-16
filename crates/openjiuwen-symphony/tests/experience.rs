@@ -1,5 +1,7 @@
-//! Behaviour tests for the experience bank: generated ids, deterministic dedupe,
-//! lexical and embedding ranking, skill filters, and JSON-file persistence.
+//! Behaviour tests for the experience layer: generated ids, deterministic dedupe,
+//! lexical and embedding ranking, skill filters, JSON-file persistence, and the
+//! cross-module paths where trace grading, clustering, the batching embedding client,
+//! and query-time retrieval meet.
 //!
 //! Everything is offline and deterministic: the bank's in-memory store or a
 //! `tempfile`-backed document, `HashEmbedding` for the semantic path, explicit
@@ -14,8 +16,12 @@ use async_trait::async_trait;
 use openjiuwen_retrieval::{Embedding, HashEmbedding};
 use openjiuwen_symphony::error::ErrorKind;
 use openjiuwen_symphony::experience::{
-    AddOutcome, ExperienceBank, ExperienceHit, ExperienceItem, ExperienceRanking, SearchOptions,
+    cluster_traces, AddOutcome, EmbeddingClient, EvaluationConfig, ExperienceBank,
+    ExperienceCollector, ExperienceHit, ExperienceIndex, ExperienceItem, ExperienceRanking,
+    ExperienceRetriever, RankingProvenance, RetrieveRequest, RetrieveSource, SearchOptions,
+    TraceEvaluator, TraceRecord,
 };
+use openjiuwen_symphony::llm::{LlmJudgeMetric, StaticCompletionModel};
 
 /// Builds an item with the given pattern and skills.
 fn item(pattern: &str, skills: &[&str]) -> ExperienceItem {
@@ -626,4 +632,162 @@ fn item_defaults_and_builders_are_exposed() {
     let json = serde_json::to_value(&item).expect("serialize");
     assert_eq!(json["success_count"], serde_json::json!(7));
     assert!(json.get("embedding").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Trace grading, clustering, retrieval, and the embedding client
+// ---------------------------------------------------------------------------
+/// A successful trace record for `query` that used `skills`.
+fn trace(trace_id: &str, query: &str, output: &str, skills: &[&str]) -> TraceRecord {
+    TraceRecord {
+        trace_id: trace_id.to_string(),
+        session_id: "session".to_string(),
+        request_id: trace_id.to_string(),
+        query: query.to_string(),
+        final_output: output.to_string(),
+        skills: skills.iter().map(|skill| (*skill).to_string()).collect(),
+        success: true,
+        ..TraceRecord::default()
+    }
+}
+#[tokio::test]
+async fn graded_traces_flow_into_the_bank_and_back_out_through_the_retriever() {
+    let records = vec![
+        trace(
+            "s/1",
+            "summarize the report",
+            "the summary",
+            &["summarizer"],
+        ),
+        trace(
+            "s/2",
+            "summarize the report",
+            "a shorter summary",
+            &["summarizer"],
+        ),
+        TraceRecord {
+            success: false,
+            ..trace("s/3", "summarize the report", "", &["summarizer"])
+        },
+    ];
+    let evaluator = TraceEvaluator::with_config(EvaluationConfig::new().with_max_traces(10));
+    let grades = evaluator.grade_traces(&records).await.expect("grade");
+    assert_eq!(grades.len(), 3);
+    let passing: Vec<TraceRecord> = records
+        .iter()
+        .filter(|record| {
+            grades
+                .iter()
+                .any(|grade| grade.trace_id == record.trace_id && grade.success)
+        })
+        .cloned()
+        .collect();
+    assert_eq!(passing.len(), 2);
+    let bank = Arc::new(ExperienceBank::new());
+    let collector = ExperienceCollector::for_bank(bank.clone());
+    assert_eq!(collector.add(&passing).await.expect("collect"), 1);
+    assert_eq!(collector.pending(), 1);
+    assert_eq!(collector.flush().await.expect("flush"), 1);
+    let retriever = ExperienceRetriever::for_bank(bank.clone());
+    let report = retriever
+        .retrieve(&RetrieveRequest::new("summarize the report"))
+        .await
+        .expect("retrieve");
+    assert_eq!(report.ranking, RankingProvenance::Lexical);
+    assert_eq!(report.sources, vec![RetrieveSource::Bank]);
+    assert_eq!(report.hits.len(), 1);
+    assert_eq!(
+        report.hits[0].item.skill_ids,
+        vec!["summarizer".to_string()]
+    );
+    assert!(!report.hits[0].item.query_examples.is_empty());
+    let summary = evaluator.summarise_grades(&grades);
+    assert_eq!(summary.traces, 3);
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.signals.get("failed").copied(), Some(1));
+    assert_eq!(summary.signals.get("completed").copied(), Some(2));
+    assert!((summary.mean_score - ((2.0 + 0.15) / 3.0)).abs() < 1e-9);
+    assert_eq!(
+        summary.provenance,
+        openjiuwen_symphony::experience::JudgementProvenance::Deterministic
+    );
+}
+#[tokio::test]
+async fn the_embedding_client_caches_batches_and_an_index_answers_semantically() {
+    let documents = vec![
+        "summarize the report".to_string(),
+        "translate text".to_string(),
+    ];
+    let client = EmbeddingClient::hash().with_batch_size(1);
+    let first = client.embed_documents(&documents).await.expect("embed");
+    assert_eq!(first.len(), 2);
+    assert_eq!(client.stats().batches, 2);
+    assert_eq!(client.stats().embedded, 2);
+    let second = client.embed_documents(&documents).await.expect("re-embed");
+    assert_eq!(first, second);
+    assert_eq!(client.stats().batches, 2);
+    assert_eq!(client.stats().cache_hits, 2);
+    assert_eq!(client.cache_len(), 2);
+    let index = Arc::new(ExperienceIndex::new(Arc::new(HashEmbedding::default())));
+    index
+        .add(item("summarize the report", &["summarizer"]))
+        .await
+        .expect("add");
+    index
+        .add(item("translate text", &["translator"]))
+        .await
+        .expect("add");
+    let retriever = ExperienceRetriever::for_index(index);
+    let report = retriever
+        .retrieve(&RetrieveRequest::new("translate text"))
+        .await
+        .expect("retrieve");
+    assert_eq!(report.ranking, RankingProvenance::Embedding);
+    assert_eq!(report.sources, vec![RetrieveSource::Index]);
+    assert_eq!(
+        report.hits[0].item.skill_ids,
+        vec!["translator".to_string()]
+    );
+}
+#[tokio::test]
+async fn clusters_grade_and_a_scripted_judge_records_model_provenance() {
+    let records = vec![
+        trace(
+            "s/1",
+            "summarize the report",
+            "the summary",
+            &["summarizer"],
+        ),
+        trace(
+            "s/2",
+            "summarize the report",
+            "another summary",
+            &["summarizer"],
+        ),
+    ];
+    let clusters = cluster_traces(&records);
+    assert_eq!(clusters.len(), 1);
+    let evaluator = TraceEvaluator::new();
+    let grades = evaluator
+        .grade_clusters(&clusters)
+        .await
+        .expect("grade clusters");
+    assert_eq!(grades.len(), 1);
+    assert!(grades[0].success);
+    assert_eq!(grades[0].trace_id, "s/1");
+    let judge = LlmJudgeMetric::new("skill_correctness", "the skills must fit the task")
+        .with_model(Arc::new(StaticCompletionModel::single(
+            r#"{"score":1,"reason":"the summarizer fits the request"}"#,
+        )));
+    let judged = TraceEvaluator::with_config(EvaluationConfig::new().with_model_judgement(true))
+        .with_judge(judge);
+    let grades = judged.grade_traces(&records).await.expect("judge");
+    assert_eq!(grades.len(), 2);
+    assert!(grades.iter().all(|grade| grade.judged.is_model()));
+    let summary = judged.summarise_grades(&grades);
+    assert_eq!(summary.judged_by_model, 2);
+    assert_eq!(
+        summary.provenance,
+        openjiuwen_symphony::experience::JudgementProvenance::Model
+    );
 }

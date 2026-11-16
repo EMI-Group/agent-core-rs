@@ -92,7 +92,7 @@ use crate::retrieval::search::engine::{
 use crate::retrieval::search::expand::DefaultTargetExpander;
 use crate::retrieval::search::flow::{
     ChatMessage, CurrentSubtree, SearchCursor, SelectableTarget, SelectionProtocol,
-    SelectionResult, ABSTAIN_TOKEN,
+    SelectionProvenance, SelectionResult, ABSTAIN_TOKEN,
 };
 use crate::retrieval::search::reduce::DefaultBranchReducer;
 use crate::retrieval::search::render::{
@@ -100,7 +100,8 @@ use crate::retrieval::search::render::{
     parse_selected_codes, DefaultSubtreeRenderer, SubtreeRenderer,
 };
 use crate::retrieval::search::selector::{
-    is_abstain_output, record_selection, DefaultTopKSelector, MODE_GENERATE,
+    is_abstain_output, mark_selection_degraded, record_selection, trace_degraded_selections,
+    trace_selection_provenance, DefaultTopKSelector, MODE_GENERATE,
 };
 use crate::retrieval::search::subtree::DefaultCurrentSubtreeProvider;
 use crate::retrieval::types::{RetrieverCandidate, RetrieverNode, RetrieverTrace};
@@ -132,6 +133,12 @@ pub struct ProgressiveSearchResult {
     pub steps: usize,
     /// The final (exhausted) walk state, so a caller can inspect or resume it.
     pub state: TraversalState,
+    /// The provenance of the walk's last selection ([`SelectionProvenance::Lexical`] when the
+    /// walk recorded no selection at all).
+    pub selection_provenance: SelectionProvenance,
+    /// How many selections degraded away from the configured model (a missing model in
+    /// generate mode, a failed model call or an unusable reply).
+    pub degraded_selections: usize,
 }
 
 /// The model a [`ProgressiveRetriever`] selects with.
@@ -154,7 +161,14 @@ pub struct ProgressiveRetriever {
     /// The prompt rendering seam.
     renderer: Arc<dyn SubtreeRenderer>,
     /// The fallback selector (lexical, or embedding-blended when an embedder is configured).
+    ///
+    /// This is the primary selector (it knows the configured selection mode, so it reports the
+    /// no-model degradation); `fallback_selector` is the same ranking configured as
+    /// [`SelectionMode::Lexical`], used after a model failure.
     selector: Arc<dyn TopKSelector>,
+    /// The selector a failed model call degrades to: lexical (or blended), never the no-model
+    /// degradation path.
+    fallback_selector: Arc<dyn TopKSelector>,
     /// The expansion seam.
     expander: Arc<dyn TargetExpander>,
     /// The reduction seam.
@@ -190,12 +204,17 @@ impl ProgressiveRetriever {
             builder,
         )?;
         let selector: Arc<dyn TopKSelector> = Arc::new(DefaultTopKSelector::new(config.clone()));
+        let mut fallback_config = config.clone();
+        fallback_config.selection_mode = SelectionMode::Lexical;
+        let fallback_selector: Arc<dyn TopKSelector> =
+            Arc::new(DefaultTopKSelector::new(fallback_config));
         Ok(Self {
             root: RwLock::new(root),
             config: config.clone(),
             provider: Arc::new(provider),
             renderer: Arc::new(DefaultSubtreeRenderer::new()),
             selector,
+            fallback_selector,
             expander: Arc::new(DefaultTargetExpander::new(config.clone())),
             reducer: Arc::new(DefaultBranchReducer::new(config)),
             model: None,
@@ -229,6 +248,10 @@ impl ProgressiveRetriever {
     pub fn with_embedding(mut self, embedding: Arc<dyn Embedding>) -> Result<Self> {
         self.config.embedding.validate()?;
         self.selector = Arc::new(EmbeddingBlendedTopKSelector::new(
+            self.config.clone(),
+            Arc::clone(&embedding),
+        ));
+        self.fallback_selector = Arc::new(EmbeddingBlendedTopKSelector::new(
             self.config.clone(),
             embedding,
         ));
@@ -390,12 +413,18 @@ impl ProgressiveRetriever {
         } else {
             METHOD_LEXICAL_FALLBACK
         };
+        let trace = state.trace().clone();
+        let selection_provenance =
+            trace_selection_provenance(&trace).unwrap_or(SelectionProvenance::Lexical);
+        let degraded_selections = trace_degraded_selections(&trace);
         ProgressiveSearchResult {
             candidates: state.candidates().to_vec(),
-            trace: state.trace().clone(),
+            trace,
             method: method.to_owned(),
             steps: state.steps(),
             state,
+            selection_provenance,
+            degraded_selections,
         }
     }
 
@@ -406,7 +435,7 @@ impl ProgressiveRetriever {
                 model.model,
                 model.name,
                 self.config.clone(),
-                Arc::clone(&self.selector),
+                Arc::clone(&self.fallback_selector),
             )),
             None => Arc::clone(&self.selector),
         };
@@ -564,7 +593,17 @@ impl TopKSelector for ModelTopKSelector {
                         error = %error,
                         "progressive selection failed; falling back to the lexical selector"
                     );
-                    return self.fallback.select_topk(request, trace).await;
+                    let result = self
+                        .fallback
+                        .select_topk(request, trace)
+                        .await?
+                        .with_provenance(SelectionProvenance::LexicalAfterModelError);
+                    mark_selection_degraded(
+                        trace,
+                        cursor,
+                        SelectionProvenance::LexicalAfterModelError,
+                    );
+                    return Ok(result);
                 }
             },
         };
@@ -578,11 +617,25 @@ impl TopKSelector for ModelTopKSelector {
         if is_abstain {
             targets.clear();
         }
+        let provenance = if targets.is_empty() && !is_abstain && !raw_output.trim().is_empty() {
+            tracing::warn!(
+                node_id = %cursor.node_id,
+                depth = cursor.depth,
+                model = %self.model_name,
+                reply_chars = raw_output.chars().count(),
+                "the model reply named no known candidate; the node selects nothing"
+            );
+            SelectionProvenance::UnusableReply
+        } else {
+            SelectionProvenance::Model
+        };
         let result = SelectionResult {
             raw_output,
             selected_targets: targets,
             is_abstain,
-        };
+            ..SelectionResult::default()
+        }
+        .with_provenance(provenance);
         record_selection(trace, cursor, MODE_GENERATE, &result);
         Ok(result)
     }
@@ -797,6 +850,32 @@ mod tests {
         assert_eq!(result.method, METHOD_LEXICAL_FALLBACK);
         assert!(!result.candidates.is_empty());
         assert!(result.trace.event_types().contains(&LLM_REQUEST_EVENT));
+        assert!(
+            result.degraded_selections >= 1,
+            "the model failures are reported on the result"
+        );
+        let degraded: Vec<_> = result
+            .trace
+            .events()
+            .iter()
+            .filter(|event| {
+                event.event_type == crate::retrieval::search::selector::FRAGMENT_SELECTED_EVENT
+                    && event.detail.get("provenance") == Some(&json!("lexical_after_model_error"))
+            })
+            .collect();
+        assert!(!degraded.is_empty(), "each failed call is marked");
+        for event in &degraded {
+            assert_eq!(
+                event.detail["mode"],
+                json!(crate::retrieval::search::selector::MODE_LEXICAL),
+                "the fallback keeps its lexical mode"
+            );
+            assert_eq!(event.detail["degraded"], json!(true));
+        }
+        assert!(
+            result.selection_provenance.is_degraded()
+                || result.selection_provenance == SelectionProvenance::SingleSelectable
+        );
     }
 
     #[tokio::test]

@@ -13,6 +13,12 @@
 //! `log_max_total_lines`. The candidate starts with a
 //! `[LOG compressed: format=..., kept=X/Y, omitted=N]` header and ends with a
 //! `[LOG omitted: ...]` footer whenever anything was dropped.
+//!
+//! `details` are reported for every classified log, declined or accepted; the
+//! report also names the truncation the `log_stack_trace_max_lines` cap caused
+//! (`stack_traces_truncated`, `stack_trace_truncated_lines` and
+//! `stack_trace_dropped_lines`), and a log shorter than `log_min_lines` is a
+//! decline carrying `reason: "below_min_lines"` instead of a bare no-op.
 use super::{RuleCompressionResult, RuleCompressor};
 use crate::processor::rule_compression::common::{contains_word, meets_savings_ratio};
 use crate::processor::rule_compression::types::{ContentType, RuleContext};
@@ -111,9 +117,25 @@ impl RuleCompressor for LogCompressor {
     fn compress(&self, content: &str, ctx: &RuleContext) -> RuleCompressionResult {
         let raw_lines: Vec<&str> = content.lines().collect();
         if raw_lines.len() < ctx.log_min_lines {
-            return RuleCompressionResult::unchanged(content, ContentType::Log);
+            tracing::debug!(
+                reason = "below_min_lines",
+                total_lines = raw_lines.len(),
+                min_lines = ctx.log_min_lines,
+                "rule compression: log declined as too short"
+            );
+            return RuleCompressionResult::declined(
+                content,
+                ContentType::Log,
+                Some(json!({
+                    "reason": "below_min_lines",
+                    "total_lines": raw_lines.len(),
+                    "min_lines": ctx.log_min_lines,
+                })),
+            );
         }
-        let (lines, traces_seen) = classify_lines(&raw_lines, ctx.log_stack_trace_max_lines);
+        let classification = classify_lines(&raw_lines, ctx.log_stack_trace_max_lines);
+        let traces_seen = classification.traces_seen;
+        let lines = classification.lines;
         let (mut selected, warnings_deduplicated) = select(&lines, ctx);
         if selected.is_empty() {
             selected = head_tail(&lines, ctx.log_max_total_lines.min(20));
@@ -146,6 +168,12 @@ impl RuleCompressor for LogCompressor {
         }
         let candidate = output.join("\n");
         let stack_traces_retained = count_trace_groups(&lines, &selected);
+        let kept: BTreeSet<usize> = selected.iter().copied().collect();
+        let stack_trace_dropped_lines = classification
+            .truncated_tail
+            .iter()
+            .filter(|position| !kept.contains(position))
+            .count();
         let details = json!({
             "format_detected": format_detected,
             "total_lines": lines.len(),
@@ -157,6 +185,9 @@ impl RuleCompressor for LogCompressor {
             "info": counts.get(&LogLevel::Info).copied().unwrap_or(0),
             "stack_traces_seen": traces_seen,
             "stack_traces_retained": stack_traces_retained,
+            "stack_traces_truncated": classification.traces_truncated,
+            "stack_trace_truncated_lines": classification.truncated_tail.len(),
+            "stack_trace_dropped_lines": stack_trace_dropped_lines,
             "warnings_deduplicated": warnings_deduplicated,
             "selected_line_numbers": selected.iter().map(|position| position + 1).collect::<Vec<_>>(),
         });
@@ -171,13 +202,40 @@ impl RuleCompressor for LogCompressor {
         RuleCompressionResult::declined(content, ContentType::Log, Some(details))
     }
 }
-/// Classifies every line and counts the traces that opened.
-fn classify_lines(lines: &[&str], max_trace_lines: usize) -> (Vec<LogLine>, usize) {
+/// What classifying a log found.
+struct Classification {
+    /// Every line, classified and scored.
+    lines: Vec<LogLine>,
+    /// Traces that opened.
+    traces_seen: usize,
+    /// Traces the `max_trace_lines` cap cut short.
+    traces_truncated: usize,
+    /// Positions of the tail lines that continued a cut trace.
+    truncated_tail: Vec<usize>,
+}
+
+/// Classifies every line, counting the traces that opened and the ones cut short.
+///
+/// A trace longer than `max_trace_lines` is closed by resetting its flavour (the
+/// selection caps each kept trace at the same length); the lines that continue
+/// it are recorded in [`Classification::truncated_tail`] so the report can say
+/// how much of a trace the cap dropped, and how much of that the selection lost.
+fn classify_lines(lines: &[&str], max_trace_lines: usize) -> Classification {
     let mut classified: Vec<LogLine> = Vec::with_capacity(lines.len());
     let mut trace_flavor: Option<&'static str> = None;
     let mut trace_lines = 0_usize;
     let mut traces_seen = 0_usize;
+    let mut cut_flavor: Option<&'static str> = None;
+    let mut traces_truncated = 0_usize;
+    let mut truncated_tail: Vec<usize> = Vec::new();
     for (position, content) in lines.iter().enumerate() {
+        if let Some(flavor) = cut_flavor {
+            if trace_flavor_of(content) == Some(flavor) {
+                truncated_tail.push(position);
+            } else {
+                cut_flavor = None;
+            }
+        }
         let opened = trace_flavor_of(content);
         if opened.is_some() && trace_flavor.is_none() {
             trace_flavor = opened;
@@ -197,7 +255,10 @@ fn classify_lines(lines: &[&str], max_trace_lines: usize) -> (Vec<LogLine>, usiz
         if in_trace {
             trace_lines += 1;
             if trace_lines >= max_trace_lines {
-                trace_flavor = None;
+                if let Some(flavor) = trace_flavor.take() {
+                    cut_flavor = Some(flavor);
+                    traces_truncated += 1;
+                }
             }
         }
         let level = classify_level(content);
@@ -218,7 +279,12 @@ fn classify_lines(lines: &[&str], max_trace_lines: usize) -> (Vec<LogLine>, usiz
             score: score.min(100),
         });
     }
-    (classified, traces_seen)
+    Classification {
+        lines: classified,
+        traces_seen,
+        traces_truncated,
+        truncated_tail,
+    }
 }
 /// The highest-priority classification of a line.
 fn classify_level(line: &str) -> LogLevel {
@@ -747,15 +813,18 @@ mod tests {
         assert_eq!(details["total_lines"], 64);
     }
     #[test]
-    fn short_logs_are_declined() {
+    fn short_logs_are_declined_with_the_reason() {
         let content = "line one\nline two\n";
         let result = LogCompressor.compress(content, &RuleContext::new(100));
         assert!(!result.modified);
-        assert!(result.details.is_none());
+        let details = result.details.expect("the decline reports why");
+        assert_eq!(details["reason"], "below_min_lines");
+        assert_eq!(details["total_lines"], 2);
+        assert_eq!(details["min_lines"], 50);
     }
     #[test]
     fn python_tracebacks_are_flagged() {
-        let (lines, seen) = classify_lines(
+        let classification = classify_lines(
             &[
                 "Traceback (most recent call last):",
                 "  File \"a.py\", line 3, in <module>",
@@ -764,10 +833,28 @@ mod tests {
             ],
             20,
         );
-        assert_eq!(seen, 1);
+        let lines = classification.lines;
+        assert_eq!(classification.traces_seen, 1);
+        assert_eq!(classification.traces_truncated, 0);
+        assert_eq!(classification.truncated_tail, Vec::<usize>::new());
         assert!(lines[0].stack_trace);
         assert!(lines[1].stack_trace);
         assert!(lines[2].stack_trace);
         assert!(!lines[3].stack_trace);
+    }
+    #[test]
+    fn a_trace_past_the_cap_reports_its_dropped_tail() {
+        let mut body = vec!["Traceback (most recent call last):".to_owned()];
+        for index in 0..10 {
+            body.push(format!("  File \"a{index}.py\", line {index}, in <module>"));
+        }
+        body.push("ValueError: boom".to_owned());
+        let borrowed: Vec<&str> = body.iter().map(String::as_str).collect();
+        let classification = classify_lines(&borrowed, 4);
+        // The tail is reclassified as new traces, so the cap cuts more than once.
+        assert_eq!(classification.traces_truncated, 3);
+        // The lines past the cap that continue the same trace are recorded.
+        assert_eq!(classification.truncated_tail.len(), 7);
+        assert_eq!(classification.truncated_tail.first(), Some(&4));
     }
 }

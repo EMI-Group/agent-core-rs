@@ -6,14 +6,19 @@
 //! A team may declare a pool of interchangeable LLM endpoints
 //! ([`TeamAgentSpec::model_pool`](crate::schema::TeamAgentSpec::model_pool)). The allocator hands
 //! one endpoint to each member so concurrent members spread over the pool instead of saturating a
-//! single endpoint. Two strategies ship in this port — the router/intelli-router strategies are
-//! deferred — selected by [`ModelPoolStrategy`](crate::schema::ModelPoolStrategy):
+//! single endpoint. The strategy is selected by
+//! [`ModelPoolStrategy`](crate::schema::ModelPoolStrategy):
 //!
 //! * [`ModelPoolStrategy::RoundRobin`](crate::schema::ModelPoolStrategy::RoundRobin) rotates through
 //!   every entry in pool order, ignoring the requested model name. Always allocates.
 //! * [`ModelPoolStrategy::ByModelName`](crate::schema::ModelPoolStrategy::ByModelName) picks the
 //!   entry whose `model_name` the member asked for,
 //!   falling back to the first entry when the pool does not serve that name.
+//! * [`ModelPoolStrategy::IntelliRouter`](crate::schema::ModelPoolStrategy::IntelliRouter) is
+//!   modelled on the wire but never allocates: that strategy needs the `IntelliRouter` client-side
+//!   reliable router and its route-group service, which this port does not implement, so every
+//!   allocation is a typed [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported)
+//!   refusal.
 //!
 //! Python builds no allocator when the pool is empty and lets every member resolve its per-agent
 //! model. Here the allocator is always constructed and an empty pool reports the caller's requested
@@ -44,6 +49,9 @@ use crate::schema::{ModelPoolEntry, ModelPoolStrategy};
 /// Error a member gets when neither a pool entry nor a model name is available.
 const NO_MODEL_MESSAGE: &str =
     "no model configured for member; set model_pool or a member model name";
+
+/// Refusal for the `intelli_router` strategy, whose router client this port does not carry.
+const INTELLI_ROUTER_MESSAGE: &str = "the intelli_router model-pool strategy requires the IntelliRouter client-side reliable router and its route-group service, which this port does not implement";
 
 /// One allocation result: the model name a member runs on and its position in the pool.
 ///
@@ -134,25 +142,37 @@ impl ModelAllocator {
     ///
     /// # Errors
     ///
+    /// Returns [`Error::Unsupported`] when the strategy is
+    /// [`ModelPoolStrategy::IntelliRouter`]: that strategy needs the `IntelliRouter` client-side
+    /// reliable router and its route-group service, which this port does not implement, so the
+    /// refusal is typed and fires before the empty-pool echo and before any round-robin/by-name
+    /// dispatch.
+    ///
     /// Returns [`Error::Config`] when the pool is empty and
     /// no model name was requested — there is nothing to allocate and nothing to echo back.
     pub fn allocate(&self, model_name: Option<&str>) -> Result<TeamModelAllocation> {
-        if self.entries.is_empty() {
-            return match model_name {
-                // Without a pool the member keeps the model its own spec declares.
-                Some(name) => Ok(TeamModelAllocation::new(name, 0)),
-                None => Err(Error::config(NO_MODEL_MESSAGE)),
-            };
+        match self.strategy {
+            // Refused first, so the unported strategy can never fall through to the empty-pool echo
+            // or to a round-robin/by-name dispatch.
+            ModelPoolStrategy::IntelliRouter => Err(Error::unsupported(INTELLI_ROUTER_MESSAGE)),
+            ModelPoolStrategy::RoundRobin | ModelPoolStrategy::ByModelName
+                if self.entries.is_empty() =>
+            {
+                match model_name {
+                    // Without a pool the member keeps the model its own spec declares.
+                    Some(name) => Ok(TeamModelAllocation::new(name, 0)),
+                    None => Err(Error::config(NO_MODEL_MESSAGE)),
+                }
+            }
+            ModelPoolStrategy::RoundRobin => Ok(self.allocate_round_robin()),
+            ModelPoolStrategy::ByModelName => Ok(self.allocate_by_name(model_name)),
         }
-        Ok(match self.strategy {
-            ModelPoolStrategy::RoundRobin => self.allocate_round_robin(),
-            ModelPoolStrategy::ByModelName => self.allocate_by_name(model_name),
-        })
     }
 
     /// Snapshot of the allocator cursor for session persistence.
     ///
-    /// The shape is `{"strategy": "round_robin"|"by_model_name", "next_index": n}`, where
+    /// The shape is
+    /// `{"strategy": "round_robin"|"by_model_name"|"intelli_router", "next_index": n}`, where
     /// `next_index` is the pool position the next allocation hands out.
     #[must_use]
     pub fn state_dict(&self) -> Value {
@@ -165,9 +185,12 @@ impl ModelAllocator {
     /// Restores an allocator cursor from [`ModelAllocator::state_dict`] output.
     ///
     /// The pool itself is never persisted — it is rebuilt from the spec — so the restored allocator
-    /// is empty and carries only the strategy and cursor. A missing or unknown strategy restores as
-    /// [`ModelPoolStrategy::RoundRobin`] (the Python default), and a missing or malformed
-    /// `next_index` restores as `0`.
+    /// is empty and carries only the strategy and cursor. A known strategy wire value (including
+    /// `"intelli_router"`) restores faithfully, an unknown string restores as
+    /// [`ModelPoolStrategy::RoundRobin`] with one warning — so a state dict written by a newer
+    /// runtime still restores — and an absent strategy restores as
+    /// [`ModelPoolStrategy::RoundRobin`] silently, which is the Python default rather than an
+    /// anomaly. A missing or malformed `next_index` restores as `0`.
     ///
     /// # Errors
     ///
@@ -280,21 +303,43 @@ impl Default for ModelAllocator {
     }
 }
 
-/// Returns the wire value of `strategy` (`"round_robin"` / `"by_model_name"`).
+/// Returns the wire value of `strategy` (`"round_robin"` / `"by_model_name"` / `"intelli_router"`).
 const fn strategy_wire(strategy: ModelPoolStrategy) -> &'static str {
     match strategy {
         ModelPoolStrategy::RoundRobin => "round_robin",
         ModelPoolStrategy::ByModelName => "by_model_name",
+        ModelPoolStrategy::IntelliRouter => "intelli_router",
     }
 }
 
-/// Parses a persisted strategy value, defaulting to round-robin.
+/// Parses a persisted strategy value.
+///
+/// Three-way rule: a known wire value restores faithfully, a present but unknown string restores
+/// [`ModelPoolStrategy::RoundRobin`] with one warning (so a state dict written by a newer runtime
+/// still restores), and an absent or null strategy restores [`ModelPoolStrategy::RoundRobin`]
+/// silently because that is the Python default, not an anomaly.
 fn strategy_from_state(value: Option<&Value>) -> ModelPoolStrategy {
-    match value.and_then(Value::as_str) {
-        Some("by_model_name") => ModelPoolStrategy::ByModelName,
-        // An absent or unknown strategy is the Python default rather than an error, so a state
-        // dict written by a newer runtime still restores.
-        _ => ModelPoolStrategy::RoundRobin,
+    match value {
+        None | Some(Value::Null) => ModelPoolStrategy::RoundRobin,
+        Some(Value::String(raw)) => match raw.as_str() {
+            "round_robin" => ModelPoolStrategy::RoundRobin,
+            "by_model_name" => ModelPoolStrategy::ByModelName,
+            "intelli_router" => ModelPoolStrategy::IntelliRouter,
+            unknown => {
+                tracing::warn!(
+                    strategy = unknown,
+                    "unknown model-pool strategy in allocator state; restoring round_robin"
+                );
+                ModelPoolStrategy::RoundRobin
+            }
+        },
+        Some(other) => {
+            tracing::warn!(
+                strategy = %other,
+                "non-string model-pool strategy in allocator state; restoring round_robin"
+            );
+            ModelPoolStrategy::RoundRobin
+        }
     }
 }
 
@@ -487,10 +532,6 @@ mod tests {
         assert_eq!(restored.strategy(), ModelPoolStrategy::RoundRobin);
         assert_eq!(restored.state_dict()["next_index"], json!(0));
 
-        let restored =
-            ModelAllocator::from_state_dict(&json!({"strategy": "intelli_router"})).unwrap();
-        assert_eq!(restored.strategy(), ModelPoolStrategy::RoundRobin);
-
         let restored = ModelAllocator::from_state_dict(&json!({"next_index": "7"})).unwrap();
         assert_eq!(restored.state_dict()["next_index"], json!(0));
 
@@ -499,6 +540,86 @@ mod tests {
             restored.state_dict(),
             json!({"strategy": "round_robin", "next_index": 4})
         );
+
+        // A known `intelli_router` value is restored faithfully rather than degraded to round-robin,
+        // so the deferred strategy stays a typed refusal instead of a silent fallback.
+        let restored =
+            ModelAllocator::from_state_dict(&json!({"strategy": "intelli_router"})).unwrap();
+        assert_eq!(restored.strategy(), ModelPoolStrategy::IntelliRouter);
+        let error = restored
+            .allocate(None)
+            .expect_err("intelli_router is unported");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(error.to_string().contains("intelli_router"), "{error}");
+    }
+
+    #[test]
+    fn a_populated_intelli_router_allocator_refuses_every_allocation() {
+        let allocator = ModelAllocator::new(&pool(3), ModelPoolStrategy::IntelliRouter);
+        for requested in [None, Some("m1")] {
+            let error = allocator
+                .allocate(requested)
+                .expect_err("intelli_router is unported");
+            assert_eq!(error.kind(), ErrorKind::Unsupported);
+            assert!(error.to_string().contains("intelli_router"), "{error}");
+        }
+        // The refusal never advances the cursor or echoes the requested name.
+        assert_eq!(allocator.state_dict()["next_index"], json!(0));
+    }
+
+    #[test]
+    fn intelli_router_state_dict_round_trips() {
+        let mut allocator = ModelAllocator::new(&pool(3), ModelPoolStrategy::IntelliRouter);
+        // An IntelliRouter allocator never allocates, so pin a cursor to prove the value round-trips.
+        allocator.cursor = Mutex::new(2);
+        let state = allocator.state_dict();
+        assert_eq!(
+            state,
+            json!({"strategy": "intelli_router", "next_index": 2})
+        );
+
+        let restored = ModelAllocator::from_state_dict(&state).expect("object state");
+        assert!(restored.is_empty(), "the pool is rebuilt from the spec");
+        assert_eq!(restored.strategy(), ModelPoolStrategy::IntelliRouter);
+        assert_eq!(restored.state_dict(), state);
+    }
+
+    #[test]
+    fn from_state_dict_tolerates_unknown_and_absent_strategies() {
+        let restored = ModelAllocator::from_state_dict(&json!({"strategy": "bogus"})).unwrap();
+        assert_eq!(restored.strategy(), ModelPoolStrategy::RoundRobin);
+
+        let restored =
+            ModelAllocator::from_state_dict(&json!({"strategy": "by_model_name"})).unwrap();
+        assert_eq!(restored.strategy(), ModelPoolStrategy::ByModelName);
+
+        for state in [json!({"strategy": null}), json!({})] {
+            let restored = ModelAllocator::from_state_dict(&state).unwrap();
+            assert_eq!(
+                restored.strategy(),
+                ModelPoolStrategy::RoundRobin,
+                "state {state}"
+            );
+        }
+    }
+
+    #[test]
+    fn intelli_router_refuses_before_the_empty_pool_echo() {
+        let allocator = ModelAllocator::new(&[], ModelPoolStrategy::IntelliRouter);
+        assert!(allocator.is_empty());
+
+        // Neither the requested-name echo nor the empty-pool config error: a typed refusal.
+        let error = allocator
+            .allocate(Some("gpt-4o"))
+            .expect_err("an empty IntelliRouter pool is still refused");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(error.to_string().contains("intelli_router"), "{error}");
+
+        let error = allocator
+            .allocate(None)
+            .expect_err("an empty IntelliRouter pool is still refused");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(error.to_string().contains("intelli_router"), "{error}");
     }
 
     #[test]

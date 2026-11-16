@@ -42,6 +42,12 @@ fn pool_strategy_maps_onto_router_strategy() {
         RouterStrategy::from(ModelPoolStrategy::ByModelName),
         RouterStrategy::ByName
     );
+    // `RouterStrategy` has no IntelliRouter behaviour, so the conversion rotates; a team really
+    // configured with `IntelliRouter` is refused at allocation instead of reaching this mapping.
+    assert_eq!(
+        RouterStrategy::from(ModelPoolStrategy::IntelliRouter),
+        RouterStrategy::RoundRobin
+    );
     assert_eq!(RouterStrategy::default(), RouterStrategy::RoundRobin);
 }
 

@@ -93,6 +93,10 @@ fn payload_metadata(payload: &Value) -> Map<String, Value> {
 }
 
 /// The request [`Message`], decoded from the params or synthesized.
+///
+/// A `message` member that does not decode is reported at `warn` and replaced by
+/// the synthesized form, because dropping the whole request would fail a caller
+/// whose payload is otherwise usable.
 fn request_message(params: &Value, payload: &Value, task_id: &str, context_id: &str) -> Message {
     let Some(wire) = params.get("message") else {
         return synthesized_message(payload, task_id, context_id);
@@ -100,7 +104,10 @@ fn request_message(params: &Value, payload: &Value, task_id: &str, context_id: &
     match serde_json::from_value::<Message>(wire.clone()) {
         Ok(message) => message,
         Err(error) => {
-            tracing::debug!(
+            // The caller's own message is being replaced by a synthesized one, so
+            // this is worth a warning rather than a debug line: the parts the
+            // request carried are lost, and only `query` survives.
+            tracing::warn!(
                 %error,
                 "A2A request message did not decode; synthesizing it from the payload"
             );

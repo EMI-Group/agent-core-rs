@@ -12,6 +12,7 @@ use crate::policy::ContextWindowSnapshot;
 use crate::processor::ProcessorContext;
 use crate::reload::{inject_reload_hint, ReloadLanguage};
 use crate::stats::{compute_stats, PreparedContext};
+use crate::telemetry::recorder::TokenProvenance;
 use crate::telemetry::CompressionStatePhase;
 use crate::tokens::count_messages;
 use crate::window::{assemble_window, drop_orphan_tool_results, WindowOptions};
@@ -19,6 +20,39 @@ use crate::window::{assemble_window, drop_orphan_tool_results, WindowOptions};
 use super::{ConversationContext, ModelContext};
 
 impl ConversationContext {
+    /// How this context's token counts are produced.
+    ///
+    /// A boxed [`TokenCounter`](openjiuwen_foundation::prompt::TokenCounter)
+    /// cannot describe itself, so the declarations the context carries are
+    /// consulted in order, and the answer is conservative when none of them
+    /// speaks:
+    ///
+    /// 1. the recorder's declared provenance — the engine installs it together
+    ///    with the counter it hands the pipeline, and a caller may declare it
+    ///    with [`with_token_counter_provenance`];
+    /// 2. the usage analyzer's [`CounterIdentity`], the identity that analyzer
+    ///    publishes its own measurements under;
+    /// 3. an unnamed estimate, because claiming exactness without a declaration
+    ///    is exactly the lie this vocabulary exists to prevent.
+    ///
+    /// [`with_token_counter_provenance`]:
+    ///     crate::telemetry::ContextProcessorStateRecorder::with_token_counter_provenance
+    /// [`CounterIdentity`]: crate::usage::CounterIdentity
+    pub(crate) fn counter_provenance(&self) -> TokenProvenance {
+        if let Some(recorder) = self.recorder.as_ref() {
+            return recorder.token_provenance();
+        }
+        if let Some(analyzer) = self.usage_analyzer.as_ref() {
+            return TokenProvenance::from_source(analyzer.counter_identity().source);
+        }
+        TokenProvenance::unverified("the context's token counter does not declare how it counts")
+    }
+
+    /// Whether this context's token counts are estimates.
+    fn counts_are_estimated(&self) -> bool {
+        self.counter_provenance().is_estimated()
+    }
+
     /// Runs the processor pipeline over `messages` in `phase`.
     ///
     /// `manual` bypasses the threshold check, which is what an explicit
@@ -43,6 +77,9 @@ impl ConversationContext {
             cancellation: &self.cancellation,
             recall: self.recall.as_deref(),
             session_memory: self.session_memory.as_deref(),
+            // The prepare pass holds no agent: extraction belongs to the
+            // compaction pass, which is the only one that replaces history.
+            session_memory_agent: None,
         };
         self.pipeline.run_in_phase(messages, &cx, phase).await
     }
@@ -101,7 +138,12 @@ impl ConversationContext {
                 "reload hint injection for a prepared context window"
             );
         }
-        let stats = compute_stats(&messages, self.counter.as_ref());
+        // The prepared window is the crate's most-read total, so its statistics
+        // carry the provenance of the counter that produced them: a native
+        // selection declared on the recorder is exact, everything else is an
+        // estimate.
+        let stats = compute_stats(&messages, self.counter.as_ref())
+            .with_estimated(self.counts_are_estimated());
         let token_count = count_messages(self.counter.as_ref(), &messages);
         // The LLM-bound window splits at the leading system messages; the split
         // feeds both the usage snapshot and the KV-cache diff.

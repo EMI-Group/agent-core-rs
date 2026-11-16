@@ -30,11 +30,26 @@
 //!   [`Error::Validation`]. [`RoutingStrategy::Custom`] names behave as
 //!   `ordered-failover`.
 //!
+//! - **Rate limits** — a route's `rpm`/`tpm` hints are enforced per provider/model
+//!   key (see [`super::limit`]): the prompt tokens are reserved from an estimate
+//!   before the request and reconciled with the usage the provider reports, and a
+//!   budget that cannot free up within the route/group `timeout_seconds` is a
+//!   [`Error::timeout`] naming TPM/RPM. The limiter and its state belong to this
+//!   model instance; nothing is shared process-wide.
+//! - **Attempt deadline** — an attempt is wrapped in a `tokio::time::timeout` of
+//!   the route's own `timeout`, falling back to the group `timeout_seconds`: a
+//!   timeout is an ordinary retryable failure, so it fails over to the next
+//!   candidate, and when every candidate timed out the returned error is
+//!   [`Error::timeout`]. On the streaming path the deadline bounds the time until
+//!   the first chunk — the failover window — because once a chunk reached the
+//!   caller the route is committed.
+//!
 //! Every per-route call uses the route's compiled request config as defaults and
 //! lets the caller's request win where it is set (including a deep merge of
 //! [`ModelRequestConfig::extra`]).
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -44,11 +59,12 @@ use openjiuwen_common::error::{Error, ErrorKind, Result};
 use tracing::{debug, warn};
 
 use super::compiler::{compile_route, enabled_routes, strategy_tags, INTELLI_ROUTER_PROVIDER};
+use super::limit::{Clock, LimitKey, Limits, RateLimiter, Reservation};
 use super::schema::{ResolvedModelGroup, ResolvedRoute, ResolvedRoutingConfig, RoutingStrategy};
 use crate::llm::config::ModelRequestConfig;
 use crate::llm::factory::init_model;
 use crate::llm::model::{ChatResponse, Model, StreamChunk};
-use crate::prompt::BaseMessage;
+use crate::prompt::{ApproxTokenCounter, BaseMessage, TokenCounter, Usage};
 
 /// Tracing target of the routing layer.
 const TRACING_TARGET: &str = "openjiuwen_foundation::llm::routing";
@@ -81,6 +97,7 @@ pub struct RoutingModel {
     entries: Vec<RoutingEntry>,
     routing: ResolvedRoutingConfig,
     fallback_tag: Option<String>,
+    limiter: Arc<RateLimiter>,
 }
 
 /// One candidate: its resolved route, the built model, and its request defaults.
@@ -91,6 +108,25 @@ struct RoutingEntry {
 }
 
 impl RoutingEntry {
+    /// The rate-limit budget key of this route: its provider plus model name.
+    fn limit_key(&self) -> LimitKey {
+        LimitKey::new(&self.route.model.provider, &self.route.model.model_name)
+    }
+
+    /// The per-minute budgets this route declares; `None` fields are unthrottled.
+    fn limits(&self) -> Limits {
+        Limits::new(self.route.rpm, self.route.tpm)
+    }
+
+    /// The deadline of one attempt on this route.
+    ///
+    /// The route's own `timeout` wins over the group `timeout_seconds`, because a
+    /// per-route setting is the more specific one; with neither set an attempt is
+    /// unbounded.
+    fn attempt_timeout(&self, routing: &ResolvedRoutingConfig) -> Option<Duration> {
+        positive_duration(self.route.timeout).or_else(|| positive_duration(routing.timeout_seconds))
+    }
+
     /// Builds the request one route call uses.
     ///
     /// The route's compiled request config supplies the defaults (model name,
@@ -150,6 +186,13 @@ struct PreparedRoute {
     model_name: String,
     model: Arc<dyn Model>,
     request: ModelRequestConfig,
+    limiter: Arc<RateLimiter>,
+    limit_key: LimitKey,
+    limits: Limits,
+    /// Prompt-token estimate reserved before the request.
+    reserved_tokens: u64,
+    /// Attempt deadline; `None` means unbounded.
+    timeout: Option<Duration>,
 }
 
 impl RoutingModel {
@@ -220,6 +263,24 @@ impl RoutingModel {
         self
     }
 
+    /// Drives the TPM/RPM limiter with `clock` instead of the real clock.
+    ///
+    /// The limiter and its window state belong to this routing model instance — no
+    /// state is process-global — so replacing the clock starts from an empty
+    /// window. Passing a virtual [`Clock`] is how a caller (or a test) makes a
+    /// budget wait resolve without wall-clock time passing.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.limiter = Arc::new(RateLimiter::new(clock));
+        self
+    }
+
+    /// The rate limiter enforcing this model's per-provider TPM/RPM budgets.
+    #[must_use]
+    pub fn rate_limiter(&self) -> &RateLimiter {
+        &self.limiter
+    }
+
     /// The id of the model group this model routes over.
     #[must_use]
     pub fn model_group_id(&self) -> &str {
@@ -261,6 +322,7 @@ impl RoutingModel {
             entries,
             routing: group.routing(),
             fallback_tag: group.fallback_tag.clone(),
+            limiter: Arc::new(RateLimiter::system()),
         }
     }
 
@@ -336,23 +398,148 @@ impl RoutingModel {
     fn exhausted_error(&self, attempted: &[String], last: Option<Error>) -> Error {
         exhausted_error(&self.model_group_id, attempted, last)
     }
+
+    /// The routes one streamed call may attempt, with everything the stream needs.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the candidate errors of [`attempts`](Self::attempts).
+    fn prepare_stream(
+        &self,
+        messages: &[BaseMessage],
+        request: &ModelRequestConfig,
+    ) -> Result<Vec<PreparedRoute>> {
+        let reserved_tokens = estimate_prompt_tokens(messages);
+        Ok(self
+            .attempts()?
+            .into_iter()
+            .map(|entry| PreparedRoute {
+                route_id: entry.route.route_id.clone(),
+                model_name: entry.route.model.model_name.clone(),
+                model: Arc::clone(&entry.model),
+                request: entry.effective_request(request),
+                limiter: Arc::clone(&self.limiter),
+                limit_key: entry.limit_key(),
+                limits: entry.limits(),
+                reserved_tokens,
+                timeout: entry.attempt_timeout(&self.routing),
+            })
+            .collect())
+    }
+
+    /// Reserves this route's TPM/RPM budget for one attempt.
+    ///
+    /// The prompt tokens are reserved from an estimate of `messages`; the caller
+    /// reconciles the reservation with the usage the provider reports. The wait is
+    /// bounded by the same deadline [`RoutingEntry::attempt_timeout`] gives the
+    /// attempt, so throttling can never outlive the route it belongs to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for a route that declares a non-positive
+    /// budget and [`Error::timeout`] (naming TPM/RPM) when the budget cannot free
+    /// up inside the deadline.
+    async fn reserve(&self, entry: &RoutingEntry, messages: &[BaseMessage]) -> Result<Reservation> {
+        self.limiter
+            .reserve(
+                &entry.limit_key(),
+                entry.limits(),
+                estimate_prompt_tokens(messages),
+                entry.attempt_timeout(&self.routing),
+            )
+            .await
+    }
 }
 
 /// Builds the "all routes failed" error, naming the attempted routes and the cause.
+///
+/// The kind follows the last cause where that matters: a group whose every
+/// candidate timed out reports [`Error::timeout`], everything else reports
+/// [`Error::llm`].
 fn exhausted_error(model_group_id: &str, attempted: &[String], last: Option<Error>) -> Error {
     let routes = attempted.join(", ");
     match last {
-        Some(error) => Error::llm(format!(
-            "all routes failed for model_group_id={model_group_id}: attempted=[{routes}]; \
-             last: {} ({})",
-            error.kind(),
-            error.message()
-        )),
+        Some(error) => {
+            let message = format!(
+                "all routes failed for model_group_id={model_group_id}: attempted=[{routes}]; \
+                 last: {} ({})",
+                error.kind(),
+                error.message()
+            );
+            if error.kind() == ErrorKind::Timeout {
+                Error::timeout(message)
+            } else {
+                Error::llm(message)
+            }
+        }
         None => Error::llm(format!(
             "all routes failed for model_group_id={model_group_id}: attempted=[{routes}]; \
              no route reported a cause"
         )),
     }
+}
+
+/// The error of one route attempt whose deadline expired.
+fn route_timeout_error(route_id: &str, limit: Duration) -> Error {
+    Error::timeout(format!(
+        "route {route_id} exceeded its {limit:?} routing timeout"
+    ))
+}
+
+/// Reads the next item of one route stream, honouring the attempt deadline.
+///
+/// The deadline only binds while the attempt has not reached the caller
+/// (`committed`): it bounds time to the first chunk — the failover window —
+/// because once a chunk was emitted the route is committed and a deadline would
+/// truncate a legitimate answer. An expired deadline becomes a [`Error::timeout`]
+/// item, so the caller handles it as an ordinary route failure.
+async fn next_stream_item(
+    stream: &mut BoxStream<'static, Result<StreamChunk>>,
+    timeout: Option<Duration>,
+    committed: bool,
+    route_id: &str,
+) -> Option<Result<StreamChunk>> {
+    match timeout.filter(|_| !committed) {
+        Some(limit) => match tokio::time::timeout(limit, stream.next()).await {
+            Ok(next) => next,
+            Err(_elapsed) => Some(Err(route_timeout_error(route_id, limit))),
+        },
+        None => stream.next().await,
+    }
+}
+
+/// Reads a seconds-valued deadline, ignoring a value that cannot be one.
+///
+/// `compile_route` already validates a route's own `timeout`; a group
+/// `timeout_seconds` arrives unvalidated, and a non-positive or non-finite value
+/// must not panic in `Duration::from_secs_f64`, so it means "no deadline".
+fn positive_duration(seconds: Option<f64>) -> Option<Duration> {
+    let seconds = seconds.filter(|value| value.is_finite() && *value > 0.0)?;
+    Duration::try_from_secs_f64(seconds).ok()
+}
+
+/// Estimates the prompt tokens of one call, reserving them from the TPM budget.
+fn estimate_prompt_tokens(messages: &[BaseMessage]) -> u64 {
+    u64::try_from(ApproxTokenCounter::default().count_messages(messages)).unwrap_or(u64::MAX)
+}
+
+/// The total tokens to charge a budget, when the provider reported any.
+fn usage_tokens(usage: &Usage) -> Option<u64> {
+    if usage.total_tokens > 0 {
+        Some(usage.total_tokens)
+    } else if usage.input_tokens > 0 || usage.output_tokens > 0 {
+        Some(usage.input_tokens.saturating_add(usage.output_tokens))
+    } else {
+        None
+    }
+}
+
+/// The total tokens of a completed response, when the provider reported any.
+fn usage_tokens_of_response(response: &Result<ChatResponse>) -> Option<u64> {
+    response
+        .as_ref()
+        .ok()
+        .and_then(|response| usage_tokens(&response.usage))
 }
 
 impl fmt::Debug for RoutingModel {
@@ -388,10 +575,25 @@ impl Model for RoutingModel {
         let mut last_error: Option<Error> = None;
         for entry in attempts {
             attempted.push(entry.route.route_id.clone());
-            let response = entry
-                .model
-                .invoke(messages, &entry.effective_request(request))
-                .await;
+            let reservation = self.reserve(entry, messages).await?;
+            let attempt_request = entry.effective_request(request);
+            let timeout = entry.attempt_timeout(&self.routing);
+            let response = match timeout {
+                Some(limit) => {
+                    match tokio::time::timeout(
+                        limit,
+                        entry.model.invoke(messages, &attempt_request),
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(_elapsed) => Err(route_timeout_error(&entry.route.route_id, limit)),
+                    }
+                }
+                None => entry.model.invoke(messages, &attempt_request).await,
+            };
+            self.limiter
+                .reconcile(&reservation, usage_tokens_of_response(&response));
             match response {
                 Ok(response) => {
                     if attempted.len() > 1 {
@@ -430,16 +632,8 @@ impl Model for RoutingModel {
         messages: Vec<BaseMessage>,
         request: ModelRequestConfig,
     ) -> BoxStream<'static, Result<StreamChunk>> {
-        let prepared: Vec<PreparedRoute> = match self.attempts() {
-            Ok(attempts) => attempts
-                .into_iter()
-                .map(|entry| PreparedRoute {
-                    route_id: entry.route.route_id.clone(),
-                    model_name: entry.route.model.model_name.clone(),
-                    model: Arc::clone(&entry.model),
-                    request: entry.effective_request(&request),
-                })
-                .collect(),
+        let prepared = match self.prepare_stream(&messages, &request) {
+            Ok(prepared) => prepared,
             Err(error) => return Box::pin(futures::stream::once(async move { Err(error) })),
         };
         let group_id = self.model_group_id.clone();
@@ -449,11 +643,47 @@ impl Model for RoutingModel {
             let mut emitted = false;
             for route in prepared {
                 attempted.push(route.route_id.clone());
+                let reservation = match route
+                    .limiter
+                    .reserve(
+                        &route.limit_key,
+                        route.limits,
+                        route.reserved_tokens,
+                        route.timeout,
+                    )
+                    .await
+                {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        // The budget cannot free up inside the configured deadline,
+                        // so waiting on another route would only repeat the wait.
+                        warn!(
+                            target: TRACING_TARGET,
+                            group = %group_id,
+                            route = %route.route_id,
+                            model = %route.model_name,
+                            kind = %error.kind(),
+                            "model route rate limit cannot be satisfied; propagating the failure"
+                        );
+                        Err::<(), Error>(error)?;
+                        return;
+                    }
+                };
                 let mut stream = route.model.stream(messages.clone(), route.request);
+                let mut usage = Usage::default();
                 let mut failure: Option<Error> = None;
-                while let Some(item) = stream.next().await {
+                loop {
+                    let Some(item) =
+                        next_stream_item(&mut stream, route.timeout, emitted, &route.route_id)
+                            .await
+                    else {
+                        break;
+                    };
                     match item {
                         Ok(chunk) => {
+                            if let StreamChunk::Usage(reported) = &chunk {
+                                usage.add(reported);
+                            }
                             emitted = true;
                             yield chunk;
                         }
@@ -463,6 +693,11 @@ impl Model for RoutingModel {
                         }
                     }
                 }
+                // A stream that ends (or fails) leaves its reservation charged with
+                // the provider-reported usage; no usage means the estimate stands.
+                route
+                    .limiter
+                    .reconcile(&reservation, usage_tokens(&usage));
                 let Some(error) = failure else {
                     return;
                 };

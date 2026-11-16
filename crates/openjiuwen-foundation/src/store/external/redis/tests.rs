@@ -4,6 +4,11 @@
 //! decodes client commands with this module's own [`Decoder`] and answers with
 //! hand-built RESP frames. Nothing here leaves the loopback interface, and no
 //! test needs a running server.
+//!
+//! The `rediss://` transport is checked with [`RawProbe`], a protocol-blind
+//! loopback server that records the first bytes a client writes: those must be a
+//! TLS handshake record, so the TLS path is proven without completing a handshake
+//! (which would need a trusted certificate chain the offline build cannot mint).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -386,22 +391,187 @@ async fn url_supplies_credentials_and_database() {
     assert_eq!(commands[1], vec!["SELECT", "4"]);
 }
 
-#[tokio::test]
-async fn rediss_urls_are_unsupported() {
-    let error = RedisConfig::from_url("rediss://localhost:6379")
-        .connect()
-        .await
-        .expect_err("TLS is not available");
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
+#[test]
+fn rediss_url_parses_with_tls_and_fields() {
+    let resolved = RedisConfig::from_url("rediss://user:pass@host:6390/2")
+        .resolved()
+        .expect("resolved");
+    assert!(resolved.tls, "a rediss:// URL enables TLS");
+    assert_eq!(resolved.addr, "host:6390");
+    assert_eq!(resolved.username.as_deref(), Some("user"));
+    assert_eq!(resolved.password.as_deref(), Some("pass"));
+    assert_eq!(resolved.db, Some(2));
+}
+
+#[test]
+fn rediss_url_without_port_keeps_the_default_port() {
+    let resolved = RedisConfig::from_url("rediss://cache.internal")
+        .resolved()
+        .expect("resolved");
+    assert!(resolved.tls);
+    assert_eq!(resolved.addr, "cache.internal:6379");
+    assert_eq!(resolved.db, None);
+}
+
+#[test]
+fn redis_url_stays_cleartext() {
+    let resolved = RedisConfig::from_url("redis://localhost:6390/3")
+        .resolved()
+        .expect("resolved");
+    assert!(!resolved.tls);
+    assert_eq!(resolved.addr, "localhost:6390");
+    assert_eq!(resolved.db, Some(3));
+}
+
+#[test]
+fn explicit_fields_override_a_rediss_url_without_disabling_tls() {
+    let mut config = RedisConfig::from_url("rediss://user:pass@host:6390/2");
+    config.addr = Some("other:7000".to_string());
+    config.username = Some("alice".to_string());
+    config.password = Some(SecretString::new("secret"));
+    config.db = Some(5);
+
+    let resolved = config.resolved().expect("resolved");
+    assert_eq!(resolved.addr, "other:7000");
+    assert_eq!(resolved.username.as_deref(), Some("alice"));
+    assert_eq!(resolved.password.as_deref(), Some("secret"));
+    assert_eq!(resolved.db, Some(5));
+    assert!(
+        resolved.tls,
+        "a rediss URL is never downgraded to cleartext"
+    );
+}
+
+#[test]
+fn with_tls_enables_tls_for_an_explicit_addr() {
+    let resolved = RedisConfig::new("127.0.0.1:6380")
+        .with_tls(true)
+        .resolved()
+        .expect("resolved");
+    assert!(resolved.tls);
+    assert_eq!(resolved.addr, "127.0.0.1:6380");
+
+    let plain = RedisConfig::new("127.0.0.1:6380")
+        .resolved()
+        .expect("resolved");
+    assert!(!plain.tls, "an explicit addr is cleartext by default");
+
+    let default = RedisConfig::default().resolved().expect("resolved");
+    assert_eq!(default.addr, super::DEFAULT_ADDR);
+    assert!(!default.tls);
+}
+
+#[test]
+fn other_url_schemes_are_config_errors() {
+    for url in [
+        "http://localhost:6379",
+        "https://localhost:6379",
+        "unix:///tmp/redis.sock",
+        "redis+tls://localhost:6379",
+    ] {
+        let error = RedisConfig::from_url(url)
+            .resolved()
+            .err()
+            .expect("only redis:// and rediss:// are accepted");
+        assert_eq!(error.kind(), ErrorKind::Config, "{url}: {error}");
+        assert!(error.to_string().contains("scheme"), "{url}: {error}");
+    }
 }
 
 #[tokio::test]
-async fn non_redis_url_schemes_are_config_errors() {
-    let error = RedisConfig::from_url("http://localhost:6379")
+async fn rediss_connect_starts_a_tls_handshake_and_writes_no_resp() {
+    let server = RawProbe::start(None).await;
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        RedisConnection::connect_tls(&server.addr, None, None),
+    )
+    .await
+    .expect("the handshake must not hang")
+    .expect_err("the probe closes the connection mid-handshake");
+
+    assert!(
+        matches!(error.kind(), ErrorKind::External | ErrorKind::Timeout),
+        "unexpected error kind: {error}"
+    );
+    let received = server.received();
+    assert!(
+        received.len() >= 2,
+        "no bytes reached the server: {received:?}"
+    );
+    assert_eq!(
+        &received[..2],
+        &[0x16, 0x03],
+        "the first bytes must be a TLS handshake record, not a RESP command: {received:?}"
+    );
+    for marker in [b"AUTH".as_slice(), b"PING".as_slice(), b"SELECT".as_slice()] {
+        assert!(
+            !contains_sequence(&received, marker),
+            "cleartext RESP reached the server: {received:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rediss_handshake_timeout_is_a_typed_error() {
+    let server = RawProbe::silent().await;
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        RedisConnection::connect_tls_with_timeout(
+            &server.addr,
+            None,
+            None,
+            Duration::from_millis(300),
+        ),
+    )
+    .await
+    .expect("the configured timeout must fire well before the 5 s bound")
+    .expect_err("a silent server never completes the handshake");
+
+    assert_eq!(error.kind(), ErrorKind::Timeout, "{error}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn rediss_config_connect_uses_the_tls_transport() {
+    let server = RawProbe::start(None).await;
+    let error = RedisConfig::from_url(format!("rediss://{}", server.addr))
         .connect()
         .await
-        .expect_err("wrong scheme");
-    assert_eq!(error.kind(), ErrorKind::Config);
+        .expect_err("the probe closes the connection mid-handshake");
+    assert!(
+        matches!(error.kind(), ErrorKind::External | ErrorKind::Timeout),
+        "{error}"
+    );
+    let received = server.received();
+    assert!(
+        received.starts_with(&[0x16, 0x03]),
+        "RedisConfig::connect must dial TLS for a rediss:// URL: {received:?}"
+    );
+}
+
+#[tokio::test]
+async fn tls_host_that_is_not_a_server_name_is_a_config_error() {
+    let error = RedisConnection::connect_tls("bad host:6390", None, None)
+        .await
+        .expect_err("a host with a space cannot become a TLS server name");
+    assert_eq!(error.kind(), ErrorKind::Config, "{error}");
+}
+
+#[tokio::test]
+async fn redis_connect_still_writes_plain_resp_to_the_same_probe() {
+    let server = RawProbe::start(Some(simple("PONG"))).await;
+    let mut connection = RedisConnection::connect(&server.addr, None, None)
+        .await
+        .expect("connect");
+    assert!(!connection.is_tls());
+    connection.ping().await.expect("ping");
+
+    let received = server.received();
+    assert!(
+        received.starts_with(b"*1\r\n$4\r\nPING\r\n"),
+        "redis:// must stay cleartext RESP: {received:?}"
+    );
 }
 
 #[tokio::test]
@@ -826,4 +996,106 @@ async fn ping_round_trips() {
         .expect("connect");
     connection.ping().await.expect("ping");
     assert!(saw(&server.commands(), &["PING"]));
+}
+
+/// A loopback server that records the raw bytes a client writes, protocol-blind.
+///
+/// The `rediss://` transport is proven with this fixture: the first bytes a client
+/// sends must be a TLS handshake record (`0x16 0x03`), never a cleartext RESP
+/// command. A real handshake cannot be completed offline because that needs a
+/// certificate chain the workspace trusts (or a PEM/certificate-generation crate),
+/// so the probe always closes the connection instead.
+struct RawProbe {
+    /// `host:port` the server listens on.
+    addr: String,
+    /// Every byte read from the single accepted connection.
+    received: Arc<Mutex<Vec<u8>>>,
+    /// The accept loop; aborted when the fixture drops.
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RawProbe {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl RawProbe {
+    /// Starts a server that records the first chunk, optionally answers it, and
+    /// then closes the connection.
+    ///
+    /// With `reply: None` the connection is dropped right after the first chunk,
+    /// which aborts a TLS handshake mid-flight.
+    async fn start(reply: Option<Vec<u8>>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&received);
+        let task = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0_u8; 2048];
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => recorder
+                    .lock()
+                    .expect("received")
+                    .extend_from_slice(&buffer[..read]),
+            }
+            let Some(reply) = reply else {
+                // Dropping the stream closes the connection mid-handshake.
+                return;
+            };
+            if stream.write_all(&reply).await.is_err() {
+                return;
+            }
+            // Keep the socket open until the fixture drops, discarding any input.
+            let mut sink = [0_u8; 1024];
+            while let Ok(read) = stream.read(&mut sink).await {
+                if read == 0 {
+                    break;
+                }
+            }
+        });
+        Self {
+            addr,
+            received,
+            task,
+        }
+    }
+
+    /// Starts a server that accepts one connection and then never answers it.
+    async fn silent() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn(async move {
+            let Ok((_stream, _)) = listener.accept().await else {
+                return;
+            };
+            // Hold the socket open without reading or writing: the client must
+            // give up on its own timeout.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        Self {
+            addr,
+            received,
+            task,
+        }
+    }
+
+    /// Every byte the server received so far.
+    fn received(&self) -> Vec<u8> {
+        self.received.lock().expect("received").clone()
+    }
+}
+
+/// Whether `haystack` contains `needle` as a contiguous byte sequence.
+fn contains_sequence(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }

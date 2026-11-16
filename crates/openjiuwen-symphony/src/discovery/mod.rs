@@ -29,7 +29,9 @@
 //!   `skill_index` tool: the virtual category
 //!   [`SkillDirectoryView`](crate::discovery::SkillDirectoryView), the pinned row
 //!   renderers, request validation, and the
-//!   [`SkillIndexToolkit`](crate::discovery::SkillIndexToolkit) execution engine;
+//!   [`SkillIndexToolkit`](crate::discovery::SkillIndexToolkit) execution engine, with the
+//!   catalog's derived [`SkillFsLayout`](crate::discovery::SkillFsLayout) and the
+//!   baseline-driven [`IndexState`](crate::discovery::IndexState) it reports;
 //! - [`settings`](crate::discovery::settings) —
 //!   [`DiscoverySettings`](crate::discovery::DiscoverySettings), the result/output/token
 //!   budget for one discovery round.
@@ -83,6 +85,10 @@ pub use scanner::{
 };
 pub use settings::{DiscoverySettings, DEFAULT_MAX_OUTPUT_CHARS, DEFAULT_MAX_RESULTS};
 
+pub use directory_toolkit::layout::{
+    index_fingerprint, index_state_for, layout_for_records, skillfs_layout, IndexBaseline,
+    IndexState, SkillFsLayout, INDEX_FRESH, INDEX_MISSING, INDEX_STALE, LAYOUT_FLAT, LAYOUT_TREE,
+};
 pub use directory_toolkit::{
     apply_pipeline, empty_message, execute_list, execute_read, execute_search, fit_rows, list_row,
     metadata_card, sanitize_model_text, search_directory_row, search_row, tool_input_schema,

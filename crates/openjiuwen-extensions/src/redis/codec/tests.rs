@@ -113,11 +113,143 @@ fn decode_moved_and_ask_stay_error_replies() {
     );
 }
 #[test]
-fn unsupported_resp3_constructs_are_typed() {
-    let attribute = parse_reply(b"|1\r\n+x\r\n:1\r\n").unwrap_err();
-    assert_eq!(attribute.kind(), ErrorKind::Unsupported);
-    let streamed = parse_reply(b";4\r\nabcd\r\n").unwrap_err();
-    assert_eq!(streamed.kind(), ErrorKind::Unsupported);
+fn attributes_are_projected_onto_the_following_reply() {
+    // Attribute metadata is dropped; the caller sees the reply after the pairs.
+    assert_eq!(
+        parse(b"|1\r\n+key-popularity\r\n,90\r\n+OK\r\n"),
+        Reply::Simple("OK".to_owned())
+    );
+    assert_eq!(
+        parse(b"|2\r\n+a\r\n:1\r\n+b\r\n:2\r\n:7\r\n"),
+        Reply::Integer(7)
+    );
+    // An attribute may decorate a map; the map is the value.
+    assert_eq!(
+        parse(b"|1\r\n+ttl\r\n:10\r\n%2\r\n+k1\r\n+v1\r\n+k2\r\n+v2\r\n"),
+        Reply::Map(vec![
+            (
+                Reply::Simple("k1".to_owned()),
+                Reply::Simple("v1".to_owned())
+            ),
+            (
+                Reply::Simple("k2".to_owned()),
+                Reply::Simple("v2".to_owned())
+            ),
+        ])
+    );
+    // A zero-pair attribute is legal and still projects.
+    assert_eq!(
+        parse(b"|0\r\n:0\r\n"),
+        Reply::Integer(0),
+        "empty attribute bag"
+    );
+    // Attributes nested inside an aggregate decorate the element they precede.
+    assert_eq!(
+        parse(b"*2\r\n|1\r\n+rank\r\n:1\r\n$5\r\nfirst\r\n+bare\r\n"),
+        Reply::Array(vec![
+            Reply::Bulk(b"first".to_vec()),
+            Reply::Simple("bare".to_owned()),
+        ])
+    );
+    // Attribute chains project to the value after the whole chain.
+    assert_eq!(
+        parse(b"|1\r\n+a\r\n+a\r\n|1\r\n+b\r\n+b\r\n:1\r\n"),
+        Reply::Integer(1)
+    );
+}
+#[test]
+fn streamed_strings_are_concatenated_chunks() {
+    assert_eq!(
+        parse(b";4\r\nabcd\r\n;0\r\n"),
+        Reply::Bulk(b"abcd".to_vec())
+    );
+    assert_eq!(
+        parse(b";3\r\nabc\r\n;2\r\nde\r\n;1\r\nf\r\n;0\r\n"),
+        Reply::Bulk(b"abcdef".to_vec())
+    );
+    assert_eq!(parse(b";0\r\n"), Reply::Bulk(Vec::new()));
+    // Chunk payloads stay binary safe, including NUL and CRLF bytes.
+    assert_eq!(
+        parse(b";3\r\n\x00\r\n\r\n;0\r\n"),
+        Reply::Bulk(b"\x00\r\n".to_vec())
+    );
+    // A streamed string inside an aggregate and after an attribute both resolve.
+    assert_eq!(
+        parse(b"*2\r\n;1\r\na\r\n;0\r\n|1\r\n+t\r\n:1\r\n;0\r\n"),
+        Reply::Array(vec![Reply::Bulk(b"a".to_vec()), Reply::Bulk(Vec::new())])
+    );
+}
+#[test]
+fn streamed_strings_parse_incrementally() {
+    let sample = b";3\r\nabc\r\n;2\r\nde\r\n;0\r\n";
+    // Any prefix is incomplete rather than an error or a partial value.
+    for length in 0..sample.len() {
+        assert!(
+            matches!(parse_reply(&sample[..length]), Ok(None)),
+            "prefix at {length} bytes must be incomplete"
+        );
+    }
+    let (reply, consumed) = parse_reply(sample).unwrap().unwrap();
+    assert_eq!(consumed, sample.len());
+    assert_eq!(reply, Reply::Bulk(b"abcde".to_vec()));
+    // A complete reply followed by a partial one consumes only the first, so a
+    // caller can feed the rest of the stream later.
+    let mut buffer = b";1\r\na\r\n;0\r\n;2\r\nbc".to_vec();
+    let (first, used) = parse_reply(&buffer).unwrap().unwrap();
+    assert_eq!(first, Reply::Bulk(b"a".to_vec()));
+    buffer.drain(..used);
+    assert!(matches!(parse_reply(&buffer), Ok(None)));
+    buffer.extend_from_slice(b"\r\n;0\r\n");
+    let (second, used) = parse_reply(&buffer).unwrap().unwrap();
+    assert_eq!(second, Reply::Bulk(b"bc".to_vec()));
+    assert_eq!(used, buffer.len());
+}
+#[test]
+fn oversized_and_malformed_streamed_strings_are_rejected() {
+    let cases: &[&[u8]] = &[
+        b";-1\r\n",              // negative chunk length
+        b";x\r\n",               // non-numeric chunk length
+        b";2\r\nabcd\r\n;0\r\n", // chunk not terminated by its own CRLF
+        b";2\r\nabXY;0\r\n",     // payload terminator is not CRLF
+    ];
+    for case in cases {
+        assert_eq!(
+            parse_reply(case).unwrap_err().kind(),
+            ErrorKind::Transport,
+            "case {case:?}"
+        );
+    }
+    // An attribute without a following reply is merely incomplete, never an error.
+    assert!(matches!(parse_reply(b"|1\r\n+a\r\n:1\r\n"), Ok(None)));
+    // A chunk header beyond `MAX_BULK_LEN` is rejected without allocating.
+    let oversized = format!(";{}\r\n", MAX_BULK_LEN + 1);
+    assert_eq!(
+        parse_reply(oversized.as_bytes()).unwrap_err().kind(),
+        ErrorKind::Transport
+    );
+    // So is an attribute claiming more pairs than `MAX_ELEMENTS`.
+    let huge_attribute = format!("|{}\r\n", MAX_ELEMENTS + 1);
+    assert_eq!(
+        parse_reply(huge_attribute.as_bytes()).unwrap_err().kind(),
+        ErrorKind::Transport
+    );
+    let negative_attribute = parse_reply(b"|-1\r\n").unwrap_err();
+    assert_eq!(negative_attribute.kind(), ErrorKind::Transport);
+    let unknown_element = parse_reply(b"|1\r\n?bad\r\n").unwrap_err();
+    assert_eq!(unknown_element.kind(), ErrorKind::Transport);
+}
+#[test]
+fn attributes_and_streamed_strings_count_towards_the_depth_limit() {
+    // Each attribute level adds one to the nesting depth, so a chain deeper than
+    // `MAX_DEPTH` is rejected instead of recursing without bound.
+    let mut deep = Vec::new();
+    for _ in 0..=MAX_DEPTH {
+        deep.extend_from_slice(b"|0\r\n");
+    }
+    deep.extend_from_slice(b":1\r\n");
+    let error = parse_reply(&deep).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Transport);
+    assert!(error.to_string().contains("nesting"), "{error}");
 }
 #[test]
 fn every_truncation_of_a_complete_stream_is_incomplete() {
@@ -139,6 +271,11 @@ fn every_truncation_of_a_complete_stream_is_incomplete() {
         b"#f\r\n",
         b",2.5\r\n",
         b"(42\r\n",
+        b"|1\r\n+ttl\r\n:1\r\n:7\r\n",
+        b"|0\r\n+OK\r\n",
+        b";0\r\n",
+        b";3\r\nabc\r\n;0\r\n",
+        b"*1\r\n|1\r\n+a\r\n:1\r\n;2\r\nhi\r\n;0\r\n",
     ];
     for sample in samples {
         for length in 0..sample.len() {

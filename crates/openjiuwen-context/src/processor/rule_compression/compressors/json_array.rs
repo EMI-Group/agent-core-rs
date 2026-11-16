@@ -12,34 +12,87 @@
 //! - String, number and mixed arrays render compact JSON when it fits, and
 //!   otherwise keep their first, last, extreme and error-matching rows.
 //!
-//! This is the only compressor that enforces [`fits_budget_and_saves`];
-//! `details` are never emitted, matching Python.
+//! This is the only compressor that enforces [`fits_budget_and_saves`].
+//!
+//! `details` are never emitted for an accepted candidate, matching Python, but
+//! every decline names its reason: `unparsable_array`, `empty_array`,
+//! `no_object_keys`, `too_few_rows`, `candidate_does_not_fit` (the row-preserving
+//! and the salient-row candidate both failed the budget/savings gate) and
+//! `candidate_unchanged`. A number array also reports `unmeasurable_rows`, the
+//! rows `f64` measurement could not score (always 0 for a parsed JSON number
+//! array, so a future measurement gap is visible rather than silently scored
+//! `0.0`).
 //!
 //! [`fits_budget_and_saves`]: crate::processor::rule_compression::common::fits_budget_and_saves
 use super::{RuleCompressionResult, RuleCompressor};
 use crate::processor::rule_compression::common::{fits_budget_and_saves, is_error_text};
 use crate::processor::rule_compression::types::{ContentType, RuleContext};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 /// An array rendered as CSV, JSONL or a salient-row digest.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JsonArrayCompressor;
 impl RuleCompressor for JsonArrayCompressor {
     fn compress(&self, content: &str, ctx: &RuleContext) -> RuleCompressionResult {
-        let (compressed, lossy) = run(content, ctx);
-        if compressed == content {
-            return RuleCompressionResult::unchanged(content, ContentType::JsonArray);
+        match ladder(content, ctx) {
+            Ladder::Applied { candidate, lossy } if candidate != content => {
+                RuleCompressionResult::applied(candidate, ContentType::JsonArray, lossy, None)
+            }
+            Ladder::Applied { .. } => {
+                tracing::debug!(
+                    reason = "candidate_unchanged",
+                    "rule compression: JSON array declined, the candidate is the input"
+                );
+                RuleCompressionResult::declined(
+                    content,
+                    ContentType::JsonArray,
+                    Some(json!({ "reason": "candidate_unchanged" })),
+                )
+            }
+            Ladder::Declined(details) => {
+                tracing::debug!(
+                    reason = details["reason"].as_str().unwrap_or("declined"),
+                    details = %details,
+                    "rule compression: JSON array declined"
+                );
+                RuleCompressionResult::declined(content, ContentType::JsonArray, Some(details))
+            }
         }
-        RuleCompressionResult::applied(compressed, ContentType::JsonArray, lossy, None)
     }
 }
-/// Compresses `content` and reports whether the result is lossy.
-fn run(content: &str, ctx: &RuleContext) -> (String, bool) {
+/// What the JSON-array ladder decided.
+enum Ladder {
+    /// A candidate to accept.
+    Applied {
+        /// The rendered candidate.
+        candidate: String,
+        /// Whether rows were dropped.
+        lossy: bool,
+    },
+    /// A decline carrying the reason and the facts behind it.
+    Declined(Value),
+}
+/// A decline with `reason` plus the `facts` object merged into one report.
+fn declined(reason: &'static str, facts: Value) -> Ladder {
+    let mut map = Map::new();
+    map.insert("reason".to_owned(), Value::from(reason));
+    if let Value::Object(facts) = facts {
+        for (key, value) in facts {
+            map.insert(key, value);
+        }
+    }
+    Ladder::Declined(Value::Object(map))
+}
+/// Runs the ladder: parse, render and gate `content`.
+fn ladder(content: &str, ctx: &RuleContext) -> Ladder {
     let Some(rows) = load_json_array(content) else {
-        return (content.to_owned(), false);
+        return declined(
+            "unparsable_array",
+            json!({ "characters": content.chars().count() }),
+        );
     };
     if rows.is_empty() {
-        return (content.to_owned(), false);
+        return declined("empty_array", json!({ "rows": 0 }));
     }
     if rows.iter().all(Value::is_object) {
         return object_array(content, &rows, ctx);
@@ -57,7 +110,7 @@ fn is_number(value: &Value) -> bool {
     value.is_number()
 }
 /// Object arrays: CSV or JSONL, then a salient-row digest.
-fn object_array(content: &str, rows: &[Value], ctx: &RuleContext) -> (String, bool) {
+fn object_array(content: &str, rows: &[Value], ctx: &RuleContext) -> Ladder {
     let mut keys: Vec<String> = rows
         .iter()
         .filter_map(Value::as_object)
@@ -66,7 +119,7 @@ fn object_array(content: &str, rows: &[Value], ctx: &RuleContext) -> (String, bo
     keys.sort_unstable();
     keys.dedup();
     if keys.is_empty() {
-        return (content.to_owned(), false);
+        return declined("no_object_keys", json!({ "rows": rows.len() }));
     }
     let candidate = if schema_density(rows, keys.len()) >= ctx.json_csv_min_density {
         to_csv(rows, &keys)
@@ -74,7 +127,10 @@ fn object_array(content: &str, rows: &[Value], ctx: &RuleContext) -> (String, bo
         to_jsonl(rows)
     };
     if fits_budget_and_saves(content, &candidate, ctx) {
-        return (candidate, false);
+        return Ladder::Applied {
+            candidate,
+            lossy: false,
+        };
     }
     let selected = select_salient_rows(rows);
     let candidate = format_lossy_array(
@@ -83,18 +139,34 @@ fn object_array(content: &str, rows: &[Value], ctx: &RuleContext) -> (String, bo
         Some(object_summary(rows)),
     );
     if fits_budget_and_saves(content, &candidate, ctx) {
-        return (candidate, selected.len() < rows.len());
+        return Ladder::Applied {
+            lossy: selected.len() < rows.len(),
+            candidate,
+        };
     }
-    (content.to_owned(), false)
+    declined(
+        "candidate_does_not_fit",
+        json!({
+            "rows": rows.len(),
+            "resolution": "salient_rows",
+            "omitted_rows": rows.len() - selected.len(),
+        }),
+    )
 }
 /// String arrays: compact JSON, then first/last/error/longest rows.
-fn string_array(content: &str, rows: &[Value], ctx: &RuleContext) -> (String, bool) {
+fn string_array(content: &str, rows: &[Value], ctx: &RuleContext) -> Ladder {
     let compact = compact_json(rows);
     if fits_budget_and_saves(content, &compact, ctx) {
-        return (compact, false);
+        return Ladder::Applied {
+            candidate: compact,
+            lossy: false,
+        };
     }
     if rows.len() <= 6 {
-        return (content.to_owned(), false);
+        return declined(
+            "too_few_rows",
+            json!({ "rows": rows.len(), "resolution": "compact_json" }),
+        );
     }
     let mut indexes = vec![0_usize, rows.len() - 1];
     for (index, value) in rows.iter().enumerate() {
@@ -115,18 +187,39 @@ fn string_array(content: &str, rows: &[Value], ctx: &RuleContext) -> (String, bo
     let selected: Vec<Value> = indexes.iter().map(|index| rows[*index].clone()).collect();
     let candidate = format_lossy_array(&selected, rows.len() - selected.len(), None);
     if fits_budget_and_saves(content, &candidate, ctx) {
-        return (candidate, true);
+        return Ladder::Applied {
+            candidate,
+            lossy: true,
+        };
     }
-    (content.to_owned(), false)
+    declined(
+        "candidate_does_not_fit",
+        json!({
+            "rows": rows.len(),
+            "resolution": "salient_rows",
+            "omitted_rows": rows.len() - selected.len(),
+        }),
+    )
 }
 /// Number arrays: compact JSON, then first/last/min/max/largest-delta rows.
-fn number_array(content: &str, rows: &[Value], ctx: &RuleContext) -> (String, bool) {
+fn number_array(content: &str, rows: &[Value], ctx: &RuleContext) -> Ladder {
     let compact = compact_json(rows);
     if fits_budget_and_saves(content, &compact, ctx) {
-        return (compact, false);
+        return Ladder::Applied {
+            candidate: compact,
+            lossy: false,
+        };
     }
+    let unmeasurable_rows = rows.iter().filter(|value| value.as_f64().is_none()).count();
     if rows.len() <= 6 {
-        return (content.to_owned(), false);
+        return declined(
+            "too_few_rows",
+            json!({
+                "rows": rows.len(),
+                "resolution": "compact_json",
+                "unmeasurable_rows": unmeasurable_rows,
+            }),
+        );
     }
     let mut indexes = vec![0_usize, rows.len() - 1];
     if let Some((index, _)) = first_extreme(rows, false) {
@@ -138,7 +231,13 @@ fn number_array(content: &str, rows: &[Value], ctx: &RuleContext) -> (String, bo
     let mut change_index = 1_usize;
     let mut largest = f64::NEG_INFINITY;
     for index in 1..rows.len() {
-        let delta = (number_at(rows, index) - number_at(rows, index - 1)).abs();
+        let (Some(current), Some(previous)) = (number_at(rows, index), number_at(rows, index - 1))
+        else {
+            // An unmeasurable row cannot contribute a delta; it is reported
+            // instead of being scored as `0.0`.
+            continue;
+        };
+        let delta = (current - previous).abs();
         if delta > largest {
             largest = delta;
             change_index = index;
@@ -151,18 +250,35 @@ fn number_array(content: &str, rows: &[Value], ctx: &RuleContext) -> (String, bo
     let selected: Vec<Value> = indexes.iter().map(|index| rows[*index].clone()).collect();
     let candidate = format_lossy_array(&selected, rows.len() - selected.len(), None);
     if fits_budget_and_saves(content, &candidate, ctx) {
-        return (candidate, true);
+        return Ladder::Applied {
+            candidate,
+            lossy: true,
+        };
     }
-    (content.to_owned(), false)
+    declined(
+        "candidate_does_not_fit",
+        json!({
+            "rows": rows.len(),
+            "resolution": "salient_rows",
+            "omitted_rows": rows.len() - selected.len(),
+            "unmeasurable_rows": unmeasurable_rows,
+        }),
+    )
 }
 /// Mixed arrays: compact JSON, then the first row of each type plus errors.
-fn mixed_array(content: &str, rows: &[Value], ctx: &RuleContext) -> (String, bool) {
+fn mixed_array(content: &str, rows: &[Value], ctx: &RuleContext) -> Ladder {
     let compact = compact_json(rows);
     if fits_budget_and_saves(content, &compact, ctx) {
-        return (compact, false);
+        return Ladder::Applied {
+            candidate: compact,
+            lossy: false,
+        };
     }
     if rows.len() <= 6 {
-        return (content.to_owned(), false);
+        return declined(
+            "too_few_rows",
+            json!({ "rows": rows.len(), "resolution": "compact_json" }),
+        );
     }
     let mut indexes = vec![0_usize, rows.len() - 1];
     let mut seen_types: Vec<&'static str> = Vec::new();
@@ -181,9 +297,19 @@ fn mixed_array(content: &str, rows: &[Value], ctx: &RuleContext) -> (String, boo
     let selected: Vec<Value> = indexes.iter().map(|index| rows[*index].clone()).collect();
     let candidate = format_lossy_array(&selected, rows.len() - selected.len(), None);
     if fits_budget_and_saves(content, &candidate, ctx) {
-        return (candidate, true);
+        return Ladder::Applied {
+            candidate,
+            lossy: true,
+        };
     }
-    (content.to_owned(), false)
+    declined(
+        "candidate_does_not_fit",
+        json!({
+            "rows": rows.len(),
+            "resolution": "salient_rows",
+            "omitted_rows": rows.len() - selected.len(),
+        }),
+    )
 }
 /// Python's `_json_value_type` names.
 fn json_value_type(value: &Value) -> &'static str {
@@ -196,9 +322,9 @@ fn json_value_type(value: &Value) -> &'static str {
         Value::Array(_) => "array",
     }
 }
-/// `rows[index]` as `f64`, treating a non-number as `0.0`.
-fn number_at(rows: &[Value], index: usize) -> f64 {
-    rows.get(index).and_then(Value::as_f64).unwrap_or_default()
+/// `rows[index]` as `f64`, or `None` when the row carries no measurable number.
+fn number_at(rows: &[Value], index: usize) -> Option<f64> {
+    rows.get(index).and_then(Value::as_f64)
 }
 /// The first index with the smallest (`largest == false`) or largest value.
 fn first_extreme(rows: &[Value], largest: bool) -> Option<(usize, f64)> {
@@ -416,10 +542,33 @@ mod tests {
         assert!(result.content.contains("\"_summary\":{\"total_rows\":200"));
     }
     #[test]
-    fn small_arrays_are_declined() {
+    fn small_arrays_are_declined_with_the_reason() {
         let content = r#"[{"a":1},{"a":2}]"#;
         let result = JsonArrayCompressor.compress(content, &RuleContext::new(100));
         assert!(!result.modified);
         assert_eq!(result.content, content);
+        let details = result.details.expect("the decline reports why");
+        assert_eq!(details["reason"], "candidate_does_not_fit");
+        assert_eq!(details["rows"], 2);
+    }
+    #[test]
+    fn every_decline_reason_is_reported() {
+        let ctx = RuleContext::new(100);
+        let unparsable = JsonArrayCompressor.compress("[{\"a\": oops}]", &ctx);
+        assert!(!unparsable.modified);
+        assert_eq!(
+            unparsable.details.expect("details")["reason"],
+            "unparsable_array"
+        );
+        let empty = JsonArrayCompressor.compress("[]", &ctx);
+        assert!(!empty.modified);
+        assert_eq!(empty.details.expect("details")["reason"], "empty_array");
+        let numbers = JsonArrayCompressor.compress("[1,2,3]", &ctx);
+        assert!(!numbers.modified);
+        let details = numbers.details.expect("details");
+        assert_eq!(details["reason"], "too_few_rows");
+        // A parsed number array is measurable, so the count is zero rather than
+        // an unscoreable row silently scored `0.0`.
+        assert_eq!(details["unmeasurable_rows"], 0);
     }
 }

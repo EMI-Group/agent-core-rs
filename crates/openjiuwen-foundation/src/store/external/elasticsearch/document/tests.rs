@@ -10,7 +10,11 @@ use super::*;
 use openjiuwen_common::error::ErrorKind;
 use serde_json::json;
 use wiremock::matchers::{body_json, body_string_contains, header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+use crate::store::document::SortOrder;
+
+use super::super::{MAX_SCAN_DOCUMENTS, SEARCH_PAGE_SIZE};
 
 /// Builds a store pointing at `server` with the default index prefix.
 fn store(server: &MockServer) -> ElasticsearchDocumentStore {
@@ -399,20 +403,26 @@ async fn get_reads_a_missing_document_as_none() {
 }
 
 #[tokio::test]
-async fn query_sends_the_translated_filter_order_and_paging() {
+async fn query_pages_the_translated_filter_and_applies_the_offset() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/openjiuwen__docs/_search"))
         .and(body_json(json!({
             "query": {"range": {"age": {"gte": 18}}},
-            "from": 1,
-            "size": 2,
-            "track_total_hits": true,
-            "sort": [{"age": {
-                "order": "desc",
-                "missing": "_last",
-                "unmapped_type": "keyword",
-            }}],
+            "_source": true,
+            "size": 3,
+            "sort": [
+                {"age": {
+                    "order": "desc",
+                    "missing": "_last",
+                    "unmapped_type": "keyword",
+                }},
+                {"id": {
+                    "order": "asc",
+                    "missing": "_last",
+                    "unmapped_type": "keyword",
+                }},
+            ],
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "hits": {
@@ -434,11 +444,11 @@ async fn query_sends_the_translated_filter_order_and_paging() {
         order_by: vec![("age".to_string(), SortOrder::Desc)],
     };
     let documents = store(&server).query("docs", &query).await.expect("query");
-    // Hits keep the server's order; a `_source` without `id` is completed.
-    assert_eq!(documents.len(), 2);
-    assert_eq!(documents[0].id, "b");
-    assert_eq!(documents[1].id, "a");
-    assert_eq!(documents[1].fields.get("age"), Some(&json!(20)));
+    // The short page ends the read; `offset` skips the first match and the
+    // `_source` without `id` is completed from `_id`.
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0].id, "a");
+    assert_eq!(documents[0].fields.get("age"), Some(&json!(20)));
 }
 
 #[tokio::test]
@@ -448,9 +458,9 @@ async fn query_sorts_ascending_with_missing_values_first() {
         .and(path("/openjiuwen__docs/_search"))
         .and(body_json(json!({
             "query": {"match_all": {}},
-            "from": 0,
-            "size": 10_000,
-            "track_total_hits": true,
+            "_source": true,
+            "size": SEARCH_PAGE_SIZE,
+            // No second `id` criterion: the caller already ordered by it.
             "sort": [
                 {"age": {"order": "asc", "missing": "_first", "unmapped_type": "keyword"}},
                 {"id": {"order": "desc", "missing": "_last", "unmapped_type": "keyword"}},
@@ -471,6 +481,149 @@ async fn query_sorts_ascending_with_missing_values_first() {
     assert_eq!(
         store(&server).query("docs", &query).await.expect("query"),
         Vec::<Document>::new()
+    );
+}
+
+#[tokio::test]
+async fn query_pages_with_search_after_until_the_index_is_exhausted() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/openjiuwen__docs/_search"))
+        .respond_with(paged_index(1_200))
+        .mount(&server)
+        .await;
+
+    let documents = store(&server)
+        .query("docs", &Query::default())
+        .await
+        .expect("query");
+    assert_eq!(documents.len(), 1_200);
+    assert_eq!(documents[0].id, "doc-000000");
+    assert_eq!(documents[1_199].id, "doc-001199");
+
+    // Three pages, each continuing from the previous page's `sort` values.
+    let bodies: Vec<Value> = server
+        .received_requests()
+        .await
+        .expect("requests")
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).expect("request body"))
+        .collect();
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(bodies[0]["size"], json!(SEARCH_PAGE_SIZE));
+    assert_eq!(bodies[0]["sort"][0]["id"]["order"], json!("asc"));
+    assert!(bodies[0].get("search_after").is_none());
+    assert_eq!(bodies[1]["search_after"], json!(["doc-000499"]));
+    assert_eq!(bodies[2]["search_after"], json!(["doc-000999"]));
+}
+
+#[tokio::test]
+async fn query_reads_a_small_window_with_one_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/openjiuwen__docs/_search"))
+        .respond_with(paged_index(1_200))
+        .mount(&server)
+        .await;
+
+    let query = Query {
+        limit: Some(2),
+        offset: 1,
+        ..Query::default()
+    };
+    let documents = store(&server).query("docs", &query).await.expect("query");
+    assert_eq!(
+        documents
+            .iter()
+            .map(|document| document.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["doc-000001", "doc-000002"]
+    );
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 1);
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("request body");
+    // `offset + limit` documents are asked for, and the page is exact.
+    assert_eq!(body["size"], json!(3));
+    assert!(body.get("search_after").is_none());
+}
+
+#[tokio::test]
+async fn query_fails_instead_of_truncating_at_the_document_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/openjiuwen__docs/_search"))
+        .respond_with(paged_index(MAX_SCAN_DOCUMENTS + 5_000))
+        .mount(&server)
+        .await;
+
+    let query = Query {
+        filter: json!({"age": {"$gte": 0}}),
+        ..Query::default()
+    };
+    let error = store(&server)
+        .query("docs", &query)
+        .await
+        .expect_err("the cap must fail the read");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let message = error.to_string();
+    assert!(
+        message.contains(&MAX_SCAN_DOCUMENTS.to_string()),
+        "message: {message}"
+    );
+    assert!(message.contains(r#""age""#), "message: {message}");
+    assert!(message.contains("explicit `limit`"), "message: {message}");
+
+    // One page per `SEARCH_PAGE_SIZE` documents plus the probe past the cap.
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), MAX_SCAN_DOCUMENTS / SEARCH_PAGE_SIZE + 1);
+}
+
+#[tokio::test]
+async fn the_local_fallback_respects_the_document_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/openjiuwen__docs/_search"))
+        .respond_with(paged_index(MAX_SCAN_DOCUMENTS + 1))
+        .mount(&server)
+        .await;
+
+    let query = Query {
+        filter: json!({"meta.owner": "ada"}),
+        ..Query::default()
+    };
+    let error = store(&server)
+        .query("docs", &query)
+        .await
+        .expect_err("the fallback must fail at the cap");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(error.to_string().contains("meta.owner"), "message: {error}");
+}
+
+#[tokio::test]
+async fn a_full_page_without_sort_values_is_rejected() {
+    let server = MockServer::start().await;
+    let hits: Vec<Value> = (0..SEARCH_PAGE_SIZE)
+        .map(|index| {
+            let id = format!("doc-{index:06}");
+            json!({"_id": id, "_source": {"id": id, "age": index}})
+        })
+        .collect();
+    Mock::given(method("POST"))
+        .and(path("/openjiuwen__docs/_search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "hits": {"total": {"value": SEARCH_PAGE_SIZE, "relation": "eq"}, "hits": hits},
+        })))
+        .mount(&server)
+        .await;
+
+    let error = store(&server)
+        .query("docs", &Query::default())
+        .await
+        .expect_err("paging cannot continue without `sort` values");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(
+        error.to_string().contains("search_after"),
+        "message: {error}"
     );
 }
 
@@ -496,6 +649,40 @@ async fn query_reads_a_missing_index_as_empty() {
     );
 }
 
+/// A `_search` responder that serves `total` documents through `search_after`.
+///
+/// Documents are named `doc-000000`, `doc-000001`, …; the responder honours the
+/// requested `size` and the `search_after` cursor and returns the `sort` values
+/// of every hit, so a paged read can be exercised end to end.
+fn paged_index(total: usize) -> impl Respond + 'static {
+    move |request: &Request| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let size = body.get("size").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let start = body
+            .get("search_after")
+            .and_then(Value::as_array)
+            .and_then(|cursor| cursor.first())
+            .and_then(Value::as_str)
+            .and_then(|id| id.strip_prefix("doc-"))
+            .and_then(|index| index.parse::<usize>().ok())
+            .map_or(0, |index| index + 1);
+        let hits: Vec<Value> = (start..total.min(start + size))
+            .map(|index| {
+                let id = format!("doc-{index:06}");
+                let owner = if index % 2 == 0 { "ada" } else { "bob" };
+                json!({
+                    "_id": id,
+                    "_source": {"id": id, "age": index, "owner": owner},
+                    "sort": [id],
+                })
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "hits": {"total": {"value": total, "relation": "eq"}, "hits": hits},
+        }))
+    }
+}
+
 /// Mounts the fallback scan of `POST /openjiuwen__docs/_search` used by the
 /// local re-check, returning three documents with nested metadata.
 async fn mount_scan(server: &MockServer) {
@@ -504,9 +691,12 @@ async fn mount_scan(server: &MockServer) {
         .and(body_json(json!({
             "query": {"match_all": {}},
             "_source": true,
-            "from": 0,
-            "size": 500,
-            "sort": ["_doc"],
+            "size": SEARCH_PAGE_SIZE,
+            "sort": [{"id": {
+                "order": "asc",
+                "missing": "_last",
+                "unmapped_type": "keyword",
+            }}],
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "hits": {
@@ -531,7 +721,7 @@ async fn mount_scan(server: &MockServer) {
 }
 
 #[tokio::test]
-async fn query_falls_back_to_a_bounded_scan_for_untranslatable_filters() {
+async fn query_falls_back_to_a_local_scan_for_untranslatable_filters() {
     let server = MockServer::start().await;
     mount_scan(&server).await;
     let query = Query {
@@ -590,7 +780,7 @@ async fn count_reads_a_missing_index_as_zero() {
 }
 
 #[tokio::test]
-async fn count_falls_back_to_the_bounded_scan() {
+async fn count_falls_back_to_the_local_scan() {
     let server = MockServer::start().await;
     mount_scan(&server).await;
     let query = Query {

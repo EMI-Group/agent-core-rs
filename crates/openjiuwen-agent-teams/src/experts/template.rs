@@ -18,6 +18,12 @@
 //! [`bind_group`] reads the group a team was assembled from back out of the package on disk: the
 //! caller gets one [`BoundGroupMember`] per spawnable (non-leader) member, carrying exactly the
 //! persona and launch kind that member needs.
+//!
+//! Binding never drops a member silently: every roster member that does not become a
+//! [`BoundGroupMember`] is recorded in [`BoundAgentGroup::skipped`] as a [`SkippedMember`] naming
+//! the member, a human-readable reason and a [`SkipReason`], and is logged with the package name.
+//! The leader is always skipped by design (it is not spawnable); a member whose persona is empty
+//! or no longer readable is skipped deliberately so one broken member does not hide the rest.
 
 use std::collections::BTreeSet;
 
@@ -45,7 +51,50 @@ pub struct BoundGroupMember {
     pub external_cli: bool,
 }
 
-/// The team's bound `AgentGroup`: its name and spawnable member templates.
+/// Why [`bind_group`] left an `AgentGroup` roster member out of the bound teammates.
+///
+/// [`SkipReason::Leader`] is the expected filter applied to every package; the persona variants
+/// report a member the package on disk can no longer back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// The member is the group leader, which is never spawnable as a teammate.
+    #[default]
+    Leader,
+    /// The member's persona is present but empty.
+    EmptyPersona,
+    /// The member's persona can no longer be read from the package on disk.
+    PersonaUnreadable,
+}
+
+impl SkipReason {
+    /// Stable wire name of this reason: `leader`, `empty_persona` or `persona_unreadable`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Leader => "leader",
+            Self::EmptyPersona => "empty_persona",
+            Self::PersonaUnreadable => "persona_unreadable",
+        }
+    }
+}
+
+/// One roster member [`bind_group`] did not bind as a spawnable teammate.
+///
+/// The entry exists so binding is never lossy in silence: `name` identifies the member, `reason`
+/// is a human-readable sentence that names the member too, and `kind` is the same fact as data.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct SkippedMember {
+    /// Member name as it appears in the package roster.
+    pub name: String,
+    /// Human-readable reason for the skip, naming the member and the failing condition.
+    pub reason: String,
+    /// Classification of `reason` for programmatic handling.
+    pub kind: SkipReason,
+}
+
+/// The team's bound `AgentGroup`: its name, spawnable member templates and skipped members.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct BoundAgentGroup {
@@ -53,6 +102,11 @@ pub struct BoundAgentGroup {
     pub name: String,
     /// Spawnable members, ordered by member name.
     pub members: Vec<BoundGroupMember>,
+    /// Roster members that were not bound, ordered by member name.
+    ///
+    /// The leader is always recorded here (see [`SkipReason::Leader`]); a member whose persona is
+    /// empty or unreadable appears with the matching [`SkipReason`] instead of vanishing.
+    pub skipped: Vec<SkippedMember>,
 }
 
 impl BoundAgentGroup {
@@ -62,7 +116,44 @@ impl BoundAgentGroup {
         Self {
             name: name.into(),
             members: Vec::new(),
+            skipped: Vec::new(),
         }
+    }
+
+    /// `true` when every non-leader roster member bound as a spawnable teammate.
+    ///
+    /// The leader is skipped by design on every package and is not counted.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.skipped
+            .iter()
+            .all(|skipped| skipped.kind == SkipReason::Leader)
+    }
+
+    /// Names of the skipped roster members, in member-name order.
+    #[must_use]
+    pub fn skipped_names(&self) -> Vec<&str> {
+        self.skipped
+            .iter()
+            .map(|skipped| skipped.name.as_str())
+            .collect()
+    }
+
+    /// The reason a roster member was skipped, or `None` when it bound as a teammate.
+    #[must_use]
+    pub fn skipped_reason(&self, name: &str) -> Option<&str> {
+        self.skipped
+            .iter()
+            .find(|skipped| skipped.name == name)
+            .map(|skipped| skipped.reason.as_str())
+    }
+
+    fn record_skip(&mut self, name: &str, kind: SkipReason, reason: impl Into<String>) {
+        self.skipped.push(SkippedMember {
+            name: name.to_owned(),
+            reason: reason.into(),
+            kind,
+        });
     }
 
     /// One member by name.
@@ -87,21 +178,56 @@ impl BoundAgentGroup {
 /// read from the package (the directory was removed or edited after loading) or is empty are
 /// skipped with a warning rather than failing the whole binding, so one broken member does not
 /// hide the rest.
+///
+/// Every skip is observable: it is logged with the package and member identity and appended to
+/// [`BoundAgentGroup::skipped`], so a caller can tell "the package has only the leader" from "two
+/// members were dropped".
 #[must_use]
 pub fn bind_group(package: &LoadedAgentGroupPackage) -> BoundAgentGroup {
     let mut bound = BoundAgentGroup::new(package.manifest.name.clone());
     for (name, card) in &package.templates {
         if name == LEADER_MEMBER {
+            tracing::debug!(
+                package = %bound.name,
+                member = %name,
+                "agent group leader is not spawnable as a teammate; skipping"
+            );
+            bound.record_skip(
+                name,
+                SkipReason::Leader,
+                format!(
+                    "member {name:?} is the agent group leader, which is not spawnable as a teammate"
+                ),
+            );
             continue;
         }
         let persona = match package.load_member_persona(name) {
             Ok(persona) if !persona.trim().is_empty() => persona,
             Ok(_) => {
-                tracing::debug!(member = %name, "agent group member has an empty persona; skipping");
+                tracing::warn!(
+                    package = %bound.name,
+                    member = %name,
+                    "agent group member has an empty persona; skipping"
+                );
+                bound.record_skip(
+                    name,
+                    SkipReason::EmptyPersona,
+                    format!("member {name:?} has an empty persona"),
+                );
                 continue;
             }
             Err(error) => {
-                tracing::warn!(member = %name, %error, "agent group member persona unavailable; skipping");
+                tracing::warn!(
+                    package = %bound.name,
+                    member = %name,
+                    %error,
+                    "agent group member persona unavailable; skipping"
+                );
+                bound.record_skip(
+                    name,
+                    SkipReason::PersonaUnreadable,
+                    format!("member {name:?} persona is unreadable: {error}"),
+                );
                 continue;
             }
         };
@@ -332,5 +458,120 @@ mod tests {
 
         let member2 = bound.member("member2").unwrap();
         assert!(!member2.external_cli);
+    }
+
+    #[test]
+    fn bind_group_binds_every_member_and_records_only_the_leader_skip() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = crate::experts::test_support::minimal_group_package(temp.path());
+        let bound = bind_group(&package);
+
+        assert_eq!(bound.member_names(), vec!["member1", "member2"]);
+        assert_eq!(bound.skipped_names(), vec!["leader"]);
+
+        let leader = &bound.skipped[0];
+        assert_eq!(leader.name, "leader");
+        assert_eq!(leader.kind, SkipReason::Leader);
+        assert_eq!(leader.kind.as_str(), "leader");
+        assert!(leader.reason.contains("leader"), "{}", leader.reason);
+        assert!(leader.reason.contains("not spawnable"), "{}", leader.reason);
+
+        assert!(bound.is_complete());
+        assert!(bound
+            .skipped_reason("leader")
+            .is_some_and(|reason| reason.contains("leader")));
+        assert_eq!(bound.skipped_reason("member1"), None);
+    }
+
+    #[test]
+    fn bind_group_surfaces_a_member_whose_persona_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = crate::experts::test_support::minimal_group_package(temp.path());
+        let persona = package
+            .package_dir
+            .join("agents")
+            .join("member2")
+            .join("persona")
+            .join("main.md");
+        std::fs::write(&persona, "  \n").unwrap();
+
+        let bound = bind_group(&package);
+
+        assert_eq!(bound.member_names(), vec!["member1"]);
+        assert_eq!(bound.skipped_names(), vec!["leader", "member2"]);
+        assert!(!bound.is_complete());
+
+        let skipped = bound
+            .skipped
+            .iter()
+            .find(|skipped| skipped.name == "member2")
+            .unwrap();
+        assert_eq!(skipped.kind, SkipReason::EmptyPersona);
+        assert_eq!(skipped.kind.as_str(), "empty_persona");
+        assert!(skipped.reason.contains("member2"), "{}", skipped.reason);
+        assert!(
+            skipped.reason.contains("empty persona"),
+            "{}",
+            skipped.reason
+        );
+        assert_eq!(
+            bound.skipped_reason("member2"),
+            Some(skipped.reason.as_str())
+        );
+    }
+
+    #[test]
+    fn bind_group_surfaces_a_member_whose_persona_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = crate::experts::test_support::minimal_group_package(temp.path());
+        std::fs::remove_dir_all(package.package_dir.join("agents").join("member2")).unwrap();
+
+        let bound = bind_group(&package);
+
+        assert_eq!(bound.member_names(), vec!["member1"]);
+        assert!(!bound.is_complete());
+        let skipped = bound
+            .skipped
+            .iter()
+            .find(|skipped| skipped.name == "member2")
+            .unwrap();
+        assert_eq!(skipped.kind, SkipReason::PersonaUnreadable);
+        assert_eq!(skipped.kind.as_str(), "persona_unreadable");
+        assert!(skipped.reason.contains("member2"), "{}", skipped.reason);
+        assert!(skipped.reason.contains("unreadable"), "{}", skipped.reason);
+        assert!(
+            skipped.reason.contains("agent directory not found"),
+            "{}",
+            skipped.reason
+        );
+    }
+
+    #[test]
+    fn skipped_members_round_trip_and_older_payloads_still_load() {
+        let bound = BoundAgentGroup {
+            name: "group".to_owned(),
+            members: Vec::new(),
+            skipped: vec![SkippedMember {
+                name: "member2".to_owned(),
+                reason: "member \"member2\" has an empty persona".to_owned(),
+                kind: SkipReason::PersonaUnreadable,
+            }],
+        };
+
+        let json = serde_json::to_value(&bound).unwrap();
+        assert_eq!(json["skipped"][0]["name"], "member2");
+        assert_eq!(json["skipped"][0]["kind"], "persona_unreadable");
+        let back: BoundAgentGroup = serde_json::from_value(json).unwrap();
+        assert_eq!(back, bound);
+
+        let legacy: BoundAgentGroup = serde_json::from_value(serde_json::json!({
+            "name": "group",
+            "members": [],
+            "a_field_from_the_future": true,
+        }))
+        .unwrap();
+        assert_eq!(legacy.skipped, Vec::<SkippedMember>::new());
+        assert!(legacy.is_complete());
+        assert!(legacy.skipped_reason("member2").is_none());
     }
 }

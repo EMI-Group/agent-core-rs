@@ -2,14 +2,15 @@
 //!
 //! Python's `ExperienceBaseBuilder` runs cluster → LLM distill → write. The Rust port
 //! keeps the buffering, the validity filter, the example cap, and the similar-pattern
-//! merge, and replaces the LLM distillation with the deterministic centroid query that
-//! [`cluster_traces`] already computes:
+//! merge, and replaces the LLM distillation with the centroid query that
+//! [`cluster_traces_with_embedding`] computes:
 //!
 //! 1. Drop traces that are not usable evidence — not successful, no skills, or a blank
 //!    query (Python's `_filter_valid_traces`/`add` apply the same three conditions).
-//! 2. Cluster the survivors with [`cluster_traces`], producing one [`ExperienceItem`]
-//!    per cluster: the centroid query as the pattern, at most [`QUERY_EXAMPLES_COUNT`]
-//!    example queries, the shared skill set, and the cluster's success count.
+//! 2. Cluster the survivors with [`cluster_traces_with_embedding`], producing one
+//!    [`ExperienceItem`] per cluster: the centroid query as the pattern, at most
+//!    [`QUERY_EXAMPLES_COUNT`] example queries, the shared skill set, and the cluster's
+//!    success count.
 //! 3. Merge each new item into an existing pending item when it has the same skill set
 //!    and a normalized-pattern token similarity of at least
 //!    [`PATTERN_MERGE_THRESHOLD`] (Python's `_merge_similar_patterns`, single-linkage
@@ -19,18 +20,28 @@
 //!    [`PENDING_FLUSH_THRESHOLD`] items are pending, or when the caller calls
 //!    [`ExperienceCollector::flush`].
 //!
+//! The clustering embedder defaults to [`HashEmbedding`] — the crate's deterministic
+//! offline embedder — and the k-means tunables to [`ClusterConfig::default`]; a caller with
+//! a model installs it with [`ExperienceCollector::with_embedding`] and can narrow the
+//! bounds with [`ExperienceCollector::with_cluster_config`]. A failing embedding call is
+//! returned to the caller instead of dropping the batch: the collector buffers and counts
+//! nothing in that case, so the evidence is still in the caller's hands.
+//!
 //! The sink is an [`ExperienceSink`], implemented for [`ExperienceBank`] and
 //! [`ExperienceIndex`], so the collector feeds either catalog without duplicating the
 //! write path. Everything is deterministic: no RNG, no clock, and items keep zeroed
 //! timestamps.
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use openjiuwen_retrieval::{Embedding, HashEmbedding};
+
 use crate::error::Result;
-use crate::experience::cluster::{cluster_traces, jaccard, normalized_skills};
+use crate::experience::cluster::{cluster_traces_with_embedding, normalized_skills, ClusterConfig};
 use crate::experience::ranking::query_terms;
 use crate::experience::trace::TraceRecord;
 use crate::experience::{merge_item, ExperienceBank, ExperienceIndex, ExperienceItem};
@@ -43,10 +54,10 @@ pub const QUERY_EXAMPLES_COUNT: usize = 5;
 
 /// The normalized-pattern similarity at which two items merge (`0.9` in Python).
 ///
-/// The similarity is the token Jaccard index over
-/// [`crate::search::tokenize`], the same measure clustering uses;
-/// Python compares embeddings, which needs the model stack this port deliberately does
-/// not require.
+/// The similarity is the token Jaccard index over [`crate::search::tokenize`]. Python
+/// compares embeddings here; this merge stays lexical on purpose, so buffering never
+/// depends on a model call — the embedding stage is the clustering itself, which runs
+/// through [`cluster_traces_with_embedding`].
 pub const PATTERN_MERGE_THRESHOLD: f64 = 0.9;
 
 /// A catalog the collector can write distilled items into.
@@ -105,6 +116,10 @@ struct CollectorState {
 pub struct ExperienceCollector {
     /// The catalog that receives a flush.
     sink: Arc<dyn ExperienceSink>,
+    /// The embedder the clustering stage uses; `HashEmbedding` unless the caller sets one.
+    embedding: Arc<dyn Embedding>,
+    /// The k-means tunables the clustering stage uses.
+    config: ClusterConfig,
     /// The pending buffer and the counters; never held across an `.await`.
     state: Mutex<CollectorState>,
 }
@@ -113,6 +128,8 @@ impl std::fmt::Debug for ExperienceCollector {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ExperienceCollector")
+            .field("embedding", &self.embedding.model_name())
+            .field("config", &self.config)
             .field("pending", &self.pending())
             .field("stats", &self.stats())
             .finish_non_exhaustive()
@@ -121,10 +138,17 @@ impl std::fmt::Debug for ExperienceCollector {
 
 impl ExperienceCollector {
     /// Builds a collector that flushes into `sink`.
+    ///
+    /// Traces are clustered with
+    /// [`HashEmbedding`] and
+    /// [`ClusterConfig::default`]; use [`ExperienceCollector::with_embedding`] and
+    /// [`ExperienceCollector::with_cluster_config`] to change that.
     #[must_use]
     pub fn new(sink: Arc<dyn ExperienceSink>) -> Self {
         Self {
             sink,
+            embedding: Arc::new(HashEmbedding::default()),
+            config: ClusterConfig::default(),
             state: Mutex::new(CollectorState::default()),
         }
     }
@@ -141,10 +165,39 @@ impl ExperienceCollector {
         Self::new(index)
     }
 
+    /// Replaces the embedder the clustering stage uses.
+    ///
+    /// A caller with a model installs it here; without one the collector keeps the
+    /// deterministic offline [`HashEmbedding`].
+    #[must_use]
+    pub fn with_embedding(mut self, embedding: Arc<dyn Embedding>) -> Self {
+        self.embedding = embedding;
+        self
+    }
+
+    /// Replaces the k-means tunables the clustering stage uses.
+    #[must_use]
+    pub fn with_cluster_config(mut self, config: ClusterConfig) -> Self {
+        self.config = config;
+        self
+    }
+
     /// The sink this collector writes into.
     #[must_use]
     pub fn sink(&self) -> &Arc<dyn ExperienceSink> {
         &self.sink
+    }
+
+    /// The embedder this collector clusters with.
+    #[must_use]
+    pub fn embedding(&self) -> &Arc<dyn Embedding> {
+        &self.embedding
+    }
+
+    /// The k-means tunables this collector clusters with.
+    #[must_use]
+    pub fn cluster_config(&self) -> &ClusterConfig {
+        &self.config
     }
 
     /// Distils `records` into buffered items and flushes automatically at the threshold.
@@ -155,8 +208,10 @@ impl ExperienceCollector {
     ///
     /// # Errors
     ///
-    /// Returns the sink's error when an automatic flush fails. The items are put back
-    /// into the buffer in that case, so no evidence is lost.
+    /// Returns the sink's error when an automatic flush fails; the items are put back into
+    /// the buffer in that case, so no evidence is lost. Returns the clustering error when
+    /// the embedder fails or [`ClusterConfig::validate`] rejects the configuration — the
+    /// collector is left untouched then, so the caller can retry the same batch.
     pub async fn add(&self, records: &[TraceRecord]) -> Result<usize> {
         let candidates: Vec<TraceRecord> = records
             .iter()
@@ -164,7 +219,7 @@ impl ExperienceCollector {
             .cloned()
             .collect();
         let dropped = records.len() - candidates.len();
-        let derived = items_from_traces(&candidates);
+        let derived = items_from_traces(&candidates, self.embedding.as_ref(), &self.config).await?;
         let produced = derived.len();
 
         let mut snapshot = None;
@@ -249,8 +304,13 @@ impl ExperienceCollector {
 }
 
 /// Turns valid traces into one item per cluster.
-fn items_from_traces(records: &[TraceRecord]) -> Vec<ExperienceItem> {
-    cluster_traces(records)
+async fn items_from_traces(
+    records: &[TraceRecord],
+    embedding: &dyn Embedding,
+    config: &ClusterConfig,
+) -> Result<Vec<ExperienceItem>> {
+    Ok(cluster_traces_with_embedding(records, embedding, config)
+        .await?
         .into_iter()
         .map(|cluster| {
             ExperienceItem::new(cluster.pattern)
@@ -264,7 +324,7 @@ fn items_from_traces(records: &[TraceRecord]) -> Vec<ExperienceItem> {
                 .with_skill_ids(cluster.skill_ids)
                 .with_success_count(cluster.success_count.max(1))
         })
-        .collect()
+        .collect())
 }
 
 /// Finds the first buffered item `incoming` may merge into.
@@ -282,8 +342,24 @@ fn merge_target(pending: &[ExperienceItem], incoming: &ExperienceItem) -> Option
     })
 }
 
+/// The Jaccard similarity of two token sets, in `[0, 1]`.
+///
+/// Two empty sets are `1.0` (the patterns carry no distinguishing terms), and an empty set
+/// against a non-empty one is `0.0`.
+#[allow(clippy::cast_precision_loss)]
+fn jaccard(left: &BTreeSet<String>, right: &BTreeSet<String>) -> f64 {
+    if left.is_empty() && right.is_empty() {
+        return 1.0;
+    }
+    let union = left.union(right).count();
+    if union == 0 {
+        return 1.0;
+    }
+    left.intersection(right).count() as f64 / union as f64
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 mod tests {
     use super::*;
 
@@ -299,8 +375,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn invalid_traces_are_dropped_before_clustering() {
+    #[tokio::test]
+    async fn invalid_traces_are_dropped_before_clustering() {
         let mut failure = record("t3", "a query", &["a"]);
         failure.success = false;
         let records = [
@@ -315,9 +391,22 @@ mod tests {
                 .filter(|record| record.is_experience_candidate())
                 .cloned()
                 .collect::<Vec<_>>(),
-        );
+            &HashEmbedding::default(),
+            &ClusterConfig::default(),
+        )
+        .await
+        .expect("distil");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].skill_ids, vec!["summarizer"]);
+    }
+
+    #[test]
+    fn jaccard_handles_empty_sets() {
+        let empty = BTreeSet::new();
+        let tokens: BTreeSet<String> = ["a".to_string()].into_iter().collect();
+        assert_eq!(jaccard(&empty, &empty), 1.0);
+        assert_eq!(jaccard(&empty, &tokens), 0.0);
+        assert_eq!(jaccard(&tokens, &tokens), 1.0);
     }
 
     #[test]
@@ -330,5 +419,206 @@ mod tests {
         let other_skills = ExperienceItem::new("alpha bravo charlie").with_skill_ids(["b"]);
         let pending = vec![first, other_skills];
         assert_eq!(merge_target(&pending, &candidate), Some(0));
+    }
+
+    /// An embedder delegating to [`HashEmbedding`] and counting the batch calls.
+    struct CountingEmbedding {
+        inner: HashEmbedding,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingEmbedding {
+        fn new() -> Self {
+            Self {
+                inner: HashEmbedding::new(16),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Embedding for CountingEmbedding {
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+
+        fn dimension_hint(&self) -> Option<usize> {
+            self.inner.dimension_hint()
+        }
+
+        async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+            self.inner.embed_query(text).await
+        }
+
+        async fn embed_documents(
+            &self,
+            texts: &[String],
+            batch_size: Option<usize>,
+        ) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.embed_documents(texts, batch_size).await
+        }
+    }
+
+    /// An embedder that always fails, standing in for an unavailable model.
+    struct FailingEmbedding;
+
+    #[async_trait]
+    impl Embedding for FailingEmbedding {
+        fn model_name(&self) -> &'static str {
+            "failing"
+        }
+
+        async fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
+            Err(crate::error::Error::retrieval("embedder unavailable"))
+        }
+
+        async fn embed_documents(
+            &self,
+            _texts: &[String],
+            _batch_size: Option<usize>,
+        ) -> Result<Vec<Vec<f32>>> {
+            Err(crate::error::Error::retrieval("embedder unavailable"))
+        }
+    }
+
+    #[tokio::test]
+    async fn with_embedding_installs_the_supplied_embedder() {
+        let counting = Arc::new(CountingEmbedding::new());
+        let bank = Arc::new(ExperienceBank::new());
+        let collector = ExperienceCollector::for_bank(Arc::clone(&bank))
+            .with_embedding(Arc::clone(&counting) as Arc<dyn Embedding>);
+        assert_eq!(collector.embedding().model_name(), "hash-embedding");
+        assert_eq!(*collector.cluster_config(), ClusterConfig::default());
+        assert_eq!(counting.calls(), 0);
+
+        assert_eq!(
+            collector
+                .add(&[record("t1", "summarize the report", &["summarizer"])])
+                .await
+                .expect("add"),
+            1
+        );
+        assert_eq!(counting.calls(), 1);
+        assert_eq!(collector.flush().await.expect("flush"), 1);
+        assert_eq!(bank.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn with_cluster_config_is_honoured() {
+        let bank = Arc::new(ExperienceBank::new());
+        let config = ClusterConfig {
+            max_clusters: 1,
+            ..ClusterConfig::default()
+        };
+        let collector =
+            ExperienceCollector::for_bank(Arc::clone(&bank)).with_cluster_config(config);
+        assert_eq!(collector.cluster_config().max_clusters, 1);
+        assert_eq!(
+            collector
+                .add(&[
+                    record("t1", "alpha request", &["a"]),
+                    record("t2", "beta request", &["a"]),
+                ])
+                .await
+                .expect("add"),
+            1
+        );
+        assert_eq!(collector.pending(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_embedder_leaves_the_collector_untouched() {
+        let bank = Arc::new(ExperienceBank::new());
+        let collector = ExperienceCollector::for_bank(Arc::clone(&bank))
+            .with_embedding(Arc::new(FailingEmbedding));
+        let error = collector
+            .add(&[record("t1", "summarize the report", &["summarizer"])])
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("embedder unavailable"), "{error}");
+        assert_eq!(collector.pending(), 0);
+        assert_eq!(collector.stats(), CollectorStats::default());
+        assert!(bank.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_invalid_cluster_config_is_returned_not_swallowed() {
+        let collector = ExperienceCollector::for_bank(Arc::new(ExperienceBank::new()))
+            .with_cluster_config(ClusterConfig {
+                min_clusters: 0,
+                ..ClusterConfig::default()
+            });
+        let error = collector
+            .add(&[record("t1", "summarize the report", &["summarizer"])])
+            .await
+            .unwrap_err();
+        assert!(error.message().starts_with("min_clusters"), "{error}");
+        assert_eq!(collector.pending(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_embedding_pipeline_feeds_the_bank() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path().join("sessions").join("sess");
+        tokio::fs::create_dir_all(&session).await.expect("mkdir");
+        tokio::fs::write(session.join("metadata.json"), br#"{"status":"ok"}"#)
+            .await
+            .expect("metadata");
+        tokio::fs::write(
+            session.join("history.json"),
+            serde_json::to_vec(&serde_json::json!([
+                {
+                    "request_id": "r1",
+                    "role": "user",
+                    "content": "Summarize the quarterly report"
+                },
+                {
+                    "request_id": "r1",
+                    "role": "assistant",
+                    "event_type": "chat.tool_call",
+                    "tool_call": {
+                        "name": "skill_tool",
+                        "arguments": {"skill_name": "summarizer"}
+                    }
+                }
+            ]))
+            .expect("encode history"),
+        )
+        .await
+        .expect("history");
+
+        let store = crate::experience::trace::TraceStore::open(dir.path())
+            .await
+            .expect("open store");
+        let records = store.parse_all_sessions().await.expect("parse");
+        let clusters = cluster_traces_with_embedding(
+            &records,
+            &HashEmbedding::default(),
+            &ClusterConfig::default(),
+        )
+        .await
+        .expect("cluster");
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].skill_ids, vec!["summarizer"]);
+
+        let bank = Arc::new(ExperienceBank::new());
+        let collector = ExperienceCollector::for_bank(Arc::clone(&bank))
+            .with_embedding(Arc::new(HashEmbedding::default()));
+        assert_eq!(collector.add(&records).await.expect("add"), 1);
+        assert_eq!(collector.flush().await.expect("flush"), 1);
+
+        let hits = bank
+            .search("summarize quarterly report", 5)
+            .await
+            .expect("search");
+        assert!(!hits.is_empty());
+        assert!(hits[0].item.has_skill("summarizer"));
+        assert_eq!(hits[0].item.query_pattern, "Summarize the quarterly report");
+        assert_eq!(hits[0].item.query_examples.len(), 1);
     }
 }

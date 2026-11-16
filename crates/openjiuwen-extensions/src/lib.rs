@@ -8,6 +8,9 @@
 //!
 //! - `a2a` — the Agent-to-Agent protocol client and server (module `a2a`).
 //! - `otel` — live OpenTelemetry tracing; without it [`otel`] is a no-op seam.
+//! - `mcp` — the harness `ToolGateway` bridge over kernel MCP tools (module `mcp`); the MCP
+//!   client and server tooling it adapts lives in `openjiuwen-foundation`, whose default `mcp`
+//!   feature this one forwards.
 //! - `sqlite` / `redis` / `pulsar` — optional backends for the adapters.
 //!
 //! ```
@@ -32,6 +35,9 @@ pub mod vendor_specific;
 
 #[cfg(feature = "a2a")]
 pub mod a2a;
+
+#[cfg(feature = "mcp")]
+pub mod mcp;
 
 #[cfg(feature = "redis")]
 pub mod redis;

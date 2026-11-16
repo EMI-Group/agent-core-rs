@@ -253,9 +253,14 @@ pub fn execute_read(view: &SkillDirectoryView, skills: &[String], request: &Vali
 pub fn apply_pipeline(rows: &[Row], pipeline: &[PipelineStage], output_mode: OutputMode) -> Result<PipelineOutcome>;
 // toolkit: the model-facing tool (see toolkit.rs)
 pub struct SkillIndexConfig { pub session_scope: String, pub max_output_chars: usize, pub incremental_notice_max_chars: usize }
-pub struct SkillIndexToolkit { /* catalog, view, config, tool_id, notice, cursors, observed paths */ }
+pub struct SkillIndexToolkit { /* catalog, view, config, tool_id, notice, cursors, observed paths, index baseline */ }
 impl SkillIndexToolkit {
     pub fn new(catalog: SkillFs, config: SkillIndexConfig) -> Result<Self>;
+    pub fn new_with_baseline(catalog: SkillFs, config: SkillIndexConfig, baseline: Option<IndexBaseline>) -> Result<Self>;
+    pub fn with_index_baseline(self, baseline: IndexBaseline) -> Self;
+    pub fn set_index_baseline(&mut self, baseline: Option<IndexBaseline>);
+    pub fn index_baseline(&self) -> Option<&IndexBaseline>;   pub fn index_state(&self) -> IndexState;
+    pub fn record_index_baseline(&mut self) -> IndexBaseline;
     pub fn tool_id(&self) -> &str;   pub fn catalog(&self) -> &SkillFs;   pub fn view(&self) -> &SkillDirectoryView;
     pub fn card(&self) -> SkillIndexToolCard;
     pub fn invoke(&mut self, arguments: &Value) -> Result<SkillIndexResult>;
@@ -265,10 +270,31 @@ impl SkillIndexToolkit {
 pub struct SkillIndexToolCard { pub id: String, pub name: String, pub description: String, pub input_schema: Value, pub parallel_safe: bool, pub stateless: bool }
 pub struct SkillIndexResult { /* content, model_content, operation, rows, observed_skill_ids, truncated,
                                  truncation_reason, total_count, shown_count, result_complete, next_cursor,
-                                 effective_max_output_chars, skillfs_layout, index_state, candidate_count,
-                                 estimated_candidate_tokens, candidate_budget_tokens */ }
+                                 effective_max_output_chars, skillfs_layout, index_state, inventory_fingerprint,
+                                 index_baseline_fingerprint, candidate_count, estimated_candidate_tokens,
+                                 candidate_budget_tokens */ }
 pub const MAX_CURSORS: usize = 32;   pub const CURSOR_MAX_CHARS: usize = 128;
 ```
+
+### `directory_toolkit::layout` (`src/discovery/directory_toolkit/layout.rs`)
+
+```rust
+pub enum SkillFsLayout { Flat /* Default */, Tree }        // as_str/Display/parse; "flat"/"tree"
+pub enum IndexState { Missing /* Default */, Fresh, Stale } // as_str/Display/parse; "missing"/"fresh"/"stale"
+pub struct IndexBaseline { pub inventory_fingerprint: String, pub layout: String,
+                          pub indexed_skills: usize, pub index_fingerprint: String }
+pub fn layout_for_records(records: &[SkillRecord]) -> SkillFsLayout;
+pub fn skillfs_layout(catalog: &SkillFs) -> SkillFsLayout;
+pub fn index_state_for(catalog: &SkillFs, baseline: Option<&IndexBaseline>) -> IndexState;
+pub fn index_fingerprint(inventory_fingerprint: &str, layout: &str, indexed_skills: usize) -> String;
+pub const LAYOUT_FLAT: &str = "flat";   pub const LAYOUT_TREE: &str = "tree";
+pub const INDEX_MISSING: &str = "missing";   pub const INDEX_FRESH: &str = "fresh";   pub const INDEX_STALE: &str = "stale";
+```
+
+`skillfs_layout` counts the directory components of each `SkillRecord::skill_file` (split on `/`, empty segments dropped, the last segment is the file name): `flat` when every record has at most one directory component and `tree` when any record sits two or more levels down. An empty catalog is `flat`, because there is no nesting to report. `\` is never a separator, and a blank `skill_file` contributes zero components.
+`index_state` is decided by one comparison: no baseline is `missing`, a baseline whose `inventory_fingerprint` equals `catalog.inventory().fingerprint` is `fresh`, anything else is `stale`. `layout`, `indexed_skills` and `index_fingerprint` on the baseline are informational — `index_fingerprint` is SHA-256 hex over the canonical JSON of those three fields, so it identifies one recorded generation.
+The reported state describes the baseline in force **before** the call: the first result on a fresh toolkit says `missing` and records a baseline, a second request over the same immutable catalog says `fresh`, and `stale` appears when a caller hands in a baseline recorded from another inventory (`with_index_baseline`/`set_index_baseline`) or reloads the catalog (`reload`) after a skill changed on disk.
+`SkillIndexResult` also reports `inventory_fingerprint` (the catalog's current digest) and `index_baseline_fingerprint` (the baseline in force, `None` when missing), so a host can persist and replay a baseline.
 Categories are derived from each skill's `CapabilityDescriptor::classification` — split on `>` (else `/`), trimmed, blank segments dropped, depth capped at 32 — because Python's retriever-node taxonomy does not exist in this crate.
 Sibling segments that collide case-insensitively (or a label colliding with a skill id) get `~2`, `~3`, … in `(to_lowercase, exact)` order, so the tree is a pure function of the catalog.
 `invoke` is the model-facing shape and accepts only `operation`, `category`, `query` and `cursor`; `execute` takes the full typed request.
@@ -299,7 +325,7 @@ The notice reminder is appended last and never lets the response exceed its budg
 - `tests/discovery.rs` — scans, front matter, diagnostics, descriptors, inventory, catalog search, excerpts, settings.
 - `tests/skill_prompt.rs` — visible-name ordering and disabled-skill exclusion, exact pinned snapshot text (plain, category sections, empty), multi-byte `max_chars` truncation with `included`/`omitted`/`truncated` and fingerprint bookkeeping, `worker_id` filtering, fingerprint stability/content sensitivity, added/removed/changed notices with the exact Python reminder, reminder fallback and custom tool name, deterministic ordering, idempotent second consume, serde persistence, and `SkillFs::notice_state`.
 - `tests/discovery_toolkit_notice.rs` — the notice session layer: the tool-id digest and its validation, card normalization (fallbacks, 300-char word-boundary shortening, escaping, ordering), pinned reminder text and its budget fallback, registry baseline/one-shot delta/LRU eviction/capacity clamp/clear, session rollback then later delivery, serde round-trip, byte-identical reruns.
-- `tests/discovery_toolkit.rs` — the tool: category-tree building (`~n` collisions, depth cap), path normalization, `children`/`skill_count`/`entries`/`tree_entries`/`searchable_entries`/`scoped_records`, metadata paths, category lookups (unknown and ambiguous), every pinned row/summary/message rendering, `fit_rows` truncation with multi-byte budgets, the full validation matrix, then end-to-end `invoke`/`execute` for list/search/read, multi-query interleaving, `result = matches` snippets, pagination without gaps or duplicates, cursor mismatch/stale/unknown errors and the 32-entry bound, pipelines with `output_mode = count`, output-budget shortening and `disable_output_truncation`, notice delivery, the pinned tool card, and byte-identical repeated calls.
+- `tests/discovery_toolkit.rs` — the tool: the derived `flat`/`tree` layout and the `missing` → `fresh` → `stale` index-state transitions through the public catalog API, category-tree building (`~n` collisions, depth cap), path normalization, `children`/`skill_count`/`entries`/`tree_entries`/`searchable_entries`/`scoped_records`, metadata paths, category lookups (unknown and ambiguous), every pinned row/summary/message rendering, `fit_rows` truncation with multi-byte budgets, the full validation matrix, then end-to-end `invoke`/`execute` for list/search/read, multi-query interleaving, `result = matches` snippets, pagination without gaps or duplicates, cursor mismatch/stale/unknown errors and the 32-entry bound, pipelines with `output_mode = count`, output-budget shortening and `disable_output_truncation`, notice delivery, the pinned tool card, and byte-identical repeated calls.
 - Unit tests beside `catalog.rs` pin the plain/category/empty renderings; beside `notice.rs` the reminder wording, the `textwrap.shorten` behavior and state round-tripping; beside `ops/` the pipeline and search-assembly helpers.
 
 ## Routing Table
@@ -329,7 +355,9 @@ The notice reminder is appended last and never lets the response exceed its budg
     - `./directory_toolkit/ops/mod.rs` → execution types, constants and re-exports
     - `./directory_toolkit/ops/list.rs` / `read.rs` / `pipeline.rs` / `request.rs`
     - `./directory_toolkit/ops/search.rs` → multi-query assembly, content/entry hits, snippets, category hints
-  - `./directory_toolkit/toolkit.rs` → `SkillIndexToolkit`, `SkillIndexConfig`, `SkillIndexToolCard`, `SkillIndexResult`, cursors
+  - `./directory_toolkit/toolkit.rs` → `SkillIndexToolkit`, `SkillIndexConfig`, `SkillIndexToolCard`, `SkillIndexResult`, the index baseline
+  - `./directory_toolkit/layout.rs` → `SkillFsLayout`, `IndexState`, `IndexBaseline`, `layout_for_records`, `index_state_for`, `index_fingerprint`
+  - `./directory_toolkit/cursor.rs` → the private `CursorState`/`CursorStore` page-cursor machinery
   - `./directory_toolkit/matcher.rs` → `case_fold`, `glob_match`, `literal_match_rank`
 - `./settings.rs` → `DiscoverySettings`, token budget, settings defaults
 
@@ -341,11 +369,11 @@ The notice reminder is appended last and never lets the response exceed its budg
 - **One matcher, no regex.** Both the search modes and the `filter` pipeline stage use case-folded substring matching with `*`/`?` globbing, so the offline build has no regex dependency and the same query text behaves identically everywhere.
 - **Search reuses the crate's own scorer.** Content mode delegates to `SkillFs`'s BM25 index (with the hit excerpt as the evidence snippet) and category hints use `LexicalIndex`, so discovery never grows a second scoring implementation.
 - **The escape replaces the untrusted-metadata prefix.** Python's `sanitize_model_text` prefixes `[untrusted Skill metadata] ` when it detects injection phrasing; here `<`/`>` are escaped and control characters dropped instead, which neutralizes the same vectors without leaking the prefix into legitimate descriptions and snippets.
+- **The layout and the index state are derived, not reported as constants.** Python reads both off its committed index snapshot; this crate has no artifact store under the catalog, so `skillfs_layout` is computed from how deep the discovered `SKILL.md` files sit (one directory component everywhere is `flat`, any deeper nesting is `tree`) and `index_state` compares the inventory digest against a caller-owned `IndexBaseline` (`missing`/`fresh`/`stale`). The baseline is recorded by the toolkit when it hands out a result and can be injected from another snapshot, which is what makes a `stale` state reachable without mutating an immutable `SkillFs`.
 - **The summary header is the paged contract.** A paged result's `content` equals `model_content` (header included); an unpaged result's `content` is the row body only and the header travels in `model_content`, mirroring Python's `SkillDCICommandResult`/`.data["content"]` split.
 
 ## Known Issues
 
-- `SkillIndexResult::skillfs_layout` is always `flat` and `index_state` always `flat`/`missing`: no taxonomy index is built, so Python's `tree`/`fresh`/`stale` states have no counterpart.
 - The category-hint fallback is mostly unreachable end-to-end: a label appears in its skills' own searchable text (the category is part of the view, not of the descriptor retrieval text, but the label usually matches the description), so a label query normally becomes a content hit first. `ops::search_categories` is implemented, exported and unit-tested directly.
 - Python's `DiscoverySettings.max_results` is still unused by the tool; the model-facing `limit` is the only result cap.
 - `read` resolves the legacy path form only for `META.md` paths an earlier result in the same toolkit instance returned; a fresh toolkit rejects them by design.

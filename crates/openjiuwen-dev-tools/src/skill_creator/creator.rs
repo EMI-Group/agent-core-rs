@@ -8,8 +8,10 @@
 //!   [`SkillRequest`] with one model call that must answer with a fenced JSON
 //!   object (`{"name", "description", "instructions"}`).
 //! - [`SkillCreator::create_from_url`] runs the `skill_omni_creation` pipeline:
-//!   a URL is scraped, its assets downloaded, and a skill bundle written (a
-//!   model, when attached, drafts the document with a deterministic fallback).
+//!   a URL (HTML, an archive entry set, an office/`PDF` document, or plain text)
+//!   is scraped, its assets downloaded, and a skill bundle written (a model,
+//!   when attached, drafts the document with a deterministic fallback whose use
+//!   is reported through [`OmniOutcome::provenance`]).
 //!
 //! Every path validates the resulting [`SkillDefinition`] before returning it, and
 //! [`SkillCreator::write`] / [`SkillCreator::read`] delegate to
@@ -291,14 +293,40 @@ impl SkillCreator {
     /// when one is configured, and runs scrape → download → generate → save
     /// under `root`.
     ///
+    /// The scrape stage accepts four page inputs: an HTML page (parsed by the
+    /// in-crate HTML parser), an archive (`tar`, `zip`, and `gzip`, including
+    /// gzip-wrapped `tar`/`zip`, unpacked in-process and read as markdown), an
+    /// office or `PDF` document (`PDF`, `DOCX`, `XLSX`, `PPTX`, `ODT`, plus the
+    /// text, Markdown, `CSV`/`TSV`, and `JSON` formats) extracted through the
+    /// kernel's retrieval loaders, and any other body read as plain text.
+    /// Decoding `bzip2`, `xz`, or `zstd` input is not ported, so such a page is
+    /// a typed [`Error::unsupported`](openjiuwen_common::error::Error::unsupported)
+    /// naming the codec rather than a text approximation of the container.
+    ///
+    /// The outcome's [`provenance`](OmniOutcome::provenance) reports which
+    /// generator produced the document:
+    /// [`GenerationProvenance::Model`](crate::skill_creator::omni::GenerationProvenance::Model)
+    /// when a model is attached and its answer was accepted, and
+    /// [`GenerationProvenance::Deterministic`](crate::skill_creator::omni::GenerationProvenance::Deterministic)
+    /// when the deterministic template path ran instead. The deterministic path
+    /// is used when no model is attached — one `tracing` `warn!` names the URL
+    /// and points at [`OmniCreation::with_model`] — or when the attached model's
+    /// answer was unusable (model error, no JSON fence, malformed payload, a
+    /// body that is blank once hallucinated image references are stripped, or an
+    /// invalid definition), which is logged with its cause; a model failure is
+    /// never propagated, so check the provenance instead of assuming the model
+    /// answered.
+    ///
     /// # Errors
     ///
-    /// Returns every error of [`OmniCreation::run`]: an invalid configuration, a
-    /// page that yields no text, headings, links, or images, an unsupported
-    /// `zip`/`gzip` page input, a fetch failure for the source page, or a
-    /// filesystem failure while writing the bundle. Per-resource download
-    /// failures are skipped, and a model failure falls back to the deterministic
-    /// generator.
+    /// Returns [`Error::validation`](openjiuwen_common::error::Error::validation)
+    /// for an invalid configuration, a page that yields no text, headings, links,
+    /// or images, or a document whose loader and plain-text fallback both carry
+    /// nothing; [`Error::unsupported`](openjiuwen_common::error::Error::unsupported)
+    /// for `bzip2`/`xz`/`zstd` page input;
+    /// whatever the [`Fetcher`] reports for the source page; and a filesystem
+    /// failure while writing the bundle. Per-resource download failures are
+    /// skipped instead of propagated.
     pub async fn create_from_url(
         &self,
         fetcher: Arc<dyn Fetcher>,
@@ -407,8 +435,12 @@ fn default_language() -> String {
 mod tests {
     use super::*;
     use crate::skill_creator::omni::fetch::ScriptedFetcher;
+    use crate::skill_creator::omni::GenerationProvenance;
     use openjiuwen_test_support::{ScriptedModel, TempWorkspace};
     use serde_json::json;
+
+    /// The example page every `create_from_url` test derives its skill from.
+    const GUIDE_URL: &str = "https://example.com/guide";
 
     fn spec() -> SkillSpec {
         SkillSpec::new(
@@ -426,6 +458,17 @@ mod tests {
             "Here you go:\n```json\n{}\n```\n",
             serde_json::to_string_pretty(&payload).expect("payload serializes")
         )
+    }
+
+    /// A fetcher serving one HTML guide page at [`GUIDE_URL`].
+    fn guide_fetcher() -> ScriptedFetcher {
+        let fetcher = ScriptedFetcher::new();
+        fetcher.with_html(
+            GUIDE_URL,
+            "<!doctype html><html><head><title>Deploy the Service</title></head>\
+             <body><h1>Deploy the Service</h1><p>Run the deploy script.</p></body></html>",
+        );
+        fetcher
     }
 
     #[test]
@@ -603,20 +646,11 @@ mod tests {
     #[tokio::test]
     async fn create_from_url_writes_a_bundle() {
         let workspace = TempWorkspace::new().expect("temp workspace");
-        let fetcher = ScriptedFetcher::new();
-        fetcher.with_html(
-            "https://example.com/guide",
-            "<!doctype html><html><head><title>Deploy the Service</title></head>\
-             <body><h1>Deploy the Service</h1><p>Run the deploy script.</p></body></html>",
-        );
+        let fetcher = guide_fetcher();
 
         let creator = SkillCreator::new();
         let outcome = creator
-            .create_from_url(
-                Arc::new(fetcher.clone()),
-                "https://example.com/guide",
-                workspace.root(),
-            )
+            .create_from_url(Arc::new(fetcher.clone()), GUIDE_URL, workspace.root())
             .await
             .expect("creates from url");
         assert_eq!(outcome.definition.name, "deploy-the-service");
@@ -634,14 +668,83 @@ mod tests {
         })));
         let creator = SkillCreator::with_model(Arc::new(model));
         let outcome = creator
-            .create_from_url(
-                Arc::new(fetcher),
-                "https://example.com/guide",
-                workspace.root(),
-            )
+            .create_from_url(Arc::new(fetcher), GUIDE_URL, workspace.root())
             .await
             .expect("creates with a model");
         assert_eq!(outcome.definition.name, "model-deploy");
+    }
+
+    #[tokio::test]
+    async fn create_from_url_reports_who_drafted_the_skill() {
+        let workspace = TempWorkspace::new().expect("temp workspace");
+        let fetcher = guide_fetcher();
+
+        let templated = SkillCreator::new()
+            .create_from_url(Arc::new(fetcher.clone()), GUIDE_URL, workspace.root())
+            .await
+            .expect("creates deterministically");
+        assert_eq!(
+            templated.provenance,
+            GenerationProvenance::Deterministic,
+            "no model is attached, so the template path must be reported"
+        );
+        assert_eq!(templated.provenance.as_str(), "deterministic");
+
+        let model = ScriptedModel::text(fenced(json!({
+            "name": "model-deploy",
+            "description": "Deploy the service",
+            "instructions": "# Deploy\n\nRun the deploy script."
+        })));
+        let drafted = SkillCreator::with_model(Arc::new(model.clone()))
+            .create_from_url(Arc::new(fetcher), GUIDE_URL, workspace.root())
+            .await
+            .expect("creates with a model");
+        assert_eq!(drafted.provenance, GenerationProvenance::Model);
+        assert_eq!(drafted.provenance.as_str(), "model");
+        assert_eq!(drafted.definition.name, "model-deploy");
+        assert_eq!(model.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_from_url_reports_the_fallback_as_deterministic() {
+        let workspace = TempWorkspace::new().expect("temp workspace");
+        let model = ScriptedModel::text("Sure, here is your skill.");
+        let outcome = SkillCreator::with_model(Arc::new(model.clone()))
+            .create_from_url(Arc::new(guide_fetcher()), GUIDE_URL, workspace.root())
+            .await
+            .expect("an unusable model answer falls back");
+
+        assert_eq!(outcome.provenance, GenerationProvenance::Deterministic);
+        assert_eq!(outcome.definition.name, "deploy-the-service");
+        assert_eq!(model.call_count(), 1);
+    }
+
+    #[test]
+    fn legacy_outcome_json_without_provenance_still_deserializes() {
+        let outcome = OmniOutcome {
+            definition: SkillDefinition::new("demo", "A demo skill", "Body"),
+            resources: vec!["references/guide.md".to_owned()],
+            bundle_path: PathBuf::from("skills/demo"),
+            provenance: GenerationProvenance::Model,
+        };
+        let encoded = serde_json::to_value(&outcome).expect("serializes");
+        assert_eq!(encoded["provenance"], json!("model"));
+
+        let mut legacy = encoded.clone();
+        legacy
+            .as_object_mut()
+            .expect("outcome JSON is an object")
+            .remove("provenance");
+        let decoded: OmniOutcome =
+            serde_json::from_value(legacy).expect("legacy JSON stays readable");
+        assert_eq!(decoded.provenance, GenerationProvenance::Deterministic);
+        assert_eq!(
+            decoded,
+            OmniOutcome {
+                provenance: GenerationProvenance::Deterministic,
+                ..outcome
+            }
+        );
     }
 
     #[test]

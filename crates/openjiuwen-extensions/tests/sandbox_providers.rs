@@ -269,13 +269,17 @@ fn the_sandbox_type_constants_match_the_python_provider_package() {
         assert!(is_deferred(deferred), "{deferred} has no remote provider");
     }
 }
-// Python: the deferred registration path, kept as a compatibility no-op.
+// Python: the providers package registers the three sandbox types at import
+// time; `register_deferred` is the idempotent equivalent of that setup path.
 #[tokio::test]
-async fn register_deferred_registers_nothing_and_stays_called_afterwards() {
+async fn register_deferred_installs_the_three_types_idempotently() {
     let registry = SandboxProviderRegistry::new();
     register_deferred(&registry).await.unwrap();
-    assert_eq!(registered_types(&registry), Vec::<String>::new());
-    // Calling it after the real registration must not fail either.
+    assert_eq!(registered_types(&registry), REMOTE_SANDBOX_TYPES);
+    // Calling it again, or after the real registration, must not fail.
+    register_deferred(&registry).await.unwrap();
+    assert_eq!(registered_types(&registry), REMOTE_SANDBOX_TYPES);
+    let registry = SandboxProviderRegistry::new();
     register_remote_providers(&registry).unwrap();
     register_deferred(&registry).await.unwrap();
     assert_eq!(registered_types(&registry), REMOTE_SANDBOX_TYPES);

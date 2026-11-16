@@ -10,9 +10,12 @@
 //!    leader's inbox, sends mail that lands in the recipient's stored mailbox, and snapshots the
 //!    team;
 //! 3. the same client creates, edits, claims and completes a task on the hosting team's board;
-//! 4. an op-level fault (`not_found`) travels in band and keeps the connection, while a frame-level
+//! 4. `invoke_tool` round-trips a member-facing team tool (`view_task`) through the host's shared
+//!    dispatcher and answers with that tool's own wire shape, and a rejected call — an unknown tool
+//!    name, reported in band as `not_found` — leaves the very same connection serving;
+//! 5. an op-level fault (`not_found`) travels in band and keeps the connection, while a frame-level
 //!    fault is answered once and ends that connection — and neither disturbs the team;
-//! 5. the `stop_team` op answers `{"stopping": true}`, cancels the open run, and the host tears the
+//! 6. the `stop_team` op answers `{"stopping": true}`, cancels the open run, and the host tears the
 //!    socket down; a second stop is a typed failure that returns immediately.
 //!
 //! Everything is offline and deterministic: the `support` fakes answer every member input with one
@@ -533,6 +536,72 @@ async fn an_outside_client_creates_edits_claims_and_completes_a_task() {
         ROSTER,
         "the snapshot carries members and tasks together"
     );
+
+    agent.stop().await.expect("the team did not stop");
+}
+
+#[tokio::test]
+async fn invoke_tool_round_trips_and_survives_an_in_band_rejection() {
+    let prepared = Prepared::new(Shape::Socket, "team.sock");
+    let agent = prepared.start().await;
+    let client = prepared.client().await;
+
+    // Seed the board so the `view_task` listing has exactly one row to project.
+    client
+        .create_task(
+            "Write the attach tests",
+            "drive the socket from outside",
+            Some("task-a"),
+            &[],
+        )
+        .await
+        .expect("create_task");
+
+    // A tool call crosses the socket and answers with the tool's own wire shape: one entry per
+    // board task carrying the four `view_task` list fields, exactly as the in-process tool answers.
+    let listed = timeout(
+        BOUND,
+        client.invoke_tool("view_task", json!({"action": "list"})),
+    )
+    .await
+    .expect("invoke_tool did not answer")
+    .expect("view_task");
+    assert_eq!(
+        listed,
+        json!([{
+            "task_id": "task-a",
+            "title": "Write the attach tests",
+            "status": "pending",
+            "assignee": null,
+        }]),
+        "the host answers with the `view_task` list projection"
+    );
+
+    // An unknown tool is refused in band as `not_found`, not as a frame-level fault.
+    let error = timeout(BOUND, client.invoke_tool("nope", json!({})))
+        .await
+        .expect("the rejected call did not answer")
+        .expect_err("'nope' is not a team tool");
+    assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+    assert!(error.message().contains("nope"), "{}", error.message());
+    assert!(
+        client.is_connected().await,
+        "an in-band rejection keeps the connection"
+    );
+
+    // The rejected call cost nothing: the next round trip on that same connection is answered.
+    let relisted = timeout(
+        BOUND,
+        client.invoke_tool("view_task", json!({"action": "list"})),
+    )
+    .await
+    .expect("the surviving call did not answer")
+    .expect("the connection still serves");
+    assert_eq!(
+        relisted, listed,
+        "the surviving call answers the same listing"
+    );
+    assert!(client.is_connected().await, "the connection is still held");
 
     agent.stop().await.expect("the team did not stop");
 }
