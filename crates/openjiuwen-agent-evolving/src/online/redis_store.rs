@@ -7,10 +7,12 @@
 //! Redis commands; no rule of the task, sample or training machine lives here.
 //!
 //! The transport is [`openjiuwen_extensions::redis`]'s in-workspace client (one
-//! serialized connection per store, `redis://` only). TLS (`rediss://`) and
-//! cluster slot routing are not vendored in this workspace and are rejected with
-//! [`Error::Unsupported`] by
-//! [`RedisOnlineStoreOptions::validate`].
+//! serialized connection per store). All four client URL schemes are accepted —
+//! `redis://`, `rediss://` (TLS), `redis+cluster://` and `rediss+cluster://` —
+//! and the scheme's `tls`/`cluster_mode` flags are handed to the client unchanged
+//! by [`RedisOnlineStoreOptions::validate`] and `connection_options`. What the
+//! store itself does not add is a trust or topology policy: see
+//! [TLS and cluster](#tls-and-cluster) for the caveats that remain.
 //!
 //! # Command mapping
 //!
@@ -33,12 +35,37 @@
 //! # Errors are never swallowed
 //!
 //! A server error reply (`WRONGTYPE` when a key is read as the wrong type, a
-//! protocol error, `MOVED`/`ASK` from a cluster reply) surfaces as an
+//! protocol error, a failed redirect) surfaces as an
 //! [`openjiuwen_common::error::Error`] — `Validation` for `WRONGTYPE`,
-//! `Unsupported` for a redirection, `Transport`/`Timeout` otherwise — and the
-//! state machines turn it into [`OnlineError::Store`](crate::online::OnlineError::Store).
+//! `Transport` otherwise (including a redirection the client already followed
+//! once) — and the state machines turn it into
+//! [`OnlineError::Store`](crate::online::OnlineError::Store).
 //! A reply of an unexpected type is a `Validation` error too. Nothing degrades to
 //! an empty read or a silent no-op.
+//!
+//! # TLS and cluster
+//!
+//! `ConnectionOptions::from_url` owns the scheme: `rediss` sets `tls` and
+//! `+cluster` sets `cluster_mode`, so `rediss+cluster://` sets both. This module
+//! forwards the parsed options unchanged (only `database` and `timeout` are
+//! overridden from the options struct), which means the caveats below are the
+//! client's, not a policy of the store:
+//!
+//! - TLS verifies the server certificate and host name against the web PKI
+//!   (`webpki_roots`); there is no insecure mode and this module adds no
+//!   trust-config escape hatch, so a private CA needs a `redis://` hop or a local
+//!   TLS terminator.
+//! - Cluster mode is verified at connect time: the seed must report
+//!   `cluster_enabled:1` via `CLUSTER INFO` or return slot ranges from
+//!   `CLUSTER SLOTS`, and a standalone node is a `Validation` error instead of a
+//!   silently used single node.
+//! - A `MOVED` reply re-issues the command once on the reported node and caches
+//!   `slot → node` for the single-key commands; an `ASK` reply sends `ASKING` and
+//!   the command once and caches nothing; a second consecutive redirection for one
+//!   command is a `Transport` error rather than a loop.
+//! - The store still owns exactly one seed connection, so cluster mode buys node
+//!   routing, not parallelism: commands remain serialized and the
+//!   [durability](#durability-and-concurrency) rules below are unchanged.
 //!
 //! # Durability and concurrency
 //!
@@ -81,7 +108,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configuration of a [`RedisOnlineStore`].
 ///
-/// `url` is a `redis://[user[:password]@]host[:port][/db]` URL; `prefix` is the
+/// `url` is a `redis[s][+cluster]://[user[:password]@]host[:port][/db]` URL whose
+/// scheme selects TLS (`rediss`) and cluster mode (`+cluster`); `prefix` is the
 /// namespace prepended to every key; `database` overrides the database index the
 /// URL selects; `timeout` bounds one round trip.
 ///
@@ -91,7 +119,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct RedisOnlineStoreOptions {
-    /// `redis://` URL of the server, including credentials and database.
+    /// `redis[s][+cluster]://` URL of the server, including credentials and database.
     pub url: String,
     /// Namespace prepended to every key; blank means [`DEFAULT_PREFIX`].
     pub prefix: String,
@@ -143,15 +171,18 @@ impl RedisOnlineStoreOptions {
         }
     }
 
-    /// Rejects a blank URL, a non-`redis://` scheme, TLS and cluster mode.
+    /// Accepts every client scheme: `redis://`, `rediss://` (TLS),
+    /// `redis+cluster://` and `rediss+cluster://`.
+    ///
+    /// TLS and cluster mode are not rejected here: the scheme decides the client's
+    /// `tls`/`cluster_mode` flags, and the client verifies the TLS peer and the
+    /// cluster seed when it connects. Only the shape of the URL is checked.
     ///
     /// # Errors
     ///
-    /// [`Error::Validation`] for a blank or
-    /// malformed URL and a negative database index;
-    /// [`Error::Unsupported`] for `rediss://` /
-    /// `rediss+cluster://` (no TLS stack is vendored) and for a cluster scheme
-    /// (slot routing is not implemented).
+    /// [`Error::Validation`] for a blank URL, a scheme outside the four above, a
+    /// malformed URL (no host, non-numeric database path) and a negative database
+    /// index.
     pub fn validate(&self) -> Result<()> {
         let url = self.url.trim();
         if url.is_empty() {
@@ -160,29 +191,17 @@ impl RedisOnlineStoreOptions {
             ));
         }
         match scheme(url) {
-            Some("redis") => {}
-            Some("redis+cluster" | "rediss+cluster") => {
-                return Err(Error::unsupported(
-                    "redis cluster mode is not supported by the online RL store: slot routing \
-                     is not implemented; point the url at one node with redis://",
-                ));
-            }
-            Some("rediss") => {
-                return Err(Error::unsupported(
-                    "redis TLS (rediss://) is not supported by the online RL store: the \
-                     workspace does not vendor a TLS stack; use redis:// to a trusted network or \
-                     a TLS terminator",
-                ));
-            }
+            Some("redis" | "rediss" | "redis+cluster" | "rediss+cluster") => {}
             Some(other) => {
                 return Err(Error::validation(format!(
-                    "unsupported redis online store url scheme '{other}'; accepted scheme is \
-                     redis://"
+                    "unsupported redis online store url scheme '{other}'; accepted schemes are \
+                     redis://, rediss://, redis+cluster://, and rediss+cluster://"
                 )));
             }
             None => {
                 return Err(Error::validation(format!(
-                    "invalid redis online store url '{url}': expected redis://host[:port][/db]"
+                    "invalid redis online store url '{url}': expected \
+                     redis[s][+cluster]://host[:port][/db]"
                 )));
             }
         }
@@ -193,11 +212,17 @@ impl RedisOnlineStoreOptions {
                 )));
             }
         }
-        // Confirms the host, port and database path the client will parse.
+        // Confirms the host, port and database path the client will parse; the
+        // scheme's `tls`/`cluster_mode` flags come back untouched.
         self.connection_options().map(|_| ())
     }
 
     /// Builds the client connection options these settings describe.
+    ///
+    /// The URL decides `host`/`port`/credentials/`db` plus `tls` and
+    /// `cluster_mode` (`rediss` → TLS, `+cluster` → cluster mode); both flags are
+    /// forwarded unchanged, while `database` and `timeout` override the URL's
+    /// database and the client's default timeout.
     fn connection_options(&self) -> Result<ConnectionOptions> {
         let mut connection = ConnectionOptions::from_url(self.url.trim())?;
         if let Some(database) = self.database {
@@ -245,14 +270,24 @@ pub struct RedisOnlineStore {
 impl RedisOnlineStore {
     /// Connects to `url` with the default prefix, database and timeout.
     ///
-    /// The URL is validated against [`RedisOnlineStoreOptions::validate`] first,
-    /// so TLS and cluster URLs are rejected with
-    /// [`Error::Unsupported`].
+    /// The URL is validated against [`RedisOnlineStoreOptions::validate`] first, so
+    /// a blank URL, an unknown scheme or a malformed URL fails as
+    /// [`Error::Validation`]. Every client scheme is accepted: `rediss://`
+    /// performs a verified TLS handshake and `redis+cluster://` /
+    /// `rediss+cluster://` verify the seed node and enable `MOVED`/`ASK`
+    /// redirection. See the module docs for the caveats that remain.
     pub async fn connect(url: &str) -> Result<Self> {
         Self::connect_with_options(&RedisOnlineStoreOptions::new(url)).await
     }
 
     /// Connects with explicit options.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Validation`] for invalid options or a seed node that is not a
+    /// cluster node while cluster mode is requested, `Transport` for a connection,
+    /// TLS-handshake or handshake-command failure, and `Timeout` when the connect or
+    /// TLS handshake exceeds [`RedisOnlineStoreOptions::timeout`].
     pub async fn connect_with_options(options: &RedisOnlineStoreOptions) -> Result<Self> {
         options.validate()?;
         let client = Client::connect(options.connection_options()?).await?;
@@ -400,7 +435,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use openjiuwen_common::error::{Error, ErrorKind};
+    use openjiuwen_common::error::ErrorKind;
 
     use super::{normalize_prefix, RedisOnlineStoreOptions, DEFAULT_PREFIX};
 
@@ -429,7 +464,14 @@ mod tests {
 
     #[test]
     fn blank_and_malformed_urls_are_validation_errors() {
-        for url in ["", "   ", "cache:6379", "http://cache:6379"] {
+        for url in [
+            "",
+            "   ",
+            "cache:6379",
+            "http://cache:6379",
+            "redis+tls://cache:6379",
+            "rediss+cluster://",
+        ] {
             let error = RedisOnlineStoreOptions::new(url)
                 .validate()
                 .expect_err("invalid url");
@@ -449,23 +491,67 @@ mod tests {
     }
 
     #[test]
-    fn tls_and_cluster_urls_are_unsupported() {
-        let tls = RedisOnlineStoreOptions::new("rediss://cache:6379/0")
-            .validate()
-            .expect_err("tls");
-        assert!(matches!(tls, Error::Unsupported(_)));
-        assert!(tls.to_string().contains("TLS"), "{tls}");
+    fn tls_and_cluster_schemes_are_accepted_and_forwarded() {
+        // `connection_options()` is exactly what `connect` hands to the client, and
+        // `tls`/`cluster_mode` are the flags the client acts on.
+        let plain = RedisOnlineStoreOptions::new("redis://cache:6379/0");
+        plain.validate().expect("plain url");
+        let connection = plain.connection_options().expect("parse");
+        assert!(!connection.tls);
+        assert!(!connection.cluster_mode);
 
-        let cluster = RedisOnlineStoreOptions::new("redis+cluster://cache:6379/0")
-            .validate()
-            .expect_err("cluster");
-        assert!(matches!(cluster, Error::Unsupported(_)));
-        assert!(cluster.to_string().contains("cluster"), "{cluster}");
+        let tls = RedisOnlineStoreOptions::new("rediss://cache:6379/0");
+        tls.validate().expect("tls url");
+        let connection = tls.connection_options().expect("parse");
+        assert!(connection.tls, "rediss:// selects TLS");
+        assert!(!connection.cluster_mode, "rediss:// is not cluster mode");
 
-        let tls_cluster = RedisOnlineStoreOptions::new("rediss+cluster://cache:6379/0")
-            .validate()
-            .expect_err("tls cluster");
-        assert!(matches!(tls_cluster, Error::Unsupported(_)));
+        let cluster = RedisOnlineStoreOptions::new("redis+cluster://cache:6379/0");
+        cluster.validate().expect("cluster url");
+        let connection = cluster.connection_options().expect("parse");
+        assert!(!connection.tls, "redis+cluster:// is not TLS");
+        assert!(
+            connection.cluster_mode,
+            "redis+cluster:// selects cluster mode"
+        );
+
+        let both = RedisOnlineStoreOptions::new("rediss+cluster://cache:6379/0");
+        both.validate().expect("tls cluster url");
+        let connection = both.connection_options().expect("parse");
+        assert!(connection.tls, "rediss+cluster:// selects TLS");
+        assert!(
+            connection.cluster_mode,
+            "rediss+cluster:// selects cluster mode"
+        );
+    }
+
+    #[test]
+    fn overrides_apply_to_tls_and_cluster_urls() {
+        let options = RedisOnlineStoreOptions {
+            database: Some(4),
+            timeout: Duration::from_millis(250),
+            ..RedisOnlineStoreOptions::new("rediss+cluster://user:secret@cache:6380/2")
+        };
+        options.validate().expect("valid tls cluster options");
+        let connection = options.connection_options().expect("parse");
+        assert_eq!(connection.host, "cache");
+        assert_eq!(connection.port, 6380);
+        assert_eq!(connection.username.as_deref(), Some("user"));
+        assert!(
+            connection.password.is_some(),
+            "credentials survive the override"
+        );
+        assert_eq!(connection.db, Some(4), "the explicit database wins");
+        assert_eq!(connection.timeout, Duration::from_millis(250));
+        assert!(connection.tls, "the scheme still selects TLS");
+        assert!(
+            connection.cluster_mode,
+            "the scheme still selects cluster mode"
+        );
+        assert!(
+            !format!("{options:?}").contains("secret"),
+            "no credential leak"
+        );
     }
 
     #[test]

@@ -70,6 +70,10 @@ pub mod evaluator;
 pub mod evaluator_pipeline;
 /// Online RL task registry: task/capture state machine over a primitive store seam.
 pub mod online;
+/// GPU-free offline RL runtime: task queue, rollout workers, encoding, batch
+/// planning, processors, persistence, metrics, the training coordinator and the
+/// offline trainer (the Python `agent_rl/offline` pipeline).
+pub mod offline;
 /// Candidates, the optimizer baseline, and checkpoints/stores/manager.
 pub mod optimizer;
 /// Pure evolution events, observer trait, and harness rail adapter.
@@ -95,6 +99,8 @@ pub mod signal;
 pub mod trajectory;
 /// Test-time skill experience: tip bank, induction, consultation.
 pub mod ttse;
+/// Update contracts, apply helpers, updaters, and the RL update pipeline.
+pub mod updater;
 
 /// The crate name as reported by Cargo.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -187,6 +193,22 @@ pub use trainer::{
     Callbacks, EpochReport, NoopCallbacks, Progress, StopReason, TrainableTarget, Trainer,
     TrainerConfig, TrainerReport,
 };
+/// The offline RL runtime's primary types: queue, store, processors, encoding,
+/// batch planning, runtime workers, coordinator, metrics, trainer and the
+/// experience hook.
+pub use offline::{
+    BatchBuilder, BatchComponents, BatchConfig, BatchDiagnostics, BatchPlan, ClassifierFn,
+    CoordinatorConfig, CoordinatorReport, EncodingOutcome, ExactMatchComposer,
+    ExperienceCollector, FileRolloutStore, GpuTrainingExecutor, MetricsTracker,
+    NullRolloutStore, OfflineStopReason, OfflineTrainReport, OfflineTrainer, OfflineTrainerConfig,
+    ParallelRuntimeExecutor, PpoTrainingExecutor, ProcessorsRegistry, RewardComposer,
+    RolloutPersistence, RolloutPhase, RolloutRewards, RolloutSource, RoundReport, RuntimeExecutor,
+    RuntimeOutcome, SamplerFn, ScriptedRolloutSource, SeriesSummary, TaskQueue,
+    TrainingCoordinator, TrainingStepMetrics, TrajectoryExperienceCollector, TurnEncoder,
+    ValidationMetrics, ValidationSummary, ValidatorFn, WeightedRewardComposer,
+    ADAPTIVE_SAMPLER, BALANCED_VALIDATOR, DEFAULT_CLASSIFIER, DEFAULT_SAMPLER, DEFAULT_VALIDATOR,
+    GPU_TRAINING_AREA,
+};
 /// Trajectory recording, spans, windows, grouping, and digests.
 pub use trajectory::{
     first_error, from_messages, last_n, longest_span, render_digest, span_by_name, spans,
@@ -200,4 +222,15 @@ pub use ttse::{
     DreamReport, Dreamer, EmbeddingIndex, IndexMatch, RankedTip, RetrieveMode, SuccessAssessment,
     SuccessDetector, TipBank, TipBankStats, TipCategory, TipClassifier, TipInducer, TipParser,
     TipRecord, TtseConfig, TtseEngine, RRF_K,
+};
+/// Update contracts, apply helpers, updaters, and the RL update pipeline.
+pub use updater::{
+    apply_updates, compute_advantages, domain_for_signal, execute_updates, normalize_update_value,
+    normalize_updates, policy_update_key, signals_from_cases, summarize_apply_results,
+    AdvantageGroupStats, AdvantageReport, ApplyResult, ApplySummary, GradientOptimizer,
+    GpuGradientOptimizer, LifecycleStage, MultiDimUpdater, OfflinePolicyOptimizer, OperatorMap,
+    ParameterUpdate, RecordingOptimizer, RecordingTarget, RlUpdatePipeline, SingleDimUpdater,
+    TextualOptimizer, Update, UpdateConfig, UpdateDomain, UpdateEffect, UpdateEntry, UpdateKey,
+    UpdateMode, UpdateTarget, UpdateValue, Updater, Updates, EXPERIENCES_TARGET, POLICY_TARGET,
+    SKILL_EXPERIENCE_ENTRY,
 };
