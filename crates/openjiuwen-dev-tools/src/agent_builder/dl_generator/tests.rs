@@ -298,7 +298,10 @@ async fn generate_candidate_returns_an_invalid_model_answer_with_its_issues() {
     assert_eq!(generated.provenance.len(), 1);
     let record = &generated.provenance.stages[0];
     assert_eq!(record.stage, ProgressStage::GeneratingDl);
-    assert_eq!(record.source, GenerationSource::Model);
+    // The candidate is handed over, but the stage's own document was rejected,
+    // so the answer is recorded as a fallback the repair loop may still rescue.
+    assert_eq!(record.source, GenerationSource::Fallback);
+    assert!(generated.provenance.has_fallback());
     assert!(
         record.detail.contains("needs repair"),
         "detail {:?} names the repair",

@@ -20,9 +20,9 @@
 //! path: the model's parsed answer comes back even when it fails
 //! [`WorkflowDsl::validate`], together with one note per structural failure, so
 //! the pipeline's bounded repair loop can refine that document instead of
-//! throwing the model's content away. The deterministic document always comes
-//! back beside the candidate, so a caller that cannot repair the answer still
-//! has its baseline to fall back to.
+//! throwing the model's content away.
+//! The deterministic document always comes back beside the candidate, so a caller that cannot repair the answer still has its baseline to fall back to.
+//! The generation stage is recorded as `GenerationSource::Fallback` in that case, because its document is rejected; the repair loop may still rescue the answer, which then shows up as a later `refining_dl` = `model` record.
 //!
 //! # Refine mode
 //!
@@ -43,7 +43,7 @@ use openjiuwen_foundation::BaseMessage;
 use serde::{Deserialize, Serialize};
 
 use super::designer::WorkflowDesign;
-use super::outcome::{GenerationProvenance, GenerationSource};
+use super::outcome::GenerationProvenance;
 use super::progress::ProgressStage;
 use super::spec::WorkflowSpec;
 use super::utils::extract_json_from_text;
@@ -247,13 +247,19 @@ impl DlGenerator {
     /// Converts a design into a workflow-DSL candidate for the repair loop.
     ///
     /// The deterministic baseline is computed first, so an invalid design is a
-    /// validation error regardless of the model. Without a model the result
-    /// holds no candidate and one [`GenerationSource::Deterministic`] record.
+    /// validation error regardless of the model.
+    /// Without a model the result holds no candidate and one
+    /// [`GenerationSource::Deterministic`] record.
     /// Otherwise the single model round trip produces the document the model
     /// answered with — *even when it fails [`WorkflowDsl::validate`]* — beside
     /// one note per structural failure, so a caller can repair it instead of
     /// keeping the baseline.
-    ///
+    /// A parsed answer that fails [`WorkflowDsl::validate`] is recorded as
+    /// [`GenerationSource::Fallback`], because its document is rejected and the
+    /// stage delivered no usable document; the candidate is still handed over
+    /// for repair.
+    /// The repair loop may still rescue such an answer, which then shows up as a
+    /// later `refining_dl` = `model` record.
     /// A failed call, a choice-less answer, a missing JSON fence, or an
     /// unparseable document yields no candidate, no issues, and one
     /// [`GenerationSource::Fallback`] record naming the reason.
@@ -294,9 +300,8 @@ impl DlGenerator {
                 if issues.is_empty() {
                     provenance.record_model(ProgressStage::GeneratingDl);
                 } else {
-                    provenance.record(
+                    provenance.record_fallback(
                         ProgressStage::GeneratingDl,
-                        GenerationSource::Model,
                         format!("model document needs repair: {}", issues.join("; ")),
                     );
                 }

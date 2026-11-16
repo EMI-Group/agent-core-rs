@@ -542,9 +542,10 @@ async fn repair_loop_rescues_an_invalid_model_document() {
         result.repair.notes
     );
 
-    // The model answered throughout, so nothing fell back.
+    // The invalid generation answer is recorded as a fallback, so the rejection
+    // stays visible; the accepted revision is the model's own document.
     assert!(
-        !result.provenance.has_fallback(),
+        result.provenance.has_fallback(),
         "{:?}",
         result.provenance.stages
     );
@@ -554,7 +555,7 @@ async fn repair_loop_rescues_an_invalid_model_document() {
         .iter()
         .find(|record| record.stage == ProgressStage::GeneratingDl)
         .expect("the generation stage is recorded");
-    assert_eq!(generation.source, GenerationSource::Model);
+    assert_eq!(generation.source, GenerationSource::Fallback);
     assert!(generation.detail.contains("needs repair"), "{generation:?}");
     let refinements: Vec<_> = result
         .provenance
