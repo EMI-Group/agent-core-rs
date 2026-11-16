@@ -98,7 +98,7 @@ pub use experts::{
     bind_group, clear_process_expert_catalog, compose_template_member, get_process_expert_catalog,
     load_agent_group, render_persona, set_process_expert_catalog, AgentGroupCard,
     AgentGroupMemberCard, AgentTemplateCard, BoundAgentGroup, BoundGroupMember, ExpertCatalog,
-    ExpertRef, LoadedAgentGroupPackage, LocalizedText, PackageLocation,
+    ExpertRef, LoadedAgentGroupPackage, LocalizedText, PackageLocation, SkipReason, SkippedMember,
 };
 // --- persistence -----------------------------------------------------------
 pub use storage::*;
