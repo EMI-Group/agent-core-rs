@@ -71,7 +71,15 @@ impl FakeRedis {
 
     /// A `redis://` URL pointing at this server with database `0`.
     pub(super) fn url(&self) -> String {
-        format!("redis://{}/0", self.addr)
+        self.url_with("redis")
+    }
+
+    /// A URL with `scheme` (`rediss`, `redis+cluster`, …) at this server, database `0`.
+    ///
+    /// The server speaks plain `RESP2`, so a TLS scheme connects to a peer that
+    /// cannot complete a handshake and a cluster scheme finds no cluster node.
+    pub(super) fn url_with(&self, scheme: &str) -> String {
+        format!("{scheme}://{}/0", self.addr)
     }
 
     /// A handle for asserting on the server's data.

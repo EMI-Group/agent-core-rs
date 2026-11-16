@@ -6,7 +6,7 @@
 //! are re-proven here through the real command mapping — primitives, key
 //! prefixing, the task lifecycle, the sample ledger's first-wins publication, a
 //! full training run with checkpoint export, durability across two store
-//! instances, and the typed rejection of TLS/cluster URLs.
+//! instances, and the typed errors of an unusable TLS peer and a non-cluster seed.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -190,25 +190,38 @@ async fn a_wrong_type_reply_surfaces_as_an_error() {
 }
 
 #[tokio::test]
-async fn tls_and_cluster_urls_are_rejected() {
-    for url in [
-        "rediss://127.0.0.1:6379/0",
-        "redis+cluster://127.0.0.1:6379/0",
-        "rediss+cluster://127.0.0.1:6379/0",
-    ] {
-        let error = RedisOnlineStore::connect(url)
+async fn a_rediss_url_against_a_plain_listener_fails_the_handshake() {
+    // No certificate fixture exists offline, so a completed handshake is not
+    // exercised here. What matters is that TLS is attempted — the scheme is
+    // accepted (never `Unsupported`) and the flags reach the client — and that a
+    // peer which does not speak TLS surfaces as a typed transport error naming TLS.
+    let fake = FakeRedis::start().await;
+    for scheme in ["rediss", "rediss+cluster"] {
+        let error = RedisOnlineStore::connect(&fake.url_with(scheme))
             .await
-            .expect_err("unsupported");
-        assert_eq!(error.kind(), ErrorKind::Unsupported, "url {url}");
+            .expect_err("a plain listener cannot complete a TLS handshake");
+        assert_eq!(error.kind(), ErrorKind::Transport, "{scheme}: {error}");
+        let message = error.to_string();
+        assert!(message.contains("TLS"), "{scheme}: {message}");
+        assert!(!message.contains("Unsupported"), "{scheme}: {message}");
     }
-    let tls = RedisOnlineStore::connect("rediss://127.0.0.1:6379/0")
+    fake.shutdown().await;
+}
+
+#[tokio::test]
+async fn cluster_mode_against_a_standalone_server_is_a_typed_error() {
+    // Cluster mode verifies the seed at connect time, so a standalone node is a
+    // validation error about the cluster rather than a timeout or a silently used
+    // single node.
+    let fake = FakeRedis::start().await;
+    let error = RedisOnlineStore::connect(&fake.url_with("redis+cluster"))
         .await
-        .expect_err("tls");
-    assert!(tls.to_string().contains("TLS"), "{tls}");
-    let cluster = RedisOnlineStore::connect("redis+cluster://127.0.0.1:6379/0")
-        .await
-        .expect_err("cluster");
-    assert!(cluster.to_string().contains("cluster"), "{cluster}");
+        .expect_err("a standalone node is not a cluster node");
+    assert_eq!(error.kind(), ErrorKind::Validation, "{error}");
+    let message = error.to_string();
+    assert!(message.contains("cluster node"), "{message}");
+    assert!(!message.contains("Unsupported"), "{message}");
+    fake.shutdown().await;
 }
 
 #[tokio::test]
