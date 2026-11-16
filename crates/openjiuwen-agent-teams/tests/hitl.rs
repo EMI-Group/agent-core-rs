@@ -1,6 +1,6 @@
 //! HITL surface of `openjiuwen-agent-teams`, driven through the public API only.
 //!
-//! The suite pins the five pieces an embedding host builds against:
+//! The suite pins the six pieces an embedding host builds against:
 //!
 //! 1. the `#` / `$` / `@` routing grammar ([`parse_interact_str`]) over a real roster, including
 //!    the fold-back rules for unknown mentions and unknown `$` channels;
@@ -10,11 +10,23 @@
 //! 4. the run/interact admission gate ([`InteractGate`]) with its wire tokens `not_active` and
 //!    `gate_closed`;
 //! 5. the tool-approval bridge ([`ToolApprovalRequest`] → `InteractionRequest` →
-//!    [`parse_confirm`] → `tool_approval_result`) plus the human-agent inbox enablement check.
+//!    [`parse_confirm`] → `tool_approval_result`) plus the human-agent inbox enablement check;
+//! 6. the relayed tool-call contract of `TeamAgent::deliver` over a live team: the interact gate
+//!    first (so the team must be started), then the enabled human-agent inbox (`enable_hitt`), then
+//!    a roster member whose role is exactly `passive_human`, then a known team tool —
+//!    only then is the call dispatched, and a refusal carries one stable token
+//!    (`human_agent_not_enabled`, `unknown_human_agent:<name>`,
+//!    `tool_passthrough_avatar_not_supported`, `unknown_tool:<tool>`, `invalid_arguments:<tool>`,
+//!    `tool_failed:<tool>`); an [`InteractPayload::ExternalTeam`] payload is always rejected as
+//!    `unsupported:external_team_transport`.
 //!
-//! Everything here is deterministic and offline: no session, no bus, no clock and no sleeps.
+//! Everything here is deterministic and offline: no network, no model, no wall-clock ordering.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![allow(clippy::missing_panics_doc)]
+
+mod support;
+
+use std::sync::Arc;
 
 use openjiuwen_agent_teams::constants::{
     is_reserved_name, parse_mention, DEFAULT_LEADER_MEMBER_NAME, HUMAN_AGENT_MEMBER_NAME,
@@ -26,10 +38,16 @@ use openjiuwen_agent_teams::interaction::{
     HumanAgentMessage, HumanAgentToolCall, InteractGate, InteractPayload, OperatorMessage, Route,
     ToolApprovalRequest, HUMAN_AGENT_NOT_ENABLED,
 };
-use openjiuwen_agent_teams::schema::{EventPayload, ToolApprovalResultEvent};
+use openjiuwen_agent_teams::runtime::TeamAgent;
+use openjiuwen_agent_teams::schema::{
+    EventPayload, MemberSpecBase, PredefinedMemberSpec, TaskGraphSpec, TeamAgentSpec,
+    ToolApprovalResultEvent,
+};
 use openjiuwen_common::error::ErrorKind;
 use openjiuwen_session::InteractionKind;
 use serde_json::{json, Value};
+
+use support::{sample_spec, Fixture};
 
 // ---------------------------------------------------------------------------
 // fixtures
@@ -820,4 +838,144 @@ async fn human_agent_inbox_queues_and_drains_in_arrival_order() {
     );
     assert!(inbox.is_empty());
     assert_eq!(inbox.drain().await, Vec::new());
+}
+
+// ---------------------------------------------------------------------------
+// 8. relayed tool calls — `deliver` → guard chain → `tool_dispatch`
+// ---------------------------------------------------------------------------
+
+/// The sample blueprint with the HITL channel on and one passive human on the roster.
+fn hitl_passive_human() -> TeamAgentSpec {
+    let mut spec = sample_spec();
+    spec.enable_hitt = true;
+    spec.predefined_members
+        .push(PredefinedMemberSpec::PassiveHuman(MemberSpecBase {
+            member_name: "alice".to_owned(),
+            display_name: "Alice".to_owned(),
+            desc: "a human on the roster".to_owned(),
+            ..MemberSpecBase::default()
+        }));
+    spec
+}
+
+/// Builds and starts one live team over the HITL blueprint; the fixture keeps its fakes alive.
+async fn started_hitl_team() -> (Fixture, Arc<TeamAgent>) {
+    let fixture = Fixture::new();
+    let agent = fixture
+        .activate(&hitl_passive_human(), "hitl-deliver")
+        .await;
+    agent.start().await.expect("the team did not start");
+    (fixture, agent)
+}
+
+/// One relayed tool-call payload, acting as `human`.
+fn tool_call(human: &str, tool: &str, arguments: Value) -> InteractPayload {
+    InteractPayload::HumanAgentToolCall(HumanAgentToolCall {
+        human_name: human.to_owned(),
+        tool_name: tool.to_owned(),
+        tool_args: arguments,
+    })
+}
+
+/// Pins the refusal side of a relayed call: `ok == false`, no payload, and that exact token.
+fn assert_refused(answer: &DeliverResult, reason: &str) {
+    assert!(!answer.ok, "{answer:?}");
+    assert_eq!(answer.reason.as_deref(), Some(reason), "{answer:?}");
+    assert_eq!(answer.output, Value::Null, "a refusal carries no output");
+    assert_eq!(answer.data, Value::Null, "a refusal carries no data");
+    assert_eq!(
+        answer.message_id, None,
+        "a relayed call writes no mailbox row of its own"
+    );
+}
+
+#[tokio::test]
+async fn a_relayed_view_task_answers_its_listing_and_its_rendered_text() {
+    let (_fixture, agent) = started_hitl_team().await;
+    agent
+        .create_task(TaskGraphSpec {
+            title: "ship it".to_owned(),
+            task_id: Some("t-1".to_owned()),
+            ..TaskGraphSpec::default()
+        })
+        .await
+        .expect("the task was not created");
+
+    let answer = agent
+        .deliver(tool_call("alice", "view_task", json!({"action": "list"})))
+        .await;
+    assert!(answer.ok, "{answer:?}");
+    assert_eq!(answer.reason, None, "a successful relay carries no token");
+    assert_eq!(answer.message_id, None);
+
+    let rows = answer
+        .data
+        .as_array()
+        .expect("view_task answers a list of task rows");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["task_id"], json!("t-1"));
+    assert_eq!(rows[0]["title"], json!("ship it"));
+
+    // The dispatch contract: a JSON string answer passes through verbatim, every other value is
+    // rendered as its compact JSON text — so `output` here is exactly the text of `data`.
+    let text = answer
+        .output
+        .as_str()
+        .expect("the rendered output is text, never a raw value");
+    assert_ne!(text, "", "the rendered output is never blank");
+    assert_eq!(
+        text,
+        serde_json::to_string(&answer.data).expect("the listing is serializable")
+    );
+    assert!(text.contains("\"task_id\":\"t-1\""), "{text}");
+
+    agent.stop().await.expect("the team did not stop");
+}
+
+#[tokio::test]
+async fn a_relayed_unknown_tool_is_refused_by_its_stable_token() {
+    let (_fixture, agent) = started_hitl_team().await;
+    let answer = agent
+        .deliver(tool_call("alice", "nope", json!({"action": "list"})))
+        .await;
+    assert_refused(&answer, "unknown_tool:nope");
+    agent.stop().await.expect("the team did not stop");
+}
+
+#[tokio::test]
+async fn a_relayed_call_from_off_the_roster_names_the_unknown_human() {
+    let (_fixture, agent) = started_hitl_team().await;
+    let answer = agent
+        .deliver(tool_call("ghost", "view_task", json!({"action": "list"})))
+        .await;
+    assert_refused(&answer, "unknown_human_agent:ghost");
+    agent.stop().await.expect("the team did not stop");
+}
+
+#[tokio::test]
+async fn a_relayed_call_from_a_non_passive_roster_member_is_refused() {
+    let (_fixture, agent) = started_hitl_team().await;
+    // `dev-1` is a real teammate of `sample_spec`, so the roster knows it but its role is not
+    // `passive_human`: an avatar keeps its own governed LLM tool loop, so passthrough is refused.
+    let answer = agent
+        .deliver(tool_call("dev-1", "view_task", json!({"action": "list"})))
+        .await;
+    assert_refused(&answer, "tool_passthrough_avatar_not_supported");
+    agent.stop().await.expect("the team did not stop");
+}
+
+#[tokio::test]
+async fn an_external_team_payload_is_rejected_before_the_gate() {
+    let fixture = Fixture::new();
+    let agent = fixture
+        .activate(&hitl_passive_human(), "hitl-deliver")
+        .await;
+    // The transport rejection precedes the interact gate, so a team that never started answers the
+    // same token instead of `not_active`.
+    let answer = agent
+        .deliver(InteractPayload::ExternalTeam(ExternalTeamEvent {
+            event: json!({"event_type": "team_completed", "payload": {}}),
+        }))
+        .await;
+    assert_refused(&answer, "unsupported:external_team_transport");
 }
