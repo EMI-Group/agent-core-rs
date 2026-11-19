@@ -291,3 +291,13 @@ Team transports are not the runner's: they belong to `openjiuwen-multiagent` (`T
 - `dreaming_status()` copies the orchestrator's own `DreamOrchestratorStatus` out under its lock: the returned value is one snapshot, and no lock is held across an await.
 - Tests drive the loop with millisecond intervals (`initial_delay_ms: 0`, `poll_interval_ms: 1`, `max_interval_ms: 5`) and bounded `eventually` polls; the injected clock belongs to `DreamService::tick`, never to the loop, which reads `Utc::now()`.
 - `RunBinding::run_id` and `RunStatusGuard` stay `pub(crate)` and carry `#[allow(dead_code)]` for that reason; do not widen them to silence lints.
+
+## Known Issues
+
+- Streaming hot path builds a full `CallbackContext` (and serializes every chunk via `to_value`/`to_wire`) before `trigger`, which returns immediately when there are no subscribers; `CallbackFramework::has_subscribers` exists and is unused by the run paths (`run/agent.rs`, `run/workflow.rs`).
+- Workflow runs are the only execution path that never applies `effective_deadline`: `run_options` forwards only the caller's timeout, so `RunnerConfig::default_run_timeout_secs` silently does not bound `run_workflow`/`run_workflow_streaming`.
+- `MonitoredSpawnedAgent::drop` finishes the spawn as `Completed` (`handle_dropped`), so an abandoned child that is still running is reported as a successful run; `force_kill` and `RunStatusGuard::drop` both report `Cancelled` for the same abandonment.
+- The HTTP remote backend caps time, not bytes: `invoke_http` reads `response.text()` unbounded and `body_snippet` splits/joins the whole body before keeping 256 chars, so a large error body is copied several times before it is truncated.
+- The subprocess stderr drain uses `BufReader::lines()` with no per-line cap, so a child that writes one very long line (or none, while writing a lot) grows the parent's buffer without bound.
+- `HealthSupervisor::retune` has no re-tune lock, so two concurrent `set_health_interval` calls can each arm a supervised loop and leak the first one; the subprocess backend serializes the same operation with `health_tuning`.
+- `TeamPoolInner::prune_finished` and `reaper::reap` remove a key computed under an earlier lock without re-checking that it is still the same finished entry, so an entry admitted under the same key in the window is dropped (its `Drop` cancels the new run).
