@@ -676,7 +676,7 @@ fn recorded(model: Option<&str>) -> RecordedRequest {
 async fn wait_for_requests_registers_before_rechecking_the_count() {
     let state = Arc::new(default_state());
 
-    tokio::time::timeout(Duration::from_millis(50), state.wait_for_requests(0))
+    tokio::time::timeout(Duration::from_millis(50), state.wait_for_requests_until(0))
         .await
         .expect("count 0 returns immediately");
 
@@ -686,7 +686,7 @@ async fn wait_for_requests_registers_before_rechecking_the_count() {
         recorder.record(recorded(Some("gpt-4o")));
     });
 
-    tokio::time::timeout(Duration::from_secs(1), state.wait_for_requests(1))
+    tokio::time::timeout(Duration::from_secs(1), state.wait_for_requests_until(1))
         .await
         .expect("the waiter wakes on the first recording");
     record_task.await.expect("the recorder task finishes");

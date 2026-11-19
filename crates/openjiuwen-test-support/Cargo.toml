@@ -18,6 +18,13 @@ async-trait.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 axum.workspace = true
+# The mock server owns its accept loop (so it can abort every connection task on
+# drop), which needs the same server plumbing `axum::serve` uses internally.
+# They are already locked transitively through `axum`, pinned inline like the
+# workspace's other `hyper`/`tower` consumers.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+tower-service = "0.3"
 futures.workspace = true
 uuid.workspace = true
 chrono.workspace = true

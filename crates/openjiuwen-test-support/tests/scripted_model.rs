@@ -334,7 +334,7 @@ async fn wait_for_calls_wakes_on_a_concurrent_call() {
             .await
     });
 
-    model.wait_for_calls(1).await;
+    model.wait_for_calls(1).await.expect("the call is recorded");
     assert_eq!(model.call_count(), 1);
     handle.await.expect("task joins").expect("scripted turn");
 

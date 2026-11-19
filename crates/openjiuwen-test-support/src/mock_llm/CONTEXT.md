@@ -8,7 +8,8 @@ The public API is the `MockLlmServer`, `MockLlmServerBuilder`, `ScriptedResponse
 
 ## API Surface
 
-- Server handle: `MockLlmServer` — `start`/`try_start`/`with_script`/`builder`, `base_url`, `endpoint`, `addr`, `client_config`, `request_config`, `openai_client`, `push`/`push_many`/`clear_script`/`set_fallback`/`queued`, `request_count`/`requests`/`last_request`, `wait_for_requests`/`wait_for_requests_timeout`, `shutdown`.
+- Server handle: `MockLlmServer` — `start`/`try_start`/`with_script`/`builder`, `base_url`, `endpoint`, `addr`, `client_config`, `request_config`, `openai_client`, `push`/`push_many`/`clear_script`/`set_fallback`/`queued`, `request_count`/`requests`/`last_request`, `wait_for_requests` (bounded, `Result`) / `wait_for_requests_timeout`, `connections`/`live_connections`, `shutdown`.
+- Connection tasks: `ConnectionTasks` with `live`/`spawned`; the handle `MockLlmServer::connections` returns outlives the server, so a test can assert that dropping it left no task running.
 - Builder: `MockLlmServerBuilder` — `script`, `item`, `fallback`, `id_prefix`, `default_model`, `chunk_delay`, `start`/`try_start`.
 - Script entries: `ScriptedResponse::{Completion, Chunks, Error}` with `text`, `completion`, `chunks`, `error`.
 - Error payloads: `MockHttpError { status, body }` with `new`, `with_body`, `rate_limited`, `unauthorized`, `server_error`, `not_found`.
@@ -29,11 +30,12 @@ The public API is the `MockLlmServer`, `MockLlmServerBuilder`, `ScriptedResponse
 - SSE frames must be exactly `data: <json>\n\n`, terminated by `data: [DONE]\n\n`; `StreamChunk::Done` never becomes its own JSON frame.
 - Usage is emitted as a dedicated frame with `choices: []` when the scripted usage is non-empty; the usage object always uses `prompt_tokens`/`completion_tokens`/`total_tokens` plus `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens` when non-zero.
 - `MockLlmServer::openai_client` builds an `OpenAiCompatibleClient` with provider `openai`, api key `test-api-key`, `max_retries = 0`, so a scripted 5xx fails immediately.
-- `shutdown` notifies the graceful-shutdown future and awaits the server task with a 5 s bound, aborting it when a connection refuses to drain; `Drop` notifies and aborts.
+- The server owns its accept loop (a plain `TcpListener` loop feeding `hyper_util`'s auto connection builder) instead of `axum::serve`, because `axum::serve` spawns one task per connection with no handle; every connection task is recorded in `ConnectionTasks`.
+- `shutdown` flips the graceful signal the accept loop forwards to each connection, awaits the accept task with a 5 s bound, waits up to 5 s for the connections to drain and aborts whatever is left; `Drop` aborts the accept task and every connection task, so no task outlives the server.
 
 ## Module Layout
 
-- `mod.rs` — handle (`MockLlmServer`), builder, re-exports; `Drop` aborts the server task when `shutdown` was not awaited.
+- `mod.rs` — handle (`MockLlmServer`), `ConnectionTasks`, accept loop and per-connection serving, builder, re-exports; `Drop` aborts the accept task and every connection task when `shutdown` was not awaited.
 - `state.rs` — `ServerState`: script queue, fallback, recordings, sequence counter, `Notify`, config (id prefix, default model, chunk delay); plus the synchronous pop/record/pending helpers.
 - `wire.rs` — OpenAI request parsing (tolerant serde) and response projection: completion body, SSE frame generation from `StreamChunk`, error envelope, health body; `ChatCompletionRequest` parses `messages`/`tools`/`tool_choice`/`stream_options` for tolerance only (only `model` and `stream` are read), hence the documented `#[allow(dead_code)]`.
 - `routes.rs` — axum `Router`, `chat_completions` handler (read `Bytes` → parse → pop → record → respond), `health`, JSON 404 fallback, SSE body construction with the optional per-frame delay.

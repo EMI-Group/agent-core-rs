@@ -219,7 +219,7 @@ pub(crate) struct ServerState {
     recordings: Mutex<Vec<RecordedRequest>>,
     /// Number of popped script entries; produces `chatcmpl-<prefix><seq>`.
     sequence: AtomicU64,
-    /// Wakes [`ServerState::wait_for_requests`] callers after a recording.
+    /// Wakes [`ServerState::wait_for_requests_until`] callers after a recording.
     notify: Notify,
     /// Prefix of the deterministic response ids.
     id_prefix: String,
@@ -306,7 +306,7 @@ impl ServerState {
         self.chunk_delay
     }
 
-    /// Appends one recording and wakes every `wait_for_requests` caller.
+    /// Appends one recording and wakes every `wait_for_requests_until` caller.
     pub(crate) fn record(&self, request: RecordedRequest) {
         lock(&self.recordings).push(request);
         // The notification is raised outside the lock so a waiter that wakes up
@@ -329,8 +329,11 @@ impl ServerState {
         lock(&self.recordings).last().cloned()
     }
 
-    /// Waits (indefinitely) until at least `count` requests have been recorded.
-    pub(crate) async fn wait_for_requests(&self, count: usize) {
+    /// Waits until at least `count` requests have been recorded, without a deadline.
+    ///
+    /// This is the primitive behind [`ServerState::wait_for_requests_timeout`]; it is
+    /// crate-private precisely because it can wait forever. Every public waiter is bounded.
+    pub(crate) async fn wait_for_requests_until(&self, count: usize) {
         loop {
             // Register for the wake-up before checking the counter, so a
             // recording that lands between the check and the await is not lost.
@@ -353,7 +356,7 @@ impl ServerState {
         count: usize,
         timeout: Duration,
     ) -> Result<()> {
-        if tokio::time::timeout(timeout, self.wait_for_requests(count))
+        if tokio::time::timeout(timeout, self.wait_for_requests_until(count))
             .await
             .is_ok()
         {
