@@ -38,6 +38,10 @@
 //! process-global state in this module; it holds no user data), so two tasks appending to one
 //! session can never interleave halves of a line. Across processes each append is a single
 //! `O_APPEND` write, which the kernel serialises per file.
+//!
+//! Size note: the implementation body is ~700 lines and the inline test module pushes the
+//! file past the usual 1000-line bound; the tests stay here because they exercise the private
+//! journal lines, the lock table and the compaction policy directly.
 
 use std::collections::HashMap;
 use std::io::Write as _;
