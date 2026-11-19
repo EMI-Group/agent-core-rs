@@ -34,7 +34,6 @@ use crate::rl::{Policy, RlBatch, RlCheckpoint, RlTask, RlUpdate};
 use super::coordinator::{CoordinatorConfig, TrainingCoordinator, ValidationMetrics};
 use super::experience::ExperienceCollector;
 use super::metrics::{BatchDiagnostics, MetricsTracker, TrainingStepMetrics};
-use super::store::RolloutPersistence;
 
 /// The deferred area named by the GPU training seam.
 pub const GPU_TRAINING_AREA: &str = "agent_rl/offline PPO training (verl/ray/vLLM)";
@@ -47,8 +46,7 @@ const GPU_REQUIREMENTS: &str = "torch, transformers, verl, ray and vLLM";
 /// It carries [`crate::deferred::unsupported`]'s message so the deferral table
 /// stays the single source of truth, plus the concrete dependency list so an
 /// operator reading a log knows exactly what is missing.
-#[must_use]
-pub fn gpu_training_unavailable() -> Error {
+fn gpu_training_unavailable() -> Error {
     let base = crate::deferred::unsupported(GPU_TRAINING_AREA);
     Error::unsupported(format!(
         "{base}; it needs {GPU_REQUIREMENTS}, none of which are available in a GPU-free build"
@@ -212,7 +210,7 @@ impl OfflineStopReason {
 }
 
 /// One recorded validation pass.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ValidationSummary {
     /// The training step the pass ran after.
@@ -221,16 +219,6 @@ pub struct ValidationSummary {
     pub epoch: usize,
     /// The `val/*` metrics.
     pub metrics: ValidationMetrics,
-}
-
-impl Default for ValidationSummary {
-    fn default() -> Self {
-        Self {
-            step: 0,
-            epoch: 0,
-            metrics: ValidationMetrics::default(),
-        }
-    }
 }
 
 /// What one [`OfflineTrainer::fit`] did.
@@ -397,10 +385,7 @@ impl OfflineTrainer {
                         return Err(error);
                     }
                 }
-                if let Some(validation) = self
-                    .maybe_validate(step, epoch, validation_rows)
-                    .await?
-                {
+                if let Some(validation) = self.maybe_validate(step, epoch, validation_rows).await? {
                     report.validations.push(validation);
                 }
                 if self.should_checkpoint(step) {
@@ -448,7 +433,9 @@ impl OfflineTrainer {
         rows: &[Value],
     ) -> Result<(TrainingStepMetrics, usize, RlUpdate)> {
         let round = self.coordinator.run_rounds(rows, step).await?;
-        let batch = round.batch.to_rl_batch(format!("step-{step}-batch-{batch_index}"));
+        let batch = round
+            .batch
+            .to_rl_batch(format!("step-{step}-batch-{batch_index}"));
         let update = match &self.gpu_executor {
             Some(executor) => executor.train_step(&batch).await?,
             None => self.policy.update(&batch).await?,
@@ -563,7 +550,10 @@ impl OfflineTrainer {
         if self.config.checkpoint_dir.is_none() {
             return;
         }
-        if let Err(error) = self.write_checkpoint(epoch, step, best_reward, report).await {
+        if let Err(error) = self
+            .write_checkpoint(epoch, step, best_reward, report)
+            .await
+        {
             tracing::warn!(%error, step, "could not write the failure checkpoint");
         }
     }

@@ -1036,7 +1036,7 @@ mod tests {
              the judge sees the picture's metadata (format and size), not its pixels"
         );
         // No picture is attached, because none was decoded.
-        assert!(outcome.screenshots.is_empty());
+        assert!(outcome.screenshots.is_empty(), "no browser, no screenshots");
     }
 
     #[tokio::test]

@@ -191,9 +191,7 @@ mod tests {
         queue.queue_task(task("a")).await;
         let task = queue.get_task().await.expect("task");
 
-        let id = queue
-            .add_rollout(rollout("r-a", &task.task_id, 0.5))
-            .await;
+        let id = queue.add_rollout(rollout("r-a", &task.task_id, 0.5)).await;
         assert_eq!(id, "r-a");
         assert_eq!(queue.in_processing_len().await, 0);
         assert!(queue.is_finished().await);

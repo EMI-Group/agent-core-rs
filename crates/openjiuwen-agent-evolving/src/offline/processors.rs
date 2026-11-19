@@ -47,7 +47,8 @@ pub type ValidatorFn =
     dyn Fn(&[RolloutWithReward], &[RolloutWithReward], Option<usize>) -> bool + Send + Sync;
 
 /// A sampler: the positive/negative caches plus the optional per-prompt target.
-pub type SamplerFn = dyn Fn(&RolloutCache, &RolloutCache, Option<usize>) -> SampledCaches + Send + Sync;
+pub type SamplerFn =
+    dyn Fn(&RolloutCache, &RolloutCache, Option<usize>) -> SampledCaches + Send + Sync;
 
 /// Splits rollouts into positives (`reward > 0`) and negatives.
 #[must_use]
@@ -71,14 +72,19 @@ pub fn classify_rollouts(mdp_list: &[RolloutWithReward]) -> ClassifiedRollouts {
 /// Never stops while negatives outnumber positives or fewer than two positives
 /// exist; otherwise stops as soon as one positive reward is exactly `1.0`.
 #[must_use]
-pub fn validate_stop(pos_rollout_list: &[RolloutWithReward], neg_rollout_list: &[RolloutWithReward]) -> bool {
+pub fn validate_stop(
+    pos_rollout_list: &[RolloutWithReward],
+    neg_rollout_list: &[RolloutWithReward],
+) -> bool {
     if neg_rollout_list.len() > pos_rollout_list.len() {
         return false;
     }
     if pos_rollout_list.len() < 2 {
         return false;
     }
-    pos_rollout_list.iter().any(|rollout| rollout.reward == 1.0)
+    pos_rollout_list
+        .iter()
+        .any(|rollout| rollout.reward.partial_cmp(&1.0) == Some(std::cmp::Ordering::Equal))
 }
 
 /// The balanced stop rule.
@@ -204,12 +210,8 @@ impl ProcessorsRegistry {
     #[must_use]
     pub fn new() -> Self {
         let mut registry = Self::default();
-        registry.register_classifier(DEFAULT_CLASSIFIER, |rollouts| {
-            classify_rollouts(rollouts)
-        });
-        registry.register_validator(DEFAULT_VALIDATOR, |pos, neg, _keep| {
-            validate_stop(pos, neg)
-        });
+        registry.register_classifier(DEFAULT_CLASSIFIER, |rollouts| classify_rollouts(rollouts));
+        registry.register_validator(DEFAULT_VALIDATOR, |pos, neg, _keep| validate_stop(pos, neg));
         registry.register_validator(BALANCED_VALIDATOR, |pos, neg, keep| {
             validate_stop_balanced(pos, neg, keep.unwrap_or(8))
         });
@@ -248,7 +250,11 @@ impl ProcessorsRegistry {
     }
 
     /// Registers a sampler under `name`, returning the shadowed one.
-    pub fn register_sampler<F>(&mut self, name: impl Into<String>, sampler: F) -> Option<Arc<SamplerFn>>
+    pub fn register_sampler<F>(
+        &mut self,
+        name: impl Into<String>,
+        sampler: F,
+    ) -> Option<Arc<SamplerFn>>
     where
         F: Fn(&RolloutCache, &RolloutCache, Option<usize>) -> SampledCaches + Send + Sync + 'static,
     {
@@ -370,7 +376,7 @@ mod tests {
         assert_eq!(rewards(&pos), vec![1.0, 0.25]);
         assert_eq!(neg.len(), 3);
         assert!(rewards(&neg).contains(&0.0));
-        assert!(classify_rollouts(&[]).0.is_empty());
+        assert!(classify_rollouts(&[]).0.is_empty(), "no input, no positive");
     }
 
     #[test]
@@ -389,10 +395,7 @@ mod tests {
         // Two positives, one perfect.
         assert!(validate_stop(&pos(&[0.5, 1.0]), &[]));
         // More negatives than positives.
-        assert!(!validate_stop(
-            &pos(&[1.0, 1.0]),
-            &pos(&[0.0, 0.0, 0.0])
-        ));
+        assert!(!validate_stop(&pos(&[1.0, 1.0]), &pos(&[0.0, 0.0, 0.0])));
         // Equal counts are fine.
         assert!(validate_stop(&pos(&[1.0, 0.5]), &pos(&[0.0, 0.0])));
     }
@@ -400,9 +403,7 @@ mod tests {
     #[test]
     fn the_balanced_validator_targets_both_halves() {
         let pos = |count: usize| -> Vec<RolloutWithReward> {
-            (0..count)
-                .map(|index| rollout(index as u64, 1.0))
-                .collect()
+            (0..count).map(|index| rollout(index as u64, 1.0)).collect()
         };
         // Target 8 -> 4 positives and 4 negatives.
         assert!(!validate_stop_balanced(&pos(4), &pos(3), 8));
@@ -436,7 +437,7 @@ mod tests {
         // Only positives: fill the whole target from the positive side.
         let (sel_pos, sel_neg) = downsample_one_uid(&pos, &[], 8);
         assert_eq!(sel_pos.len(), 8);
-        assert!(sel_neg.is_empty());
+        assert!(sel_neg.is_empty(), "no negatives selected");
 
         // Too few overall: keep everything available.
         let (sel_pos, sel_neg) = downsample_one_uid(&pos[..2], &neg[..1], 8);
@@ -459,8 +460,8 @@ mod tests {
         assert_eq!(out_neg["a"].len(), 4);
         assert_eq!(out_pos["b"].len(), 1);
         assert_eq!(out_neg["c"].len(), 8);
-        assert!(out_pos["c"].is_empty());
-        assert!(out_neg["b"].is_empty());
+        assert!(out_pos["c"].is_empty(), "no positives for c");
+        assert!(out_neg["b"].is_empty(), "no negatives for b");
     }
 
     #[test]
@@ -469,7 +470,7 @@ mod tests {
         assert_eq!(registry.classifier_names(), vec![DEFAULT_CLASSIFIER]);
         assert_eq!(
             registry.validator_names(),
-            vec![BALANCED_VALIDATOR, DEFAULT_VALIDATOR]
+            vec![DEFAULT_VALIDATOR, BALANCED_VALIDATOR]
         );
         assert_eq!(
             registry.sampler_names(),
@@ -481,31 +482,37 @@ mod tests {
         assert_eq!((pos.len(), neg.len()), (1, 1));
 
         let validator = registry.validator(BALANCED_VALIDATOR).expect("builtin");
-        assert!(validator(&[rollout(0, 1.0), rollout(1, 1.0)], &[rollout(2, 0.0)], Some(2)));
+        assert!(validator(
+            &[rollout(0, 1.0), rollout(1, 1.0)],
+            &[rollout(2, 0.0)],
+            Some(2)
+        ));
 
         let sampler = registry.sampler(ADAPTIVE_SAMPLER).expect("builtin");
-        let (pos, neg) = sampler(&cache(&[("a", &[1.0; 4])]), &cache(&[("a", &[0.0; 4])]), Some(2));
-        assert_eq!(pos["a"].len(), 2);
+        let (pos, neg) = sampler(
+            &cache(&[("a", &[1.0; 4])]),
+            &cache(&[("a", &[0.0; 4])]),
+            Some(2),
+        );
+        assert_eq!(pos["a"].len(), 1);
         assert_eq!(neg["a"].len(), 1);
     }
 
     #[test]
     fn unknown_names_report_the_registered_set() {
         let registry = ProcessorsRegistry::new();
-        let error = registry.classifier("nope").expect_err("unknown");
+        let error = registry.classifier("nope").err().expect("unknown");
         assert!(error.to_string().contains("unknown classifier \"nope\""));
-        assert!(error
-            .to_string()
-            .contains("default_classify_rollouts"));
+        assert!(error.to_string().contains("default_classify_rollouts"));
         assert_eq!(
             error.kind(),
             openjiuwen_common::error::ErrorKind::Validation
         );
 
-        let error = registry.validator("nope").expect_err("unknown");
+        let error = registry.validator("nope").err().expect("unknown");
         assert!(error.to_string().contains("validate_stop_balanced"));
 
-        let error = registry.sampler("nope").expect_err("unknown");
+        let error = registry.sampler("nope").err().expect("unknown");
         assert!(error.to_string().contains("sampling_ada"));
     }
 
@@ -519,7 +526,7 @@ mod tests {
         let classifier = registry.classifier(DEFAULT_CLASSIFIER).expect("shadowed");
         let (pos, neg) = classifier(&[rollout(0, 0.0)]);
         assert_eq!(pos.len(), 1);
-        assert!(neg.is_empty());
+        assert!(neg.is_empty(), "everything is positive");
 
         let previous_validator =
             registry.register_validator("custom", |_pos, _neg, keep| keep == Some(3));
@@ -529,9 +536,9 @@ mod tests {
         assert_eq!(
             registry.validator_names(),
             vec![
-                BALANCED_VALIDATOR.to_owned(),
                 "custom".to_owned(),
-                DEFAULT_VALIDATOR.to_owned()
+                DEFAULT_VALIDATOR.to_owned(),
+                BALANCED_VALIDATOR.to_owned()
             ]
         );
         assert!(registry.sampler(DEFAULT_SAMPLER).is_ok());

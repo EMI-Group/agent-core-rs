@@ -6,27 +6,27 @@
 //! (`verl`, `ray`, `torch`, `transformers`, vLLM and the YAML configuration
 //! ecosystem). This module ports the portable half to idiomatic Rust and keeps
 //! every GPU entry point typed as [`openjiuwen_common::error::Error::Unsupported`]
-//! (see [`trainer::PpoTrainingExecutor`]).
+//! (see `trainer::PpoTrainingExecutor`).
 //!
 //! # Module map
 //!
-//! - [`queue`] — `TaskQueue`: FIFO task queue, in-processing tracking and a
+//! - `queue` — `TaskQueue`: FIFO task queue, in-processing tracking and a
 //!   rollout result buffer (`coordinator/task_queue.py`).
-//! - [`store`] — `RolloutPersistence`, `FileRolloutStore` (JSONL grouped by step
+//! - `store` — `RolloutPersistence`, `FileRolloutStore` (JSONL grouped by step
 //!   ranges) and `NullRolloutStore` (`store/`).
-//! - [`processors`] — rollout classifiers, stop validators and samplers plus the
+//! - `processors` — rollout classifiers, stop validators and samplers plus the
 //!   explicitly registered `ProcessorsRegistry` (`coordinator/processors.py`).
-//! - [`encoding`] — `TurnEncoder`: per-turn and whole-trajectory samples
+//! - `encoding` — `TurnEncoder`: per-turn and whole-trajectory samples
 //!   (`coordinator/encoding.py`).
-//! - [`batch`] — the portable replacement for Python's `TensorDict` builder:
+//! - `batch` — the portable replacement for Python's `TensorDict` builder:
 //!   padding, attention masks, token-level scores and `BatchPlan`
 //!   (`coordinator/batch_builder.py`).
-//! - [`runtime`] — the agent seam (`RolloutSource`), reward composers,
+//! - `runtime` — the agent seam (`RolloutSource`), reward composers,
 //!   `RuntimeExecutor` and `ParallelRuntimeExecutor` (`runtime/`).
-//! - [`coordinator`] — `TrainingCoordinator`: round scheduling, rollout
+//! - `coordinator` — `TrainingCoordinator`: round scheduling, rollout
 //!   collection, classification/sampling and validation
 //!   (`coordinator/training_coordinator.py`).
-//! - [`metrics`] — `TrainingStepMetrics`, `MetricsTracker` and
+//! - `metrics` — `TrainingStepMetrics`, `MetricsTracker` and
 //!   `BatchDiagnostics` (`store/metrics_tracker.py`, without verl/W&B).
 //! - [`trainer`] — `OfflineTrainer` (the `MainTrainer` port) plus the typed GPU
 //!   training seam (`main_trainer.py`).
@@ -37,8 +37,8 @@
 //!
 //! No module reads the wall clock, a random number generator, a process id or a
 //! filesystem modification time. Identifiers are derived from their inputs with
-//! the FNV-1a hash in [`stable_id`], token ids come from character codes (see
-//! [`encoding`]), records are ordered through `BTreeMap`/`BTreeSet`, and the
+//! the FNV-1a hash in `stable_id`, token ids come from character codes (see
+//! `encoding`), records are ordered through `BTreeMap`/`BTreeSet`, and the
 //! persisted JSONL documents omit Python's wall-clock `timestamp` field.
 //! Polling intervals only affect *when* work completes, never *what* is
 //! produced.
@@ -75,8 +75,9 @@ pub use experience::{ExperienceCollector, TrajectoryExperienceCollector};
 pub use metrics::{BatchDiagnostics, MetricsTracker, SeriesSummary, TrainingStepMetrics};
 pub use processors::{
     classify_rollouts, downsample_one_uid, sampling, sampling_ada, validate_stop,
-    validate_stop_balanced, ClassifierFn, ProcessorsRegistry, SamplerFn, ValidatorFn,
-    ADAPTIVE_SAMPLER, BALANCED_VALIDATOR, DEFAULT_CLASSIFIER, DEFAULT_SAMPLER, DEFAULT_VALIDATOR,
+    validate_stop_balanced, ClassifiedRollouts, ClassifierFn, ProcessorsRegistry, RolloutCache,
+    SampledCaches, SamplerFn, ValidatorFn, ADAPTIVE_SAMPLER, BALANCED_VALIDATOR,
+    DEFAULT_CLASSIFIER, DEFAULT_SAMPLER, DEFAULT_VALIDATOR,
 };
 pub use queue::TaskQueue;
 pub use runtime::{
@@ -387,9 +388,9 @@ mod tests {
     #[test]
     fn turns_decode_with_defaults_and_reject_malformed_payloads() {
         let decoded = rollout_turns(&message(json!([]))).expect("empty");
-        assert!(decoded.is_empty());
+        assert!(decoded.is_empty(), "an empty array has no turns");
         let decoded = rollout_turns(&message(Value::Null)).expect("null");
-        assert!(decoded.is_empty());
+        assert!(decoded.is_empty(), "a null payload has no turns");
 
         let decoded = rollout_turns(&message(json!([
             {"input_prompt_ids": [1, 2], "output_response_ids": [3]},
@@ -400,7 +401,10 @@ mod tests {
         assert_eq!(decoded[0].turn_id, 0);
         assert_eq!(decoded[0].input_prompt_ids, vec![1, 2]);
         assert_eq!(decoded[1].turn_id, 7);
-        assert!(decoded[1].output_response_ids.is_empty());
+        assert!(
+            decoded[1].output_response_ids.is_empty(),
+            "the response is empty"
+        );
 
         let error = rollout_turns(&message(json!({"turns": []}))).expect_err("not an array");
         assert!(error.to_string().contains("malformed rollout_info"));
@@ -422,15 +426,18 @@ mod tests {
     #[test]
     fn response_and_ground_truth_rendering() {
         assert_eq!(render_response_text(&json!("answer")), "answer");
-        assert_eq!(render_response_text(&json!({"content": "answer"})), "answer");
+        assert_eq!(
+            render_response_text(&json!({"content": "answer"})),
+            "answer"
+        );
         assert_eq!(render_response_text(&json!({"text": "answer"})), "answer");
-        assert_eq!(render_response_text(&json!({"tool": "x"})), r#"{"tool":"x"}"#);
+        assert_eq!(
+            render_response_text(&json!({"tool": "x"})),
+            r#"{"tool":"x"}"#
+        );
         assert_eq!(render_response_text(&Value::Null), "");
 
-        assert_eq!(
-            prompt_ground_truth(&json!({"ground_truth": "42"})),
-            "42"
-        );
+        assert_eq!(prompt_ground_truth(&json!({"ground_truth": "42"})), "42");
         assert_eq!(prompt_ground_truth(&json!({"metadata": {}})), "");
         assert_eq!(prompt_ground_truth(&json!("42")), "");
     }
@@ -439,7 +446,7 @@ mod tests {
     fn token_encoding_uses_code_points() {
         assert_eq!(encode_text("ab"), vec![97, 98]);
         assert_eq!(encode_text("ü"), vec![252]);
-        assert!(encode_text("").is_empty());
+        assert!(encode_text("").is_empty(), "no text, no tokens");
     }
 
     #[test]

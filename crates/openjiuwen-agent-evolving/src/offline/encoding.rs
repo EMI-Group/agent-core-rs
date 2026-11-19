@@ -21,7 +21,7 @@
 //! failure and returns an empty list). Dropping is reported in
 //! [`EncodingOutcome::dropped_reason`] instead of being swallowed.
 
-use crate::rl::{Rollout, RolloutMessage, RolloutWithReward};
+use crate::rl::{RolloutMessage, RolloutWithReward};
 
 use super::{finite_reward, rollout_turns, sample_task_id, turn_prompt_ids, turn_response_ids};
 
@@ -238,7 +238,7 @@ impl TurnEncoder {
     ///
     /// [`openjiuwen_common::error::Error::validation`] when `rollout_info` is
     /// malformed.
-    pub fn turn_count(&self, message: &RolloutMessage) -> crate::Result<usize> {
+    pub fn turn_count(&self, message: &RolloutMessage) -> openjiuwen_common::error::Result<usize> {
         Ok(rollout_turns(message)?.len())
     }
 }
@@ -246,7 +246,7 @@ impl TurnEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     fn message(turns: Value, reward: f64) -> RolloutMessage {
         RolloutMessage {
@@ -290,7 +290,10 @@ mod tests {
             assert_eq!(sample.task_id, "origin-1");
             assert_eq!(sample.rollout_id, "r-1");
             assert_eq!(sample.group_id.as_deref(), Some("origin-1"));
-            assert!(sample.loss_mask.is_empty());
+            assert!(
+                sample.loss_mask.is_empty(),
+                "per-turn mode has no loss mask"
+            );
         }
         assert_eq!(outcome.samples[1].input_prompt_ids, vec![1, 2, 3, 4, 5]);
         assert_eq!(outcome.samples[2].output_response_ids, vec![7, 8]);
@@ -335,7 +338,10 @@ mod tests {
         assert!(reason.contains("turn 1 of rollout r-1"));
         assert!(reason.contains("response"));
 
-        let msg = message(json!([{"input_prompt_ids": [], "output_response_ids": [2]}]), 1.0);
+        let msg = message(
+            json!([{"input_prompt_ids": [], "output_response_ids": [2]}]),
+            1.0,
+        );
         let outcome = TurnEncoder::new().build(&msg);
         assert!(outcome.dropped_reason.expect("reason").contains("prompt"));
 
@@ -354,10 +360,7 @@ mod tests {
     fn a_single_turn_whole_trajectory_equals_the_per_turn_build() {
         let msg = message(json!([turn(&[1, 2], &[3])]), 0.5);
         let encoder = TurnEncoder::new();
-        assert_eq!(
-            encoder.build_whole_trajectory(&msg),
-            encoder.build(&msg)
-        );
+        assert_eq!(encoder.build_whole_trajectory(&msg), encoder.build(&msg));
     }
 
     #[test]
@@ -427,5 +430,4 @@ mod tests {
         assert_eq!(encoder.turn_count(&msg).expect("count"), 2);
         assert!(encoder.turn_count(&message(json!(5), 1.0)).is_err());
     }
-
 }

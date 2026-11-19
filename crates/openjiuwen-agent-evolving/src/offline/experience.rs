@@ -30,7 +30,9 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use crate::experience::{ExperienceArchive, ExperienceExtractor, ExperienceRecord, ExperienceStats};
+use crate::experience::{
+    ExperienceArchive, ExperienceExtractor, ExperienceRecord, ExperienceStats,
+};
 use crate::rl::{Rollout, RolloutMessage};
 use crate::trajectory::{StepKind, Trajectory, TrajectoryOutcome, TrajectoryStep};
 use openjiuwen_common::error::{Error, Result};
@@ -38,7 +40,7 @@ use openjiuwen_common::error::{Error, Result};
 use super::stable_id;
 
 /// The reward at or above which a rollout is recorded as a success.
-pub const SUCCESS_REWARD_THRESHOLD: f64 = 0.5;
+const SUCCESS_REWARD_THRESHOLD: f64 = 0.5;
 
 /// Receives finished rollouts so they can be mined for experience.
 ///
@@ -71,10 +73,7 @@ impl std::fmt::Debug for TrajectoryExperienceCollector {
         formatter
             .debug_struct("TrajectoryExperienceCollector")
             .field("skill_name", &self.skill_name)
-            .field(
-                "archive_records",
-                &lock(&self.archive).records().len(),
-            )
+            .field("archive_records", &lock(&self.archive).records().len())
             .finish_non_exhaustive()
     }
 }
@@ -176,10 +175,7 @@ impl TrajectoryExperienceCollector {
                 TrajectoryOutcome::Failure
             })
             .with_score(rollout.global_reward)?
-            .with_metadata(
-                "rollout_id",
-                Value::from(rollout.rollout_id.clone()),
-            )
+            .with_metadata("rollout_id", Value::from(rollout.rollout_id.clone()))
             .with_metadata("skill_name", Value::from(self.skill_name.clone()));
         if let Some(origin) = &rollout.origin_task_id {
             trajectory = trajectory.with_metadata("origin_task_id", Value::from(origin.clone()));
@@ -213,6 +209,9 @@ impl ExperienceCollector for TrajectoryExperienceCollector {
     fn collect(&self, task: &crate::rl::RlTask, rollout: &RolloutMessage) -> Result<()> {
         let trajectory = self.build_trajectory(task, rollout)?;
         let mut records = self.extractor.from_trajectories(&[trajectory]);
+        // The extractor's floor applies to every source, including trajectory
+        // lessons, so a strict collector files nothing below it.
+        records.retain(|record| record.confidence >= self.extractor.min_confidence);
         for record in &mut records {
             if record.skill_name.trim().is_empty() {
                 record.skill_name.clone_from(&self.skill_name);
@@ -408,7 +407,9 @@ mod tests {
         let collector = TrajectoryExperienceCollector::new();
         let mut bad = rollout(1.0);
         bad.rollout_info = json!({"not": "a list"});
-        let error = collector.build_trajectory(&task(), &bad).expect_err("bad info");
+        let error = collector
+            .build_trajectory(&task(), &bad)
+            .expect_err("bad info");
         assert!(error.to_string().contains("malformed rollout_info"));
 
         let mut empty = rollout(1.0);
@@ -452,7 +453,9 @@ mod tests {
             .expect("collect failure");
         let records = collector.records();
         assert_eq!(records.len(), 2);
-        assert!(records.iter().any(|record| record.content.starts_with("avoid:")));
+        assert!(records
+            .iter()
+            .any(|record| record.content.starts_with("avoid:")));
     }
 
     #[test]

@@ -54,7 +54,11 @@ impl Default for BatchConfig {
 impl BatchConfig {
     /// Creates a configuration.
     #[must_use]
-    pub const fn new(max_prompt_length: usize, max_response_length: usize, pad_token_id: u32) -> Self {
+    pub const fn new(
+        max_prompt_length: usize,
+        max_response_length: usize,
+        pad_token_id: u32,
+    ) -> Self {
         Self {
             max_prompt_length,
             max_response_length,
@@ -219,10 +223,7 @@ impl BatchPlan {
                 "n_turns".to_owned(),
                 Value::from(self.components.n_turns_list[index]),
             );
-            let sample_id = format!(
-                "{}-{index}",
-                self.components.data_ids[index]
-            );
+            let sample_id = format!("{}-{index}", self.components.data_ids[index]);
             samples.push(RlSample {
                 sample_id,
                 prompt: if prompt.is_empty() {
@@ -449,9 +450,7 @@ impl BatchBuilder {
         components.input_ids.push(input_ids);
         components.input_attention_mask.push(input_mask);
         components.response_ids.push(response_ids);
-        components
-            .response_attention_mask
-            .push(response_mask);
+        components.response_attention_mask.push(response_mask);
         components.rewards.push(if rollout.reward.is_finite() {
             rollout.reward
         } else {
@@ -494,7 +493,10 @@ impl BatchBuilder {
         }
         let expected = components.len();
         for (name, actual) in [
-            ("input_attention_mask", components.input_attention_mask.len()),
+            (
+                "input_attention_mask",
+                components.input_attention_mask.len(),
+            ),
             ("response_ids", components.response_ids.len()),
             (
                 "response_attention_mask",
@@ -596,7 +598,9 @@ mod tests {
         }
     }
 
-    fn cache(entries: &[(&str, Vec<RolloutWithReward>)]) -> BTreeMap<String, Vec<RolloutWithReward>> {
+    fn cache(
+        entries: &[(&str, Vec<RolloutWithReward>)],
+    ) -> BTreeMap<String, Vec<RolloutWithReward>> {
         entries
             .iter()
             .map(|(key, value)| ((*key).to_owned(), value.clone()))
@@ -618,8 +622,8 @@ mod tests {
         assert_eq!(mask, vec![1]);
 
         let (ids, mask) = left_padded_ids_and_attention_mask(&[1, 2], 0, 9);
-        assert!(ids.is_empty());
-        assert!(mask.is_empty());
+        assert!(ids.is_empty(), "no ids without room");
+        assert!(mask.is_empty(), "no mask without room");
     }
 
     #[test]
@@ -636,7 +640,10 @@ mod tests {
         assert_eq!(ids, vec![9, 9]);
         assert_eq!(mask, vec![0, 0]);
 
-        assert!(right_padded_ids_and_attention_mask(&[1], 0, 0).0.is_empty());
+        assert!(
+            right_padded_ids_and_attention_mask(&[1], 0, 0).0.is_empty(),
+            "a zero-width row holds no ids"
+        );
     }
 
     #[test]
@@ -647,14 +654,12 @@ mod tests {
         assert_eq!(response, vec![4, 5]);
         assert!(is_drop);
 
-        let (prompt, response, is_drop) =
-            truncate_prompt_and_response(&[1], &[4, 5, 6], 2, 2);
+        let (prompt, response, is_drop) = truncate_prompt_and_response(&[1], &[4, 5, 6], 2, 2);
         assert_eq!(prompt, vec![1]);
         assert_eq!(response, vec![4, 5]);
         assert!(!is_drop);
 
-        let (prompt, response, is_drop) =
-            truncate_prompt_and_response(&[1, 2], &[3], 2, 2);
+        let (prompt, response, is_drop) = truncate_prompt_and_response(&[1, 2], &[3], 2, 2);
         assert_eq!(prompt, vec![1, 2]);
         assert_eq!(response, vec![3]);
         assert!(!is_drop);
@@ -677,8 +682,8 @@ mod tests {
             .expect_err("row mismatch");
         assert!(error.to_string().contains("one row per score"));
 
-        let error = token_level_scores(&[vec![1, 0]], &[vec![0]], &[1.0], 1)
-            .expect_err("width mismatch");
+        let error =
+            token_level_scores(&[vec![1, 0]], &[vec![0]], &[1.0], 1).expect_err("width mismatch");
         assert!(error.to_string().contains("position entries"));
     }
 
@@ -748,11 +753,16 @@ mod tests {
         let error = builder
             .assemble_batch(&BTreeMap::new())
             .expect_err("empty batch");
-        assert!(error.to_string().contains("0 samples collected after rollout"));
+        assert!(error
+            .to_string()
+            .contains("0 samples collected after rollout"));
 
-        let error = assemble_batch(&BatchConfig::default(), &BTreeMap::new())
-            .expect_err("empty batch");
-        assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Validation);
+        let error =
+            assemble_batch(&BatchConfig::default(), &BTreeMap::new()).expect_err("empty batch");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Validation
+        );
     }
 
     #[test]

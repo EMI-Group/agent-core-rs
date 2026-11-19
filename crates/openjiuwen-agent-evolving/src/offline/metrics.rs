@@ -16,7 +16,7 @@ use super::batch::BatchPlan;
 use super::mean;
 
 /// How many consecutive zero-reward steps trigger a collapse warning.
-pub const COLLAPSE_WARNING_STEPS: usize = 3;
+const COLLAPSE_WARNING_STEPS: usize = 3;
 
 /// Count, mean, minimum and maximum of one numeric series.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -226,10 +226,7 @@ impl TrainingStepMetrics {
         }
         metrics.insert("training/global_step".to_owned(), self.step as f64);
         metrics.insert("training/epoch".to_owned(), self.epoch as f64);
-        metrics.insert(
-            "training/avg_conversation_turns".to_owned(),
-            self.avg_turns,
-        );
+        metrics.insert("training/avg_conversation_turns".to_owned(), self.avg_turns);
         metrics.insert("training/rollout_reward_mean".to_owned(), self.reward_mean);
         metrics.insert(
             "training/consecutive_zero_reward_steps".to_owned(),
@@ -241,7 +238,7 @@ impl TrainingStepMetrics {
 
 /// Collects training-step metrics in memory.
 ///
-/// Python forwards to verl's `Tracking` (TensorBoard, W&B, MLflow, ...). Those
+/// Python forwards to verl's `Tracking` (`TensorBoard`, `W&B`, `MLflow`, ...). Those
 /// backends need network access and vendor SDKs, so this tracker *is* the
 /// backend: it keeps the history and raises the reward-collapse warning Python
 /// only logs. Read the history with [`Self::training_history`] and
@@ -262,7 +259,7 @@ impl Default for MetricsTracker {
 }
 
 impl MetricsTracker {
-    /// Creates a tracker warning after [`COLLAPSE_WARNING_STEPS`] zero-reward steps.
+    /// Creates a tracker warning after `COLLAPSE_WARNING_STEPS` zero-reward steps.
     #[must_use]
     pub fn new() -> Self {
         Self::with_collapse_threshold(COLLAPSE_WARNING_STEPS)
@@ -445,10 +442,11 @@ mod tests {
         assert_eq!(diagnostics.rewards.count, 2);
         assert_eq!(diagnostics.rewards.max, 1.0);
         assert_eq!(diagnostics.rewards.mean, 0.5);
-        // Sample a: one attended response token, mask [1, 0] -> 1 trainable.
+        // Sample a: one attended response token, mask [1, 0]; the second mask
+        // entry sits past the attended response, so it counts as neither.
         // Sample b: one attended response token without a mask -> 1 trainable.
         assert_eq!(diagnostics.trainable_token_count, 2);
-        assert_eq!(diagnostics.masked_token_count, 1);
+        assert_eq!(diagnostics.masked_token_count, 0);
         assert_eq!(diagnostics.mean_n_turns, 1.5);
         assert_eq!(diagnostics.prompt_tokens.max, 3.0);
         assert_eq!(diagnostics.response_tokens.max, 1.0);
