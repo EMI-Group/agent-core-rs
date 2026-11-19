@@ -103,3 +103,105 @@ async fn acquiring_creates_the_lock_directory() {
     assert!(path.parent().unwrap().is_dir());
     guard.release().await.unwrap();
 }
+
+/// Options whose stale window is far too short for a heartbeat, so a guard can be declared stale.
+fn stealable() -> LockOptions {
+    LockOptions::new(Duration::from_millis(50))
+        .with_stale_after(Duration::from_millis(10))
+        .with_poll(Duration::from_millis(1))
+}
+
+/// Options that never reclaim a fresh file, however long the caller polls.
+fn possessive() -> LockOptions {
+    LockOptions::new(Duration::from_millis(50)).with_stale_after(Duration::from_secs(3600))
+}
+
+#[tokio::test]
+async fn a_stolen_lock_is_not_deleted_by_its_previous_holder() {
+    let temp = TempDir::new().unwrap();
+    let path = lock_path(&temp);
+
+    // A takes the lock, then loses its heartbeat so a waiter may declare it stale.
+    let mut first = acquire(&path, &stealable()).await.unwrap();
+    first.suspend_heartbeat();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // B reclaims the abandoned file and stamps its own token into a new one.
+    let second = acquire(&path, &stealable())
+        .await
+        .expect("the stale lock is reclaimed");
+    assert_ne!(first.token(), second.token(), "every holder has its own token");
+    let holder = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        holder.contains(second.token()),
+        "the file belongs to the new holder: {holder}"
+    );
+
+    // A finishes late: its release must not take B's file with it.
+    first.release().await.unwrap();
+    assert!(
+        path.is_file(),
+        "the current holder's lock file survives a stale guard's release"
+    );
+    let holder = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        holder.contains(second.token()),
+        "the survivor is still B's file: {holder}"
+    );
+
+    // Mutual exclusion holds: while B owns the lock, C is not admitted.
+    let err = acquire(&path, &possessive())
+        .await
+        .expect_err("B still holds the lock");
+    assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+
+    // B's own release does remove its file, and only then is C admitted.
+    second.release().await.unwrap();
+    assert!(!path.exists(), "the owner removes its own lock file");
+    let third = acquire(&path, &possessive())
+        .await
+        .expect("a released lock can be re-acquired");
+    third.release().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_live_holder_is_never_declared_stale() {
+    let temp = TempDir::new().unwrap();
+    let path = lock_path(&temp);
+    // The heartbeat refreshes the stamp every ~66ms, so the 200ms window never expires while the
+    // guard lives — even though the critical section outlasts it twice over.
+    let options = LockOptions::new(Duration::from_millis(80))
+        .with_stale_after(Duration::from_millis(200))
+        .with_poll(Duration::from_millis(5));
+
+    let guard = acquire(&path, &options).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let err = acquire(&path, &options)
+        .await
+        .expect_err("a provably alive holder keeps its lock");
+    assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+
+    // It still owns the file, so releasing removes it.
+    guard.release().await.unwrap();
+    assert!(!path.exists(), "the live guard removed its own file");
+}
+
+#[tokio::test]
+async fn the_lock_file_records_the_holder_pid_and_a_unique_token() {
+    let temp = TempDir::new().unwrap();
+    let path = lock_path(&temp);
+    let guard = acquire(&path, &LockOptions::default()).await.unwrap();
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        content.contains(&format!("pid={}", std::process::id())),
+        "{content}"
+    );
+    assert!(
+        guard.token().starts_with(&format!("{}-", std::process::id())),
+        "the token names the holding process: {}",
+        guard.token()
+    );
+    assert!(content.contains(guard.token()), "{content}");
+    guard.release().await.unwrap();
+    assert!(!path.exists());
+}
