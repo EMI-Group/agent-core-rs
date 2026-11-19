@@ -61,6 +61,17 @@ pub(crate) const DEFAULT_STREAM_RETRY: Duration = Duration::from_secs(1);
 const MAX_STREAM_RETRY: Duration = Duration::from_secs(120);
 /// Maximum number of server notifications buffered for [`super::client::McpClient::take_notifications`].
 pub(crate) const NOTIFICATION_BUFFER_BOUND: usize = 64;
+/// Connect deadline of every HTTP request these transports send.
+///
+/// A dead endpoint therefore fails a unary request instead of holding it open
+/// forever; a request deadline (below) bounds the server that accepts the
+/// connection but never answers.
+const MCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default deadline of one unary request when the configuration sets none.
+///
+/// It covers the response headers and the body of a JSON reply; the streaming
+/// responses (`GET` event streams, an SSE POST reply) are never bounded by it.
+const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Transport-level failures raised by the HTTP transports.
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +85,9 @@ pub(crate) enum HttpTransportError {
     /// The response did not follow the MCP framing.
     #[error("MCP protocol error: {0}")]
     Protocol(String),
+    /// The request did not finish within the transport's request deadline.
+    #[error("MCP request timed out after {0:?}")]
+    Timeout(Duration),
     /// The endpoint URL could not be parsed or resolved.
     #[error("invalid MCP endpoint URL: {0}")]
     Url(#[from] url::ParseError),
@@ -115,6 +129,8 @@ struct Endpoint {
     client: reqwest::Client,
     url: String,
     headers: HeaderMap,
+    /// Deadline of one unary request (never applied to a streamed body).
+    request_timeout: Duration,
 }
 
 impl Endpoint {
@@ -141,14 +157,39 @@ impl Endpoint {
             })?;
             headers.insert(header_name, header_value);
         }
-        let client = reqwest::Client::builder().build().map_err(|error| {
-            Error::transport(format!("failed to build MCP HTTP client: {error}"))
-        })?;
+        let request_timeout = config.request_timeout.unwrap_or(MCP_REQUEST_TIMEOUT);
+        // A shorter request deadline also shortens the connect phase, so a test
+        // (or an operator) tuning the deadline sees it applied end to end.
+        let connect_timeout = MCP_CONNECT_TIMEOUT.min(request_timeout);
+        let client = reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .build()
+            .map_err(|error| {
+                Error::transport(format!("failed to build MCP HTTP client: {error}"))
+            })?;
         Ok(Self {
             client,
             url: url.to_string(),
             headers,
+            request_timeout,
         })
+    }
+}
+
+/// Awaits one unary HTTP step under `deadline`.
+///
+/// A `reqwest` timeout and the outer deadline both become
+/// [`HttpTransportError::Timeout`], so a stalled server is reported as a typed
+/// timeout rather than as a generic transport failure.
+async fn bounded<T>(
+    deadline: Duration,
+    step: impl std::future::Future<Output = reqwest::Result<T>>,
+) -> std::result::Result<T, HttpTransportError> {
+    match tokio::time::timeout(deadline, step).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) if error.is_timeout() => Err(HttpTransportError::Timeout(deadline)),
+        Ok(Err(error)) => Err(HttpTransportError::Request(error)),
+        Err(_) => Err(HttpTransportError::Timeout(deadline)),
     }
 }
 
@@ -374,7 +415,7 @@ impl Transport<RoleClient> for StreamableHttpTransport {
             if let Some(session) = session_id.lock().ok().and_then(|guard| guard.clone()) {
                 request = request.header(HEADER_SESSION_ID, session);
             }
-            let response = request.send().await?;
+            let response = bounded(endpoint.request_timeout, request.send()).await?;
             let status = response.status();
             if let Some(session) = session_header(&response) {
                 if let Ok(mut guard) = session_id.lock() {
@@ -411,7 +452,7 @@ impl Transport<RoleClient> for StreamableHttpTransport {
                     Ok(())
                 }
                 Some(mime) if mime == JSON_MIME_TYPE => {
-                    let bytes = response.bytes().await?;
+                    let bytes = bounded(endpoint.request_timeout, response.bytes()).await?;
                     let message: ServerJsonRpcMessage = serde_json::from_slice(&bytes)
                         .map_err(|error| HttpTransportError::protocol(error.to_string()))?;
                     let _ = outbound.send(message);
@@ -432,14 +473,17 @@ impl Transport<RoleClient> for StreamableHttpTransport {
         self.cancellation.cancel();
         let session = self.session_id.lock().ok().and_then(|guard| guard.clone());
         if let Some(session) = session {
-            let _ = self
+            let request = self
                 .endpoint
                 .client
                 .delete(&self.endpoint.url)
                 .headers(self.endpoint.headers.clone())
-                .header(HEADER_SESSION_ID, session)
-                .send()
-                .await;
+                .header(HEADER_SESSION_ID, session);
+            // `rmcp` awaits `close`, so an endpoint that never answers must not
+            // hold up `disconnect`: the DELETE is bounded like any unary call.
+            if let Err(error) = bounded(self.endpoint.request_timeout, request.send()).await {
+                tracing::debug!(%error, "MCP session DELETE failed");
+            }
         }
         Ok(())
     }
@@ -706,6 +750,10 @@ pub(crate) struct SseFrame {
 #[derive(Debug, Default)]
 pub(crate) struct SseParser {
     buffer: String,
+    /// Trailing bytes of the previous chunk that did not form a complete UTF-8
+    /// sequence yet. They are decoded once the rest of the character arrives, so
+    /// a multi-byte character split across chunks is never corrupted.
+    incomplete: Vec<u8>,
     event: Option<String>,
     data: String,
     id: Option<String>,
@@ -716,7 +764,7 @@ pub(crate) struct SseParser {
 impl SseParser {
     /// Appends `bytes` and returns every frame completed by them.
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<SseFrame> {
-        self.buffer.push_str(&String::from_utf8_lossy(bytes));
+        self.decode(bytes);
         let mut frames = Vec::new();
         while let Some(index) = self.buffer.find('\n') {
             let line = self.buffer[..index].trim_end_matches('\r').to_owned();
@@ -726,6 +774,41 @@ impl SseParser {
             }
         }
         frames
+    }
+
+    /// Decodes the bytes that are valid UTF-8, retaining an incomplete trailing
+    /// sequence for the next chunk.
+    ///
+    /// A genuinely invalid sequence (not merely truncated) becomes `U+FFFD`, so
+    /// malformed input cannot stall the parser by pinning bytes in
+    /// `incomplete` forever.
+    fn decode(&mut self, bytes: &[u8]) {
+        self.incomplete.extend_from_slice(bytes);
+        loop {
+            match std::str::from_utf8(&self.incomplete) {
+                Ok(text) => {
+                    self.buffer.push_str(text);
+                    self.incomplete.clear();
+                    return;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    // `valid_up_to` guarantees this prefix is valid UTF-8.
+                    if let Ok(text) = std::str::from_utf8(&self.incomplete[..valid]) {
+                        self.buffer.push_str(text);
+                    }
+                    if let Some(length) = error.error_len() {
+                        self.buffer.push('\u{FFFD}');
+                        self.incomplete.drain(..valid + length);
+                    } else {
+                        // An incomplete trailing sequence: keep it until the next
+                        // chunk completes it.
+                        self.incomplete.drain(..valid);
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     /// Consumes one line, returning a frame when the line terminates one.

@@ -466,6 +466,34 @@ fn sse_parser_reads_event_and_data_fields() {
     assert_eq!(frames[0].data, "/messages");
 }
 
+#[test]
+fn sse_parser_reassembles_a_multibyte_character_split_across_chunks() {
+    let mut parser = SseParser::default();
+    let body = "data: {\"result\":\"你好\"}\n\n".as_bytes();
+    // Split in the middle of the 3-byte encoding of `你`.
+    let split = body
+        .windows(3)
+        .position(|window| window == "你".as_bytes())
+        .expect("the character is in the body")
+        + 1;
+    assert_eq!(parser.push(&body[..split]), Vec::new());
+    let frames = parser.push(&body[split..]);
+    assert_eq!(
+        frames.len(),
+        1,
+        "the split character was dropped: {frames:?}"
+    );
+    assert_eq!(frames[0].data, "{\"result\":\"你好\"}");
+}
+
+#[test]
+fn sse_parser_tolerates_genuinely_invalid_utf8() {
+    let mut parser = SseParser::default();
+    let frames = parser.push(b"data: a\xFFb\n\n");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].data, "a\u{FFFD}b");
+}
+
 // --- McpTool ----------------------------------------------------------------
 
 #[tokio::test]

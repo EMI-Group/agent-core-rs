@@ -13,8 +13,7 @@
 //!
 //! - `null` and `{}` (everything) become `{"match_all": {}}`, and top-level
 //!   `$and` / `$or` / `$not` become the matching `bool` clauses.
-//! - A plain `field: scalar` pair becomes a `term` query, and `field: [..]`
-//!   becomes a `terms` query.
+//! - A plain `field: scalar` pair becomes a `term` query.
 //! - The operators `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte` and `$in` map onto
 //!   `term`, `bool.must_not`, `range` and `terms`.
 //!
@@ -28,9 +27,12 @@
 //!   the shared implicit equality, which `term` cannot reproduce.
 //! - Malformed shapes (an operator with a non-scalar operand, `$in` with an
 //!   empty or non-scalar array, `$and`/`$or` that is not an array, ...).
-//! - Array-valued document fields: the adapters store scalars, so implicit
-//!   equality on an array condition is compiled to `terms` (any candidate) and
-//!   the caller's local re-check decides the exact-array case.
+//! - Implicit equality on an array condition: the shared filter language
+//!   requires the document field to equal the whole array, while Elasticsearch
+//!   `terms` is any-of. Compiling it to `terms` would over-match (and
+//!   `_delete_by_query` would then delete documents the shared contract
+//!   rejects), so the condition returns `None` and the caller's exact local
+//!   re-check decides it.
 //!
 //! Every unsupported construct makes [`translate`] return `None`, never a
 //! narrower query.
@@ -163,16 +165,15 @@ fn is_expressible_field(field: &str) -> bool {
             .any(|character| matches!(character, '.' | '[' | ']' | '*'))
 }
 
-/// Compiles implicit equality: a scalar becomes `term`, an array `terms`.
+/// Compiles implicit equality: a scalar becomes `term`.
+///
+/// An array condition is *not* compiled: the shared filter language requires the
+/// document field to equal the whole array, whereas Elasticsearch `terms` means
+/// any-of. Returning `None` makes the caller fall back to its exact local
+/// re-check instead of over-matching (and over-deleting).
 fn equality_clause(field: &str, condition: &Value) -> Option<Value> {
     match condition {
         Value::String(_) | Value::Number(_) | Value::Bool(_) => Some(term_query(field, condition)),
-        Value::Array(items) => {
-            if items.is_empty() || !items.iter().all(is_scalar) {
-                return None;
-            }
-            Some(json!({"terms": { (field): items }}))
-        }
         _ => None,
     }
 }
@@ -252,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn implicit_equality_becomes_term_or_terms() {
+    fn implicit_scalar_equality_becomes_a_term() {
         assert_eq!(
             translate(&json!({"name": "Ada"})),
             Some(json!({"term": {"name": "Ada"}}))
@@ -266,15 +267,25 @@ mod tests {
             Some(json!({"term": {"active": true}}))
         );
         assert_eq!(
-            translate(&json!({"tags": ["rust", "storage"]})),
-            Some(json!({"terms": {"tags": ["rust", "storage"]}}))
-        );
-        assert_eq!(
             translate(&json!({"name": "Ada", "age": 36})),
             Some(json!({
                 "bool": {"must": [{"term": {"name": "Ada"}}, {"term": {"age": 36}}]},
             }))
         );
+    }
+
+    #[test]
+    fn implicit_array_equality_is_not_compiled_to_terms() {
+        // The shared filter language requires the document field to equal the
+        // whole array; `terms` is any-of, so translating would over-match.
+        for filter in [
+            json!({"tags": ["rust", "storage"]}),
+            json!({"tags": ["rust"]}),
+            json!({"tags": [1, 2]}),
+            json!({"tags": []}),
+        ] {
+            assert_eq!(translate(&filter), None, "filter: {filter}");
+        }
     }
 
     #[test]
@@ -403,6 +414,8 @@ mod tests {
             // Null conditions and object literals cannot be expressed by `term`.
             json!({"nothing": null}),
             json!({"meta": {"owner": "ada"}}),
+            // Implicit array equality is exact, `terms` is any-of.
+            json!({"tags": ["rust", "storage"]}),
             // Malformed operands.
             json!({"age": {"$gt": null}}),
             json!({"age": {"$gt": true}}),

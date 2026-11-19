@@ -267,15 +267,18 @@ impl KvStore for RedisKvStore {
 
     /// Scans the keyspace, then removes each page with `DEL`.
     ///
-    /// The count is the number of live keys the server reported as deleted, so a
-    /// key that expired after the scan does not inflate it.
+    /// `scan` already returns fully prefixed keys (the store's `key_prefix` plus
+    /// the caller's `prefix`), so they are passed to `DEL` verbatim: re-applying
+    /// `key_prefix` would turn `app:app:key` into a miss and silently leak the
+    /// scanned keys. The count is the number of live keys the server reported as
+    /// deleted, so a key that expired after the scan does not inflate it.
     async fn delete_by_prefix(&self, prefix: &str) -> Result<usize> {
         let scan_prefix = format!("{}{prefix}", self.config.key_prefix);
         let keys = self.scan(&scan_prefix).await?;
         let mut deleted = 0;
         for chunk in keys.chunks(BATCH) {
-            let prefixed: Vec<Vec<u8>> = chunk.iter().map(|key| self.prefixed(key)).collect();
-            let reply = self.execute(&del_args(&prefixed)).await?;
+            let scanned: Vec<Vec<u8>> = chunk.iter().map(|key| key.as_bytes().to_vec()).collect();
+            let reply = self.execute(&del_args(&scanned)).await?;
             deleted += expect_integer(&reply, "DEL")?.max(0) as usize;
         }
         Ok(deleted)

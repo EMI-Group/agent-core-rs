@@ -685,6 +685,49 @@ async fn key_prefix_is_applied_and_stripped() {
 }
 
 #[tokio::test]
+async fn delete_by_prefix_with_key_prefix_deletes_the_scanned_keys() {
+    let state = MiniRedis::shared();
+    let server = FakeRedis::start(mini_redis(&state)).await;
+    let first = RedisConfig::new(server.addr.clone())
+        .with_key_prefix("app:")
+        .connect()
+        .await
+        .expect("first");
+    let second = RedisConfig::new(server.addr.clone())
+        .with_key_prefix("other:")
+        .connect()
+        .await
+        .expect("second");
+
+    for key in ["a", "b"] {
+        first.set(key, KvValue::text(key)).await.expect("set");
+    }
+    second.set("a", KvValue::text("kept")).await.expect("set");
+
+    // `scan` returns `app:a`/`app:b`; `DEL` must receive them verbatim.
+    assert_eq!(first.delete_by_prefix("").await.expect("delete"), 2);
+    assert_eq!(first.delete_by_prefix("").await.expect("again"), 0);
+    assert!(
+        first.get_by_prefix("").await.expect("scan").is_empty(),
+        "the prefixed keys leaked"
+    );
+    assert_eq!(
+        second.get("a").await.expect("get"),
+        Some(KvValue::text("kept")),
+        "the other prefix must survive"
+    );
+
+    let delete = server
+        .commands()
+        .into_iter()
+        .find(|command| command.first().is_some_and(|first| first == "DEL"))
+        .expect("a DEL command");
+    let mut keys = delete[1..].to_vec();
+    keys.sort();
+    assert_eq!(keys, vec!["app:a".to_string(), "app:b".to_string()]);
+}
+
+#[tokio::test]
 async fn exclusive_set_uses_nx_and_expiry() {
     let state = MiniRedis::shared();
     let server = FakeRedis::start(mini_redis(&state)).await;

@@ -36,7 +36,7 @@ use tokio::sync::Mutex;
 mod subscription;
 
 use super::http::sse::SseTransport;
-use super::http::{ServerStreamState, StreamableHttpTransport};
+use super::http::{HttpTransportError, ServerStreamState, StreamableHttpTransport};
 use super::result::{normalize_call_tool_result, McpToolResult};
 
 /// The kind of transport used to reach an MCP server.
@@ -133,6 +133,14 @@ pub struct McpServerConfig {
     pub auth_query_params: BTreeMap<String, String>,
     /// Whether image blocks are forwarded as multimodal data instead of text.
     pub include_image_content: bool,
+    /// Deadline of one unary HTTP request (connect, response headers, and the
+    /// body of a JSON reply), including the connect phase.
+    ///
+    /// `None` uses the transport default. Streaming responses — the
+    /// server-initiated `GET` channel and the legacy SSE stream — are *not*
+    /// bounded by it, because they stay open for the life of the session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_timeout: Option<Duration>,
 }
 
 impl Default for McpServerConfig {
@@ -146,6 +154,7 @@ impl Default for McpServerConfig {
             auth_headers: BTreeMap::new(),
             auth_query_params: BTreeMap::new(),
             include_image_content: false,
+            request_timeout: None,
         }
     }
 }
@@ -202,6 +211,12 @@ impl McpServerConfig {
     #[must_use]
     pub fn with_include_image_content(mut self, include: bool) -> Self {
         self.include_image_content = include;
+        self
+    }
+    /// Returns this configuration with an HTTP request deadline.
+    #[must_use]
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
         self
     }
 
@@ -571,7 +586,7 @@ fn unsupported_transport(client_type: McpClientType) -> Error {
 fn map_service_error(error: ServiceError) -> Error {
     match error {
         ServiceError::McpError(error) => Error::mcp(error.to_string()),
-        ServiceError::TransportSend(error) => Error::transport(error.to_string()),
+        ServiceError::TransportSend(error) => map_transport_send(&error),
         ServiceError::TransportClosed => Error::transport("transport closed"),
         ServiceError::UnexpectedResponse => Error::mcp("unexpected response type"),
         ServiceError::Cancelled { reason } => {
@@ -582,6 +597,23 @@ fn map_service_error(error: ServiceError) -> Error {
             Error::timeout(format!("MCP request timed out after {timeout:?}"))
         }
         other => Error::mcp(other.to_string()),
+    }
+}
+
+/// Maps one transport failure onto the shared error type.
+///
+/// The HTTP transports report a stalled server as
+/// [`HttpTransportError::Timeout`]; `rmcp` wraps it in a transport-agnostic
+/// [`rmcp::transport::DynamicTransportError`], so the wrapped error is recovered
+/// to keep the typed [`Error::Timeout`] (which callers treat as final) instead
+/// of a generic [`Error::Transport`].
+fn map_transport_send(error: &rmcp::transport::DynamicTransportError) -> Error {
+    match error.error.downcast_ref::<HttpTransportError>() {
+        Some(HttpTransportError::Timeout(deadline)) => {
+            Error::timeout(format!("MCP request timed out after {deadline:?}"))
+        }
+        Some(other) => Error::transport(other.to_string()),
+        None => Error::transport(error.to_string()),
     }
 }
 

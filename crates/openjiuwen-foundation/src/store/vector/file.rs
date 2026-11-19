@@ -16,11 +16,14 @@
 //! used as-is.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::{Map, Value};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex as AsyncMutex;
 
 use openjiuwen_common::error::{Error, Result};
 
@@ -31,6 +34,8 @@ use super::{CollectionSchema, Metric, VectorQuery, VectorSearchResult, VectorSto
 const SNAPSHOT_DIR: &str = "vector";
 /// Extension of every collection snapshot.
 const SNAPSHOT_EXTENSION: &str = "json";
+/// Disambiguates the temporary files of concurrent writers within one process.
+static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A [`VectorStore`] that persists one JSON snapshot per collection.
 ///
@@ -41,6 +46,9 @@ const SNAPSHOT_EXTENSION: &str = "json";
 pub struct LocalFileVectorStore {
     root: PathBuf,
     index: Mutex<VectorIndex>,
+    /// Serializes writers so a mutation and the snapshot that reports it as
+    /// committed are one unit: an insert that returned must be on disk.
+    writes: AsyncMutex<()>,
 }
 
 impl LocalFileVectorStore {
@@ -92,6 +100,7 @@ impl LocalFileVectorStore {
         Ok(Self {
             root,
             index: Mutex::new(index),
+            writes: AsyncMutex::new(()),
         })
     }
 
@@ -108,17 +117,57 @@ impl LocalFileVectorStore {
             .join(format!("{collection}.{SNAPSHOT_EXTENSION}"))
     }
 
+    /// Path of a unique temporary snapshot file for `collection`.
+    ///
+    /// The name carries the process id and a sequence number, so two writers
+    /// (in this process or another) never share a temporary file. The `.tmp`
+    /// extension keeps [`LocalFileVectorStore::new`] from loading it.
+    fn temporary_path(&self, collection: &str) -> PathBuf {
+        let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        self.root.join(SNAPSHOT_DIR).join(format!(
+            ".{collection}.{}.{sequence}.{SNAPSHOT_EXTENSION}.tmp",
+            std::process::id()
+        ))
+    }
+
     /// Writes the snapshot of `collection`, replacing the previous file atomically.
+    ///
+    /// The bytes are written to a unique temporary file, flushed to the device
+    /// (`fsync`), and only then renamed over the target. A concurrent
+    /// [`LocalFileVectorStore`] therefore sees either the old or the new
+    /// snapshot, never a partial file; the directory entry is synced on a
+    /// best-effort basis so the rename itself survives a crash.
     async fn write_snapshot(&self, collection: &str, snapshot: &Value) -> Result<()> {
         let target = self.snapshot_path(collection);
-        let temporary = target.with_extension(format!("{SNAPSHOT_EXTENSION}.tmp"));
+        let temporary = self.temporary_path(collection);
         let text = serde_json::to_vec_pretty(snapshot).map_err(Error::external)?;
-        fs::write(&temporary, text)
+        if let Err(error) = Self::write_and_sync(&temporary, &text).await {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&temporary, &target).await {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(io_error("replacing vector snapshot", &target, error));
+        }
+        if let Some(directory) = target.parent() {
+            if let Ok(handle) = fs::File::open(directory).await {
+                let _ = handle.sync_all().await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes `text` to `path` and flushes it to the device.
+    async fn write_and_sync(path: &Path, text: &[u8]) -> Result<()> {
+        let mut file = fs::File::create(path)
             .await
-            .map_err(|error| io_error("writing vector snapshot", &temporary, error))?;
-        fs::rename(&temporary, &target)
+            .map_err(|error| io_error("writing vector snapshot", path, error))?;
+        file.write_all(text)
             .await
-            .map_err(|error| io_error("replacing vector snapshot", &target, error))
+            .map_err(|error| io_error("writing vector snapshot", path, error))?;
+        file.sync_all()
+            .await
+            .map_err(|error| io_error("flushing vector snapshot", path, error))
     }
 
     /// Persists the current state of `collection`; a missing collection is a no-op.
@@ -153,12 +202,14 @@ impl LocalFileVectorStore {
 impl VectorStore for LocalFileVectorStore {
     async fn create_collection(&self, collection: &str, schema: CollectionSchema) -> Result<()> {
         validate_collection(collection)?;
+        let _guard = self.writes.lock().await;
         self.index.lock().create_collection(collection, schema)?;
         self.persist(collection).await
     }
 
     async fn delete_collection(&self, collection: &str) -> Result<()> {
         validate_collection(collection)?;
+        let _guard = self.writes.lock().await;
         self.index.lock().delete_collection(collection);
         let path = self.snapshot_path(collection);
         match fs::remove_file(&path).await {
@@ -180,6 +231,7 @@ impl VectorStore for LocalFileVectorStore {
 
     async fn add_docs(&self, collection: &str, docs: Vec<Map<String, Value>>) -> Result<usize> {
         validate_collection(collection)?;
+        let _guard = self.writes.lock().await;
         let inserted = self.index.lock().add_docs(collection, docs)?;
         if inserted > 0 {
             self.persist(collection).await?;
@@ -197,6 +249,7 @@ impl VectorStore for LocalFileVectorStore {
 
     async fn delete_docs_by_ids(&self, collection: &str, ids: &[String]) -> Result<usize> {
         validate_collection(collection)?;
+        let _guard = self.writes.lock().await;
         let deleted = self.index.lock().delete_docs_by_ids(collection, ids)?;
         if deleted > 0 {
             self.persist(collection).await?;
@@ -206,6 +259,7 @@ impl VectorStore for LocalFileVectorStore {
 
     async fn delete_docs_by_filters(&self, collection: &str, filters: &Value) -> Result<usize> {
         validate_collection(collection)?;
+        let _guard = self.writes.lock().await;
         let deleted = self
             .index
             .lock()
@@ -591,6 +645,59 @@ mod tests {
                 .expect("search")),
             ["b"]
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_inserts_all_survive_a_reopen() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = std::sync::Arc::new(store_in(temp.path()).await);
+        store
+            .create_collection("docs", schema())
+            .await
+            .expect("create");
+
+        let mut tasks = Vec::new();
+        for index in 0..16 {
+            let store = std::sync::Arc::clone(&store);
+            tasks.push(tokio::spawn(async move {
+                store
+                    .add_docs(
+                        "docs",
+                        vec![doc(&format!("id-{index:02}"), [1.0, 0.0], "x")],
+                    )
+                    .await
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.expect("join").expect("add"), 1);
+        }
+        drop(store);
+
+        // Every insert that returned a success is on disk.
+        let reopened = store_in(temp.path()).await;
+        let hits = reopened
+            .search("docs", &VectorQuery::new(vec![1.0, 0.0]).with_top_k(100))
+            .await
+            .expect("search");
+        assert_eq!(hits.len(), 16, "an acknowledged insert vanished on reopen");
+        let mut found = ids(&hits);
+        found.sort();
+        let mut expected: Vec<String> = (0..16).map(|index| format!("id-{index:02}")).collect();
+        expected.sort();
+        assert_eq!(found, expected);
+
+        // The atomic-replace temporary files were cleaned up.
+        let strays: Vec<String> = std::fs::read_dir(temp.path().join(SNAPSHOT_DIR))
+            .expect("read snapshot dir")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| {
+                std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"))
+            })
+            .collect();
+        assert!(strays.is_empty(), "unexpected temporary files: {strays:?}");
     }
 
     #[tokio::test]

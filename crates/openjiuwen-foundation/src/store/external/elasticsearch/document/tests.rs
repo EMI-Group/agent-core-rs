@@ -720,6 +720,28 @@ async fn mount_scan(server: &MockServer) {
         .await;
 }
 
+/// Mounts the fallback scan of `POST /openjiuwen__docs/_search` with `hits`
+/// (already `_id`/`_source` objects).
+async fn mount_scan_hits(server: &MockServer, hits: Value) {
+    Mock::given(method("POST"))
+        .and(path("/openjiuwen__docs/_search"))
+        .and(body_json(json!({
+            "query": {"match_all": {}},
+            "_source": true,
+            "size": SEARCH_PAGE_SIZE,
+            "sort": [{"id": {
+                "order": "asc",
+                "missing": "_last",
+                "unmapped_type": "keyword",
+            }}],
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "hits": {"hits": hits},
+        })))
+        .mount(server)
+        .await;
+}
+
 #[tokio::test]
 async fn query_falls_back_to_a_local_scan_for_untranslatable_filters() {
     let server = MockServer::start().await;
@@ -734,6 +756,86 @@ async fn query_falls_back_to_a_local_scan_for_untranslatable_filters() {
     // Matches `a` (30) and `c` (40); descending gives `c`, `a`; offset 1 keeps `a`.
     assert_eq!(documents.len(), 1);
     assert_eq!(documents[0].id, "a");
+}
+
+/// The documents of [`mount_scan_hits`] used by the array-equality tests:
+/// `a` holds exactly `["a", "b"]`, `b` and `c` hold a subset and a superset.
+fn tag_hits() -> Value {
+    json!([
+        {"_id": "a", "_source": {"id": "a", "tags": ["a", "b"]}},
+        {"_id": "b", "_source": {"id": "b", "tags": ["a"]}},
+        {"_id": "c", "_source": {"id": "c", "tags": ["a", "b", "c"]}},
+    ])
+}
+
+#[tokio::test]
+async fn query_array_equality_matches_only_the_exact_array() {
+    let server = MockServer::start().await;
+    mount_scan_hits(&server, tag_hits()).await;
+
+    let query = Query {
+        filter: json!({"tags": ["a", "b"]}),
+        ..Query::default()
+    };
+    let documents = store(&server).query("docs", &query).await.expect("query");
+    // `b` (a subset) and `c` (a superset) must not match an exact-array filter.
+    assert_eq!(
+        documents
+            .iter()
+            .map(|document| document.id.clone())
+            .collect::<Vec<_>>(),
+        ["a"]
+    );
+}
+
+#[tokio::test]
+async fn delete_with_array_equality_deletes_only_the_exact_match() {
+    let server = MockServer::start().await;
+    mount_scan_hits(&server, tag_hits()).await;
+    Mock::given(method("POST"))
+        .and(path("/openjiuwen__docs/_bulk"))
+        .and(body_string_contains(r#"{"delete":{"_id":"a"}}"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "errors": false,
+            "items": [
+                {"delete": {"_id": "a", "status": 200, "result": "deleted"}},
+            ],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let query = Query {
+        filter: json!({"tags": ["a", "b"]}),
+        ..Query::default()
+    };
+    assert_eq!(
+        store(&server).delete("docs", &query).await.expect("delete"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn delete_with_array_equality_deletes_nothing_when_only_subsets_match() {
+    let server = MockServer::start().await;
+    mount_scan_hits(
+        &server,
+        json!([{"_id": "b", "_source": {"id": "b", "tags": ["a"]}}]),
+    )
+    .await;
+
+    let query = Query {
+        filter: json!({"tags": ["a", "b"]}),
+        ..Query::default()
+    };
+    assert_eq!(
+        store(&server).delete("docs", &query).await.expect("delete"),
+        0
+    );
+    // No delete request was sent: only the fallback scan ran.
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 1, "unexpected requests: {requests:?}");
+    assert_eq!(requests[0].url.path(), "/openjiuwen__docs/_search");
 }
 
 #[tokio::test]

@@ -63,8 +63,7 @@ The module is async-free and performs no I/O except `PromptTemplate::load_yaml`.
   `TiktokenCounter` shares one `Lazy` cl100k_base BPE and falls back to the approx counter (one `tracing::warn`) if it cannot be loaded.
 
 ## Known Issues
-- `truncate_messages` evicts the oldest non-system message one at a time, so it can leave a `tool` result whose assistant `tool_calls` message was removed (and a list starting with `assistant`), which provider APIs reject.
-- `truncate_messages` recomputes `count_messages` and rescans the list after every single removal, so truncating a long conversation is quadratic in message count.
+- `truncate_messages` evicts whole turns (a `user` message plus the `assistant`/`tool` messages after it), so a `tool` result never outlives its `tool_calls` message and the retained list never starts with an `assistant`/`tool` turn; the token total is counted once and each evicted turn's cost subtracted from it.
 - `assembler::render` emits one `warn` per unresolved placeholder occurrence in addition to `PromptTemplate::format`'s single summary warning, so a partially formatted template logs N+1 events per render.
 - `assembler::scan` re-searches for the suffix from scratch after every rejected match, so brace-heavy template text makes placeholder scanning quadratic.
 

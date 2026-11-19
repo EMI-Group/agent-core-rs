@@ -734,6 +734,47 @@ async fn delete_docs_by_filters_without_filters_falls_back_to_the_delete_count()
 }
 
 #[tokio::test]
+async fn delete_docs_by_filters_at_the_read_cap_fails_as_incomplete() {
+    let server = MockServer::start().await;
+    mount_describe(&server, "docs", describe_data()).await;
+    let rows: Vec<Value> = (0..FILTER_DELETE_LIMIT)
+        .map(|index| json!({"id": format!("id-{index:05}")}))
+        .collect();
+    Mock::given(method("POST"))
+        .and(path(ENTITIES_QUERY))
+        .and(body_json(json!({
+            "collectionName": "docs",
+            "outputFields": ["id"],
+            "limit": FILTER_DELETE_LIMIT,
+            "filter": "score > 1",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code": 0, "data": rows})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = store(&server)
+        .delete_docs_by_filters("docs", &json!({"score": {"$gt": 1}}))
+        .await
+        .expect_err("a full read window may hide matches");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let message = error.to_string();
+    assert!(message.contains("incomplete"), "{message}");
+    assert!(
+        message.contains(&FILTER_DELETE_LIMIT.to_string()),
+        "{message}"
+    );
+    // Nothing was deleted: the only request was the read that filled the cap.
+    let requests = server.received_requests().await.expect("requests");
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.url.path().ends_with(ENTITIES_DELETE)),
+        "a partial delete was sent: {requests:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_service_error_surfaces_as_an_external_error() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

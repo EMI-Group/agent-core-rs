@@ -31,7 +31,7 @@ Network vector adapters (Chroma/Milvus/Elasticsearch) do not live here — they 
 
 ## Known Issues
 
-- `LocalFileVectorStore` has **no async writer lock** (unlike `document/file.rs`'s `write_lock` and `graph/file.rs`'s `writer`): two concurrent mutations snapshot the index under the parking-lot lock, release it, and then race `write_snapshot`, which renames a fixed `"<collection>.json.tmp"`, so the later rename can commit an older snapshot and a shared temp path lets two writes interleave — a committed document can disappear on reopen.
+- `LocalFileVectorStore` serializes every mutation and its snapshot behind one `tokio::sync::Mutex` (`writes`), so an insert that returned is on disk; `write_snapshot` uses a per-writer unique `.tmp` name, `fsync`s the file, renames atomically and best-effort syncs the directory, cleaning the temporary file up on failure.
 - Every file-backend mutation commits in memory first and persists second (`create_collection`, `add_docs`, `delete_docs_by_*`) with no rollback, so a failed write leaves memory and disk divergent and the retry fails with "already exists"/duplicate primary key.
 - A failed `fs::rename` in `write_snapshot` returns the error without deleting the temporary file (the document and graph stores do clean it up).
 - `VectorIndex::search` deep-clones each candidate's document JSON twice (once for the filter, once into the hit), buffers every matching document before `truncate(top_k)`, and has no cap on `top_k`, so a query against an N-document collection costs O(N) document clones plus O(N log N) sorting regardless of `top_k`.

@@ -24,8 +24,8 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use super::client::{McpClient, McpClientType, McpNotification, McpServerConfig, RmcpClient};
 use super::http::sse::{sse_resume_error, sse_stream_headers, SseStop, SseTransport};
 use super::http::{
-    server_stream_headers, stream_reconnect_delay, SseParser, DEFAULT_STREAM_RETRY,
-    NOTIFICATION_BUFFER_BOUND,
+    server_stream_headers, stream_reconnect_delay, HttpTransportError, SseParser,
+    StreamableHttpTransport, DEFAULT_STREAM_RETRY, NOTIFICATION_BUFFER_BOUND,
 };
 
 /// Upper bound on every wait for a spawned stream task.
@@ -634,4 +634,103 @@ fn sse_resume_error_names_the_last_event_id_and_the_budget() {
     assert!(exhausted.contains("3 attempt"), "{exhausted}");
     assert!(!without_id.contains("event id"), "{without_id}");
     assert!(rejected.contains("405"), "{rejected}");
+}
+
+// --- request deadlines ------------------------------------------------------
+/// A deadline short enough to keep the timeout tests fast.
+const SHORT_TIMEOUT: Duration = Duration::from_millis(150);
+
+#[tokio::test]
+async fn streamable_http_post_times_out_instead_of_waiting_forever() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let config = McpServerConfig::http("srv", server.uri())
+        .with_server_id("srv-id")
+        .with_request_timeout(SHORT_TIMEOUT);
+    let mut transport = StreamableHttpTransport::new(&config).unwrap();
+
+    let started = tokio::time::Instant::now();
+    let error = tokio::time::timeout(BOUND, transport.send(trigger_message()))
+        .await
+        .expect("the send hung past the deadline")
+        .expect_err("a stalled server must not answer");
+    assert!(matches!(error, HttpTransportError::Timeout(_)), "{error:?}");
+    assert!(error.to_string().contains("timed out"), "{error}");
+    assert!(started.elapsed() < BOUND, "the deadline was not applied");
+    transport.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn streamable_http_close_times_out_instead_of_waiting_forever() {
+    let server = MockServer::start().await;
+    // The notification is accepted and hands out a session id; the DELETE stalls.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(202).insert_header("Mcp-Session-Id", "sess-1"))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let config = McpServerConfig::http("srv", server.uri())
+        .with_server_id("srv-id")
+        .with_request_timeout(SHORT_TIMEOUT);
+    let mut transport = StreamableHttpTransport::new(&config).unwrap();
+    let _ = transport.send(trigger_message()).await;
+
+    tokio::time::timeout(BOUND, transport.close())
+        .await
+        .expect("close hung past the deadline")
+        .expect("close ignores a failed DELETE");
+}
+
+#[tokio::test]
+async fn legacy_sse_post_times_out_instead_of_waiting_forever() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(LegacySseResponder {
+            calls: Arc::new(AtomicUsize::new(0)),
+            event_id: None,
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let config = sse_config(&server).with_request_timeout(SHORT_TIMEOUT);
+    let mut transport = SseTransport::new(&config).unwrap();
+
+    let error = tokio::time::timeout(BOUND, transport.send(trigger_message()))
+        .await
+        .expect("the POST hung past the deadline")
+        .expect_err("a stalled server must not answer");
+    assert!(matches!(error, HttpTransportError::Timeout(_)), "{error:?}");
+    transport.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn list_tools_reports_a_typed_timeout_on_a_stalled_server() {
+    let server = MockServer::start().await;
+    mount_handshake(&server).await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let config = McpServerConfig::http("srv", server.uri())
+        .with_server_id("srv-id")
+        .with_request_timeout(SHORT_TIMEOUT);
+    let client = RmcpClient::new(&config).unwrap();
+
+    let error = tokio::time::timeout(BOUND, client.list_tools())
+        .await
+        .expect("list_tools hung past the deadline")
+        .expect_err("a stalled server must not answer");
+    assert_eq!(error.kind(), ErrorKind::Timeout, "{error}");
+    assert!(error.to_string().contains("timed out"), "{error}");
 }

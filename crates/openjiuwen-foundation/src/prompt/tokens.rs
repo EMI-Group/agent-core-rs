@@ -286,19 +286,30 @@ pub fn count_message_tokens(messages: &[BaseMessage], counter: &dyn TokenCounter
     counter.count_messages(messages)
 }
 
-/// Drops the oldest non-system messages until the conversation fits `max_tokens`.
+/// Drops the oldest turns until the conversation fits `max_tokens`.
 ///
 /// System messages are never removed and keep their order: they are the
 /// instructions that frame every turn, so a truncated conversation still has
-/// them. Messages are evicted oldest-first among the non-system entries, and the
-/// total is recomputed after every removal with the same
-/// [`TokenCounter::count_messages`] the caller would use, so the returned count
-/// can be trusted. Truncation stops when the budget is met, when only system
-/// messages remain, or when the list is empty — `max_tokens = 0` therefore
-/// always terminates, removing every non-system message.
+/// them. The remaining messages are grouped into *turns* — a `user` message plus
+/// the `assistant`/`tool` messages that follow it — and a turn is evicted as a
+/// whole, oldest first. Evicting whole turns keeps the sequence a provider
+/// accepts: a `tool` result never survives without the `assistant` message whose
+/// `tool_calls` produced it, and no `assistant`/`tool` turn is left at the front.
+/// A conversation that begins with an `assistant`/`tool` run therefore loses that
+/// run even when it already fits the budget (the return value reports it).
 ///
-/// Returns the number of messages removed; `0` means the conversation already
-/// fit (system messages alone may exceed the budget).
+/// Truncation stops when the budget is met and the retained sequence starts with
+/// a `user` (or only system messages remain), when no evictable turn is left, or
+/// when the list is empty — `max_tokens = 0` therefore always terminates,
+/// removing every non-system message.
+///
+/// The token total is computed once and each evicted turn's own cost is
+/// subtracted from it, so truncating a long conversation costs one count per
+/// turn instead of one count per removal.
+///
+/// Returns the number of messages removed; `0` means nothing was dropped (the
+/// conversation already fit and starts with a `user` message). System messages
+/// alone may exceed the budget.
 ///
 /// This is the one token-budget decision in this crate, so a counter that only
 /// estimates is called out: the first inexact truncation in the process logs a
@@ -311,18 +322,80 @@ pub fn truncate_messages(
     counter: &dyn TokenCounter,
 ) -> usize {
     warn_once_for_inexact_budget(counter);
+    let turns = turn_spans(messages);
+    if turns.is_empty() {
+        return 0;
+    }
+    let costs: Vec<usize> = turns
+        .iter()
+        .map(|turn| counter.count_messages(&messages[turn.start..turn.end]))
+        .collect();
+    let mut total = counter.count_messages(messages);
     let mut removed = 0usize;
-    loop {
-        if counter.count_messages(messages) <= max_tokens {
+    let mut first_kept = 0usize;
+    while let Some(turn) = turns.get(first_kept) {
+        let over_budget = total > max_tokens;
+        let leading_non_user = messages[turn.start].role != Role::User;
+        if !over_budget && !leading_non_user {
             break;
         }
-        let Some(index) = messages.iter().position(|m| m.role != Role::System) else {
-            break;
-        };
-        messages.remove(index);
-        removed += 1;
+        total = total.saturating_sub(costs[first_kept]);
+        removed += turn.end - turn.start;
+        first_kept += 1;
+    }
+    // Drain from the back: every earlier span keeps its original indices.
+    for turn in turns[..first_kept].iter().rev() {
+        messages.drain(turn.start..turn.end);
     }
     removed
+}
+
+/// One evictable run of non-system messages, as a half-open index range.
+struct Turn {
+    start: usize,
+    end: usize,
+}
+
+/// Groups `messages` into turns: a `user` message plus the `assistant`/`tool`
+/// messages after it.
+///
+/// A `system` message closes the current turn and is never part of one; a run of
+/// `assistant`/`tool` messages with no preceding `user` forms its own turn (and
+/// is evicted first, keeping the retained sequence provider-valid).
+fn turn_spans(messages: &[BaseMessage]) -> Vec<Turn> {
+    let mut turns = Vec::new();
+    let mut current: Option<Turn> = None;
+    for (index, message) in messages.iter().enumerate() {
+        match message.role {
+            Role::System => {
+                if let Some(turn) = current.take() {
+                    turns.push(turn);
+                }
+            }
+            Role::User => {
+                if let Some(turn) = current.take() {
+                    turns.push(turn);
+                }
+                current = Some(Turn {
+                    start: index,
+                    end: index + 1,
+                });
+            }
+            _ => match &mut current {
+                Some(turn) => turn.end = index + 1,
+                None => {
+                    current = Some(Turn {
+                        start: index,
+                        end: index + 1,
+                    });
+                }
+            },
+        }
+    }
+    if let Some(turn) = current {
+        turns.push(turn);
+    }
+    turns
 }
 
 /// Warns once per process when a budget decision uses an inexact counter.
@@ -578,6 +651,93 @@ mod tests {
             vec![
                 BaseMessage::system("system one"),
                 BaseMessage::system("system two"),
+            ]
+        );
+    }
+
+    #[test]
+    fn truncate_keeps_tool_results_with_their_assistant_tool_calls() {
+        let first_call = ToolCall::new("lookup")
+            .with_id("call_1")
+            .with_arguments(json!({"q": "first"}));
+        let second_call = ToolCall::new("lookup")
+            .with_id("call_2")
+            .with_arguments(json!({"q": "second"}));
+        let mut messages = vec![
+            BaseMessage::system("be brief"),
+            BaseMessage::user("first question"),
+            BaseMessage::assistant("").with_tool_calls(vec![first_call]),
+            BaseMessage::tool("call_1", "first result"),
+            BaseMessage::assistant("first answer"),
+            BaseMessage::user("second question"),
+            BaseMessage::assistant("").with_tool_calls(vec![second_call]),
+            BaseMessage::tool("call_2", "second result"),
+            BaseMessage::assistant("second answer"),
+        ];
+        let last_turn = &messages[5..];
+        let budget =
+            approx().count_messages(&[messages[0].clone()]) + approx().count_messages(last_turn);
+
+        let removed = truncate_messages(&mut messages, budget, &approx());
+
+        assert_eq!(removed, 4, "the whole first turn is evicted");
+        assert_eq!(
+            messages,
+            vec![
+                BaseMessage::system("be brief"),
+                BaseMessage::user("second question"),
+                BaseMessage::assistant("").with_tool_calls(vec![ToolCall::new("lookup")
+                    .with_id("call_2")
+                    .with_arguments(json!({"q": "second"}))]),
+                BaseMessage::tool("call_2", "second result"),
+                BaseMessage::assistant("second answer"),
+            ]
+        );
+        assert!(
+            approx().count_messages(&messages) <= budget,
+            "the retained conversation exceeds the budget"
+        );
+        assert_eq!(
+            messages[1].role,
+            Role::User,
+            "a truncated history must start with a user message"
+        );
+        // Every retained `tool` result has its `tool_calls` message in front.
+        for (index, message) in messages.iter().enumerate() {
+            if message.role != Role::Tool {
+                continue;
+            }
+            let call_id = message.tool_call_id.as_deref();
+            assert!(
+                messages[..index].iter().any(|earlier| earlier
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.id.as_deref() == call_id)),
+                "orphaned tool result at index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_drops_a_leading_assistant_tool_run() {
+        let call = ToolCall::new("lookup")
+            .with_id("call_1")
+            .with_arguments(json!({"q": "first"}));
+        let mut messages = vec![
+            BaseMessage::system("be brief"),
+            BaseMessage::assistant("").with_tool_calls(vec![call]),
+            BaseMessage::tool("call_1", "first result"),
+            BaseMessage::user("only question"),
+        ];
+        // The history fits, but it starts with an assistant/tool run a provider
+        // rejects, so that run is evicted anyway.
+        let budget = approx().count_messages(&messages);
+        assert_eq!(truncate_messages(&mut messages, budget, &approx()), 2);
+        assert_eq!(
+            messages,
+            vec![
+                BaseMessage::system("be brief"),
+                BaseMessage::user("only question"),
             ]
         );
     }

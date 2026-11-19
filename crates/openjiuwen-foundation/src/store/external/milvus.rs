@@ -102,6 +102,12 @@ const fn default_timeout() -> Duration {
 const ERROR_BODY_EXCERPT: usize = 200;
 
 /// Maximum number of primary keys read before a filtered delete.
+///
+/// A filtered delete reads the matching primary keys first and then deletes
+/// them by id. When the read fills the cap the match set may be larger than what
+/// was read, so the delete fails with
+/// [`Error::Unsupported`](openjiuwen_common::error::Error) instead of removing
+/// the visible window and reporting a completed delete.
 const FILTER_DELETE_LIMIT: usize = 16_384;
 
 /// Maximum number of colliding primary keys named in one error message.
@@ -539,6 +545,17 @@ impl VectorStore for MilvusVectorStore {
             let context = format!("deleting documents from collection {collection:?}");
             let data = self.call(ENTITIES_DELETE, &body, &context).await?;
             return Ok(count_field(&data, "deleteCount").unwrap_or(0));
+        }
+        if ids.len() >= FILTER_DELETE_LIMIT {
+            // The query read exactly the cap, so matches beyond it were never
+            // seen. Deleting the visible window and reporting its size would be
+            // a silent partial delete; fail before any deletion instead, like
+            // the Elasticsearch backend does at its own scan cap.
+            return Err(Error::unsupported(format!(
+                "deleting documents from collection {collection:?} by filter is incomplete: the \
+                 filter matched at least {FILTER_DELETE_LIMIT} documents, which is the most one \
+                 query can read; narrow the filter so fewer documents match"
+            )));
         }
         let removed = ids.len();
         let body = json!({"collectionName": collection, "ids": ids});

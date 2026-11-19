@@ -22,7 +22,7 @@ use url::Url;
 
 use super::super::client::{reconnect_attempt_budget, McpServerConfig};
 use super::{
-    forward_frame, stream_reconnect_delay, Endpoint, HttpTransportError, SseParser,
+    bounded, forward_frame, stream_reconnect_delay, Endpoint, HttpTransportError, SseParser,
     EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, JSON_MIME_TYPE,
 };
 
@@ -116,14 +116,13 @@ impl Transport<RoleClient> for SseTransport {
             let target = resolve_endpoint(&endpoint.url, &target)?;
             let body = serde_json::to_string(&item)
                 .map_err(|error| HttpTransportError::protocol(error.to_string()))?;
-            let response = endpoint
+            let request = endpoint
                 .client
                 .post(target)
                 .header(CONTENT_TYPE, JSON_MIME_TYPE)
                 .headers(endpoint.headers.clone())
-                .body(body)
-                .send()
-                .await?;
+                .body(body);
+            let response = bounded(endpoint.request_timeout, request.send()).await?;
             let status = response.status();
             if status.is_success() {
                 return Ok(());

@@ -46,7 +46,7 @@ The in-memory backend in `../../kv/` remains the behavioral reference.
 ## Known Issues and Gaps
 
 - No custom CA, no certificate pinning, no `insecure-skip-verify`, no client certificates; the platform trust store is not read either (`rustls-native-certs` is not a dependency).
-- `delete_by_prefix` re-applies `key_prefix` to keys that `SCAN` already returned prefixed (double prefix), so it deletes nothing and returns `0` in any store with a non-empty `key_prefix`.
+- `delete_by_prefix` passes the keys `SCAN` returned (already carrying `key_prefix`) to `DEL` verbatim and returns the server's live-deleted count.
 - `get_by_prefix` and `delete_by_prefix` interpolate the caller prefix into `SCAN MATCH` without escaping glob metacharacters, so `*`, `?`, `[`, `]` and `\` over-match in reads and over-delete in `delete_by_prefix`.
 - A failed `AUTH`/`SELECT` during reconnect leaves the fresh socket installed in `RedisConnection::stream`, so later commands skip the handshake and run unauthenticated or against db 0 instead of the configured database.
 - `DEFAULT_TIMEOUT` bounds one socket read rather than a whole reply, and the `SCAN` loop runs under the store-wide `Mutex` for up to `MAX_SCAN_PAGES` round trips, so a slow or dribbling server blocks every caller with no end-to-end deadline.
