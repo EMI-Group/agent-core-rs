@@ -147,10 +147,25 @@
 //! 4. The gRPC transport is rejected at construction time
 //!    ([`openjiuwen_common::error::Error::Unsupported`]).
 //!
+//! # Stream backpressure
+//!
+//! Each streaming send writes into a **bounded** channel
+//! (`EVENT_BUFFER_CAPACITY` events). The publisher never blocks: when a
+//! subscriber reads slower than the executor emits and the buffer fills, the
+//! server logs the overflow at `warn`, drops that subscriber's channel, and the
+//! stream ends with a terminal `INTERNAL` error frame. The task keeps running
+//! and its store updates are unaffected, so `GetTask` and a later
+//! `SubscribeToTask` still observe the final state. A client that keeps up
+//! receives every event in order.
+//!
 //! # Documented limitations
 //!
-//! Tasks live in memory by default ([`InMemoryTaskStore`]); supply another
-//! [`TaskStore`] through [`A2aServer::with_store`] to persist them.
+//! Tasks live in memory by default ([`InMemoryTaskStore`]) and are bounded by
+//! [`A2aServerConfig::max_tasks`] and
+//! [`A2aServerConfig::terminal_task_ttl_ms`]: terminal tasks are pruned first
+//! (oldest terminal state first) and a running or awaited task is never
+//! evicted. Supply another [`TaskStore`] through [`A2aServer::with_store`] to
+//! persist them and own the retention policy.
 
 mod config;
 mod event_sink;
@@ -172,7 +187,9 @@ pub use config::{
 };
 pub use event_sink::EventSink;
 pub use service::{A2aServer, A2aServerAdapter, ServerHandle};
-pub use store::{InMemoryTaskStore, TaskStore};
+pub use store::{
+    InMemoryTaskStore, RetentionPolicy, TaskStore, DEFAULT_MAX_TASKS, DEFAULT_TERMINAL_TASK_TTL_MS,
+};
 
 use std::sync::Arc;
 

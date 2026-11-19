@@ -69,7 +69,7 @@ fn every_exporter_type_initializes() {
         handle.shutdown();
         assert!(!handle.is_active(), "shutdown deactivates the handle");
         handle.shutdown(); // idempotent
-        handle.shutdown_with_timeout(Duration::from_millis(50)); // idempotent
+        let _ = handle.shutdown_with_timeout(Duration::from_millis(50)); // idempotent
         handle.force_flush(); // harmless after shutdown
     }
 }
@@ -96,7 +96,7 @@ fn memory_console_and_none_stay_an_inactive_seam() {
         handle.shutdown();
         assert!(!handle.is_active(), "shutdown stays a no-op");
         handle.shutdown(); // idempotent
-        handle.shutdown_with_timeout(Duration::from_millis(50)); // idempotent
+        let _ = handle.shutdown_with_timeout(Duration::from_millis(50)); // idempotent
         handle.force_flush(); // harmless after shutdown
     }
 }
@@ -236,7 +236,7 @@ fn the_otlp_http_protobuf_exporter_owns_a_provider_without_a_capture_snapshot() 
     handle.shutdown();
     assert!(!handle.is_active(), "shutdown deactivates the handle");
     handle.shutdown(); // idempotent after the first call
-    handle.shutdown_with_timeout(Duration::from_millis(50)); // idempotent
+    let _ = handle.shutdown_with_timeout(Duration::from_millis(50)); // idempotent
     handle.force_flush(); // harmless after shutdown
 }
 

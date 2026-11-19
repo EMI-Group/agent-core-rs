@@ -841,7 +841,7 @@ fn the_otlp_http_protobuf_configuration_builds_an_active_handle() {
     handle.shutdown();
     assert!(!handle.is_active(), "shutdown deactivates the handle");
     handle.shutdown(); // idempotent
-    handle.shutdown_with_timeout(Duration::from_millis(50)); // idempotent
+    let _ = handle.shutdown_with_timeout(Duration::from_millis(50)); // idempotent
     handle.force_flush(); // harmless after shutdown
 
     // The encoding fixes the content type of every request and is visible in

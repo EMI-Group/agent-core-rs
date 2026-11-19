@@ -14,9 +14,8 @@ use axum::response::Response;
 use openjiuwen_common::error::Result;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use tokio::sync::mpsc;
 
-use super::event_sink::EventSink;
+use super::event_sink::{EventSink, EventStream};
 use super::{agent_message, fresh_id, Inner};
 use crate::a2a::jsonrpc::{error_code, JsonRpcError};
 use crate::a2a::transform::A2aTransformer;
@@ -36,7 +35,7 @@ pub(super) struct SendPlan {
     /// The publisher the executor drives.
     pub(super) sink: EventSink,
     /// The event stream the sink publishes into.
-    pub(super) receiver: mpsc::UnboundedReceiver<Value>,
+    pub(super) receiver: EventStream,
     /// The per-turn execution context.
     pub(super) context: super::config::A2aExecutionContext,
     /// The request message included in the `SUBMITTED` snapshot.
@@ -213,7 +212,7 @@ pub(super) async fn send_task(
 pub(super) fn start_stream(
     inner: &Inner,
     params: Option<&Value>,
-) -> std::result::Result<mpsc::UnboundedReceiver<Value>, JsonRpcError> {
+) -> std::result::Result<EventStream, JsonRpcError> {
     let plan = plan_send(inner, params)?;
     let SendPlan {
         sink,

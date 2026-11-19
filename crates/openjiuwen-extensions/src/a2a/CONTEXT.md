@@ -120,11 +120,13 @@ pub struct A2aServerConfig { pub agent_card: AgentCard, pub interface_url: Optio
                              pub rpc_path /* "/a2a/jsonrpc/" */, pub card_path /* "/.well-known/agent-card.json" */,
                              pub transport /* JsonRpc */, pub rest_path /* "/a2a/rest" */,
                              pub rest_prefix /* "/v1" */, pub rest_interface_url: Option<String>,
-                             pub protocol_version /* "1.0" */, pub host /* "127.0.0.1" */, pub port /* 8000 */ }
+                             pub protocol_version /* "1.0" */, pub host /* "127.0.0.1" */, pub port /* 8000 */,
+                             pub max_tasks /* 10_000; 0 = unbounded */, pub terminal_task_ttl_ms /* 1 h; 0 = forever */ }
 // A2aServerConfig: Serialize/Deserialize with #[serde(default)] ({} -> defaults, unknown fields tolerated),
 // Default + new(card), with_interface_url, with_bind, with_rpc_path, with_transport, with_rest_path,
-// with_rest_prefix, with_rest_interface_url, rest_base_path() -> String
-pub const DEFAULT_RPC_PATH/DEFAULT_CARD_PATH/DEFAULT_REST_PATH/DEFAULT_REST_PREFIX/DEFAULT_PROTOCOL_VERSION/DEFAULT_HOST/DEFAULT_PORT;
+// with_rest_prefix, with_rest_interface_url, with_max_tasks, with_terminal_task_ttl_ms,
+// rest_base_path() -> String, retention_policy() -> RetentionPolicy
+pub const DEFAULT_RPC_PATH/DEFAULT_CARD_PATH/DEFAULT_REST_PATH/DEFAULT_REST_PREFIX/DEFAULT_PROTOCOL_VERSION/DEFAULT_HOST/DEFAULT_PORT/DEFAULT_MAX_TASKS/DEFAULT_TERMINAL_TASK_TTL_MS;
 #[async_trait] pub trait A2aExecutor: Send + Sync {
     async fn execute(&self, ctx: A2aExecutionContext, sink: &EventSink) -> Result<()>;
     async fn cancel(&self, ctx: A2aExecutionContext) -> Result<()>;   // default: Ok(()), server publishes CANCELED
@@ -132,9 +134,14 @@ pub const DEFAULT_RPC_PATH/DEFAULT_CARD_PATH/DEFAULT_REST_PATH/DEFAULT_REST_PREF
 pub struct A2aExecutionContext { pub task_id: String, pub context_id: String,
                                  pub message: Message, pub metadata: Map<String, Value> }
 pub struct EventSink { .. }   // task(), working(), artifact(Artifact, last_chunk), complete(), fail(msg),
-                              // require_input(msg?), canceled(), task_id(), context_id(), is_terminal()
+                              // require_input(msg?), canceled(), task_id(), context_id(), is_terminal(),
+                              // subscriber_overflowed()
 pub trait TaskStore: Send + Sync { fn get(&self, id: &str) -> Option<Task>; fn put(&self, task: Task); fn all(&self) -> Vec<Task>; }
-pub struct InMemoryTaskStore;
+pub struct RetentionPolicy { pub max_tasks: usize, pub terminal_ttl: Option<Duration> }
+pub struct InMemoryTaskStore { .. }   // new() (default policy), with_policy(RetentionPolicy), policy()
+// retention: expired terminal tasks dropped; over the cap, terminal tasks evicted oldest-first;
+// running/awaited (INPUT_REQUIRED) tasks are never evicted, so the cap is a soft bound for in-flight work
+// streaming: EVENT_BUFFER_CAPACITY = 256 (bounded, try_send, slow subscriber dropped with a terminal error frame)
 pub struct A2aServer { .. }   // Clone
 impl A2aServer {
     pub fn new(config: A2aServerConfig, executor: Arc<dyn A2aExecutor>) -> Result<Self>;

@@ -120,7 +120,8 @@ impl TracerHandle {
     pub fn config(&self) -> &OtelTracerConfig;
     pub fn force_flush(&self);
     pub fn shutdown(&self);                             // flush, then provider shutdown within export_timeout_ms
-    pub fn shutdown_with_timeout(&self, timeout: Duration);  // explicit budget; idempotent in both builds
+    pub fn shutdown_with_timeout(&self, timeout: Duration) -> bool;  // explicit budget bounds flush+shutdown;
+                                                                     // idempotent in both builds; false = not fully flushed/stopped
     // feature "otel" only
     pub fn tracer(&self) -> Option<SdkTracer>;
     pub fn provider(&self) -> Option<&SdkTracerProvider>;
@@ -309,7 +310,7 @@ Headers are attached to every request, the `content-type` follows the job's enco
 `export_timeout_ms` sizes the per-request HTTP timeout (minimum 1 ms) and the default `TracerHandle::shutdown` budget; the batch processor keeps its SDK default because `BatchConfigBuilder::with_max_export_timeout` is gated behind the SDK's `experimental_trace_batch_span_processor_with_async_runtime` feature, which this crate does not enable (`OTEL_BSP_EXPORT_TIMEOUT` therefore governs it).
 `schedule_delay_millis` and `max_export_batch_size` configure the processor as before.
 
-`TracerHandle::shutdown_with_timeout` flushes the batch processor first and then stops the provider within the budget, so a pending OTLP batch is handed to the exporter instead of being dropped; both it and `shutdown` are idempotent and are no-ops for an inactive handle.
+`TracerHandle::shutdown_with_timeout` flushes the batch processor first and then stops the provider within the budget, so a pending OTLP batch is handed to the exporter instead of being dropped; the SDK's blocking `force_flush` runs on a helper thread so the caller's deadline also bounds the flush, and the method returns `false` when either phase did not finish inside the budget. Both it and `shutdown` are idempotent and are no-ops for an inactive handle.
 On the exporter side `shutdown_with_timeout` closes the job channel, waits for the worker, and detaches it with a `warn` when the budget expires; the worker exits after the job in flight and shuts its runtime down with a 100 ms grace period. `force_flush` on the exporter is a no-op because nothing is buffered there.
 
 Every export failure is fail-open: it surfaces as `OTelSdkError::InternalFailure` and never panics, and the transport-level failures (non-2xx status, timeout, connect, post-shutdown, closed channel, lost reply) also emit a `tracing::warn!` on target `openjiuwen_extensions::otel::otlp`.

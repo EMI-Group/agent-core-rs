@@ -7,12 +7,68 @@ use std::sync::{Arc, Mutex, PoisonError};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 use super::store::TaskStore;
 use super::{agent_message, fresh_id};
 use crate::a2a::types::{
     Artifact, Message, Task, TaskArtifactUpdateEvent, TaskState, TaskStatus, TaskStatusUpdateEvent,
 };
+
+/// How many events one streaming subscriber may fall behind before the server
+/// drops it.
+///
+/// The channel is deliberately bounded: an unbounded one would let a client
+/// that never reads its `text/event-stream` response make the server buffer the
+/// whole event stream in memory. When the buffer is full the publisher is
+/// **never** blocked — it logs the overflow at `warn`, closes the subscriber's
+/// channel, and the stream reports a terminal `INTERNAL` error frame (see
+/// [`super::sse`]). The task itself keeps running and the [`TaskStore`] stays
+/// coherent, so `GetTask`/`CancelTask` and a later `SubscribeToTask` still see
+/// the finished task.
+pub(super) const EVENT_BUFFER_CAPACITY: usize = 256;
+
+/// `tracing` target for event-channel failures.
+const LOG_TARGET: &str = "openjiuwen_extensions::a2a::server::event_sink";
+
+/// The subscriber-facing state of one event stream.
+#[derive(Debug)]
+struct StreamState {
+    /// Set once the subscriber was dropped for falling behind.
+    overflowed: AtomicBool,
+}
+
+/// The receiving half of one [`EventSink`]'s event stream.
+///
+/// Wraps the bounded channel and reports whether the stream ended because the
+/// subscriber overflowed, so [`super::sse`] can finish it with a terminal error
+/// frame instead of silently truncating the event sequence.
+#[derive(Debug)]
+pub(crate) struct EventStream {
+    /// The bounded event channel.
+    receiver: mpsc::Receiver<Value>,
+    /// Shared overflow flag, also observed by the publisher.
+    state: Arc<StreamState>,
+}
+
+impl EventStream {
+    /// Waits for the next event; `None` once the publisher is gone or the
+    /// subscriber was dropped.
+    pub(crate) async fn recv(&mut self) -> Option<Value> {
+        self.receiver.recv().await
+    }
+
+    /// Takes the next buffered event without waiting (used by the tests).
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> std::result::Result<Value, mpsc::error::TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    /// Whether this stream was terminated because it fell behind.
+    pub(crate) fn overflowed(&self) -> bool {
+        self.state.overflowed.load(Ordering::Acquire)
+    }
+}
 
 /// The publisher an [`super::A2aExecutor`] drives while it produces a task.
 ///
@@ -23,15 +79,19 @@ use crate::a2a::types::{
 /// observe coherent state.
 ///
 /// All methods are infallible: a dropped receiver is ignored (the store update
-/// still happens), and a terminal method is a no-op once the task has reached a
-/// terminal state, matching Python's "already in a terminal state" behavior.
+/// still happens), a subscriber that falls more than [`EVENT_BUFFER_CAPACITY`]
+/// events behind is dropped without blocking the publisher, and a terminal
+/// method is a no-op once the task has reached a terminal state, matching
+/// Python's "already in a terminal state" behavior.
 pub struct EventSink {
     task_id: String,
     context_id: String,
     store: Arc<dyn TaskStore>,
-    sender: mpsc::UnboundedSender<Value>,
+    /// The bounded sender; `None` once the subscriber was dropped.
+    sender: Mutex<Option<mpsc::Sender<Value>>>,
     open_artifacts: Mutex<BTreeSet<String>>,
     terminal: AtomicBool,
+    stream: Arc<StreamState>,
 }
 
 impl EventSink {
@@ -40,17 +100,28 @@ impl EventSink {
         task_id: String,
         context_id: String,
         store: Arc<dyn TaskStore>,
-    ) -> (Self, mpsc::UnboundedReceiver<Value>) {
-        let (sender, receiver) = mpsc::unbounded_channel();
+    ) -> (Self, EventStream) {
+        let (sender, receiver) = mpsc::channel(EVENT_BUFFER_CAPACITY);
+        let stream = Arc::new(StreamState {
+            overflowed: AtomicBool::new(false),
+        });
+        let receiver_state = Arc::clone(&stream);
         let sink = Self {
             task_id,
             context_id,
             store,
-            sender,
+            sender: Mutex::new(Some(sender)),
             open_artifacts: Mutex::new(BTreeSet::new()),
             terminal: AtomicBool::new(false),
+            stream,
         };
-        (sink, receiver)
+        (
+            sink,
+            EventStream {
+                receiver,
+                state: receiver_state,
+            },
+        )
     }
 
     /// The id of the task this sink publishes for.
@@ -69,6 +140,12 @@ impl EventSink {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         self.terminal.load(Ordering::Acquire)
+    }
+
+    /// Whether the streaming subscriber was dropped for falling behind.
+    #[must_use]
+    pub fn subscriber_overflowed(&self) -> bool {
+        self.stream.overflowed.load(Ordering::Acquire)
     }
 
     /// Publishes the [`Task`] snapshot and stores it (`state` as supplied).
@@ -188,6 +265,9 @@ impl EventSink {
     }
 
     /// Serializes `event` and queues it for the stream.
+    ///
+    /// Never blocks: a full buffer drops the subscriber (and records the
+    /// overflow) rather than stalling the executor.
     fn emit<T: Serialize>(&self, event: &T) {
         let value = match serde_json::to_value(event) {
             Ok(value) => value,
@@ -196,8 +276,31 @@ impl EventSink {
                 return;
             }
         };
-        if self.sender.send(value).is_err() {
-            tracing::debug!("A2A event receiver dropped; the task store is still updated");
+        let mut sender = self.sender.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(channel) = sender.as_ref() else {
+            // The subscriber was dropped on an earlier overflow.
+            return;
+        };
+        match channel.try_send(value) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                // Drop the subscriber: closing the channel ends its stream, and
+                // the sse layer turns the recorded overflow into a terminal
+                // error frame. The task itself keeps running.
+                sender.take();
+                self.stream.overflowed.store(true, Ordering::Release);
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    task_id = self.task_id,
+                    capacity = EVENT_BUFFER_CAPACITY,
+                    "A2A streaming subscriber fell behind; dropping it without blocking the publisher"
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                // The receiver was dropped (for example a non-streaming send).
+                // The store update still happens.
+                tracing::debug!("A2A event receiver dropped; the task store is still updated");
+            }
         }
     }
 

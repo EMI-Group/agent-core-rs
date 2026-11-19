@@ -49,7 +49,11 @@ impl std::fmt::Debug for A2aServer {
 }
 
 impl A2aServer {
-    /// Builds a server over a fresh [`InMemoryTaskStore`].
+    /// Builds a server over a fresh, bounded [`InMemoryTaskStore`].
+    ///
+    /// The store applies [`A2aServerConfig::max_tasks`] and
+    /// [`A2aServerConfig::terminal_task_ttl_ms`], so a long-lived server does
+    /// not retain one task per request forever.
     ///
     /// # Errors
     ///
@@ -57,7 +61,8 @@ impl A2aServer {
     /// [`Error::Config`] when a mount path is not absolute or the REST base
     /// collides with another mounted route.
     pub fn new(config: A2aServerConfig, executor: Arc<dyn A2aExecutor>) -> Result<Self> {
-        Self::with_store(config, executor, Arc::new(InMemoryTaskStore::new()))
+        let store = InMemoryTaskStore::with_policy(config.retention_policy());
+        Self::with_store(config, executor, Arc::new(store))
     }
 
     /// Builds a server over `store`.

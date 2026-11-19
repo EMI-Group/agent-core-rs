@@ -11,8 +11,10 @@ use axum::http::{header, Method, Request, StatusCode};
 use openjiuwen_common::error::{Error, ErrorKind, Result};
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::time::Duration;
 use tower::ServiceExt;
+
+use super::event_sink::{EventStream, EVENT_BUFFER_CAPACITY};
 
 /// Compile-time check: every public item stays reachable at
 /// `crate::a2a::server::` after the module split into `server/`.
@@ -20,9 +22,9 @@ use tower::ServiceExt;
 mod public_paths {
     use crate::a2a::server::{
         A2aExecutionContext, A2aExecutor, A2aServer, A2aServerAdapter, A2aServerConfig,
-        A2aTransport, EventSink, InMemoryTaskStore, ServerHandle, TaskStore, DEFAULT_CARD_PATH,
-        DEFAULT_HOST, DEFAULT_PORT, DEFAULT_PROTOCOL_VERSION, DEFAULT_REST_PATH,
-        DEFAULT_REST_PREFIX, DEFAULT_RPC_PATH,
+        A2aTransport, EventSink, InMemoryTaskStore, RetentionPolicy, ServerHandle, TaskStore,
+        DEFAULT_CARD_PATH, DEFAULT_HOST, DEFAULT_MAX_TASKS, DEFAULT_PORT, DEFAULT_PROTOCOL_VERSION,
+        DEFAULT_REST_PATH, DEFAULT_REST_PREFIX, DEFAULT_RPC_PATH, DEFAULT_TERMINAL_TASK_TTL_MS,
     };
 }
 
@@ -94,9 +96,9 @@ pub(super) fn stored_task(id: &str, state: TaskState) -> Task {
     }
 }
 
-/// Drains a sink receiver without blocking.
-fn drain(receiver: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
-    std::iter::from_fn(|| receiver.try_recv().ok()).collect()
+/// Drains a sink stream without blocking.
+fn drain(stream: &mut EventStream) -> Vec<Value> {
+    std::iter::from_fn(|| stream.try_recv().ok()).collect()
 }
 
 /// POSTs one JSON-RPC request through the router and returns the envelope.
@@ -271,6 +273,9 @@ fn config_defaults_match_python() {
     assert_eq!(config.protocol_version, "1.0");
     assert_eq!(config.host, "127.0.0.1");
     assert_eq!(config.port, 8000);
+    assert_eq!(config.max_tasks, DEFAULT_MAX_TASKS);
+    assert_eq!(config.terminal_task_ttl_ms, DEFAULT_TERMINAL_TASK_TTL_MS);
+    assert_eq!(config.retention_policy(), RetentionPolicy::default());
     assert!(config.interface_url.is_none());
 
     let config = A2aServerConfig::new(card())
@@ -285,6 +290,15 @@ fn config_defaults_match_python() {
     assert_eq!(config.host, "0.0.0.0");
     assert_eq!(config.port, 0);
     assert_eq!(config.rpc_path, "/rpc/");
+
+    // `0` disables both bounds; explicit values build the matching policy.
+    let config = config.with_max_tasks(5).with_terminal_task_ttl_ms(2_000);
+    assert_eq!(
+        config.retention_policy(),
+        RetentionPolicy::new(5, Some(Duration::from_millis(2_000)))
+    );
+    let config = config.with_max_tasks(0).with_terminal_task_ttl_ms(0);
+    assert_eq!(config.retention_policy(), RetentionPolicy::new(0, None));
 }
 
 #[test]
@@ -611,4 +625,209 @@ async fn adapter_starts_and_stops_on_an_ephemeral_port() {
     assert!(adapter.local_addr().is_none());
     // Stopping twice is a no-op.
     adapter.stop().await.unwrap();
+}
+
+#[test]
+fn task_store_evicts_the_oldest_terminal_task_first() {
+    let store = InMemoryTaskStore::with_policy(RetentionPolicy::new(3, None));
+    store.put(stored_task("run", TaskState::Working));
+    store.put(stored_task("old", TaskState::Completed));
+    std::thread::sleep(Duration::from_millis(2));
+    store.put(stored_task("new", TaskState::Completed));
+    std::thread::sleep(Duration::from_millis(2));
+    // The fourth task pushes the store over its cap: only the oldest terminal
+    // task may go.
+    store.put(stored_task("newest", TaskState::Completed));
+
+    let ids: Vec<String> = store.all().into_iter().map(|task| task.id).collect();
+    assert_eq!(ids.len(), 3, "unexpected tasks: {ids:?}");
+    assert!(
+        ids.contains(&String::from("run")),
+        "running task was evicted"
+    );
+    assert!(
+        ids.contains(&String::from("new")),
+        "newer terminal task was evicted"
+    );
+    assert!(ids.contains(&String::from("newest")));
+    assert!(
+        !ids.contains(&String::from("old")),
+        "the oldest terminal task must be evicted first: {ids:?}"
+    );
+}
+
+#[test]
+fn task_store_caps_retained_tasks() {
+    let store = InMemoryTaskStore::with_policy(RetentionPolicy::new(4, None));
+    for index in 0..20 {
+        store.put(stored_task(&format!("t{index:02}"), TaskState::Completed));
+    }
+    assert!(
+        store.all().len() <= 4,
+        "the store exceeded its cap: {} tasks",
+        store.all().len()
+    );
+}
+
+#[test]
+fn task_store_never_evicts_a_running_or_awaited_task() {
+    let store = InMemoryTaskStore::with_policy(RetentionPolicy::new(1, None));
+    store.put(stored_task("run", TaskState::Working));
+    store.put(stored_task("wait", TaskState::InputRequired));
+    for index in 0..10 {
+        store.put(stored_task(&format!("done{index}"), TaskState::Completed));
+    }
+
+    let ids: Vec<String> = store.all().into_iter().map(|task| task.id).collect();
+    assert!(
+        ids.contains(&String::from("run")),
+        "running task was evicted"
+    );
+    assert!(
+        ids.contains(&String::from("wait")),
+        "awaited task was evicted"
+    );
+    assert!(
+        ids.iter().all(|id| !id.starts_with("done")),
+        "terminal tasks must be the only eviction candidates: {ids:?}"
+    );
+}
+
+#[test]
+fn task_store_keeps_a_completed_task_readable_until_the_ttl_expires() {
+    let ttl = Duration::from_millis(30);
+    let store = InMemoryTaskStore::with_policy(RetentionPolicy::new(100, Some(ttl)));
+    store.put(stored_task("done", TaskState::Completed));
+    assert!(
+        store.get("done").is_some(),
+        "a completed task must stay readable within its TTL"
+    );
+
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(
+        store.get("done").is_none(),
+        "an expired terminal task must be pruned"
+    );
+
+    // Awaited and running tasks are not subject to the terminal TTL.
+    store.put(stored_task("wait", TaskState::InputRequired));
+    store.put(stored_task("run", TaskState::Working));
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(store.get("wait").is_some(), "awaited task expired");
+    assert!(store.get("run").is_some(), "running task expired");
+}
+
+#[tokio::test]
+async fn server_config_bounds_the_default_task_store() {
+    let config = A2aServerConfig::new(card()).with_max_tasks(3);
+    let server = A2aServer::new(config, Arc::new(EchoExecutor)).unwrap();
+    for index in 0..12 {
+        let envelope = rpc(
+            &server,
+            "SendMessage",
+            json!({ "query": format!("request-{index}") }),
+        )
+        .await;
+        assert!(
+            envelope.get("error").is_none(),
+            "unexpected error: {envelope}"
+        );
+    }
+    assert!(
+        server.store().all().len() <= 3,
+        "the configured cap must bound the server's store"
+    );
+}
+
+#[tokio::test]
+async fn a_subscriber_that_never_reads_is_dropped_without_blocking_the_publisher() {
+    let store = Arc::new(InMemoryTaskStore::new());
+    let (sink, mut stream) = EventSink::new(
+        String::from("t1"),
+        String::from("c1"),
+        Arc::clone(&store) as Arc<dyn TaskStore>,
+    );
+    sink.task(stored_task("t1", TaskState::Working));
+    for index in 0..(EVENT_BUFFER_CAPACITY + 25) {
+        sink.artifact(
+            Artifact {
+                artifact_id: format!("a{index}"),
+                parts: vec![Part::text("chunk")],
+                ..Artifact::default()
+            },
+            true,
+        );
+    }
+
+    // The publisher ran to completion without a reader: it was never blocked,
+    // and the buffer stayed bounded.
+    assert!(
+        sink.subscriber_overflowed(),
+        "the overflow must be surfaced"
+    );
+    let buffered = drain(&mut stream);
+    assert!(
+        buffered.len() <= EVENT_BUFFER_CAPACITY,
+        "the buffer grew past the channel capacity: {} events",
+        buffered.len()
+    );
+    assert!(
+        stream.overflowed(),
+        "the subscriber must observe the terminal overflow state"
+    );
+
+    // The task itself keeps running and the store stays coherent.
+    sink.complete();
+    assert_eq!(store.get("t1").unwrap().status.state, TaskState::Completed);
+}
+
+#[tokio::test]
+async fn a_healthy_subscriber_receives_every_event_in_order() {
+    let store = Arc::new(InMemoryTaskStore::new());
+    let (sink, mut stream) = EventSink::new(
+        String::from("t1"),
+        String::from("c1"),
+        Arc::clone(&store) as Arc<dyn TaskStore>,
+    );
+    let total = EVENT_BUFFER_CAPACITY * 2;
+    let producer = tokio::spawn(async move {
+        sink.task(stored_task("t1", TaskState::Working));
+        for index in 0..total {
+            sink.artifact(
+                Artifact {
+                    artifact_id: format!("a{index:04}"),
+                    parts: vec![Part::text(format!("{index}"))],
+                    ..Artifact::default()
+                },
+                true,
+            );
+            tokio::task::yield_now().await;
+        }
+        sink.complete();
+    });
+
+    let mut ids = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(value) = stream.recv().await {
+            if let Some(id) = value
+                .get("artifact")
+                .and_then(|artifact| artifact.get("artifactId"))
+                .and_then(Value::as_str)
+            {
+                ids.push(id.to_owned());
+            }
+        }
+    })
+    .await
+    .expect("a healthy subscriber must not stall");
+    producer.await.expect("the producer must finish");
+
+    assert!(
+        !stream.overflowed(),
+        "a healthy subscriber must not overflow"
+    );
+    assert_eq!(ids.len(), total, "every event must be delivered");
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(id, &format!("a{index:04}"), "events arrived out of order");
+    }
 }

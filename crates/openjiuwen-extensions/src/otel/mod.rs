@@ -208,7 +208,8 @@
 //!
 //! Shutdown keeps the tail of the stream: [`TracerHandle::shutdown`] flushes the
 //! batch processor and then stops the provider within `export_timeout_ms`, and
-//! [`TracerHandle::shutdown_with_timeout`] takes an explicit budget; both are
+//! [`TracerHandle::shutdown_with_timeout`] takes an explicit budget that bounds
+//! both phases and returns whether they completed inside it; both are
 //! idempotent and both are no-ops for an inactive handle.
 //!
 //! The doctest below builds a handle towards a local collector and never
@@ -235,7 +236,7 @@
 //! assert!(handle.capture().is_none(), "OTLP exposes no capture API");
 //!
 //! // No span was created, so the shutdown performs no HTTP request.
-//! handle.shutdown_with_timeout(Duration::from_millis(250));
+//! assert!(handle.shutdown_with_timeout(Duration::from_millis(250)));
 //! assert!(!handle.is_active());
 //! # }
 //! ```

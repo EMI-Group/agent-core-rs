@@ -12,10 +12,20 @@ use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderValue};
 use axum::response::Response;
 use futures::{Stream, StreamExt};
-use serde_json::Value;
-use tokio::sync::mpsc;
+use serde_json::{json, Value};
 
-use crate::a2a::jsonrpc::{self, JsonRpcResponse};
+use super::event_sink::EventStream;
+use crate::a2a::jsonrpc::{self, error_code, JsonRpcError, JsonRpcResponse};
+
+/// The terminal message a dropped streaming subscriber receives.
+///
+/// The publisher never blocks, so a subscriber that reads slower than the
+/// executor emits is dropped after its bounded buffer fills; the stream ends
+/// with an `INTERNAL` error frame carrying this text instead of silently
+/// truncating the event sequence.
+const OVERFLOW_MESSAGE: &str = "the event stream was terminated because the \
+     subscriber fell behind and its bounded buffer overflowed; read the stream \
+     faster or reconnect with SubscribeToTask to fetch the final task state";
 
 /// One `text/event-stream` frame holding a `JSON-RPC` response.
 pub(super) fn frame(response: &JsonRpcResponse) -> Bytes {
@@ -52,12 +62,20 @@ pub(super) fn responses(responses: Vec<JsonRpcResponse>) -> Response {
 }
 
 /// An SSE response carrying one `JSON-RPC` result frame per value received
-/// from `receiver`.
-pub(super) fn receiver_response(receiver: mpsc::UnboundedReceiver<Value>, id: Value) -> Response {
-    let mut receiver = receiver;
+/// from `stream`.
+///
+/// If the subscriber was dropped for falling behind, the stream ends with one
+/// `INTERNAL` error frame instead of a silent truncation.
+pub(super) fn receiver_response(mut stream: EventStream, id: Value) -> Response {
     let responses = async_stream::stream! {
-        while let Some(value) = receiver.recv().await {
+        while let Some(value) = stream.recv().await {
             yield JsonRpcResponse::success(id.clone(), value);
+        }
+        if stream.overflowed() {
+            yield JsonRpcResponse::failure(
+                id.clone(),
+                JsonRpcError::new(error_code::INTERNAL, OVERFLOW_MESSAGE),
+            );
         }
     };
     response(responses)
@@ -82,11 +100,23 @@ pub(super) fn value_responses(values: Vec<Value>) -> Response {
 }
 
 /// An SSE response carrying one bare-value frame per value received from
-/// `receiver`.
-pub(super) fn value_receiver_response(mut receiver: mpsc::UnboundedReceiver<Value>) -> Response {
+/// `stream`.
+///
+/// If the subscriber was dropped for falling behind, the stream ends with one
+/// REST-shaped `{"error": {code, status, message}}` frame.
+pub(super) fn value_receiver_response(mut stream: EventStream) -> Response {
     let values = async_stream::stream! {
-        while let Some(value) = receiver.recv().await {
+        while let Some(value) = stream.recv().await {
             yield value;
+        }
+        if stream.overflowed() {
+            yield json!({
+                "error": {
+                    "code": error_code::INTERNAL,
+                    "status": "INTERNAL",
+                    "message": OVERFLOW_MESSAGE,
+                }
+            });
         }
     };
     value_stream(values)

@@ -5,6 +5,9 @@ use openjiuwen_common::error::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use std::time::Duration;
+
+use super::store::{RetentionPolicy, DEFAULT_MAX_TASKS, DEFAULT_TERMINAL_TASK_TTL_MS};
 use crate::a2a::types::{self, Message};
 
 /// The default JSON-RPC mount path, trailing slash included.
@@ -116,6 +119,15 @@ pub struct A2aServerConfig {
     pub host: String,
     /// The port to bind; `0` picks an ephemeral port at bind time.
     pub port: u16,
+    /// Maximum number of tasks the default [`super::InMemoryTaskStore`]
+    /// retains; `0` leaves it unbounded.
+    ///
+    /// Only effects [`super::A2aServer::new`]: a store supplied through
+    /// [`super::A2aServer::with_store`] owns its own policy.
+    pub max_tasks: usize,
+    /// How long the default store keeps a terminal task retrievable, in
+    /// milliseconds; `0` keeps terminal tasks forever.
+    pub terminal_task_ttl_ms: u64,
 }
 
 impl Default for A2aServerConfig {
@@ -132,6 +144,8 @@ impl Default for A2aServerConfig {
             protocol_version: DEFAULT_PROTOCOL_VERSION.to_owned(),
             host: DEFAULT_HOST.to_owned(),
             port: DEFAULT_PORT,
+            max_tasks: DEFAULT_MAX_TASKS,
+            terminal_task_ttl_ms: DEFAULT_TERMINAL_TASK_TTL_MS,
         }
     }
 }
@@ -158,6 +172,21 @@ impl A2aServerConfig {
     pub fn with_bind(mut self, host: impl Into<String>, port: u16) -> Self {
         self.host = host.into();
         self.port = port;
+        self
+    }
+
+    /// Sets the cap the default in-memory store applies (`0` = unbounded).
+    #[must_use]
+    pub const fn with_max_tasks(mut self, max_tasks: usize) -> Self {
+        self.max_tasks = max_tasks;
+        self
+    }
+
+    /// Sets how long the default store keeps a terminal task retrievable
+    /// (`0` = forever).
+    #[must_use]
+    pub const fn with_terminal_task_ttl_ms(mut self, ttl_ms: u64) -> Self {
+        self.terminal_task_ttl_ms = ttl_ms;
         self
     }
 
@@ -194,6 +223,19 @@ impl A2aServerConfig {
     pub fn with_rest_interface_url(mut self, url: impl Into<String>) -> Self {
         self.rest_interface_url = Some(url.into());
         self
+    }
+
+    /// The retention policy the default [`super::InMemoryTaskStore`] applies.
+    ///
+    /// [`Self::max_tasks`] `0` disables the cap and
+    /// [`Self::terminal_task_ttl_ms`] `0` disables terminal-task expiry.
+    #[must_use]
+    pub fn retention_policy(&self) -> RetentionPolicy {
+        RetentionPolicy {
+            max_tasks: self.max_tasks,
+            terminal_ttl: (self.terminal_task_ttl_ms > 0)
+                .then(|| Duration::from_millis(self.terminal_task_ttl_ms)),
+        }
     }
 
     /// The normalized REST route base: `{rest_path}{rest_prefix}` with exactly

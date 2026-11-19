@@ -55,6 +55,8 @@
 //! [`init_otel_tracer`]: self::init_otel_tracer
 
 use std::time::Duration;
+#[cfg(feature = "otel")]
+use std::time::Instant;
 
 #[cfg(feature = "otel")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -182,53 +184,70 @@ impl TracerHandle {
     /// Shuts the private provider down; safe to call twice and from `&self`.
     ///
     /// Flushes pending spans and then shuts the provider down, both bounded by
-    /// [`OtelTracerConfig::export_timeout_ms`] (minimum 1 ms). A no-op for an
-    /// inactive handle.
+    /// [`OtelTracerConfig::export_timeout_ms`] (minimum 1 ms); see
+    /// [`Self::shutdown_with_timeout`] for the result. A no-op for an inactive
+    /// handle.
     pub fn shutdown(&self) {
-        self.shutdown_with_timeout(Duration::from_millis(self.config.export_timeout_ms.max(1)));
+        let _ =
+            self.shutdown_with_timeout(Duration::from_millis(self.config.export_timeout_ms.max(1)));
     }
 
     /// Flushes pending spans and shuts the private provider down within
-    /// `timeout`.
+    /// `timeout`, returning whether both phases completed inside that budget.
     ///
     /// The flush runs first so spans still sitting in the batch processor are
     /// handed to the exporter (an OTLP batch would otherwise be dropped), then
-    /// the provider stops its processors and waits at most `timeout` for them.
-    /// Every failure is logged at `warn` on target
-    /// `openjiuwen_extensions::otel::handle` and never panics.
+    /// the provider stops its processors with whatever budget is left. Both
+    /// phases respect the caller's deadline: the SDK's blocking `force_flush`
+    /// runs on a helper thread and the caller waits at most `timeout` for it,
+    /// so a stalled exporter cannot turn a 100 ms shutdown into seconds of
+    /// blocking. A false result means spans may not have reached the exporter;
+    /// the reason is logged at `warn` on target
+    /// `openjiuwen_extensions::otel::handle`.
     ///
     /// Idempotent: only the first call does any work, and further calls return
-    /// immediately. A no-op for an inactive handle, including the handle the
-    /// no-feature seam returns.
-    pub fn shutdown_with_timeout(&self, timeout: Duration) {
+    /// `true` immediately. An inactive handle (including the no-feature seam)
+    /// also returns `true`, since it owns nothing to flush.
+    #[must_use]
+    pub fn shutdown_with_timeout(&self, timeout: Duration) -> bool {
         #[cfg(feature = "otel")]
         {
             if self.is_shutdown() || self.shutdown.swap(true, Ordering::AcqRel) {
-                return;
+                return true;
             }
             let Some(provider) = self.provider.as_ref() else {
-                return;
+                return true;
             };
-            if let Err(error) = provider.force_flush() {
+            let started = Instant::now();
+            let flushed = flush_with_budget(provider, timeout);
+            if !flushed {
                 tracing::warn!(
                     target: LOG_TARGET,
-                    %error,
-                    "failed to flush the otel tracer provider"
+                    timeout_ms = timeout.as_millis(),
+                    "otel tracer flush exceeded its budget; some spans may not be exported"
                 );
             }
-            if let Err(error) = provider.shutdown_with_timeout(timeout) {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    %error,
-                    "failed to shut the otel tracer provider down"
-                );
-            }
+            // Hand the rest of the budget to the provider shutdown.
+            let remaining = timeout.saturating_sub(started.elapsed());
+            let stopped = match provider.shutdown_with_timeout(remaining) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        %error,
+                        "failed to shut the otel tracer provider down within the budget"
+                    );
+                    false
+                }
+            };
+            flushed && stopped
         }
         #[cfg(not(feature = "otel"))]
         {
             // The no-feature seam owns no provider, so there is nothing to flush
             // or stop; keep the signature identical in both builds.
             let _ = (self, timeout);
+            true
         }
     }
 
@@ -314,6 +333,59 @@ impl TracerHandle {
             capture,
             file,
             shutdown: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Runs the SDK's blocking `force_flush` under `budget`.
+///
+/// The SDK's flush waits on the batch processor with its own timeout, so it
+/// cannot be given the caller's deadline directly. Running it on a helper
+/// thread and waiting with `recv_timeout` makes the caller's budget
+/// authoritative; a timed-out flush is left behind (its cloned provider keeps
+/// the processor alive) instead of blocking the caller.
+#[cfg(feature = "otel")]
+fn flush_with_budget(provider: &SdkTracerProvider, budget: Duration) -> bool {
+    let provider = provider.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawn = std::thread::Builder::new()
+        .name("openjiuwen-otel-flush".to_owned())
+        .spawn(move || {
+            let _ = tx.send(provider.force_flush());
+        });
+    let handle = match spawn {
+        Ok(handle) => handle,
+        Err(error) => {
+            tracing::warn!(
+                target: LOG_TARGET,
+                %error,
+                "failed to spawn the otel flush thread"
+            );
+            return false;
+        }
+    };
+    match rx.recv_timeout(budget) {
+        Ok(Ok(())) => {
+            // The flush thread has already sent its result; joining is cheap.
+            let _ = handle.join();
+            true
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                target: LOG_TARGET,
+                %error,
+                "failed to flush the otel tracer provider"
+            );
+            let _ = handle.join();
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: LOG_TARGET,
+                %error,
+                "otel flush did not finish within the shutdown budget"
+            );
+            false
         }
     }
 }
@@ -682,7 +754,7 @@ mod tests {
         handle.force_flush();
         handle.shutdown();
         handle.shutdown();
-        handle.shutdown_with_timeout(Duration::from_millis(50));
+        let _ = handle.shutdown_with_timeout(Duration::from_millis(50));
         assert!(!handle.is_active());
         // Post-shutdown calls stay harmless.
         handle.force_flush();
@@ -706,7 +778,7 @@ mod tests {
         );
         assert_eq!(handle.config().exporter_type, ExporterType::Otlp);
 
-        handle.shutdown_with_timeout(Duration::from_millis(200));
+        let _ = handle.shutdown_with_timeout(Duration::from_millis(200));
         assert!(!handle.is_active(), "shutdown deactivates the handle");
     }
 
@@ -731,7 +803,7 @@ mod tests {
         assert!(handle.is_active());
         assert!(handle.provider().is_some());
         assert!(handle.capture().is_none());
-        handle.shutdown_with_timeout(Duration::from_millis(200));
+        let _ = handle.shutdown_with_timeout(Duration::from_millis(200));
         assert!(!handle.is_active());
     }
 
@@ -818,6 +890,70 @@ mod tests {
         assert_eq!(capture.names(), vec!["otlp.injected".to_owned()]);
     }
 
+    /// An exporter whose `export` blocks longer than any test budget.
+    #[cfg(feature = "otel")]
+    #[derive(Debug, Clone)]
+    struct StallingExporter;
+
+    #[cfg(feature = "otel")]
+    impl SpanExporter for StallingExporter {
+        fn export(
+            &self,
+            _batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+        {
+            // The SDK drives `export` on its batch-processor thread; blocking
+            // there is exactly the stalled-collector case the budget must bound.
+            std::thread::sleep(Duration::from_secs(3));
+            std::future::ready(Ok(()))
+        }
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn shutdown_with_a_stalled_exporter_returns_within_the_budget() {
+        use opentelemetry::trace::{Span as _, Tracer as _};
+
+        let handle = init_otel_tracer_with_exporter(memory_config(), StallingExporter).unwrap();
+        handle.tracer().unwrap().start("stalled.span").end();
+
+        let started = Instant::now();
+        let flushed = handle.shutdown_with_timeout(Duration::from_millis(100));
+        let elapsed = started.elapsed();
+
+        assert!(
+            !flushed,
+            "a stalled export must not be reported as fully flushed"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "shutdown ignored its budget: {elapsed:?}"
+        );
+        assert!(!handle.is_active());
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn shutdown_with_a_responsive_provider_reports_success_and_loses_no_spans() {
+        use crate::otel::provider::CaptureExporter;
+        use opentelemetry::trace::{Span as _, Tracer as _};
+
+        let capture = CaptureExporter::new();
+        let handle = init_otel_tracer_with_exporter(memory_config(), capture.clone()).unwrap();
+        handle.tracer().unwrap().start("responsive.span").end();
+
+        assert!(
+            handle.shutdown_with_timeout(Duration::from_secs(2)),
+            "a responsive provider must flush and stop inside the budget"
+        );
+        assert!(!handle.is_active());
+        assert_eq!(
+            capture.names(),
+            vec!["responsive.span".to_owned()],
+            "shutdown must not lose the span it flushed"
+        );
+    }
+
     #[cfg(feature = "otel")]
     #[test]
     fn shutdown_with_timeout_is_idempotent() {
@@ -826,10 +962,10 @@ mod tests {
         let handle = init_otel_tracer(memory_config()).unwrap();
         handle.tracer().unwrap().start("before.shutdown").end();
 
-        handle.shutdown_with_timeout(Duration::from_millis(250));
+        assert!(handle.shutdown_with_timeout(Duration::from_millis(250)));
         assert!(!handle.is_active());
         // A second call, of either shutdown flavour, is harmless.
-        handle.shutdown_with_timeout(Duration::from_millis(250));
+        assert!(handle.shutdown_with_timeout(Duration::from_millis(250)));
         handle.shutdown();
         assert!(!handle.is_active());
     }
