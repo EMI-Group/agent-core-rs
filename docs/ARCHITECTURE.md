@@ -416,7 +416,7 @@ Default builds need no network and no external service; every feature except the
 | `openjiuwen-extensions` | `a2a` | no | A2A client/server, wire types, harness bridge. |
 | `openjiuwen-extensions` | `otel` | no | Real OTel SDK provider, `OtelTraceSink`, handlers, tracing layer, `observability::{file_exporter, transforming}`. |
 | `openjiuwen-extensions` | `sqlite`, `redis`, `pulsar` | no | SQLite checkpointer/store, Redis KV/document/vector stores + checkpointer, Pulsar queue surface (constructs then rejects). The Redis stores and checkpointer validate their configuration at construction and open the connection lazily on first use; the client speaks `redis://` and `rediss://` (public web PKI) and follows `MOVED`/`ASK`. |
-| `openjiuwen-extensions` | `mcp` | no | `rmcp` dependency only — no source file reads it (dead gate). |
+| `openjiuwen-extensions` | `mcp` | no | `src/mcp`: `McpToolGateway` bridges kernel MCP tools to the harness `ToolGateway`; forwards `openjiuwen-foundation/mcp`, which is on by default anyway. |
 | `openjiuwen-harness` | `native` | yes | Empty marker; no source reads it. |
 | `openjiuwen-harness` | `browser`, `cua`, `mobile`, `notify` | no | Documented `Unsupported` subagent presets; `notify` pulls `notify` and gates `watcher/backend.rs`, without which `WorkspaceWatcher::start` answers a typed `Unsupported` naming the feature. |
 | `openjiuwen-harness-providers` | `native` | yes | The in-process DeepAgent harness provider. |
@@ -428,7 +428,7 @@ Default builds need no network and no external service; every feature except the
 | `openjiuwen` | `native` | yes | Forwards `harness/native` (an empty marker in the harness, which no source reads) and `harness-providers/native` (the real in-process DeepAgent provider). |
 | `openjiuwen` | `notify` | no | Forwards `harness/notify`; without it `WorkspaceWatcher::start` answers a typed `Unsupported`, and `openjiuwen-cli` enables the feature directly so the binary's `--watch` always compiles in. |
 | `openjiuwen` | `native-v2`, `vendor`, `browser`, `cua`, `mobile`, `sqlite`, `a2a`, `pulsar`, `distributed`, `otel`, `otlp`, `sandbox` | no | One forwarder each to the owning crate; `sqlite` fans out over foundation, session, memory, extensions, symphony and agent-teams, `otlp` forwards only `agent-teams/otlp` (the team-memory bridge), and `browser`/`cua`/`mobile` forward the harness presets. |
-| `openjiuwen` | `mcp` | no | Forwards `extensions/mcp`, which is a dead gate: it pulls `rmcp` and `tokio-stream` while no source file reads the feature. |
+| `openjiuwen` | `mcp` | no | Forwards `extensions/mcp`, the harness `ToolGateway` bridge over the kernel MCP tools; the kernel's MCP tooling is already compiled through foundation's default `mcp`. |
 | `openjiuwen` | `redis` | no | Forwards `extensions/redis` (Redis checkpointer and KV/document/vector stores, built lazily) and `agent-evolving/redis` (the online RL store). |
 | `openjiuwen` | `live-tests` | no | Forwards the empty `live-tests` gates of foundation, core, harness, harness-providers, agent-teams and extensions; no source file reads them. |
 | `openjiuwen-e2e` | `a2a`, `otel`, `sqlite` | no | Enable the `a2a_roundtrip`, `plugin_observability` and sqlite-gated scenario cases. |
@@ -449,7 +449,7 @@ Default builds need no network and no external service; every feature except the
 - Everything is offline and deterministic by default: scripted models or the loopback server, temp directories, loopback sockets, no credentials, no wall-clock ordering.
 - Deferred areas are proven, not just documented: dedicated suites assert `Error::Unsupported` and its message (for example `openjiuwen-dev-tools/tests/deferred_surface.rs`, `openjiuwen-symphony/tests/deferred.rs`, `openjiuwen-agent-evolving/tests/rl.rs`, `openjiuwen-extensions/tests/observability_deferred.rs`, `openjiuwen-rsi/tests/deferred.rs`).
 - `default-members` lists the library and binary crates, so a bare `cargo test` skips the three development crates; the Makefile gates pass `--workspace` (or `-p`) and therefore include them.
-- `make test` currently fails `openjiuwen-cli/tests/sessions.rs` and `openjiuwen-e2e/tests/runner_hosting.rs`; `PARITY.md` §Verification names the cases and the rest of the gate.
+- Gate status is not tracked here: `PARITY.md` §Verification records the gate's measured outcome and names every failing target.
 - Gates: `make test` (`cargo test --workspace`, offline), `make test-all` (the feature-gated suites: e2e `a2a`, extensions `a2a,otel`, harness and agent-teams `--no-default-features`, symphony `sqlite`, sysop `sandbox`, harness-providers `vendor`), and `make verify` (`fmt-check`, `clippy`, `test`, `test-all`, plus the example builds).
 - `cargo doc --workspace --no-deps` (and `--all-features`) stays warning-free; link private or feature-gated items as plain code spans instead of widening visibility.
 
