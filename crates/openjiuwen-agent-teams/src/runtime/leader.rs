@@ -424,6 +424,10 @@ async fn steer_line(agent: &TeamAgent, event: &EventMessage) -> Option<String> {
 }
 
 /// Renders and acknowledges the leader's unread mailbox.
+///
+/// Direct rows are flagged read; a broadcast row is read through the leader's watermark, which is
+/// advanced to the newest broadcast instant rendered here. Without that step the broadcast backlog
+/// would stay unread for the leader forever and every later event would re-render it.
 async fn unread_lines(agent: &TeamAgent, leader: &str) -> Option<String> {
     let backend = agent.backend();
     let unread = match backend.unread(leader).await {
@@ -444,6 +448,22 @@ async fn unread_lines(agent: &TeamAgent, leader: &str) -> Option<String> {
     if !direct.is_empty() {
         if let Err(error) = backend.mark_read(leader, &direct).await {
             warn!(team = agent.team_name(), error = %error, "failed to mark the leader mailbox read");
+        }
+    }
+    // The watermark is monotone in every store, so a late render of an older broadcast cannot
+    // re-open rows an earlier read already covered.
+    let broadcast_watermark = unread
+        .iter()
+        .filter(|row| row.broadcast)
+        .map(|row| row.timestamp)
+        .max();
+    if let Some(timestamp) = broadcast_watermark {
+        if let Err(error) = backend.set_read_watermark(leader, timestamp).await {
+            warn!(
+                team = agent.team_name(),
+                error = %error,
+                "failed to advance the leader broadcast watermark"
+            );
         }
     }
     Some(
@@ -556,6 +576,62 @@ mod tests {
                 .iter()
                 .any(|send| send.contains("dev-1 -> boss: status?")),
             "{sends:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broadcast_is_stamped_and_rendered_only_once() {
+        let (agent, _factory, _workspace) = built(&blueprint("alpha", "boss", &["dev-1"])).await;
+        let record = agent
+            .backend()
+            .send_message("dev-1", None, "all hands")
+            .await
+            .unwrap();
+        assert!(record.broadcast, "{record:?}");
+        assert_ne!(
+            record.timestamp, 0,
+            "a broadcast needs a real stamp or no watermark can ever cover it"
+        );
+        let broadcast_event = EventPayload::Broadcast(
+            crate::schema::BroadcastEvent {
+                message_id: record.message_id.clone(),
+                from_member_name: "dev-1".to_owned(),
+            },
+        )
+        .to_message("dev-1")
+        .unwrap();
+
+        assert_eq!(agent.backend().unread("boss").await.unwrap().len(), 1);
+        let first = steer_line(&agent, &broadcast_event)
+            .await
+            .expect("the first event renders the broadcast");
+        assert!(first.contains("all hands"), "{first}");
+        assert!(
+            agent.backend().unread("boss").await.unwrap().is_empty(),
+            "rendering a broadcast advances the reader's watermark"
+        );
+        assert_eq!(
+            agent.backend().read_watermark("boss").await.unwrap(),
+            Some(record.timestamp),
+            "the watermark is the newest broadcast instant rendered"
+        );
+
+        // A second event (the same broadcast again, or any later board event) must not re-render
+        // the backlog that was already turned into steering text.
+        assert_eq!(steer_line(&agent, &broadcast_event).await, None);
+        let later = EventPayload::TaskCreated(crate::schema::TaskCreatedEvent {
+            task_id: "task_1".to_owned(),
+            title: "ship it".to_owned(),
+            ..crate::schema::TaskCreatedEvent::default()
+        })
+        .to_message("dev-1")
+        .unwrap();
+        let line = steer_line(&agent, &later)
+            .await
+            .expect("a board event still steers the leader");
+        assert!(
+            !line.contains("all hands"),
+            "the rendered broadcast is not repeated: {line}"
         );
     }
 
