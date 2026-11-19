@@ -736,6 +736,18 @@ impl TaskSchedulerLoop {
             self.finish(&guard, &task_id, &session_id).await;
             return;
         }
+        if let Some(recorded) = self.recorded_decision(&task_id) {
+            // A pause/cancel recorded while the run was in flight owns the
+            // status too: an executor that ignores its cancellation token must
+            // not overwrite the decision with `Completed`.
+            debug!(
+                task_id,
+                status = recorded.as_str(),
+                "task was paused or cancelled during the run; keeping the recorded decision"
+            );
+            self.finish(&guard, &task_id, &session_id).await;
+            return;
+        }
         let result = match outcome {
             Ok(result) => result,
             Err(message) => {
@@ -778,6 +790,14 @@ impl TaskSchedulerLoop {
         self.finish(&guard, &task_id, &session_id).await;
     }
 
+    /// The pause/cancel a caller recorded on the store during a run, if any.
+    ///
+    /// Only the two statuses a caller can impose on a running task are
+    /// reported; every other recorded status is the driver's own to write.
+    fn recorded_decision(&self, task_id: &str) -> Option<TaskStatus> {
+        let status = self.manager.task(task_id)?.status;
+        matches!(status, TaskStatus::Paused | TaskStatus::Canceled).then_some(status)
+    }
     /// Cleanup every driver runs: untrack, wake the loop, signal completion.
     ///
     /// Disarming the run's guard first keeps its [`Drop`] from failing a task

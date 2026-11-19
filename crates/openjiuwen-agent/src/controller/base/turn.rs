@@ -15,7 +15,7 @@ const PAUSED_REPLY: &str = "paused";
 /// Reply of a cancelled task control intent.
 const CANCELED_REPLY: &str = "canceled";
 
-use super::{BaseController, Controller, EventHandlerOutcome, TurnState};
+use super::{BaseController, Controller, EventHandlerOutcome, TurnState, LAST_ERROR_STATE_KEY};
 use crate::card::AgentCard;
 use crate::controller::config::ControllerConfig;
 use crate::controller::executors::{TaskContext, TaskRun};
@@ -83,29 +83,47 @@ impl BaseController {
         let event_deadline = (event_timeout_ms != 0
             && tokio::runtime::Handle::try_current().is_ok())
         .then(|| Duration::from_millis(event_timeout_ms));
-        let mut output: Option<ControllerOutput> = None;
-        for event in &events {
-            let produced = match event_deadline {
-                Some(deadline) => {
-                    let handled = tokio::time::timeout(
-                        deadline,
-                        self.process_event(event, &session, &mut turn),
-                    )
-                    .await
-                    .map_err(|_| {
-                        Error::timeout(format!(
-                            "controller event handling timed out after {event_timeout_ms} ms"
-                        ))
-                    })?;
-                    handled?
+        // The event loop is its own future so a deadline (or a failing handler)
+        // cannot skip the cleanup below: the bound session is always released
+        // and the run this turn created is always closed.
+        let turn_result: Result<Option<ControllerOutput>> = async {
+            let mut output: Option<ControllerOutput> = None;
+            for event in &events {
+                let produced = match event_deadline {
+                    Some(deadline) => {
+                        let handled = tokio::time::timeout(
+                            deadline,
+                            self.process_event(event, &session, &mut turn),
+                        )
+                        .await
+                        .map_err(|_| {
+                            Error::timeout(format!(
+                                "controller event handling timed out after {event_timeout_ms} ms"
+                            ))
+                        })?;
+                        handled?
+                    }
+                    None => self.process_event(event, &session, &mut turn).await?,
+                };
+                if let Some(produced) = produced {
+                    output = Some(produced);
                 }
-                None => self.process_event(event, &session, &mut turn).await?,
-            };
-            if let Some(produced) = produced {
-                output = Some(produced);
             }
+            Ok(output)
         }
-        let output = output.unwrap_or_else(|| self.fallback_output());
+        .await;
+        let output = match turn_result {
+            Ok(output) => output.unwrap_or_else(|| self.fallback_output()),
+            Err(error) => {
+                self.record_failure(&session, &turn.query, &error).await;
+                if let Some(scheduler) = self.scheduler_loop() {
+                    scheduler.ensure_completion_signal(session.id()).await;
+                }
+                self.unbind_session(session.id()).await;
+                run.finish().await;
+                return Err(error);
+            }
+        };
         self.record_history(session.id(), &turn.query, &output);
         self.save_state(session.as_ref()).await?;
         // An idle session gets Python's `all_tasks_processed` sentinel; the
@@ -263,7 +281,7 @@ impl BaseController {
                     } else {
                         TaskStatus::Canceled
                     };
-                    control = Some(match self.set_task_status(&intent, status) {
+                    control = Some(match self.set_task_status(&intent, status).await {
                         Some(output) => output,
                         None => not_found_output(&intent),
                     });
@@ -317,12 +335,29 @@ impl BaseController {
             .plan_with_task_type(session_id, intents, task_type)
     }
 
-    /// Moves the persisted task targeted by a control intent to `status`.
-    fn set_task_status(&self, intent: &Intent, status: TaskStatus) -> Option<ControllerOutput> {
+    /// Moves the task targeted by a control intent to `status`.
+    ///
+    /// The pause/cancel goes through [`BaseController::pause_task`] /
+    /// [`BaseController::cancel_task`], so a task running on the background
+    /// scheduler is really stopped (executor hooks plus run cancellation)
+    /// instead of only being rewritten in the store while its driver keeps
+    /// running and later records `Completed`. `None` means the task cannot be
+    /// controlled now: it is unknown, already terminal, or the scheduler's
+    /// pause was refused.
+    async fn set_task_status(
+        &self,
+        intent: &Intent,
+        status: TaskStatus,
+    ) -> Option<ControllerOutput> {
         let id = intent.target_task_id.as_deref()?;
-        let manager = self.task_manager();
-        manager.task(id)?;
-        manager.update_task_status(id, status, false, false, None);
+        self.task_manager().task(id)?;
+        let controlled = match status {
+            TaskStatus::Canceled => self.cancel_task(id).await,
+            _ => self.pause_task(id).await,
+        };
+        if !controlled {
+            return None;
+        }
         let reply = match status {
             TaskStatus::Canceled => CANCELED_REPLY,
             _ => PAUSED_REPLY,
@@ -553,6 +588,29 @@ impl BaseController {
             log.push(entry);
         }
         trim_history(log, limit, turn_start);
+    }
+
+    /// Records a failed turn as the session's terminal state.
+    ///
+    /// The failure text goes under [`LAST_ERROR_STATE_KEY`] and the task
+    /// snapshot is saved, so a turn that timed out or a handler that failed
+    /// leaves a recorded, resumable state instead of a session that still looks
+    /// mid-turn. Both writes are best-effort and only logged: the caller is
+    /// already returning the turn's own error.
+    async fn record_failure(&self, session: &Arc<dyn Session>, query: &str, failure: &Error) {
+        let state = json!({
+            LAST_ERROR_STATE_KEY: {
+                "kind": failure.kind(),
+                "message": failure.to_string(),
+                "query": query,
+            }
+        });
+        if let Err(error) = session.update_state(state).await {
+            warn!(%error, session_id = session.id(), "cannot record a failed controller turn");
+        }
+        if let Err(error) = self.save_state(session.as_ref()).await {
+            warn!(%error, session_id = session.id(), "cannot persist the task state of a failed turn");
+        }
     }
 
     /// Output of a turn that produced nothing: the configured default response.
