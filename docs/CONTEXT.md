@@ -16,7 +16,7 @@ The Context Tree (`CONTEXT.md` per crate) is the primary source of intent and AP
 - `PARITY.md` §CLI commands — the `openjiuwen` subcommands (`run`, `chat`, `sessions`, `lsp`, `cron`, `team`, `watch`, `auto-harness`), their flags including `--resume`/`--continue`/`--worktree`, and the exit codes.
 - `PARITY.md` §Deferred Features — the authoritative per-crate gap list, each entry carrying a reason category (vendor SDK, external service/broker, GPU/ML stack, platform automation, incompatible format/design).
 - `PARITY.md` §`Error::Unsupported` surface — the typed seams by module path, plus §Gaps that are not typed seams for behavioural shortfalls.
-- `PARITY.md` §Verification — the gate commands, the `default-members` caveat, the failing targets, and the `#[ignore]` inventory.
+- `PARITY.md` §Verification — the green outcome, the gate commands, the `default-members` caveat, the hermeticity guarantees (offline, loopback, no wall clock), the `#[ignore]` inventory and what each ignored test is for, and the suites that assert the deferred surfaces.
 - `ARCHITECTURE.md` §2 — the public seams whose signatures require updating every dependent crate when changed.
 - `ARCHITECTURE.md` §2.13 — the harness seams a host wires: `MemoryToolBackend`/`WorkspaceMemoryBackend` for the memory tools and `SubAgentSpawner`/`RuntimeSubAgentSpawner` for subagents.
 - `ARCHITECTURE.md` §5 — the complete feature-flag table, including the `default = []` crates, the empty `live-tests` gates and the dead gates.
@@ -29,7 +29,7 @@ The Context Tree (`CONTEXT.md` per crate) is the primary source of intent and AP
 - Do not duplicate per-crate API details here; link to the crate `CONTEXT.md`.
 - State only verified facts, and present tense throughout: no changelog wording, no dates, no "was X, now Y".
 - Record how a claim is verified (the gate command, the package suite) instead of a test or scenario count, which drifts with the next commit.
-- When the gate is red, the verification section names the failing targets; it never claims a green run.
+- The verification section states the measured outcome of the gate: it names the failing targets when the gate is red, and claims a green run only while every gate passes.
 
 ## Notes for Agents
 
