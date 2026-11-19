@@ -427,7 +427,7 @@ mod tests {
         // panic would kill every later export of the process.
         let capture = CaptureExporter::new();
         let exporter = TransformingSpanExporter::new(capture.clone(), |span: SpanData| {
-            panic!("projection exploded");
+            panic!("projection exploded on the span named {}", span.name);
             #[allow(unreachable_code)]
             Ok(span)
         });
