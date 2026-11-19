@@ -737,7 +737,7 @@ fn session_store_new_session_writes_the_journal_header() {
     let loaded = store.load("cli-test").unwrap().unwrap();
     assert_eq!(loaded.model, "gpt-4o");
     assert_eq!(loaded.created_at, record.created_at);
-    assert!(loaded.messages.is_empty());
+    assert_eq!(loaded.messages, Vec::new());
 }
 
 #[test]
