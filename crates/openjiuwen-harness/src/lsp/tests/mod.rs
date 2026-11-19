@@ -15,6 +15,7 @@ mod fake_server;
 mod framing;
 mod parse;
 mod retry;
+mod stalled;
 mod tool;
 mod tool_lifecycle;
 mod tool_ops;
