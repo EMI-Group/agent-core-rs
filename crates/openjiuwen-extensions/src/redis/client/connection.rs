@@ -4,6 +4,17 @@
 //! connection logic through [`Transport`], which implements [`tokio::io::AsyncRead`]
 //! and [`tokio::io::AsyncWrite`]. A connection reconnects lazily: any transport
 //! failure or timeout drops the socket and the next command re-runs the handshake.
+//!
+//! # Cancellation and desynchronisation
+//!
+//! `RESP` has no request ids, so a reply is only attributable to a command while
+//! the command is in flight. [`Connection::exchange`] therefore closes the
+//! connection whenever its future is dropped before the replies have been read —
+//! a caller-side `timeout`, a `select!` arm, or a `JoinHandle` abort — so the
+//! next command reconnects instead of reading the aborted command's reply. Bytes
+//! left in the buffer by anything else (a peer that answered more than it was
+//! asked) are treated as desynchronised too: the connection is closed and the
+//! command fails with a typed `Transport` error rather than reusing the wire.
 use super::tls;
 use super::ConnectionOptions;
 use crate::redis::codec::{encode_command, parse_reply, Reply};
@@ -85,10 +96,18 @@ pub(super) struct Connection {
 
 impl Connection {
     /// Connects and runs the handshake when the connection is not open.
+    ///
+    /// The socket is published to `self` only once `AUTH`/`SELECT` have been
+    /// answered, so a cancellation in the middle of the handshake leaves the
+    /// connection closed instead of marking an unauthenticated socket open.
     pub(super) async fn ensure_open(&mut self, options: &ConnectionOptions) -> Result<()> {
         if self.stream.is_some() {
             return Ok(());
         }
+        // A closed connection never carries bytes forward: anything still here
+        // belongs to a command whose reply was abandoned, so it cannot be
+        // attributed to the command the caller is about to send.
+        self.buffer.clear();
         let stream = connect_transport(options).await?;
         tracing::debug!(
             host = %options.host,
@@ -96,8 +115,18 @@ impl Connection {
             transport = stream.kind(),
             "redis transport open"
         );
-        self.stream = Some(stream);
-        self.buffer.clear();
+        let mut staging = Self {
+            stream: Some(stream),
+            buffer: Vec::new(),
+        };
+        staging.handshake(options).await?;
+        self.stream = staging.stream.take();
+        self.buffer = std::mem::take(&mut staging.buffer);
+        Ok(())
+    }
+
+    /// Runs `AUTH` and `SELECT` for a freshly opened transport.
+    async fn handshake(&mut self, options: &ConnectionOptions) -> Result<()> {
         if let Some(password) = options.password.clone() {
             let result = if let Some(username) = options.username.clone() {
                 let args: [&[u8]; 3] = [b"AUTH", username.as_bytes(), password.as_bytes()];
@@ -109,12 +138,7 @@ impl Connection {
                     .await
             };
             match result {
-                Ok(reply) => {
-                    if let Err(error) = expect_ok(reply, "AUTH") {
-                        self.close();
-                        return Err(error);
-                    }
-                }
+                Ok(reply) => expect_ok(reply, "AUTH")?,
                 Err(error) => return Err(error),
             }
         }
@@ -125,12 +149,7 @@ impl Connection {
                 .perform(&encode_command(&args), options.timeout, "SELECT")
                 .await
             {
-                Ok(reply) => {
-                    if let Err(error) = expect_ok(reply, "SELECT") {
-                        self.close();
-                        return Err(error);
-                    }
-                }
+                Ok(reply) => expect_ok(reply, "SELECT")?,
                 Err(error) => return Err(error),
             }
         }
@@ -153,7 +172,8 @@ impl Connection {
     /// Writes `payload` once, then reads `expected` replies in order.
     ///
     /// Any transport failure or timeout closes the connection so the next command
-    /// reconnects instead of reading a stale reply.
+    /// reconnects instead of reading a stale reply, and so does a caller that
+    /// drops this future mid-flight (see [`InFlight`]).
     pub(super) async fn exchange(
         &mut self,
         payload: &[u8],
@@ -164,10 +184,87 @@ impl Connection {
         if expected == 0 {
             return Ok(Vec::new());
         }
-        let Some(stream) = self.stream.as_mut() else {
+        if self.stream.is_none() {
             return Err(Error::transport("redis connection is closed"));
+        }
+        if !self.buffer.is_empty() {
+            // The peer sent bytes nobody asked for (or a previous command was
+            // abandoned without closing the connection): the next reply cannot be
+            // attributed to this command, so the wire is unusable.
+            let buffered = self.buffer.len();
+            self.close();
+            tracing::warn!(
+                command = name,
+                buffered,
+                "redis connection was desynchronised; closing it"
+            );
+            return Err(Error::transport(format!(
+                "redis connection was desynchronised: {buffered} byte(s) of an unattributable \
+                 reply were buffered when command '{name}' started; the connection was closed"
+            )));
+        }
+        let mut in_flight = InFlight {
+            connection: self,
+            finished: false,
         };
-        let buffer = &mut self.buffer;
+        let outcome = in_flight.run(payload, expected, timeout).await;
+        // Every non-`Ok` outcome has already closed the connection through the
+        // guard; the assignment only tells the guard this conversion is complete.
+        in_flight.finished = outcome.is_ok();
+        drop(in_flight);
+        match outcome {
+            Ok(replies) => Ok(replies),
+            Err(Interrupted::Failed(error)) => Err(error),
+            Err(Interrupted::TimedOut) => Err(Error::timeout(format!(
+                "redis command '{name}' timed out after {timeout:?}"
+            ))),
+        }
+    }
+
+    /// Drops the socket so the next command reconnects.
+    fn close(&mut self) {
+        self.stream.take();
+        self.buffer.clear();
+    }
+}
+
+/// Why an in-flight exchange produced no replies.
+enum Interrupted {
+    /// A transport, protocol, or limit failure; the connection was closed.
+    Failed(Error),
+    /// The round trip exceeded its budget; the connection was closed.
+    TimedOut,
+}
+
+/// Closes the connection when a command future is dropped before its replies are
+/// read.
+///
+/// `RESP` replies are positional, so a partially exchanged command leaves the
+/// wire in an unknown state. Dropping the future — a caller-side `timeout`, a
+/// `select!` arm, an abort — runs this guard's `Drop` and closes the socket, so
+/// the next command reconnects instead of reading the abandoned reply.
+struct InFlight<'a> {
+    /// The connection whose wire state the guard owns.
+    connection: &'a mut Connection,
+    /// Set once the caller has its replies; before that, a drop is a cancellation.
+    finished: bool,
+}
+
+impl InFlight<'_> {
+    /// Writes `payload` and reads `expected` replies within `timeout`.
+    async fn run(
+        &mut self,
+        payload: &[u8],
+        expected: usize,
+        timeout: Duration,
+    ) -> std::result::Result<Vec<Reply>, Interrupted> {
+        let connection = &mut *self.connection;
+        let Some(stream) = connection.stream.as_mut() else {
+            return Err(Interrupted::Failed(Error::transport(
+                "redis connection is closed",
+            )));
+        };
+        let buffer = &mut connection.buffer;
         let result = tokio::time::timeout(timeout, async {
             stream
                 .write_all(payload)
@@ -186,23 +283,21 @@ impl Connection {
         .await;
         match result {
             Ok(Ok(replies)) => Ok(replies),
-            Ok(Err(error)) => {
-                self.close();
-                Err(error)
-            }
-            Err(_) => {
-                self.close();
-                Err(Error::timeout(format!(
-                    "redis command '{name}' timed out after {timeout:?}"
-                )))
-            }
+            Ok(Err(error)) => Err(Interrupted::Failed(error)),
+            Err(_) => Err(Interrupted::TimedOut),
         }
     }
+}
 
-    /// Drops the socket so the next command reconnects.
-    fn close(&mut self) {
-        self.stream.take();
-        self.buffer.clear();
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if !self.finished && self.connection.stream.is_some() {
+            tracing::debug!(
+                buffered = self.connection.buffer.len(),
+                "a redis command future was dropped in flight; closing the connection"
+            );
+            self.connection.close();
+        }
     }
 }
 

@@ -611,3 +611,112 @@ async fn empty_commands_are_rejected_before_io() {
     );
     fake.shutdown().await;
 }
+
+/// Dropping a command future in flight must never leave the abandoned reply on
+/// the wire for the next command to read.
+///
+/// `RESP` replies carry no request id, so a caller-side `timeout`/`select!`/
+/// abort drops `exchange` between the write and the read. Without an RAII guard
+/// the socket stays open with the abandoned reply behind it, and the next
+/// command reads that reply instead of its own — silent wrong data on a
+/// checkpoint or store read.
+#[tokio::test]
+async fn a_dropped_command_future_never_hands_its_reply_to_the_next_command() {
+    let fake = FakeRedis::start_with(
+        FakeOptions::default().with_command_delay(Duration::from_millis(150)),
+    )
+    .await;
+    let client = Client::from_url(&fake.url()).await.unwrap();
+    client
+        .command_str(&["SET", "first", "alpha"])
+        .await
+        .unwrap();
+    client
+        .command_str(&["SET", "second", "beta"])
+        .await
+        .unwrap();
+    let connections_before = fake.state().connection_count();
+
+    // Abort the command with a caller-side timeout while the fake is still
+    // holding the reply back.
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(50),
+        client.command_str(&["GET", "first"]),
+    )
+    .await;
+    assert!(
+        dropped.is_err(),
+        "the caller-side timeout drops the in-flight command"
+    );
+    // Let the fake finish the abandoned command, so its reply really is on the
+    // wire (in the closed socket's buffer, or lost with it).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let reply = client
+        .command_str(&["GET", "second"])
+        .await
+        .expect("the next command succeeds");
+    assert_eq!(
+        reply,
+        Reply::Bulk(b"beta".to_vec()),
+        "the dropped command's reply must never be reused"
+    );
+    assert!(
+        fake.state().connection_count() > connections_before,
+        "the dropped command closes the connection so the next command reconnects"
+    );
+    fake.shutdown().await;
+}
+
+/// A loopback peer that answers every accepted connection with canned bytes and
+/// then closes it, in acceptance order.
+///
+/// Writing on accept (before the client's command even arrives) keeps the test
+/// deterministic: every byte of the canned reply is already queued when the
+/// client reads.
+async fn canned_reply_peer(answers: Vec<&'static [u8]>) -> SocketAddr {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt as _;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("loopback listener binds");
+    let addr = listener.local_addr().expect("listener has an address");
+    tokio::spawn(async move {
+        let accepted = AtomicUsize::new(0);
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let index = accepted.fetch_add(1, Ordering::SeqCst);
+            if let Some(answer) = answers.get(index) {
+                let _ = stream.write_all(answer).await;
+            }
+        }
+    });
+    addr
+}
+
+/// Bytes the peer sends beyond the reply the client asked for cannot be
+/// attributed to any command: the connection is closed and the command fails
+/// with a typed error instead of reusing the wire.
+#[tokio::test]
+async fn buffered_unsolicited_replies_are_a_typed_desynchronisation_error() {
+    let addr = canned_reply_peer(vec![b"+FIRST\r\n+UNSOLICITED\r\n", b"+THIRD\r\n"]).await;
+    let client = Client::from_url(&format!("redis://{addr}")).await.unwrap();
+    assert_eq!(
+        client.command_str(&["GET", "a"]).await.unwrap(),
+        Reply::Simple("FIRST".to_string())
+    );
+    let error = client
+        .command_str(&["GET", "b"])
+        .await
+        .expect_err("the connection is desynchronised");
+    assert_eq!(error.kind(), ErrorKind::Transport);
+    assert!(
+        error.to_string().contains("desynchronised"),
+        "the error names the cause: {error}"
+    );
+    assert_eq!(
+        client.command_str(&["GET", "c"]).await.unwrap(),
+        Reply::Simple("THIRD".to_string()),
+        "the next command reconnects instead of reusing the wire"
+    );
+}
