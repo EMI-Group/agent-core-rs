@@ -50,6 +50,7 @@
 //! frame.
 pub(crate) mod agent_loop;
 pub mod config;
+mod control;
 pub(crate) mod exposure;
 pub(crate) mod frames;
 pub(crate) mod hooks;
@@ -78,6 +79,7 @@ use crate::rails::{AgentRail, RailRegistry};
 use crate::steering::SteeringQueue;
 use crate::usage::{UsageTelemetry, MAIN_CONTEXT_ID};
 use agent_loop::AgentRuntime;
+use control::RunControl;
 use futures::stream::{BoxStream, StreamExt};
 use openjiuwen_common::error::{Error, ErrorKind, Result};
 use openjiuwen_context::{
@@ -90,6 +92,19 @@ use openjiuwen_session::Session;
 use serde_json::Value;
 use std::fmt;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+/// Cancels the agent's current run when dropped.
+///
+/// The returned stream carries one, so dropping the consumer stops the run
+/// instead of leaving a detached task driving a model or a tool.
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 
 /// The `ReAct` agent: configuration plus the runtime state of one agent.
 ///
@@ -144,6 +159,12 @@ pub struct ReActAgent {
     final_check: parking_lot::RwLock<Option<Arc<dyn FinalRequestCheck>>>,
     kv_cache_hook: parking_lot::RwLock<Option<Arc<KVCacheModelCallHook>>>,
     memory_provider: parking_lot::RwLock<Option<Arc<dyn MemoryProvider>>>,
+    /// Cancellation token of the most recently started run.
+    ///
+    /// [`ReActAgent::abort`] cancels it; a fresh token is installed by every
+    /// `invoke`/`stream`, and dropping a returned stream cancels its own token
+    /// through a drop guard.
+    cancel: parking_lot::RwLock<CancellationToken>,
 }
 
 impl ReActAgent {
@@ -181,6 +202,7 @@ impl ReActAgent {
             final_check: parking_lot::RwLock::new(None),
             kv_cache_hook: parking_lot::RwLock::new(None),
             memory_provider: parking_lot::RwLock::new(None),
+            cancel: parking_lot::RwLock::new(CancellationToken::new()),
         }
     }
 
@@ -235,6 +257,21 @@ impl ReActAgent {
     #[must_use]
     pub fn config(&self) -> ReActAgentConfig {
         self.config.read().clone()
+    }
+
+    /// Cancels the agent's current run.
+    ///
+    /// Every `invoke`/`stream` installs a fresh cancellation token; this
+    /// cancels the most recently started one, so a streaming caller that keeps
+    /// polling can also stop the work from outside. The loop observes it at
+    /// every model-stream poll, around every tool call, and at each iteration;
+    /// a cancelled run ends with [`Error::Cancelled`] (streamed as one terminal
+    /// `Err` item) or the run-wide completion timeout.
+    ///
+    /// Calling it before a run starts has no effect: the next run installs its
+    /// own token.
+    pub fn abort(&self) {
+        self.cancel.read().cancel();
     }
 
     /// Sets the model used for subsequent invocations.
@@ -691,10 +728,19 @@ impl Agent for ReActAgent {
         )
         .await?;
         let owned = run.is_owned();
+        let cancellation = CancellationToken::new();
+        *self.cancel.write() = cancellation.clone();
         // Boxed so the loop's large future does not inflate this trait method's
         // own future (`clippy::large_futures`); the allocation happens once per
         // invocation, next to the ones the run already makes.
-        let loop_future = agent_loop::run(self, input, Arc::clone(run.session()), None, owned);
+        let loop_future = agent_loop::run(
+            self,
+            input,
+            Arc::clone(run.session()),
+            None,
+            owned,
+            cancellation,
+        );
         let result = Box::pin(loop_future).await;
         run.finish().await;
         result
@@ -727,7 +773,11 @@ impl Agent for ReActAgent {
         };
         let agent_id = self.card.id.clone();
         let agent_name = self.card.name.clone();
+        let cancellation = CancellationToken::new();
+        *self.cancel.write() = cancellation.clone();
+        let control = RunControl::new(cancellation.clone(), runtime.config.completion_timeout_secs);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<AgentChunk>>();
+        let forward_cancel = cancellation.clone();
         tokio::spawn(async move {
             // The loop publishes plain chunks; a forwarding task wraps each one
             // in `Ok` so the returned stream can also carry terminal `Err` items.
@@ -736,6 +786,8 @@ impl Agent for ReActAgent {
             let forwarder = tokio::spawn(async move {
                 while let Some(chunk) = frame_rx.recv().await {
                     if frames.send(Ok(chunk)).is_err() {
+                        // The caller dropped the stream: stop the run.
+                        forward_cancel.cancel();
                         break;
                     }
                 }
@@ -764,6 +816,7 @@ impl Agent for ReActAgent {
                 Arc::clone(run.session()),
                 Some(frame_tx),
                 owned,
+                &control,
             )
             .await;
             // Every frame the loop produced reaches the caller before the
@@ -780,8 +833,10 @@ impl Agent for ReActAgent {
             run.finish().await;
             drop(tx);
         });
-        futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
+        // Dropping the returned stream cancels the same token the run holds.
+        let guard = CancelOnDrop(cancellation);
+        futures::stream::unfold((rx, guard), |(mut rx, guard)| async move {
+            rx.recv().await.map(|item| (item, (rx, guard)))
         })
         .boxed()
     }
