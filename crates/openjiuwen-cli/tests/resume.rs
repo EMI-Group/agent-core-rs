@@ -31,7 +31,9 @@
 
 mod support;
 
+use openjiuwen_common::config::OpenJiuwenHome;
 use openjiuwen_core::foundation::prompt::BaseMessage;
+use openjiuwen_harness::cli::{SessionRecord, SessionStore};
 use openjiuwen_harness::{
     EntryPayload, ExecutionIdentity, ExecutionLink, ExecutionLinkSource, ExecutionLog,
     FileLinkStore, FileSessionStore, LinkRelation, LogCapacity, ModelUsage, PersistentAgentLayout,
@@ -137,14 +139,39 @@ fn shown_messages(value: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Reads the CLI session record of `id` from the sandbox home.
+/// Reads the CLI session record of `id` through the store production reads.
 ///
-/// The transcript lives at `<home>/sessions/<id>.json` (the sandbox home is
-/// `<root>/home`). It is read as JSON instead of through `sessions show`,
-/// because the catalogue's view of a session may be a richer persistent plan
-/// whose seeded window carries synthetic summary/replay decorations.
-fn cli_record(sandbox: &Sandbox, id: &str) -> Value {
-    parse_json(&sandbox.read(format!("home/sessions/{id}.json")))
+/// The store owns the on-disk encoding (today an append-only journal behind
+/// `<home>/sessions`, historically a single JSON document), so the suite asks it
+/// for the [`SessionRecord`] instead of parsing a file at a hand-built path: a
+/// future format or extension change cannot silently break these cases. It is
+/// read as a record instead of through `sessions show`, because the catalogue's
+/// view of a session may be a richer persistent plan whose seeded window carries
+/// synthetic summary/replay decorations.
+fn cli_record(sandbox: &Sandbox, id: &str) -> SessionRecord {
+    SessionStore::new(&OpenJiuwenHome::from_root(sandbox.home()))
+        .load(id)
+        .unwrap_or_else(|err| panic!("loading the CLI session record of {id}: {err}"))
+        .unwrap_or_else(|| panic!("no CLI session record for {id}"))
+}
+
+/// Returns the session ids [`SessionStore::list`] reports for the sandbox home.
+fn cli_record_ids(sandbox: &Sandbox) -> Vec<String> {
+    SessionStore::new(&OpenJiuwenHome::from_root(sandbox.home()))
+        .list()
+        .expect("the CLI session catalogue")
+        .into_iter()
+        .map(|summary| summary.session_id)
+        .collect()
+}
+
+/// Returns the `(role, content)` pairs of one loaded CLI session record.
+fn record_messages(record: &SessionRecord) -> Vec<(String, String)> {
+    record
+        .messages
+        .iter()
+        .map(|message| (message.role.clone(), message.content.clone()))
+        .collect()
 }
 
 /// Returns every `cli-*` session id mentioned in `text`.
@@ -253,15 +280,14 @@ async fn a_fresh_run_then_resume_by_id_continues_the_record() {
     );
 
     // A run is recorded twice: a persistent session record (which the resume
-    // resolves) and the CLI record this suite reads directly.
-    let record = cli_record(&sandbox, id);
+    // resolves) and the CLI record this suite reads through the store.
     assert_eq!(
-        shown_messages(&record),
+        record_messages(&cli_record(&sandbox, id)),
         vec![
             ("user".to_owned(), FIRST_QUESTION.to_owned()),
             ("assistant".to_owned(), ANSWER.to_owned()),
         ],
-        "the first turn persisted exactly its question and answer: {record}"
+        "the first turn persisted exactly its question and answer"
     );
 
     let output = sandbox
@@ -294,16 +320,15 @@ async fn a_fresh_run_then_resume_by_id_continues_the_record() {
 
     // The CLI record continues the transcript; the resumed plan's synthetic
     // window decorations stay out of it.
-    let record = cli_record(&sandbox, id);
     assert_eq!(
-        shown_messages(&record),
+        record_messages(&cli_record(&sandbox, id)),
         vec![
             ("user".to_owned(), FIRST_QUESTION.to_owned()),
             ("assistant".to_owned(), ANSWER.to_owned()),
             ("user".to_owned(), SECOND_QUESTION.to_owned()),
             ("assistant".to_owned(), ANSWER.to_owned()),
         ],
-        "the record continues both turns in order: {record}"
+        "the record continues both turns in order"
     );
 
     let requests = server.requests();
@@ -371,8 +396,7 @@ async fn continue_picks_the_most_recent_session() {
         "the second `--continue` keeps picking the same session: {note:?}"
     );
 
-    let record = cli_record(&sandbox, id);
-    let messages = shown_messages(&record);
+    let messages = record_messages(&cli_record(&sandbox, id));
     assert_eq!(
         messages.len(),
         6,
@@ -422,6 +446,27 @@ async fn a_persistent_state_record_resumes_through_its_execution_plan() {
     seed_persistent_state(&sandbox).await;
     let server = scripted_server().await;
 
+    // The seeded record's ending names `exec-1`, so `show` traces that journal
+    // into a plan whose window is the journalled turn — exactly what the resumed
+    // turn is seeded with. It is read before the run, because the run rewrites
+    // the record's ending to its own execution.
+    let shown = parse_json(&assert_success(
+        &sandbox
+            .run(&sessions_args(&sandbox, &["show", STATE_SESSION, "--json"]))
+            .await,
+    ));
+    assert!(
+        shown["plan"].is_object(),
+        "the reuse traces the journal into a plan: {shown}"
+    );
+    let messages = shown_messages(&shown);
+    assert!(
+        messages
+            .iter()
+            .any(|(_, content)| content.contains(EARLIER_QUESTION)),
+        "the restored window carries the journalled question: {messages:?}"
+    );
+
     let output = sandbox
         .run(&cli_args(
             &sandbox,
@@ -449,6 +494,10 @@ async fn a_persistent_state_record_resumes_through_its_execution_plan() {
         "the ending names the execution the resume traced: {note:?}"
     );
 
+    // The run rewrote the record's ending to its own execution, so `show` now
+    // rebuilds the window from that journal: the resumed turn is what a further
+    // resume seeds. Only the message content is asserted — the assembler's
+    // summary/replay frames are its own rendering, not the catalogue's contract.
     let shown = parse_json(&assert_success(
         &sandbox
             .run(&sessions_args(&sandbox, &["show", STATE_SESSION, "--json"]))
@@ -456,14 +505,14 @@ async fn a_persistent_state_record_resumes_through_its_execution_plan() {
     ));
     assert!(
         shown["plan"].is_object(),
-        "the reuse traces the journal into a plan: {shown}"
+        "the rewritten record still resumes through a plan: {shown}"
     );
     let messages = shown_messages(&shown);
     assert!(
         messages
             .iter()
-            .any(|(_, content)| content.contains(EARLIER_QUESTION)),
-        "the restored window carries the journalled question: {messages:?}"
+            .any(|(role, content)| role == "user" && content.contains(NEXT_QUESTION)),
+        "the recorded window carries the resumed turn: {messages:?}"
     );
 
     let requests = server.requests();
@@ -514,7 +563,7 @@ async fn an_execution_id_resumes_its_journal_and_creates_the_cli_record() {
         rows.iter().any(|row| row["id"] == STATE_SESSION),
         "the resumed execution's session is listed: {rows:?}"
     );
-    let messages = shown_messages(&cli_record(&sandbox, STATE_SESSION));
+    let messages = record_messages(&cli_record(&sandbox, STATE_SESSION));
     assert!(
         messages
             .iter()
@@ -542,7 +591,7 @@ async fn chat_resume_continues_the_persisted_session() {
     let session_id = session_id_of(&parse_json(&first));
     let id = session_id.as_str();
     assert_eq!(
-        shown_messages(&cli_record(&sandbox, id)).len(),
+        record_messages(&cli_record(&sandbox, id)).len(),
         2,
         "the first turn left a two-message record"
     );
@@ -574,8 +623,7 @@ async fn chat_resume_continues_the_persisted_session() {
         "the note mentions no session id but the resumed one: {note:?}"
     );
 
-    let record = cli_record(&sandbox, id);
-    let messages = shown_messages(&record);
+    let messages = record_messages(&cli_record(&sandbox, id));
     assert_eq!(
         messages.len(),
         4,
@@ -583,21 +631,9 @@ async fn chat_resume_continues_the_persisted_session() {
     );
     assert_eq!(messages[2], ("user".to_owned(), THIRD_QUESTION.to_owned()));
     assert_eq!(messages[3], ("assistant".to_owned(), ANSWER.to_owned()));
-
-    let mut names: Vec<String> = std::fs::read_dir(sandbox.path("home/sessions"))
-        .expect("the sessions directory")
-        .map(|entry| {
-            entry
-                .expect("a sessions directory entry")
-                .file_name()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
-    names.sort();
     assert_eq!(
-        names,
-        vec![format!("{id}.json")],
+        cli_record_ids(&sandbox),
+        vec![session_id.clone()],
         "no fresh `cli-*` record appeared"
     );
     server.shutdown().await;
