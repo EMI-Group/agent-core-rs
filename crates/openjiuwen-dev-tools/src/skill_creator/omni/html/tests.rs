@@ -136,6 +136,45 @@ fn parse_is_attribute_order_independent() {
     assert_eq!(first.links, second.links);
 }
 
+/// A page of many unclosed anchors used to rescan to the end of the document
+/// for every one of them: 20 000 anchors cost 2·10⁸ token comparisons, so the
+/// parse took seconds on a page a scrape stage then blocked its worker on.
+#[test]
+fn many_unterminated_anchors_stay_linear() {
+    const COUNT: usize = 20_000;
+    let html = "<a href=target>".repeat(COUNT);
+    let started = std::time::Instant::now();
+    let document = HtmlDocument::parse(&html, "");
+    let elapsed = started.elapsed();
+
+    assert_eq!(document.links.len(), COUNT);
+    assert!(
+        document
+            .links
+            .iter()
+            .all(|link| link.href == "target" && link.text.is_empty()),
+        "an unclosed anchor keeps its href and an empty text"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "extracting {COUNT} unclosed anchors took {elapsed:?}"
+    );
+}
+
+#[test]
+fn close_matching_pairs_the_innermost_open_tag() {
+    // Nested same-name tags pair innermost-first, so the outer heading is
+    // unclosed and only the inner one is recorded.
+    let nested = HtmlDocument::parse("<h1>outer<h1>inner</h1> tail", "");
+    assert_eq!(heading_pairs(&nested), vec![(1, "inner")]);
+    // A stray close tag is ignored, and a following anchor still pairs.
+    let stray = HtmlDocument::parse("</a><a href=x>ok</a>", "");
+    assert_eq!(link_pairs(&stray), vec![("x", "ok")]);
+    // Nested anchors: the inner one keeps its text, the unclosed outer one does not.
+    let anchors = HtmlDocument::parse(r#"<a href=x>first<a href=y>second</a>"#, "");
+    assert_eq!(link_pairs(&anchors), vec![("x", ""), ("y", "second")]);
+}
+
 #[test]
 fn parse_survives_unterminated_markup() {
     for html in ["<p>before</p><script>var x = 1;", "<a href=>Click</a>"] {

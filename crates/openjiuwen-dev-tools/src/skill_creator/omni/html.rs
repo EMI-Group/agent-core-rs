@@ -41,6 +41,8 @@
 //!
 //! Relative references are not resolved here; callers resolve them with [`resolve_url`].
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// A heading (`<h1>`…`<h6>`) in document order.
@@ -102,17 +104,18 @@ impl HtmlDocument {
     pub fn parse(html: &str, _base_url: &str) -> HtmlDocument {
         let cleaned = strip_noise(html);
         let tokens = tokenize(&cleaned);
+        let closes = CloseIndex::new(&tokens);
         let mut document = HtmlDocument {
             text: extract_text(&tokens),
             ..HtmlDocument::default()
         };
-        walk(&tokens, &mut document);
+        walk(&tokens, &closes, &mut document);
         document
     }
 }
 
 /// Walks the token stream once, filling every collection in document order.
-fn walk(tokens: &[Token<'_>], document: &mut HtmlDocument) {
+fn walk(tokens: &[Token<'_>], closes: &CloseIndex, document: &mut HtmlDocument) {
     let mut index = 0;
     while index < tokens.len() {
         index = match &tokens[index] {
@@ -122,7 +125,7 @@ fn walk(tokens: &[Token<'_>], document: &mut HtmlDocument) {
                     index + 1
                 }
                 "a" => {
-                    take_link(tokens, index, tag, document);
+                    take_link(tokens, closes, index, tag, document);
                     index + 1
                 }
                 "img" => {
@@ -130,7 +133,7 @@ fn walk(tokens: &[Token<'_>], document: &mut HtmlDocument) {
                     index + 1
                 }
                 name @ ("title" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre" | "code") => {
-                    take_inner(tokens, index, name, document)
+                    take_inner(tokens, closes, index, name, document)
                 }
                 _ => index + 1,
             },
@@ -157,11 +160,12 @@ fn take_description(tag: &Tag, document: &mut HtmlDocument) {
 /// is never visited, so it cannot be emitted twice.
 fn take_inner(
     tokens: &[Token<'_>],
+    closes: &CloseIndex,
     index: usize,
     name: &str,
     document: &mut HtmlDocument,
 ) -> usize {
-    let Some(close) = find_close(tokens, index, name) else {
+    let Some(close) = closes.close_of(index) else {
         return index + 1;
     };
     let raw = inner_text(tokens, index, close);
@@ -191,11 +195,17 @@ fn take_inner(
 }
 
 /// Captures one `<a href>` anchor, keeping anchors whose visible text is empty.
-fn take_link(tokens: &[Token<'_>], index: usize, tag: &Tag, document: &mut HtmlDocument) {
+fn take_link(
+    tokens: &[Token<'_>],
+    closes: &CloseIndex,
+    index: usize,
+    tag: &Tag,
+    document: &mut HtmlDocument,
+) {
     let Some(href) = tag.attr("href").map(str::trim).filter(|s| !s.is_empty()) else {
         return;
     };
-    let text = find_close(tokens, index, "a").map_or_else(String::new, |close| {
+    let text = closes.close_of(index).map_or_else(String::new, |close| {
         normalize(&inner_text(tokens, index, close))
     });
     document.links.push(Link {
@@ -751,24 +761,50 @@ fn parse_attribute_value(html: &str, index: &mut usize) -> String {
     html[value_start..*index].to_string()
 }
 
-/// Index of the end tag matching the start tag at `open`, counting nested same-name tags.
-fn find_close(tokens: &[Token<'_>], open: usize, name: &str) -> Option<usize> {
-    let mut depth = 0_usize;
-    for (index, token) in tokens.iter().enumerate().skip(open) {
-        if let Token::Tag(tag) = token {
-            if tag.name == name {
-                if tag.closing {
-                    if depth == 1 {
-                        return Some(index);
+/// The matching close tag of every open tag, built in one pass over the tokens.
+///
+/// Extraction used to rescan from each open tag to the end of the document, which is
+/// quadratic on a page with many unclosed tags: 20 000 `<a href=x>` anchors cost about
+/// 2·10⁸ token comparisons and blocked the async scrape worker for over a second. The index
+/// keeps the same nesting rule — a close tag matches the innermost open tag of the same
+/// name, a stray close is ignored, and an open tag with no close has no entry — while making
+/// every lookup a single vector access, so a page that is entirely unclosed tags stays
+/// linear.
+struct CloseIndex {
+    /// The matching close tag position of each token, when that token is a matched open tag.
+    closes: Vec<Option<usize>>,
+}
+
+impl CloseIndex {
+    /// Pairs every close tag with the innermost open tag it closes.
+    fn new(tokens: &[Token<'_>]) -> Self {
+        let mut closes = vec![None; tokens.len()];
+        let mut open: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (index, token) in tokens.iter().enumerate() {
+            let Token::Tag(tag) = token else {
+                continue;
+            };
+            if tag.name.is_empty() {
+                // A skipped declaration or a stray `</` names no element.
+                continue;
+            }
+            if tag.closing {
+                if let Some(stack) = open.get_mut(tag.name.as_str()) {
+                    if let Some(open_index) = stack.pop() {
+                        closes[open_index] = Some(index);
                     }
-                    depth = depth.saturating_sub(1);
-                } else {
-                    depth += 1;
                 }
+            } else {
+                open.entry(tag.name.as_str()).or_default().push(index);
             }
         }
+        Self { closes }
     }
-    None
+
+    /// The index of the close tag matching the open tag at `open`, if any.
+    fn close_of(&self, open: usize) -> Option<usize> {
+        self.closes.get(open).copied().flatten()
+    }
 }
 
 /// Concatenates the raw text runs between two token positions.
