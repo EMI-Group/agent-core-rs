@@ -893,3 +893,35 @@ async fn a_contended_repository_lock_times_out_with_a_typed_error() {
     contender.create("feature", None, None).await.unwrap();
     assert_eq!(runner.commands().len(), 5);
 }
+
+/// A hanging git command must not hold the repository lock past its deadline.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_timed_out_git_command_releases_the_repository_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_dir, repo) = temp_root();
+    let script = repo.join("slow-git");
+    std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    let runner = Arc::new(
+        crate::worktree::ProcessGitRunner::with_program(script.to_string_lossy().into_owned())
+            .with_timeout(Duration::from_millis(250)),
+    );
+    let manager = WorktreeManager::with_runner(&repo, runner);
+    let started = std::time::Instant::now();
+    let error = manager.create("feature", None, None).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(error.to_string().contains("timed out after"));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the create must fail at the git deadline, took {:?}",
+        started.elapsed()
+    );
+    let guard = tokio::time::timeout(Duration::from_secs(2), manager.repo_lock().try_acquire())
+        .await
+        .expect("the lock must be free once the create failed")
+        .expect("the lock must be free once the create failed");
+    assert!(guard.is_active());
+}

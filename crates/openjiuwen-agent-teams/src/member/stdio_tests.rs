@@ -606,3 +606,40 @@ async fn concurrent_sends_are_serialized_without_corrupting_frames() {
     assert!(deltas.contains(&json!("b")), "deltas: {deltas:?}");
     stop(&runtime).await;
 }
+// 21 --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn a_timed_out_frame_write_poisons_the_protocol_stream() {
+    // The child never reads stdin, so a frame larger than the pipe buffer blocks in `write_all`
+    // and the configured I/O bound expires with a half-written line on the wire.
+    let child = FakeChild::silent();
+    let runtime = StdioMemberRuntime::spawn_with(
+        &command(&child),
+        "s-21",
+        StdioRuntimeOptions::new().with_io_timeout(Duration::from_millis(200)),
+    )
+    .await
+    .expect("spawn");
+    assert!(runtime.stdin_is_open(), "the pipe starts writable");
+    let oversized = "x".repeat(1024 * 1024);
+    let err = tokio::time::timeout(BOUND, runtime.send(oversized, false))
+        .await
+        .expect("the blocked write returned within the bound")
+        .expect_err("a frame that cannot be written in time is an error");
+    assert_eq!(err.kind(), ErrorKind::Timeout, "{err:?}");
+    assert!(err.to_string().contains("unusable"), "{err}");
+
+    // The truncated frame is fatal: the pipe is closed, so no later frame can be appended after a
+    // half line and the failure is typed instead of a silent protocol desynchronisation.
+    assert!(!runtime.stdin_is_open(), "the stdin pipe was closed");
+    let err = tokio::time::timeout(BOUND, runtime.send("ping".to_owned(), false))
+        .await
+        .expect("the poisoned send failed fast")
+        .expect_err("a poisoned stream refuses every later frame");
+    assert_eq!(err.kind(), ErrorKind::Transport, "{err:?}");
+    assert!(err.to_string().contains("unusable"), "{err}");
+    assert!(
+        runtime.is_running(),
+        "poisoning the write side does not tear the child down"
+    );
+    stop(&runtime).await;
+}

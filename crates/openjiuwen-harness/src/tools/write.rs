@@ -34,6 +34,13 @@ use super::support::{parse_args, schema_for, tool_card, ToolEnv, ToolPayload};
 /// Largest file `edit_file` will modify, in bytes (`EditFileTool.MAX_FILE_SIZE`).
 const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 
+/// Largest existing target whose contents are loaded for the read-before-write gate.
+///
+/// The gate only needs to know whether the observed content still matches; above this size the
+/// tool answers from the recorded fingerprint instead of allocating the file, and refuses with
+/// a typed error when the fingerprint cannot settle the question.
+const MAX_GATE_READ_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Python's refusal when a create would overwrite content the model never saw.
 const CREATE_CONFLICT: &str = "Cannot create new file - file already exists.";
 
@@ -144,11 +151,17 @@ impl WriteFileTool {
         };
         if let Some(metadata) = existing.as_ref() {
             let fingerprint = file_fingerprint(metadata);
-            let current_text = match tokio::fs::read(&resolved).await {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(error) => return ToolPayload::fail(error.to_string()),
+            // A huge target is never loaded just to answer the gate: the fingerprint decides,
+            // and an unsettled question is a typed refusal instead of an allocation.
+            let gate = if metadata.len() <= MAX_GATE_READ_BYTES {
+                let current_text = match tokio::fs::read(&resolved).await {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Err(error) => return ToolPayload::fail(error.to_string()),
+                };
+                self.state.write_gate(&resolved, fingerprint, &current_text)
+            } else {
+                self.state.write_gate_metadata(&resolved, fingerprint)
             };
-            let gate = self.state.write_gate(&resolved, fingerprint, &current_text);
             if gate == WriteGate::Stale {
                 self.state.invalidate(&resolved);
             }
@@ -357,7 +370,17 @@ impl EditFileTool {
         new_string: &str,
         fs: &dyn FsOperation,
     ) -> ToolPayload {
-        if tokio::fs::metadata(path).await.is_ok() {
+        if let Ok(metadata) = tokio::fs::metadata(path).await {
+            // A create only ever replaces a blank file, so a large existing target is a
+            // conflict outright: reading it to prove it is blank would allocate the file.
+            if metadata.len() > MAX_GATE_READ_BYTES {
+                return ToolPayload::fail(format!(
+                    "Cannot create new file - file already exists: {display} ({} bytes, above \
+                     the {MAX_GATE_READ_BYTES}-byte read-before-edit limit). Edit it or choose \
+                     another path.",
+                    metadata.len()
+                ));
+            }
             let raw = match tokio::fs::read(path).await {
                 Ok(raw) => raw,
                 Err(error) => return ToolPayload::fail(error.to_string()),
@@ -826,6 +849,44 @@ mod tests {
         for (inputs, message) in cases {
             assert_error(&call(&fx.write, inputs).await, message);
         }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_existing_target_is_refused_instead_of_loaded() {
+        let fx = setup();
+        let path = fx.dir.path().join("huge.txt");
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            // Larger than any gate allocation; the body is a hole, never read.
+            file.set_len(2 * 1024 * 1024 * 1024).unwrap();
+        }
+
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            call(&fx.write, json!({"file_path": "huge.txt", "content": "x"})),
+        )
+        .await
+        .expect("write_file must not load an oversized target");
+        assert_eq!(out["success"], json!(false));
+        assert!(
+            out["error"].as_str().unwrap().contains("has not been read"),
+            "unexpected payload: {out}"
+        );
+
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            call(&fx.edit, edit_args("huge.txt", "", "replacement")),
+        )
+        .await
+        .expect("edit_file must not load an oversized target");
+        assert_eq!(out["success"], json!(false));
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap()
+                .contains("read-before-edit limit"),
+            "unexpected payload: {out}"
+        );
     }
 
     #[tokio::test]

@@ -469,6 +469,43 @@ fn get_node_path_is_top_level_only() {
 }
 
 #[test]
+fn unsafe_node_paths_are_rejected_and_never_joined() {
+    for path in ["../../escape", "/etc", "C:\\Windows", "..", "a/../../b"] {
+        let mut workspace = Workspace::new("/tmp/agent");
+        workspace.directories = vec![DirectoryNode::dir("escape", path)];
+        let error = workspace
+            .validate()
+            .expect_err("unsafe path must be rejected");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(
+            error.message().contains("Unsafe path detected"),
+            "unexpected error for {path:?}: {error}"
+        );
+        assert!(
+            workspace.get_node_path("escape").is_none(),
+            "an unsafe node must not produce a path: {path:?}"
+        );
+    }
+}
+
+#[test]
+fn a_serialised_workspace_rejects_an_escaping_node() {
+    for path in ["../../escape", "/absolute/path"] {
+        let serialized = serde_json::json!({
+            "root_path": "/tmp/agent",
+            "language": "en",
+            "directories": [{"name": "todo", "path": path}],
+        });
+        let error = serde_json::from_value::<Workspace>(serialized)
+            .expect_err("deserialization must validate the node path");
+        assert!(
+            error.to_string().contains("Unsafe path detected"),
+            "unexpected error for {path:?}: {error}"
+        );
+    }
+}
+
+#[test]
 fn set_directory_upserts_and_validates() {
     let mut workspace = Workspace::new("/tmp/agent");
     workspace

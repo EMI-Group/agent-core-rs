@@ -34,7 +34,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_common::utils::id::uuid_hex;
+use openjiuwen_common::utils::id::{unix_millis, uuid_hex};
 
 use crate::constants::{BROADCAST_TARGET, DEFAULT_LEADER_MEMBER_NAME, MAX_MESSAGE_CONTENT_CHARS};
 use crate::member::{MemberActivityRegistry, MemberSpawner, TeamMember};
@@ -327,8 +327,9 @@ impl TeamBackend {
     /// Every persisted row is published on [`TeamTopic::Message`] as a `broadcast` or `message`
     /// event stamped with `from` as sender, so bus subscribers see the same mail the mailbox holds
     /// and can attribute it to the member that wrote it. The caller — not the store — stamps the
-    /// timestamp, and these rows carry `0`: ordering inside a run comes from the bus and from the
-    /// mailbox sort, not from a clock read here.
+    /// timestamp. A broadcast row carries the wall-clock send instant, because its read state is the
+    /// per-member watermark and a zero stamp would leave it unread forever; a direct row carries
+    /// `0` and is consumed through its own read flag.
     ///
     /// # Errors
     ///
@@ -368,13 +369,37 @@ impl TeamBackend {
     /// Flags the direct messages `ids` as read for `name`.
     ///
     /// Broadcast read state is a per-member watermark, not a row flag, so broadcast ids are
-    /// skipped silently; advance it through the store's `set_read_watermark`.
+    /// skipped silently; advance it through [`Self::set_read_watermark`].
     ///
     /// # Errors
     ///
     /// Returns whatever the store fails with.
     pub async fn mark_read(&self, name: &str, ids: &[String]) -> Result<()> {
         self.store.mark_read(self.team_name(), name, ids).await
+    }
+
+    /// Advances `name`'s broadcast read watermark to `timestamp`.
+    ///
+    /// Every [`MessageRecord::broadcast`] row stamped at or before `timestamp` is read for `name`
+    /// from then on. The watermark is monotone: the stores never move it backwards, so a late
+    /// render cannot re-open rows an earlier read already covered.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the store fails with.
+    pub async fn set_read_watermark(&self, name: &str, timestamp: u64) -> Result<()> {
+        self.store
+            .set_read_watermark(self.team_name(), name, timestamp)
+            .await
+    }
+
+    /// Returns `name`'s broadcast read watermark, or `None` when it never read a broadcast.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the store fails with.
+    pub async fn read_watermark(&self, name: &str) -> Result<Option<u64>> {
+        self.store.read_watermark(self.team_name(), name).await
     }
 
     /// Publishes `payload` on `topic`, stamped with the team name as sender, and returns the
@@ -467,8 +492,13 @@ impl TeamBackend {
     /// Persists and publishes one broadcast row sent by `from`.
     async fn broadcast_row(&self, from: &str, content: &str) -> Result<MessageRecord> {
         let message_id = mint_message_id();
-        let record =
-            MessageRecord::broadcast(self.team_name(), message_id.clone(), from, content, 0);
+        let record = MessageRecord::broadcast(
+            self.team_name(),
+            message_id.clone(),
+            from,
+            content,
+            now_millis(),
+        );
         let event = EventPayload::Broadcast(BroadcastEvent {
             message_id,
             from_member_name: from.to_owned(),
@@ -561,6 +591,14 @@ fn is_broadcast_target(targets: &str) -> bool {
 /// Mints a mailbox id in the Python `msg_<uuid hex>` form.
 fn mint_message_id() -> String {
     format!("msg_{}", uuid_hex())
+}
+/// Returns the wall-clock send instant of a broadcast row in milliseconds since the Unix epoch.
+///
+/// A broadcast row's read state is the per-member watermark, so the row needs a real stamp: with a
+/// zero stamp no watermark could ever cover it and the row would stay unread for every member
+/// forever. A clock read before 1970 saturates at `0` rather than panicking.
+fn now_millis() -> u64 {
+    u64::try_from(unix_millis()).unwrap_or(0)
 }
 
 /// Splits `targets` into trimmed, non-empty, de-duplicated member names, order preserved.

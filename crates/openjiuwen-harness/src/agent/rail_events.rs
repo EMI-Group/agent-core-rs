@@ -40,7 +40,7 @@ use openjiuwen_agent::AgentChunk;
 use openjiuwen_common::error::Result;
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use crate::rails::{HarnessRail, HarnessRailContext};
 use crate::schema::InteractionEvent;
@@ -128,7 +128,7 @@ pub struct RailEventBus {
     /// Events dropped because the buffer was full.
     dropped: AtomicU64,
     /// Stream of the running invocation, when one is streaming.
-    stream: RwLock<Option<UnboundedSender<Result<AgentChunk>>>>,
+    stream: RwLock<Option<Sender<Result<AgentChunk>>>>,
 }
 
 impl Default for RailEventBus {
@@ -202,16 +202,25 @@ impl RailEventBus {
     }
 
     /// Installs (`Some`) or removes (`None`) the stream of the running invocation.
-    pub(crate) fn set_stream(&self, stream: Option<UnboundedSender<Result<AgentChunk>>>) {
+    pub(crate) fn set_stream(&self, stream: Option<Sender<Result<AgentChunk>>>) {
         *self.stream.write() = stream;
     }
 
     /// Sends `event` to the live stream as an `__interaction__` frame.
+    ///
+    /// The stream is bounded, so a rail never blocks (nor grows the buffer without limit): a
+    /// full channel drops this frame, exactly like a closed one.
     fn forward(&self, event: &InteractionEvent) {
         let frame = AgentChunk::new(INTERACTION, 0, event.to_output_value());
         if let Some(tx) = self.stream.read().as_ref() {
-            if tx.send(Ok(frame)).is_err() {
-                tracing::debug!("rail event stream is closed; the frame was dropped");
+            match tx.try_send(Ok(frame)) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!("rail event stream is closed; the frame was dropped");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::debug!("rail event stream is full; the frame was dropped");
+                }
             }
         }
     }
@@ -446,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn pushed_events_are_forwarded_as_interaction_frames() {
         let bus = std::sync::Arc::new(RailEventBus::default());
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         bus.set_stream(Some(tx));
 
         let drain = RailEventDrain::new(bus.clone());

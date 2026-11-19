@@ -235,14 +235,15 @@ impl DirectoryNode {
         &self.default_content
     }
 
-    /// Validates this node and, recursively, its children.
+    /// Validates this node's name and path and, recursively, its children.
     ///
     /// # Errors
     ///
     /// Returns [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
-    /// carrying Python's message when a name is empty or contains a path separator.
-    /// Path *safety* (absolute paths, `..`) is checked by
-    /// [`is_safe_relative_path`](crate::workspace::is_safe_relative_path), not here.
+    /// carrying Python's message when a name is empty or contains a path separator, and the
+    /// "Unsafe path detected" message when the resolved path is absolute, contains a `..`
+    /// component that escapes, or carries a Windows drive/UNC prefix. A serialised workspace
+    /// never reaches the filesystem with an escaping node.
     pub fn validate(&self) -> Result<()> {
         if self.name.is_empty() {
             return Err(Error::validation(
@@ -253,6 +254,12 @@ impl DirectoryNode {
             return Err(Error::validation(format!(
                 "Directory `name` must not contain path separators: {:?}",
                 self.name
+            )));
+        }
+        let relative = self.resolved_path();
+        if !crate::workspace::is_safe_relative_path(relative) {
+            return Err(Error::validation(format!(
+                "Unsafe path detected: {relative}"
             )));
         }
         for child in &self.children {

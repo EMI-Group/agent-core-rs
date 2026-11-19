@@ -86,8 +86,8 @@ use openjiuwen_foundation::tool::{Tool, ToolCard};
 use openjiuwen_session::Session;
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio::sync::mpsc::Sender;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::permission::{PermissionEngine, PermissionHost};
@@ -122,6 +122,12 @@ pub use subagent_factory::DeepAgentSubAgentFactory;
 /// Error message of a second concurrent invocation.
 const RUNNING_MESSAGE: &str =
     "DeepAgent invocation already running: only one invocation at a time is supported.";
+
+/// Buffer of the public invocation stream.
+///
+/// Bounded so a consumer that stops polling applies backpressure instead of letting the run
+/// buffer frames without limit; dropping the stream cancels the run.
+const STREAM_CHANNEL_CAPACITY: usize = 64;
 
 /// Error message of an explicit state entry point without a session.
 const NO_SESSION_MESSAGE: &str = "no session bound to this DeepAgent";
@@ -626,16 +632,18 @@ impl Agent for DeepAgent {
     ) -> Result<AgentOutput> {
         let guard = RunningGuard::acquire(self.running.clone())?;
         let driver = self.driver();
-        let output = driver.invoke_inner(inputs, session, None).await;
+        let cancel = driver.cancel_token();
+        let output = driver.invoke_inner(inputs, session, None, cancel).await;
         drop(guard);
         output
     }
 
     /// Runs one invocation, yielding stream frames as they are produced.
     ///
-    /// The channel is unbounded, so a slow consumer never blocks the round. The
-    /// terminal `answer` frame is emitted for a completed run; interrupt runs
-    /// forward their interaction frames only.
+    /// The channel is bounded: a consumer that stops polling applies backpressure, and dropping
+    /// the stream cancels the in-flight turn so it stops burning tokens and releases the
+    /// single-run slot. The terminal `answer` frame is emitted for a completed run; interrupt
+    /// runs forward their interaction frames only.
     fn stream(
         &self,
         inputs: Value,
@@ -646,23 +654,43 @@ impl Agent for DeepAgent {
             Ok(guard) => guard,
             Err(error) => return futures::stream::once(async move { Err(error) }).boxed(),
         };
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
         let driver = self.driver();
+        // The token is claimed before the task starts, so a consumer that drops the stream
+        // immediately still cancels the exact turn that is about to run.
+        let cancel = driver.cancel_token();
         tokio::spawn(async move {
             let _guard = guard;
             let sender = Some(tx.clone());
-            match driver.invoke_inner(inputs, session, sender).await {
-                Ok(output) => {
-                    if !output.is_interrupt() {
-                        let _ = tx.send(Ok(AgentChunk::answer(&output)));
+            let mut invocation =
+                Box::pin(driver.invoke_inner(inputs, session, sender, cancel.clone()));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => {
+                        // Nobody is reading: cancel the turn and let it unwind so the
+                        // running slot is free for the next invocation.
+                        cancel.cancel();
+                        let _ = invocation.as_mut().await;
+                        break;
                     }
-                }
-                Err(error) => {
-                    let _ = tx.send(Err(error));
+                    result = &mut invocation => {
+                        match result {
+                            Ok(output) => {
+                                if !output.is_interrupt() {
+                                    let _ = tx.send(Ok(AgentChunk::answer(&output))).await;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = tx.send(Err(error)).await;
+                            }
+                        }
+                        break;
+                    }
                 }
             }
         });
-        UnboundedReceiverStream::new(rx).boxed()
+        ReceiverStream::new(rx).boxed()
     }
 }
 
@@ -761,10 +789,13 @@ impl Driver {
         &self,
         inputs: Value,
         session: Option<Arc<dyn Session>>,
-        stream_tx: Option<UnboundedSender<Result<AgentChunk>>>,
+        stream_tx: Option<Sender<Result<AgentChunk>>>,
+        cancel: CancellationToken,
     ) -> Result<AgentOutput> {
         self.rail_events.set_stream(stream_tx.clone());
-        let result = self.invoke_streaming(inputs, session, stream_tx).await;
+        let result = self
+            .invoke_streaming(inputs, session, stream_tx, cancel)
+            .await;
         self.rail_events.set_stream(None);
         result
     }
@@ -774,7 +805,8 @@ impl Driver {
         &self,
         inputs: Value,
         session: Option<Arc<dyn Session>>,
-        stream_tx: Option<UnboundedSender<Result<AgentChunk>>>,
+        stream_tx: Option<Sender<Result<AgentChunk>>>,
+        cancel: CancellationToken,
     ) -> Result<AgentOutput> {
         self.ensure_wired().await?;
         let normalized = normalize_inputs(&inputs)?;
@@ -789,7 +821,9 @@ impl Driver {
         )
         .await?;
         let session = run.session().clone();
-        let result = self.run_resolved(&normalized, &session, stream_tx).await;
+        let result = self
+            .run_resolved(&normalized, &session, stream_tx, cancel)
+            .await;
         run.finish().await;
         result
     }
@@ -804,7 +838,8 @@ impl Driver {
         &self,
         normalized: &Value,
         session: &Arc<dyn Session>,
-        stream_tx: Option<UnboundedSender<Result<AgentChunk>>>,
+        stream_tx: Option<Sender<Result<AgentChunk>>>,
+        cancel: CancellationToken,
     ) -> Result<AgentOutput> {
         *self.last_session.lock() = Some(session.clone());
         self.state.reset();
@@ -825,10 +860,11 @@ impl Driver {
         )
         .await;
         let outcome = if task_loop {
-            self.run_task_loop(normalized, session.clone(), loaded, stream_tx)
+            self.run_task_loop(normalized, session.clone(), loaded, stream_tx, cancel)
                 .await
         } else {
-            self.round_handle(Some(session.clone()), stream_tx)
+            self.round_handle(Some(session.clone()), stream_tx, cancel)
+                .with_timeout(completion_timeout(config.completion_timeout_secs))
                 .execute(normalized)
                 .await
         };
@@ -916,7 +952,8 @@ impl Driver {
         normalized: &Value,
         session: Arc<dyn Session>,
         loaded: DeepAgentState,
-        stream_tx: Option<UnboundedSender<Result<AgentChunk>>>,
+        stream_tx: Option<Sender<Result<AgentChunk>>>,
+        cancel: CancellationToken,
     ) -> Result<AgentOutput> {
         let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel::<DeepAgentState>();
         let sink: StateSink = Arc::new(move |state: &DeepAgentState| {
@@ -954,7 +991,7 @@ impl Driver {
             })
             .unwrap_or_default();
         controller.submit_round(inputs, false, None);
-        let handle = self.round_handle(Some(session.clone()), stream_tx);
+        let handle = self.round_handle(Some(session.clone()), stream_tx, cancel);
         let report = controller.run_until_idle(&handle).await;
         *self.last_state.lock() = controller.state();
 
@@ -987,13 +1024,14 @@ impl Driver {
     fn round_handle(
         &self,
         session: Option<Arc<dyn Session>>,
-        stream_tx: Option<UnboundedSender<Result<AgentChunk>>>,
+        stream_tx: Option<Sender<Result<AgentChunk>>>,
+        cancel: CancellationToken,
     ) -> RoundExecutorHandle {
         let handle = RoundExecutorHandle::new(
             self.inner.clone(),
             self.rails.clone(),
             self.queues.clone(),
-            self.cancel_token(),
+            cancel,
             session,
             self.state.clone(),
         )

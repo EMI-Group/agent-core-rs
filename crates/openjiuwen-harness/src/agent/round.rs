@@ -13,12 +13,13 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
 use openjiuwen_agent::output::{ANSWER, INTERACTION, LLM_OUTPUT};
@@ -50,6 +51,9 @@ const RAIL_ERROR_CODE: &str = "rail_error";
 
 /// Message returned by [`RoundExecutorHandle::execute`] after an abort.
 const ABORTED_MESSAGE: &str = "DeepAgent invocation aborted";
+
+/// Message returned by [`RoundExecutorHandle::execute`] when the completion timeout expires.
+const COMPLETION_TIMEOUT_MESSAGE: &str = "DeepAgent invocation exceeded its completion timeout";
 
 /// Keys the task-loop consumes rather than forwarding to the kernel agent.
 const RESERVED_KEYS: [&str; 14] = [
@@ -200,8 +204,10 @@ pub struct RoundExecutorHandle {
     cancel: CancellationToken,
     session: Option<Arc<dyn Session>>,
     state: Arc<RoundState>,
-    stream_tx: Option<UnboundedSender<Result<AgentChunk>>>,
+    stream_tx: Option<Sender<Result<AgentChunk>>>,
     rail_events: Option<Arc<RailEventBus>>,
+    /// Deadline of this turn, when the caller bounded it.
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl RoundExecutorHandle {
@@ -228,13 +234,25 @@ impl RoundExecutorHandle {
             state,
             stream_tx: None,
             rail_events: None,
+            deadline: None,
         }
     }
 
     /// Returns this handle forwarding every stream frame to `tx`.
     #[must_use]
-    pub fn with_stream_sender(mut self, tx: UnboundedSender<Result<AgentChunk>>) -> Self {
+    pub fn with_stream_sender(mut self, tx: Sender<Result<AgentChunk>>) -> Self {
         self.stream_tx = Some(tx);
+        self
+    }
+
+    /// Returns this handle bounded by `timeout`, counted from now.
+    ///
+    /// A zero timeout leaves the handle unbounded (Python's "0 disables the timeout").
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        if !timeout.is_zero() {
+            self.deadline = Some(tokio::time::Instant::now() + timeout);
+        }
         self
     }
 
@@ -270,20 +288,35 @@ impl RoundExecutorHandle {
     /// failures (invalid input, unconfigured model, cancellation) from the
     /// inner agent.
     pub async fn execute(&self, inputs: &Value) -> Result<AgentOutput> {
-        self.fire_pre_hooks(inputs).await?;
-        if self.cancel.is_cancelled() {
-            return Err(Error::validation(ABORTED_MESSAGE));
-        }
-
-        let output = if self.stream_tx.is_some() {
-            self.stream_turn(inputs).await?
-        } else {
-            self.inner
-                .invoke(inputs.clone(), self.session.clone())
-                .await?
+        let run = async {
+            self.fire_pre_hooks(inputs).await?;
+            let output = if self.stream_tx.is_some() {
+                self.stream_turn(inputs).await?
+            } else {
+                self.inner
+                    .invoke(inputs.clone(), self.session.clone())
+                    .await?
+            };
+            self.state.record(&output);
+            Ok(output)
         };
-        self.state.record(&output);
-        Ok(output)
+        // The turn races its own cancellation and deadline. Dropping the inner future stops the
+        // model request instead of letting it finish into a receiver nobody reads.
+        match self.deadline {
+            Some(deadline) => tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => Err(Error::validation(ABORTED_MESSAGE)),
+                result = tokio::time::timeout_at(deadline, run) => match result {
+                    Ok(result) => result,
+                    Err(_) => Err(Error::timeout(COMPLETION_TIMEOUT_MESSAGE)),
+                },
+            },
+            None => tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => Err(Error::validation(ABORTED_MESSAGE)),
+                result = run => result,
+            },
+        }
     }
 
     /// Fires the user-message and steering hooks for one turn.
@@ -327,15 +360,23 @@ impl RoundExecutorHandle {
                     if let Ok(frame) = OutputFrame::from_value(chunk.payload.clone()) {
                         frames.push(frame);
                     }
-                    self.send(chunk);
+                    if !self.send(chunk).await {
+                        return Err(Error::cancelled());
+                    }
                 }
                 LLM_OUTPUT => {
                     if let Some(text) = chunk.payload.get("content").and_then(Value::as_str) {
                         llm_text.push_str(text);
                     }
-                    self.send(chunk);
+                    if !self.send(chunk).await {
+                        return Err(Error::cancelled());
+                    }
                 }
-                _ => self.send(chunk),
+                _ => {
+                    if !self.send(chunk).await {
+                        return Err(Error::cancelled());
+                    }
+                }
             }
         }
 
@@ -347,7 +388,10 @@ impl RoundExecutorHandle {
                 AgentOutput::interrupt(frames, ids)
             }
         };
-        self.send(AgentChunk::answer(&output));
+        // A consumer that went away ends the turn: its terminal frame has nowhere to go.
+        if !self.send(AgentChunk::answer(&output)).await {
+            return Err(Error::cancelled());
+        }
         Ok(output)
     }
 
@@ -360,9 +404,13 @@ impl RoundExecutorHandle {
     }
 
     /// Forwards `chunk` to the stream sender, when one is configured.
-    fn send(&self, chunk: AgentChunk) {
-        if let Some(tx) = &self.stream_tx {
-            let _ = tx.send(Ok(chunk));
+    ///
+    /// Returns `false` when the receiver was dropped: the turn can then stop instead of
+    /// producing frames nobody will read.
+    async fn send(&self, chunk: AgentChunk) -> bool {
+        match &self.stream_tx {
+            Some(tx) => tx.send(Ok(chunk)).await.is_ok(),
+            None => true,
         }
     }
 }
@@ -647,7 +695,7 @@ mod tests {
         // The inner agent surfaces a model failure as a `result_type: "error"`
         // terminal frame while streaming, so the round reports `deepagent_error`
         // rather than a transport-level `round_execution_error`.
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let handle =
             handle(ScriptedModel::new([ScriptedTurn::fail("boom")])).with_stream_sender(tx);
         let outcome = handle.run_round(work("hello")).await.unwrap();
@@ -692,7 +740,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_forwards_frames_and_returns_the_same_output() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let handle = handle(ScriptedModel::text("streamed answer")).with_stream_sender(tx);
 
         let output = handle.execute(&json!({"query": "hello"})).await.unwrap();

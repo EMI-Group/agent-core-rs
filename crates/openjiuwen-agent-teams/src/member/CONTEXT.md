@@ -129,6 +129,7 @@ impl StdioMemberRuntime {
     pub fn is_running(&self) -> bool;        pub fn exit_code(&self) -> Option<i32>;
     pub fn stderr_tail(&self) -> String;     pub fn cancellation_token(&self) -> CancellationToken;
     pub fn options(&self) -> &StdioRuntimeOptions;
+    // test-only: pub(crate) fn stdin_is_open(&self) -> bool
 }
 impl MemberRuntime for StdioMemberRuntime; impl Drop for StdioMemberRuntime;
 
@@ -173,6 +174,7 @@ A child-process member is driven by one JSON object per line: leader→member re
 Request frames: `{"type":"start","session_id":…}`, `{"type":"send","content":…,"immediate":false}`, `{"type":"abort","immediate":false}`, `{"type":"pause"}`, `{"type":"resume","query":…}`, `{"type":"stop"}`.
 Response frames: `{"type":"ready","session_id":…}`, `{"type":"state","state":"idle|running|pausing|paused|terminated"}`, `{"type":"round","outcome":"started|finished|aborted|failed"}`, `{"type":"chunk","chunk":{…}}`, `{"type":"error","message":"…"}`.
 The child must flush after every line; blank lines are skipped; unknown JSON fields are ignored; a garbage stdout line is logged and skipped, and a child that produces 100 consecutive garbage lines is treated as terminated.
+A frame write that times out or fails part way through leaves a truncated JSON line on the wire, which no later frame can be appended after safely: the runtime records the failure, closes (takes and drops) the child's stdin so the child sees end-of-file, and every later frame fails with a typed `Transport` error naming the stream as unusable (the runtime itself stays `running`; `stop` still kills the child).
 Frame mapping: `ready` completes the pending `start` handshake only, `state` → `MemberObserver::on_state` (and the stored `HarnessState`), `round` → `on_round`, `chunk` → `on_chunk`, `error` fails the pending `start` and is otherwise logged without touching the lifecycle state.
 Child exit stores `HarnessState::Terminated`, notifies observers exactly once and turns every later runtime call into a typed `member process … exited` error.
 The child end is the `team-member serve` subcommand (`../skill/serve.rs`): it reads request frames on stdin, writes response frames on stdout, keeps every diagnostic on stderr, and exits `0` on `stop` or end of input, or `1` after an `error` frame when its runtime cannot be built or started.
@@ -195,7 +197,7 @@ A missing `ssh`, `team-member` or CLI binary is `ErrorKind::Config` from `StdioC
 
 - Only files under `src/member/` are edited; `../lib.rs`, `../schema/`, `../storage/`, `../runtime/` and sibling modules belong to other nodes.
 - `openjiuwen_common::error::{Error, Result}` only; no panic on user input; no `unwrap`/`expect` outside `#[cfg(test)]`.
-- Async-first: `#[async_trait]` for the object-safe seams; `parking_lot` locks are held for one map read/write only and never across `.await`; cancellation is `tokio_util::sync::CancellationToken`; every child-process write and handshake wait is bounded by `StdioRuntimeOptions::io_timeout`.
+- Async-first: `#[async_trait]` for the object-safe seams; `parking_lot` locks are held for one map read/write only and never across `.await`; cancellation is `tokio_util::sync::CancellationToken`; every child-process write and handshake wait is bounded by `StdioRuntimeOptions::io_timeout`, and a bounded write that does not complete poisons the stdin side instead of retrying after a truncated frame.
 - Config errors for missing build dependencies and missing programs, validation errors for bad names/states, not-found for missing rows, unsupported for a capability this node does not implement.
 - `tracing` only; no `println!`/`eprintln!`; secrets (an ssh `password`) are never logged and never placed on an argv.
 - No `unsafe`; no global mutable state — every registry is a local instance owned by the caller.

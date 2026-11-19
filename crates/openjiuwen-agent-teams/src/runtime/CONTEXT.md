@@ -191,6 +191,8 @@ impl TeamBackend {
     pub async fn send_message(&self, from: &str, to: Option<&str>, content: &str) -> Result<MessageRecord>;
     pub async fn unread(&self, name: &str) -> Result<Vec<MessageRecord>>;
     pub async fn mark_read(&self, name: &str, ids: &[String]) -> Result<()>;
+    pub async fn set_read_watermark(&self, name: &str, timestamp: u64) -> Result<()>;   // monotone
+    pub async fn read_watermark(&self, name: &str) -> Result<Option<u64>>;
     pub async fn post_event(&self, topic: TeamTopic, payload: EventPayload) -> Result<String>;
     pub async fn publish_mutation(&self, mutation: &TaskMutation) -> Result<()>;   // emits task signals
     pub async fn list_tasks(&self, filter: &TaskFilter) -> Result<Vec<TaskSummary>>;
@@ -766,8 +768,17 @@ tests over 15 binaries),
   it.
 - `leader::run` returns the `AgentOutput` directly; frames flow through a `ChunkSink`, so `stream` yields
   them live and `invoke` ignores them.
-- One run at a time per team: the bus receiver is single-consumer (`TeamAgent::take_events`), so a second
-  concurrent `invoke`/`stream` on the same handle is unsupported (documented, not enforced).
+- One run at a time per team: the bus receiver is single-consumer, so a second concurrent `invoke`/`stream`
+  on the same handle is unsupported (documented, not enforced). It is *leased* for one run (`EventsLease`,
+  `TeamAgent::take_events`) and returned to the handle when that run ends, so a later sequential run gets a
+  live receiver and with it the mail/board events published in between; when the lease cannot be taken the
+  run drains chunks and the settle tick only, and the build-time bus sink logs (never silently drops) an
+  event whose receiver is gone.
+- Mailbox read state: a direct row carries `timestamp = 0` and is consumed through its `is_read` flag; a
+  broadcast row carries its wall-clock send instant, because its read state is the per-member watermark.
+  `leader::unread_lines` flags the direct rows read and advances the leader's watermark to the newest
+  broadcast instant it rendered, so a broadcast is unread once, rendered once, and a later bus event does not
+  re-render the backlog.
 - Settle is two consecutive 25 ms ticks (`SETTLE_POLL_INTERVAL`, `REQUIRED_SETTLE_TICKS = 2`) rather than
   Python's 2 s idle debounce: a run that answers immediately still emits exactly one completed marker.
 - `build` always produces the leader handle. Teammates are not a second public constructor: they are

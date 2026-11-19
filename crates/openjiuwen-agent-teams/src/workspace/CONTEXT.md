@@ -118,8 +118,12 @@ pub const LOCK_FILE_NAME: &str = "openjiuwen-worktree.lock";
 pub const DEFAULT_LOCK_WAIT: Duration = 10s;  pub const DEFAULT_STALE_AFTER: Duration = 60s;  pub const DEFAULT_POLL_INTERVAL: Duration = 25ms;
 pub struct LockOptions { pub wait: Duration, pub stale_after: Duration, pub poll: Duration }   // Default = the three consts
 impl LockOptions { pub fn new(wait: Duration) -> Self; pub fn with_stale_after(self, d) -> Self; pub fn with_poll(self, d) -> Self; }
-pub struct WorktreeLockGuard;                      // removes the lock file on drop
-impl WorktreeLockGuard { pub fn path(&self) -> &Path; pub async fn release(self) -> Result<()>; }
+pub struct WorktreeLockGuard;                      // removes its own lock file on drop
+impl WorktreeLockGuard {
+    pub fn path(&self) -> &Path;
+    pub fn token(&self) -> &str;                   // "<pid>-<32 lowercase hex>", stamped into the file
+    pub async fn release(self) -> Result<()>;
+}
 pub async fn acquire(path: &Path, options: &LockOptions) -> Result<WorktreeLockGuard>;
 
 // worktree_remote.rs — the remote protocol
@@ -173,10 +177,12 @@ Operations (all `10 s` bounded, stderr captured, `GIT_TERMINAL_PROMPT=0`, empty 
 ## Locking
 `<common-dir>/openjiuwen-worktree.lock` (Python `<repo_root>/.git/openjiuwen-worktree.lock`), held around every critical section of one repository (`create`, `remove`, `lock`, `unlock`) so two members cannot race on shared `.git` state.
 The file lives inside `.git`, where a leading dot would be meaningless, so the name has none; Python only uses `.openjiuwen-worktree.lock` beside a repository that has no `.git` directory, a case this port does not reach.
-- Exclusivity is `create_new` file creation, which the filesystem arbitrates atomically across tasks and processes; the file records `pid=<n>`.
+- Exclusivity is `create_new` file creation, which the filesystem arbitrates atomically across tasks and processes; the file records `pid=<n>` and `token=<pid>-<32 lowercase hex>`, a token unique to one acquisition.
 - A loser polls every `poll` (25 ms) until `wait` (10 s) expires, then fails with `Error::Timeout` — never lock-free.
 - A file older than `stale_after` (60 s) is treated as abandoned: it is removed with `warn!` and the acquisition retries; an unreadable modification time is left alone (fail closed).
-- `WorktreeLockGuard` removes the file on drop and on `release()`; `release()` reports removal failures that are not `NotFound`.
+  The decision is re-checked over the content: the file must still be stale after it was read and its bytes must be identical across two reads, so a holder that refreshed its stamp (or another waiter that replaced the file) is never stolen.
+- A guard keeps its file's modification time fresh — a heartbeat task every `stale_after / 3` (minimum 10 ms; a window shorter than 30 ms gets no heartbeat) re-reads the file first and stops as soon as it no longer names its token — so a critical section that provably outlives `stale_after` is never declared abandoned.
+- Ownership is checked on every release path: `WorktreeLockGuard` removes the file on drop and on `release()` **only while the content still carries its own token**, because a stale guard that was reclaimed must not delete the new holder's file (that would admit a third writer next to the second). A file that already vanished is a successful release, the takeover is logged with `warn!`, and `release()` reports removal failures that are not `NotFound`.
 
 ## Remote adapter status
 Python's remote contract is JSON over the team `Messager` (`send_and_wait`), **not** HTTP: the leader sends a `WorktreeRemoteRequest` and the node answers with a `WorktreeRemoteResponse` (`openjiuwen/agent_teams/worktree_remote.py`).
@@ -231,10 +237,10 @@ Branch: `worktree_branch(name)` = `worktree-<name>` with `/` flattened to `+`.
 - `./worktree.rs` -> `WorktreeInfo`, name/branch/digest helpers, `WorktreeCreateRequest`, the `WorktreeBackend` seam, `UnsupportedWorktreeBackend`
 - `./git.rs` -> `run_git`/`GitOutput`, `resolve_git`, `normalize_path`, `existing_ancestor`, `GitRepository` (discovery, worktree verbs, branch deletion), `WorktreeEntry` + `parse_worktree_list`
 - `./worktree_git.rs` -> `GitWorktreeBackend`, `teammate_worktrees` (the owned-worktree filter)
-- `./lock.rs` -> `LockOptions`, `WorktreeLockGuard`, `acquire`, stale reclamation
+- `./lock.rs` -> `LockOptions`, `WorktreeLockGuard` (owner token + heartbeat), `acquire`, stale reclamation
 - `./worktree_remote.rs` -> `RemoteWorktreeAction`/`Request`/`Response`, `RemoteDispatch`, `UnavailableRemoteDispatch`, `RemoteWorkspaceAdapter`
 - `./git_tests.rs` -> porcelain parsing, path helpers, discovery, branch deletion, the command runner
-- `./lock_tests.rs` -> exclusivity, bounded wait, stale reclamation, directory creation
+- `./lock_tests.rs` -> exclusivity, bounded wait, stale reclamation, directory creation, ownership on release after a steal, the heartbeat keeping a live holder
 - `./worktree_git_tests.rs` -> real repositories: round trip, no reuse, concurrent create, base ref, pinned root, list filter, provider allocation
 - `./worktree_remote_tests.rs` -> wire shapes, validation, dispatch seam, remote failure, unavailable transport
 - `./test_repo.rs` -> shared fixture: a temporary repository with one commit and helpers for commits/branches/heads

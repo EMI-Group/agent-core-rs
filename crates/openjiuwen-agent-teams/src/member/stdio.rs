@@ -294,6 +294,17 @@ impl StdioMemberRuntime {
         self.cancel.clone()
     }
 
+    /// Returns `true` while the child's stdin pipe is still writable.
+    ///
+    /// A failed or timed-out frame write closes it for good; see [`Self::write_frame`].
+    #[cfg(test)]
+    pub(crate) fn stdin_is_open(&self) -> bool {
+        match self.shared.stdin.try_lock() {
+            Ok(slot) => slot.is_some(),
+            Err(_) => true,
+        }
+    }
+
     /// Returns the options the runtime was built with.
     ///
     /// The configured `cancellation` field is left as the caller passed it; the token the runtime
@@ -309,9 +320,18 @@ impl StdioMemberRuntime {
     }
 
     /// Writes one protocol frame, bounded by the configured I/O timeout.
+    ///
+    /// A write that stalls past the bound — or fails part way through — leaves a truncated JSON
+    /// line on the wire, and the child would read every later frame as a continuation of that
+    /// line and answer `error` forever. The stream therefore cannot be resynchronised: the failure
+    /// closes the child's stdin (`poison_stdin`) and every later frame fails with a typed error
+    /// instead of being appended after the half line.
     async fn write_frame(&self, request: &MemberRequest) -> Result<()> {
         if let Some(error) = self.terminated_error() {
             return Err(error);
+        }
+        if let Some(reason) = self.shared.stdin_failure() {
+            return Err(self.unusable_stream_error(&reason));
         }
         let line = request.to_line()?;
         let frame = request.frame_type();
@@ -324,29 +344,58 @@ impl StdioMemberRuntime {
                     self.program
                 ))
             })?;
-        let Some(stdin) = stdin.as_mut() else {
+        let Some(pipe) = stdin.as_mut() else {
             return Err(self.terminated_error().unwrap_or_else(|| {
-                Error::transport(format!("member process '{}' stdin is closed", self.program))
+                match self.shared.stdin_failure() {
+                    Some(reason) => self.unusable_stream_error(&reason),
+                    None => Error::transport(format!(
+                        "member process '{}' stdin is closed",
+                        self.program
+                    )),
+                }
             }));
         };
-        let write = async {
-            stdin.write_all(line.as_bytes()).await?;
-            stdin.flush().await
+        let written = tokio::time::timeout(io_timeout, async {
+            pipe.write_all(line.as_bytes()).await?;
+            pipe.flush().await
+        })
+        .await;
+        // Record the poison while the pipe lock is still held, so a concurrent writer can never
+        // slip a frame in between the failed write and the poison, then close the pipe.
+        let (reason, timed_out) = match written {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => (
+                format!("the '{frame}' frame failed part way through: {error}"),
+                false,
+            ),
+            Err(_) => (
+                format!("the '{frame}' frame did not complete within {io_timeout:?}"),
+                true,
+            ),
         };
-        tokio::time::timeout(io_timeout, write)
-            .await
-            .map_err(|_| {
-                Error::timeout(format!(
-                    "member process '{}' did not accept the '{frame}' frame within {io_timeout:?}",
-                    self.program
-                ))
-            })?
-            .map_err(|error| {
-                Error::transport(format!(
-                    "failed to write the '{frame}' frame to member process '{}': {error}",
-                    self.program
-                ))
-            })
+        let pipe = stdin.take();
+        self.shared.record_stdin_failure(reason.clone());
+        drop(stdin);
+        drop(pipe);
+        if timed_out {
+            Err(Error::timeout(format!(
+                "member process '{}': {reason}; the protocol stream is now unusable",
+                self.program
+            )))
+        } else {
+            Err(Error::transport(format!(
+                "member process '{}': {reason}; the protocol stream is now unusable",
+                self.program
+            )))
+        }
+    }
+
+    /// Builds the typed error every frame write fails with after the stream was poisoned.
+    fn unusable_stream_error(&self, reason: &str) -> Error {
+        Error::transport(format!(
+            "member process '{}': the protocol stream is unusable after {reason}; no frame can be written",
+            self.program
+        ))
     }
 
     /// Waits up to `bound` for the child's termination to be recorded.
@@ -625,8 +674,10 @@ struct RuntimeState {
     state: RwLock<HarnessState>,
     /// Termination detail, recorded once.
     termination: Mutex<Option<Termination>>,
-    /// Child stdin, absent once the runtime drops it.
+    /// Child stdin, absent once the runtime drops it or a failed write poisons the stream.
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
+    /// Why the stdin side became unusable, recorded once; a poisoned stream never writes again.
+    stdin_failure: Mutex<Option<String>>,
     /// Observers that receive state, round and chunk callbacks.
     observers: ObserverSet,
     /// Pending `start` handshake, if one is in flight.
@@ -647,6 +698,7 @@ impl RuntimeState {
             state: RwLock::new(HarnessState::Idle),
             termination: Mutex::new(None),
             stdin: tokio::sync::Mutex::new(Some(stdin)),
+            stdin_failure: Mutex::new(None),
             observers: ObserverSet::new(),
             start_pending: Mutex::new(None),
             terminated,
@@ -662,6 +714,24 @@ impl RuntimeState {
     /// Returns `true` once the terminal phase was recorded.
     fn is_terminated(&self) -> bool {
         matches!(self.state(), HarnessState::Terminated)
+    }
+
+    /// Returns why the stdin side is unusable, when a frame write failed or timed out.
+    fn stdin_failure(&self) -> Option<String> {
+        self.stdin_failure.lock().clone()
+    }
+
+    /// Records the first reason the stdin side became unusable.
+    ///
+    /// Called while the stdin lock is held, so no other writer can append a frame between the
+    /// failure and the poison; the caller then takes the pipe out of
+    /// [`Self::stdin`](RuntimeState) and drops it, which closes the child's end.
+    fn record_stdin_failure(&self, reason: String) {
+        let mut slot = self.stdin_failure.lock();
+        if slot.is_none() {
+            warn!(program = %self.program, %reason, "member protocol stream poisoned");
+            *slot = Some(reason);
+        }
     }
 
     /// Returns the bounded stderr tail.

@@ -28,10 +28,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{ErrorKind, Result};
 use openjiuwen_foundation::tool::{Tool, ToolCard, ToolContext};
 use openjiuwen_retrieval::parsing::{PdfDocument, PdfParser};
-use openjiuwen_sysop::fs::types::{FileContent, LineRange, ReadFileParams, ReadMode};
+use openjiuwen_sysop::fs::types::{
+    FileContent, LineRange, ReadBytesParams, ReadFileParams, ReadMode,
+};
 use openjiuwen_sysop::operation::FsOperation;
 
 use super::descriptions;
@@ -47,6 +49,24 @@ const MAX_SIZE_BYTES: u64 = 256 * 1024;
 /// Maximum number of pages a single PDF read selects
 /// (`ReadFileTool.PDF_MAX_PAGES_PER_READ`).
 const PDF_MAX_PAGES_PER_READ: usize = 20;
+
+/// Maximum PDF size, in bytes, a single read will load.
+///
+/// Python has no such ceiling, but a PDF is parsed from memory, so an unbounded read of a
+/// multi-gigabyte file would allocate the whole file. The cap is far above any document the
+/// page-selection limit allows a caller to render.
+const PDF_MAX_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bytes fetched per bounded read while scanning for a line window.
+const READ_CHUNK_BYTES: u64 = 64 * 1024;
+
+/// Maximum bytes scanned to reach a requested line offset in a large file.
+///
+/// A text read with an explicit `limit` is bounded by this budget instead of the file size:
+/// the first lines of a multi-gigabyte log cost the budget, never the file. When the budget is
+/// exhausted the lines found so far are returned; a request whose offset lies beyond it is
+/// reported as a typed failure.
+const TEXT_SCAN_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The warning returned when a whole-file read finds no content.
 const EMPTY_FILE_WARNING: &str = "Warning: the file exists but the contents are empty.";
@@ -214,34 +234,58 @@ impl ReadFileTool {
         let limit = usize::try_from(args.limit.unwrap_or(max_lines).clamp(1, max_lines))
             .unwrap_or(MAX_LINES_TO_READ)
             .clamp(1, MAX_LINES_TO_READ);
+        let display = resolved.to_string_lossy().into_owned();
 
-        let params = ReadFileParams {
-            path: resolved.to_string_lossy().into_owned(),
-            mode: ReadMode::Text,
-            line_range: Some(LineRange {
-                start: offset.saturating_add(1),
-                end: offset.saturating_add(limit),
-            }),
-            ..ReadFileParams::default()
+        // Stat first: an oversized file is rejected before any of it is read, and the whole-file
+        // ceiling only applies when the caller did not ask for a bounded window.
+        let bounded_size = match bounded_file_size(fs, &display).await {
+            Ok(size) => size,
+            Err(message) => return ToolPayload::fail(message),
         };
-
-        let result = fs.read_file(params).await;
-        if result.is_failure() {
-            return ToolPayload::fail(result.message);
+        if let Some(total_bytes) = bounded_size {
+            if !user_supplied_limit && total_bytes > MAX_SIZE_BYTES {
+                return ToolPayload::fail(oversized_message(total_bytes));
+            }
         }
-        let Some(data) = result.data else {
-            return ToolPayload::fail("read_file returned no data from the filesystem operation");
-        };
 
-        let total_bytes = data.total_bytes;
-        let raw_text = match data.content {
-            FileContent::Text(text) => text,
-            FileContent::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        };
+        let (raw_text, _total_bytes) = match bounded_size {
+            Some(_) => match read_text_window(fs, &display, offset, limit).await {
+                Ok((text, actual_total)) => (text, actual_total),
+                Err(message) => return ToolPayload::fail(message),
+            },
+            // A backend without a bounded read keeps the whole-file path; its own policy bounds
+            // the read, and the size guard above cannot see the file size in advance.
+            None => {
+                let params = ReadFileParams {
+                    path: display.clone(),
+                    mode: ReadMode::Text,
+                    line_range: Some(LineRange {
+                        start: offset.saturating_add(1),
+                        end: offset.saturating_add(limit),
+                    }),
+                    ..ReadFileParams::default()
+                };
 
-        if !user_supplied_limit && total_bytes > MAX_SIZE_BYTES {
-            return ToolPayload::fail(oversized_message(total_bytes));
-        }
+                let result = fs.read_file(params).await;
+                if result.is_failure() {
+                    return ToolPayload::fail(result.message);
+                }
+                let Some(data) = result.data else {
+                    return ToolPayload::fail(
+                        "read_file returned no data from the filesystem operation",
+                    );
+                };
+                let total_bytes = data.total_bytes;
+                let text = match data.content {
+                    FileContent::Text(text) => text,
+                    FileContent::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                };
+                if !user_supplied_limit && total_bytes > MAX_SIZE_BYTES {
+                    return ToolPayload::fail(oversized_message(total_bytes));
+                }
+                (text, total_bytes)
+            }
+        };
 
         let (displayed, line_count) = if raw_text.trim().is_empty() {
             let content = if offset == 0 {
@@ -312,7 +356,7 @@ impl ReadFileTool {
             None => None,
         };
 
-        let bytes = match read_bytes(fs, resolved).await {
+        let bytes = match read_pdf_bytes(fs, resolved).await {
             Ok(bytes) => bytes,
             Err(message) => return ToolPayload::fail(message),
         };
@@ -514,6 +558,147 @@ fn no_text_message(path: &str, total_pages: usize) -> String {
 fn is_pdf(path: &Path) -> bool {
     path.extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+}
+
+/// Returns the size of `path` through the bounded read, or `None` when the backend cannot bound
+/// a read (it keeps its own whole-file policy in that case).
+///
+/// A zero-byte window asks the backend only for the metadata facts, so the file is never loaded
+/// just to learn how large it is.
+async fn bounded_file_size(
+    fs: &dyn FsOperation,
+    path: &str,
+) -> std::result::Result<Option<u64>, String> {
+    match fs
+        .read_bytes_limited(ReadBytesParams::new(path, 0, 0))
+        .await
+    {
+        Ok(data) => Ok(Some(data.total_bytes)),
+        Err(error) if error.kind() == ErrorKind::Unsupported => Ok(None),
+        Err(error) => Err(error.message().into_owned()),
+    }
+}
+
+/// Reads the line window `[offset, offset + limit)` without loading the whole file.
+///
+/// The scan is bounded by [`TEXT_SCAN_MAX_BYTES`] and by [`READ_CHUNK_BYTES`] per read, so the
+/// memory a read needs is a function of the window, not of the file. Lines found before the
+/// budget runs out are returned; a window whose offset lies beyond the budget is a typed
+/// failure instead of an empty answer.
+async fn read_text_window(
+    fs: &dyn FsOperation,
+    path: &str,
+    offset: usize,
+    limit: usize,
+) -> std::result::Result<(String, u64), String> {
+    let mut collected: Vec<String> = Vec::with_capacity(limit.min(64));
+    let mut pending: Vec<u8> = Vec::new();
+    // 1-based number of the line `pending` starts.
+    let mut next_line = 1usize;
+    let mut position = 0u64;
+    // Assigned by the first iteration, which every path enters before it can break.
+    let mut total_bytes: u64;
+    let mut scanned = 0u64;
+    let mut eof = false;
+    let mut budget_exhausted = false;
+    loop {
+        let chunk = fs
+            .read_bytes_limited(ReadBytesParams::new(path, position, READ_CHUNK_BYTES))
+            .await
+            .map_err(|error| error.message().into_owned())?;
+        total_bytes = chunk.total_bytes;
+        if chunk.bytes.is_empty() {
+            eof = true;
+            break;
+        }
+        position = position.saturating_add(chunk.bytes.len() as u64);
+        scanned = scanned.saturating_add(chunk.bytes.len() as u64);
+        pending.extend_from_slice(&chunk.bytes);
+
+        let mut range_start = 0usize;
+        let mut done = false;
+        for (index, byte) in pending.iter().enumerate() {
+            if *byte != b'\n' {
+                continue;
+            }
+            let line = strip_line_ending(&pending[range_start..index]);
+            if next_line > offset && collected.len() < limit {
+                collected.push(String::from_utf8_lossy(line).into_owned());
+            }
+            next_line = next_line.saturating_add(1);
+            range_start = index + 1;
+            if collected.len() >= limit {
+                done = true;
+                break;
+            }
+        }
+        if range_start > 0 {
+            pending.drain(..range_start);
+        }
+        if done || !chunk.truncated {
+            eof = !done;
+            break;
+        }
+        if scanned >= TEXT_SCAN_MAX_BYTES
+            || u64::try_from(pending.len()).unwrap_or(u64::MAX) >= TEXT_SCAN_MAX_BYTES
+        {
+            budget_exhausted = true;
+            break;
+        }
+    }
+
+    if eof && !pending.is_empty() && collected.len() < limit && next_line > offset {
+        collected.push(String::from_utf8_lossy(&pending).into_owned());
+    }
+    if budget_exhausted && collected.is_empty() {
+        return Err(offset_beyond_budget_message(offset));
+    }
+    Ok((collected.join("\n"), total_bytes))
+}
+
+/// Strips one trailing `\r` so a CRLF line matches what `str::lines` reports.
+fn strip_line_ending(line: &[u8]) -> &[u8] {
+    match line.last() {
+        Some(b'\r') => &line[..line.len() - 1],
+        _ => line,
+    }
+}
+
+/// Builds the rejection of an offset beyond the bounded scan budget.
+fn offset_beyond_budget_message(offset: usize) -> String {
+    format!(
+        "Error: The requested offset {offset} lies more than {} MiB into the file. Use grep to \
+         locate the content and read a bounded window around it.",
+        TEXT_SCAN_MAX_BYTES / (1024 * 1024)
+    )
+}
+
+/// Builds the rejection of a PDF larger than [`PDF_MAX_SIZE_BYTES`].
+#[allow(clippy::cast_precision_loss)]
+fn pdf_oversized_message(total_bytes: u64) -> String {
+    format!(
+        "Error: PDF content ({:.1}MB) exceeds the maximum allowed PDF size ({}MB). Split the \
+         document or extract the pages you need before reading it.",
+        total_bytes as f64 / (1024.0 * 1024.0),
+        PDF_MAX_SIZE_BYTES / (1024 * 1024)
+    )
+}
+
+/// Reads a PDF's bytes with a hard size ceiling.
+///
+/// The bounded read caps the allocation at [`PDF_MAX_SIZE_BYTES`] even when the file is far
+/// larger; a backend without a bounded read falls back to its own whole-file policy.
+async fn read_pdf_bytes(fs: &dyn FsOperation, path: &Path) -> std::result::Result<Vec<u8>, String> {
+    let display = path.to_string_lossy().into_owned();
+    match fs
+        .read_bytes_limited(ReadBytesParams::new(display.clone(), 0, PDF_MAX_SIZE_BYTES))
+        .await
+    {
+        Ok(data) if data.truncated => Err(pdf_oversized_message(data.total_bytes)),
+        Ok(data) => Ok(data.bytes),
+        Err(error) if error.kind() == ErrorKind::Unsupported => read_bytes(fs, path).await,
+        Err(error) => Err(error.message().into_owned()),
+    }
 }
 
 /// Reads the whole file in byte mode through the filesystem backend.
@@ -1067,6 +1252,56 @@ mod tests {
 
         let limited = invoke(&tool, json!({"file_path": "big.txt", "limit": 10})).await;
         assert_eq!(limited["success"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn a_bounded_read_of_a_huge_sparse_file_returns_the_first_lines() {
+        let (tool, _state, dir) = setup();
+        let path = dir.path().join("huge.log");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(b"alpha\nbeta\ngamma\n").unwrap();
+            file.flush().unwrap();
+            // 2 GiB is larger than any allocation a read may make; the tail is a hole.
+            file.set_len(2 * 1024 * 1024 * 1024).unwrap();
+        }
+
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            invoke(&tool, json!({"file_path": "huge.log", "limit": 10})),
+        )
+        .await
+        .expect("a bounded read must not load the file");
+
+        assert_eq!(out["success"], json!(true), "unexpected payload: {out}");
+        assert_eq!(out["data"]["line_count"], json!(3));
+        assert_eq!(
+            out["data"]["content"],
+            json!("     1\talpha\n     2\tbeta\n     3\tgamma")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_pdf_is_refused_before_it_is_parsed() {
+        let (tool, _state, dir) = setup();
+        let path = dir.path().join("huge.pdf");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(b"%PDF-1.4\n").unwrap();
+            file.flush().unwrap();
+            file.set_len(PDF_MAX_SIZE_BYTES + 1).unwrap();
+        }
+
+        let out = invoke(&tool, json!({"file_path": "huge.pdf"})).await;
+
+        assert_eq!(out["success"], json!(false));
+        let error = out["error"].as_str().unwrap();
+        assert!(
+            error.contains("exceeds the maximum allowed PDF size"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
