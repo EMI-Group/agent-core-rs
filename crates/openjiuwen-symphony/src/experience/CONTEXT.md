@@ -151,7 +151,7 @@ impl ExperienceIndex {
 `add` embeds `search_text()` with `embed_query` (a caller-supplied `embedding` is replaced: the index owns its vector space) before taking the lock, merges duplicates exactly like the bank, persists, and rolls the touched entry back if the write fails; a merge into an already-embedded duplicate skips the embedding call.
 `add_batch` makes one `embed_documents` call, applies every item, persists once, and restores every touched entry on any failure, so the batch is all-or-nothing.
 `search` embeds the query and ranks with the shared `rank_by_embedding` helper (ties on id, `top_k == 0` unlimited, `min_score` after truncation), and falls back to lexical ranking for a blank query.
-`add`, `add_batch` and `remove` drop the cached coarse quantiser, so the next IVF search or `persist()` trains it from the current catalog.
+`add`, `add_batch` and `remove` only mark the touched ids dirty and drop the frozen search quantiser, so the next IVF search retrains from the current catalog while `persist()` reuses its own cached quantiser under the documented rebuild policy.
 
 ### Vector algorithms
 
@@ -184,7 +184,18 @@ The trained `CoarseIndex` is cached behind its own lock, built lazily on the fir
 ```
 
 `persist()` on an in-memory index refreshes the manifest without writing files.
-Every write is a temp sibling plus a rename in dependency order — vectors → scalar → coarse quantiser → manifest — so a crash leaves a manifest that still describes the previous snapshot and the next load rejects the mixture.
+### Incremental encoding and the rebuild policy
+`persist()` encodes only the ids that changed since the last publish: a `Mutex<EncodeCache>` holds one `CacheEntry` (the scalar JSON line plus the embedding row) per id plus a dirty `BTreeSet`, drained before the catalog is read so a mutation racing the encode re-marks itself.
+The cache is seeded on `load()` from the parsed catalog, so the first mutation after a reopen encodes one item rather than the file.
+`persist_counters()` reports `(items encoded, publishes completed)` — diagnostic only, never a result; `n` appends move the first counter by `n` and the second by `n`.
+The CPU-bound encode and quantiser training run on `spawn_blocking`, so a publish never stalls a tokio worker; the per-index `persist_lock` serialises two `persist()` calls and each memory mutation is applied before its publish.
+The cached coarse quantiser (`CachedQuantiser`: the `CoarseIndex`, the serialized `ivf.json` bytes and the trained item count) is reused unless the policy says otherwise: rebuild when no quantiser is cached, when the effective `nlist` differs from the trained one, when a known id disappeared, or when the catalog grew by `max(trained / 4, 64)` items (`IVF_REBUILD_GROWTH_DIVISOR`, `IVF_REBUILD_MIN_NEW_ITEMS`).
+Otherwise every new id is assigned to its nearest existing centroid (`CoarseIndex::assign_all`) and the known lists are kept, so a bounded number of untrained adds costs an assignment instead of a full k-means, rebuilds total `O(log n)` over a growing catalog, and republishing an unchanged catalog reuses the cached bytes.
+### Atomic publication
+Every write is a unique temp sibling (`<path>.<pid>.<counter>.tmp`) created, written and `sync_all`ed, and the directory is fsynced after the renames, so a concurrent writer never shares a temp file and no rename is lost on a crash.
+A publish writes every temp first and then renames in dependency order — vectors → scalar → coarse quantiser → manifest — with `meta.json` last as the commit point, so an interrupted publish leaves a directory whose manifest still describes the previous snapshot.
+Publishes into one directory are serialised by an async mutex keyed on the canonical path (`publish_lock`), and a failed publish removes its temps; `add`/`add_batch` additionally restore the touched entries in memory.
+A fault at any point of the rename sequence therefore leaves a loadable directory holding either the old or the new complete snapshot, never a mixture the loader rejects.
 `meta.json` carries `MANIFEST_VERSION` (still 1) plus the digests of the three data files; `ivf_sha256` is `None` for a flat index and omitted from the document.
 Load is all-or-nothing and loud: an empty/absent directory is an empty index with `next_ordinal = 1`; a partial file set is `Error::External`; and a version, algorithm-grammar, digest, count, dimension, duplicate-id, row-length, id-set or coarse-geometry problem is `Error::Validation` naming the offending file.
 Opening an IVF directory as `flat` (or as a different IVF name) is a validation error naming `meta.json`, and a flat manifest that carries an IVF digest is rejected rather than repaired.

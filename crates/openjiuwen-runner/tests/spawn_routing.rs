@@ -747,6 +747,11 @@ async fn dropping_the_spawn_handle_clears_the_active_spawn() {
         .monitor()
         .snapshot(&run_id)
         .expect("the dropped run stays readable");
+    assert_eq!(
+        finished.phase,
+        RunPhase::Cancelled,
+        "an abandoned spawn is not a successful run"
+    );
     assert_eq!(finished.detail, json!({"reason": "handle_dropped"}));
 }
 

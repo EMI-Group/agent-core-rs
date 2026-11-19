@@ -84,13 +84,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use openjiuwen_retrieval::Embedding;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{validation, Result};
+use crate::error::{validation, Error, Result};
 use crate::experience::ranking::{
     rank_by_embedding, rank_lexically, ExperienceHit, ExperienceRanking,
 };
@@ -102,6 +102,7 @@ mod persist;
 
 use self::algorithm::{effective_nlist, AlgorithmSpec};
 use self::ivf::CoarseIndex;
+use self::persist::{EncodeCache, EncodeInput, EncodedIndex, WriteFault};
 
 /// The manifest schema version written by [`ExperienceIndex::persist`].
 pub const MANIFEST_VERSION: u32 = 1;
@@ -189,6 +190,15 @@ pub struct ExperienceIndex {
     coarse: RwLock<Option<Arc<CoarseIndex>>>,
     /// The manifest of the last successful load or persist.
     meta: RwLock<ExperienceIndexMeta>,
+    /// The per-item encoding cache that keeps a publish incremental.
+    cache: Mutex<EncodeCache>,
+    /// Serialises the persists of this index, so a slower, older snapshot cannot overwrite a
+    /// newer one.
+    persist_lock: tokio::sync::Mutex<()>,
+    /// The number of individual items encoded since construction (diagnostics).
+    encoded_items: AtomicU64,
+    /// The number of completed publishes since construction (diagnostics).
+    publishes: AtomicU64,
 }
 
 impl fmt::Debug for ExperienceIndex {
@@ -499,6 +509,7 @@ impl ExperienceIndex {
             return Ok(false);
         };
         self.invalidate_coarse();
+        self.forget_cached(id);
         if let Err(error) = self.persist().await {
             self.write_items().insert(id.to_string(), previous);
             self.invalidate_coarse();
@@ -509,13 +520,24 @@ impl ExperienceIndex {
 
     /// Writes the catalog to its directory and refreshes [`Self::meta`].
     ///
-    /// The artifacts are written in dependency order — `vector/embeddings.json`, then
-    /// `scalar/metadata.jsonl`, then `vector/ivf.json` for an IVF index, then the `meta.json`
-    /// that vouches for them — each through a temp sibling plus a rename, so a reader never
-    /// observes a partial file. The call is idempotent: persisting an unchanged catalog
-    /// rewrites the same bytes and the same digests, an IVF index's coarse quantiser
-    /// included, because training is deterministic. An in-memory index ([`Self::dir`] is
-    /// `None`) writes nothing but still refreshes the manifest and the cached quantiser.
+    /// The publish is incremental and atomic:
+    ///
+    /// - Only the items that changed since the last publish are serialized (a dirty set plus
+    ///   the cache seeded by [`Self::open`]); an unchanged catalog re-encodes nothing, so `n`
+    ///   appends cost `O(n)` item encodings in total rather than `O(n^2)`.
+    /// - An IVF index keeps its trained coarse quantiser while the policy in
+    ///   `persist::reusable_quantiser` allows it, assigning a new item to its nearest existing
+    ///   centroid instead of retraining; the documented rebuild triggers are a missing
+    ///   quantiser, a changed effective list count, a removal, or a catalog that grew by
+    ///   `max(trained/4, 64)` items. This bounds the expensive rebuilds to `O(log n)`.
+    /// - The CPU-bound serialization and quantiser work runs on
+    ///   [`tokio::task::spawn_blocking`], so a large index cannot stall a runtime worker.
+    /// - The four artifacts are written to unique temp files and flushed first, then renamed
+    ///   with `meta.json` last, so a failure part-way leaves the previous snapshot loadable.
+    ///
+    /// The call is idempotent: persisting an unchanged catalog rewrites the same bytes and the
+    /// same digests. An in-memory index ([`Self::dir`] is `None`) writes nothing but still
+    /// refreshes the manifest and the cached quantiser.
     ///
     /// # Errors
     ///
@@ -523,13 +545,42 @@ impl ExperienceIndex {
     /// embedding, and [`Error::External`](crate::error::Error::External) when a file cannot be
     /// encoded or written.
     pub async fn persist(&self) -> Result<()> {
-        let encoded = persist::encode(&self.items(), &self.algorithm)?;
+        let _persisting = self.persist_lock.lock().await;
+        let (input, drained) = self.begin_encode()?;
+        let encoded = match tokio::task::spawn_blocking(move || persist::encode(input)).await {
+            Ok(Ok(encoded)) => encoded,
+            Ok(Err(error)) => {
+                self.mark_dirty(drained);
+                return Err(error);
+            }
+            Err(error) => {
+                self.mark_dirty(drained);
+                return Err(Error::external(error).with_context("encoding the experience index"));
+            }
+        };
+        self.encoded_items
+            .fetch_add(encoded.encoded_items as u64, Ordering::Relaxed);
+        self.commit_cache(&encoded);
         if let Some(dir) = &self.dir {
-            persist::write(dir, &encoded).await?;
+            persist::write(dir, &encoded, WriteFault::default()).await?;
+            self.publishes.fetch_add(1, Ordering::Relaxed);
         }
-        *self.write_coarse() = encoded.coarse;
-        *self.write_meta() = encoded.meta;
+        self.write_coarse().clone_from(&encoded.coarse);
+        *self.write_meta() = encoded.meta.clone();
         Ok(())
+    }
+
+    /// The number of individual items encoded and the number of publishes completed.
+    ///
+    /// A full-catalog re-encode (the old behaviour of every [`Self::persist`]) moves the first
+    /// counter by the catalog size; an incremental publish moves it by one. The counters are
+    /// diagnostic only and never affect a result.
+    #[must_use]
+    pub fn persist_counters(&self) -> (u64, u64) {
+        (
+            self.encoded_items.load(Ordering::Relaxed),
+            self.publishes.load(Ordering::Relaxed),
+        )
     }
 
     /// Searches the index, returning at most `ranking.top_k` hits (`0` means unlimited).
@@ -633,9 +684,21 @@ impl ExperienceIndex {
             nprobe: AtomicUsize::new(DEFAULT_IVF_NPROBE),
             coarse: RwLock::new(coarse),
             meta: RwLock::new(meta),
+            cache: Mutex::new(EncodeCache::default()),
+            persist_lock: tokio::sync::Mutex::new(()),
+            encoded_items: AtomicU64::new(0),
+            publishes: AtomicU64::new(0),
         }
     }
 
+    /// Seeds the encoding cache with the entries a loaded catalog already has.
+    ///
+    /// The cache is not a constructor argument: only [`Self::load`](crate::experience::index)
+    /// has entries to seed, so it sets them after assembly.
+    pub(super) fn seed_encode_cache(self, cache: EncodeCache) -> Self {
+        *self.lock_cache() = cache;
+        self
+    }
     /// Reports whether the index uses the IVF probe path.
     fn is_ivf(&self) -> bool {
         self.algorithm.is_ivf()
@@ -760,6 +823,7 @@ impl ExperienceIndex {
                 drop(items);
                 self.note_ordinal(&merged_id);
                 self.invalidate_coarse();
+                self.mark_dirty_one(&merged_id);
                 return Ok((
                     AddOutcome::merged_into(merged_id.clone()),
                     (merged_id, Some(previous)),
@@ -787,24 +851,40 @@ impl ExperienceIndex {
         drop(items);
         self.note_ordinal(&id);
         self.invalidate_coarse();
+        self.mark_dirty_one(&id);
         Ok((AddOutcome::inserted(id.clone()), (id, previous)))
     }
 
     /// Restores the entries a failed mutation touched, newest first.
+    ///
+    /// The encoding cache is repaired with it: every restored id is dirty again, the entries
+    /// of ids the rollback deleted are dropped, and the frozen quantiser is discarded (it may
+    /// describe the rolled-back catalog).
     fn restore(&self, entries: Vec<(String, Option<ExperienceItem>)>) {
         let mut items = self.write_items();
+        let mut dirty = Vec::with_capacity(entries.len());
+        let mut dropped = Vec::new();
         for (id, previous) in entries.into_iter().rev() {
-            match previous {
-                Some(item) => {
-                    items.insert(id, item);
-                }
-                None => {
-                    items.remove(&id);
-                }
+            if let Some(item) = previous {
+                items.insert(id.clone(), item);
+                dirty.push(id);
+            } else {
+                items.remove(&id);
+                dropped.push(id);
             }
         }
         drop(items);
         self.invalidate_coarse();
+        let mut cache = self.lock_cache();
+        cache.ivf = None;
+        cache.dirty.extend(dirty);
+        if !dropped.is_empty() {
+            let mut cached = (*cache.entries).clone();
+            for id in &dropped {
+                cached.remove(id);
+            }
+            cache.entries = Arc::new(cached);
+        }
     }
 
     /// The stored item whose dedupe key matches `dedupe_key`.
@@ -821,6 +901,98 @@ impl ExperienceIndex {
             self.next_ordinal
                 .fetch_max(ordinal.saturating_add(1), Ordering::SeqCst);
         }
+    }
+
+    /// Snapshots the catalog and the work a publish has to do.
+    ///
+    /// The dirty set is drained *before* the catalog is read: a mutation racing with this call
+    /// either lands in the snapshot (when it happened before the read) or re-marks its id
+    /// dirty (when it happens after the drain), so no change is ever silently marked clean.
+    /// Only dirty or not-yet-cached items are serialized here.
+    fn begin_encode(&self) -> Result<(EncodeInput, BTreeSet<String>)> {
+        let (base, reuse_ivf, drained) = {
+            let mut cache = self.lock_cache();
+            let base = Arc::clone(&cache.entries);
+            let reuse_ivf = cache.ivf.clone();
+            let drained = std::mem::take(&mut cache.dirty);
+            (base, reuse_ivf, drained)
+        };
+        let items = self.read_items();
+        let mut ids = Vec::with_capacity(items.len());
+        let mut fresh = BTreeMap::new();
+        for (id, item) in items.iter() {
+            ids.push(id.clone());
+            if !drained.contains(id) && base.contains_key(id) {
+                continue;
+            }
+            match persist::cache_entry(item) {
+                Ok(entry) => {
+                    fresh.insert(id.clone(), entry);
+                }
+                Err(error) => {
+                    drop(items);
+                    self.mark_dirty(drained);
+                    return Err(error);
+                }
+            }
+        }
+        drop(items);
+        Ok((
+            EncodeInput {
+                algorithm: self.algorithm.clone(),
+                ids,
+                base,
+                fresh,
+                reuse_ivf,
+            },
+            drained,
+        ))
+    }
+
+    /// Stores the entries a publish encoded, and the quantiser it produced.
+    ///
+    /// The cached map is unwrapped in place when no snapshot is outstanding, so the common
+    /// case costs one pass over the new entries rather than a copy of the whole catalog.
+    fn commit_cache(&self, encoded: &EncodedIndex) {
+        let mut cache = self.lock_cache();
+        let current = std::mem::replace(&mut cache.entries, Arc::new(BTreeMap::new()));
+        let mut entries = match Arc::try_unwrap(current) {
+            Ok(entries) => entries,
+            Err(shared) => (*shared).clone(),
+        };
+        for (id, entry) in &encoded.fresh {
+            entries.insert(id.clone(), entry.clone());
+        }
+        cache.entries = Arc::new(entries);
+        cache.ivf.clone_from(&encoded.cached_ivf);
+    }
+
+    /// Marks `ids` as needing an encode on the next publish.
+    fn mark_dirty(&self, ids: impl IntoIterator<Item = String>) {
+        let mut cache = self.lock_cache();
+        cache.dirty.extend(ids);
+    }
+
+    /// Marks one id as needing an encode on the next publish.
+    fn mark_dirty_one(&self, id: &str) {
+        self.lock_cache().dirty.insert(id.to_string());
+    }
+
+    /// Drops every cached trace of `id` after it was removed from the catalog.
+    fn forget_cached(&self, id: &str) {
+        let mut cache = self.lock_cache();
+        cache.dirty.remove(id);
+        cache.ivf = None;
+        if cache.entries.contains_key(id) {
+            let mut entries = (*cache.entries).clone();
+            entries.remove(id);
+            cache.entries = Arc::new(entries);
+        }
+    }
+
+    /// Locks the encoding cache, recovering from a poisoned lock.
+    fn lock_cache(&self) -> std::sync::MutexGuard<'_, EncodeCache> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Locks the catalog for reading, recovering from a poisoned lock.

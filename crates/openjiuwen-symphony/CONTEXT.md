@@ -152,6 +152,8 @@ One API-shaped stub remains and every entry point returns `Error::Unsupported` v
 - **Capability-tree grouping has four real strategies** — the classification → tag → name-token rule (default), `LlmGrouping`, and embedding k-means for `Kmeans`/`FaissKmeans`; the runtime ones go through `group_items_with` with `GroupingProvenance`, and the sync entry points answer a typed `Unsupported`.
 - **The capability-tree index publishes a fixed three-file contract** — validated up front (`TreeSchema` makes bad cids, cycles, depth and node-count violations fatal) and written per file through temp+rename, so a rejected build leaves the previous index intact; `tree_index.html` is opt-in, keeping the default publish byte-identical.
 - **The experience index has two algorithms over one matrix** — flat cosine is exact, IVF adds deterministic coarse quantisation persisted in `vector/ivf.json`, `nprobe >= nlist` reproduces the flat neighbours, and PQ is recorded rather than applied.
+- **A publish encodes only what changed** — a dirty-set cache keyed by id (seeded on `load`) plus `spawn_blocking` makes `n` appends cost `O(n)` encodings instead of `O(n²)`, and the cached quantiser is reused with each new id assigned to its nearest centroid; it is rebuilt only when absent, when `nlist` changed, on a removal, or when the catalog grew by `max(trained / 4, 64)` items.
+- **A multi-file snapshot commits at `meta.json`** — unique fsynced temps, all temps written before the first rename, renames in dependency order with the manifest last, directory fsync and one async mutex per canonical directory, so an interrupted publish is a loadable old snapshot rather than a rejected mixture.
 - **Trace ingestion is deterministic, not statistical** — k-means seeded from a content hash, RNG-free, centroid = the member closest to the mean, and no clock.
 - **The package review's deterministic stage always wins** — a model can only add findings, never clear `secrets`/`code_safety`, and the stage is skipped when the deterministic verdict is not approved.
 - **Redaction happens where text enters an artifact**, not at render time, and the review's `secrets` check re-runs the redactor as the last line of defence.
@@ -226,10 +228,10 @@ Unit tests live beside modules (`#[cfg(test)] mod tests`); cross-module behavior
 | `discovery_toolkit_notice` | tool-id digest, card normalization, reminder text/budget, LRU, session rollback. |
 | `skill_prompt` | ordering, pinned snapshot, truncation, added/removed/changed notices. |
 | `experience` | ids, dedupe, ranking, filters, persistence, retriever provenance, evaluator, embedding cache. |
-| `experience_index` | add/search/dedupe, corruption, round-trip, IVF names, `nprobe >= nlist` = flat, probes. |
+| `experience_index` | add/search/dedupe, corruption, round-trip, IVF names, `nprobe >= nlist` = flat, probes, incremental encode counters and bounded publishes, cached-encoding reuse, injected mid-publish failure leaving a loadable snapshot, concurrent adds surviving a reopen. |
 | `experience_trace` | exact `TraceRecord`s, re-parse, malformed sessions, k-means determinism, collector, bank search. |
 | `retrieval_build` | sources, grouping, presets, schema failures, incremental ops, provenance, shaping, deferral, HTML. |
-| `retrieval_artifacts` | three-artifact set, byte-identical rebuilds, no `*.tmp`, rejected publishes, corruption, HTML. |
+| `retrieval_artifacts` | three-artifact set, byte-identical rebuilds, no `*.tmp`, rejected publishes, corruption, HTML, the `MAX_CID_DEPTH` rejection of a 10 000-segment cid and an over-deep branch chain, and a normal five-level index still loading. |
 | `retrieval_search` | loading, scripted walk and fallback, strict mode, traces, bounds, flat retriever, provenance. |
 | `retrieval_search_lexical` | item/branch docs, field rules, CJK snippets, scoping, blank queries, truncation. |
 | `retrieval_search_disclosure` | exposure order, codes, reply shapes, two-message prompt, truncation, fingerprint stability. |

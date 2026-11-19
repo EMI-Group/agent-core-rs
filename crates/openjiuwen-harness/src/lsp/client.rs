@@ -6,6 +6,21 @@
 //! channel. Every request is bounded by [`LspClient::request_timeout`] via
 //! [`tokio::time::timeout`], so a wedged server cannot hang the agent loop.
 //!
+//! # Bounded teardown
+//!
+//! A language server that stops reading its stdin (or stops answering) must not park the
+//! client forever, and it must not outlive it either. Three bounds enforce that:
+//!
+//! - **The enqueue is bounded.** Handing a message to the I/O task is itself wrapped in the
+//!   request deadline, so a full [`OUTGOING_CAPACITY`] queue surfaces as [`Error::Timeout`]
+//!   instead of a task parked on `send`;
+//! - **The write is bounded.** The I/O task wraps every [`LspTransport::send`] in a write
+//!   deadline, so a `write_all` blocked on a full child stdin pipe gives up;
+//! - **Overrun tears the connection down.** Either bound (and a dropped client whose queue is
+//!   full) cancels the client's teardown token, and the I/O task then closes the transport —
+//!   which kills and reaps a [`StdioTransport`](crate::lsp::StdioTransport) child — before it
+//!   fails the pending requests.
+//!
 //! The task also answers server-initiated requests (`workspace/configuration`,
 //! `workspace/workspaceFolders`, `client/registerCapability`) with the same empty payloads
 //! Python uses, which many servers require before they answer `initialize`.
@@ -23,6 +38,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 
 use openjiuwen_common::error::{Error, Result};
 
@@ -39,8 +55,16 @@ use super::wire::{
     DocumentDiagnosticReport,
 };
 
-/// Capacity of the outgoing command queue; requests beyond it wait for the I/O task.
-const OUTGOING_CAPACITY: usize = 64;
+/// Capacity of the outgoing command queue; requests beyond it wait for the I/O task for at
+/// most the request deadline, then fail with [`Error::Timeout`].
+pub(crate) const OUTGOING_CAPACITY: usize = 64;
+
+/// Upper bound on a single frame write, so a server that stops draining its stdin cannot
+/// park the I/O task inside `write_all`.
+///
+/// The effective bound is `min(request_timeout, MAX_WRITE_TIMEOUT)`: a client configured with
+/// a shorter request deadline is never slower than that deadline.
+const MAX_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A message the client hands to its I/O task.
 enum Outgoing {
@@ -119,6 +143,8 @@ pub struct LspClient {
     pending: PendingMap,
     next_id: AtomicU64,
     request_timeout: Duration,
+    write_timeout: Duration,
+    teardown: CancellationToken,
     capabilities: Mutex<Option<ServerCapabilities>>,
     versions: Mutex<HashMap<String, i64>>,
     handlers: NotificationHandlers,
@@ -127,6 +153,9 @@ pub struct LspClient {
 
 impl LspClient {
     /// Starts the I/O task over `transport` and bounds each request with `request_timeout`.
+    ///
+    /// A single frame write is bounded by `min(request_timeout, 30 s)`; see the module docs
+    /// for the teardown that an overrun triggers.
     #[must_use]
     pub fn new(transport: Box<dyn LspTransport>, request_timeout: Duration) -> Self {
         let (outgoing, receiver) = mpsc::channel(OUTGOING_CAPACITY);
@@ -134,23 +163,34 @@ impl LspClient {
         let task_pending = Arc::clone(&pending);
         let handlers: NotificationHandlers = Arc::new(Mutex::new(Vec::new()));
         let lifecycle = Arc::new(Lifecycle::new());
+        let teardown = CancellationToken::new();
         tokio::spawn(run_io(
             transport,
             receiver,
             task_pending,
             Arc::clone(&handlers),
             Arc::clone(&lifecycle),
+            teardown.clone(),
+            request_timeout.min(MAX_WRITE_TIMEOUT),
         ));
         Self {
             outgoing,
             pending,
             next_id: AtomicU64::new(1),
             request_timeout,
+            write_timeout: request_timeout.min(MAX_WRITE_TIMEOUT),
+            teardown,
             capabilities: Mutex::new(None),
             versions: Mutex::new(HashMap::new()),
             handlers,
             lifecycle,
         }
+    }
+
+    /// The bound on a single frame write handed to the transport.
+    #[must_use]
+    pub const fn write_timeout(&self) -> Duration {
+        self.write_timeout
     }
 
     /// The per-request timeout this client enforces.
@@ -503,14 +543,13 @@ impl LspClient {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] when the client has been shut down. The write itself
-    /// completes asynchronously through the I/O task.
+    /// Returns [`Error::Transport`] when the client has been shut down and
+    /// [`Error::Timeout`] when the message cannot be handed to the I/O task within the
+    /// request deadline (a server that stopped reading its pipe).
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
         let message = super::protocol::notification_message(method, params);
-        self.outgoing
-            .send(Outgoing::Message(message))
+        self.enqueue(Outgoing::Message(message), self.request_timeout)
             .await
-            .map_err(|_| Error::transport("LSP client is shut down"))
     }
 
     /// Performs the graceful LSP shutdown: `shutdown` request, `exit` notification, close.
@@ -525,10 +564,13 @@ impl LspClient {
             .await;
         let _ = self.notify("exit", Value::Null).await;
         self.lifecycle.close("shutdown requested");
-        let _ = self.outgoing.send(Outgoing::Close).await;
+        let _ = self.enqueue(Outgoing::Close, self.write_timeout).await;
     }
 
     /// Sends a request bounded by `timeout` instead of the client default.
+    ///
+    /// Both the enqueue and the answer are bounded by `timeout`; an enqueue overrun closes the
+    /// connection (see the module docs) instead of parking the request forever.
     async fn request_with_timeout(
         &self,
         method: &str,
@@ -539,14 +581,21 @@ impl LspClient {
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().insert(id, sender);
         let message = request_message(id, method, params);
-        if self
-            .outgoing
-            .send(Outgoing::Message(message))
-            .await
-            .is_err()
-        {
-            self.pending.lock().remove(&id);
-            return Err(Error::transport("LSP client is shut down"));
+        match tokio::time::timeout(timeout, self.outgoing.send(Outgoing::Message(message))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.pending.lock().remove(&id);
+                return Err(Error::transport("LSP client is shut down"));
+            }
+            Err(_) => {
+                self.pending.lock().remove(&id);
+                let reason = format!(
+                    "LSP request '{method}' could not be handed to the transport within {} ms",
+                    timeout.as_millis()
+                );
+                self.abort(&reason);
+                return Err(Error::timeout(reason));
+            }
         }
         match tokio::time::timeout(timeout, receiver).await {
             Ok(Ok(outcome)) => outcome,
@@ -562,11 +611,42 @@ impl LspClient {
             }
         }
     }
+
+    /// Hands one command to the I/O task, bounded by `timeout`.
+    ///
+    /// An overrun means the I/O task is stuck (typically inside a write to a server that
+    /// stopped reading), so the connection is torn down and the caller gets a typed timeout.
+    async fn enqueue(&self, command: Outgoing, timeout: Duration) -> Result<()> {
+        match tokio::time::timeout(timeout, self.outgoing.send(command)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(Error::transport("LSP client is shut down")),
+            Err(_) => {
+                let reason = format!(
+                    "LSP message could not be handed to the transport within {} ms",
+                    timeout.as_millis()
+                );
+                self.abort(&reason);
+                Err(Error::timeout(reason))
+            }
+        }
+    }
+
+    /// Stops the I/O task, which closes the transport (killing and reaping a child server) and
+    /// fails every pending request with the recorded reason.
+    fn abort(&self, reason: &str) {
+        self.lifecycle.close(reason);
+        self.teardown.cancel();
+    }
 }
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        let _ = self.outgoing.try_send(Outgoing::Close);
+        if self.outgoing.try_send(Outgoing::Close).is_err() {
+            // The queue is full, so the command can never reach a blocked I/O task: cancel its
+            // teardown token instead, so the transport (and any child server) is closed rather
+            // than leaked.
+            self.teardown.cancel();
+        }
     }
 }
 
@@ -574,23 +654,51 @@ impl Drop for LspClient {
 ///
 /// Every exit path records why the client stopped, fails the pending requests with that
 /// reason, closes the transport and marks [`LspClient::is_alive`] `false`.
+///
+/// Each frame write is bounded by `write_timeout` and each teardown request (a client drop or
+/// a stalled enqueue) cancels `teardown`; both make the task leave the loop even while the
+/// server is not draining its stdin, so `transport.close()` — kill plus reap for
+/// [`StdioTransport`](crate::lsp::StdioTransport) — always runs.
 async fn run_io(
     mut transport: Box<dyn LspTransport>,
     mut outgoing: mpsc::Receiver<Outgoing>,
     pending: PendingMap,
     handlers: NotificationHandlers,
     lifecycle: Arc<Lifecycle>,
+    teardown: CancellationToken,
+    write_timeout: Duration,
 ) {
     let reason: String;
     let mut failure: Option<Error> = None;
     loop {
         tokio::select! {
+            // The teardown branch is polled first so an explicit close or a stalled enqueue
+            // always wins over a queued command.
+            biased;
+            () = teardown.cancelled() => {
+                reason = lifecycle
+                    .reason()
+                    .unwrap_or_else(|| "LSP client was closed".to_owned());
+                failure = Some(Error::transport(reason.clone()));
+                break;
+            }
             command = outgoing.recv() => match command {
                 Some(Outgoing::Message(message)) => {
-                    if let Err(error) = transport.send(message).await {
-                        reason = format!("LSP transport failed: {}", error.message());
-                        failure = Some(error);
-                        break;
+                    match tokio::time::timeout(write_timeout, transport.send(message)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            reason = format!("LSP transport failed: {}", error.message());
+                            failure = Some(error);
+                            break;
+                        }
+                        Err(_) => {
+                            reason = format!(
+                                "LSP transport write timed out after {} ms",
+                                write_timeout.as_millis()
+                            );
+                            failure = Some(Error::timeout(reason.clone()));
+                            break;
+                        }
                     }
                 }
                 Some(Outgoing::Close) | None => {
@@ -600,10 +708,28 @@ async fn run_io(
             },
             incoming = transport.recv() => match incoming {
                 Ok(Some(message)) => {
-                    if let Err(error) = dispatch(&mut transport, &pending, &handlers, message).await {
-                        reason = format!("LSP transport failed: {}", error.message());
-                        failure = Some(error);
-                        break;
+                    // The dispatch of a server-initiated request writes a response, so it is
+                    // bounded by the same write deadline.
+                    match tokio::time::timeout(
+                        write_timeout,
+                        dispatch(&mut transport, &pending, &handlers, message),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            reason = format!("LSP transport failed: {}", error.message());
+                            failure = Some(error);
+                            break;
+                        }
+                        Err(_) => {
+                            reason = format!(
+                                "LSP transport write timed out after {} ms",
+                                write_timeout.as_millis()
+                            );
+                            failure = Some(Error::timeout(reason.clone()));
+                            break;
+                        }
                     }
                 }
                 Ok(None) => {

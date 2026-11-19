@@ -58,6 +58,7 @@ use super::io::CliIo;
 use super::mcp_config;
 use super::permissions::CliPermissionHost;
 use super::render::RenderState;
+use super::session_store::MessageRecord;
 use super::style::Style;
 use super::RunArgs;
 use crate::agent::{create_deep_agent, DeepAgent};
@@ -547,11 +548,12 @@ pub(crate) async fn stream_run(
     }
 
     let store = options.sessions();
-    if let Err(error) = store.append_message(session_id, ROLE_USER, prompt) {
-        tracing::warn!(%error, "failed to persist CLI user message");
-    }
-    if let Err(error) = store.append_message(session_id, ROLE_ASSISTANT, &outcome.answer) {
-        tracing::warn!(%error, "failed to persist CLI assistant message");
+    let turn = vec![
+        MessageRecord::new(ROLE_USER, prompt),
+        MessageRecord::new(ROLE_ASSISTANT, &outcome.answer),
+    ];
+    if let Err(error) = store.append_turn(session_id, turn).await {
+        tracing::warn!(%error, "failed to persist the CLI turn");
     }
 
     Ok(outcome)

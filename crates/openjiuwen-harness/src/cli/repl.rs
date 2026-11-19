@@ -40,7 +40,9 @@ use openjiuwen_agent::Agent;
 use openjiuwen_common::error::Result;
 use openjiuwen_foundation::BaseMessage;
 use openjiuwen_session::Session;
+use parking_lot::Mutex;
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 use super::compact::ConversationHistory;
 use super::config::{CliOptions, ProcessEnv};
@@ -205,6 +207,12 @@ pub struct Repl {
     session_id: String,
     /// Ctrl-C presses of the current turn.
     interrupts: Arc<InterruptCounter>,
+    /// Cancellation of the current turn (Ctrl-C), shared with the signal watcher.
+    ///
+    /// A `!cmd` command races this token, so an interrupt returns from the shell
+    /// instead of waiting for the command. It is replaced at the start of every
+    /// turn, exactly like [`Repl::interrupts`].
+    cancel: Arc<Mutex<CancellationToken>>,
     /// Whether to install the Ctrl-C watcher (stdio REPL only).
     watch_signals: bool,
     /// Set by the watcher when a second press asks for exit.
@@ -301,6 +309,7 @@ impl Repl {
             session: new_session(&id),
             session_id: id,
             interrupts: Arc::new(InterruptCounter::new()),
+            cancel: Arc::new(Mutex::new(CancellationToken::new())),
             watch_signals,
             exited: Arc::new(AtomicBool::new(false)),
             history,
@@ -311,6 +320,17 @@ impl Repl {
             shell: Arc::new(ProcessShellRunner::new()),
             style,
         }
+    }
+
+    /// Returns a handle that is cancelled when the current turn is interrupted.
+    ///
+    /// It is the token a `!cmd` runner races, exposed so a host (or a test) can
+    /// observe the interrupt without driving a real terminal. The REPL replaces
+    /// the token at the start of every turn, so a handle taken now goes stale —
+    /// which is exactly what makes one Ctrl-C stop one turn.
+    #[must_use]
+    pub fn turn_cancellation(&self) -> CancellationToken {
+        self.cancel.lock().clone()
     }
 
     /// Returns the id of the current session.
@@ -370,6 +390,7 @@ impl Repl {
                 break;
             };
             self.interrupts.reset();
+            *self.cancel.lock() = CancellationToken::new();
             self.remember(&line);
             match self.handle_input(&line) {
                 ReplCommand::Empty => {}
@@ -472,7 +493,7 @@ impl Repl {
     /// aborts once and then asks for exit, which is the Python behaviour.
     #[must_use]
     pub fn on_interrupt(&self) -> InterruptAction {
-        press_interrupt(&self.interrupts, &self.agent)
+        press_interrupt(&self.interrupts, &self.agent, &self.cancel)
     }
 
     /// Runs one prompt as a streamed turn.
@@ -510,12 +531,12 @@ impl Repl {
         self.conversation.push(ROLE_ASSISTANT, &outcome.answer);
 
         let store = self.options.sessions();
-        if let Err(error) = store.append_message(&self.session_id, ROLE_USER, input) {
-            tracing::warn!(%error, "failed to persist REPL user message");
-        }
-        if let Err(error) = store.append_message(&self.session_id, ROLE_ASSISTANT, &outcome.answer)
-        {
-            tracing::warn!(%error, "failed to persist REPL assistant message");
+        let turn = vec![
+            MessageRecord::new(ROLE_USER, input),
+            MessageRecord::new(ROLE_ASSISTANT, &outcome.answer),
+        ];
+        if let Err(error) = store.append_turn(&self.session_id, turn).await {
+            tracing::warn!(%error, "failed to persist the REPL turn");
         }
         Ok(outcome)
     }
@@ -665,7 +686,8 @@ impl Repl {
         if let Err(error) = self
             .options
             .sessions()
-            .replace_messages(&self.session_id, messages)
+            .replace_messages_async(&self.session_id, messages)
+            .await
         {
             tracing::warn!(%error, "failed to persist the compacted transcript");
         }
@@ -678,8 +700,17 @@ impl Repl {
     }
 
     /// Runs one `!cmd` line through the shell, bypassing the model.
+    ///
+    /// The command races the turn's cancellation token, so a Ctrl-C kills the
+    /// command's process group and returns to the prompt instead of wedging the
+    /// REPL on a command that never ends.
     async fn run_shell(&self, command: &str) -> Result<()> {
-        match self.shell.run(command, &self.options.workspace).await {
+        let cancel = self.cancel.lock().clone();
+        match self
+            .shell
+            .run_cancellable(command, &self.options.workspace, &cancel)
+            .await
+        {
             Ok(output) => {
                 if !output.stdout.is_empty() {
                     self.io.write(&output.stdout).await?;
@@ -769,6 +800,7 @@ impl Repl {
     /// borrow and no lock is shared across the stream.
     fn spawn_signal_watcher(&self) {
         let interrupts = Arc::clone(&self.interrupts);
+        let cancel = Arc::clone(&self.cancel);
         let agent = Arc::clone(&self.agent);
         let io = self.io.clone();
         let exited = Arc::clone(&self.exited);
@@ -777,7 +809,7 @@ impl Repl {
                 if tokio::signal::ctrl_c().await.is_err() {
                     return;
                 }
-                match press_interrupt(&interrupts, &agent) {
+                match press_interrupt(&interrupts, &agent, &cancel) {
                     InterruptAction::Abort => {
                         if io.write_line(&format!("\n{INTERRUPTED}")).await.is_err() {
                             return;
@@ -793,14 +825,21 @@ impl Repl {
     }
 }
 
-/// Records one press and aborts `agent` when it asks for an abort.
+/// Records one press, aborts `agent` and cancels the turn's shell command.
 ///
 /// Shared by [`Repl::on_interrupt`] and the signal watcher so both paths behave
-/// identically without the watcher needing a borrow of the REPL.
-fn press_interrupt(interrupts: &InterruptCounter, agent: &DeepAgent) -> InterruptAction {
+/// identically without the watcher needing a borrow of the REPL: aborting the
+/// agent cannot reach a `!cmd` await, so the same press also cancels the token the
+/// shell runner races.
+fn press_interrupt(
+    interrupts: &InterruptCounter,
+    agent: &DeepAgent,
+    cancel: &Mutex<CancellationToken>,
+) -> InterruptAction {
     let action = interrupts.press();
     if action == InterruptAction::Abort {
         agent.abort();
+        cancel.lock().cancel();
     }
     action
 }

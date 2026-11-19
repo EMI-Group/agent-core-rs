@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use openjiuwen_test_support::{MockCompletion, ScriptedModel};
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::cli::allow_rules::AllowRules;
@@ -61,7 +62,12 @@ impl FixedShell {
 
 #[async_trait]
 impl ShellRunner for FixedShell {
-    async fn run(&self, command: &str, _cwd: &Path) -> Result<ShellOutput> {
+    async fn run_cancellable(
+        &self,
+        command: &str,
+        _cwd: &Path,
+        _cancel: &CancellationToken,
+    ) -> Result<ShellOutput> {
         self.commands.lock().unwrap().push(command.to_owned());
         Ok(self.output.clone())
     }
@@ -382,6 +388,7 @@ async fn repl_transcript_covers_help_shell_sessions_clear_and_exit() {
         stdout: "hi\n".to_owned(),
         stderr: String::new(),
         code: Some(0),
+        ..ShellOutput::default()
     });
     let scripted = ScriptedModel::text("unused");
     let probe = scripted.clone();

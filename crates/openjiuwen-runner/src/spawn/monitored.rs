@@ -63,9 +63,10 @@
 //! **Finished exactly once.** `shutdown`, `force_kill`, [`Drop`] and the dead-child
 //! rule all finish the run, and a [`std::sync::atomic::AtomicBool`] latches the
 //! first terminal transition, so a shutdown followed by a drop records one
-//! terminal event. A dropped handle finishes as completed with
-//! `{"reason": "handle_dropped"}`, so an abandoned spawn never leaves a live status
-//! behind.
+//! terminal event. A dropped handle finishes as cancelled with
+//! `{"reason": "handle_dropped"}` — an abandoned spawn is not a run that
+//! succeeded — so it never leaves a live status behind and never claims
+//! completion for work that never finished.
 
 use crate::monitor::{RunKind, RunMonitor, RunOutcome, RunPhase, RunStart};
 use crate::spawn::{SpawnBackend, SpawnHealth, SpawnedAgent};
@@ -680,10 +681,15 @@ impl SpawnedAgent for MonitoredSpawnedAgent {
 }
 
 impl Drop for MonitoredSpawnedAgent {
-    /// Finishes the run as completed with `{"reason": "handle_dropped"}` unless a
+    /// Finishes the run as cancelled with `{"reason": "handle_dropped"}` unless a
     /// terminal transition was already recorded.
+    ///
+    /// An abandoned handle is not a completed run: reporting `Completed` would
+    /// claim success for work that never finished. `Cancelled` is what
+    /// [`RunStatusGuard`](crate::monitor)'s drop and `force_kill` already record
+    /// for the same abandonment.
     fn drop(&mut self) {
-        self.finish_once(RunOutcome::completed().with_detail(json!({"reason": "handle_dropped"})));
+        self.finish_once(RunOutcome::cancelled().with_detail(json!({"reason": "handle_dropped"})));
     }
 }
 

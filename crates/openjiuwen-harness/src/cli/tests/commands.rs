@@ -16,6 +16,7 @@ use openjiuwen_foundation::llm::Model;
 use openjiuwen_foundation::Usage;
 use openjiuwen_test_support::{MockCompletion, ScriptedModel};
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 use crate::cli::history::History;
 use crate::cli::shell::{ShellOutput, ShellRunner};
@@ -56,6 +57,8 @@ struct FakeShell {
     calls: Mutex<Vec<(String, String)>>,
     /// What every call returns.
     reply: FakeReply,
+    /// Whether the cancellation token was already cancelled on each call.
+    cancellations: Mutex<Vec<bool>>,
 }
 
 impl FakeShell {
@@ -64,6 +67,7 @@ impl FakeShell {
         Arc::new(Self {
             calls: Mutex::new(Vec::new()),
             reply,
+            cancellations: Mutex::new(Vec::new()),
         })
     }
 
@@ -71,11 +75,25 @@ impl FakeShell {
     fn calls(&self) -> Vec<(String, String)> {
         self.calls.lock().unwrap().clone()
     }
+
+    /// Returns whether the cancellation token was already cancelled on each call.
+    fn cancellations(&self) -> Vec<bool> {
+        self.cancellations.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
 impl ShellRunner for FakeShell {
-    async fn run(&self, command: &str, cwd: &Path) -> Result<ShellOutput> {
+    async fn run_cancellable(
+        &self,
+        command: &str,
+        cwd: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<ShellOutput> {
+        self.cancellations
+            .lock()
+            .unwrap()
+            .push(cancel.is_cancelled());
         self.calls
             .lock()
             .unwrap()
@@ -423,6 +441,63 @@ async fn repl_sessions_lists_the_persisted_record() {
 // --- shell passthrough ---------------------------------------------------
 
 #[tokio::test]
+async fn repl_interrupt_cancels_the_turn_and_a_new_turn_gets_a_fresh_token() {
+    let temp = TempDir::new().unwrap();
+    let options = prepared_options(&temp);
+    let shell = FakeShell::new(FakeReply::Output(ShellOutput {
+        command: "echo hi".to_owned(),
+        stdout: "hi\n".to_owned(),
+        stderr: String::new(),
+        code: Some(0),
+        ..ShellOutput::default()
+    }));
+    let (io, _buffer) = scripted_io(&["!echo hi", "/exit"]);
+    let mut repl = repl_over(&options, io, Arc::new(ScriptedModel::text("unused")))
+        .await
+        .with_shell(shell.clone());
+
+    // One press aborts the turn: the `!cmd` runner races this very token.
+    let turn = repl.turn_cancellation();
+    assert!(!turn.is_cancelled());
+    assert_eq!(repl.on_interrupt(), InterruptAction::Abort);
+    assert!(
+        turn.is_cancelled(),
+        "Ctrl-C must reach the shell command, not only the agent"
+    );
+
+    // The next turn starts a fresh token, so the interrupt does not leak forward.
+    repl.run().await.unwrap();
+    assert_eq!(shell.calls().len(), 1);
+    assert_eq!(
+        shell.cancellations(),
+        vec![false],
+        "a new turn must hand the shell an uncancelled token"
+    );
+}
+
+#[tokio::test]
+async fn repl_reports_an_interrupted_shell_command() {
+    let temp = TempDir::new().unwrap();
+    let options = prepared_options(&temp);
+    let shell = FakeShell::new(FakeReply::Output(ShellOutput {
+        command: "sleep 9999".to_owned(),
+        stdout: String::new(),
+        stderr: String::new(),
+        code: None,
+        cancelled: true,
+        ..ShellOutput::default()
+    }));
+    let (io, buffer) = scripted_io(&["!sleep 9999", "/exit"]);
+    let mut repl = repl_over(&options, io, Arc::new(ScriptedModel::text("unused")))
+        .await
+        .with_shell(shell);
+    repl.run().await.unwrap();
+    let text = output(&buffer);
+    assert!(text.contains("Interrupted"), "{text}");
+    assert!(!text.contains("Exit code"), "{text}");
+}
+
+#[tokio::test]
 async fn repl_shell_command_prints_output_without_calling_the_model() {
     let temp = TempDir::new().unwrap();
     let options = prepared_options(&temp);
@@ -431,6 +506,7 @@ async fn repl_shell_command_prints_output_without_calling_the_model() {
         stdout: "hi\n".to_owned(),
         stderr: "oops\n".to_owned(),
         code: Some(3),
+        ..ShellOutput::default()
     }));
     let scripted = ScriptedModel::text("unused");
     let probe = scripted.clone();

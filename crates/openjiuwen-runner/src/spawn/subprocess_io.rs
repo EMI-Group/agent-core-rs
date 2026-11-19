@@ -46,7 +46,7 @@ use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::ChildStderr;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -70,6 +70,13 @@ const HEALTH_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Longest prefix of a child's stderr line echoed into the debug log.
 pub(super) const STDERR_PREVIEW_CHARS: usize = 512;
+
+/// Hard cap on the bytes retained from one child stderr line.
+///
+/// A child that writes one enormous line must never make the parent buffer it
+/// whole: everything past this cap is drained and discarded while the line is
+/// still streaming.
+pub(super) const STDERR_LINE_CAP_BYTES: usize = 8 * 1024;
 
 /// Takes the request lock, refusing to start when the handle is out of sync.
 async fn acquire(state: &ProcessState) -> Result<RequestGuard<'_>> {
@@ -505,17 +512,26 @@ pub(super) async fn read_frame(state: &ProcessState) -> Result<Option<SpawnMessa
 
 /// Drains the child's stderr into the debug log so a full pipe can never block
 /// it.
+///
+/// A line is read under [`STDERR_LINE_CAP_BYTES`]: the retained prefix is logged
+/// as a preview, everything past the cap is drained and discarded, and the
+/// truncation is recorded on the event, so one runaway line can never make the
+/// parent allocate without bound.
 pub(super) fn spawn_stderr_task(pid: Option<u32>, stderr: ChildStderr) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
+        let mut reader = BufReader::new(stderr);
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => debug!(
-                    target: TARGET,
-                    pid = ?pid,
-                    line = %line_preview(&line),
-                    "child stderr"
-                ),
+            match frames::read_line_capped(&mut reader, STDERR_LINE_CAP_BYTES).await {
+                Ok(Some(line)) => {
+                    let text = String::from_utf8_lossy(&line.bytes);
+                    debug!(
+                        target: TARGET,
+                        pid = ?pid,
+                        line = %line_preview(&text),
+                        truncated = line.truncated,
+                        "child stderr"
+                    );
+                }
                 Ok(None) => return,
                 Err(error) => {
                     trace!(target: TARGET, pid = ?pid, %error, "child stderr could not be read");

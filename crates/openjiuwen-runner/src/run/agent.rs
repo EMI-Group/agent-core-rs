@@ -20,8 +20,8 @@ use uuid::Uuid;
 
 use super::{
     effective_deadline, next_stream_step, record_stream_outcome, resolve_agent, resolve_session_id,
-    run_with_limits, trace_failure, trace_finish, trace_start, AgentRef, RunOptions, RunServices,
-    RunSpan, StreamStep, Teardown, LOG_TARGET,
+    run_with_limits, stream_frame_output, trace_failure, trace_finish, trace_start, AgentRef,
+    RunOptions, RunServices, RunSpan, StreamStep, Teardown, LOG_TARGET,
 };
 use crate::callback::{CallbackContext, CallbackEvent};
 
@@ -273,18 +273,26 @@ pub fn stream_agent(
                     break;
                 }
                 StreamStep::Frame(Some(Ok(chunk))) => {
-                    let context = CallbackContext::new(CallbackEvent::AgentStreamOutput)
-                        .with_component(card.id.clone())
-                        .with_index(index)
-                        .with_output(chunk.to_value())
-                        .with_session(Arc::clone(&session));
-                    if let Err(error) = services
-                        .callbacks
-                        .trigger(CallbackEvent::AgentStreamOutput, &context)
-                        .await
-                    {
-                        failure = Some(error);
-                        break;
+                    // A run without subscribers must not serialise every frame for
+                    // a callback that would return immediately.
+                    if let Some(output) = stream_frame_output(
+                        &services.callbacks,
+                        CallbackEvent::AgentStreamOutput,
+                        || chunk.to_value(),
+                    ) {
+                        let context = CallbackContext::new(CallbackEvent::AgentStreamOutput)
+                            .with_component(card.id.clone())
+                            .with_index(index)
+                            .with_output(output)
+                            .with_session(Arc::clone(&session));
+                        if let Err(error) = services
+                            .callbacks
+                            .trigger(CallbackEvent::AgentStreamOutput, &context)
+                            .await
+                        {
+                            failure = Some(error);
+                            break;
+                        }
                     }
                     index += 1;
                     yield Ok(chunk);
@@ -640,6 +648,69 @@ mod tests {
                 CallbackEvent::AgentStreamOutput,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_without_subscribers_yields_the_same_frames() {
+        // No handler is registered at all: the stream must still deliver every
+        // frame unchanged and never project one for the callback hot path.
+        let services = RunServices::new(
+            ResourceMgr::new(),
+            CallbackFramework::new(),
+            RunnerConfig::default().with_default_session_id("runner-default"),
+            None,
+        );
+        let frames: Vec<Result<AgentChunk>> = stream_agent(
+            services,
+            fake("fake"),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .collect()
+        .await;
+        assert_eq!(frames.len(), 2);
+        let chunks: Vec<AgentChunk> = frames.into_iter().map(Result::unwrap).collect();
+        assert_eq!(chunks[0].kind, "llm_output");
+        assert_eq!(chunks[0].payload, json!("one"));
+        assert_eq!(chunks[1].kind, "answer");
+        assert_eq!(chunks[1].payload, json!("two"));
+    }
+
+    #[tokio::test]
+    async fn a_stream_subscriber_receives_every_frame_in_order() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let services = RunServices::new(
+            ResourceMgr::new(),
+            CallbackFramework::new(),
+            RunnerConfig::default().with_default_session_id("runner-default"),
+            None,
+        );
+        let seen = Arc::clone(&observed);
+        services.callbacks.register_sync(
+            CallbackEvent::AgentStreamOutput,
+            0,
+            move |ctx: &CallbackContext| {
+                seen.lock().unwrap().push((ctx.index, ctx.output.clone()));
+                Ok(CallbackVerdict::Continue)
+            },
+        );
+        let frames: Vec<Result<AgentChunk>> = stream_agent(
+            services,
+            fake("fake"),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .collect()
+        .await;
+        assert_eq!(frames.len(), 2);
+        let observed = observed.lock().unwrap().clone();
+        assert_eq!(
+            observed.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            vec![Some(0), Some(1)],
+            "every frame arrives once, in order, under its 0-based index"
+        );
+        assert_eq!(observed[0].1.as_ref().unwrap()["payload"], json!("one"));
+        assert_eq!(observed[1].1.as_ref().unwrap()["payload"], json!("two"));
     }
 
     #[tokio::test]
