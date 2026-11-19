@@ -454,27 +454,23 @@ fn marker_count(frames: &[Result<AgentChunk>]) -> usize {
         .count()
 }
 
-/// Asserts the four coordination bus publications the scenario's calls produce, in publication order.
+/// Asserts the four coordination publications plus the run's completion, in publication order.
 ///
-/// A settled run also announces itself on the bus (`team_completed`), so that publication is
-/// optional here and checked on its own: the four coordination events keep their strict order and
-/// payloads, and a completion may appear at most once, right after the mail the run follows.
+/// A settled run reports its completion twice: the `team.completed` stream frame (asserted by the
+/// caller) and exactly one `team_completed` bus publication, so an observer holding no stream still
+/// learns the team completed. Both are part of the contract, so the completion is required here and
+/// pinned between the mail the run follows and the task the caller creates afterwards.
 fn assert_bus_publications(events: &[EventMessage], mail_id: &str) {
-    let mut coordination = events.to_vec();
-    coordination.retain(|event| event.event_type != "team_completed");
-    assert!(
-        events.len() - coordination.len() <= 1,
-        "a settled run publishes the completion at most once: {events:?}"
-    );
     assert_eq!(
-        event_types(&coordination),
+        event_types(events),
         [
             "member_status_changed",
             "message",
+            "team_completed",
             "task_created",
             "task_status_changed"
         ],
-        "the bus carries exactly the four coordination publications, in order: {events:?}"
+        "the bus carries the coordination publications and one completion, in order: {events:?}"
     );
 
     let status = find_event(events, "member_status_changed", |payload| {
@@ -514,26 +510,20 @@ fn assert_bus_publications(events: &[EventMessage], mail_id: &str) {
         "publication order follows the calls: {events:?}"
     );
 
-    if let Some(completed) = events
-        .iter()
-        .position(|event| event.event_type == "team_completed")
-    {
-        assert_eq!(
-            events[completed].payload["team_name"],
-            json!(TEAM),
-            "the settlement names its team: {events:?}"
-        );
-        assert_eq!(
-            events[completed].payload["reason"],
-            json!("settled"),
-            "the settlement names why the team completed: {events:?}"
-        );
-        assert!(
-            message < completed && completed < created,
-            "the settled run publishes its completion after the mail and before the caller's task: \
-             {events:?}"
-        );
-    }
+    let completed = find_event(events, "team_completed", |payload| {
+        payload["team_name"] == json!(TEAM)
+    })
+    .expect("the settled run publishes its completion on the bus");
+    assert_eq!(
+        events[completed].payload["reason"],
+        json!("settled"),
+        "the settlement names why the team completed: {events:?}"
+    );
+    assert!(
+        message < completed && completed < created,
+        "the settled run publishes its completion after the mail and before the caller's task: \
+         {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -605,19 +595,42 @@ async fn event_bus_records_member_task_and_mail_publications_in_order() {
     let snapshot = events.lock().unwrap().clone();
     assert_bus_publications(&snapshot, &mail.message_id);
 
-    // The settled run announces itself on the bus exactly once, beside the stream marker asserted
-    // above, so an observer with no stream still learns the team completed.
-    let completions = snapshot
-        .iter()
-        .filter(|event| event.event_type == "team_completed")
-        .collect::<Vec<_>>();
+    // A blocking `invoke` is the same run without a stream: there is no frame to observe, so the
+    // bus publication is the *only* completion its caller-side observers can see, and it must
+    // still arrive exactly once.
+    let blocking = Fixture::new();
+    let blocking_agent = build(&blocking).await;
+    let blocking_events: Arc<Mutex<Vec<EventMessage>>> = Arc::new(Mutex::new(Vec::new()));
+    let blocking_recorded = Arc::clone(&blocking_events);
+    let blocking_sink: EventSink =
+        Arc::new(move |event: EventMessage| blocking_recorded.lock().unwrap().push(event));
+    blocking_agent
+        .backend()
+        .messager()
+        .subscribe("observer", &[TeamTopic::Team], blocking_sink)
+        .expect("the observer subscribes");
+    within(
+        "blocking team run",
+        blocking_agent.invoke(json!("ship the release"), None),
+    )
+    .await
+    .expect("the blocking run answers");
+    let blocking_snapshot = blocking_events.lock().unwrap().clone();
     assert_eq!(
-        completions.len(),
-        1,
-        "the settled run publishes the completion once: {snapshot:?}"
+        event_types(&blocking_snapshot),
+        ["team_completed"],
+        "a blocking run has no stream, so the bus carries the whole completion: {blocking_snapshot:?}"
     );
-    assert_eq!(completions[0].payload["team_name"], json!(TEAM));
-    assert_eq!(completions[0].payload["reason"], json!("settled"));
+    assert_eq!(blocking_snapshot[0].payload["team_name"], json!(TEAM));
+    assert_eq!(blocking_snapshot[0].payload["reason"], json!("settled"));
+    assert!(
+        blocking
+            .factory
+            .sends(LEADER)
+            .iter()
+            .any(|text| text == "ship the release"),
+        "the blocking run's query reaches the leader verbatim"
+    );
 }
 
 #[tokio::test]

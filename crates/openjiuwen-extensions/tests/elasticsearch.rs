@@ -846,6 +846,21 @@ async fn mount_document_index_creation(server: &MockServer) {
         .await;
 }
 
+/// The hits of one `search_after` page: `doc-{index:06}` documents for
+/// `start..end`, each carrying the `sort` value the next page continues from.
+fn document_page(start: usize, end: usize) -> Vec<Value> {
+    (start..end)
+        .map(|index| {
+            let id = format!("doc-{index:06}");
+            json!({
+                "_id": id,
+                "_source": {"id": id, "age": index, "name": format!("Doc {index}")},
+                "sort": [id],
+            })
+        })
+        .collect()
+}
+
 /// Mounts the `POST /{index}/_bulk` write that accepts every item.
 async fn mount_document_bulk(server: &MockServer) {
     Mock::given(method("POST"))
@@ -1060,25 +1075,55 @@ async fn document_get_reads_a_hit_and_a_miss() {
 #[tokio::test]
 async fn document_query_sends_the_filter_order_and_paging() {
     let server = MockServer::start().await;
+    // The caller's `order_by` criteria in order, plus the keyword `id`
+    // tiebreaker the store appends so `search_after` has a total order.
+    let sort = json!([
+        {"age": {
+            "order": "desc",
+            "missing": "_last",
+            "unmapped_type": "keyword",
+        }},
+        {"id": {
+            "order": "asc",
+            "missing": "_last",
+            "unmapped_type": "keyword",
+        }},
+    ]);
+    // `offset + limit` is 501, so the opening page asks for one full
+    // `SEARCH_PAGE_SIZE` page and no `from`.
     Mock::given(method("POST"))
         .and(path(format!("{INDEX}/_search")))
         .and(body_json(json!({
             "query": {"range": {"age": {"gte": 18}}},
-            "from": 1,
-            "size": 2,
-            "track_total_hits": true,
-            "sort": [{"age": {
-                "order": "desc",
-                "missing": "_last",
-                "unmapped_type": "keyword",
-            }}],
+            "_source": true,
+            "size": 500,
+            "sort": sort.clone(),
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "hits": {
-                "total": {"value": 2, "relation": "eq"},
+                "total": {"value": 501, "relation": "eq"},
+                "hits": document_page(0, 500),
+            },
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The second page continues from the previous page's last `sort` value and
+    // asks for the rest of the window.
+    Mock::given(method("POST"))
+        .and(path(format!("{INDEX}/_search")))
+        .and(body_json(json!({
+            "query": {"range": {"age": {"gte": 18}}},
+            "_source": true,
+            "size": 1,
+            "sort": sort,
+            "search_after": ["doc-000499"],
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "hits": {
+                "total": {"value": 501, "relation": "eq"},
                 "hits": [
-                    {"_id": "b", "_source": {"id": "b", "name": "Bob", "age": 24}},
-                    {"_id": "a", "_source": {"name": "Ada", "age": 20}},
+                    {"_id": "doc-000500", "_source": {"age": 500}, "sort": ["doc-000500"]},
                 ],
             },
         })))
@@ -1088,7 +1133,7 @@ async fn document_query_sends_the_filter_order_and_paging() {
 
     let query = Query {
         filter: json!({"age": {"$gte": 18}}),
-        limit: Some(2),
+        limit: Some(500),
         offset: 1,
         order_by: vec![("age".to_string(), SortOrder::Desc)],
     };
@@ -1096,18 +1141,21 @@ async fn document_query_sends_the_filter_order_and_paging() {
         .query("docs", &query)
         .await
         .expect("query");
-    assert_eq!(documents.len(), 2);
-    assert_eq!(documents[0].id, "b");
+    assert_eq!(documents.len(), 500, "`offset` trims the page window");
     assert_eq!(
-        documents[0].fields.get("name"),
-        Some(&json!("Bob")),
+        documents[0].id, "doc-000001",
+        "`offset` skips the first match"
+    );
+    assert_eq!(
+        documents[1].id, "doc-000002",
         "the hit order of the server is kept"
     );
+    assert_eq!(documents[1].fields.get("name"), Some(&json!("Doc 2")));
+    assert_eq!(documents[1].fields.get("age"), Some(&json!(2)));
     assert_eq!(
-        documents[1].id, "a",
+        documents[499].id, "doc-000500",
         "a `_source` without `id` is completed from `_id`"
     );
-    assert_eq!(documents[1].fields.get("age"), Some(&json!(20)));
 }
 
 #[tokio::test]

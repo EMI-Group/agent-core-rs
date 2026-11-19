@@ -168,11 +168,11 @@ struct HangModel {
 
 #[async_trait]
 impl Model for HangModel {
-    fn provider(&self) -> &str {
+    fn provider(&self) -> &'static str {
         "hang"
     }
 
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "hang"
     }
 
