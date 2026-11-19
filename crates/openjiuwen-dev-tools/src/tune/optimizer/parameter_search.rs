@@ -31,8 +31,17 @@
 //! [`candidate_space`] turns a baseline and a list of alternative parameter maps
 //! into the per-key choice lists Python derives from `[base, *parameters]`, and
 //! [`generate_candidates`] expands those lists into the cross product.
+//!
+//! A search never expands more of that space than its `sample_num`: a small
+//! space (at most [`MAX_MATERIALISED_CANDIDATES`] combinations) is expanded and
+//! shuffled exactly as before, while a large one is sampled by drawing the
+//! mixed-radix indices of the non-baseline combinations directly. Ten parameters
+//! with ten choices each is 10¹⁰ maps, which no materialisation survives; the
+//! direct path needs only `sample_num` map lookups. A space whose cardinality
+//! does not fit the platform index type is a typed validation error rather than an
+//! overflow.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 
 use openjiuwen_common::error::{Error, Result};
@@ -45,6 +54,15 @@ use crate::tune::prng::Rng64;
 /// Python `DEFAULT_CANDIDATES_SAMPLE_NUM`: how many parameter candidates one
 /// search evaluates.
 pub const DEFAULT_CANDIDATES_SAMPLE_NUM: usize = 6;
+
+/// The largest cross product a search expands before sampling.
+///
+/// A space at or below this size is materialised and shuffled, so its sample is
+/// bit-identical to the historical implementation. A larger space is sampled by
+/// drawing mixed-radix indices directly: expanding it would allocate the whole
+/// cross product first (`10` parameters with `10` choices each is 10¹⁰ maps) and
+/// run out of memory before a single candidate was scored.
+pub const MAX_MATERIALISED_CANDIDATES: usize = 1 << 16;
 
 /// Expands per-parameter choice lists into their cross product.
 ///
@@ -76,6 +94,114 @@ pub fn generate_candidates(params: &BTreeMap<String, Vec<Value>>) -> Vec<BTreeMa
         combinations = next;
     }
     combinations
+}
+
+/// How many candidates `params` expands to, without expanding them.
+///
+/// An empty map, and a map with any empty value list, yields `0` — exactly what
+/// [`generate_candidates`] returns for those inputs.
+///
+/// # Errors
+///
+/// [`Error::validation`] when the cross product does not fit `usize`, naming the
+/// parameter whose choices overflow it.
+fn candidate_cardinality(params: &BTreeMap<String, Vec<Value>>) -> Result<usize> {
+    if params.is_empty() {
+        return Ok(0);
+    }
+    let mut total = 1_usize;
+    for (key, values) in params {
+        if values.is_empty() {
+            return Ok(0);
+        }
+        total = total.checked_mul(values.len()).ok_or_else(|| {
+            Error::validation(format!(
+                "parameter search space overflows usize above the option `{key}`; tune \
+                     fewer parameters or give them fewer alternatives"
+            ))
+        })?;
+    }
+    Ok(total)
+}
+
+/// The candidate at mixed-radix `rank`, in [`generate_candidates`] order.
+///
+/// The last key of the [`BTreeMap`] varies fastest, so rank `1` is the first
+/// non-baseline combination and rank `total - 1` the last.
+fn candidate_at(space: &BTreeMap<String, Vec<Value>>, mut rank: usize) -> BTreeMap<String, Value> {
+    let mut candidate = BTreeMap::new();
+    for (key, values) in space.iter().rev() {
+        // `candidate_space` never yields an empty choice list; a defensive empty
+        // list would otherwise divide by zero.
+        let choice = rank.checked_rem(values.len()).unwrap_or(0);
+        rank /= values.len().max(1);
+        if let Some(value) = values.get(choice) {
+            candidate.insert(key.clone(), value.clone());
+        }
+    }
+    candidate
+}
+
+/// `take` distinct indices drawn uniformly from `0..population`.
+///
+/// A partial Fisher-Yates pass from the front: position `position` is swapped with
+/// a uniformly drawn position at or after it, and only the positions touched so
+/// far are remembered. That draws a uniform sample in `O(take)` time and memory
+/// instead of materialising (and shuffling) the whole population.
+fn sample_ranks(rng: &mut Rng64, population: usize, take: usize) -> Vec<usize> {
+    let mut displaced: HashMap<usize, usize> = HashMap::with_capacity(take);
+    let mut ranks = Vec::with_capacity(take);
+    for position in 0..take {
+        let draw = position + rng.below(population - position);
+        let drawn = displaced.get(&draw).copied().unwrap_or(draw);
+        if draw == position {
+            displaced.remove(&position);
+        } else {
+            let at_position = displaced.remove(&position).unwrap_or(position);
+            displaced.insert(draw, at_position);
+        }
+        ranks.push(drawn);
+    }
+    ranks
+}
+
+/// The sample a search evaluates: `sample_num` distinct non-baseline candidates.
+///
+/// A space of at most [`MAX_MATERIALISED_CANDIDATES`] combinations goes through
+/// the historical expand-shuffle-truncate path, so it yields exactly the same
+/// sample as before. A larger space draws the mixed-radix ranks of its
+/// non-baseline combinations directly; candidate `0` (the all-first-value
+/// combination) is never sampled either way.
+///
+/// # Errors
+///
+/// [`Error::validation`] when the cross product overflows `usize`.
+fn sample_candidates(
+    space: &BTreeMap<String, Vec<Value>>,
+    sample_num: usize,
+    seed: u64,
+) -> Result<Vec<BTreeMap<String, Value>>> {
+    let total = candidate_cardinality(space)?;
+    let alternatives = total.saturating_sub(1);
+    let take = sample_num.min(alternatives);
+    if take == 0 {
+        return Ok(Vec::new());
+    }
+    if total <= MAX_MATERIALISED_CANDIDATES {
+        let mut candidates = generate_candidates(space);
+        if !candidates.is_empty() {
+            candidates.remove(0);
+        }
+        let mut rng = Rng64::new(seed);
+        rng.shuffle(&mut candidates);
+        candidates.truncate(take);
+        return Ok(candidates);
+    }
+    let mut rng = Rng64::new(seed);
+    Ok(sample_ranks(&mut rng, alternatives, take)
+        .into_iter()
+        .map(|rank| candidate_at(space, rank + 1))
+        .collect())
 }
 
 /// Builds the per-parameter choice lists of a search space.
@@ -197,8 +323,11 @@ impl ParameterSearcher {
     /// 1. builds the space with [`candidate_space`] and the candidates with
     ///    [`generate_candidates`],
     /// 2. drops candidate `0` (the all-baseline combination),
-    /// 3. shuffles the rest with the seeded Fisher-Yates and keeps the first
-    ///    `min(sample_num, len)`,
+    /// 3. keeps a seeded sample of `min(sample_num, len)` of the rest: a space of
+    ///    at most [`MAX_MATERIALISED_CANDIDATES`] combinations is expanded and
+    ///    shuffled as before, a larger one is sampled by drawing its mixed-radix
+    ///    indices directly, so a huge space costs the sample, not the cross
+    ///    product,
     /// 4. evaluates them in that order through `evaluate`, replacing the winner
     ///    only when a score is **strictly** greater than `base_score` (so a tied
     ///    candidate never displaces the baseline or an earlier winner), and
@@ -208,8 +337,9 @@ impl ParameterSearcher {
     /// # Errors
     ///
     /// [`Error::validation`] when `base_score` is not finite, `sample_num` is
-    /// zero, `base_parameters` declares no parameter, or a variant misses a base
-    /// key; otherwise the first error `evaluate` returns.
+    /// zero, `base_parameters` declares no parameter, a variant misses a base
+    /// key, or the cross product does not fit `usize`; otherwise the first error
+    /// `evaluate` returns.
     pub async fn search_best<F, Fut>(
         &self,
         base_score: f64,
@@ -238,13 +368,7 @@ impl ParameterSearcher {
         }
 
         let space = candidate_space(&base_parameters, parameters)?;
-        let mut candidates = generate_candidates(&space);
-        if !candidates.is_empty() {
-            candidates.remove(0);
-        }
-        let mut rng = Rng64::new(self.seed);
-        rng.shuffle(&mut candidates);
-        candidates.truncate(self.sample_num);
+        let candidates = sample_candidates(&space, self.sample_num, self.seed)?;
 
         let mut best_score = base_score;
         let mut best_parameters = base_parameters;
@@ -705,6 +829,125 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(capped.evaluated, 2);
+    }
+
+    #[test]
+    fn mixed_radix_decoding_matches_the_expanded_cross_product() {
+        let mut params = BTreeMap::new();
+        params.insert("a".to_owned(), values(&["a1", "a2", "a3"]));
+        params.insert("b".to_owned(), values(&["b1", "b2"]));
+        let expanded = generate_candidates(&params);
+        let decoded: Vec<_> = (0..expanded.len())
+            .map(|rank| candidate_at(&params, rank))
+            .collect();
+        assert_eq!(decoded, expanded);
+        let cardinality = candidate_cardinality(&params).unwrap();
+        assert_eq!(cardinality, expanded.len());
+    }
+
+    #[test]
+    fn cardinality_of_empty_spaces_is_zero_and_overflow_is_a_validation_error() {
+        assert_eq!(candidate_cardinality(&BTreeMap::new()).unwrap(), 0);
+        let mut with_empty = BTreeMap::new();
+        with_empty.insert("a".to_owned(), values(&["a1"]));
+        with_empty.insert("b".to_owned(), Vec::new());
+        assert_eq!(candidate_cardinality(&with_empty).unwrap(), 0);
+
+        // 20 parameters with 20 choices each is 20^20, far above u64::MAX.
+        let mut huge = BTreeMap::new();
+        for key in 0..20 {
+            let choices: Vec<Value> = (0..20).map(|choice| text(&format!("v{choice}"))).collect();
+            huge.insert(format!("k{key}"), choices);
+        }
+        let error = candidate_cardinality(&huge).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.to_string().contains("search space"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_small_space_keeps_its_pinned_sample() {
+        let base = entries(&[("a", "a0"), ("b", "b0")]);
+        let variants = [
+            entries(&[("a", "a1"), ("b", "b1")]),
+            entries(&[("a", "a2"), ("b", "b2")]),
+            entries(&[("a", "a3"), ("b", "b3")]),
+        ];
+        let order = RefCell::new(Vec::new());
+        let outcome = ParameterSearcher::new()
+            .with_seed(7)
+            .search_best(0.0, base, &variants, |candidate| {
+                order.borrow_mut().push(render(candidate));
+                async { Ok((0.5, vec![evaluated("c", 0.5)])) }
+            })
+            .await
+            .unwrap();
+
+        // The 16-combination space stays on the materialised path, so its
+        // seeded Fisher-Yates sample is exactly the historical one.
+        assert_eq!(outcome.evaluated, DEFAULT_CANDIDATES_SAMPLE_NUM);
+        assert_eq!(order.into_inner(), SAMPLED_ORDER);
+    }
+
+    /// The sample [`ParameterSearcher::new`] with seed `7` draws from
+    /// `{a: [a0..a3], b: [b0..b3]}`, in evaluation order.
+    const SAMPLED_ORDER: [&str; DEFAULT_CANDIDATES_SAMPLE_NUM] = [
+        "a=a3,b=b3",
+        "a=a1,b=b2",
+        "a=a0,b=b1",
+        "a=a3,b=b1",
+        "a=a0,b=b2",
+        "a=a2,b=b3",
+    ];
+
+    #[tokio::test]
+    async fn a_huge_space_is_sampled_without_materialising_it() {
+        // Ten parameters with ten choices each: 10^10 combinations, which the
+        // cross product could never hold.
+        let base: BTreeMap<String, Value> = (0..10)
+            .map(|key| (format!("k{key}"), text(&format!("k{key}=0"))))
+            .collect();
+        let variants: Vec<BTreeMap<String, Value>> = (1..10)
+            .map(|choice| {
+                (0..10)
+                    .map(|key| (format!("k{key}"), text(&format!("k{key}={choice}"))))
+                    .collect()
+            })
+            .collect();
+
+        let baseline = render(&base);
+        let order = RefCell::new(Vec::new());
+        let started = std::time::Instant::now();
+        let outcome = ParameterSearcher::new()
+            .with_sample_num(3)
+            .search_best(0.0, base, &variants, |candidate| {
+                order.borrow_mut().push(render(candidate));
+                async { Ok((0.5, vec![evaluated("c", 0.5)])) }
+            })
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(outcome.evaluated, 3);
+        let sample = order.into_inner();
+        assert_eq!(sample.len(), 3);
+        assert!(
+            sample
+                .iter()
+                .all(|rendered| rendered.split(',').count() == 10),
+            "every candidate is complete: {sample:?}"
+        );
+        let mut unique = sample.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "the sample holds distinct candidates");
+        assert!(
+            sample.iter().all(|rendered| *rendered != baseline),
+            "the all-baseline combination is never sampled: {sample:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "sampling 10^10 combinations took {elapsed:?}"
+        );
     }
 
     #[tokio::test]

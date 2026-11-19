@@ -53,7 +53,7 @@ pub use instruction::InstructionOptimizer;
 pub use joint::JointOptimizer;
 pub use parameter_search::{
     candidate_space, generate_candidates, ParameterSearchOutcome, ParameterSearcher,
-    DEFAULT_CANDIDATES_SAMPLE_NUM,
+    DEFAULT_CANDIDATES_SAMPLE_NUM, MAX_MATERIALISED_CANDIDATES,
 };
 pub use search::PromptSearchOptimizer;
 pub use search_config::{

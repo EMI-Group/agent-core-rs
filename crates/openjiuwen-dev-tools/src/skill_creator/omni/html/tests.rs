@@ -171,7 +171,7 @@ fn close_matching_pairs_the_innermost_open_tag() {
     let stray = HtmlDocument::parse("</a><a href=x>ok</a>", "");
     assert_eq!(link_pairs(&stray), vec![("x", "ok")]);
     // Nested anchors: the inner one keeps its text, the unclosed outer one does not.
-    let anchors = HtmlDocument::parse(r#"<a href=x>first<a href=y>second</a>"#, "");
+    let anchors = HtmlDocument::parse("<a href=x>first<a href=y>second</a>", "");
     assert_eq!(link_pairs(&anchors), vec![("x", ""), ("y", "second")]);
 }
 
