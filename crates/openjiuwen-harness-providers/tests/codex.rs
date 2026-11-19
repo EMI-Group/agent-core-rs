@@ -706,8 +706,7 @@ fn process_alive(pid: u32) -> bool {
         .arg("-c")
         .arg(format!("kill -0 {pid} 2>/dev/null"))
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 /// Waits until `pid` no longer exists, failing the test past the deadline.

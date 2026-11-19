@@ -181,12 +181,18 @@ impl TurnCycleTracker {
         self.settle_if_ready()
     }
 
-    /// Settles a turn whose last messages never drew a receipt.
+    /// Settles a turn whose submitted messages never drew a receipt.
+    ///
+    /// Only messages the CLI never acknowledged are dropped: one it took (`queued`/`started`) is
+    /// this turn's work however long its answer runs, so it keeps blocking the turn and this
+    /// returns `false`.
     pub fn abandon_unacknowledged(&mut self) -> bool {
         if self.turn_id.is_none() || self.settled {
             return false;
         }
-        self.abandon("never acknowledged");
+        self.abandon_where("never acknowledged", |state| {
+            *state == CommandState::Submitted
+        });
         self.settle_if_ready()
     }
 
@@ -226,17 +232,29 @@ impl TurnCycleTracker {
 
     /// Drops the outstanding set, reporting why.
     fn abandon(&mut self, reason: &str) {
-        if self.outstanding.is_empty() {
+        self.abandon_where(reason, |_| true);
+    }
+
+    /// Drops the outstanding messages `select` accepts, reporting why.
+    fn abandon_where(&mut self, reason: &str, select: impl Fn(&CommandState) -> bool) {
+        let ids: Vec<String> = self
+            .outstanding
+            .iter()
+            .filter(|(_, state)| select(state))
+            .map(|(message_id, _)| message_id.clone())
+            .collect();
+        if ids.is_empty() {
             return;
         }
-        let ids: Vec<&str> = self.outstanding.keys().map(String::as_str).collect();
+        for message_id in &ids {
+            self.outstanding.remove(message_id);
+        }
+        self.ack_deadline = None;
         self.diagnostics.push(format!(
             "{reason} {} message(s): {}",
-            self.outstanding.len(),
+            ids.len(),
             ids.join(", ")
         ));
-        self.outstanding.clear();
-        self.ack_deadline = None;
     }
 
     /// Settles the turn when a result arrived and nothing is outstanding any more.
@@ -316,10 +334,10 @@ mod tests {
 
     /// Decodes one frame object.
     fn frame(value: JsonValue) -> serde_json::Map<String, JsonValue> {
-        value
-            .as_object()
-            .cloned()
-            .expect("the test frame is a JSON object")
+        match value {
+            JsonValue::Object(object) => object,
+            _ => panic!("the test frame is a JSON object"),
+        }
     }
 
     /// Builds the user frame the driver writes for `message_id`.
@@ -389,7 +407,10 @@ mod tests {
         assert!(tracker.straggler_timeout().is_none(), "a taken message");
         assert!(!tracker.note_inbound(&result("success", false)));
         assert!(tracker.note_inbound(&receipt("message-2", "completed")));
-        assert!(tracker.drain_diagnostics().is_empty());
+        assert!(
+            tracker.drain_diagnostics().is_empty(),
+            "every message drew its receipt"
+        );
     }
 
     /// A failed result abandons the outstanding receipts and settles at once.
@@ -436,7 +457,50 @@ mod tests {
         assert!(tracker.straggler_timeout().is_none());
         tokio::time::sleep(ACK * 3).await;
         assert!(!tracker.abandon_unacknowledged(), "still working");
-        assert!(tracker.drain_diagnostics().is_empty());
+        assert_eq!(tracker.outstanding(), 1, "the started message still counts");
+        assert!(
+            tracker.drain_diagnostics().is_empty(),
+            "nothing was abandoned"
+        );
+    }
+
+    /// A queued message is a message the CLI took, so the deadline never abandons it either.
+    #[test]
+    fn a_queued_message_never_times_out() {
+        let mut tracker = tracking(ACK, &["message-1"]);
+        tracker.note_inbound(&receipt("message-1", "queued"));
+        assert!(!tracker.note_inbound(&result("success", false)));
+        assert!(tracker.straggler_timeout().is_none(), "a taken message");
+        assert!(!tracker.abandon_unacknowledged(), "still queued");
+        assert_eq!(tracker.outstanding(), 1);
+        assert!(
+            tracker.drain_diagnostics().is_empty(),
+            "nothing was abandoned"
+        );
+    }
+
+    /// The deadline abandons only the messages the CLI never acknowledged.
+    #[tokio::test]
+    async fn only_unacknowledged_messages_are_abandoned() {
+        let mut tracker = tracking(ACK, &["message-1", "message-2"]);
+        tracker.note_inbound(&receipt("message-1", "started"));
+        assert!(!tracker.note_inbound(&result("success", false)));
+        tokio::time::sleep(ACK * 3).await;
+        assert!(
+            !tracker.abandon_unacknowledged(),
+            "the started message is still working"
+        );
+        assert_eq!(tracker.outstanding(), 1, "only the started message is left");
+        let diagnostics = tracker.drain_diagnostics();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("message-2") && !diagnostics[0].contains("message-1"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            tracker.note_inbound(&receipt("message-1", "completed")),
+            "the taken message settles the turn when it completes"
+        );
     }
 
     /// Sub-agent messages are never tracked, and neither are frames outside a turn.

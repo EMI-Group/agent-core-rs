@@ -131,7 +131,7 @@ pub fn merge_pending_error(pending: Option<&TurnError>, terminal: TurnError) -> 
     let mut category = terminal.category.clone();
     let mut retryable = terminal.retryable;
     let mut provider_data = terminal.provider_data.clone();
-    let generic_terminal = terminal.provider_data.get("http_status").is_none()
+    let generic_terminal = !terminal.provider_data.contains_key("http_status")
         || terminal.category.as_deref() == Some("sdk_error");
     if generic_terminal
         && pending
@@ -139,7 +139,7 @@ pub fn merge_pending_error(pending: Option<&TurnError>, terminal: TurnError) -> 
             .as_deref()
             .is_some_and(|category| category != "sdk_error")
     {
-        category = pending.category.clone();
+        category.clone_from(&pending.category);
         retryable = pending.retryable;
         if provider_data.is_empty() {
             provider_data = pending.provider_data.clone();
