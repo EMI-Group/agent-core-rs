@@ -369,14 +369,20 @@ orchestrator.rs PaperStatus { Running, Completed, Failed, Cancelled }; PaperTask
 command.rs  CommandSpec { program, args, cwd, env, env_remove, timeout, merge_stderr, stdin }
               new + arg/args/cwd/env/env_remove/timeout/merge_stderr/stdin/with_default_timeout,
               command_line()
-            CommandOutcome { code: Option<i32>, stdout, stderr, timed_out, cancelled, duration }
+            CommandOutcome { code: Option<i32>, stdout, stderr, timed_out, cancelled,
+              truncated, duration } (`truncated` is `#[serde(default)]`)
               success(), combined_output(), truncated_output(limit), success_with/failure_with/
               timed_out_after/cancelled_after, require_success(label)
             #[async_trait] trait CommandRunner { name; run(CommandSpec); run_cancellable(spec, token)
               (default: select over run and cancellation; the child is kill-on-drop) }
-            ProcessCommandRunner { new, with_default_timeout, default_timeout } — tokio::process,
-              kill_on_drop, stdin per spec, lossy UTF-8 with one trailing newline stripped,
-              missing executable → Error::config, other spawn failure → Error::tool, timeout → data
+            MAX_OUTPUT_BYTES (10 MiB) / DEFAULT_COMMAND_TIMEOUT (600 s) — the two documented bounds
+            ProcessCommandRunner { default_timeout, max_output_bytes }:
+              new (both defaults), without_default_timeout / clear_default_timeout (deadline opt-out),
+              with_default_timeout, with_max_output_bytes, default_timeout, max_output_bytes
+              — tokio::process, kill_on_drop, stdin per spec, lossy UTF-8 with one trailing newline
+              stripped, missing executable → Error::config, other spawn failure → Error::tool,
+              timeout → data. Reads are capped while reading (the surplus is drained, not retained),
+              merged stderr shares the same ceiling, and truncation is reported, never an error
             FakeCommandRunner { reply, fallback, calls, call_count, command_lines } + FakeReply
               { program ("*" wildcard), args_contain, outcome }; unmatched → Error::tool
             decode_output(bytes) -> String
@@ -583,7 +589,7 @@ These three are the only places the crate constructs `Error::Unsupported` (`rg U
 - `tests/member_optimizer.rs` — selection formula/order/beam/confidence filter, wave layering and cycle/unknown/duplicate errors, verification checks (success, missing outcome, undeclared write path, escape, missing target, repairable), and the end-to-end pass (`NoTargets`, `NoActions`, `Success`, `PartialSuccess`, `PlanningRejected`, one repair round, artifact round-trip).
 - `tests/ledger.rs` — token alias matrix, `usage_snapshot`, JSONL round trip and replay with no double counting, malformed line → `Error::session`, task-id mismatch, pending-call delivery checks, and per-model/per-stage aggregation.
 - `tests/progress.rs` — progress-event serde round trip, defaults, `from_bool`, callback delivery and the `None` callback no-op.
-- `tests/runtime_command.rs` — real `ProcessCommandRunner` exit/merge/timeout/cancellation/missing-program behaviour (Unix-gated where needed) and `FakeCommandRunner` matching/recording.
+- `tests/runtime_command.rs` — real `ProcessCommandRunner` exit/merge/timeout/cancellation/missing-program behaviour (Unix-gated where needed), the bounded defaults plus both deadline opt-outs, output-ceiling truncation over a 100 MB newline-free child and over merged streams (the child must still exit normally), `FakeCommandRunner` matching/recording, and backward-compatible deserialization without the `truncated` flag.
 - `tests/runtime_git.rs` — porcelain status buckets, `add_paths` empty, branch/commit failures as data, `has_commits_against_base`, push escalation, cherry-pick abort, `slugify_topic`, credential scrubbing and auth env.
 - `tests/runtime_ci.rs` — gate config parsing (fail-closed), command normalisation, changed-line ranges, finding filter, failure-output sanitising, gate outcomes, action selection and `__CI_CHECK_FAIL__`.
 - `tests/runtime_python.rs` — JSON/JUnit report parsing (attribute order, self-closing, entities, malformed root), `pytest_args`, venv idempotency, pip failure text, `run_pytest` over a fake runner with a written report, and the subprocess evaluator's Tagged/Files success, failed exit and cleanup.
@@ -603,6 +609,7 @@ These three are the only places the crate constructs `Error::Unsupported` (`rg U
 - Evaluation scores are `Option<f64>` per case so "ungraded" is representable and never folded into an average (Python `test_evaluator.py` behaviour).
 - `SessionState`/`SingleHarnessState`/`PaperTaskState` are the checkpoint units; resume is a full state restore, plus idempotency keys (`batch_key`/`attempt_key`) for the batch-level loops.
 - Process execution is one seam (`CommandRunner`) with exit codes as data and timeouts as outcomes: every git/CI/pytest/subprocess layer composes it, so a scripted fake drives all of them and no library code spawns a process directly.
+- The real runner is bounded by default (600 s deadline, 10 MiB retained per stream) because a bare unbounded runner let a hung command outlive the session budget and a chatty one OOM the process; the ceiling is enforced while reading and the surplus is drained so the child still exits, and both bounds stay overridable with an explicit deadline opt-out.
 - Git prompts are suppressed (`GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=""`, `GCM_INTERACTIVE=never`) and credentials/tokens are scrubbed from any output that can reach logs or reports.
 - The CI gate is fail-closed: a malformed gate config yields no gates (a failed report), findings are scoped to changed lines for display only, and `__CI_CHECK_FAIL__` in a successful command's output still fails the gate.
 - The evaluator package is split at the model boundary: records, verdict parsing, score/penalty arithmetic, benchmark argv/report parsing and metrics are local; the solver (`CaseExecutionBackend`) and the judge model stay injected. An unavailable or unusable verdict is an ungraded result, never a pass.
