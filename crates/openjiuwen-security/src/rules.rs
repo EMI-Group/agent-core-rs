@@ -6,6 +6,7 @@
 //! never a panic.
 
 use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
 
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
@@ -98,17 +99,20 @@ pub struct TextMatch {
 /// skipped when its byte range overlaps a range already claimed by an earlier
 /// rule or by an earlier match of the same rule, so the result never contains
 /// overlapping ranges.
+///
+/// Claims are kept in an ordered `RangeClaims` map, so the overlap test is
+/// `O(log m)` instead of a scan: `m` matches cost `O(m log m)` rather than
+/// `O(m²)`, which matters for a tool result holding thousands of `PII` hits.
 #[must_use]
 pub fn find_all(rules: &[CompiledRule], text: &str) -> Vec<TextMatch> {
-    let mut claimed: Vec<(usize, usize)> = Vec::new();
+    let mut claimed = RangeClaims::new();
     let mut matches = Vec::new();
     for rule in rules {
         for found in rule.regex.find_iter(text) {
             let range = (found.start(), found.end());
-            if overlaps_any(&claimed, range) {
+            if !claimed.try_claim(range) {
                 continue;
             }
-            claimed.push(range);
             matches.push(TextMatch {
                 rule: rule.name.clone(),
                 start: range.0,
@@ -121,39 +125,144 @@ pub fn find_all(rules: &[CompiledRule], text: &str) -> Vec<TextMatch> {
 
 /// Replaces every non-overlapping range in `text` with `marker`.
 ///
-/// Ranges are applied from the end of the string backwards, so byte offsets stay
-/// valid while replacing. Invalid ranges are skipped instead of panicking: an
-/// empty or inverted range, a range beyond the end of `text`, a range whose
-/// bounds are not UTF-8 character boundaries, and a range overlapping one that
-/// was already replaced.
+/// Ranges are considered from the end of the string backwards, so when two
+/// ranges overlap the **rightmost** one wins; ranges with the same start are
+/// considered in input order, so the first of them wins (the previous
+/// end-first implementation sorted them unstably, leaving that tie
+/// unspecified). Invalid ranges are skipped instead of panicking: an empty or
+/// inverted range, a range beyond the end of `text`, and a range whose bounds
+/// are not UTF-8 character boundaries.
+///
+/// The accepted ranges are selected in one descending pass and the result is
+/// rebuilt in one ascending pass with a single pre-sized allocation, so `m`
+/// ranges cost `O(m log m)` time (the sort) and no per-range string memmove.
 #[must_use]
 pub fn redact_ranges(text: &str, ranges: &[(usize, usize)], marker: &str) -> String {
-    let mut sorted = ranges.to_vec();
-    sorted.sort_unstable_by_key(|&(start, _)| Reverse(start));
-    let mut result = text.to_owned();
-    let mut replaced: Vec<(usize, usize)> = Vec::new();
-    for (start, end) in sorted {
-        if start >= end
-            || end > text.len()
-            || !text.is_char_boundary(start)
-            || !text.is_char_boundary(end)
-        {
+    let mut candidates: Vec<(usize, usize)> = ranges
+        .iter()
+        .copied()
+        .filter(|&(start, end)| {
+            start < end
+                && end <= text.len()
+                && text.is_char_boundary(start)
+                && text.is_char_boundary(end)
+        })
+        .collect();
+    // Descending start order, input order as the tiebreak.
+    candidates.sort_by_key(|&(start, _)| Reverse(start));
+
+    // While walking right to left the accepted ranges stay pairwise disjoint,
+    // so only the leftmost accepted range can still touch a candidate: if it
+    // starts before the candidate ends, the two overlap. That makes selection
+    // a single linear pass.
+    let mut accepted: Vec<(usize, usize)> = Vec::with_capacity(candidates.len());
+    let mut leftmost_start: Option<usize> = None;
+    for (start, end) in candidates {
+        if leftmost_start.is_some_and(|leftmost| end > leftmost) {
             continue;
         }
-        if overlaps_any(&replaced, (start, end)) {
-            continue;
-        }
-        result.replace_range(start..end, marker);
-        replaced.push((start, end));
+        leftmost_start = Some(start);
+        accepted.push((start, end));
     }
+
+    let mut result = String::with_capacity(text.len() + accepted.len() * marker.len());
+    let mut cursor = 0;
+    for &(start, end) in accepted.iter().rev() {
+        result.push_str(&text[cursor..start]);
+        result.push_str(marker);
+        cursor = end;
+    }
+    result.push_str(&text[cursor..]);
     result
 }
 
-/// Whether `range` shares at least one byte with a claimed range.
-fn overlaps_any(claimed: &[(usize, usize)], range: (usize, usize)) -> bool {
-    claimed
-        .iter()
-        .any(|&(start, end)| range.0 < end && start < range.1)
+/// The byte ranges one scan has already claimed, indexed by offset.
+///
+/// A candidate is claimable when it shares no byte with an accepted range.
+/// Accepted ranges are pairwise disjoint, so keeping them ordered by start
+/// makes that test two [`BTreeMap`] probes instead of a scan over every claim:
+/// claiming `m` ranges costs `O(m log m)` rather than `O(m²)`.
+///
+/// An empty range (`start == end`, which an empty-matching regex can produce)
+/// blocks nothing by itself but does block a candidate that strictly contains
+/// its offset, exactly like the byte-wise overlap test it replaces; those
+/// offsets live in a separate set so they cannot shadow a real claim.
+#[derive(Debug, Default)]
+pub(crate) struct RangeClaims {
+    /// Non-empty claims, start → end; disjoint, so starts are unique.
+    starts: BTreeMap<usize, usize>,
+    /// Offsets of accepted empty claims.
+    points: BTreeSet<usize>,
+}
+
+impl RangeClaims {
+    /// An empty claim set.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Claims `range`, reporting whether it was free.
+    ///
+    /// An inverted range is treated as unclaimable input: like
+    /// [`redact_ranges`], the caller's invalid range neither blocks nor is
+    /// recorded.
+    pub(crate) fn try_claim(&mut self, (start, end): (usize, usize)) -> bool {
+        if start > end {
+            return true;
+        }
+        if self.overlaps(start, end) {
+            return false;
+        }
+        if start == end {
+            self.points.insert(start);
+        } else {
+            // Two non-empty claims can never share a start (the second would
+            // overlap the first), so a start-keyed map is lossless here.
+            self.starts.insert(start, end);
+        }
+        true
+    }
+
+    /// The claimed ranges, ascending by start, empty claims included (as
+    /// `(point, point)`), so a caller sees exactly what it claimed.
+    pub(crate) fn ranges(&self) -> Vec<(usize, usize)> {
+        let mut ranges: Vec<(usize, usize)> = self
+            .starts
+            .iter()
+            .map(|(&start, &end)| (start, end))
+            .chain(self.points.iter().map(|&point| (point, point)))
+            .collect();
+        ranges.sort_unstable();
+        ranges
+    }
+
+    /// Whether `start..end` shares at least one byte with a claimed range.
+    fn overlaps(&self, start: usize, end: usize) -> bool {
+        // An empty claim blocks only when its offset sits strictly inside the
+        // candidate: `start < point && point < end`.
+        if start < end && self.points.range(start + 1..end).next().is_some() {
+            return true;
+        }
+        // The nearest claim starting before `start` overlaps when it ends after
+        // `start`.
+        if self
+            .starts
+            .range(..start)
+            .next_back()
+            .is_some_and(|(_, claimed_end)| *claimed_end > start)
+        {
+            return true;
+        }
+        // The nearest claim starting at or after `start` overlaps when it
+        // starts before `end` and ends after `start` (the latter only fails for
+        // a claim that shares the candidate's start and is empty).
+        self.starts
+            .range(start..)
+            .next()
+            .is_some_and(|(claimed_start, claimed_end)| {
+                *claimed_start < end && *claimed_end > start
+            })
+    }
 }
 
 /// Validates a number with the Luhn checksum, ignoring non-digit characters.
@@ -303,5 +412,269 @@ mod tests {
     #[test]
     fn redact_ranges_skips_overlapping_ranges() {
         assert_eq!(redact_ranges("abcdef", &[(0, 4), (2, 6)], "*"), "ab*");
+    }
+
+    /// The replaced end-first implementation, kept verbatim as the differential
+    /// oracle for [`redact_ranges`].
+    fn redact_ranges_reference(text: &str, ranges: &[(usize, usize)], marker: &str) -> String {
+        let mut sorted = ranges.to_vec();
+        sorted.sort_unstable_by_key(|&(start, _)| Reverse(start));
+        let mut result = text.to_owned();
+        let mut replaced: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in sorted {
+            if start >= end
+                || end > text.len()
+                || !text.is_char_boundary(start)
+                || !text.is_char_boundary(end)
+            {
+                continue;
+            }
+            if replaced
+                .iter()
+                .any(|&(claimed_start, claimed_end)| start < claimed_end && claimed_start < end)
+            {
+                continue;
+            }
+            result.replace_range(start..end, marker);
+            replaced.push((start, end));
+        }
+        result
+    }
+
+    /// The replaced rule-order scan, kept verbatim as the differential oracle
+    /// for [`find_all`].
+    fn find_all_reference(rules: &[CompiledRule], text: &str) -> Vec<TextMatch> {
+        let mut claimed: Vec<(usize, usize)> = Vec::new();
+        let mut matches = Vec::new();
+        for rule in rules {
+            for found in rule.regex.find_iter(text) {
+                let (start, end) = (found.start(), found.end());
+                if claimed
+                    .iter()
+                    .any(|&(claimed_start, claimed_end)| start < claimed_end && claimed_start < end)
+                {
+                    continue;
+                }
+                claimed.push((start, end));
+                matches.push(TextMatch {
+                    rule: rule.name.clone(),
+                    start,
+                    end,
+                });
+            }
+        }
+        matches
+    }
+
+    #[test]
+    fn redact_ranges_is_byte_identical_to_the_end_first_algorithm() {
+        let unicode = "héllo wörld ünïcode";
+        let é = unicode.find('é').unwrap();
+        let ö = unicode.find('ö').unwrap();
+        let cases: Vec<(&str, Vec<(usize, usize)>)> = vec![
+            ("", vec![]),
+            ("", vec![(0, 0), (0, 1)]),
+            ("abcdef", vec![]),
+            ("abcdef", vec![(0, 6)]),
+            // Rightmost wins.
+            ("abcdef", vec![(2, 6), (0, 4)]),
+            ("abcdef", vec![(0, 4), (2, 6)]),
+            // Nested, distinct starts.
+            ("abcdefgh", vec![(0, 8), (2, 5), (1, 7)]),
+            ("abcdefgh", vec![(2, 5), (0, 8), (1, 7)]),
+            // Adjacent ranges all apply.
+            ("abcdef", vec![(0, 2), (2, 4), (4, 6)]),
+            ("abcdef", vec![(4, 6), (0, 2), (2, 4)]),
+            // Identical ranges: one replacement.
+            ("abcdef", vec![(2, 5), (2, 5)]),
+            ("abcdef", vec![(2, 5), (2, 5), (2, 5)]),
+            // Empty, inverted, and out-of-bounds ranges are skipped.
+            (
+                "abcdef",
+                vec![(2, 2), (3, 1), (0, 999), (5, 5), (999, 1000)],
+            ),
+            // Multibyte ranges.
+            (unicode, vec![(é, é + 2), (ö, ö + 2)]),
+            (unicode, vec![(é, ö), (ö, ö + 2), (0, é)]),
+            // A boundary inside a multibyte character is skipped.
+            (unicode, vec![(é + 1, é + 3)]),
+            // Out-of-order with a duplicate.
+            ("abcdef", vec![(4, 6), (0, 2), (4, 6), (1, 3)]),
+        ];
+        for (text, ranges) in cases {
+            assert_eq!(
+                redact_ranges(text, &ranges, "<R>"),
+                redact_ranges_reference(text, &ranges, "<R>"),
+                "text {text:?} ranges {ranges:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_ranges_matches_the_end_first_algorithm_on_many_overlaps() {
+        let text: String = (0..400u32)
+            .map(|index| {
+                if index % 7 == 0 {
+                    '\n'
+                } else {
+                    char::from(b'a' + (index % 26) as u8)
+                }
+            })
+            .collect();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut ranges: Vec<(usize, usize)> = (0..200)
+            .map(|index| {
+                // Strictly increasing starts keep the tie-break out of the
+                // oracle comparison; the lengths make the ranges overlap.
+                let start = index * 2;
+                (start, (start + (next() % 9) as usize).min(text.len()))
+            })
+            .collect();
+        ranges.rotate_left(37);
+        assert_eq!(
+            redact_ranges(&text, &ranges, "<R>"),
+            redact_ranges_reference(&text, &ranges, "<R>")
+        );
+    }
+
+    #[test]
+    fn redact_ranges_keeps_the_rightmost_range_and_the_first_input_tiebreak() {
+        // The rightmost range wins an overlap, so the left replacement is lost.
+        assert_eq!(redact_ranges("abcdef", &[(0, 4), (2, 6)], "*"), "ab*");
+        assert_eq!(redact_ranges("abcdef", &[(2, 6), (0, 4)], "*"), "ab*");
+        // Ranges with the same start: the first one in input order wins (the
+        // replaced implementation sorted them unstably, so this was unspecified).
+        assert_eq!(redact_ranges("abcdef", &[(2, 6), (2, 4)], "*"), "ab*");
+        assert_eq!(redact_ranges("abcdef", &[(2, 4), (2, 6)], "*"), "ab*ef");
+        // The inner range wins and the enclosing one is dropped, because the
+        // inner one starts further right.
+        assert_eq!(redact_ranges("abcdef", &[(0, 6), (2, 3)], "*"), "ab*def");
+        assert_eq!(redact_ranges("abcdef", &[(2, 3), (0, 6)], "*"), "ab*def");
+    }
+
+    #[test]
+    fn redact_ranges_handles_thousands_of_matches() {
+        let mut text = String::new();
+        for index in 0..5_000 {
+            text.push_str("user");
+            text.push_str(&index.to_string());
+            text.push_str("@example.com ");
+        }
+        let ranges: Vec<(usize, usize)> = text
+            .match_indices('@')
+            .map(|(at, _)| {
+                let start = text[..at].rfind(' ').map_or(0, |space| space + 1);
+                let end = text[at..].find(' ').map_or(text.len(), |space| at + space);
+                (start, end)
+            })
+            .collect();
+        assert_eq!(ranges.len(), 5_000);
+        let redacted = redact_ranges(&text, &ranges, "<REDACTED>");
+        assert_eq!(redacted.matches("<REDACTED>").count(), 5_000);
+        assert!(!redacted.contains('@'));
+    }
+
+    #[test]
+    fn redact_ranges_handles_thousands_of_overlapping_candidates() {
+        // Every one of the 5_000 ranges overlaps its neighbours, so the old
+        // quadratic overlap scan did ~12.5M comparisons; the result must still
+        // be the same rightmost-wins selection.
+        let text: String = "x".repeat(20_000);
+        let ranges: Vec<(usize, usize)> = (0..5_000)
+            .map(|index| {
+                let start = index * 2;
+                (start, start + 8)
+            })
+            .collect();
+        let redacted = redact_ranges(&text, &ranges, "*");
+        assert_eq!(redacted, redact_ranges_reference(&text, &ranges, "*"));
+        // The leftmost 8 bytes of every accepted block are claimed first, and
+        // the 2-byte stride means only every fourth candidate survives: 1_250
+        // disjoint 8-byte blocks replace 10_000 bytes.
+        assert_eq!(redacted.matches('*').count(), 1_250);
+        assert_eq!(redacted.len(), 20_000 - 1_250 * 8 + 1_250);
+    }
+
+    #[test]
+    fn find_all_is_identical_to_the_rule_order_scan() {
+        let rules = vec![
+            CompiledRule::compile("first", r"abc", false).unwrap(),
+            CompiledRule::compile("second", r"cde", false).unwrap(),
+            CompiledRule::compile("third", r"xyz", false).unwrap(),
+            CompiledRule::compile("outer", r"bcd", false).unwrap(),
+            CompiledRule::compile("inner", r"c", false).unwrap(),
+        ];
+        for text in ["abcde xyz", "xyzabc", "", "ccc", "abcdefghij"] {
+            assert_eq!(
+                find_all(&rules, text),
+                find_all_reference(&rules, text),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_all_keeps_empty_matches_from_claiming_a_later_range() {
+        // `x*` matches the empty string at every offset; the old byte-wise
+        // overlap test let an empty claim at a strictly interior offset block a
+        // later range, and the map-backed claim set must reproduce that.
+        let empty = CompiledRule::compile("empty", r"x*", false).unwrap();
+        let word = CompiledRule::compile("word", r"ab", false).unwrap();
+        let rules = vec![empty.clone(), word.clone()];
+        let matches = find_all(&rules, "ab");
+        assert_eq!(
+            matches
+                .iter()
+                .map(|found| (found.rule.as_str(), found.start, found.end))
+                .collect::<Vec<_>>(),
+            vec![("empty", 0, 0), ("empty", 1, 1), ("empty", 2, 2)]
+        );
+        assert_eq!(matches, find_all_reference(&rules, "ab"));
+        // With no empty claim in between, the word range is accepted.
+        assert_eq!(
+            find_all(std::slice::from_ref(&word), "ab"),
+            vec![TextMatch {
+                rule: "word".to_owned(),
+                start: 0,
+                end: 2
+            }]
+        );
+        // Reversing the rule order claims the word first, so only the empty
+        // matches outside its bytes survive.
+        let reversed = vec![word, empty];
+        let matches = find_all(&reversed, "ab");
+        assert_eq!(
+            matches
+                .iter()
+                .map(|found| (found.rule.as_str(), found.start, found.end))
+                .collect::<Vec<_>>(),
+            vec![("word", 0, 2), ("empty", 0, 0), ("empty", 2, 2)]
+        );
+        assert_eq!(matches, find_all_reference(&reversed, "ab"));
+    }
+
+    #[test]
+    fn find_all_claims_thousands_of_ranges_without_quadratic_scans() {
+        let mut text = String::new();
+        for index in 0..2_000 {
+            text.push('a');
+            text.push_str(&index.to_string());
+            text.push(' ');
+        }
+        let word = CompiledRule::compile("word", r"a\w*", false).unwrap();
+        let digit = CompiledRule::compile("digit", r"\d+", false).unwrap();
+        let matches = find_all(&[word, digit], &text);
+        assert_eq!(
+            matches.len(),
+            2_000,
+            "every inner digit match overlaps a word"
+        );
+        assert!(matches.iter().all(|found| found.rule == "word"));
     }
 }

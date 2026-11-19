@@ -69,7 +69,10 @@
 //!     }
 //!
 //!     async fn check(&self, ctx: &GuardrailContext) -> Result<GuardrailResult> {
-//!         if ctx.text_view().contains(self.0) {
+//!         // The checked projection: a payload no detector can read is a typed
+//!         // failure for the pipeline's failure policy, never a silent pass.
+//!         let text = ctx.text_view_checked()?;
+//!         if text.contains(self.0) {
 //!             Ok(GuardrailResult::block(
 //!                 RiskLevel::High,
 //!                 "banned_word",

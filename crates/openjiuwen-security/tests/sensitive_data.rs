@@ -468,3 +468,33 @@ async fn unscannable_payload_blocks_instead_of_passing() {
     assert_eq!(error.kind(), ErrorKind::Security);
     assert!(error.to_string().contains("unscannable content"), "{error}");
 }
+
+// No Python equivalent: the claim set used to be a linear scan per match, so a
+// tool result holding thousands of PII hits cost O(m²) comparisons in the
+// async task running the scan. The scan now claims ranges through an ordered
+// map; the selection (and therefore the redaction) must be unchanged.
+#[test]
+fn thousands_of_matches_are_found_and_redacted() {
+    let guardrail = SensitiveDataGuardrail::new();
+    let mut text = String::new();
+    for index in 0..2_000 {
+        text.push_str("row ");
+        text.push_str(&index.to_string());
+        text.push_str(": someone");
+        text.push_str(&index.to_string());
+        text.push_str("@example.com ");
+    }
+    let outcome = guardrail.redact_text(&text);
+    assert_eq!(outcome.matches.len(), 2_000);
+    assert!(outcome.matches.iter().all(|found| found.pattern == "email"));
+    assert_eq!(outcome.redacted.matches("<REDACTED>").count(), 2_000);
+    assert!(!outcome.redacted.contains('@'));
+    // The ranges are the non-overlapping ones, in ascending order.
+    let mut previous_end = 0;
+    for found in &outcome.matches {
+        assert!(found.start < found.end);
+        assert!(found.start >= previous_end);
+        assert!(text[found.start..found.end].contains('@'));
+        previous_end = found.end;
+    }
+}
