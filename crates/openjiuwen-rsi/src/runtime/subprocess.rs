@@ -99,6 +99,7 @@ impl Default for SubprocessResult {
                 stderr: String::new(),
                 timed_out: false,
                 cancelled: false,
+                truncated: false,
                 duration: Duration::ZERO,
             },
             workdir: PathBuf::new(),

@@ -13,6 +13,12 @@
 //! downstream layers (git, CI gates, pytest) can be tested without spawning
 //! processes.
 //!
+//! Every real run is bounded: [`DEFAULT_COMMAND_TIMEOUT`] preempts a command
+//! that never finishes, and [`MAX_OUTPUT_BYTES`] caps what is retained from each
+//! stream while the surplus is drained. Both are overridable (and the deadline
+//! can be removed) through the [`ProcessCommandRunner`] builders; truncation is
+//! reported on [`CommandOutcome::truncated`], never by dropping the run.
+//!
 //! Decoding choice: both streams are decoded as UTF-8 lossily and exactly one
 //! trailing newline is stripped (including the `\r\n` pair), matching the
 //! Python helpers' `rstrip()` on command output without hiding internal blank
@@ -31,6 +37,22 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use openjiuwen_common::error::{Error, Result};
+
+/// Default ceiling on the bytes retained from one command stream.
+///
+/// The remainder is still drained from the pipe (so a child never blocks on a
+/// full pipe) but is not kept, so a runaway command's memory cost is bounded no
+/// matter how much it writes. Override it with
+/// [`ProcessCommandRunner::with_max_output_bytes`].
+pub const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Default fallback deadline applied to specs that carry no timeout.
+///
+/// Long enough for a real test suite or git operation, short enough that a hung
+/// command cannot outlive the session budget. Override it with
+/// [`ProcessCommandRunner::with_default_timeout`], or opt out of the bound with
+/// [`ProcessCommandRunner::without_default_timeout`].
+pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A description of one external command.
 ///
@@ -179,6 +201,13 @@ pub struct CommandOutcome {
     pub timed_out: bool,
     /// Whether the command was cancelled through a [`CancellationToken`].
     pub cancelled: bool,
+    /// Whether either retained stream was cut off at the runner's output ceiling.
+    ///
+    /// Set when the child wrote more than [`MAX_OUTPUT_BYTES`] (or the runner's
+    /// configured ceiling) on a stream; the retained text is the head of that
+    /// stream and the surplus was drained and discarded.
+    #[serde(default)]
+    pub truncated: bool,
     /// Wall-clock duration of the run.
     pub duration: Duration,
 }
@@ -193,6 +222,7 @@ impl CommandOutcome {
             stderr: String::new(),
             timed_out: false,
             cancelled: false,
+            truncated: false,
             duration: Duration::ZERO,
         }
     }
@@ -206,6 +236,7 @@ impl CommandOutcome {
             stderr: String::new(),
             timed_out: false,
             cancelled: false,
+            truncated: false,
             duration: Duration::ZERO,
         }
     }
@@ -219,6 +250,7 @@ impl CommandOutcome {
             stderr: String::new(),
             timed_out: true,
             cancelled: false,
+            truncated: false,
             duration,
         }
     }
@@ -232,6 +264,7 @@ impl CommandOutcome {
             stderr: String::new(),
             timed_out: false,
             cancelled: true,
+            truncated: false,
             duration,
         }
     }
@@ -367,17 +400,45 @@ pub trait CommandRunner: Send + Sync {
 /// Children are spawned with `kill_on_drop`, a null stdin by default, and piped
 /// output, so dropping the future (cancellation) or hitting the deadline kills
 /// the process instead of leaking it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Every run is bounded twice: [`ProcessCommandRunner::default_timeout`]
+/// ([`DEFAULT_COMMAND_TIMEOUT`] unless overridden) preempts a command that never
+/// finishes, and [`ProcessCommandRunner::max_output_bytes`]
+/// ([`MAX_OUTPUT_BYTES`] unless overridden) caps what is retained from each
+/// stream. The surplus is drained, so a chatty command still exits normally and
+/// reports [`CommandOutcome::truncated`] instead of exhausting memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessCommandRunner {
     default_timeout: Option<Duration>,
+    max_output_bytes: usize,
+}
+
+impl Default for ProcessCommandRunner {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProcessCommandRunner {
-    /// Creates a runner with no default timeout.
+    /// Creates a runner with the documented defaults: [`DEFAULT_COMMAND_TIMEOUT`]
+    /// and [`MAX_OUTPUT_BYTES`].
     #[must_use]
     pub fn new() -> Self {
         Self {
+            default_timeout: Some(DEFAULT_COMMAND_TIMEOUT),
+            max_output_bytes: MAX_OUTPUT_BYTES,
+        }
+    }
+
+    /// Creates a runner without a fallback deadline.
+    ///
+    /// This is the explicit opt-out of [`DEFAULT_COMMAND_TIMEOUT`]; the output
+    /// ceiling still applies.
+    #[must_use]
+    pub fn without_default_timeout() -> Self {
+        Self {
             default_timeout: None,
+            max_output_bytes: MAX_OUTPUT_BYTES,
         }
     }
 
@@ -386,6 +447,30 @@ impl ProcessCommandRunner {
     pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = Some(timeout);
         self
+    }
+
+    /// Removes the fallback deadline (the explicit opt-out of
+    /// [`DEFAULT_COMMAND_TIMEOUT`]).
+    #[must_use]
+    pub fn clear_default_timeout(mut self) -> Self {
+        self.default_timeout = None;
+        self
+    }
+
+    /// Sets how many bytes are retained from each stream.
+    ///
+    /// `usize::MAX` restores the pre-ceiling behaviour and is not recommended:
+    /// a runaway command can then exhaust memory.
+    #[must_use]
+    pub fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
+        self.max_output_bytes = max_output_bytes;
+        self
+    }
+
+    /// Returns how many bytes are retained from each stream.
+    #[must_use]
+    pub fn max_output_bytes(&self) -> usize {
+        self.max_output_bytes
     }
 
     /// Returns the fallback deadline, if any.
@@ -445,8 +530,11 @@ impl CommandRunner for ProcessCommandRunner {
         }
 
         let timeout = spec.timeout.or(self.default_timeout);
+        let max_output_bytes = self.max_output_bytes;
         let (stdout, stderr, code) = if let Some(limit) = timeout {
-            if let Ok(result) = tokio::time::timeout(limit, collect_output(&mut child)).await {
+            if let Ok(result) =
+                tokio::time::timeout(limit, collect_output(&mut child, max_output_bytes)).await
+            {
                 let (stdout, stderr, status) =
                     result.map_err(|error| read_error(&spec.program, &error))?;
                 (stdout, stderr, status.code())
@@ -471,22 +559,26 @@ impl CommandRunner for ProcessCommandRunner {
                     stderr: String::new(),
                     timed_out: true,
                     cancelled: false,
+                    truncated: false,
                     duration: started.elapsed(),
                 });
             }
         } else {
-            let (stdout, stderr, status) = collect_output(&mut child)
+            let (stdout, stderr, status) = collect_output(&mut child, max_output_bytes)
                 .await
                 .map_err(|error| read_error(&spec.program, &error))?;
             (stdout, stderr, status.code())
         };
 
-        let (stdout, stderr) = if spec.merge_stderr {
-            let mut combined = stdout;
-            combined.extend(stderr);
-            (decode_output(&combined), String::new())
+        let (stdout, stderr, truncated) = if spec.merge_stderr {
+            let (combined, truncated) = merge_captured(stdout, &stderr, max_output_bytes);
+            (decode_output(&combined), String::new(), truncated)
         } else {
-            (decode_output(&stdout), decode_output(&stderr))
+            (
+                decode_output(&stdout.bytes),
+                decode_output(&stderr.bytes),
+                stdout.truncated || stderr.truncated,
+            )
         };
 
         Ok(CommandOutcome {
@@ -495,6 +587,7 @@ impl CommandRunner for ProcessCommandRunner {
             stderr,
             timed_out: false,
             cancelled: false,
+            truncated,
             duration: started.elapsed(),
         })
     }
@@ -514,31 +607,81 @@ fn read_error(program: &str, error: &io::Error) -> Error {
     Error::tool(format!("failed to read output of `{program}`: {error}"))
 }
 
-/// Reads one optional stream to end.
-async fn read_stream<R>(stream: Option<R>, buffer: &mut Vec<u8>) -> io::Result<()>
+/// One captured stream: at most the ceiling, plus whether anything was dropped.
+struct Captured {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl Captured {
+    fn empty() -> Self {
+        Self {
+            bytes: Vec::new(),
+            truncated: false,
+        }
+    }
+}
+
+/// Reads one optional stream to end, retaining at most `limit` bytes.
+///
+/// The cap is enforced while reading: once `limit` bytes are held, the read
+/// loop keeps draining the pipe (so a chatty child never blocks on a full pipe
+/// and exits normally) but discards the surplus, and the pre-allocation is
+/// bounded so the buffer never grows past the ceiling.
+async fn read_stream<R>(stream: Option<R>, limit: usize) -> io::Result<Captured>
 where
     R: AsyncRead + Unpin,
 {
-    match stream {
-        Some(mut stream) => stream.read_to_end(buffer).await.map(|_| ()),
-        None => Ok(()),
+    let Some(mut stream) = stream else {
+        return Ok(Captured::empty());
+    };
+    let mut captured = Captured {
+        bytes: Vec::with_capacity(limit.min(64 * 1024)),
+        truncated: false,
+    };
+    // Heap-allocated so the read future stays small (the buffer is reused).
+    let mut chunk = vec![0u8; 8192];
+    loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(captured);
+        }
+        let room = limit.saturating_sub(captured.bytes.len());
+        let kept = room.min(read);
+        captured.bytes.extend_from_slice(&chunk[..kept]);
+        if kept < read {
+            captured.truncated = true;
+        }
     }
+}
+
+/// Combines the two captured streams, keeping at most `limit` bytes.
+///
+/// Output is appended in capture order (stdout first, then stderr) and the
+/// retained prefix never exceeds the ceiling, so `merge_stderr` cannot double
+/// the memory cost.
+fn merge_captured(stdout: Captured, stderr: &Captured, limit: usize) -> (Vec<u8>, bool) {
+    let mut truncated = stdout.truncated || stderr.truncated;
+    let mut combined = stdout.bytes;
+    let room = limit.saturating_sub(combined.len());
+    if stderr.bytes.len() > room {
+        truncated = true;
+    }
+    combined.extend_from_slice(&stderr.bytes[..stderr.bytes.len().min(room)]);
+    (combined, truncated)
 }
 
 /// Reads both pipes and waits for the child, avoiding pipe-buffer deadlocks.
 async fn collect_output(
     child: &mut tokio::process::Child,
-) -> io::Result<(Vec<u8>, Vec<u8>, std::process::ExitStatus)> {
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let (stdout_result, stderr_result, status) = tokio::join!(
-        read_stream(child.stdout.take(), &mut stdout),
-        read_stream(child.stderr.take(), &mut stderr),
+    max_output_bytes: usize,
+) -> io::Result<(Captured, Captured, std::process::ExitStatus)> {
+    let (stdout, stderr, status) = tokio::join!(
+        read_stream(child.stdout.take(), max_output_bytes),
+        read_stream(child.stderr.take(), max_output_bytes),
         child.wait(),
     );
-    stdout_result?;
-    stderr_result?;
-    Ok((stdout, stderr, status?))
+    Ok((stdout?, stderr?, status?))
 }
 
 /// One scripted reply for [`FakeCommandRunner`].

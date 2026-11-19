@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use openjiuwen_common::error::ErrorKind;
 use openjiuwen_rsi::runtime::command::{
     decode_output, CommandOutcome, CommandRunner, CommandSpec, FakeCommandRunner, FakeReply,
-    ProcessCommandRunner,
+    ProcessCommandRunner, DEFAULT_COMMAND_TIMEOUT, MAX_OUTPUT_BYTES,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -35,8 +35,9 @@ async fn process_runner_captures_success() {
     assert!(!outcome.timed_out);
     assert!(!outcome.cancelled);
     assert!(outcome.duration > Duration::ZERO);
+    assert!(!outcome.truncated);
     assert_eq!(runner.name(), "process");
-    assert_eq!(runner.default_timeout(), None);
+    assert_eq!(runner.default_timeout(), Some(DEFAULT_COMMAND_TIMEOUT));
 }
 
 #[cfg(unix)]
@@ -325,6 +326,7 @@ fn outcome_helpers_and_serde_round_trip() {
         stderr: "err".to_owned(),
         timed_out: false,
         cancelled: false,
+        truncated: false,
         duration: Duration::from_millis(12),
     };
     let json = serde_json::to_string(&outcome).unwrap();
@@ -341,4 +343,123 @@ fn outcome_helpers_and_serde_round_trip() {
         ..CommandOutcome::success_with("")
     };
     assert_eq!(stderr_only.combined_output(), "only-error");
+}
+#[test]
+fn new_runner_defaults_are_bounded_and_the_opt_out_is_explicit() {
+    // The regression: a bare runner used to have no deadline and no ceiling.
+    let runner = ProcessCommandRunner::new();
+    assert_eq!(runner.default_timeout(), Some(DEFAULT_COMMAND_TIMEOUT));
+    assert_eq!(runner.max_output_bytes(), MAX_OUTPUT_BYTES);
+    let deadline = runner.default_timeout().expect("a bounded default");
+    assert!(deadline > Duration::ZERO);
+    assert!(deadline <= Duration::from_secs(3600));
+    let ceiling = runner.max_output_bytes();
+    assert!(ceiling > 0 && ceiling < usize::MAX);
+    // `Default` matches `new`, so a derived-default caller is bounded too.
+    assert_eq!(
+        ProcessCommandRunner::default().default_timeout(),
+        Some(DEFAULT_COMMAND_TIMEOUT)
+    );
+    // Both explicit opt-outs exist.
+    assert_eq!(
+        ProcessCommandRunner::without_default_timeout().default_timeout(),
+        None
+    );
+    assert_eq!(
+        ProcessCommandRunner::new()
+            .clear_default_timeout()
+            .default_timeout(),
+        None
+    );
+    assert_eq!(
+        ProcessCommandRunner::new()
+            .with_default_timeout(Duration::from_secs(7))
+            .default_timeout(),
+        Some(Duration::from_secs(7))
+    );
+    assert_eq!(
+        ProcessCommandRunner::new()
+            .with_max_output_bytes(64)
+            .max_output_bytes(),
+        64
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn output_beyond_the_ceiling_is_truncated_and_drained() {
+    // 100 MiB written with no newline at all: the reader must stop retaining at
+    // the cap while still draining, so the child exits normally.
+    let cap = 1024 * 1024;
+    let started = Instant::now();
+    let outcome = ProcessCommandRunner::new()
+        .with_max_output_bytes(cap)
+        .run(
+            CommandSpec::new("sh")
+                .arg("-c")
+                .arg("head -c 104857600 /dev/zero")
+                .timeout(Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
+    assert!(
+        outcome.success(),
+        "the child must exit normally: {outcome:?}"
+    );
+    assert!(outcome.truncated);
+    assert_eq!(outcome.stdout.len(), cap);
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "the surplus was not drained: {:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn merged_streams_share_one_ceiling() {
+    let cap = 256 * 1024;
+    let outcome = ProcessCommandRunner::new()
+        .with_max_output_bytes(cap)
+        .run(
+            CommandSpec::new("sh")
+                .arg("-c")
+                .arg("head -c 200000 /dev/zero; head -c 200000 /dev/zero >&2")
+                .merge_stderr()
+                .timeout(Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
+    assert!(outcome.success(), "{outcome:?}");
+    assert!(outcome.truncated);
+    assert_eq!(outcome.stdout.len(), cap);
+    assert_eq!(outcome.stderr, "");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unmerged_streams_are_capped_independently() {
+    let cap = 128 * 1024;
+    let outcome = ProcessCommandRunner::new()
+        .with_max_output_bytes(cap)
+        .run(
+            CommandSpec::new("sh")
+                .arg("-c")
+                .arg("head -c 300000 /dev/zero; head -c 9000 /dev/zero >&2")
+                .timeout(Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
+    assert!(outcome.success(), "{outcome:?}");
+    assert_eq!(outcome.stdout.len(), cap);
+    assert_eq!(outcome.stderr.len(), 9000);
+    assert!(outcome.truncated);
+}
+
+#[test]
+fn outcomes_from_before_the_ceiling_deserialize_without_a_truncated_flag() {
+    let json = r#"{"code":0,"stdout":"ok","stderr":"","timed_out":false,"cancelled":false,"duration":{"secs":0,"nanos":0}}"#;
+    let outcome: CommandOutcome = serde_json::from_str(json).unwrap();
+    assert!(!outcome.truncated);
+    assert_eq!(outcome.stdout, "ok");
 }
