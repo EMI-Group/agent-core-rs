@@ -23,7 +23,7 @@ Crate path `openjiuwen_dev_tools::skill_creator::omni`, with `omni` re-exporting
 ### `html`
 
 - `HtmlDocument { title, description, headings, links, images, code_blocks, text }`, `Heading { level, text }`, `Link { href, text }`, `Image { src, alt }`.
-- `HtmlDocument::parse(html, base_url)` — total, never fails or hangs; hrefs are not resolved here.
+- `HtmlDocument::parse(html, base_url)` — total, never fails or hangs; hrefs are not resolved here. One pass builds a close-tag index (each close paired with the innermost open tag of the same name), so extraction is linear even on a page of 20 000 unterminated tags instead of rescanning to the end for each one.
 - `resolve_url(base, href) -> Option<String>` — absolute, protocol-relative, root-relative, `.`/`..` normalization; `None` for `mailto:`/`javascript:`/`data:`/`tel:`/`#fragment`/empty/non-http base.
 
 ### `archive` (see `./archive/CONTEXT.md`)
@@ -121,7 +121,7 @@ The outcome's `provenance` is `Model` only when the model's answer was accepted;
 
 ## Test Strategy
 
-- Unit tests live beside each module: `fetch.rs` (loopback TCP server, size cap, schemes, scripted fetcher), `html/tests.rs` (fixtures, entities, malformed markup, url resolution), `archive/{tar,zip,gzip,inflate}` + their `tests.rs` siblings (archive matrix, ZIP64 records and extra fields, ZipCrypto round trips and rejections, PAX/GNU extension records, symlink entries, DEFLATE golden/dynamic streams, gzip members, zip round-trip and caps), `crc.rs`/`sha256.rs` (published vectors), `filter/tests.rs` + `filter/dimensions/tests.rs` (sniffing, keep policy, extension mapping, icon heuristics, the dimension parser matrix, SHA-256 dedupe, slugify), `render.rs` (`strip_hallucinated_images` matrix, section rendering), `pipeline/tests.rs` + `pipeline/documents/tests.rs` (end-to-end URL→bundle read back through `SkillBundle::read`, archive and document page inputs, codec-suffix refusals, caps, blank page, model/fallback with provenance, saved-image provenance and persistence, determinism, config validation).
+- Unit tests live beside each module: `fetch.rs` (loopback TCP server, size cap, schemes, scripted fetcher), `html/tests.rs` (fixtures, entities, malformed markup, innermost-open close matching, 20 000 unclosed anchors staying under a second, url resolution), `archive/{tar,zip,gzip,inflate}` + their `tests.rs` siblings (archive matrix, ZIP64 records and extra fields, ZipCrypto round trips and rejections, PAX/GNU extension records, symlink entries, DEFLATE golden/dynamic streams, gzip members, zip round-trip and caps), `crc.rs`/`sha256.rs` (published vectors), `filter/tests.rs` + `filter/dimensions/tests.rs` (sniffing, keep policy, extension mapping, icon heuristics, the dimension parser matrix, SHA-256 dedupe, slugify), `render.rs` (`strip_hallucinated_images` matrix, section rendering), `pipeline/tests.rs` + `pipeline/documents/tests.rs` (end-to-end URL→bundle read back through `SkillBundle::read`, archive and document page inputs, codec-suffix refusals, caps, blank page, model/fallback with provenance, saved-image provenance and persistence, determinism, config validation).
 - `SkillCreator::create_from_url` is covered in `creator.rs`'s own test module; the crate-root `tests/omni_bundle.rs` covers the public seam.
 - Everything is offline and deterministic: `ScriptedFetcher` for HTTP, `TempWorkspace` for bundles, `ScriptedModel` for the model path, in-crate byte builders for archives and image headers, no wall-clock ordering.
 
