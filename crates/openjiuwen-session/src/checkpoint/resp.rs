@@ -12,9 +12,18 @@
 //! against the compiled-in `webpki_roots` roots plus the optional CA file a
 //! caller passes to [`RespConnection::connect_with_ca_file`], and its failures
 //! are [`openjiuwen_common::error::ErrorKind::Session`] errors naming the host.
+//!
+//! A connection can carry a per-operation deadline
+//! ([`RespConnection::connect_with_ca_file_and_timeout`]): dialing plus the TLS
+//! handshake share one budget, and every command exchange (write and reply) gets
+//! its own. An elapsed deadline is
+//! [`openjiuwen_common::error::ErrorKind::Timeout`] and marks the connection
+//! broken, because a reply that arrives after the caller gave up would
+//! desynchronise the next command on the same socket.
 #![allow(clippy::module_name_repetitions)]
 
 use std::path::Path;
+use std::time::Duration;
 
 use openjiuwen_common::error::{Error, Result};
 use tokio::io::{
@@ -348,6 +357,9 @@ pub struct RespConnection {
     stream: BufReader<BoxStream>,
     tls: bool,
     broken: bool,
+    /// The per-operation deadline; `None` waits forever (the pre-timeout
+    /// behavior, kept for callers that configure nothing).
+    timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for RespConnection {
@@ -356,6 +368,7 @@ impl std::fmt::Debug for RespConnection {
             .debug_struct("RespConnection")
             .field("transport", &if self.tls { "tls" } else { "plaintext" })
             .field("broken", &self.broken)
+            .field("timeout", &self.timeout)
             .finish_non_exhaustive()
     }
 }
@@ -367,6 +380,11 @@ impl RespConnection {
     /// A `rediss://` URL dials over TLS and trusts the compiled-in webpki roots
     /// only; use [`RespConnection::connect_with_ca_file`] to add a private CA.
     ///
+    /// No deadline is applied, so use
+    /// [`RespConnection::connect_with_ca_file_and_timeout`] (or
+    /// [`RespConnection::connect_with_timeout`]) against a server that may be
+    /// partitioned.
+    ///
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for a
@@ -374,6 +392,17 @@ impl RespConnection {
     /// the connection, the TLS handshake, or the protocol handshake fails.
     pub async fn connect(url: &str) -> Result<Self> {
         Self::connect_with_ca_file(url, None).await
+    }
+
+    /// Connects to `url` applying `timeout` to dialing plus the TLS handshake
+    /// and to every command exchange, and trusting the compiled-in webpki roots
+    /// only.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`RespConnection::connect_with_ca_file_and_timeout`].
+    pub async fn connect_with_timeout(url: &str, timeout: Duration) -> Result<Self> {
+        Self::connect_with_ca_file_and_timeout(url, None, Some(timeout)).await
     }
 
     /// Connects to `url`, adding the root certificates in `ca_file` to the
@@ -384,6 +413,9 @@ impl RespConnection {
     /// `redis://` URL is a validation error rather than a silent no-op: a
     /// clear-text connection has no TLS layer to verify against it.
     ///
+    /// No deadline is applied; see
+    /// [`RespConnection::connect_with_ca_file_and_timeout`].
+    ///
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for a
@@ -393,6 +425,30 @@ impl RespConnection {
     /// fails (an untrusted certificate, a server that is not speaking TLS), or
     /// the protocol handshake fails.
     pub async fn connect_with_ca_file(url: &str, ca_file: Option<&Path>) -> Result<Self> {
+        Self::connect_with_ca_file_and_timeout(url, ca_file, None).await
+    }
+
+    /// Connects to `url` with an optional per-operation deadline.
+    ///
+    /// `timeout` bounds dialing plus the TLS handshake as one budget; each
+    /// `AUTH`/`SELECT` and every later [`RespConnection::command`] gets its own
+    /// budget. An elapsed deadline is
+    /// [`openjiuwen_common::error::ErrorKind::Timeout`] and marks the connection
+    /// broken so a late reply can never be read by the next command.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for a
+    /// malformed URL, a malformed CA file, or a CA file without a `rediss://`
+    /// URL, [`openjiuwen_common::error::ErrorKind::Timeout`] when the deadline
+    /// elapses, and [`openjiuwen_common::error::ErrorKind::Session`] when the CA
+    /// file cannot be read, the connection cannot be dialed, the TLS handshake
+    /// fails, or the protocol handshake fails.
+    pub async fn connect_with_ca_file_and_timeout(
+        url: &str,
+        ca_file: Option<&Path>,
+        timeout: Option<Duration>,
+    ) -> Result<Self> {
         let target = ConnectionTarget::parse(url)?;
         if ca_file.is_some() && !target.tls {
             return Err(Error::validation(format!(
@@ -405,22 +461,37 @@ impl RespConnection {
         } else {
             None
         };
-        let socket = TcpStream::connect((target.host.as_str(), target.port))
-            .await
-            .map_err(|error| {
-                Error::session(format!(
-                    "failed to connect to redis at {}:{}: {error}",
+        // Dialing and the TLS handshake share one budget: a peer that completes
+        // the TCP handshake but never answers the TLS one must not hang here.
+        let dial = async {
+            let socket = TcpStream::connect((target.host.as_str(), target.port))
+                .await
+                .map_err(|error| {
+                    Error::session(format!(
+                        "failed to connect to redis at {}:{}: {error}",
+                        target.host, target.port
+                    ))
+                })?;
+            let stream: BoxStream = match config {
+                Some(config) => Box::new(resp_tls::handshake(socket, &target.host, config).await?),
+                None => Box::new(socket),
+            };
+            Ok::<BoxStream, Error>(stream)
+        };
+        let stream = match timeout {
+            Some(budget) => tokio::time::timeout(budget, dial).await.map_err(|_| {
+                Error::timeout(format!(
+                    "connecting to redis at {}:{} timed out after {budget:?}",
                     target.host, target.port
                 ))
-            })?;
-        let stream: BoxStream = match config {
-            Some(config) => Box::new(resp_tls::handshake(socket, &target.host, config).await?),
-            None => Box::new(socket),
-        };
+            })?,
+            None => dial.await,
+        }?;
         let mut connection = Self {
             stream: BufReader::new(stream),
             tls: target.tls,
             broken: false,
+            timeout,
         };
         if let Some(password) = target.password.as_deref() {
             let reply = match target.username.as_deref() {
@@ -454,8 +525,16 @@ impl RespConnection {
         self.tls
     }
 
-    /// Reports whether a transport failure has already invalidated this
-    /// connection, in which case the caller must dial a fresh one.
+    /// The per-operation deadline this connection applies, or `None` when it
+    /// waits forever.
+    #[must_use]
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    /// Reports whether a transport failure (or an elapsed deadline) has already
+    /// invalidated this connection, in which case the caller must dial a fresh
+    /// one.
     #[must_use]
     pub fn is_broken(&self) -> bool {
         self.broken
@@ -466,8 +545,10 @@ impl RespConnection {
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::ErrorKind::Session`] when the write
-    /// or the read fails, or when the peer's reply is not valid RESP2. Server
-    /// error replies are returned as [`RespValue::Error`], not as `Err`.
+    /// or the read fails, [`openjiuwen_common::error::ErrorKind::Timeout`] when
+    /// the configured deadline elapses, or when the peer's reply is not valid
+    /// RESP2. Server error replies are returned as [`RespValue::Error`], not as
+    /// `Err`.
     pub async fn command(&mut self, args: &[&str]) -> Result<RespValue> {
         let parts: Vec<&[u8]> = args.iter().map(|arg| arg.as_bytes()).collect();
         self.command_bytes(&parts).await
@@ -475,10 +556,31 @@ impl RespConnection {
 
     /// Sends one command with binary-safe arguments and returns its reply.
     ///
+    /// The write and the reply read share one `timeout` budget when the
+    /// connection has one. An elapsed deadline marks the connection broken,
+    /// because the pending reply would otherwise be read as the answer to the
+    /// *next* command.
+    ///
     /// # Errors
     ///
-    /// Same as [`RespConnection::command`].
+    /// Same as [`RespConnection::command`], plus
+    /// [`openjiuwen_common::error::ErrorKind::Timeout`] on an elapsed deadline.
     pub async fn command_bytes(&mut self, args: &[&[u8]]) -> Result<RespValue> {
+        let Some(budget) = self.timeout else {
+            return self.exchange(args).await;
+        };
+        if let Ok(outcome) = tokio::time::timeout(budget, self.exchange(args)).await {
+            outcome
+        } else {
+            self.broken = true;
+            Err(Error::timeout(format!(
+                "redis command timed out after {budget:?}"
+            )))
+        }
+    }
+
+    /// Writes one command and reads its reply, without a deadline.
+    async fn exchange(&mut self, args: &[&[u8]]) -> Result<RespValue> {
         let payload = encode_command_bytes(args);
         match self.stream.get_mut().write_all(&payload).await {
             Ok(()) => {}
@@ -861,8 +963,10 @@ mod tests {
             stream: tokio::io::BufReader::new(Box::new(stream)),
             tls: true,
             broken: false,
+            timeout: None,
         };
         assert!(connection.is_tls());
+        assert_eq!(connection.timeout(), None);
         let debug = format!("{connection:?}");
         assert!(debug.contains("transport: \"tls\""), "{debug}");
         assert!(!debug.contains("password"), "{debug}");

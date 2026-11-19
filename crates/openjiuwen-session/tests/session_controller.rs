@@ -393,3 +393,66 @@ async fn controller_saves_live_sessions_into_the_scope() {
     let reloaded = store.load("agent", "wf-7").await.unwrap().unwrap();
     assert_eq!(reloaded.snapshot.global, json!({"step": 8}));
 }
+
+/// Concurrent saves of distinct sessions must all land in `sessions.json`: the
+/// index is a read-modify-write document, so without a lock two saves that read
+/// the same snapshot would let the later write drop the other's entry.
+#[tokio::test]
+async fn concurrent_saves_keep_every_index_entry() {
+    const COUNT: usize = 16;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = DiskSessionStore::new(temp.path());
+    let scope = SessionScope::main();
+
+    // Store clones share the index lock, so they are the documented way to
+    // write concurrently over one base directory.
+    let mut tasks = Vec::with_capacity(COUNT);
+    for index in 0..COUNT {
+        let store = store.clone();
+        let scope = scope.clone();
+        tasks.push(tokio::spawn(async move {
+            let session_id = format!("s-{index:02}");
+            let snapshot = SessionSnapshot::new(session_id.clone(), SessionType::Workflow);
+            store
+                .save_snapshot("agent", &scope, &session_id, snapshot, None)
+                .await
+                .map(|meta| meta.session_id)
+        }));
+    }
+    let mut saved = Vec::with_capacity(COUNT);
+    for task in tasks {
+        saved.push(task.await.unwrap().unwrap());
+    }
+    saved.sort();
+
+    // Every save is present in the index, none was lost to a stale read...
+    let mut listed: Vec<String> = store
+        .list("agent", Some(&scope))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|meta| meta.session_id)
+        .collect();
+    listed.sort();
+    assert_eq!(listed, saved, "the index must keep every concurrent save");
+
+    let index = store.read_index("agent").await.unwrap();
+    assert_eq!(
+        index
+            .scopes
+            .get("agent:agent:main")
+            .map(|scope| scope.sessions.len()),
+        Some(COUNT)
+    );
+    // ...and each per-session document is still readable.
+    for session_id in &saved {
+        let record = store
+            .load("agent", session_id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("session {session_id} has no state document"));
+        assert_eq!(record.meta.session_id, *session_id);
+        assert_eq!(record.snapshot.session_id, *session_id);
+    }
+}
