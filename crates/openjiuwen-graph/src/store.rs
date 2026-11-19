@@ -92,12 +92,8 @@ pub trait GraphStore: Send + Sync + std::fmt::Debug {
     /// # Errors
     ///
     /// Returns an error when the backend cannot write the snapshot.
-    async fn save(
-        &self,
-        session_id: &str,
-        namespace: &str,
-        snapshot: &GraphSnapshot,
-    ) -> Result<()>;
+    async fn save(&self, session_id: &str, namespace: &str, snapshot: &GraphSnapshot)
+        -> Result<()>;
 
     /// Deletes the snapshot of `session_id` in `namespace`, or every snapshot of
     /// the session when `namespace` is `None`.

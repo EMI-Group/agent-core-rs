@@ -291,7 +291,10 @@ mod tests {
         };
         let table = DispatchTable::compile(
             &spec(Vec::new()),
-            &[("a".to_string(), router("first")), ("a".to_string(), router("second"))],
+            &[
+                ("a".to_string(), router("first")),
+                ("a".to_string(), router("second")),
+            ],
         )
         .unwrap();
         let shared = state();

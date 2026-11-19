@@ -117,8 +117,8 @@ Sync nodes run inline on the executor task, so they must be cheap and non-blocki
 ### Routers (`src/router.rs`)
 
 ```rust
-pub struct RouterContext { source: String, state: GraphState, superstep: u32, session: Arc<dyn Session>, metadata: Arc<BTreeMap<String, Value>> }
-impl RouterContext { pub fn source(&self) -> &str; pub fn state(&self) -> &GraphState; pub fn superstep(&self) -> u32; pub fn session(&self) -> &Arc<dyn Session>; pub fn metadata(&self) -> &BTreeMap<String, Value>; }
+pub struct RouterContext { /* source, Arc<GraphState>, superstep, session, metadata */ }
+impl RouterContext { pub fn source(&self) -> &str; pub fn state(&self) -> &GraphState; pub fn state_arc(&self) -> &Arc<GraphState>; pub fn superstep(&self) -> u32; pub fn session(&self) -> &Arc<dyn Session>; pub fn metadata(&self) -> &BTreeMap<String, Value>; }
 
 #[async_trait]
 pub trait Router: Send + Sync {
@@ -134,6 +134,7 @@ impl<F> FnRouter<F> { pub fn new(name: impl Into<String>, f: F) -> Self; }
 A router returns the nodes to activate; an empty vector routes nowhere (the branch ends).
 Returned ids must be known nodes, otherwise the run fails with [`Error::graph`].
 Static edges are compiled into dedicated static routers; conditional routers are appended for their source, and every dispatch result is unioned.
+The context's state is an `Arc` handle (`state_arc`), so one `RouterContext` serves every router of a dispatch and routing copies no state.
 
 ### Spec (`src/spec.rs`)
 
@@ -220,7 +221,7 @@ impl GraphSnapshot { pub fn is_resumable(&self) -> bool; }
 #[async_trait]
 pub trait GraphStore: Send + Sync + std::fmt::Debug {
     async fn get(&self, session_id: &str, namespace: &str) -> Result<Option<GraphSnapshot>>;
-    async fn save(&self, session_id: &str, namespace: &str, snapshot: GraphSnapshot) -> Result<()>;
+    async fn save(&self, session_id: &str, namespace: &str, snapshot: &GraphSnapshot) -> Result<()>;
     async fn delete(&self, session_id: &str, namespace: Option<&str>) -> Result<()>;
 }
 
@@ -230,6 +231,7 @@ impl CheckpointerStore { pub fn new(checkpointer: Arc<dyn Checkpointer>, entity_
 ```
 
 `CheckpointerStore` persists each snapshot as a `Checkpoint` in [`CheckpointNamespace::WorkflowGraph`] with `checkpoint_id = namespace`, `entity_id` from the constructor, and the snapshot JSON in `global_state`; `get` loads by `(session_id, namespace)`; `delete(None)` releases the session's snapshots.
+`save` borrows the snapshot, so the executor can retain the boundary it just persisted as the resume point of a later failure without a second deep copy.
 
 ### Visualization (`src/visualize.rs`)
 
@@ -253,7 +255,8 @@ Python emits Mermaid only (`visualization/Drawable.to_mermaid`); DOT is intentio
 - **Halt.** `NodeOutcome::Halt { value }` ends the run after the current superstep (siblings already running complete, matching Python's interrupt-as-data behavior). The result carries `halted: Some(HaltInfo)`.
 - **Limits and failures.** At most `max_supersteps` supersteps (default `10_000`, Python `MAX_RECURSIVE_LIMIT`) — exceeding it is [`Error::graph`]. Node errors propagate the original [`Error`] with the node id and superstep added as context; timeouts are [`ErrorKind::Timeout`]; cancellation is [`ErrorKind::Cancelled`]. Node `max_retries` re-runs an errored node (`max_retries + 1` attempts), never a halt and never a cancellation.
 - **Cancellation.** `ExecutionOptions::cancellation` is checked before every superstep and raced against every node attempt; cancelling drops in-flight node futures.
-- **Checkpoints.** With a store configured, a snapshot (state + channel fired sets) is saved after every completed superstep (when `checkpoint_every_superstep`), and once more at the last completed boundary when a run fails. `ExecutionOptions::resume` restores the stored snapshot and continues; the input value is ignored on a resume. Resume re-runs the superstep that failed (at-least-once per superstep).
+- **Checkpoints.** A snapshot (state + channel fired sets) is built only when a store is attached, and exactly once per durable boundary: it is both the per-superstep checkpoint (saved when `checkpoint_every_superstep`) and the boundary a later failure persists. A graph compiled without a store builds no snapshot at all. One further snapshot captures the initial state before the first superstep, so a failure inside the first superstep still leaves a resume point.
+`ExecutionOptions::resume` restores the stored snapshot and continues; the input value is ignored on a resume. Resume re-runs the superstep that failed (at-least-once per superstep).
 - **Streaming.** Events are delivered through `ExecutionOptions::events` and, when `write_session_trace` is set, mirrored to `Session::write_stream` as `StreamItem::trace("graph_event", …)` frames (payload is always an object, never `null`, because the stream hub rejects null payloads). Multi-subscriber delivery is the session hub's job; the `stream*` methods additionally expose an in-process ordered stream for the caller.
 - **Session.** The engine never mutates session state itself; nodes read/write `Session` for their own component state. `GraphState` is engine-owned and returned to the caller.
 
@@ -269,6 +272,7 @@ Python emits Mermaid only (`visualization/Drawable.to_mermaid`); DOT is intentio
 
 - **State is functional per node.** Parallel nodes cannot share `&mut GraphState`, so each node receives a clone and the engine applies the result in declaration order as a delta against the pre-superstep state. Python passed `state=None` and discarded node return values, so this is an extension, not a compatibility break.
 - **Node state is merged as a top-level delta.** A node's returned state is compared with the state it was given: changed top-level keys are deep-merged and top-level keys the node dropped are removed, so `GraphState::remove` works from a node. Keys added by an earlier node in the same superstep survive because a later node never saw them; nested removals do not propagate (only top-level keys are diffed).
+- **The run state is shared, never copied for readers.** The executor holds it in an `Arc` and merges with `Arc::make_mut`, so routers read one allocation and a superstep whose routers all finished merges in place; a boundary snapshot is built only when a store can persist it (`BoundaryProbe` counts them in unit tests).
 - **Python's router-shadowing quirks are not reproduced.** Python keys routers by callable `__name__` and silently overwrites same-named routers; Rust stores every router in a `Vec`, so same-named routers all run. Conditional targets are declared explicitly (`conditional_edges_to`) instead of Python's `register_branch_targets` side channel.
 - **Cross-branch CNF hoisting is omitted.** Python's `_resolve_barrier_groups` merges groups reachable from one branch into an OR group; the Rust engine uses the literal per-edge groups. This is simpler and predictable; branch fan-in still needs one explicit edge group per incoming path.
 - **Validation is stricter than Python.** Python defers unknown endpoints to a `KeyError` at compile time and accepts duplicate node ids silently in places; Rust reports unknown endpoints, duplicate ids, unknown router sources, and a missing entry as one compile error.
@@ -300,7 +304,7 @@ Python emits Mermaid only (`visualization/Drawable.to_mermaid`); DOT is intentio
 
 ## Test Strategy
 
-Unit tests live beside the modules (`state`, `node`, `router`, `spec`, `store`, `visualize`, `pregel::channel`, `pregel::dispatch`).
+Unit tests live beside the modules (`state`, `node`, `router`, `spec`, `store`, `visualize`, `pregel::channel`, `pregel::dispatch`, `pregel::executor` — the executor's suite pins the boundary-snapshot count through `BoundaryProbe` and the pristine state every retry starts from).
 Integration tests in `./tests/` use `openjiuwen_session::WorkflowSession` as `Arc<dyn Session>` and cover:
 
 - `common/mod.rs` — shared helpers (`session()`, counting/marker/noop nodes).
@@ -313,7 +317,8 @@ Integration tests in `./tests/` use `openjiuwen_session::WorkflowSession` as `Ar
 - `errors.rs` — node error carries node id/superstep, retry counts (`max_retries + 1` attempts), timeout is `ErrorKind::Timeout`.
 - `cancel.rs` — cancellation before and during a superstep, `ErrorKind::Cancelled`.
 - `streaming.rs` — event order (`SuperstepStarted` → `NodeStarted`/`NodeCompleted` → `EdgeTraversed` → … → `GraphCompleted`), superstep numbers, session trace frames observed through `Session::subscribe`/`StreamHub`, and abort-on-drop (an abandoned stream stops the run).
-- `checkpoint.rs` — snapshot saved per superstep, failing run resumes without repeating completed supersteps, `InMemoryGraphStore` and `CheckpointerStore` round-trips.
+- `checkpoint.rs` — snapshot saved per superstep, a first-superstep failure keeps the initial boundary, failing run resumes without repeating completed supersteps, `InMemoryGraphStore` and `CheckpointerStore` round-trips.
+- `hot_path.rs` — the per-superstep cost model: pinned 3-node/2-superstep output, the router reading the merged state, exactly one persisted snapshot per durable boundary, the failure boundary re-save, and identical state with and without a store.
 - `spec_serde.rs` — `GraphSpec` JSON round-trip, unknown fields tolerated, defaults.
 - `mermaid.rs` — flowchart header, node shapes, conditional edge labels, entry/exit markers.
 - `validation.rs` — duplicate id, unknown edge endpoint, unknown router source, missing entry, `NodeOutcome::Route` to an unknown node.

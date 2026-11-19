@@ -93,6 +93,38 @@ async fn failing_runs_save_the_last_completed_boundary() {
 }
 
 #[tokio::test]
+async fn a_first_superstep_failure_keeps_the_initial_boundary() {
+    // The run's initial boundary is captured before the first superstep, so a
+    // failure inside that superstep still leaves a resume point holding the
+    // input state and the seeded entry activation.
+    let store = Arc::new(InMemoryGraphStore::new());
+    let graph = GraphBuilder::new("chain")
+        .node(
+            "a",
+            SyncNode::new("a", |_state: &mut GraphState, _ctx: &GraphContext| {
+                Err(openjiuwen_common::error::Error::validation("broken"))
+            }),
+        )
+        .compile_with(CompileOptions {
+            store: Some(Arc::clone(&store) as Arc<dyn GraphStore>),
+            ..CompileOptions::default()
+        })
+        .unwrap();
+    let _ = graph
+        .run(
+            json!({"seed": 1}),
+            common::session(),
+            ExecutionOptions::default(),
+        )
+        .await
+        .unwrap_err();
+    let snapshot = store.get("s1", "chain").await.unwrap().unwrap();
+    assert_eq!(snapshot.superstep, 0);
+    assert_eq!(snapshot.state.get("seed"), Some(&json!(1)));
+    assert!(!snapshot.is_resumable());
+}
+
+#[tokio::test]
 async fn resume_continues_without_repeating_completed_supersteps() {
     let store = Arc::new(InMemoryGraphStore::new());
     let fail_once = Arc::new(AtomicBool::new(true));

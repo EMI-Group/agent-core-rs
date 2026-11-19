@@ -8,9 +8,9 @@
 //! the outcome of a superstep never depends on which node finished first and a
 //! node's top-level key removals propagate to the run state.
 
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::Future;
@@ -95,6 +95,8 @@ impl BoundaryProbe {
     }
 
     /// Records one built snapshot.
+    // Non-test builds have no counter field, so the method has nothing to read.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
     fn record(&self) {
         #[cfg(test)]
         if let Some(count) = &self.count {
@@ -615,7 +617,8 @@ async fn with_timeout<T>(
 mod tests {
     use super::*;
     use crate::builder::GraphBuilder;
-    use crate::node::SyncNode;
+    use crate::node::{FnNode, SyncNode};
+    use crate::store::GraphStore;
     use openjiuwen_session::WorkflowSession;
     use serde_json::Value;
 
@@ -724,5 +727,111 @@ mod tests {
             result.visited,
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
+    }
+
+    /// Two supersteps: `a`, then `b` and `c` in parallel.
+    fn parallel() -> GraphBuilder {
+        GraphBuilder::new("g")
+            .node("a", counting("a"))
+            .node("b", counting("b"))
+            .node("c", counting("c"))
+            .edge("a", "b")
+            .edge("a", "c")
+    }
+
+    #[tokio::test]
+    async fn a_store_less_run_builds_no_boundary_snapshots() {
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let graph = parallel().compile().unwrap();
+        let result = execute_probed(
+            Arc::clone(&graph.inner),
+            json!({}),
+            session(),
+            ExecutionOptions::default(),
+            BoundaryProbe::counting(Arc::clone(&snapshots)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.supersteps, 2);
+        // A snapshot no backend can persist is pure cost: a graph compiled
+        // without a store must not deep-copy the state for one.
+        assert_eq!(
+            snapshots.load(Ordering::SeqCst),
+            0,
+            "a store-less run built a boundary snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_run_builds_one_boundary_snapshot_per_superstep() {
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(crate::store::InMemoryGraphStore::new());
+        let graph = parallel()
+            .compile_with(crate::builder::CompileOptions {
+                store: Some(Arc::clone(&store) as Arc<dyn crate::store::GraphStore>),
+                ..crate::builder::CompileOptions::default()
+            })
+            .unwrap();
+        let result = execute_probed(
+            Arc::clone(&graph.inner),
+            json!({}),
+            session(),
+            ExecutionOptions::default(),
+            BoundaryProbe::counting(Arc::clone(&snapshots)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.supersteps, 2);
+        // Exactly one snapshot per durable boundary, plus the run's initial
+        // boundary (the resume point of a failure inside the first superstep).
+        assert_eq!(
+            snapshots.load(Ordering::SeqCst),
+            result.supersteps as usize + 1,
+            "the executor built more than one snapshot per boundary"
+        );
+        let stored = store.get("s1", "g").await.unwrap().unwrap();
+        assert_eq!(stored.superstep, 2);
+        assert_eq!(stored.state.get("count"), Some(&json!(2)));
+    }
+
+    #[tokio::test]
+    async fn retries_start_from_the_pristine_state() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let recorder = Arc::clone(&seen);
+        let node = Arc::new(FnNode::new(
+            "flaky",
+            move |state: &mut GraphState, _ctx: &GraphContext| {
+                let count = state.get("count").and_then(Value::as_u64).unwrap_or(0);
+                recorder.lock().unwrap().push(count);
+                let first_attempt = attempts.fetch_add(1, Ordering::SeqCst) == 0;
+                let outcome = if first_attempt {
+                    // A failed attempt's writes must not survive into the retry.
+                    state.set("count", json!(99));
+                    Err(Error::validation("first attempt"))
+                } else {
+                    state.set("count", json!(count + 1));
+                    Ok(NodeOutcome::Continue)
+                };
+                Box::pin(async move { outcome })
+            },
+        ));
+        let ctx = GraphContext::new(
+            session(),
+            "g",
+            "flaky",
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            Arc::new(std::collections::BTreeMap::new()),
+        );
+        let state = GraphState::from_value(json!({"count": 1})).unwrap();
+        let (state, outcome) = run_node(node, "flaky", state, &ctx, None, 1).await.unwrap();
+        assert!(matches!(outcome, NodeOutcome::Continue));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![1, 1],
+            "the retry must start from the pristine state, not the failed attempt's"
+        );
+        assert_eq!(state.get("count"), Some(&json!(2)));
     }
 }
