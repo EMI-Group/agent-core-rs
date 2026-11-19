@@ -6,6 +6,22 @@ use super::{ensure_positive, ensure_unit_interval};
 use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+/// The deepest neighbor expansion a single search may request.
+///
+/// It is the bound `GraphMemoryConfig::validate` enforces on
+/// [`GraphMemoryConfig::max_depth`] and the ceiling a per-call
+/// [`GraphSearchOptions::max_depth`](crate::graph::GraphSearchOptions::max_depth) is
+/// clamped to, so neither a config nor a call can ask for an unbounded walk.
+pub const MAX_SEARCH_DEPTH: usize = 4;
+
+/// The largest per-parent neighbor budget a single search may request.
+///
+/// `GraphMemoryConfig::validate` only requires a positive
+/// [`GraphMemoryConfig::max_neighbors`]; this constant is the absolute ceiling a per-call
+/// [`GraphSearchOptions::max_neighbors`](crate::graph::GraphSearchOptions::max_neighbors)
+/// is clamped to, so one call cannot ask to read thousands of edges per entity.
+pub const MAX_SEARCH_NEIGHBORS: usize = 256;
+
 /// Settings of the optional entity/graph memory subsystem.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
@@ -45,9 +61,9 @@ impl GraphMemoryConfig {
     /// Called by `MemoryEngineConfig::validate`; each failure is `Error::Config`
     /// naming the field and the offending value.
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.max_depth > 4 {
+        if self.max_depth > MAX_SEARCH_DEPTH {
             return Err(Error::config(format!(
-                "max_depth must be at most 4 (got {})",
+                "max_depth must be at most {MAX_SEARCH_DEPTH} (got {})",
                 self.max_depth
             )));
         }

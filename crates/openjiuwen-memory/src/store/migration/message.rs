@@ -34,7 +34,9 @@ use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::store::KvValue;
 
 use crate::store::keys;
-use crate::store::messages::{derived_message_id, stored_document, StoredMessage};
+use crate::store::messages::{
+    derived_message_id, stored_document, DerivedMessageId, StoredMessage,
+};
 
 use super::operation::{MigrationOperationHandler, OperationReport};
 use super::plan::{MigrationContext, MigrationCounts, MigrationStep, Migrator};
@@ -216,11 +218,18 @@ impl MessageMigrator {
                     Ok(row) => {
                         let mut message = row.into_stored();
                         if message.id.is_empty() {
-                            message.id = derived_message_id(
-                                &message.content,
-                                &message.role,
-                                message.timestamp,
-                            );
+                            // A legacy row carries its own scope; folding it into the id
+                            // keeps two scopes' identical rows apart, and the import
+                            // writes one row at a time, so the ordinal is always `0`.
+                            message.id = derived_message_id(DerivedMessageId {
+                                user_id: &message.user_id,
+                                scope_id: &message.scope_id,
+                                session_id: message.session_id.as_deref(),
+                                content: &message.content,
+                                role: &message.role,
+                                timestamp: message.timestamp,
+                                ordinal: 0,
+                            });
                         }
                         match context.document().get(&target, &message.id).await? {
                             Some(existing) if existing == stored_document(&message) => {
@@ -661,7 +670,15 @@ mod tests {
         assert_eq!(nested.role, "assistant");
         assert_eq!(nested.session_id.as_deref(), Some("s1"));
         assert_eq!(nested.user_id, "alice");
-        let expected = derived_message_id("anonymous", "user", millis(1_700_000_000_000));
+        let expected = derived_message_id(DerivedMessageId {
+            user_id: "alice",
+            scope_id: "ws",
+            session_id: None,
+            content: "anonymous",
+            role: "user",
+            timestamp: millis(1_700_000_000_000),
+            ordinal: 0,
+        });
         assert!(rows.iter().any(|row| row.id == expected));
         assert!(legacy_keys(&stores).await.is_empty());
 
@@ -819,7 +836,15 @@ mod tests {
             )
             .await
             .expect("append");
-        let id = derived_message_id("hello", "user", timestamp);
+        let id = derived_message_id(DerivedMessageId {
+            user_id: "alice",
+            scope_id: "ws",
+            session_id: None,
+            content: "hello",
+            role: "user",
+            timestamp,
+            ordinal: 0,
+        });
         let row = format!(
             r#"{{"message_id":"{id}","user_id":"alice","scope_id":"ws","content":"hello","role":"user","timestamp":1700000000000}}"#
         );

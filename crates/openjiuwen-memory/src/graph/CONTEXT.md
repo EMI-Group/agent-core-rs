@@ -151,10 +151,12 @@ Default selection in `GraphMemory::add`: `GraphAddOptions::extractor` when set, 
 1. Load scope entities via `query_entities` (no limit when `top_k == 0`, else a candidate scan bounded to `top_k * 8`, at least `16`).
 2. Score seeds: `similarity = normalized cosine` when both query and entity embeddings exist, else 0; `keyword = keyword_score(query, entity_text)` over name + `content` + `description`; `score = 0.7 * similarity + 0.3 * keyword` clamped to `[0, 1]`; keep `score >= threshold`.
 3. Sort by score desc (ties by entity id), then `truncate(top_k)` when `top_k > 0`.
-4. BFS expansion for `max_depth` rounds: `store.neighbors(entity.id, Direction::Both, None)`, skip already visited, score a neighbor as `parent_score * 0.5^depth`, cap `max_neighbors` per parent per round.
+4. BFS expansion for `max_depth` rounds under `recall::ExpansionLimits`: `store.neighbors(entity.id, Direction::Both, None)`, skip already visited, score a neighbor as `parent_score * 0.5^depth`, cap `max_neighbors` per parent per round in the store's deterministic neighbor order.
+   The `CancellationToken` is checked before every store query, and the walk stops with `Error::Graph` (never a silent truncation) when it would exceed `EXPANSION_QUERY_BUDGET` (1024 queries) or `EXPANSION_NODE_BUDGET` (4096 nodes).
 5. Return unique `GraphRecallHit`s sorted by `(score desc, depth asc, id asc)`.
 
 Knob resolution in `search`: a positive `threshold` is clamped to `0.0..=1.0`, otherwise `GraphMemoryConfig::min_score` (default `0.3`) applies; `max_depth == 0` uses `GraphMemoryConfig::max_depth` (default `1`); `max_neighbors == 0` uses `GraphMemoryConfig::max_neighbors` (default `8`); `top_k == 0` keeps every seed above the threshold.
+A positive per-call `max_depth`/`max_neighbors` is clamped to the validated bounds `config::graph::MAX_SEARCH_DEPTH` (4, the same bound `validate` enforces) and `MAX_SEARCH_NEIGHBORS` (256), so no call can widen a search past them.
 `GraphSearchOptions::include_relations` defaults to `true`, so a default search expands neighbors; `false` returns the scored seeds only.
 Expansion is gated by `include_relations && max_depth > 0 && max_neighbors > 0`, so after config resolution a positive depth and neighbor budget are required even when relations are included.
 
