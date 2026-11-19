@@ -16,11 +16,12 @@
 //! | `delegation` | `on_delegation` | — |
 
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use serde_json::json;
 
 use crate::member::{MemberActivityRegistry, MemberObserver, TeamMember};
-use crate::monitor::{BackpressurePolicy, MonitorEvent};
+use crate::monitor::{BackpressurePolicy, EmitOutcome, MonitorEvent};
 use crate::observability::{
     MemberObservableEvent, ObservabilityHooks, ObservableEvent, RecordedEvent, RecordingHooks,
     RoundObservableEvent, TurnMetrics,
@@ -31,7 +32,7 @@ use crate::schema::{
     MemberLifetime, MemberStatus, RoundOutcome, TaskGraphSpec, TaskStatus, TeamRole,
 };
 
-use super::{blueprint, monitor_kinds, position_of, take_monitor, wire};
+use super::{blueprint, monitor_kinds, position_of, take_monitor, wire, BOUND};
 
 /// Returns the member payload of `record`, when the callback carried one.
 fn member_event(record: &RecordedEvent) -> Option<&MemberObservableEvent> {
@@ -428,4 +429,124 @@ async fn one_monitor_stream_keeps_the_lifecycle_order() {
         )),
         "{kinds:?}"
     );
+}
+
+// --- backpressure accounting -------------------------------------------------
+//
+// `BackpressurePolicy::Block` is a production policy, so an emission it cannot honour must be
+// reported instead of discarded. These tests pin the two documented modes of
+// `TeamSignals`: the synchronous lifecycle hooks report overflow through `monitor_dropped`, and
+// the async path (`emit_waiting` / `emit_waiting_within`) makes `Block` real, bounded by the
+// caller's budget.
+
+#[tokio::test]
+async fn a_full_block_sink_reports_overflow_instead_of_losing_events_silently() {
+    let signals = TeamSignals::new("alpha", Vec::new());
+    let _monitor = signals.monitor_stream(1, BackpressurePolicy::Block);
+    let emitter = signals
+        .monitor_emitter()
+        .expect("no emitter after the stream");
+    assert_eq!(emitter.policy(), BackpressurePolicy::Block);
+    for _ in 0..3 {
+        signals.emit(MonitorEvent::TeamStopped);
+    }
+    assert_eq!(emitter.emitted(), 1, "the queue holds exactly one event");
+    assert_eq!(emitter.dropped(), 2, "the emitter counts both refusals");
+    assert_eq!(
+        signals.monitor_dropped(),
+        2,
+        "the fan-out reports the overflow the non-blocking path could not apply"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_drop_oldest_sink_counts_every_eviction() {
+    let signals = TeamSignals::new("alpha", Vec::new());
+    let _monitor = signals.monitor_stream(1, BackpressurePolicy::DropOldest);
+    let emitter = signals
+        .monitor_emitter()
+        .expect("no emitter after the stream");
+    signals.emit(MonitorEvent::TeamStopped);
+    signals.emit(MonitorEvent::TeamStopped);
+    assert_eq!(emitter.emitted(), 2);
+    assert_eq!(emitter.dropped(), 1);
+    assert_eq!(
+        signals.monitor_dropped(),
+        1,
+        "an evicted event is accounted, never silent"
+    );
+}
+
+#[tokio::test]
+async fn the_async_emission_path_waits_for_capacity_and_applies_the_event() {
+    let signals = TeamSignals::new("alpha", Vec::new());
+    let mut monitor = signals.monitor_stream(1, BackpressurePolicy::Block);
+    let emitter = signals
+        .monitor_emitter()
+        .expect("no emitter after the stream");
+    signals.emit(MonitorEvent::TeamStopped);
+    let waiting = tokio::spawn({
+        let signals = signals.clone();
+        async move {
+            signals
+                .emit_waiting(MonitorEvent::MemberStopped {
+                    member_name: "dev-1".to_owned(),
+                    reason: None,
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        emitter.emitted(),
+        1,
+        "the waiting emission suspends instead of being refused"
+    );
+    assert_eq!(signals.monitor_dropped(), 0, "waiting loses nothing");
+    let drained = monitor.try_recv().expect("the buffered event");
+    assert_eq!(drained.event, MonitorEvent::TeamStopped);
+    let outcome = tokio::time::timeout(BOUND, waiting)
+        .await
+        .expect("the waiting emission never completed")
+        .expect("the emission task panicked");
+    assert_eq!(outcome, EmitOutcome::Sent);
+    assert_eq!(emitter.emitted(), 2, "the waited event is buffered");
+    assert_eq!(signals.monitor_dropped(), 0);
+}
+
+#[tokio::test]
+async fn a_budget_bounded_emission_reports_a_sink_that_never_drains() {
+    let signals = TeamSignals::new("alpha", Vec::new());
+    let _monitor = signals.monitor_stream(1, BackpressurePolicy::Block);
+    let emitter = signals
+        .monitor_emitter()
+        .expect("no emitter after the stream");
+    signals.emit(MonitorEvent::TeamStopped);
+    let outcome = signals
+        .emit_waiting_within(MonitorEvent::TeamStopped, Duration::from_millis(10))
+        .await;
+    assert_eq!(
+        outcome,
+        EmitOutcome::DroppedNew,
+        "an expired budget is reported like a refusal"
+    );
+    assert_eq!(emitter.emitted(), 1);
+    assert_eq!(
+        signals.monitor_dropped(),
+        1,
+        "the expired budget is the one loss, and it is reported"
+    );
+}
+
+#[tokio::test]
+async fn no_monitor_sink_means_no_loss_accounting() {
+    let signals = TeamSignals::new("alpha", Vec::new());
+    signals.emit(MonitorEvent::TeamStopped);
+    assert_eq!(signals.monitor_dropped(), 0, "nobody was watching");
+    assert_eq!(
+        signals.emit_waiting(MonitorEvent::TeamStopped).await,
+        EmitOutcome::Closed,
+        "an absent emitter accepts nothing and loses nothing"
+    );
+    assert_eq!(signals.monitor_dropped(), 0);
 }

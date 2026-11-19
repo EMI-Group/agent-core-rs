@@ -20,17 +20,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::prompt::message::BaseMessage;
+use openjiuwen_foundation::prompt::Role;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::entry::EntryPayload;
+use super::entry::{EntryPayload, ExecutionEntry};
 use super::identity::{ExecutionIdentity, LinkRelation, SessionBinding};
 use super::log::{
     ExecutionLog, LogCapacity, LogDigest, LogMeta, LogSnapshot, LOG_ENCODING, LOG_META_FILE,
 };
 use super::session::{ContinuationCursor, PersistentSessionRecord, SessionStateStore};
 use super::util::{is_valid_identifier, percent_encode_identifier, read_json, write_json_atomic};
-use super::window::{WindowAssembler, WindowAssembly};
+use super::window::{WindowAssembler, WindowAssembly, EXECUTION_GOAL_PREFIX, SUMMARY_PREFIX};
 use super::{Clock, SystemClock};
 
 /// Name of the file holding one execution link.
@@ -483,9 +484,10 @@ pub struct ResumePlan {
 impl ResumePlan {
     /// Returns the reconstructed model window a resumed turn starts from.
     ///
-    /// These are the messages [`WindowAssembler`] rebuilt from the
-    /// recovery execution's journal — the summary message first, then the retained groups — so a
-    /// host seeds its run with them instead of re-deriving the transcript.
+    /// These are the messages the chain assembly rebuilt from the traced executions' journals,
+    /// completed by the loaded record's transcript when the chain is short — the summary message
+    /// (if any) first, then every earlier turn once, oldest first — so a host seeds its run with
+    /// them instead of re-deriving the transcript.
     #[must_use]
     pub fn seed_messages(&self) -> &[BaseMessage] {
         &self.window.messages
@@ -504,8 +506,12 @@ impl ResumePlan {
 /// `request_id` is settled. Tracing starts at `continuation.recovery_ref`: each execution's journal
 /// is opened and read first, then its link. A `first` link ends tracing normally; a missing or
 /// unreadable journal, a missing, unreadable or invalid link, a predecessor cycle and reaching
-/// `continuation.chain_limit` all stop tracing with a stop note (never an error). The window and
-/// digest come from the recovery execution's snapshot alone.
+/// `continuation.chain_limit` all stop tracing with a stop note (never an error).
+///
+/// The window is assembled from every traced execution's journal, oldest first, so a chain that
+/// reaches back across continuations rebuilds every earlier turn; the loaded record's transcript
+/// completes it when the chain is short (see the seed rules on `window`). The digest and the
+/// resume cursor stay those of the recovery execution.
 ///
 /// A failing window summariser never fails the resume: the plan's `window.summary_error` carries
 /// it alongside the marked count-only fallback summary, so a host that needs the error itself
@@ -581,14 +587,15 @@ pub async fn resume(
         current = predecessor;
     }
 
-    let (window, digest, resume_seq) = match snapshots.get(&continuation.recovery_ref) {
-        Some(snapshot) => (
-            assembler.assemble(&snapshot.entries),
-            snapshot.digest(),
-            snapshot.replay().cursor.next_seq,
-        ),
-        None => (assembler.assemble(&[]), empty_digest(), 1),
+    let (digest, resume_seq) = match snapshots.get(&continuation.recovery_ref) {
+        Some(snapshot) => (snapshot.digest(), snapshot.replay().cursor.next_seq),
+        None => (empty_digest(), 1),
     };
+    let window = seed_window(
+        assembler,
+        &chain_entries(&chain, &snapshots),
+        &record.messages,
+    );
     let cursor = ContinuationCursor {
         recovery_ref: Some(continuation.recovery_ref.clone()),
         predecessor_id: chain.first().and_then(|link| link.predecessor_id.clone()),
@@ -611,6 +618,100 @@ pub async fn resume(
         background,
         digest,
     })
+}
+
+/// Returns the journal entries of every traced execution, oldest first.
+///
+/// [`snapshot_order`] gives the causal order, so a chain that reaches back across continuations
+/// hands [`seed_window`] every earlier turn's entries in the order they happened.
+fn chain_entries(
+    chain: &[ExecutionLink],
+    snapshots: &BTreeMap<String, LogSnapshot>,
+) -> Vec<ExecutionEntry> {
+    let mut entries = Vec::new();
+    for execution_id in snapshot_order(chain, snapshots) {
+        if let Some(snapshot) = snapshots.get(execution_id) {
+            entries.extend(snapshot.entries.iter().cloned());
+        }
+    }
+    entries
+}
+
+/// Rebuilds the seed window from the traced chain, completed by the persisted transcript.
+///
+/// The chain is the primary source: each traced execution contributes its journal messages in
+/// causal order, so once every run records its predecessor link a continuation sees every earlier
+/// turn. The record's transcript is stronger exactly when the chain is short — a run recorded
+/// before links existed, a journal that rotated away, a deleted journal — so the messages only the
+/// record carries are prepended, oldest first.
+///
+/// A message the chain already renders is never repeated: [`message_key`] ignores the
+/// [`EXECUTION_GOAL_PREFIX`] the window adds to a goal, so the record's raw query and the chain's
+/// rendered goal count as the same turn. The record's own [`SUMMARY_PREFIX`] message is dropped
+/// when the assembly produced a fresh summary, so summaries never stack, and nothing already in
+/// the seed is summarised again because only journal entries are assembled.
+fn seed_window(
+    assembler: &WindowAssembler,
+    entries: &[ExecutionEntry],
+    record_messages: &[BaseMessage],
+) -> WindowAssembly {
+    let mut window = assembler.assemble(entries);
+    if record_messages.is_empty() {
+        return window;
+    }
+    let body_start = usize::from(window.summary.is_some());
+    let keys: Vec<(Role, String)> = window.messages[body_start..]
+        .iter()
+        .map(message_key)
+        .collect();
+    let mut missing: Vec<BaseMessage> = Vec::new();
+    let mut cursor = 0_usize;
+    for message in record_messages {
+        if is_summary(message) {
+            continue;
+        }
+        let key = message_key(message);
+        match keys[cursor..]
+            .iter()
+            .position(|candidate| *candidate == key)
+        {
+            Some(offset) => cursor += offset + 1,
+            None => missing.push(message.clone()),
+        }
+    }
+    let record_summary = record_messages.iter().find(|message| is_summary(message));
+    let mut summary = window
+        .summary
+        .clone()
+        .map(BaseMessage::user)
+        .or_else(|| record_summary.cloned());
+    if missing.is_empty() && (window.summary.is_some() || summary.is_none()) {
+        // The chain already renders everything the record holds and carries its own summary.
+        return window;
+    }
+    let mut messages = Vec::with_capacity(missing.len() + window.messages.len());
+    if let Some(message) = summary.take() {
+        window.summary = Some(message.text().to_string());
+        messages.push(message);
+    }
+    messages.extend(missing);
+    messages.extend(window.messages[body_start..].iter().cloned());
+    window.tokens = assembler.count_messages(&messages);
+    window.over_budget = window.tokens > window.budget;
+    window.messages = messages;
+    window
+}
+
+/// Returns the role and text that a transcript message and a rendered journal goal agree on.
+fn message_key(message: &BaseMessage) -> (Role, String) {
+    let text = message.text();
+    let text = text.strip_prefix(EXECUTION_GOAL_PREFIX).unwrap_or(&text);
+    (message.role.clone(), text.to_string())
+}
+
+/// Returns whether `message` is a window summary rendered by [`WindowAssembler`].
+fn is_summary(message: &BaseMessage) -> bool {
+    message.text().starts_with(SUMMARY_PREFIX)
 }
 
 /// Renders the continuation background document.
@@ -1007,6 +1108,140 @@ mod tests {
         assert_eq!(plan.chain.len(), 2);
         assert!(plan.background.contains("停止追溯"));
         assert!(plan.background.contains("exec2"));
+    }
+
+    /// Returns the index of the message that mentions `needle`.
+    fn index_of(messages: &[openjiuwen_foundation::prompt::BaseMessage], needle: &str) -> usize {
+        messages
+            .iter()
+            .position(|message| message.text().contains(needle))
+            .unwrap_or_else(|| panic!("no seed message mentions {needle:?}"))
+    }
+
+    /// Asserts that exactly one seed message mentions `needle`.
+    fn assert_once(messages: &[openjiuwen_foundation::prompt::BaseMessage], needle: &str) {
+        let seen = messages
+            .iter()
+            .filter(|message| message.text().contains(needle))
+            .count();
+        assert_eq!(seen, 1, "{needle:?} must appear exactly once, got {seen}");
+    }
+
+    #[tokio::test]
+    async fn a_chain_without_links_still_seeds_the_record_transcript() {
+        let (_store_dir, store) = store_with_record().await;
+        let mut record = completed_record();
+        record.messages = vec![
+            openjiuwen_foundation::prompt::BaseMessage::user("earlier question"),
+            openjiuwen_foundation::prompt::BaseMessage::assistant("earlier answer"),
+            openjiuwen_foundation::prompt::BaseMessage::user("latest question"),
+            openjiuwen_foundation::prompt::BaseMessage::assistant("latest answer"),
+        ];
+        store.save(&record).await.unwrap();
+
+        let log_dir = tempfile::TempDir::new().unwrap();
+        let link_dir = tempfile::TempDir::new().unwrap();
+        seed_log(
+            log_dir.path(),
+            "exec3",
+            &[
+                EntryPayload::execution_started("latest question"),
+                EntryPayload::model_turn("mc_1", "latest answer", ModelUsage::known(1, 1)),
+                EntryPayload::execution_final(
+                    crate::persistent_agent::entry::FinalStatus::Completed,
+                    None,
+                ),
+            ],
+        )
+        .await;
+        // No link was written: tracing stops at the recovery execution, so only the record can
+        // reach the earlier turns.
+        let plan = resume(
+            &store,
+            &RootLogSource::new(log_dir.path(), LogCapacity::default()).with_clock(clock()),
+            &FileLinkStore::new(link_dir.path()),
+            &binding(),
+            "request",
+            &Continuation::new("exec3", None, 4).unwrap(),
+            &assembler(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(plan.chain.len(), 0, "a missing link traces no predecessor");
+        let messages = plan.seed_history();
+        assert!(
+            messages[0].text().contains("【窗口摘要】"),
+            "the assembly summary stays first: {messages:?}"
+        );
+        assert_once(&messages, "earlier question");
+        assert_once(&messages, "earlier answer");
+        assert_once(&messages, "latest question");
+        assert_once(&messages, "latest answer");
+        assert!(index_of(&messages, "earlier question") < index_of(&messages, "earlier answer"));
+        assert!(index_of(&messages, "earlier answer") < index_of(&messages, "latest question"));
+        assert!(index_of(&messages, "latest question") < index_of(&messages, "latest answer"));
+    }
+
+    #[tokio::test]
+    async fn the_chain_walk_seeds_every_traced_execution_once_in_order() {
+        let (_store_dir, store) = store_with_record().await;
+        let mut record = completed_record();
+        // A continuation seeds the record with the window's own rendering, so the first turn is
+        // prefixed and the query the host sent is not.
+        record.messages = vec![
+            openjiuwen_foundation::prompt::BaseMessage::user("【本次执行】alpha"),
+            openjiuwen_foundation::prompt::BaseMessage::assistant("reply one"),
+            openjiuwen_foundation::prompt::BaseMessage::user("beta"),
+            openjiuwen_foundation::prompt::BaseMessage::assistant("reply two"),
+        ];
+        store.save(&record).await.unwrap();
+
+        let log_dir = tempfile::TempDir::new().unwrap();
+        let link_dir = tempfile::TempDir::new().unwrap();
+        for (execution_id, goal, answer) in [
+            ("exec1", "alpha", "reply one"),
+            ("exec2", "beta", "reply two"),
+            ("exec3", "gamma", "reply three"),
+        ] {
+            seed_log(
+                log_dir.path(),
+                execution_id,
+                &[
+                    EntryPayload::execution_started(goal),
+                    EntryPayload::model_turn("mc_1", answer, ModelUsage::known(1, 1)),
+                ],
+            )
+            .await;
+        }
+        let links = FileLinkStore::new(link_dir.path());
+        seed_link(&links, "exec1", None, LinkRelation::First).await;
+        seed_link(&links, "exec2", Some("exec1"), LinkRelation::Continuation).await;
+        seed_link(&links, "exec3", Some("exec2"), LinkRelation::Continuation).await;
+
+        let plan = resume(
+            &store,
+            &RootLogSource::new(log_dir.path(), LogCapacity::default()).with_clock(clock()),
+            &links,
+            &binding(),
+            "request",
+            &Continuation::new("exec3", None, 4).unwrap(),
+            &assembler(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(plan.chain.len(), 3, "the chain reaches every execution");
+        let messages = plan.seed_history();
+        assert!(
+            messages[0].text().contains("【本次执行】alpha"),
+            "the oldest traced execution comes first: {messages:?}"
+        );
+        assert_once(&messages, "alpha");
+        assert_once(&messages, "beta");
+        assert_once(&messages, "gamma");
+        assert!(index_of(&messages, "alpha") < index_of(&messages, "beta"));
+        assert!(index_of(&messages, "beta") < index_of(&messages, "gamma"));
     }
 
     #[tokio::test]

@@ -81,6 +81,8 @@ impl MessageRecord {
     async fn transition_task(&self, team: &str, task_id: &str, from: TaskStatus, to: TaskStatus) -> Result<bool>;
     async fn add_dependency(&self, team: &str, task_id: &str, depends_on: &str) -> Result<()>;
     async fn dependencies(&self, team: &str, task_id: &str) -> Result<Vec<String>>;
+    async fn dependencies_many(&self, team: &str, task_ids: &[String]) -> Result<Vec<(String, Vec<String>)>>;
+        // default: join_all over `dependencies` (concurrent, one call per task); in-memory and sqlite override with one read
     async fn dependents(&self, team: &str, task_id: &str) -> Result<Vec<String>>;
     async fn insert_vote(&self, rec: ReviewVote) -> Result<()>;
     async fn votes(&self, team: &str, task_id: &str, round: u32) -> Result<Vec<ReviewVote>>;
@@ -127,7 +129,7 @@ Task/status types are *not* redefined here: `TaskRecord`, `TaskPatch`, `TaskFilt
 - `transition_member` / `transition_task` are compare-and-set: `true` only when the stored status equals `from` **and** `schema::is_valid_member_transition` / `TaskStatus::is_valid_transition` accepts the edge; a `false` is a normal lost race, not an error. Both refresh `updated_at`.
 - `update_member` / `update_task` apply the patch verbatim (no transition validation); an empty patch on a known row returns `true` and writes nothing; an unknown row returns `false`.
 - `update_task` bumps `revision` and appends a rendered `TaskRevision` note (`r{n}: content updated` / `r{n}: title updated` / `r{n}: title and content updated`) only when the title or content actually changes and the patch does not set `revision` explicitly. `clear_assignee` wins over `assignee`.
-- `list_members` sorts by `member_name`; `list_tasks` sorts by `updated_at` descending then `task_id` ascending and truncates to `TaskFilter::limit`; `dependencies`/`dependents` sort lexicographically; `votes` sorts by `reviewer`; `unread_messages` sorts by `timestamp` then `message_id`.
+- `list_members` sorts by `member_name`; `list_tasks` sorts by `updated_at` descending then `task_id` ascending and truncates to `TaskFilter::limit`; `dependencies`/`dependents` sort lexicographically and `dependencies_many` answers in the order the ids were requested (an unknown id gets an empty list); `votes` sorts by `reviewer`; `unread_messages` sorts by `timestamp` then `message_id`.
 - `add_dependency` is idempotent, rejects a self-dependency (`Error::validation("task '<id>' cannot depend on itself")`) and does not require either task row to exist yet.
 - `insert_vote` replaces a reviewer's vote in the same `(team, task, round)` instead of appending; rounds are isolated from each other.
 - Mailbox: a direct row is unread while `is_read == false` and `to_member_name == member`; a broadcast is unread while its `timestamp` is strictly greater than the member's watermark and the member is not its sender. No watermark means every broadcast is unread.

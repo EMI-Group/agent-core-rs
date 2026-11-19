@@ -32,6 +32,17 @@
 //! path is explicit and counted by [`MonitorEmitter::dropped`]: drop-oldest eviction, a refusal
 //! from the non-blocking [`MonitorEmitter::try_emit`], the documented eviction race described
 //! there, and cancelling [`MonitorEmitter::emit`] before it completes (which drops its event).
+//!
+//! # The two emission modes
+//!
+//! The policy describes what `emit` does, not what `try_emit` does: a non-blocking call can never
+//! honour `Block`, so under that policy [`MonitorEmitter::try_emit`] *refuses* the event
+//! ([`EmitOutcome::DroppedNew`]), counts it in [`MonitorEmitter::dropped`] and logs a `warn!`.
+//! That refusal is the overflow report — a caller that keeps using `try_emit` under `Block` learns
+//! about the loss instead of losing the event silently.
+//! [`MonitorEmitter::emit`] is the lossless path that makes `Block` real, and its caller owns the
+//! bound: cancel the future, or wrap it in `tokio::time::timeout`, when the emission must not
+//! outlive a turn.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -43,6 +54,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tracing::warn;
 
 use crate::monitor::event::{MonitorEvent, StampedEvent};
 use crate::monitor::render::TeamMonitor;
@@ -254,6 +266,13 @@ impl MonitorEmitter {
     /// competing producer can take the freed slot first. The new event is then refused
     /// ([`EmitOutcome::DroppedNew`]) and counted in [`MonitorEmitter::dropped`]; the stream keeps
     /// whatever the competitor pushed. This race is accepted because monitoring is observational.
+    ///
+    /// # Refusals under [`BackpressurePolicy::Block`]
+    ///
+    /// A non-blocking call cannot wait for capacity, so a full queue under `Block` refuses the event
+    /// instead of evicting the oldest one: the result is [`EmitOutcome::DroppedNew`], the loss is
+    /// counted in [`MonitorEmitter::dropped`], and the refusal is logged at `warn!` level because a
+    /// `Block` sink is supposed to be lossless. Use [`MonitorEmitter::emit`] for that policy.
     #[must_use]
     pub fn try_emit(&self, event: MonitorEvent) -> EmitOutcome {
         self.enqueue(StampedEvent::now(event))
@@ -344,7 +363,14 @@ impl MonitorEmitter {
             }
             PushOutcome::Full(stamped) => {
                 if self.queue.policy == BackpressurePolicy::Block {
+                    // Never silent: the refusal is counted here (and mirrored by the caller's own
+                    // accounting) and logged, because a `Block` sink is meant to be lossless.
                     self.queue.dropped.fetch_add(1, Ordering::AcqRel);
+                    warn!(
+                        capacity = self.queue.capacity,
+                        "monitor queue is full under the Block policy; the non-blocking path \
+                         refused the event (its loss is counted in `dropped`)"
+                    );
                     return EmitOutcome::DroppedNew;
                 }
                 self.queue.evict_oldest();

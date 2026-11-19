@@ -29,7 +29,8 @@
 //!
 //! [`AttachServer::bind`] creates the socket file (parent directories, stale-socket reclamation and
 //! mode `0600` included), [`AttachServer::serve`] answers every connection concurrently through an
-//! [`AttachHandler`], and [`AttachServer::shutdown`] stops the accept loop and removes the file.
+//! [`AttachHandler`] under the [`AttachLimits`] bounds (a concurrency ceiling plus a per-connection
+//! idle timeout), and [`AttachServer::shutdown`] stops the accept loop and removes the file.
 //! Dropping a server also removes the socket file, and only ever a path that is still a socket.
 //!
 //! # Security
@@ -56,7 +57,7 @@ pub use protocol::{
     AttachError, AttachHandler, AttachOp, AttachResult, RequestFrame, ResponseFrame,
     MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
-pub use server::AttachServer;
+pub use server::{AttachLimits, AttachServer};
 
 #[cfg(test)]
 #[path = "client_tests.rs"]

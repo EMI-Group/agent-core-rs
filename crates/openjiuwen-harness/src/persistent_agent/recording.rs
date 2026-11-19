@@ -27,8 +27,9 @@ use serde_json::Value;
 
 use crate::workspace::Workspace;
 
+use super::continuation::{ExecutionLink, ExecutionLinkSource, FileLinkStore};
 use super::entry::{EntryPayload, FinalStatus, ModelUsage, DETAIL_LIMIT};
-use super::identity::{ExecutionIdentity, SessionBinding};
+use super::identity::{ExecutionIdentity, LinkRelation, SessionBinding};
 use super::layout::PersistentAgentLayout;
 use super::log::{ExecutionLog, LogCapacity};
 use super::rails::deterministic_model_call_id;
@@ -196,11 +197,14 @@ impl ExecutionRecorder {
     ///
     /// The journal lives at `<logs root>/<percent-encoded execution id>` and its first entry is
     /// [`EntryPayload::execution_started`] carrying `query`, which is the entry the resumed window
-    /// rebuilds the question from.
+    /// rebuilds the question from. The execution link is recorded too: it names the execution the
+    /// session record already ended with, so a later resume traces the whole chain of
+    /// continuations instead of just the newest execution.
     ///
     /// # Errors
     /// [`PersistentRunConfig::identity`] errors, and every error [`ExecutionLog::open`] or
-    /// [`ExecutionLog::append`] reports.
+    /// [`ExecutionLog::append`] reports. A link that cannot be written is logged and skipped: a
+    /// missing link costs a later resume the chain walk, never the run.
     pub async fn begin(
         &self,
         config: &PersistentRunConfig,
@@ -208,15 +212,75 @@ impl ExecutionRecorder {
     ) -> Result<ActiveExecution> {
         let identity = config.identity()?;
         let dir = self.layout.logs_root().join(identity.directory_name());
+        let store = FileSessionStore::new(self.layout.sessions_root());
         let log = ExecutionLog::open(dir, identity.clone(), self.capacity).await?;
         log.append(EntryPayload::execution_started(query)).await?;
+        self.record_link(&identity, &store).await;
         Ok(ActiveExecution {
             log,
             identity,
-            store: FileSessionStore::new(self.layout.sessions_root()),
+            store,
             model_turns: AtomicUsize::new(0),
         })
     }
+
+    /// Records the link from `identity` to the execution its session record already ended with.
+    ///
+    /// A run that follows an earlier one continues it; the first run of a session is a `first`
+    /// link. The link is what [`crate::persistent_agent::resume`] traces, so a host that continues
+    /// a session repeatedly rebuilds every turn, not only the newest one.
+    async fn record_link(&self, identity: &ExecutionIdentity, store: &FileSessionStore) {
+        let predecessor = previous_execution(store, &identity.session_binding()).await;
+        let relation = if predecessor.is_some() {
+            LinkRelation::Continuation
+        } else {
+            LinkRelation::First
+        };
+        let link = match ExecutionLink::from_identity(identity, predecessor.as_deref(), relation) {
+            Ok(link) => link,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to build the persistent-agent execution link"
+                );
+                return;
+            }
+        };
+        if let Err(error) = FileLinkStore::new(self.layout.links_root())
+            .write_link(&link)
+            .await
+        {
+            tracing::warn!(error = %error, "failed to record the persistent-agent execution link");
+        }
+    }
+}
+
+/// Returns the execution the session record of `binding` names as its latest, if it names one.
+///
+/// A completed run names it in the ending, a paused one in its checkpoint. An unreadable record
+/// names nothing: a resume then falls back to the record's transcript instead of the chain walk.
+async fn previous_execution(store: &FileSessionStore, binding: &SessionBinding) -> Option<String> {
+    let record = match store.load(binding).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to read the persistent-agent session record");
+            return None;
+        }
+    };
+    record
+        .ending
+        .as_ref()
+        .map(|ending| &ending.execution_id)
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            record
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| &checkpoint.execution_id)
+                .filter(|id| !id.is_empty())
+        })
+        .cloned()
 }
 
 /// One execution whose journal and session record are open for appending.
@@ -360,8 +424,9 @@ mod tests {
         DEFAULT_SOURCE_REF, SESSION_ENDING_OUTCOME,
     };
     use crate::persistent_agent::{
-        EntryKind, EntryPayload, ExecutionLog, FinalStatus, LogCapacity, PersistentAgentLayout,
-        PersistentSessionRecord, SessionBinding, SessionStateStore, UsageStatus,
+        EntryKind, EntryPayload, ExecutionLinkSource, ExecutionLog, FileLinkStore, FinalStatus,
+        LinkRelation, LogCapacity, PersistentAgentLayout, PersistentSessionRecord, SessionBinding,
+        SessionStateStore, UsageStatus,
     };
     use crate::workspace::Workspace;
 
@@ -457,6 +522,51 @@ mod tests {
             snapshot.entries[0].payload,
             EntryPayload::execution_started("hello question")
         );
+    }
+
+    #[tokio::test]
+    async fn begin_links_a_run_to_the_execution_the_record_ended_with() {
+        let (_dir, recorder) = recorder();
+        let config = PersistentRunConfig::new("agent", "session");
+        let links = FileLinkStore::new(recorder.layout().links_root());
+
+        let first = recorder.begin(&config, "first question").await.unwrap();
+        let first_id = first.execution_id().to_owned();
+        let link = links.read_link(&first_id).await.unwrap().unwrap();
+        assert_eq!(link.execution_id, first_id);
+        assert_eq!(link.relation, LinkRelation::First);
+        assert_eq!(link.predecessor_id, None);
+        assert!(link.matches(&first.binding()));
+
+        // A second run of the same session follows the execution the record ended with.
+        first
+            .finish(FinalStatus::Completed, Some("first answer"))
+            .await
+            .unwrap();
+        first
+            .save_session(vec![BaseMessage::user("first question")], None)
+            .await
+            .unwrap();
+        let second = recorder.begin(&config, "second question").await.unwrap();
+        let link = links
+            .read_link(second.execution_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(link.relation, LinkRelation::Continuation);
+        assert_eq!(link.predecessor_id.as_deref(), Some(first_id.as_str()));
+
+        // A different session has no predecessor of its own.
+        let other = recorder
+            .begin(&PersistentRunConfig::new("agent", "other"), "q")
+            .await
+            .unwrap();
+        let link = links
+            .read_link(other.execution_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(link.relation, LinkRelation::First);
     }
 
     #[tokio::test]

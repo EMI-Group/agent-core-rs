@@ -29,8 +29,6 @@
 //! The receiver is leased per run and returned to the handle when the run ends, so a second
 //! *sequential* run on the same team gets a live receiver — and with it the mail and board events
 //! published between the two runs.
-use std::time::Duration;
-
 use openjiuwen_agent::{AgentChunk, AgentOutput};
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_harness_protocol::HarnessState;
@@ -38,23 +36,15 @@ use openjiuwen_session::Session;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tokio::time::{self, MissedTickBehavior};
+use tokio::time;
 use tracing::{debug, warn};
 
+use super::settle::SettleTracker;
 use super::team_agent::TeamAgent;
 use crate::schema::{
     tag_chunk, team_completed_frame, EventMessage, EventPayload, TeamCompletedEvent, TeamTopic,
     TEAM_COMPLETED,
 };
-
-/// How often an idle run re-reads the task board before concluding the team is done.
-pub const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
-
-/// How many consecutive settle ticks must observe "leader idle && board settled".
-///
-/// Two ticks (one interval apart) keep a between-turn idle from ending the run before the leader
-/// starts its next turn.
-const REQUIRED_SETTLE_TICKS: u32 = 2;
 
 /// Chunk kind of an answer/reasoning output event (see [`crate::harness::mapping`]).
 const CHUNK_LLM_OUTPUT: &str = "llm_output";
@@ -174,13 +164,14 @@ pub(crate) async fn run(
         (Some(tx), BusFeed::Detached(rx))
     };
     let cancel = agent.cancellation_token();
-    let mut ticker = time::interval(SETTLE_POLL_INTERVAL);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The settle policy (two-tick debounce plus the adaptive poll interval) lives in
+    // `super::settle`; the loop only holds its schedule and feeds it observations.
+    let mut settle = SettleTracker::new();
+    let mut ticker = Box::pin(time::sleep(SettleTracker::initial_delay()));
 
     let mut index: i64 = 0;
     let mut answer = String::new();
     let mut batch: Vec<String> = Vec::new();
-    let mut idle_ticks: u32 = 0;
     let mut chunks_open = true;
     let mut events_open = true;
 
@@ -190,7 +181,7 @@ pub(crate) async fn run(
             chunk = chunks.recv(), if chunks_open => {
                 match chunk {
                     Some(chunk) => {
-                        idle_ticks = 0;
+                        settle.activity();
                         forward_chunk(&agent, chunk, &mut index, &mut answer, sink.as_ref());
                     }
                     None => chunks_open = false,
@@ -199,7 +190,7 @@ pub(crate) async fn run(
             event = events.recv(), if events_open => {
                 match event {
                     Some(event) => {
-                        idle_ticks = 0;
+                        settle.activity();
                         if let Some(line) = steer_line(&agent, &event).await {
                             batch.push(line);
                             if batch.len() >= agent.steer_batch_size() {
@@ -211,25 +202,27 @@ pub(crate) async fn run(
                 }
             }
             () = cancel.cancelled() => break RunExit::Cancelled,
-            _ = ticker.tick() => {
+            () = &mut ticker => {
                 // Drain output produced before the runtime went idle, so a tick can never
                 // outrun a chunk that is already queued.
                 while let Ok(chunk) = chunks.try_recv() {
-                    idle_ticks = 0;
+                    settle.activity();
                     forward_chunk(&agent, chunk, &mut index, &mut answer, sink.as_ref());
                 }
                 drain_org_mail(&agent, &mut batch, &mut org_acks).await;
                 if flush(&agent, &mut batch).await {
                     acknowledge_org(&agent, &mut org_acks).await;
                 }
-                if agent.state() == HarnessState::Idle && agent.backend().tasks().is_settled().await? {
-                    idle_ticks += 1;
-                    if idle_ticks >= REQUIRED_SETTLE_TICKS {
-                        break RunExit::Settled;
-                    }
-                } else {
-                    idle_ticks = 0;
+                // One board read per poll, whatever the number of tasks: the probe is a
+                // bounded-traffic settle read and also carries the fingerprint the backoff uses.
+                let probe = agent.backend().tasks().settle_probe().await?;
+                let leader_idle = agent.state() == HarnessState::Idle;
+                if settle.poll(leader_idle, probe) {
+                    break RunExit::Settled;
                 }
+                ticker
+                    .as_mut()
+                    .reset(time::Instant::now() + settle.interval());
             }
         }
     };
@@ -513,6 +506,8 @@ async fn unread_lines(agent: &TeamAgent, leader: &str) -> Option<String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::memory::{MemoryConfig, TeamMemoryWiring};
     use crate::runtime::team_agent::test_support::{
