@@ -167,7 +167,7 @@ pub(crate) async fn run(
     // The settle policy (two-tick debounce plus the adaptive poll interval) lives in
     // `super::settle`; the loop only holds its schedule and feeds it observations.
     let mut settle = SettleTracker::new();
-    let mut ticker = Box::pin(time::sleep(settle.initial_delay()));
+    let mut ticker = Box::pin(time::sleep(SettleTracker::initial_delay()));
 
     let mut index: i64 = 0;
     let mut answer = String::new();

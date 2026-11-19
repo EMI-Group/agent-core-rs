@@ -108,7 +108,7 @@ impl TeamSignals {
     /// the team it observes, so the call never suspends.
     /// An absent emitter means nobody is watching and nothing is lost.
     /// A closed queue, a drop-oldest eviction and — under
-    /// [`BackpressurePolicy::Block`](crate::monitor::BackpressurePolicy::Block) — a refusal all
+    /// [`BackpressurePolicy::Block`] — a refusal all
     /// count in [`TeamSignals::monitor_dropped`]; the refusal is additionally logged at `warn!`
     /// level, because under a `Block` policy it is a policy violation rather than the documented
     /// lossy default.
@@ -121,10 +121,10 @@ impl TeamSignals {
     }
     /// Emits one monitor event, waiting for capacity under a blocking policy.
     ///
-    /// Under [`BackpressurePolicy::Block`](crate::monitor::BackpressurePolicy::Block) this
+    /// Under [`BackpressurePolicy::Block`] this
     /// suspends until the writer drains a slot or the stream closes, which is what makes the policy
     /// *real* where the caller can afford it; under
-    /// [`BackpressurePolicy::DropOldest`](crate::monitor::BackpressurePolicy::DropOldest) it is
+    /// [`BackpressurePolicy::DropOldest`] it is
     /// [`TeamSignals::emit`] with an `.await`.
     ///
     /// The caller bounds the wait: cancel the future (or wrap it in [`TeamSignals::emit_waiting_within`])

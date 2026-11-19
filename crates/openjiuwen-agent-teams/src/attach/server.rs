@@ -141,8 +141,8 @@ const REJECT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Resource bounds an [`AttachServer`] enforces on its connections.
 ///
 /// The attach bridge serves one peer per connection and the peers are local processes, so the
-/// defaults are generous for a host that also runs the team: [`DEFAULT_MAX_CONNECTIONS`] slots and
-/// [`DEFAULT_IDLE_TIMEOUT`] of silence.
+/// defaults are generous for a host that also runs the team: [`AttachLimits::DEFAULT_MAX_CONNECTIONS`]
+/// slots and [`AttachLimits::DEFAULT_IDLE_TIMEOUT`] of silence.
 /// Both bounds exist so a slow or hostile client cannot exhaust the host: without them every
 /// accepted connection took a task and a file descriptor for as long as the peer cared to keep it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,29 +345,25 @@ impl AttachServer {
                     match accepted {
                         Ok((stream, peer)) => {
                             let cancel = self.cancel.clone();
-                            match Arc::clone(&permits).try_acquire_owned() {
-                                Ok(permit) => {
-                                    let handler = Arc::clone(&handler);
-                                    let idle = self.limits.idle_timeout;
-                                    tasks.spawn(async move {
-                                        // The permit is held for the whole connection, which is
-                                        // what bounds the number of live connection tasks.
-                                        serve_connection(stream, handler, cancel, idle, permit)
-                                            .await;
-                                    });
-                                }
-                                Err(_) => {
-                                    tracing::warn!(
-                                        peer = ?peer,
-                                        path = %self.path.display(),
-                                        limit = self.limits.max_connections,
-                                        "attach connection rejected: server at its connection limit"
-                                    );
-                                    let limit = self.limits.max_connections;
-                                    tasks.spawn(async move {
-                                        reject_connection(stream, limit, cancel).await;
-                                    });
-                                }
+                            if let Ok(permit) = Arc::clone(&permits).try_acquire_owned() {
+                                let handler = Arc::clone(&handler);
+                                let idle = self.limits.idle_timeout;
+                                tasks.spawn(async move {
+                                    // The permit is held for the whole connection, which is
+                                    // what bounds the number of live connection tasks.
+                                    serve_connection(stream, handler, cancel, idle, permit).await;
+                                });
+                            } else {
+                                tracing::warn!(
+                                    peer = ?peer,
+                                    path = %self.path.display(),
+                                    limit = self.limits.max_connections,
+                                    "attach connection rejected: server at its connection limit"
+                                );
+                                let limit = self.limits.max_connections;
+                                tasks.spawn(async move {
+                                    reject_connection(stream, limit, cancel).await;
+                                });
                             }
                             while tasks.try_join_next().is_some() {}
                         }

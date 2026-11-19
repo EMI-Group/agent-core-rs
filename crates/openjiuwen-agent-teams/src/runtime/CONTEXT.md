@@ -118,7 +118,10 @@ impl TeamSignals {
     pub fn observability(&self) -> Arc<TeamObservability>;   pub fn team_name(&self) -> &str;
     pub fn install_monitor(&self, MonitorEmitter);   pub fn monitor_emitter(&self) -> Option<MonitorEmitter>;
     pub fn monitor_stream(&self, usize, BackpressurePolicy) -> MonitorReceiver;   // replaces the emitter
-    pub fn emit(&self, MonitorEvent);
+    pub fn emit(&self, MonitorEvent);                              // non-blocking; overflow is counted
+    pub async fn emit_waiting(&self, MonitorEvent) -> EmitOutcome; // real Block: awaits capacity
+    pub async fn emit_waiting_within(&self, MonitorEvent, Duration) -> EmitOutcome;   // budget-bounded
+    pub fn monitor_dropped(&self) -> u64;                          // the overflow accounting channel
     pub fn team_started(&self, Option<&str>);   pub fn team_finished(&self);
     pub fn member_spawned(&self, &str, TeamRole);   pub fn member_status(&self, &str, TeamRole, MemberStatus);
     pub fn member_stopped(&self, &str, TeamRole, &str);   pub fn round_started(&self, &str, u32);
@@ -256,8 +259,17 @@ impl TeamAgent {
     pub fn roster(&self) -> Vec<String>;
 }
 
-// leader.rs — the coordination loop (`pub(crate)` surface)
-pub const SETTLE_POLL_INTERVAL: Duration;
+// leader.rs — the coordination loop (`pub(crate)` surface); the settle policy lives in settle.rs
+pub use settle::{SETTLE_MAX_POLL_INTERVAL, SETTLE_POLL_INTERVAL};   // 25 ms while the board moves; 250 ms backoff ceiling
+pub(crate) struct SettleTracker;   // two-tick debounce + adaptive interval (settle.rs)
+impl SettleTracker {
+    pub(crate) const fn new() -> Self;
+    pub(crate) const fn with_intervals(fast: Duration, max: Duration) -> Self;
+    pub(crate) const fn initial_delay(&self) -> Duration;   // zero: the first poll is immediate
+    pub(crate) fn interval(&self) -> Duration;              // delay before the next poll
+    pub(crate) fn activity(&mut self);                      // a chunk/event: not idle, poll fast again
+    pub(crate) fn poll(&mut self, leader_idle: bool, probe: SettleProbe) -> bool;   // true = settle
+}
 pub(crate) type ChunkSink = UnboundedSender<Result<AgentChunk>>;
 pub(crate) async fn run(agent: TeamAgent, query: Option<String>, session: Option<Arc<dyn Session>>,
                         deliver: Vec<InteractPayload>, sink: Option<ChunkSink>) -> Result<AgentOutput>;
@@ -396,6 +408,11 @@ Monitor events are emitted synchronously on the calling task, so a reader must i
 before the event it wants; a later `monitor_stream` replaces the emitter, so events reach the newest reader only
 (bounded queue + `BackpressurePolicy`).
 Hooks must not block — they run inline on the leader/observer task.
+Emission modes: every lifecycle hook uses the non-blocking `emit`, which never suspends a member or the
+leader, so under `BackpressurePolicy::Block` a full sink is a policy violation that is counted in
+`monitor_dropped()` and logged at `warn!` instead of being discarded; `emit_waiting` is the lossless
+`await` path (bounded by the caller's cancellation) and `emit_waiting_within` bounds it with a budget whose
+expiry is reported like a refusal. `emitted + dropped` therefore accounts for every emission attempt.
 
 ### Organisation layer
 
@@ -494,11 +511,17 @@ config therefore just logs.
    leader's `(derived session, card id)` when one exists — attach bind (see policy), `signals.team_started`.
    A teammate's `spawn_member` start does the same restore before its pump and records the memory join after it.
 4. The leader query is sent with `immediate = false` (a follow-up turn).
-5. Loop on `tokio::select!`: member chunks, bus events, caller cancellation, and a settle tick.
+5. Loop on `tokio::select!`: member chunks, bus events, caller cancellation, and an adaptive settle poll.
    - teammate/leader chunks are forwarded tagged with `TeamOutputSchema{source_member, role, chunk}`;
    - mailbox/task/org events are translated into one leader `send` batched by `steer_batch_size`;
-   - the loop ends when the leader runtime is `Idle` **and** `taskboard.is_settled()`, when the caller
-     cancels, or when `stop()` fires.
+   - every chunk/event calls `SettleTracker::activity` (breaks the idle streak, polls fast again);
+   - each poll takes **one** `taskboard.settle_probe()` (a bounded three-call board read) and calls
+     `SettleTracker::poll(leader_idle, probe)`; the interval is `SETTLE_POLL_INTERVAL` while the board
+     moves and doubles up to `SETTLE_MAX_POLL_INTERVAL` while two consecutive probes are identical, so a
+     quiet run no longer rebuilds the board 40 times a second;
+   - the loop ends when the leader runtime is `Idle` **and** the board is settled on two consecutive
+     polls, when the caller cancels, or when `stop()` fires. A settled observation always schedules the
+     fast interval, so the decision point is the same as with a fixed interval.
 6. The org mailbox is acknowledged only for the ids whose flush succeeded; a failed flush keeps them unread.
 7. The `team.completed` frame (`schema::stream::team_completed_frame`) is emitted last and the gate is
    already closed; a settled run then publishes **one** `EventPayload::TeamCompleted(TeamCompletedEvent
@@ -555,7 +578,7 @@ a new session instead of being rebuilt.
 - No `unsafe`, no `unwrap`/`expect` outside tests.
 - Process-global state: exactly one new singleton here — the team runtime registry
   (`global_registry`), the crate's second documented singleton after the expert catalog.
-- Files ≤1000 lines; split by responsibility (`leader.rs` holds the loop while `team_agent/` is one
+- Files ≤1000 lines; split by responsibility (`leader.rs` holds the loop, `settle.rs` its settle policy, while `team_agent/` is one
   directory per concern — `mod.rs` is the handle, `lifecycle.rs` the run entry points, `members.rs` the
   member lifecycle, `attach.rs`/`signals.rs`/`org_ops.rs` their own surface — and `routing.rs`, `spec_meta.rs`,
   `observability_bind.rs`, `org_bind.rs`, `attach_host.rs` and `observer.rs` each own one concern).
@@ -596,7 +619,8 @@ a new session instead of being rebuilt.
 - `./team_agent/signals.rs` → `signals`, `monitor_stream`, `kv_cache`, `kv_env`
 - `./team_agent/test_support.rs` → the `#[cfg(test)]` offline kit (scripted factory/harness, recording workspace provider, `blueprint`/`deps`/`built`)
 - `./team_agent/tests.rs` → the handle's unit tests (build, spawn/shutdown, workspace lifecycle, delivery, gate)
-- `./leader.rs` → the coordination loop and its settle/batching/flush acknowledgement rules
+- `./leader.rs` → the coordination loop and its batching/flush acknowledgement rules
+- `./settle.rs` → `SettleTracker`: the two-tick settle debounce and the adaptive board poll interval
 - `./pool.rs` → `TeamRuntimePool`
 - `./manager.rs` → `TeamRuntimeManager`, `global_registry`/`set_global_registry`/`clear_global_registry`
 - `./adapter.rs` → `openjiuwen_agent::Agent` and `openjiuwen_multiagent::Team` implementations

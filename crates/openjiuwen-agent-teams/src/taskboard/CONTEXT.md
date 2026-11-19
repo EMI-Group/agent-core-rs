@@ -52,6 +52,7 @@ impl TaskBoard {
     pub async fn claimable(&self) -> Result<Vec<TaskSummary>>;
     pub async fn subtasks(&self, parent_id: &str) -> Result<Vec<TaskSummary>>;
     pub async fn is_settled(&self) -> Result<bool>;
+    pub(crate) async fn settle_probe(&self) -> Result<SettleProbe>;   // one bounded board read: settled + fingerprint
     pub async fn is_completed(&self) -> Result<bool>;
     pub async fn stale_tasks(&self, now_ms: u64, claim_idle_ms: u64, pending_idle_ms: u64) -> Result<Vec<TaskSummary>>;
 }
@@ -86,6 +87,7 @@ pub fn tally_with(votes: &[ReviewVote], reviewers: &[String]) -> ReviewTally;
 - **Reset**: `completed|cancelled|in_review` → `pending`, clearing assignee/summary/note. `review_round` is deliberately not rewound (votes are kept forever and a rewound round would re-read the previous cycle's verdicts).
 - **Unblocking**: after a task becomes terminal, every direct dependent still `blocked` whose dependencies are all terminal becomes `pending` and is listed in `TaskMutation::unblocked` (sorted). The pass is idempotent.
 - **Settled vs completed**: `is_settled` = no open task (an empty board is settled); `is_completed` = settled **and** at least one task exists, so an untouched board never reads as a finished team.
+- **Bounded reads**: every whole-board read (`is_settled`, `is_completed`, `stale_tasks`, `view`, `settle_probe`, unblocking) goes through one `snapshot()` = `list_tasks` + one batched `TeamStore::dependencies_many` + `list_members`, i.e. three store calls whatever the number of tasks; `SettleProbe` additionally carries a task-row digest so a caller can tell a still board from a moving one (`crate::runtime::settle`).
 - **Stale sweep**: `planning|in_progress` stale at `age >= claim_idle_ms`; unassigned `pending` stale at `age >= pending_idle_ms` (inclusive, `age = now_ms - updated_at`); `blocked`, `in_review` and terminal rows are never stale. Rows are sorted by `task_id`.
 
 ### Stable reason strings (shown to the model — treat as API)
@@ -138,6 +140,7 @@ Unblocked tasks are reported through `TaskMutation::unblocked`, not as events; t
 
 ## Test Strategy
 
+`probe_tests.rs` pins the settle read's cost and settle point over a counting `TeamStore` (`a_settle_probe_costs_three_store_calls_regardless_of_task_count`, `a_changed_row_changes_the_probe_fingerprint`, `the_backoff_settles_two_polls_after_the_board_settles`).
 `board_tests.rs`, all async and deterministic against `InMemoryTeamStore` (`#[tokio::test]`, unwrap/expect allowed inside the module): creation with dependencies and minted ids, cycle rejection leaving no rows or edges, unblocking on complete and on cancel, claim ownership and reason strings, completion with and without reviewers, verify pass/fail, the scheduled tally (1 of 3 → not decided, then pass/fail majority), the revision gate plus re-read recovery, assign/reassign/set_plan/reset/cancel, the subtask depth gate and parent parking, `is_settled`/`is_completed`, the inclusive stale boundaries, and the `view`/`claimable`/`detail`/`subtasks` shapes.
 `graph.rs` and `review.rs` carry their own pure unit tests (cycle determinism, depth, tally majorities/ties/duplicates/former reviewers).
 Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --lib`, `cargo test -p openjiuwen-agent-teams --no-default-features --lib`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` green for this node.

@@ -88,7 +88,10 @@ impl SettleTracker {
     }
 
     /// The delay before the first poll: none, so an already-settled board settles without waiting.
-    pub(crate) const fn initial_delay(&self) -> Duration {
+    ///
+    /// An associated function rather than a method: the delay is a property of the policy, not of a
+    /// tracker's current backoff state.
+    pub(crate) const fn initial_delay() -> Duration {
         Duration::ZERO
     }
 
@@ -164,7 +167,7 @@ mod tests {
         let tracker = SettleTracker::new();
         assert_eq!(tracker.interval(), SETTLE_POLL_INTERVAL);
         assert_eq!(SETTLE_MAX_POLL_INTERVAL, Duration::from_millis(250));
-        assert_eq!(tracker.initial_delay(), Duration::ZERO);
+        assert_eq!(SettleTracker::initial_delay(), Duration::ZERO);
         assert_eq!(SettleTracker::default().interval(), SETTLE_POLL_INTERVAL);
         assert_eq!(
             SettleTracker::with_intervals(MAX, FAST).interval(),
