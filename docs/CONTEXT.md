@@ -16,7 +16,7 @@ The Context Tree (`CONTEXT.md` per crate) is the primary source of intent and AP
 - `PARITY.md` §CLI commands — the `openjiuwen` subcommands (`run`, `chat`, `sessions`, `lsp`, `cron`, `team`, `watch`, `auto-harness`), their flags including `--resume`/`--continue`/`--worktree`, and the exit codes.
 - `PARITY.md` §Deferred Features — the authoritative per-crate gap list, each entry carrying a reason category (vendor SDK, external service/broker, GPU/ML stack, platform automation, incompatible format/design).
 - `PARITY.md` §`Error::Unsupported` surface — the typed seams by module path, plus §Gaps that are not typed seams for behavioural shortfalls.
-- `PARITY.md` §Verification — the gate commands, the measured counts, the `default-members` caveat, and the `#[ignore]` inventory.
+- `PARITY.md` §Verification — the gate commands, the `default-members` caveat, the failing targets, and the `#[ignore]` inventory.
 - `ARCHITECTURE.md` §2 — the public seams whose signatures require updating every dependent crate when changed.
 - `ARCHITECTURE.md` §2.13 — the harness seams a host wires: `MemoryToolBackend`/`WorkspaceMemoryBackend` for the memory tools and `SubAgentSpawner`/`RuntimeSubAgentSpawner` for subagents.
 - `ARCHITECTURE.md` §5 — the complete feature-flag table, including the `default = []` crates, the empty `live-tests` gates and the dead gates.
@@ -25,11 +25,11 @@ The Context Tree (`CONTEXT.md` per crate) is the primary source of intent and AP
 
 - Documentation describes the current state; history lives in git, so a fixed gap is deleted rather than annotated as fixed.
 - Keep the parity matrix and the deferred table current whenever a crate's scope changes.
-- Write one sentence per line so git diffs stay granular, and keep each file under ~60 KB.
+- Write one sentence per line so git diffs stay granular, and keep each file under ~64 KB.
 - Do not duplicate per-crate API details here; link to the crate `CONTEXT.md`.
 - State only verified facts, and present tense throughout: no changelog wording, no dates, no "was X, now Y".
-- Parity numbers (test and scenario counts) come from a measured run of the gate, never from an earlier revision.
-- When the gate is red, the verification section names the failing targets and the measured counts; it never claims a green run.
+- Record how a claim is verified (the gate command, the package suite) instead of a test or scenario count, which drifts with the next commit.
+- When the gate is red, the verification section names the failing targets; it never claims a green run.
 
 ## Notes for Agents
 

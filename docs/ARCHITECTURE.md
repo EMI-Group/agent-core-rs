@@ -58,6 +58,7 @@ pub enum Error { Config(String), Validation(String), Llm(String), Tool(String), 
                  NotFound(String), Unsupported(String), Cancelled, External(Box<dyn Error + Send + Sync>) }
 ```
 
+JSON paths are bounded (`utils::json::MAX_JSON_INDEX` = 100 000, plus a path-growth cap): an index past the limit is a typed `Error::Validation` before anything is allocated, and every URL in an HTTP error string is credential-redacted.
 `ErrorKind` mirrors those variants so callers can match without owning a message; the Python `Card`/`Config` split is preserved (`*Card` is serializable and registry-safe, `*Config` is process-local, may hold clients or credentials, and is passed to `configure`/`set_config`).
 All serialized structs use `#[serde(rename_all = "snake_case", default)]`, tolerate unknown fields, and default missing collections to empty.
 
@@ -160,6 +161,8 @@ pub trait Checkpointer: Send + Sync + std::fmt::Debug {
 `InteractionBroker` pairs `InteractionRequest`s with the responses that answer them (`request`, `resolve`, `seed`, `pending`, `cancel_all`).
 `Tracer` emits `TraceFrame`s into a `TraceSink` (`NoopTraceSink`, `MemoryTraceSink`, `StreamTraceSink`); `SwappableTraceSink` is the indirection that lets a host install a real sink after construction, and `install_trace_sink` is the `otel`-gated helper over it.
 Checkpointer backends are in-memory, filesystem JSON, SQLite (`sqlite`) and Redis RESP2 — the RESP2 client lives in-crate (`checkpoint::resp`) and is always compiled, and `create_checkpointer(&CheckpointerConfig)` selects one by `CheckpointerKind`.
+The Redis client dials `redis://` in the clear and `rediss://` through `tokio-rustls`, and `RedisOptions::io_timeout` (60 s default) bounds dialling, the TLS handshake and every command; a timed-out connection is dropped instead of re-pooled, so a late reply can never answer the next command, and the connection mutex is only held to take or return a pooled handle.
+`DiskSessionStore` serialises the `sessions.json` read-modify-write of `save` and `delete` behind one store-level index lock shared across clones, and writes both documents temp-file-plus-rename.
 Concrete sessions are `WorkflowSession`, `AgentSession`, `AgentTeamSession` and `NodeSession`, with the `SubWorkflowSession` and `RouterSession` views; resume is keyed by `session_id`, global state is JSON, and component state is namespaced by component id.
 
 ### 2.5 Graph and workflow (`openjiuwen-graph`, `openjiuwen-workflow`)
@@ -207,8 +210,9 @@ impl Workflow {
 `invoke_with`/`stream_with` take `WorkflowRunOptions` (stream modes, deadline, cancellation).
 
 Superstep scheduling uses two channel kinds: a `NodeChannel` fires on the barrier groups accumulated from `EdgeKind::Barrier` edges, and one with no groups is a trigger channel that fires from a plain edge; both snapshot and restore with the run, so a resumed run re-derives readiness from persisted state rather than re-executing completed nodes.
-`NodeOutcome::Route` selects the next nodes, `Halt` ends the run with a value, and a failed run saves a boundary snapshot at its last completed superstep.
-Data flow uses textual `${node.field}` references resolved in the engine, with one documented extension: a field name applied to an array projects over its elements; component capabilities (`invoke`, `stream`, `transform`, `collect`) determine legal edge kinds.
+`NodeOutcome::Route` selects the next nodes and `Halt` ends the run with a value; a failed run saves a boundary snapshot at its last completed superstep only when a `GraphStore` can persist it (`GraphStore::save(&self, session_id, namespace, snapshot: &GraphSnapshot)` borrows the snapshot), and `RouterContext::state_arc()` shares the run state with every router of a dispatch, so routing copies no state.
+Data flow uses `${node.field}` references compiled once per node into a schema template and resolved against run state, with one documented extension: a field name applied to an array projects over its elements; component capabilities (`invoke`, `stream`, `transform`, `collect`) determine legal edge kinds, and a node execution takes the state through a `StateView` (moved out, written back on drop) instead of cloning it.
+`invoke`, `stream` and `resume` share one deadline and one cancellation token; the stream buffer is a bounded channel, so a slow consumer backpressures the run instead of growing memory, and `StreamDelivery::Interleaved` is rejected before any session mutation or graph compile.
 Rendering is split: graph emits Mermaid (`CompiledGraph::to_mermaid_with`), and the deterministic SVG renderer lives in `openjiuwen-workflow::render` (`to_svg`, `render_svg`, `error_svg`, `SvgOptions`), where the same spec always produces byte-identical output and `DrawFormat::Png` is a typed `Error::Unsupported`.
 
 ### 2.6 Agents (`openjiuwen-agent`) and runner (`openjiuwen-runner`)
@@ -226,6 +230,7 @@ pub trait Agent: Send + Sync {
 There is no `BaseAgent`: `Agent` plus `AgentCard` is the whole seam, and `ReActAgent`, `LlmAgent`, `WorkflowAgent` and `ReActAgentEvolve` implement it.
 `ControllerAgent` is not an `Agent`: it implements `TaskExecutor` over an `Arc<dyn Agent>`.
 `ReActAgent::configure(ReActAgentConfig)`, `WorkflowAgent::add_workflows` and `LlmAgent::new(LlmAgentConfig)` are the configuration entry points.
+Every `invoke`/`stream` installs a fresh cancellation token and runs the loop under `ReActAgentConfig::{completion_timeout_secs, tool_timeout_secs}` (600 s each; `0` disables), `ReActAgent::abort()` cancels the most recently started run, a cancelled run ends with `Error::Cancelled` (one terminal `Err` item on a stream), and dropping a returned stream cancels its own run through a `CancelOnDrop` guard.
 Rail hooks are one trait, `AgentRail`, with nine callbacks: `before_invoke`, `after_invoke`, `before_model_call`, `after_model_call`, `on_model_exception`, `before_tool_call`, `after_tool_call`, `on_tool_exception`, `after_react_iteration`, plus `name` and `priority`.
 Interrupts are typed by `InterruptKind` (`Undeclared`, `Permission`, `Confirm`, `AskUser`, `SkillAuthorization`, `SkillEvolutionApproval`, `TeamToolApproval`, `ClientTool`, `Custom`) and each maps to a stable wire string.
 The controller stack (`controller::{BaseController, Controller, GroupRouter, TaskManager, TaskQueue, TaskSchedulerLoop}`) owns task bookkeeping; `TaskManager` is clone-shared and indexes tasks by id, by priority and by parent/child links including the root ids, while session lookup and status filtering are linear scans.
@@ -255,6 +260,7 @@ impl Runner {
 ```
 
 `Runner::run_workflow` mirrors `run_agent` with a `WorkflowRef`, every `run_*` has a `*_streaming` twin, and team runs additionally expose `try_start_agent_team`, `acquire_agent_team`, `pause_/resume_/stop_agent_team`, `interact_agent_team` and `answer_interaction`.
+Workflow runs fall back to `RunnerConfig::default_run_timeout_secs` when the caller sets no deadline (`0` disables it), captured child stderr is read line-bounded, a dropped spawn handle reports `cancelled` instead of a silent success, and callback projection is skipped when no subscriber is registered.
 `RunOptions` carries the optional caller session, deadline, cancellation token, session id, envs, checkpointer override, stream modes and metadata; an id passed as `AgentRef`/`WorkflowRef`/`TeamRef` is resolved through `ResourceMgr`.
 `ResourceMgr` registers tools, agents, workflows and teams by card, owns the tag, model, prompt, sysop and MCP-server managers, and `TeamPool` keys pooled team runs by `(team name, session id)` behind `start_agent_team`.
 `SpawnerRegistry` routes a `SpawnSpec` to a backend (`spec.backend` hint → explicit default → sole spawner → typed failure) and `Runner::spawn_agent` returns a `SpawnedAgent` whose `health` probes the backend.
@@ -276,7 +282,7 @@ The wire is pinned by `PROTOCOL_VERSION` (`"1.0"`) and `EVENT_WIRE_SCHEMA_VERSIO
 
 Graph runs publish ordered `GraphEvent`s (`kind`, optional `node_id`, 1-based `superstep`, object `payload`): `superstep_started`, `node_started`, `node_completed`, `node_failed`, `edge_traversed`, `superstep_completed`, and one terminal `graph_completed`/`graph_halted`/`graph_failed`.
 A consumed graph stream ends with that terminal event, or with exactly one `Err` after the failure's events; dropping the stream aborts the run.
-Workflow runs stream `WorkflowChunk` frames in production order, filtered by `WorkflowRunOptions::stream_modes`, ending in one `workflow_final` frame or exactly one `Err`; an interrupted run ends quietly after its interaction frames.
+Workflow runs stream `WorkflowChunk` frames in production order, filtered by `WorkflowRunOptions::stream_modes`, ending in one `workflow_final` frame or exactly one `Err`; an expired deadline or a trip of the run's cancellation token ends it with one typed `Timeout`/`Cancelled` item, and an interrupted run ends quietly after its interaction frames.
 Session frames are one struct, `StreamItem { mode: StreamMode, item_type (wire "type"), index, payload }`, where `mode` is the local routing class (`output`, `trace`, `custom`) and is dropped from the wire projection; `output`, `output_at`, `trace` and `custom` are the constructors.
 Harness streams wrap provider events in `HarnessEvent`, whose serde keys are `schema_version` (`"1"`), `event_type`, `sequence`, `timestamp`, `host_session_id`, `agent_id`, `provider_session_id`, `turn_id`, `item_id`, `correlation_id`, `causation_ids` and `payload`; a foreign `schema_version` decodes to `UnknownEvent` and re-encodes unchanged.
 Context telemetry adds two frame types of its own: `context.compression_state` (`CONTEXT_COMPRESSION_STATE_TYPE`) around every compression pass and `context.usage` (`CONTEXT_USAGE_EVENT_TYPE`) for the prepared window's usage block; the goal rail publishes `goal.updated` under `GOAL_EVENT_EXTRA_KEY` (`harness.goal_events`) once a goal settles, because rails have no direct event sink.
@@ -315,6 +321,7 @@ pub trait MemoryProvider: Send + Sync {
 `sync_turn(user_msg, assistant_msg)` and `on_session_end(&[ConversationTurn])` are the turn-lifecycle hooks a host drives; `sync_turn`'s default writes one episodic memory via `add(&self.default_scope(), …)`, `prefetch`'s default recalls and renders snippets, and only `on_session_end` and `system_prompt_block` are inert.
 `EngineProvider` adapts the in-crate long-term engine to that SPI, `ProviderRegistry`/`ProviderKind` plus the vendor handles and `RestProvider` expose vendor memories as record-only implementations, and `TeamMemory` + `MemberMemoryToolkit` (`team_memory_remember|search|forget|stats`) cover team scope over `TeamMemoryObserver`.
 Dreaming is a repository + orchestrator contract: `DreamRepository::claim_next_leased` takes a `LeaseRequest` and returns a `LeasedJob`, `DreamLeaseGuard` renews or releases it, and `DreamOrchestrator::tick` runs one bounded sweep.
+Message history is tenant-scoped: `clear_messages` and `delete_for` require an explicit `user_id` + `scope_id`, a message id folds that scope plus the batch ordinal, and graph recall clamps `max_depth`/`max_neighbors` to the validated bounds, reporting an expansion that cannot finish within its budget as a typed error.
 
 ### 2.11 Observability (`openjiuwen-extensions::observability`, OTel sink, team bridge)
 
@@ -331,7 +338,8 @@ The real exporter is separate: `otel::OtelTraceSink` implements the kernel `Trac
 `DeepAgent` journals its own turns when `DeepAgentConfig::persistent_agent` is on (default off): `ExecutionRecorder::for_workspace(workspace).begin(PersistentRunConfig::new(card id, session id), query)` opens one entry per turn, `finish(status, Some(&output.output))` closes it, and `save_session(messages, state)` rewrites the `PersistentSessionRecord`; both writes are best effort, so a journal failure is logged and the answer still returns.
 Journal appends call `sync_all`, so a returned append survives a killed process or a power loss.
 The CLI always enables the flag and pins the agent id to `openjiuwen-cli`, because the session binding is `(agent_id, session_id)` and a per-process uuid would make `--resume` look for a record the previous process never wrote.
-`Repl::with_session_id` adopts a persisted id — the kernel session is rebuilt around it and the existing `<home>/sessions/<id>.json` record is appended to, never truncated — while the one-shot `run --resume` path builds a `ResumedTurn` and calls `cli::run_once_resumed`.
+CLI session records are append-only journals at `<home>/sessions/<id>.jsonl` (a `header` line, then one `message` line per message, and an explicit `truncated` line when the retention cap dropped the oldest ones); a legacy single-document `<id>.json` record is still read and is migrated to the journal on its first append.
+`Repl::with_session_id` adopts a persisted id — the kernel session is rebuilt around it and the existing journal is appended to, never truncated — while the one-shot `run --resume` path builds a `ResumedTurn` and calls `cli::run_once_resumed`.
 Two deviations remain: recording is per turn rather than per model or tool call, and resume stays host-driven, since the harness never calls `resume` or seeds history on its own.
 The runner has no resume entry point of its own: `Runner` exposes only `run_agent(_streaming)`, `run_workflow(_streaming)` and `run_agent_team(_streaming)`.
 
@@ -359,6 +367,7 @@ pub trait SubAgentSpawner: Send + Sync {
 `WorkspaceMemoryBackend` is the production `MemoryToolBackend`: it maps Python's model paths onto workspace nodes (`USER.md`, `<memory>/MEMORY.md`, `<memory>/daily_memory/YYYY-MM-DD.md`, coding `*.md`), resolves every path through `Workspace::resolve` so a symlink escaping the workspace is `Error::Security`, and answers `search` with a deterministic keyword scan that reports `provider: "local"`, `search_mode: "keyword_only"` and `embedding_available: false`.
 `ToolRegistry::with_workspace_memory` installs it, `ToolRegistry::with_memory` substitutes a host backend, and `DeepAgentBuilder::build` mounts it by default; a registry without a backend answers the memory tools with `success=false` and `memory tool backend is not configured`.
 `RuntimeSubAgentSpawner` is the production `SubAgentSpawner` over `SubAgentRuntime`: a semaphore of `limit` permits taken with `try_acquire_owned` makes an over-limit `spawn` fail immediately with `Error::Validation`, the permit is held until the instance reaches a terminal status, and one cancellation token per instance is cancelled by `close` before the runtime is asked to close (a running turn still refuses to close).
+`SubAgentQuota::default()` bounds model-driven fan-out at 32 cumulative spawns, 4 children per parent and depth 3 (10 live and 5 concurrent turns), each limit reporting a typed `Error::Config` naming it, and every tool that reads or fetches is bounded (a line budget on reads, 100 glob results, a grep head limit, byte and timeout caps on `fetch_webpage`, and a per-stream cap plus process-group kill on `!cmd`).
 `DeepAgentBuilder` mounts it as the default subagent rail, so `SubagentRail::with_spawner` always has a real implementor.
 
 ## 3. Async and streaming model
@@ -367,7 +376,8 @@ pub trait SubAgentSpawner: Send + Sync {
 - Long-running loops check `CancellationToken` at await points; deadlines use `tokio::time::timeout`.
 - Session fan-out is `tokio::sync::broadcast` behind `StreamHub`: bounded per subscriber, and a slow consumer drops its oldest frames instead of stalling the producer.
 - Harness event buffering advertises `EventBufferConfig { capacity: 1024, overflow: CoalesceOrBlock }`; the policy coalesces progress frames and blocks rather than dropping a terminal frame.
-- Checkpoints are taken per superstep in the graph engine (opt-in via `checkpoint_every_superstep`, plus one boundary snapshot on failure) and per turn through `HarnessCheckpointSink`, so a resumed run restarts from a completed boundary rather than re-executing a node.
+- Checkpoints are taken per superstep in the graph engine (opt-in via `checkpoint_every_superstep`, plus one boundary snapshot on failure when a `GraphStore` is configured) and per turn through `HarnessCheckpointSink`, so a resumed run restarts from a completed boundary rather than re-executing a node.
+Bounded channels carry streaming frames and tool output, so a slow consumer backpressures its producer instead of growing memory.
 - Structured concurrency: spawned tasks are joined or explicitly detached with a documented owner, and no detached task may outlive its `Runner` without being tracked.
 - Shared mutable state uses `Arc<RwLock<..>>`/`Arc<Mutex<..>>`, locks are never held across `.await`, and the only process-global mutable state is `Runner::global()` plus the TTL-bounded OpenRouter window cache in `openjiuwen-context::policy` and the harness provider registry — all three documented exceptions.
 
@@ -405,7 +415,7 @@ Default builds need no network and no external service; every feature except the
 | `openjiuwen-core` | `otel`, `sqlite`, `sandbox`, `live-tests` | no | Forwarders to session/foundation/memory/sysop; they cover the whole gated kernel surface. |
 | `openjiuwen-extensions` | `a2a` | no | A2A client/server, wire types, harness bridge. |
 | `openjiuwen-extensions` | `otel` | no | Real OTel SDK provider, `OtelTraceSink`, handlers, tracing layer, `observability::{file_exporter, transforming}`. |
-| `openjiuwen-extensions` | `sqlite`, `redis`, `pulsar` | no | SQLite checkpointer/store, Redis KV/document/vector stores + checkpointer, Pulsar queue surface (constructs then rejects). The Redis stores and checkpointer validate their configuration at construction and open the connection lazily on first use; `rediss://` and cluster redirection are typed `Unsupported` at that point. |
+| `openjiuwen-extensions` | `sqlite`, `redis`, `pulsar` | no | SQLite checkpointer/store, Redis KV/document/vector stores + checkpointer, Pulsar queue surface (constructs then rejects). The Redis stores and checkpointer validate their configuration at construction and open the connection lazily on first use; the client speaks `redis://` and `rediss://` (public web PKI) and follows `MOVED`/`ASK`. |
 | `openjiuwen-extensions` | `mcp` | no | `rmcp` dependency only — no source file reads it (dead gate). |
 | `openjiuwen-harness` | `native` | yes | Empty marker; no source reads it. |
 | `openjiuwen-harness` | `browser`, `cua`, `mobile`, `notify` | no | Documented `Unsupported` subagent presets; `notify` pulls `notify` and gates `watcher/backend.rs`, without which `WorkspaceWatcher::start` answers a typed `Unsupported` naming the feature. |
@@ -432,13 +442,14 @@ Default builds need no network and no external service; every feature except the
 
 ## 6. Testing infrastructure
 
-- `openjiuwen-test-support` is dev-only (`publish = false`, never a library dependency) and holds 152 tests of its own: a loopback `MockLlmServer` (axum, OpenAI-compatible, chat completions + SSE + tool calls + scripted responses), `ScriptedModel`/`MockCompletion` fakes, temporary workspace/home/env/session fixtures, JSON assertions (`assert_json_eq`, `assert_json_subset`, `assert_json_pointer_eq`, `assert_json_roundtrip`, `first_difference`), eventual-consistency polling, and a `wiremock` re-export; there is no card snapshot store.
-- Integration tests are one binary per file: 399 top-level `tests/*.rs` files workspace-wide (373 outside `openjiuwen-e2e`); the umbrellas keep only path/feature checks (`openjiuwen/tests/module_paths.rs`, `openjiuwen-core/tests/{module_paths,feature_forwarding}.rs`).
-- `openjiuwen-e2e` holds 26 scenario binaries with 125 scenarios, all cross-crate, with bounded helpers (`BOUND` = 10 s, `within`, `collect_bounded`) in `tests/support/mod.rs`.
-- `openjiuwen-examples` has 26 example binaries, 15 `src/support/` unit tests, and `tests/examples_offline.rs`, which runs 25 examples through the offline harness by default and 26 with `--features a2a` (example 11).
+- `openjiuwen-test-support` is dev-only (`publish = false`, never a library dependency) and is verified by its own package suite: a loopback `MockLlmServer` (axum, OpenAI-compatible, chat completions + SSE + tool calls + scripted responses), `ScriptedModel`/`MockCompletion` fakes, temporary workspace/home/env/session fixtures, JSON assertions (`assert_json_eq`, `assert_json_subset`, `assert_json_pointer_eq`, `assert_json_roundtrip`, `first_difference`), eventual-consistency polling, and a `wiremock` re-export; there is no card snapshot store.
+- Integration tests are one binary per file, so a crate's `tests/*.rs` listing is its suite inventory; the umbrellas keep only path/feature checks (`openjiuwen/tests/module_paths.rs`, `openjiuwen-core/tests/{module_paths,feature_forwarding}.rs`), and the package suites, not this document, are the authority on how much is covered.
+- `openjiuwen-e2e` holds the cross-crate scenario binaries, each with bounded helpers (`BOUND` = 10 s, `within`, `collect_bounded`) in `tests/support/mod.rs`; its feature gates (`a2a`, `otel`, `sqlite`) select the scenarios that need them.
+- `openjiuwen-examples` ships the runnable example binaries, the `src/support/` unit tests, and `tests/examples_offline.rs`, which runs every example the enabled features compile through the offline harness (`--features a2a` adds the A2A example).
 - Everything is offline and deterministic by default: scripted models or the loopback server, temp directories, loopback sockets, no credentials, no wall-clock ordering.
 - Deferred areas are proven, not just documented: dedicated suites assert `Error::Unsupported` and its message (for example `openjiuwen-dev-tools/tests/deferred_surface.rs`, `openjiuwen-symphony/tests/deferred.rs`, `openjiuwen-agent-evolving/tests/rl.rs`, `openjiuwen-extensions/tests/observability_deferred.rs`, `openjiuwen-rsi/tests/deferred.rs`).
-- `default-members` lists the 27 library and binary crates, so a bare `cargo test` skips the three development crates; the Makefile gates pass `--workspace` (or `-p`) and therefore include them.
+- `default-members` lists the library and binary crates, so a bare `cargo test` skips the three development crates; the Makefile gates pass `--workspace` (or `-p`) and therefore include them.
+- `make test` currently fails `openjiuwen-cli/tests/sessions.rs` and `openjiuwen-e2e/tests/runner_hosting.rs`; `PARITY.md` §Verification names the cases and the rest of the gate.
 - Gates: `make test` (`cargo test --workspace`, offline), `make test-all` (the feature-gated suites: e2e `a2a`, extensions `a2a,otel`, harness and agent-teams `--no-default-features`, symphony `sqlite`, sysop `sandbox`, harness-providers `vendor`), and `make verify` (`fmt-check`, `clippy`, `test`, `test-all`, plus the example builds).
 - `cargo doc --workspace --no-deps` (and `--all-features`) stays warning-free; link private or feature-gated items as plain code spans instead of widening visibility.
 
