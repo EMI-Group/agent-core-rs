@@ -5,17 +5,19 @@
 //! [`openjiuwen_session::stream::StreamItem`]. [`FrameWriter`] is the single
 //! write path used by components and the engine: it forwards every frame to an
 //! optional channel sink, to an optional in-memory collector, and to the
-//! workflow session's stream.
+//! workflow session's stream. The engine streams through a *bounded* sink, so a
+//! slow consumer backpressures the run instead of letting it buffer frames.
 
 use std::sync::Arc;
 
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_session::stream::StreamItem;
 use openjiuwen_session::Session;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Sender, UnboundedSender};
+use tokio_util::sync::CancellationToken;
 
 /// Frame type used for the buffered output of a streaming end node.
 pub const END_NODE_STREAM: &str = "end node stream";
@@ -179,41 +181,105 @@ pub fn frame_to_wire(frame: &OutputFrame) -> Value {
     frame.to_wire()
 }
 
+/// Where a [`FrameWriter`] publishes a frame.
+///
+/// The unbounded variant is the compatibility constructor ([`FrameWriter::new`]): it
+/// never blocks and drops frames once the receiver is gone. The bounded variant
+/// ([`FrameWriter::bounded`]) is what the engine's `stream` uses, so a slow consumer
+/// applies backpressure to the run instead of letting it buffer every frame it emits.
+#[derive(Clone)]
+enum FrameSink {
+    /// Never blocks; a closed receiver only logs a debug line.
+    Unbounded(UnboundedSender<WorkflowChunk>),
+    /// Waits for capacity, and for cancellation while it waits.
+    Bounded(Sender<WorkflowChunk>),
+}
+
 /// Fan-out writer for workflow stream frames.
 ///
-/// Every frame is offered to the optional channel sink (a closed sink is a
-/// debug log, never an error), then appended to the optional collector, and
-/// finally written to the session. The session write is the authoritative one:
-/// its error is propagated to the caller.
+/// Every frame is offered to the optional channel sink, then appended to the optional
+/// collector, and finally written to the session. The session write is the authoritative
+/// one: its error is propagated to the caller.
+///
+/// A bounded sink applies backpressure: [`FrameWriter::write`] waits for capacity (or for
+/// the run's cancellation), so a run cannot outpace its consumer. A closed sink is a debug
+/// log, never an error, in both modes.
+///
+/// The in-memory collector is opt-in through [`FrameWriter::collect_into`] and is meant for
+/// callers that drain it ([`FrameWriter::drained`]); nothing on the engine's run paths
+/// attaches one, because an undrained collector would retain every frame of the run.
 #[derive(Clone)]
 pub struct FrameWriter {
-    sink: Option<UnboundedSender<WorkflowChunk>>,
+    sink: Option<FrameSink>,
     session: Arc<dyn Session>,
     collector: Arc<Mutex<Option<FrameCollector>>>,
+    cancellation: Option<CancellationToken>,
 }
 
 impl std::fmt::Debug for FrameWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FrameWriter")
             .field("has_sink", &self.sink.is_some())
+            .field(
+                "bounded_sink",
+                &matches!(self.sink, Some(FrameSink::Bounded(_))),
+            )
             .field("has_collector", &self.collector.lock().is_some())
+            .field("cancellation", &self.cancellation.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl FrameWriter {
-    /// Create a writer forwarding to `sink` (when present) and `session`.
+    /// Create a writer forwarding to the unbounded `sink` (when present) and `session`.
     #[must_use]
     pub fn new(sink: Option<UnboundedSender<WorkflowChunk>>, session: Arc<dyn Session>) -> Self {
+        Self::with_sink(sink.map(FrameSink::Unbounded), session)
+    }
+
+    /// Create a writer whose `sink` applies backpressure to the producer.
+    ///
+    /// [`FrameWriter::write`] awaits capacity, so a slow (or stalled) consumer slows the
+    /// run instead of letting it buffer frames without bound. Use
+    /// [`FrameWriter::with_cancellation`] as well so a blocked write gives up when the run
+    /// is cancelled.
+    #[must_use]
+    pub fn bounded(sink: Sender<WorkflowChunk>, session: Arc<dyn Session>) -> Self {
+        Self::with_sink(Some(FrameSink::Bounded(sink)), session)
+    }
+
+    /// The shared constructor behind [`FrameWriter::new`] and [`FrameWriter::bounded`].
+    fn with_sink(sink: Option<FrameSink>, session: Arc<dyn Session>) -> Self {
         Self {
             sink,
             session,
             collector: Arc::new(Mutex::new(None)),
+            cancellation: None,
         }
     }
 
+    /// Abort a blocked [`FrameWriter::write`] with [`Error::Cancelled`] when `token` fires.
+    ///
+    /// Only a bounded sink can block, so this only matters for [`FrameWriter::bounded`].
+    #[must_use]
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Whether this writer publishes into a bounded (backpressure) sink.
+    #[must_use]
+    pub fn is_bounded(&self) -> bool {
+        matches!(self.sink, Some(FrameSink::Bounded(_)))
+    }
+
     /// Attach an in-memory collector that receives a clone of every frame.
+    ///
+    /// The collector grows with the run, so only attach one when a caller drains it with
+    /// [`FrameWriter::drained`].
     pub fn collect_into(&self, collector: FrameCollector) {
+        #[cfg(test)]
+        crate::output::attachment_metrics::record();
         *self.collector.lock() = Some(collector);
     }
 
@@ -222,15 +288,35 @@ impl FrameWriter {
     /// # Errors
     ///
     /// Propagates [`Session::write_stream`] errors (for example a validation
-    /// error for a `null` payload).
+    /// error for a `null` payload), and [`Error::Cancelled`] when a bounded sink is full
+    /// and the writer's cancellation token fires first.
     pub async fn write(&self, item: WorkflowChunk) -> Result<()> {
-        if let Some(sink) = &self.sink {
-            if sink.send(item.clone()).is_err() {
-                tracing::debug!(
-                    item_type = item.item_type.as_str(),
-                    "workflow stream sink closed; dropping frame"
-                );
+        match &self.sink {
+            Some(FrameSink::Unbounded(sink)) => {
+                if sink.send(item.clone()).is_err() {
+                    tracing::debug!(
+                        item_type = item.item_type.as_str(),
+                        "workflow stream sink closed; dropping frame"
+                    );
+                }
             }
+            Some(FrameSink::Bounded(sink)) => {
+                let sent = match &self.cancellation {
+                    Some(cancellation) => tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => return Err(Error::cancelled()),
+                        sent = sink.send(item.clone()) => sent,
+                    },
+                    None => sink.send(item.clone()).await,
+                };
+                if sent.is_err() {
+                    tracing::debug!(
+                        item_type = item.item_type.as_str(),
+                        "workflow stream sink closed; dropping frame"
+                    );
+                }
+            }
+            None => {}
         }
         {
             let collector = self.collector.lock().clone();
@@ -276,6 +362,31 @@ impl FrameWriter {
         };
         let mut frames = collector.lock();
         std::mem::take(&mut *frames)
+    }
+}
+
+/// Test-only observation of how many frame collectors were attached on this thread.
+///
+/// An undrained collector retains every frame of a run, so the engine's regression suites
+/// assert that its run paths attach none. The counter is thread-local, so the assertions
+/// cannot be disturbed by other unit tests running in parallel, and it only exists in test
+/// builds.
+#[cfg(test)]
+pub(crate) mod attachment_metrics {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ATTACHED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Records one [`super::FrameWriter::collect_into`] on this thread.
+    pub(crate) fn record() {
+        ATTACHED.with(|attached| attached.set(attached.get().saturating_add(1)));
+    }
+
+    /// How many collectors were attached on this thread so far.
+    pub(crate) fn attached() -> usize {
+        ATTACHED.with(Cell::get)
     }
 }
 
@@ -455,5 +566,57 @@ mod tests {
             .write(output_chunk(OUTPUT_FRAME_TYPE, 0, Value::Null))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_bounded_writer_waits_for_capacity() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let writer = FrameWriter::bounded(sender, session());
+        assert!(writer.is_bounded());
+        writer.write_custom(json!({"index": 1})).await.unwrap();
+
+        let pending = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.write_custom(json!({"index": 2})).await }
+        });
+        // Let the pending write reach the full channel before asserting it is waiting.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !pending.is_finished(),
+            "a full bounded sink must block the writer instead of buffering"
+        );
+
+        // Draining one frame makes room and the write completes in order.
+        assert_eq!(receiver.recv().await.unwrap().payload, json!({"index": 1}));
+        pending.await.unwrap().unwrap();
+        assert_eq!(receiver.recv().await.unwrap().payload, json!({"index": 2}));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_write_gives_up_waiting_for_capacity() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let cancellation = CancellationToken::new();
+        let writer =
+            FrameWriter::bounded(sender, session()).with_cancellation(cancellation.clone());
+        writer.write_custom(json!({"index": 1})).await.unwrap();
+
+        let pending = tokio::spawn(async move { writer.write_custom(json!({"index": 2})).await });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+
+        let failure = pending.await.unwrap().unwrap_err();
+        assert!(failure.is_cancelled(), "{failure}");
+    }
+
+    #[tokio::test]
+    async fn a_bounded_writer_tolerates_a_closed_sink() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        let writer = FrameWriter::bounded(sender, session());
+        writer
+            .write_custom(json!({"still": "delivered"}))
+            .await
+            .unwrap();
+        assert!(writer.drained().is_empty());
     }
 }

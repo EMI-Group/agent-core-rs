@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use futures::StreamExt;
 use openjiuwen_common::error::ErrorKind;
 use openjiuwen_session::stream::StreamMode;
@@ -15,8 +16,10 @@ use serde_json::json;
 
 use super::test_support::{CountingComponent, TestComponent};
 use super::*;
+use crate::component::Component;
 use crate::components::{BranchRouterAdapter, EndComponent, StartComponent};
 use crate::condition::{Branch, BranchRouter, Condition};
+use crate::engine::run::STREAM_CHANNEL_CAPACITY;
 use crate::output::{WorkflowExecutionState, END_NODE_STREAM, WORKFLOW_FINAL};
 
 fn session(name: &str) -> Arc<dyn Session> {
@@ -868,5 +871,181 @@ fn run_options_are_chainable_and_permissive() {
         configured.stream_delivery,
         StreamDelivery::Interleaved,
         "the delivery mode is recorded verbatim for the run funnel to check"
+    );
+}
+
+/// A streaming end component that counts the frames it has produced.
+///
+/// The counter is the observation point for the backpressure regressions: a run that
+/// buffers frames without bound drives it to `total` while the consumer sits idle, whereas
+/// one that publishes through a bounded channel stops as soon as the channel is full.
+#[derive(Clone)]
+struct CountedFrames {
+    total: usize,
+    produced: Arc<AtomicUsize>,
+}
+
+impl CountedFrames {
+    fn shared(self) -> Arc<dyn Component> {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl Component for CountedFrames {
+    fn card(&self) -> crate::component::ComponentCard {
+        crate::component::ComponentCard::new("counted", "counted").with_abilities(self.abilities())
+    }
+
+    fn abilities(&self) -> Vec<ComponentAbility> {
+        vec![ComponentAbility::Stream]
+    }
+
+    fn component_type(&self) -> &'static str {
+        "counted"
+    }
+
+    fn stream(
+        self: Arc<Self>,
+        _inputs: Value,
+        _ctx: Arc<crate::context::ComponentContext>,
+    ) -> futures::stream::BoxStream<'static, Result<Value>> {
+        let produced = Arc::clone(&self.produced);
+        let total = self.total;
+        futures::stream::iter(0..total)
+            .map(move |index| {
+                produced.fetch_add(1, Ordering::SeqCst);
+                Ok(json!(index))
+            })
+            .boxed()
+    }
+}
+
+/// `start -> end`, where `end` streams `total` counted frames.
+fn counted_stream_workflow(total: usize, produced: &Arc<AtomicUsize>) -> CompiledWorkflow {
+    let mut definition = WorkflowDefinition::new(test_support::card());
+    definition
+        .insert_component(
+            "start",
+            Arc::new(StartComponent::new()),
+            NodeConfig::default(),
+        )
+        .insert_component(
+            "end",
+            CountedFrames {
+                total,
+                produced: Arc::clone(produced),
+            }
+            .shared(),
+            NodeConfig {
+                abilities: Some(vec![ComponentAbility::Stream]),
+                ..NodeConfig::default()
+            },
+        )
+        .add_edge(
+            vec!["start".to_owned()],
+            "end".to_owned(),
+            DefinitionEdgeKind::Regular,
+        );
+    CompiledWorkflow::build(with_endpoints(definition)).unwrap()
+}
+
+/// Waits until the producer stops making progress and returns what it produced.
+///
+/// `yield_now` cannot be used to prove a producer is blocked (the run is a separate task),
+/// so this polls the counter until two consecutive samples agree. Every caller bounds the
+/// number of samples, so a regression cannot hang the suite.
+async fn settled_production(produced: &Arc<AtomicUsize>) -> usize {
+    let mut last = produced.load(Ordering::SeqCst);
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let now = produced.load(Ordering::SeqCst);
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+    last
+}
+
+#[tokio::test]
+async fn a_slow_consumer_backpressures_the_run_instead_of_buffering_every_frame() {
+    // Far more frames than the channel can hold: an unbounded sink would let the run
+    // produce all of them while the consumer sits idle.
+    let produced = Arc::new(AtomicUsize::new(0));
+    let workflow = counted_stream_workflow(10_000, &produced);
+    let mut stream = workflow.stream(
+        json!({}),
+        session("backpressure"),
+        WorkflowRunOptions::default(),
+    );
+    // Poll once so the run starts and the first frame reaches the consumer.
+    let first = stream.next().await.expect("a frame").unwrap();
+    assert_eq!(first.item_type, END_NODE_STREAM);
+
+    let stopped_at = settled_production(&produced).await;
+    // One frame sits in the generator's `yield`, one is in the writer's `send`.
+    let slack = STREAM_CHANNEL_CAPACITY + 4;
+    assert!(
+        stopped_at <= slack,
+        "a stalled consumer must backpressure the run: {stopped_at} frames produced, \
+         capacity is {STREAM_CHANNEL_CAPACITY}"
+    );
+    drop(stream);
+}
+
+#[tokio::test]
+async fn dropping_the_stream_aborts_the_producing_run() {
+    let produced = Arc::new(AtomicUsize::new(0));
+    let workflow = counted_stream_workflow(10_000, &produced);
+    let mut stream = workflow.stream(
+        json!({}),
+        session("drop-aborts"),
+        WorkflowRunOptions::default(),
+    );
+    stream.next().await.expect("a frame").unwrap();
+    let before_drop = settled_production(&produced).await;
+    assert!(
+        before_drop < 10_000,
+        "the run must still be in flight when the stream is dropped"
+    );
+
+    drop(stream);
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        produced.load(Ordering::SeqCst),
+        before_drop,
+        "dropping the stream must abort the run instead of letting it buffer frames"
+    );
+}
+
+#[tokio::test]
+async fn the_run_paths_attach_no_frame_collector() {
+    // `FrameWriter::collect_into` retains every frame forever unless a caller drains it,
+    // which nothing on the run paths does; both entry points must leave it unattached.
+    let before = crate::output::attachment_metrics::attached();
+    let workflow = CompiledWorkflow::build(linear(echo(), streaming_end())).unwrap();
+
+    let mut stream = workflow.stream(
+        json!({"query": "hi"}),
+        session("no-collector-stream"),
+        WorkflowRunOptions::default(),
+    );
+    while stream.next().await.is_some() {}
+    let output = workflow
+        .invoke(
+            json!({"query": "hi"}),
+            session("no-collector-invoke"),
+            WorkflowRunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.state, WorkflowExecutionState::Completed);
+    assert_eq!(
+        crate::output::attachment_metrics::attached(),
+        before,
+        "the engine's run paths must not retain frames in a collector"
     );
 }

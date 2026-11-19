@@ -10,9 +10,12 @@
 //!   becomes `INPUT_REQUIRED` carrying the interaction wires and keeps the pre-superstep
 //!   snapshot for `resume`; a completed run deletes the snapshot and returns the end
 //!   component's value.
-//! - **stream** publishes frames through the run's [`FrameWriter`] into an unbounded
+//! - **stream** publishes frames through the run's [`FrameWriter`] into a *bounded*
 //!   channel while the run executes in a spawned task, and aborts that task when the
-//!   stream is dropped.
+//!   stream is dropped. A slow consumer therefore backpressures the run instead of letting
+//!   it buffer every frame it will ever emit; a write that is blocked on a full channel
+//!   gives up with [`openjiuwen_common::error::Error::Cancelled`] when the run's
+//!   cancellation token fires.
 //!
 //! The root state of every run carries a reserved `"inputs"` key with the original
 //! inputs, so both `${query}` (root reference) and `${start.query}` resolve.
@@ -31,19 +34,25 @@ use openjiuwen_graph::{CheckpointerStore, ExecutionOptions, GraphStore};
 use openjiuwen_session::interaction::INTERACTION_FRAME_TYPE;
 use openjiuwen_session::stream::StreamMode;
 use openjiuwen_session::Session;
-use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 
 use crate::engine::node::RunScope;
 use crate::engine::{CompiledWorkflow, StreamDelivery, WorkflowRunOptions};
 use crate::interrupt::{find_interrupt, InteractionState};
 use crate::output::{
-    output_chunk, FrameCollector, FrameWriter, OutputFrame, WorkflowChunk, WorkflowExecutionState,
-    WorkflowOutput, WORKFLOW_FINAL,
+    output_chunk, FrameWriter, OutputFrame, WorkflowChunk, WorkflowExecutionState, WorkflowOutput,
+    WORKFLOW_FINAL,
 };
 
 /// Reserved root-state key holding the run's original inputs.
 const INPUTS_KEY: &str = "inputs";
+
+/// Frames a run may produce ahead of its consumer before the producer waits.
+///
+/// The engine's `stream` deliberately uses a bounded channel: a stalled consumer
+/// backpressures the run through [`FrameWriter::write`] instead of letting the run buffer
+/// frames for as long as it keeps producing them.
+pub(crate) const STREAM_CHANNEL_CAPACITY: usize = 32;
 
 impl CompiledWorkflow {
     /// Runs the workflow and returns its output.
@@ -92,10 +101,11 @@ impl CompiledWorkflow {
             // the error into the stream's single `Err` item.
             check_delivery(&options)?;
             let workflow_id = workflow.inner.card.id.clone();
-            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-            let writer = Arc::new(FrameWriter::new(Some(sender), Arc::clone(&session)));
-            let collector: FrameCollector = Arc::new(Mutex::new(Vec::new()));
-            writer.collect_into(collector);
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
+            let writer = Arc::new(
+                FrameWriter::bounded(sender, Arc::clone(&session))
+                    .with_cancellation(options.cancellation.clone()),
+            );
 
             if !options.resume && inputs.is_object() {
                 session.update_state(inputs.clone()).await?;
@@ -231,8 +241,6 @@ async fn run_blocking(
         interactions.seed(interactive);
     }
     let writer = Arc::new(FrameWriter::new(None, Arc::clone(&session)));
-    let collector: FrameCollector = Arc::new(Mutex::new(Vec::new()));
-    writer.collect_into(collector);
 
     let store = store_for(&session, &inner.card.id);
     let scope = Arc::new(RunScope::new(
