@@ -282,6 +282,14 @@ pub struct SpanHandle; // id / trace_id / set_inputs / set_outputs / set_metadat
 - Files ≤ ~1000 lines; `openjiuwen`-specific docs per subdirectory live in that subdirectory's `CONTEXT.md`.
 - No dependency on `openjiuwen-harness-protocol` (layer-1 rule in `docs/ARCHITECTURE.md` §1); interaction↔harness-protocol conversion is documented below and left to the bridging crate.
 
+## Known Issues
+
+- `checkpoint::resp`/`checkpoint::redis` have no timeout or cancellation on any Redis path (TCP connect, TLS handshake, `AUTH`/`SELECT`, every command read/write), so a blackholed server hangs the caller forever; `RedisCheckpointer::exchange` holds its `tokio::sync::Mutex` across the dial and the command, so one hung operation queues every other checkpointer call behind it.
+- `DiskSessionStore::save` read-modify-writes `sessions.json` with no lock (the history and link graphs each have one), so two concurrent saves for one agent can drop an index entry while the session's `state.data` stays on disk; `delete`'s index update has the same race.
+- `checkpoint::pickle` bounds a single length prefix and the nesting depth but not the total decoded size: memoized containers are deep-cloned on every `APPEND`/`SETITEM`/`LIST` while the heap keeps every intermediate, so a self-referential append chain doubles memory about every two input bytes and reaches OOM far below `MAX_DEPTH`.
+- `list` deserializes every full checkpoint document just to build `CheckpointMeta` (file and sqlite payload columns; Redis issues one serial `GET` per index member), and the default `latest` is `list` + `load`, so the resume path parses every checkpoint and the newest one twice; `FileCheckpointer::session_exists` full-scans and stats the session directory.
+- Scoped state reads deep-clone the whole node subtree before reading one key, and every staged commit deep-clones the target object per patch, so workflow state cost is O(patches × subtree) per commit.
+
 ## Design Decisions
 
 - **One `Session` trait, two state lanes.** Python's `State` has io/global/comp/workflow lanes plus staging; §2.4 exposes only global + component. `WorkflowState` keeps all four lanes and staging for the graph/workflow engines; sessions expose global + component through the trait.
