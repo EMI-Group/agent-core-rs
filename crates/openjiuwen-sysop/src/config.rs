@@ -19,8 +19,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::constants::{
-    DEFAULT_LOCK_TIMEOUT_SECS, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_SHELL_ALLOWLIST,
-    DEFAULT_TIMEOUT_SECS,
+    DEFAULT_LOCK_TIMEOUT_SECS, DEFAULT_MAX_FILE_SIZE_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_SHELL_ALLOWLIST, DEFAULT_TIMEOUT_SECS,
 };
 
 /// Regular expressions that reject a dangerous command when
@@ -153,8 +153,17 @@ pub struct LocalWorkConfig {
     /// Root used to resolve relative paths. `None` = the process working directory at
     /// construction time (Python resolves against its `ContextVar` CWD).
     pub workspace_root: Option<String>,
-    /// Maximum size of a file the local backend will read, in bytes.
-    /// `None` = unlimited (Python parity).
+    /// Maximum size of a file the local backend will load whole, in bytes.
+    ///
+    /// Defaults to [`DEFAULT_MAX_FILE_SIZE_BYTES`] (64 MiB): `read_file` and
+    /// `read_file_stream` load the entire file, so a larger file is refused with a typed
+    /// [`openjiuwen_common::error::ErrorKind::Validation`] reason naming the size and the
+    /// limit instead of being allocated. `None` restores Python's unlimited behavior and is
+    /// what [`Self::unrestricted`] selects.
+    ///
+    /// This ceiling does *not* apply to the bounded read
+    /// ([`crate::operation::FsOperation::read_bytes_limited`]), which allocates at most the
+    /// requested window; it only bounds a window larger than the ceiling.
     pub max_file_size_bytes: Option<u64>,
     /// Bytes retained per captured stdout/stderr stream before truncation.
     /// Defaults to [`DEFAULT_MAX_OUTPUT_BYTES`].
@@ -200,7 +209,7 @@ impl Default for LocalWorkConfig {
             restrict_to_sandbox: false,
             dangerous_patterns: None,
             workspace_root: None,
-            max_file_size_bytes: None,
+            max_file_size_bytes: Some(DEFAULT_MAX_FILE_SIZE_BYTES),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             default_timeout_secs: DEFAULT_TIMEOUT_SECS,
             env_policy: EnvPolicy::default(),
@@ -213,18 +222,32 @@ impl Default for LocalWorkConfig {
 }
 
 impl LocalWorkConfig {
-    /// Configuration rooted at `workspace` that accepts any shell command.
+    /// Configuration rooted at `workspace` that accepts any shell command and reads any
+    /// file size.
     ///
-    /// Useful for tests and for hosts that apply their own command policy above this
-    /// crate.
+    /// Useful for tests and for hosts that apply their own command and size policy above
+    /// this crate. `max_file_size_bytes` is `None` (Python's unlimited whole-file read);
+    /// every other default is kept.
     #[must_use]
     pub fn unrestricted(workspace: impl Into<String>) -> Self {
         Self {
             shell_allowlist: None,
             workspace_root: Some(workspace.into()),
             env_policy: EnvPolicy::minimal(),
+            max_file_size_bytes: None,
             ..Self::default()
         }
+    }
+
+    /// Returns this configuration with `limit` as the whole-file read ceiling.
+    ///
+    /// `None` restores Python's unlimited behavior; a `Some(limit)` makes `read_file` /
+    /// `read_file_stream` refuse a file larger than `limit` bytes with a typed
+    /// [`openjiuwen_common::error::ErrorKind::Validation`] reason.
+    #[must_use]
+    pub fn with_max_file_size(mut self, limit: Option<u64>) -> Self {
+        self.max_file_size_bytes = limit;
+        self
     }
 
     /// Returns this configuration with `workspace` as the path-resolution root.

@@ -56,22 +56,33 @@
 //! - The loop is single-use: [`stop`](TaskSchedulerLoop::stop) cancels the
 //!   loop token, so a stopped scheduler must be rebuilt (not restarted) to run
 //!   again.
+//! - A panicking executor never unwinds the driver: the panic is recorded as a
+//!   failed task (`task executor panicked: <payload>`) and the run's
+//!   `RunGuard` still releases its in-flight slot, so a panic can neither leak
+//!   concurrency capacity nor silence the completion sentinel.
 use super::{TaskContext, TaskExecutor, TaskExecutorRegistry};
 use crate::controller::config::ControllerConfig;
 use crate::controller::schema::{
-    ControllerOutputChunk, ControllerOutputPayload, DataFrame, OutputKind, Task, TaskStatus,
+    ControllerOutputChunk, ControllerOutputPayload, DataFrame, OutputKind, Task, TaskResult,
+    TaskStatus,
 };
 use crate::controller::task_manager::{TaskFilter, TaskManager};
+use futures::FutureExt;
 use openjiuwen_session::Session;
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+mod guard;
+
+use guard::{panic_text, RunGuard};
 
 /// Text frame the completion sentinel carries (Python's literal).
 pub const COMPLETION_TEXT: &str = "All tasks have been successfully processed";
@@ -633,10 +644,56 @@ impl TaskSchedulerLoop {
         debug!(task_id, "task scheduler started task");
     }
 
+    /// Runs one executor under the run's timeout, containing a panic.
+    ///
+    /// A user-supplied executor must never unwind the driver: its panic is
+    /// turned into a failure message, and the driver's guard keeps the
+    /// in-flight bookkeeping consistent either way.
+    async fn execute_guarded(
+        executor: &Arc<dyn TaskExecutor>,
+        task: &Task,
+        ctx: &TaskContext<'_>,
+        timeout: Option<Duration>,
+    ) -> std::result::Result<TaskResult, String> {
+        let execution = async {
+            match timeout {
+                Some(limit) => {
+                    match tokio::time::timeout(limit, executor.execute(task, ctx)).await {
+                        Ok(outcome) => outcome.map_err(|error| error.message().into_owned()),
+                        Err(_) => Err(format!(
+                            "Task timeout after {} seconds",
+                            limit.as_secs_f64()
+                        )),
+                    }
+                }
+                None => executor
+                    .execute(task, ctx)
+                    .await
+                    .map_err(|error| error.message().into_owned()),
+            }
+        };
+        match AssertUnwindSafe(execution).catch_unwind().await {
+            Ok(outcome) => outcome,
+            Err(payload) => Err(format!(
+                "task executor panicked: {}",
+                panic_text(payload.as_ref())
+            )),
+        }
+    }
+
     /// Executes one claimed task and records its outcome on the store.
     async fn drive(&self, task: Task, session: Arc<dyn Session>, token: CancellationToken) {
         let task_id = task.task_id.clone();
         let session_id = task.session_id.clone();
+        // Every exit path — returned, early, or unwinding — releases the run
+        // through this guard, so a stale entry can never eat concurrency
+        // capacity or suppress the completion sentinel forever.
+        let guard = RunGuard::new(
+            self.manager.clone(),
+            &self.in_flight,
+            &self.wake,
+            task_id.clone(),
+        );
         // The two knobs the run needs are read once, before any await: the
         // guard is never held across an `.await`.
         let (timeout, expose_reasoning) = {
@@ -662,33 +719,33 @@ impl TaskSchedulerLoop {
                     Some(message),
                 );
             }
-            self.finish(&task_id, &session_id).await;
+            self.finish(&guard, &task_id, &session_id).await;
             return;
         };
         self.set_executor(&task_id, Arc::clone(&executor));
         // The failure text is Python's: an executor error reports its message
         // (not the `<kind>: <message>` rendering), and a timed-out run reports
         // `Task timeout after <seconds> seconds` verbatim.
-        let outcome = match timeout {
-            Some(limit) => match tokio::time::timeout(limit, executor.execute(&task, &ctx)).await {
-                Ok(outcome) => outcome.map_err(|error| error.message().into_owned()),
-                Err(_) => Err(format!(
-                    "Task timeout after {} seconds",
-                    limit.as_secs_f64()
-                )),
-            },
-            None => executor
-                .execute(&task, &ctx)
-                .await
-                .map_err(|error| error.message().into_owned()),
-        };
+        let outcome = Self::execute_guarded(&executor, &task, &ctx, timeout).await;
         if ctx.cancellation.is_cancelled() {
             // A pause/cancel that raced the finish owns the status.
             debug!(
                 task_id,
                 "task stopped by pause/cancel, leaving the status to the caller"
             );
-            self.finish(&task_id, &session_id).await;
+            self.finish(&guard, &task_id, &session_id).await;
+            return;
+        }
+        if let Some(recorded) = self.recorded_decision(&task_id) {
+            // A pause/cancel recorded while the run was in flight owns the
+            // status too: an executor that ignores its cancellation token must
+            // not overwrite the decision with `Completed`.
+            debug!(
+                task_id,
+                status = recorded.as_str(),
+                "task was paused or cancelled during the run; keeping the recorded decision"
+            );
+            self.finish(&guard, &task_id, &session_id).await;
             return;
         }
         let result = match outcome {
@@ -702,7 +759,7 @@ impl TaskSchedulerLoop {
                     false,
                     Some(message),
                 );
-                self.finish(&task_id, &session_id).await;
+                self.finish(&guard, &task_id, &session_id).await;
                 return;
             }
         };
@@ -730,11 +787,24 @@ impl TaskSchedulerLoop {
             expose_reasoning,
             result.reasoning.as_deref(),
         );
-        self.finish(&task_id, &session_id).await;
+        self.finish(&guard, &task_id, &session_id).await;
     }
 
+    /// The pause/cancel a caller recorded on the store during a run, if any.
+    ///
+    /// Only the two statuses a caller can impose on a running task are
+    /// reported; every other recorded status is the driver's own to write.
+    fn recorded_decision(&self, task_id: &str) -> Option<TaskStatus> {
+        let status = self.manager.task(task_id)?.status;
+        matches!(status, TaskStatus::Paused | TaskStatus::Canceled).then_some(status)
+    }
     /// Cleanup every driver runs: untrack, wake the loop, signal completion.
-    async fn finish(&self, task_id: &str, session_id: &str) {
+    ///
+    /// Disarming the run's guard first keeps its [`Drop`] from failing a task
+    /// whose outcome (or whose pause/cancel) is already recorded, while the
+    /// untrack/wake it repeats on drop stay harmless.
+    async fn finish(&self, guard: &RunGuard, task_id: &str, session_id: &str) {
+        guard.disarm();
         self.untrack(task_id);
         self.wake();
         self.ensure_completion_signal(session_id).await;

@@ -12,6 +12,7 @@
 //! swapped the model for this call.
 use crate::output::{AgentChunk, CONTEXT_USAGE, LLM_ROUTE};
 use crate::react::model_step::DeltaSink;
+use openjiuwen_common::error::Result;
 use openjiuwen_context::{ContextUsageSnapshot, PreparedContext};
 use openjiuwen_foundation::{ModelRequestConfig, Usage};
 use openjiuwen_session::Session;
@@ -71,7 +72,7 @@ pub(crate) async fn context_usage(
     session: &Arc<dyn Session>,
     iteration: usize,
     prepared: &PreparedContext,
-) {
+) -> Result<()> {
     let payload = json!({
         "iteration": iteration,
         "phase": "pre_call",
@@ -84,7 +85,7 @@ pub(crate) async fn context_usage(
         "result_type": "answer",
     });
     let mut sink = DeltaSink::new(publisher, Some(session));
-    sink.emit(CONTEXT_USAGE, payload).await;
+    sink.emit(CONTEXT_USAGE, payload).await
 }
 
 /// Publishes one post-call `context.usage` frame for a completed model call.
@@ -119,7 +120,7 @@ pub(crate) async fn context_usage_post_call(
     usage: &Usage,
     snapshot: &ContextUsageSnapshot,
     window: WindowSummary,
-) {
+) -> Result<()> {
     let payload = json!({
         "iteration": iteration,
         "phase": "post_call",
@@ -133,7 +134,7 @@ pub(crate) async fn context_usage_post_call(
         "result_type": "answer",
     });
     let mut sink = DeltaSink::new(publisher, Some(session));
-    sink.emit(CONTEXT_USAGE, payload).await;
+    sink.emit(CONTEXT_USAGE, payload).await
 }
 
 /// Publishes one `llm_route` frame announcing a non-primary model.
@@ -157,7 +158,7 @@ pub(crate) async fn llm_route(
     request: &ModelRequestConfig,
     route: &str,
     reason: Option<&str>,
-) {
+) -> Result<()> {
     let payload = json!({
         "route": route,
         "model": request.model_name,
@@ -165,7 +166,7 @@ pub(crate) async fn llm_route(
         "result_type": "answer",
     });
     let mut sink = DeltaSink::new(publisher, Some(session));
-    sink.emit(LLM_ROUTE, payload).await;
+    sink.emit(LLM_ROUTE, payload).await
 }
 
 #[cfg(test)]
@@ -205,7 +206,9 @@ mod tests {
         let session: Arc<dyn Session> = Arc::new(AgentSession::new("s"));
         let mut events = session.subscribe();
         let (publisher, mut frames) = tokio::sync::mpsc::unbounded_channel();
-        context_usage(Some(&publisher), &session, 3, &prepared()).await;
+        context_usage(Some(&publisher), &session, 3, &prepared())
+            .await
+            .unwrap();
 
         let frame = frames.recv().await.expect("a frame is published");
         assert_eq!(frame.kind, CONTEXT_USAGE);
@@ -241,7 +244,9 @@ mod tests {
         let (publisher, mut frames) = tokio::sync::mpsc::unbounded_channel();
         let mut prepared = prepared();
         prepared.usage = Some(snapshot(7));
-        context_usage(Some(&publisher), &session, 1, &prepared).await;
+        context_usage(Some(&publisher), &session, 1, &prepared)
+            .await
+            .unwrap();
 
         let frame = frames.recv().await.expect("a frame is published");
         assert_eq!(frame.payload["usage"]["context_window"]["tokens"], 7);
@@ -255,7 +260,9 @@ mod tests {
         let session: Arc<dyn Session> = Arc::new(AgentSession::new("s"));
         let (publisher, mut frames) = tokio::sync::mpsc::unbounded_channel();
         let prepared = PreparedContext::default();
-        context_usage(Some(&publisher), &session, 1, &prepared).await;
+        context_usage(Some(&publisher), &session, 1, &prepared)
+            .await
+            .unwrap();
         let frame = frames.recv().await.expect("a frame is published");
         assert!(frame.payload["window_size"].is_null());
     }
@@ -278,7 +285,8 @@ mod tests {
                 window_size: Some(8),
             },
         )
-        .await;
+        .await
+        .unwrap();
 
         let frame = frames.recv().await.expect("a frame is published");
         assert_eq!(frame.kind, CONTEXT_USAGE);
@@ -331,7 +339,8 @@ mod tests {
             "backup",
             Some("model_override"),
         )
-        .await;
+        .await
+        .unwrap();
         let frame = frames.recv().await.expect("a frame is published");
         assert_eq!(frame.kind, LLM_ROUTE);
         assert_eq!(frame.payload["route"], "backup");
@@ -351,7 +360,8 @@ mod tests {
             "backup",
             None,
         )
-        .await;
+        .await
+        .unwrap();
         let frame = frames.recv().await.expect("a frame is published");
         assert!(frame.payload["reason"].is_null());
     }

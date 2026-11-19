@@ -11,8 +11,9 @@
 mod support;
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openjiuwen_common::error::ErrorKind;
 use openjiuwen_session::checkpoint::redis::DEFAULT_REDIS_KEY_PREFIX;
@@ -443,5 +444,232 @@ async fn prunes_expired_documents_from_the_index() {
             .iter()
             .any(|command| command.first().is_some_and(|name| name == "SREM")),
         "the stale index member is pruned"
+    );
+}
+
+/// The deadline the timeout tests configure: long enough that a loaded machine
+/// does not trip it early, short enough to keep the suite fast.
+const IO_BUDGET: Duration = Duration::from_millis(250);
+
+/// The bound each awaited call gets: a call that hangs fails the test instead of
+/// hanging the suite (the runner would otherwise wait forever).
+const BOUND: Duration = Duration::from_secs(5);
+
+/// A TCP listener that accepts connections and never answers, standing in for a
+/// partitioned or blackholed Redis server.
+///
+/// Accepted sockets are kept open and left silent: the client's write fits in
+/// the socket buffer, so it then waits on a reply that never comes.
+struct Blackhole {
+    addr: String,
+    accepts: Arc<AtomicUsize>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Blackhole {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl Blackhole {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the blackhole listener");
+        let addr = listener
+            .local_addr()
+            .expect("read the blackhole address")
+            .to_string();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        Self {
+            addr,
+            accepts,
+            handle,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("redis://{}", self.addr)
+    }
+
+    /// How many client connections were accepted so far.
+    fn accepts(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
+    }
+}
+
+/// Saves one checkpoint, failing the test when the call outlives [`BOUND`].
+async fn bounded_save(
+    checkpointer: &RedisCheckpointer,
+    session_id: &str,
+) -> openjiuwen_common::error::Error {
+    let call = checkpointer.save(Checkpoint::new(
+        session_id,
+        CheckpointNamespace::Agent,
+        "agent-hung",
+    ));
+    tokio::time::timeout(BOUND, call)
+        .await
+        .unwrap_or_else(|_| panic!("save against a silent server must not hang"))
+        .expect_err("a silent server cannot store a checkpoint")
+}
+
+/// Waits until the blackhole has accepted `expected` connections.
+///
+/// The accept counter is bumped by the listener task, so it can lag one
+/// scheduling tick behind the client's completed dial.
+async fn wait_for_accepts(server: &Blackhole, expected: usize) -> usize {
+    let deadline = Instant::now() + BOUND;
+    loop {
+        let accepted = server.accepts();
+        if accepted >= expected {
+            return accepted;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {expected} accepted connections, saw {accepted}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Lets a pending accept be recorded before asserting that none happened.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(20)).await;
+}
+
+/// Connects a checkpointer with a short, explicit deadline.
+async fn timed_checkpointer(server: &Blackhole) -> RedisCheckpointer {
+    let checkpointer = RedisCheckpointer::connect_with_options(RedisOptions {
+        url: server.url(),
+        io_timeout: Some(IO_BUDGET),
+        ..RedisOptions::default()
+    })
+    .await
+    .expect("the blackhole accepts the TCP connection, so the eager dial succeeds");
+    assert_eq!(checkpointer.options().effective_io_timeout(), IO_BUDGET);
+    checkpointer
+}
+
+#[tokio::test]
+async fn a_silent_server_times_out_instead_of_hanging() {
+    let server = Blackhole::start().await;
+    let checkpointer = timed_checkpointer(&server).await;
+
+    let started = Instant::now();
+    let error = bounded_save(&checkpointer, "session-hung").await;
+    assert_eq!(error.kind(), ErrorKind::Timeout, "{error}");
+    assert!(error.to_string().contains("timed out"), "{error}");
+    assert!(
+        started.elapsed() < BOUND,
+        "the deadline is the configured one, not the test bound"
+    );
+
+    // Reads are bounded the same way.
+    let error = tokio::time::timeout(BOUND, checkpointer.load("session-hung", "cp-1"))
+        .await
+        .expect("load against a silent server must not hang")
+        .expect_err("a silent server cannot answer a read");
+    assert_eq!(error.kind(), ErrorKind::Timeout, "{error}");
+
+    // ...and so are the index scans behind `list`/`session_exists`.
+    let error = tokio::time::timeout(BOUND, checkpointer.list("session-hung"))
+        .await
+        .expect("list against a silent server must not hang")
+        .expect_err("a silent server cannot answer an index scan");
+    assert_eq!(error.kind(), ErrorKind::Timeout, "{error}");
+}
+
+#[tokio::test]
+async fn a_hung_exchange_does_not_park_concurrent_callers() {
+    let server = Blackhole::start().await;
+    let checkpointer = Arc::new(timed_checkpointer(&server).await);
+    assert_eq!(
+        wait_for_accepts(&server, 1).await,
+        1,
+        "the eager connect dials once"
+    );
+
+    let started = Instant::now();
+    let first = tokio::spawn({
+        let checkpointer = Arc::clone(&checkpointer);
+        async move { bounded_save(&checkpointer, "session-first").await }
+    });
+    let second = tokio::spawn({
+        let checkpointer = Arc::clone(&checkpointer);
+        async move { bounded_save(&checkpointer, "session-second").await }
+    });
+
+    // Both callers dialed while the first exchange was still waiting: the
+    // connection mutex guards only the pooled handle, so the second caller does
+    // not sit behind a dead connection. The window is half the deadline: a
+    // serialized caller could only dial after the first one timed out.
+    let both_dialed = tokio::time::timeout(IO_BUDGET / 2, async {
+        while server.accepts() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        both_dialed.is_ok(),
+        "the second caller dialed only after the first timed out (accepts = {})",
+        server.accepts()
+    );
+
+    let first = tokio::time::timeout(BOUND, first)
+        .await
+        .expect("the first save must not hang")
+        .expect("the first save task must finish");
+    let second = tokio::time::timeout(BOUND, second)
+        .await
+        .expect("the second save must not hang")
+        .expect("the second save task must finish");
+    assert_eq!(first.kind(), ErrorKind::Timeout, "{first}");
+    assert_eq!(second.kind(), ErrorKind::Timeout, "{second}");
+    assert!(
+        started.elapsed() < IO_BUDGET * 2,
+        "the two callers time out concurrently; took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_timed_out_connection_is_never_reused() {
+    let server = Blackhole::start().await;
+    let checkpointer = timed_checkpointer(&server).await;
+    assert_eq!(
+        wait_for_accepts(&server, 1).await,
+        1,
+        "the eager connect dials once"
+    );
+
+    // The first call rides the pooled connection and hits its deadline.
+    let error = bounded_save(&checkpointer, "session-discard").await;
+    assert_eq!(error.kind(), ErrorKind::Timeout, "{error}");
+    settle().await;
+    assert_eq!(
+        server.accepts(),
+        1,
+        "the pooled connection served the timed-out call"
+    );
+
+    // The timed-out socket could still deliver its late reply, so it must be
+    // dropped: the next call dials a fresh connection instead of reading that
+    // reply as its own answer.
+    let error = bounded_save(&checkpointer, "session-discard").await;
+    assert_eq!(error.kind(), ErrorKind::Timeout, "{error}");
+    assert_eq!(
+        wait_for_accepts(&server, 2).await,
+        2,
+        "a timed-out connection is discarded, so the next call dialed"
     );
 }

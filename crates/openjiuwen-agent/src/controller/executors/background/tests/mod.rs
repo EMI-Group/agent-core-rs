@@ -14,6 +14,8 @@ use openjiuwen_session::{
 use serde_json::json;
 use std::sync::atomic::AtomicUsize;
 
+mod panic;
+
 /// Session the fixtures dispatch into.
 const SESSION_ID: &str = "s1";
 /// Controller id the fixtures report.
@@ -37,6 +39,8 @@ enum Outcome {
     WithReasoning(&'static str),
     /// A failed result carrying the message.
     Failed(&'static str),
+    /// A panic carrying the message (the executor unwinds).
+    Panic(&'static str),
     /// An interrupted result.
     InputRequired,
     /// A typed error instead of a result.
@@ -149,6 +153,7 @@ impl TaskExecutor for TestExecutor {
                 Ok(TaskResult::text("done").with_reasoning(reasoning))
             }
             Outcome::Failed(message) => Ok(TaskResult::failed(message)),
+            Outcome::Panic(message) => panic!("{message}"),
             Outcome::InputRequired => Ok(TaskResult::input_required(vec![DataFrame::text("more")])),
             Outcome::Error(message) => Err(Error::validation(message)),
         }

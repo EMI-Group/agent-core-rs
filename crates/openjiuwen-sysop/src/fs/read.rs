@@ -6,19 +6,43 @@
 //! Python's order is preserved: the line selection is validated before the path is
 //! resolved, so a bad request never touches the filesystem.
 //!
+//! # Read contract
+//!
+//! Two read paths exist, and the difference is the memory they may use:
+//!
+//! - [`read_file`] / [`read_file_stream`] load the **whole** file. They therefore refuse a
+//!   file above the configured ceiling
+//!   ([`PathPolicy::check_read_size`](crate::workspace::PathPolicy::check_read_size),
+//!   `LocalWorkConfig::max_file_size_bytes`, 64 MiB by default) before reading a byte, and
+//!   report a reason naming the file size and the limit. Python has no such ceiling; setting
+//!   `max_file_size_bytes` to `None` restores its unlimited behavior.
+//! - [`read_bytes_limited`] reads at most the requested window from a requested offset by
+//!   seeking and taking, so a caller that wants the first lines of a huge file never
+//!   allocates the file. It reports the real total length and whether bytes remained.
+//!
 //! # Failures
 //!
 //! Failures are Python-compatible [`OpResult`] values with code `199003`, carrying the
-//! Python method name (`read_file` or `read_file_stream`) in the `execution` slot.
+//! Python method name (`read_file` or `read_file_stream`) in the `execution` slot. The
+//! bounded read returns the typed [`openjiuwen_common::error::Result`] instead, because it
+//! is a Rust addition: a path or I/O failure is
+//! [`ErrorKind::SysOp`](openjiuwen_common::error::ErrorKind::SysOp) and a rejected window is
+//! [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation).
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use openjiuwen_common::error::{Error, Result};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
 use crate::constants::{AUTO_ENCODING, DEFAULT_READ_STREAM_CHUNK_SIZE};
 use crate::fs::local::{len_u64, LocalFsOperation};
 use crate::fs::slice;
-use crate::fs::types::{FileContent, ReadChunkData, ReadFileData, ReadFileParams, ReadMode};
+use crate::fs::types::{
+    FileContent, ReadBytesData, ReadBytesParams, ReadChunkData, ReadFileData, ReadFileParams,
+    ReadMode,
+};
 use crate::operation::OpStream;
 use crate::result::{fs_failure, OpResult};
 use crate::util::format_path;
@@ -27,6 +51,8 @@ use crate::util::format_path;
 const READ_FILE: &str = "read_file";
 /// `execution` slot of a `read_file_stream` failure.
 const READ_FILE_STREAM: &str = "read_file_stream";
+/// Bytes reserved up front for a bounded read window (the buffer grows only as data arrives).
+const WINDOW_RESERVE_BYTES: u64 = 8 * 1024;
 
 /// Reads a whole file in text or bytes mode (Python `read_file`).
 pub(crate) async fn read_file(
@@ -196,7 +222,9 @@ async fn prepare_read_stream(
 /// # Errors
 ///
 /// Returns the failure reason when the path is denied, missing, not a regular file, over
-/// the configured size limit, or unreadable.
+/// the configured size limit (see [`PathPolicy::check_read_size`](crate::workspace::PathPolicy::check_read_size)),
+/// or unreadable. The size check runs on the metadata, before the file is opened, so an
+/// oversized file is never loaded.
 async fn load_for_read(
     op: &LocalFsOperation,
     params: &ReadFileParams,
@@ -216,13 +244,8 @@ async fn load_for_read(
             format!("not a file: {}", format_path(&path))
         });
     }
-    if let Some(limit) = op.policy().max_file_size() {
-        if metadata.len() > limit {
-            return Err(format!(
-                "file size {} exceeds the configured limit {limit} bytes",
-                metadata.len()
-            ));
-        }
+    if let Err(error) = op.policy().check_read_size(metadata.len()) {
+        return Err(error.message().to_string());
     }
     let bytes = read_bytes_locked(op, &path, params.only_read).await?;
     Ok(LoadedFile {
@@ -230,6 +253,93 @@ async fn load_for_read(
         size: metadata.len(),
         bytes,
     })
+}
+
+/// Reads at most `params.max_bytes` bytes from `params.offset` without loading the file.
+///
+/// The bounded counterpart of [`read_file`]: it resolves and inspects the path, then seeks
+/// to the requested offset and reads no more than the window, so the memory used is bounded
+/// by [`ReadBytesParams::max_bytes`] rather than by the file size. The whole-file ceiling is
+/// not applied to the file (a large file is exactly what this read is for); it *is* applied
+/// to the requested window, so a caller cannot ask this path for an allocation the size
+/// ceiling would refuse.
+///
+/// # Errors
+///
+/// Returns [`Error::validation`] when the window is wider than the configured ceiling, when
+/// the path is a directory, and [`Error::sys_op`] when the path is denied, missing, cannot
+/// be locked, or cannot be read.
+pub(crate) async fn read_bytes_limited(
+    op: &LocalFsOperation,
+    params: ReadBytesParams,
+) -> Result<ReadBytesData> {
+    if let Some(limit) = op.policy().max_file_size() {
+        if params.max_bytes > limit {
+            return Err(Error::validation(format!(
+                "requested read window {} exceeds the configured limit {limit} bytes",
+                params.max_bytes
+            )));
+        }
+    }
+    let path = op.policy().resolve_existing(&params.path).await?;
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|error| Error::sys_op(metadata_reason(&path, &error)))?;
+    if !metadata.is_file() {
+        return Err(Error::validation(if metadata.is_dir() {
+            format!("Is a directory: {}", format_path(&path))
+        } else {
+            format!("not a file: {}", format_path(&path))
+        }));
+    }
+    let total_bytes = metadata.len();
+    let bytes = read_window(op, &path, &params).await?;
+    let end = params.offset.saturating_add(len_u64(bytes.len()));
+    Ok(ReadBytesData {
+        path: format_path(&path),
+        bytes,
+        total_bytes,
+        truncated: end < total_bytes,
+    })
+}
+
+/// Seeks to `params.offset` and reads at most `params.max_bytes` bytes, holding the read lock.
+///
+/// The buffer is reserved only up to the window (capped at [`WINDOW_RESERVE_BYTES`]), so a
+/// window of a huge file never sizes an allocation from the file's length.
+async fn read_window(
+    op: &LocalFsOperation,
+    path: &Path,
+    params: &ReadBytesParams,
+) -> Result<Vec<u8>> {
+    let guard = if params.only_read {
+        None
+    } else {
+        Some(op.read_guard(path).await.map_err(Error::sys_op)?)
+    };
+    let result = read_window_locked(path, params.offset, params.max_bytes).await;
+    drop(guard);
+    result
+}
+
+/// The unlocked seek-and-read half of [`read_window`].
+async fn read_window_locked(path: &Path, offset: u64, max_bytes: u64) -> Result<Vec<u8>> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| Error::sys_op(error.to_string()))?;
+    if offset > 0 {
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|error| Error::sys_op(error.to_string()))?;
+    }
+    let reserve = usize::try_from(max_bytes.min(WINDOW_RESERVE_BYTES)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(reserve);
+    // `take` bounds both the bytes read and the buffer's growth: the window, not the file.
+    file.take(max_bytes)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| Error::sys_op(error.to_string()))?;
+    Ok(bytes)
 }
 
 /// Reads `path`, holding the shared lock unless `only_read` skips it.

@@ -9,14 +9,16 @@
 //! frames) and uses the non-streaming `call_model` only for the tool-free
 //! finalization call of the `FinalAnswer` max-iteration policy.
 use crate::output::{AgentChunk, LLM_OUTPUT, LLM_REASONING, LLM_USAGE};
+use crate::react::control::RunControl;
 use futures::StreamExt;
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::{FinishReason, Model, ModelRequestConfig};
 use openjiuwen_foundation::{BaseMessage, StreamAccumulator, StreamChunk, Usage};
 use openjiuwen_session::Session;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
 /// The normalized result of one model call.
 ///
 /// It is the value rails observe on `AfterModelCall` (`RailContext::response`)
@@ -43,13 +45,15 @@ pub struct ModelReply {
 ///
 /// # Errors
 ///
-/// Returns the provider's error from `Model::invoke` unchanged.
+/// Returns the provider's error from `Model::invoke` unchanged, or the run's
+/// typed cancellation/timeout error when either fires before the call returns.
 pub(crate) async fn call_model(
     model: &Arc<dyn Model>,
     messages: &[BaseMessage],
     request: ModelRequestConfig,
+    control: &RunControl,
 ) -> Result<ModelReply> {
-    let response = model.invoke(messages, &request).await?;
+    let response = control.race(model.invoke(messages, &request)).await??;
     let message = response.message().cloned().unwrap_or_default();
     let finish_reason = response.finish_reason().cloned();
     let usage = response.usage.clone();
@@ -72,6 +76,9 @@ pub(crate) struct DeltaSink<'a> {
     publisher: Option<&'a UnboundedSender<AgentChunk>>,
     session: Option<&'a Arc<dyn Session>>,
     index: i64,
+    /// Cancelled when a dropped subscriber closes the publisher, so the loop
+    /// stops instead of producing frames nobody reads.
+    cancellation: Option<CancellationToken>,
 }
 
 impl<'a> DeltaSink<'a> {
@@ -84,7 +91,18 @@ impl<'a> DeltaSink<'a> {
             publisher,
             session,
             index: 0,
+            cancellation: None,
         }
+    }
+
+    /// Attaches the run's cancellation token.
+    ///
+    /// A closed publisher cancels it and fails the model call with
+    /// [`Error::Cancelled`], so dropping the caller's stream stops the run.
+    #[must_use]
+    pub(crate) fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = Some(cancellation);
+        self
     }
 
     /// Returns the current frame index and advances past it.
@@ -96,14 +114,22 @@ impl<'a> DeltaSink<'a> {
 
     /// Emits one frame of `kind` with `payload`.
     ///
-    /// Delivery failures never abort the model call: a closed publisher channel
-    /// is ignored and a session write error is logged only.
-    pub(crate) async fn emit(&mut self, kind: &str, payload: Value) {
+    /// A session write failure is logged only: it must not fail the model call.
+    /// A closed publisher means the consumer stopped reading, which aborts the
+    /// run with [`Error::Cancelled`] so no further model or tool work happens.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Cancelled`] when the publisher's receiver was dropped.
+    pub(crate) async fn emit(&mut self, kind: &str, payload: Value) -> Result<()> {
         let chunk = AgentChunk::new(kind, self.next_index(), payload);
         if let Some(publisher) = self.publisher {
-            // The receiver may have gone away once the caller stopped reading;
-            // that must not fail the model call.
-            let _ = publisher.send(chunk.clone());
+            if publisher.is_closed() || publisher.send(chunk.clone()).is_err() {
+                if let Some(cancellation) = &self.cancellation {
+                    cancellation.cancel();
+                }
+                return Err(Error::Cancelled);
+            }
         }
         if let Some(session) = self.session {
             if let Err(error) = session.write_stream(chunk.to_stream_item()).await {
@@ -114,6 +140,7 @@ impl<'a> DeltaSink<'a> {
                 );
             }
         }
+        Ok(())
     }
 }
 
@@ -126,17 +153,20 @@ impl<'a> DeltaSink<'a> {
 ///
 /// # Errors
 ///
-/// Returns the provider's error from the stream unchanged.
+/// Returns the provider's error from the stream unchanged, [`Error::Cancelled`]
+/// when the run is cancelled or the caller's stream was dropped, and
+/// [`Error::Timeout`] when the run deadline expires mid-stream.
 pub(crate) async fn call_model_streaming(
     model: &Arc<dyn Model>,
     messages: &[BaseMessage],
     mut request: ModelRequestConfig,
     sink: &mut DeltaSink<'_>,
+    control: &RunControl,
 ) -> Result<ModelReply> {
     request.stream = true;
     let mut stream = model.stream(messages.to_vec(), request);
     let mut accumulator = StreamAccumulator::new();
-    while let Some(item) = stream.next().await {
+    while let Some(item) = control.race(stream.next()).await? {
         let chunk = item?;
         accumulator.push(&chunk);
         if let StreamChunk::Delta {
@@ -148,7 +178,7 @@ pub(crate) async fn call_model_streaming(
                 LLM_OUTPUT,
                 serde_json::json!({"content": text, "result_type": "answer"}),
             )
-            .await;
+            .await?;
         }
         if let StreamChunk::Delta {
             reasoning: Some(text),
@@ -159,7 +189,7 @@ pub(crate) async fn call_model_streaming(
                 LLM_REASONING,
                 serde_json::json!({"content": text, "result_type": "answer"}),
             )
-            .await;
+            .await?;
         }
     }
 
@@ -169,7 +199,7 @@ pub(crate) async fn call_model_streaming(
         LLM_USAGE,
         serde_json::json!({"usage_metadata": usage_metadata, "result_type": "answer"}),
     )
-    .await;
+    .await?;
     let reasoning_present = turn.message.reasoning_content.is_some();
     Ok(ModelReply {
         message: turn.message,
@@ -184,11 +214,16 @@ mod tests {
     use super::*;
     use openjiuwen_test_support::{MockCompletion, ScriptedError, ScriptedModel, ScriptedTurn};
 
+    /// A control that never cancels and has no deadline.
+    fn control() -> RunControl {
+        RunControl::new(CancellationToken::new(), 0.0)
+    }
+
     #[tokio::test]
     async fn text_reply_carries_content_and_finish_reason() {
         let model: Arc<dyn Model> = Arc::new(ScriptedModel::text("hello there"));
         let messages = vec![BaseMessage::user("hi")];
-        let reply = call_model(&model, &messages, ModelRequestConfig::default())
+        let reply = call_model(&model, &messages, ModelRequestConfig::default(), &control())
             .await
             .unwrap();
         assert_eq!(reply.message.content.as_text(), Some("hello there"));
@@ -203,7 +238,7 @@ mod tests {
         let model: Arc<dyn Model> = Arc::new(ScriptedModel::new([ScriptedTurn::fail_with(
             ScriptedError::llm("boom"),
         )]));
-        let error = call_model(&model, &[], ModelRequestConfig::default())
+        let error = call_model(&model, &[], ModelRequestConfig::default(), &control())
             .await
             .unwrap_err();
         assert!(error.to_string().contains("boom"));
@@ -238,10 +273,15 @@ mod tests {
         let mut sink = DeltaSink::new(Some(&publisher), None);
         let messages = vec![BaseMessage::user("hi")];
 
-        let plain =
-            call_model_streaming(&model, &messages, ModelRequestConfig::default(), &mut sink)
-                .await
-                .unwrap();
+        let plain = call_model_streaming(
+            &model,
+            &messages,
+            ModelRequestConfig::default(),
+            &mut sink,
+            &control(),
+        )
+        .await
+        .unwrap();
         assert_eq!(plain.message.content.as_text(), Some("hello"));
         assert_eq!(plain.finish_reason, Some(FinishReason::Stop));
         assert!(!plain.reasoning_present);
@@ -260,10 +300,15 @@ mod tests {
             vec![0, 1]
         );
 
-        let reasoning =
-            call_model_streaming(&model, &messages, ModelRequestConfig::default(), &mut sink)
-                .await
-                .unwrap();
+        let reasoning = call_model_streaming(
+            &model,
+            &messages,
+            ModelRequestConfig::default(),
+            &mut sink,
+            &control(),
+        )
+        .await
+        .unwrap();
         assert_eq!(reasoning.message.content.as_text(), Some("answer"));
         assert!(reasoning.reasoning_present);
         assert_eq!(
@@ -291,9 +336,15 @@ mod tests {
         let model = ScriptedModel::builder().stream_text("hi").build();
         let shared: Arc<dyn Model> = Arc::new(model.clone());
         let mut sink = DeltaSink::new(None, None);
-        call_model_streaming(&shared, &[], ModelRequestConfig::default(), &mut sink)
-            .await
-            .unwrap();
+        call_model_streaming(
+            &shared,
+            &[],
+            ModelRequestConfig::default(),
+            &mut sink,
+            &control(),
+        )
+        .await
+        .unwrap();
         let call = model.last_call().expect("stream call recorded");
         assert!(call.request.stream);
     }

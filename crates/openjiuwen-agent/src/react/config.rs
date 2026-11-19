@@ -10,6 +10,19 @@ use openjiuwen_foundation::{BaseMessage, ModelClientConfig, ModelRequestConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Default deadline of one run, in seconds.
+///
+/// Follows the workspace's `completion_timeout_secs` convention (the harness
+/// `DeepAgentConfig` default), so a hung model or tool cannot wedge a turn
+/// forever.
+pub const DEFAULT_COMPLETION_TIMEOUT_SECS: f64 = 600.0;
+
+/// Default deadline of one tool call, in seconds.
+///
+/// A tool that never returns fails its call after this long instead of hanging
+/// the turn; `0` disables the deadline.
+pub const DEFAULT_TOOL_TIMEOUT_SECS: f64 = 600.0;
+
 /// What the loop does when it exhausts [`ReActAgentConfig::max_iterations`].
 ///
 /// Wire names are `error`, `final_answer`, and `return_observations`.
@@ -75,6 +88,20 @@ pub struct ReActAgentConfig {
     ///
     /// Extension over Python: it bounds the total tokens a run may consume.
     pub max_total_tokens: Option<usize>,
+    /// Deadline of one run, in seconds; non-positive disables it.
+    ///
+    /// Extension over Python: it bounds the whole invocation (including every
+    /// model stream poll and tool call), so a hung provider stream ends the run
+    /// with a typed [`Error::Timeout`](openjiuwen_common::error::Error::Timeout)
+    /// instead of hanging forever. Follows the workspace's
+    /// `completion_timeout_secs` convention.
+    pub completion_timeout_secs: f64,
+    /// Deadline of one tool call, in seconds; non-positive disables it.
+    ///
+    /// Extension over Python: it gives each tool call a per-call deadline (in
+    /// addition to the run deadline), so a tool that never returns fails its
+    /// call instead of blocking the turn.
+    pub tool_timeout_secs: f64,
 }
 
 impl Default for ReActAgentConfig {
@@ -100,6 +127,8 @@ impl Default for ReActAgentConfig {
             parallel_tool_calls: true,
             retain_tool_facts_on_abort: false,
             max_total_tokens: None,
+            completion_timeout_secs: DEFAULT_COMPLETION_TIMEOUT_SECS,
+            tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
         }
     }
 }
@@ -181,6 +210,18 @@ impl ReActAgentConfig {
         self.custom_headers = headers;
         self
     }
+
+    /// Sets the run-wide completion deadline in seconds (`0` disables it).
+    pub fn configure_completion_timeout(&mut self, secs: f64) -> &mut Self {
+        self.completion_timeout_secs = secs;
+        self
+    }
+
+    /// Sets the per-tool deadline in seconds (`0` disables it).
+    pub fn configure_tool_timeout(&mut self, secs: f64) -> &mut Self {
+        self.tool_timeout_secs = secs;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -207,6 +248,8 @@ mod tests {
         assert!(config.parallel_tool_calls);
         assert!(!config.retain_tool_facts_on_abort);
         assert_eq!(config.max_total_tokens, None);
+        assert!((config.completion_timeout_secs - 600.0).abs() < f64::EPSILON);
+        assert!((config.tool_timeout_secs - 600.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -239,7 +282,9 @@ mod tests {
             .configure_max_iterations(9)
             .configure_parallel_tool_calls(false)
             .configure_mem_scope("scope")
-            .configure_custom_headers(BTreeMap::from([("x".to_owned(), "y".to_owned())]));
+            .configure_custom_headers(BTreeMap::from([("x".to_owned(), "y".to_owned())]))
+            .configure_completion_timeout(30.0)
+            .configure_tool_timeout(5.0);
         config.configure_model_provider("anthropic");
         config.configure_prompt_template(vec![BaseMessage::user("hi")]);
         assert_eq!(config.model_name, "gpt-4o");
@@ -249,6 +294,8 @@ mod tests {
         assert!(!config.parallel_tool_calls);
         assert_eq!(config.mem_scope_id, "scope");
         assert_eq!(config.custom_headers["x"], "y");
+        assert!((config.completion_timeout_secs - 30.0).abs() < f64::EPSILON);
+        assert!((config.tool_timeout_secs - 5.0).abs() < f64::EPSILON);
     }
 
     #[test]

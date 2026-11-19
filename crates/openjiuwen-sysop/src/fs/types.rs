@@ -278,6 +278,62 @@ impl Default for ReadFileData {
     }
 }
 
+/// Parameters of the bounded read (`FsOperation::read_bytes_limited`).
+///
+/// Rust addition: Python's `read_file` always loads the whole file. This request reads at
+/// most [`Self::max_bytes`] bytes starting at [`Self::offset`] without touching the rest of
+/// the file, so the memory a read needs is bounded by the caller rather than by the file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", default)]
+pub struct ReadBytesParams {
+    /// Path to read, absolute or relative to the workspace root.
+    pub path: String,
+    /// Byte offset the window starts at; `0` starts at the beginning of the file.
+    pub offset: u64,
+    /// Maximum number of bytes to return; `0` returns no bytes (only the size facts).
+    pub max_bytes: u64,
+    /// Skip both lock layers (Python `skip_lock`); default `false`.
+    pub only_read: bool,
+}
+
+impl ReadBytesParams {
+    /// Bounded parameters for the window `[offset, offset + max_bytes)` of `path`.
+    #[must_use]
+    pub fn new(path: impl Into<String>, offset: u64, max_bytes: u64) -> Self {
+        Self {
+            path: path.into(),
+            offset,
+            max_bytes,
+            only_read: false,
+        }
+    }
+
+    /// Returns these parameters with [`Self::only_read`] set.
+    #[must_use]
+    pub fn with_only_read(mut self, only_read: bool) -> Self {
+        self.only_read = only_read;
+        self
+    }
+}
+
+/// Data of the bounded read (`FsOperation::read_bytes_limited`).
+///
+/// [`Self::bytes`] never holds more than the requested window, [`Self::total_bytes`] is the
+/// real length of the whole file, and [`Self::truncated`] says whether bytes were left
+/// unread past the window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", default)]
+pub struct ReadBytesData {
+    /// Resolved path that was read.
+    pub path: String,
+    /// The window's bytes, at most `ReadBytesParams::max_bytes` of them.
+    pub bytes: Vec<u8>,
+    /// Full size of the file in bytes.
+    pub total_bytes: u64,
+    /// `true` when the window ended before the end of the file.
+    pub truncated: bool,
+}
+
 /// One chunk of `read_file_stream` (Python `ReadFileChunkData`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]

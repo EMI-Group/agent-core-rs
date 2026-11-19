@@ -45,8 +45,9 @@ use super::scope::{SessionScope, SessionScopeKey};
 /// A session store rooted at a base directory.
 ///
 /// The store is cheap to clone: clones share the same base path, the same
-/// version-history commit lock, and the same link-graph write lock, so
-/// concurrent writers coordinate through one mutex each.
+/// version-history commit lock, the same link-graph write lock, and the same
+/// session-index write lock, so concurrent writers coordinate through one mutex
+/// each.
 ///
 /// Two stores constructed independently over the same base directory do not
 /// share those locks, so writers over one base must be store clones.
@@ -55,6 +56,7 @@ pub struct DiskSessionStore {
     base: PathBuf,
     history_lock: Arc<AsyncMutex<()>>,
     links_lock: Arc<AsyncMutex<()>>,
+    index_lock: Arc<AsyncMutex<()>>,
 }
 
 /// The file name of the per-agent session index.
@@ -74,6 +76,7 @@ impl DiskSessionStore {
             base: base.into(),
             history_lock: Arc::new(AsyncMutex::new(())),
             links_lock: Arc::new(AsyncMutex::new(())),
+            index_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -143,6 +146,10 @@ impl DiskSessionStore {
     /// its version is bumped. Timestamps are made strictly monotonic across
     /// saves for one agent, so "newest first" listings are deterministic.
     ///
+    /// The index update is a read-modify-write cycle serialized across store
+    /// clones, so concurrent saves of distinct sessions keep every entry; both
+    /// the state document and the index are written atomically.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`](openjiuwen_common::error::ErrorKind::Validation)
@@ -157,6 +164,11 @@ impl DiskSessionStore {
     ) -> Result<SessionMeta> {
         validate_id("agent", agent_id)?;
         validate_id("session", &record.meta.session_id)?;
+
+        // The index is a read-modify-write document: without this lock two
+        // concurrent saves of distinct sessions could each read the same index
+        // and the later write would drop the other's entry.
+        let _index_guard = self.index_lock.lock().await;
 
         let mut index = self.read_index(agent_id).await?;
         let now = now_seconds().max(index.updated_at + TIMESTAMP_EPSILON);
@@ -353,6 +365,9 @@ impl DiskSessionStore {
 
         let index_path = self.sessions_index_path(agent_id);
         if tokio::fs::metadata(&index_path).await.is_ok() {
+            // Same read-modify-write lock as `save`: a concurrent save must not
+            // resurrect an entry this delete just removed (or vice versa).
+            let _index_guard = self.index_lock.lock().await;
             let mut index = self.read_index(agent_id).await?;
             let mut changed = false;
             index.scopes.retain(|_, scope| {

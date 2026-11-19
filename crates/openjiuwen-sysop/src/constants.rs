@@ -35,6 +35,20 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 /// Marker appended to a captured stream that hit `LocalWorkConfig::max_output_bytes`.
 pub const OUTPUT_TRUNCATION_MARKER: &str = "\n[output truncated]";
 
+/// Default ceiling for a *whole-file* read, in bytes (64 MiB).
+///
+/// `read_file` and `read_file_stream` load the entire file into memory, so they refuse a file
+/// above [`LocalWorkConfig::max_file_size_bytes`](crate::config::LocalWorkConfig::max_file_size_bytes)
+/// instead of allocating it. Python's `read_file` has no such ceiling; this is a Rust addition
+/// that turns an accidental multi-gigabyte read into a typed failure.
+///
+/// A caller that needs a window of a larger file uses the bounded read
+/// ([`crate::operation::FsOperation::read_bytes_limited`]), which never allocates more than the
+/// requested window, or sets `max_file_size_bytes` to `None`
+/// ([`LocalWorkConfig::unrestricted`](crate::config::LocalWorkConfig::unrestricted) does that)
+/// to restore Python's unlimited behavior.
+pub const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Default chunk size in bytes for `read_file_stream` (Python `DEFAULT_READ_STREAM_CHUNK_SIZE`).
 pub const DEFAULT_READ_STREAM_CHUNK_SIZE: usize = 8192;
 
@@ -95,5 +109,6 @@ mod tests {
         assert_eq!(DEFAULT_STDERR_RETENTION_BYTES, 8192);
         assert_eq!(DEFAULT_LAUNCHER_TYPE, "pre_deploy");
         assert_eq!(DEFAULT_SANDBOX_TYPE, "aio");
+        assert_eq!(DEFAULT_MAX_FILE_SIZE_BYTES, 67_108_864);
     }
 }

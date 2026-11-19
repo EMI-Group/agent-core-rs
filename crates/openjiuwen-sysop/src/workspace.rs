@@ -105,6 +105,28 @@ impl PathPolicy {
         self.max_file_size
     }
 
+    /// Rejects a whole-file read of `size` bytes when it is above [`Self::max_file_size`].
+    ///
+    /// The whole-file read (`read_file`, `read_file_stream`) loads the entire file, so a file
+    /// above the configured ceiling is refused *before* anything is allocated instead of
+    /// growing a buffer until the process is killed. A caller that needs a window of a larger
+    /// file uses the bounded read
+    /// ([`crate::operation::FsOperation::read_bytes_limited`]), which never allocates more
+    /// than the window it asks for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] with a message naming the
+    /// file size and the configured limit.
+    pub fn check_read_size(&self, size: u64) -> Result<()> {
+        match self.max_file_size {
+            Some(limit) if size > limit => Err(Error::validation(format!(
+                "file size {size} exceeds the configured limit {limit} bytes"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// The configuration this policy was built from.
     #[must_use]
     pub fn config(&self) -> &LocalWorkConfig {

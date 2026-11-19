@@ -82,9 +82,9 @@ use crate::fs::lock::{FileLockGuard, FileLockManager};
 use crate::fs::types::{
     CopyData, CopyParams, DeleteData, DeleteParams, DownloadFileData, DownloadFileParams, FileStat,
     ListDirsParams, ListFilesData, ListFilesParams, MkdirData, MkdirParams, MoveData, MoveParams,
-    ReadChunkData, ReadFileData, ReadFileParams, SearchFilesData, SearchFilesParams,
-    SearchPatternMode, TransferChunkData, UploadFileData, UploadFileParams, WriteFileData,
-    WriteFileParams,
+    ReadBytesData, ReadBytesParams, ReadChunkData, ReadFileData, ReadFileParams, SearchFilesData,
+    SearchFilesParams, SearchPatternMode, TransferChunkData, UploadFileData, UploadFileParams,
+    WriteFileData, WriteFileParams,
 };
 use crate::fs::{ext, list, read, search, transfer, write};
 use crate::operation::{FsExtOperation, FsOperation, OpStream};
@@ -241,6 +241,13 @@ impl FsOperation for LocalFsOperation {
 
     async fn read_file(&self, params: ReadFileParams) -> OpResult<ReadFileData> {
         read::read_file(self, params).await
+    }
+
+    async fn read_bytes_limited(
+        &self,
+        params: ReadBytesParams,
+    ) -> openjiuwen_common::error::Result<ReadBytesData> {
+        read::read_bytes_limited(self, params).await
     }
 
     fn read_file_stream(self: Arc<Self>, params: ReadFileParams) -> OpStream<ReadChunkData> {

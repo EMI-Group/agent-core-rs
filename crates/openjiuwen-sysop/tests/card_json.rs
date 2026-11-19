@@ -8,7 +8,9 @@
 
 use openjiuwen_sysop::card::{generate_tool_id, SysOperationCard};
 use openjiuwen_sysop::config::{EnvInheritMode, LocalWorkConfig};
-use openjiuwen_sysop::constants::{DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECS};
+use openjiuwen_sysop::constants::{
+    DEFAULT_MAX_FILE_SIZE_BYTES, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECS,
+};
 use openjiuwen_sysop::mode::{OperationKind, OperationMode};
 use openjiuwen_sysop::sandbox::config::{
     ContainerScope, OnStop, SandboxGatewayConfig, SandboxIsolationConfig, SandboxLauncherConfig,
@@ -259,8 +261,15 @@ fn local_work_config_defaults_match_python() {
         "the default environment policy inherits everything"
     );
     assert_eq!(
-        config.max_file_size_bytes, None,
-        "max_file_size_bytes is unlimited by default (Python parity)"
+        config.max_file_size_bytes,
+        Some(DEFAULT_MAX_FILE_SIZE_BYTES),
+        "the whole-file read is bounded by default (a documented Rust addition); \
+         `LocalWorkConfig::unrestricted` restores Python's unlimited read"
+    );
+    assert_eq!(
+        LocalWorkConfig::unrestricted("/tmp").max_file_size_bytes,
+        None,
+        "the explicit opt-out keeps Python's unlimited whole-file read"
     );
     assert_eq!(
         config.sandbox_root, None,

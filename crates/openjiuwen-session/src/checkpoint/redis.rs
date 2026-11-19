@@ -29,9 +29,10 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::error::{Error, ErrorKind, Result};
 use openjiuwen_common::utils::id::{now_rfc3339, uuid_hex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -46,13 +47,19 @@ use super::{
 /// The default key prefix, Python's `openjiuwen:session` namespace.
 pub const DEFAULT_REDIS_KEY_PREFIX: &str = "openjiuwen:session";
 
+/// The default deadline for connecting, the TLS handshake, and each command
+/// exchange: 60 s, matching the workspace's HTTP request timeout so one
+/// blackholed peer cannot hang a session indefinitely.
+pub const DEFAULT_REDIS_IO_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Configuration for [`RedisCheckpointer`].
 ///
 /// `url` uses the `[redis|rediss]://[user[:password]@]host[:port][/db]` form
 /// (`rediss://` dials over TLS); `prefix` namespaces every key; `ttl` (when set)
 /// expires each checkpoint document; `database` selects a Redis database and
 /// overrides the database in the URL; `tls_ca_file` adds trust anchors for
-/// `rediss://`.
+/// `rediss://`; `io_timeout` bounds connecting plus the TLS handshake and every
+/// command exchange.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct RedisOptions {
@@ -74,6 +81,16 @@ pub struct RedisOptions {
     /// instead of a silent no-op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca_file: Option<String>,
+    /// The per-operation deadline: connecting plus the TLS handshake share one
+    /// budget, and each command exchange (write and reply) gets its own.
+    ///
+    /// `None` uses [`DEFAULT_REDIS_IO_TIMEOUT`] (60 s), so an omitted or
+    /// previously serialized configuration stays bounded instead of hanging on a
+    /// partitioned server. An elapsed deadline is
+    /// [`openjiuwen_common::error::ErrorKind::Timeout`], and the connection is
+    /// discarded so a late reply can never answer the next command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_timeout: Option<std::time::Duration>,
 }
 
 impl Default for RedisOptions {
@@ -84,6 +101,7 @@ impl Default for RedisOptions {
             ttl: None,
             database: None,
             tls_ca_file: None,
+            io_timeout: None,
         }
     }
 }
@@ -97,13 +115,14 @@ impl RedisOptions {
     /// (string), `ttl_seconds` (unsigned integer), `database` (unsigned
     /// integer), and `tls_ca_file` (string; the hyphenated `tls-ca-file`
     /// spelling is accepted as an alias, and `tls_ca_file` wins when both are
-    /// present).
+    /// present), plus `io_timeout_ms` (unsigned integer milliseconds; zero is
+    /// rejected).
     ///
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] when neither
-    /// `extra["url"]` nor a `path` is present, and when `database` does not fit
-    /// in a `u32`.
+    /// `extra["url"]` nor a `path` is present, when `database` does not fit in a
+    /// `u32`, and when `io_timeout_ms` is zero.
     pub fn from_config(config: &CheckpointerConfig) -> Result<Self> {
         let url = config
             .extra
@@ -122,6 +141,16 @@ impl RedisOptions {
         };
         options.apply_extra(&config.extra)?;
         Ok(options)
+    }
+
+    /// The deadline applied to connecting, the TLS handshake, and every command
+    /// exchange.
+    ///
+    /// Falls back to [`DEFAULT_REDIS_IO_TIMEOUT`] when [`RedisOptions::io_timeout`]
+    /// is unset, so a configuration that predates the field is still bounded.
+    #[must_use]
+    pub fn effective_io_timeout(&self) -> Duration {
+        self.io_timeout.unwrap_or(DEFAULT_REDIS_IO_TIMEOUT)
     }
 
     /// Applies the optional keys of a [`CheckpointerConfig::extra`] map.
@@ -147,6 +176,15 @@ impl RedisOptions {
         {
             self.tls_ca_file = Some(ca_file.to_string());
         }
+        if let Some(millis) = extra.get("io_timeout_ms").and_then(Value::as_u64) {
+            if millis == 0 {
+                return Err(Error::validation(
+                    "redis io_timeout_ms must be at least 1: a zero deadline would fail every \
+                     command",
+                ));
+            }
+            self.io_timeout = Some(Duration::from_millis(millis));
+        }
         Ok(())
     }
 }
@@ -158,6 +196,13 @@ impl RedisOptions {
 /// the next operation dials a fresh one, so a server restart or an idle
 /// connection does not wedge the backend. Application-level errors (a rejected
 /// command) do not reconnect.
+///
+/// Every operation is bounded by [`RedisOptions::effective_io_timeout`], so a
+/// partitioned or blackholed server fails with
+/// [`openjiuwen_common::error::ErrorKind::Timeout`] instead of hanging. The
+/// connection mutex only guards the pooled handle: dialing happens before it is
+/// taken (so a caller waiting on a dead server cannot park the others), and a
+/// connection that hit its deadline is dropped rather than returned to the pool.
 #[derive(Default)]
 pub struct RedisCheckpointer {
     options: RedisOptions,
@@ -173,6 +218,7 @@ impl std::fmt::Debug for RedisCheckpointer {
             .field("ttl", &self.options.ttl)
             .field("database", &self.options.database)
             .field("tls_ca_file", &self.options.tls_ca_file)
+            .field("io_timeout", &self.options.io_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -184,9 +230,11 @@ impl RedisCheckpointer {
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for an empty
-    /// or malformed URL and [`openjiuwen_common::error::ErrorKind::Session`]
-    /// when the connection, the TLS handshake of a `rediss://` URL, or its
-    /// protocol handshake fails.
+    /// or malformed URL,
+    /// [`openjiuwen_common::error::ErrorKind::Timeout`] when the default IO
+    /// deadline elapses, and
+    /// [`openjiuwen_common::error::ErrorKind::Session`] when the connection, the
+    /// TLS handshake of a `rediss://` URL, or its protocol handshake fails.
     pub async fn connect(url: impl Into<String>) -> Result<Self> {
         Self::connect_with_options(RedisOptions {
             url: url.into(),
@@ -206,7 +254,10 @@ impl RedisCheckpointer {
     ///
     /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for an empty
     /// URL or prefix, a malformed URL, a malformed CA file, or a `tls_ca_file`
-    /// on a `redis://` URL, and
+    /// on a `redis://` URL,
+    /// [`openjiuwen_common::error::ErrorKind::Timeout`] when the
+    /// [`RedisOptions::effective_io_timeout`] deadline elapses while dialing,
+    /// handshaking, or authenticating, and
     /// [`openjiuwen_common::error::ErrorKind::Session`] when the connection, the
     /// `SELECT`, the TLS handshake (an untrusted certificate, a server that is
     /// not speaking TLS), or the protocol handshake fails.
@@ -283,35 +334,62 @@ impl RedisCheckpointer {
 
     /// Runs one command over the shared connection, retrying once on a fresh
     /// connection after a transport failure.
+    ///
+    /// The connection mutex is never held across dialing or a command: the
+    /// pooled handle is taken (or a fresh connection dialed) and returned under
+    /// the lock, so a caller stuck on a blackholed server does not park the
+    /// others behind it.
     async fn exchange(&self, args: &[&[u8]]) -> Result<RespValue> {
-        let mut guard = self.connection.lock().await;
-        let mut connection = match guard.take() {
-            Some(connection) if !connection.is_broken() => connection,
-            _ => self.dial().await?,
+        let mut connection = match self.take_connection().await {
+            Some(connection) => connection,
+            None => self.dial().await?,
         };
         let error = match connection.command_bytes(args).await {
             Ok(reply) => {
-                *guard = Some(connection);
+                self.put_connection(connection).await;
                 return Ok(reply);
             }
             Err(error) => error,
         };
+        if error.kind() == ErrorKind::Timeout {
+            // A reply that arrives after the deadline would be read as the
+            // answer to the next command, so this connection is dropped instead
+            // of being returned to the pool.
+            return Err(error);
+        }
         if !connection.is_broken() {
-            *guard = Some(connection);
+            self.put_connection(connection).await;
             return Err(error);
         }
         // The transport failed: retry the (idempotent) command once on a fresh
         // connection so a dropped or restarted server does not fail the call.
+        // A second deadline is reported as-is rather than retried: retrying a
+        // timed-out peer only doubles the wait.
         let mut fresh = match self.dial().await {
             Ok(connection) => connection,
-            Err(dial_error) => {
-                *guard = Some(connection);
-                return Err(dial_error);
-            }
+            Err(dial_error) => return Err(dial_error),
         };
         let outcome = fresh.command_bytes(args).await;
-        *guard = Some(fresh);
+        match &outcome {
+            Err(error) if error.kind() == ErrorKind::Timeout || fresh.is_broken() => {}
+            _ => self.put_connection(fresh).await,
+        }
         outcome
+    }
+
+    /// Takes the pooled connection when it is still usable, dropping a broken
+    /// one.
+    async fn take_connection(&self) -> Option<RespConnection> {
+        self.connection
+            .lock()
+            .await
+            .take()
+            .filter(|connection| !connection.is_broken())
+    }
+
+    /// Returns a healthy connection to the pool.
+    async fn put_connection(&self, connection: RespConnection) {
+        *self.connection.lock().await = Some(connection);
     }
 
     /// Returns the members of an index set, in a deterministic order.
@@ -475,9 +553,16 @@ impl Checkpointer for RedisCheckpointer {
 }
 
 /// Connects to `options.url` and selects `options.database` when set.
+///
+/// Dialing plus the TLS handshake are bounded together, and the `SELECT` (like
+/// any `AUTH` in the URL) gets its own budget, so an unreachable or silent
+/// server surfaces as [`Error::Timeout`].
 async fn dial(options: &RedisOptions) -> Result<RespConnection> {
     let ca_file = options.tls_ca_file.as_deref().map(Path::new);
-    let mut connection = RespConnection::connect_with_ca_file(&options.url, ca_file).await?;
+    let timeout = options.effective_io_timeout();
+    let mut connection =
+        RespConnection::connect_with_ca_file_and_timeout(&options.url, ca_file, Some(timeout))
+            .await?;
     if let Some(database) = options.database {
         connection.select_database(database).await?;
     }
@@ -514,6 +599,75 @@ mod tests {
         assert_eq!(options.ttl, None);
         assert_eq!(options.database, None);
         assert_eq!(options.tls_ca_file, None);
+        assert_eq!(options.io_timeout, None);
+        // An unset deadline still bounds every operation.
+        assert_eq!(
+            options.effective_io_timeout(),
+            super::DEFAULT_REDIS_IO_TIMEOUT
+        );
+        assert_eq!(
+            super::DEFAULT_REDIS_IO_TIMEOUT,
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn io_timeout_round_trips_and_parses_from_extra() {
+        use crate::checkpoint::{CheckpointerConfig, CheckpointerKind};
+
+        let options = RedisOptions {
+            url: "redis://cache:6379".to_string(),
+            io_timeout: Some(std::time::Duration::from_millis(250)),
+            ..RedisOptions::default()
+        };
+        let encoded = serde_json::to_value(&options).unwrap();
+        assert_eq!(encoded["io_timeout"]["secs"], 0);
+        assert_eq!(encoded["io_timeout"]["nanos"], 250_000_000);
+        assert_eq!(
+            serde_json::from_value::<RedisOptions>(encoded).unwrap(),
+            options
+        );
+        assert_eq!(
+            options.effective_io_timeout(),
+            std::time::Duration::from_millis(250)
+        );
+        // A configuration serialized before the field existed keeps the default.
+        let legacy: RedisOptions =
+            serde_json::from_value(serde_json::json!({ "url": "redis://cache:6379" })).unwrap();
+        assert_eq!(legacy.io_timeout, None);
+        assert!(
+            serde_json::to_value(RedisOptions::default())
+                .unwrap()
+                .get("io_timeout")
+                .is_none(),
+            "an unset deadline is skipped"
+        );
+
+        let config = CheckpointerConfig {
+            kind: CheckpointerKind::Redis,
+            path: None,
+            extra: std::collections::BTreeMap::from([
+                ("url".to_string(), serde_json::json!("redis://cache:6379")),
+                ("io_timeout_ms".to_string(), serde_json::json!(1500)),
+            ]),
+        };
+        assert_eq!(
+            RedisOptions::from_config(&config).unwrap().io_timeout,
+            Some(std::time::Duration::from_millis(1500))
+        );
+        // A zero deadline would fail every command, so it is rejected.
+        let zero = CheckpointerConfig {
+            kind: CheckpointerKind::Redis,
+            path: None,
+            extra: std::collections::BTreeMap::from([
+                ("url".to_string(), serde_json::json!("redis://cache:6379")),
+                ("io_timeout_ms".to_string(), serde_json::json!(0)),
+            ]),
+        };
+        assert_eq!(
+            RedisOptions::from_config(&zero).unwrap_err().kind(),
+            ErrorKind::Validation
+        );
     }
 
     #[test]
@@ -524,12 +678,14 @@ mod tests {
             ttl: Some(std::time::Duration::from_secs(30)),
             database: Some(1),
             tls_ca_file: Some("/etc/ssl/private-ca.pem".to_string()),
+            io_timeout: Some(std::time::Duration::from_secs(5)),
         };
         let encoded = serde_json::to_value(&options).unwrap();
         assert_eq!(encoded["url"], "rediss://cache:6379/1");
         assert_eq!(encoded["prefix"], "tests");
         assert_eq!(encoded["database"], 1);
         assert_eq!(encoded["ttl"]["secs"], 30);
+        assert_eq!(encoded["io_timeout"]["secs"], 5);
         assert_eq!(encoded["tls_ca_file"], "/etc/ssl/private-ca.pem");
         let decoded: RedisOptions = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, options);

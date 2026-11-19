@@ -16,7 +16,8 @@ Integration tests may use only items exported from `openjiuwen_sysop`:
 `card::SysOperationCard`, `config::{LocalWorkConfig, EnvPolicy, BinaryPolicy, EnvInheritMode}`,
 `sandbox::config::*`, `mode::{OperationMode, OperationKind}`,
 `operation::{FsOperation, FsExtOperation, ShellOperation, CodeOperation, OpStream}`,
-`fs::types::*`, `shell::types::*`, `code::types::*`,
+`fs::types::*` (including `ReadBytesParams`/`ReadBytesData`), `shell::types::*`, `code::types::*`,
+`constants::DEFAULT_MAX_FILE_SIZE_BYTES`, `workspace::PathPolicy::check_read_size`,
 `result::OpResult`, `status::SysOpStatus`, `tool::OperationToolSpec`.
 `pub(crate)` items are not reachable here; a test that needs one belongs in a `#[cfg(test)]`
 module beside the code.
@@ -58,6 +59,8 @@ module beside the code.
 - `./encoding_write.rs` → write-side round-trips for every encoding, known byte fixtures, unknown/unrepresentable failures
 - `./file_locks.rs` → cross-process `flock` contention, timeout mapping, second-process proof
 - `./process_group.rs` → process-group teardown on timeout, cancellation and background stop
+- `./stream_interrupts.rs` → a timeout and a cancellation still reach a child that closed its own pipes, and a single huge line is captured within `max_output_bytes`
+- `./bounded_read.rs` → the default whole-file read ceiling (`Validation` gate, `unrestricted` opt-out) and `read_bytes_limited` windows with offset/EOF/zero-window shapes and typed failures
 - `./pty_streaming.rs` → PTY terminal detection, line-buffered chunks, exit codes
 - `./tool_specs.rs` → 13 generated tool specs, ids, names, JSON schemas, kind filtering
 - `./sandbox_stub.rs` → `sandbox`-feature behavior without a remote provider: card validation, unsupported errors, forwarding shape

@@ -47,6 +47,7 @@ use crate::policy::{
 };
 use crate::rails::memory::MEMORY_VARIABLES_KEY;
 use crate::rails::{RailContext, RailEvent, RailRegistry};
+use crate::react::control::{timeout_duration, RunControl};
 use crate::react::model_step::{call_model, call_model_streaming, DeltaSink};
 use crate::react::pause::pause_output;
 use crate::react::prompt::build_system_with_block;
@@ -67,6 +68,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
 
 /// Message of the `result_type: "error"` output produced by an empty model turn.
 const EMPTY_RESPONSE_MSG: &str = "模型未返回有效内容（空响应），请重试或检查上下文。";
@@ -268,7 +270,9 @@ impl UsageCall<'_> {
                 POST_CALL_PHASE.clone_into(&mut snapshot.phase);
                 snapshot.request_id.clone_from(&request_id);
                 self.runtime.usage_telemetry.record(snapshot.clone());
-                frames::context_usage_post_call(
+                // A closed publisher has already cancelled the run; the loop
+                // observes it at its next check, so this failure is only logged.
+                if let Err(error) = frames::context_usage_post_call(
                     self.publisher,
                     self.session,
                     self.iteration,
@@ -276,7 +280,10 @@ impl UsageCall<'_> {
                     &snapshot,
                     self.window,
                 )
-                .await;
+                .await
+                {
+                    tracing::debug!(%error, "the post-call usage frame was not delivered");
+                }
             }
             Err(error) => {
                 tracing::debug!(%error, "no post-call context usage snapshot was produced");
@@ -306,9 +313,11 @@ pub(crate) async fn run(
     session: Arc<dyn Session>,
     publisher: Option<UnboundedSender<AgentChunk>>,
     owned: bool,
+    cancellation: CancellationToken,
 ) -> Result<AgentOutput> {
     let runtime = AgentRuntime::snapshot(agent)?;
-    run_with(&runtime, input, session, publisher, owned).await
+    let control = RunControl::new(cancellation, runtime.config.completion_timeout_secs);
+    run_with(&runtime, input, session, publisher, owned, &control).await
 }
 
 /// Runs one invoke against an already snapshotted runtime.
@@ -332,6 +341,7 @@ pub(crate) async fn run_with(
     session: Arc<dyn Session>,
     publisher: Option<UnboundedSender<AgentChunk>>,
     owned: bool,
+    control: &RunControl,
 ) -> Result<AgentOutput> {
     let span = session.tracer().map(|tracer| {
         let span = tracer.start_span(runtime.card_name.clone(), InvokeType::Chain);
@@ -346,15 +356,21 @@ pub(crate) async fn run_with(
     // The run's text turns, forwarded to the memory provider when this run owns
     // the session.
     let mut turns: Vec<ConversationTurn> = Vec::new();
-    let result = run_inner(
-        runtime,
-        &input,
-        &session,
-        publisher.as_ref(),
-        &mut ctx,
-        &mut turns,
-    )
-    .await;
+    let result = match control
+        .race(run_inner(
+            runtime,
+            &input,
+            &session,
+            publisher.as_ref(),
+            &mut ctx,
+            &mut turns,
+            control,
+        ))
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(error),
+    };
 
     let output = match &result {
         Ok(output) => output.clone(),
@@ -475,6 +491,7 @@ async fn run_inner(
     publisher: Option<&UnboundedSender<AgentChunk>>,
     ctx: &mut RailContext,
     turns: &mut Vec<ConversationTurn>,
+    control: &RunControl,
 ) -> Result<AgentOutput> {
     let config = &runtime.config;
     let context = runtime
@@ -491,6 +508,8 @@ async fn run_inner(
     let tool_options = ToolExecutionOptions {
         parallel: config.parallel_tool_calls,
         session_id: Some(session.id().to_owned()),
+        timeout: timeout_duration(config.tool_timeout_secs),
+        cancellation: control.cancellation.clone(),
         ..ToolExecutionOptions::default()
     };
 
@@ -525,6 +544,7 @@ async fn run_inner(
     hooks::invoke_start(runtime, session, &original_query, limit).await;
 
     for iteration in start..=limit {
+        control.check()?;
         used = iteration;
         // Steering pushed before the run lands in the first request; one pushed
         // mid-run lands in the next iteration's window.
@@ -542,7 +562,7 @@ async fn run_inner(
             )
             .await?;
         let window = frames::WindowSummary::of(&prepared);
-        frames::context_usage(publisher, session, iteration, &prepared).await;
+        frames::context_usage(publisher, session, iteration, &prepared).await?;
 
         reset_ctx(ctx, RailEvent::BeforeModelCall);
         ctx.iteration = iteration;
@@ -582,13 +602,16 @@ async fn run_inner(
                     "backup",
                     Some("model_override"),
                 )
-                .await;
+                .await?;
             }
-            let mut sink = DeltaSink::new(publisher, Some(session));
+            control.check()?;
+            let mut sink = DeltaSink::new(publisher, Some(session))
+                .with_cancellation(control.cancellation.clone());
             // Best-effort prefix affinity: prepared per attempt, so a retried
             // call records its own scope and never leaves a lease dangling.
             let cache = kv_cache::prepare(runtime, session, &messages, &request).await;
-            match call_model_streaming(&model, &messages, request.clone(), &mut sink).await {
+            match call_model_streaming(&model, &messages, request.clone(), &mut sink, control).await
+            {
                 Ok(reply) => {
                     kv_cache::finish(cache, true, Some(reply.usage.input_tokens)).await;
                     break reply;
@@ -859,7 +882,7 @@ async fn run_inner(
     messages.push(BaseMessage::user(FINAL_ANSWER_NUDGE));
     let request = request_for(runtime, &[]);
     let cache = kv_cache::prepare(runtime, session, &messages, &request).await;
-    match call_model(&runtime.model, &messages, request.clone()).await {
+    match call_model(&runtime.model, &messages, request.clone(), control).await {
         Ok(reply) => {
             kv_cache::finish(cache, true, Some(reply.usage.input_tokens)).await;
             UsageCall {

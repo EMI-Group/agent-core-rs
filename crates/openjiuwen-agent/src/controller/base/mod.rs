@@ -88,6 +88,14 @@ use tracing::{debug, warn};
 /// Key the controller task state is persisted under.
 pub const TASKS_STATE_KEY: &str = "__controller_tasks__";
 
+/// Key a failed turn's terminal state is persisted under.
+///
+/// A turn that ends in an error (a deadline, a failing handler) has no output
+/// to fold into the history, so it records `{"kind", "message"}` here before its
+/// run is closed. A later successful turn leaves the entry in place: it is the
+/// last failure, not a live error flag.
+pub const LAST_ERROR_STATE_KEY: &str = "__controller_last_error__";
+
 /// Host-facing state of a controller's background task scheduler.
 ///
 /// The controller keeps two facts a host would otherwise have to combine: the

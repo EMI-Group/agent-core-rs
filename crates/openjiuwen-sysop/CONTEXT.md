@@ -53,6 +53,9 @@ isolation key is refused with 199010.
   `default_timeout_secs`, `env_policy`, `cross_process_locks`, `lock_timeout_secs`,
   `line_buffered`, `pty_streaming`. Default allowlist = `constants::DEFAULT_SHELL_ALLOWLIST`
   (30 first tokens); `null`/`[]` means allow every command.
+  `max_file_size_bytes` defaults to `constants::DEFAULT_MAX_FILE_SIZE_BYTES` (64 MiB), the
+  ceiling of the whole-file read; `with_max_file_size(Option<u64>)` sets it and
+  `LocalWorkConfig::unrestricted` restores Python's `None` (unlimited).
 - `EnvPolicy { mode: All|None|Allowlist, allow, scrub }`, `BinaryPolicy::{Lossy, Reject}`.
 - `SandboxGatewayConfig { isolation, launcher_config, timeout_seconds, auth_headers,
   auth_query_params, supports_conditional_write }`, `SandboxIsolationConfig`,
@@ -65,7 +68,8 @@ isolation key is refused with 199010.
 
 ### Operation traits — `operation`
 
-`FsOperation` (10 Python methods + `supports_conditional_write`), `FsExtOperation` (Rust
+`FsOperation` (10 Python methods + `supports_conditional_write` + the defaulted Rust addition
+`read_bytes_limited`), `FsExtOperation` (Rust
 additions: `stat`, `exists`, `mkdir`, `delete`, `copy`, `move_path`, `search_files_with`),
 `ShellOperation` (`execute_cmd`, `execute_cmd_stream`, `execute_cmd_background`,
 `execute_argv`), `CodeOperation` (`execute_code`, `execute_code_stream`).
@@ -90,7 +94,8 @@ character for character.
 
 ### Types
 
-`fs::types` — `ReadFileParams/Data`, `ReadChunkData`, `WriteFileParams/Data`,
+`fs::types` — `ReadFileParams/Data`, `ReadBytesParams/Data` (the bounded read),
+`ReadChunkData`, `WriteFileParams/Data`,
 `UploadFileParams/Data`, `DownloadFileParams/Data`, `TransferChunkData`, `ListFilesParams`,
 `ListDirsParams`, `ListFilesData`, `FileSystemItem` (Python `type` field), `SearchFilesParams/Data`,
 `SearchPatternMode`, `FileStat`, `MkdirParams/Data`, `DeleteParams/Data`, `CopyParams/Data`,
@@ -208,6 +213,21 @@ Write:
   (the message names the code point and the encoding).
 - Text content is encoded before the target is opened, so a rejected encoding fails the write
   and leaves the target untouched, creating nothing.
+
+Bounded reads (Rust addition, no Python counterpart):
+- `read_file`/`read_file_stream` load the whole file, so a file above
+  `LocalWorkConfig::max_file_size_bytes` (64 MiB by default, `None` after `unrestricted`) is
+  refused from its metadata, before a byte is allocated, with a 199003 reason
+  `file size <size> exceeds the configured limit <limit> bytes`. The typed source of that reason
+  is `PathPolicy::check_read_size` → `Error::Validation`.
+- `FsOperation::read_bytes_limited(ReadBytesParams { path, offset, max_bytes, only_read }) ->
+  Result<ReadBytesData { path, bytes, total_bytes, truncated }>` seeks to `offset` and reads at
+  most `max_bytes`, so the memory is the window rather than the file; `truncated` says more bytes
+  remained and `total_bytes` is the real length. A window above the ceiling is
+  `Error::Validation` (`requested read window <n> exceeds the configured limit <n> bytes`), a
+  missing/denied path is `Error::SysOp`, a directory is `Error::Validation`, and a backend that
+  does not implement it (the sandbox backend) answers `Error::Unsupported` through the trait's
+  default method. An offset past EOF is an empty, non-truncated window (not an error).
 
 Upload/download: `local_path` is **not** sandbox-checked (host side), `target_path`/
 `source_path` are; existing destinations are rejected unless `overwrite`; parents are created
@@ -409,12 +429,11 @@ Sandbox lifecycle (`sandbox/gateway/gateway.py`, `sandbox/launchers/`):
   `-lc` path normalization are not ported.
 - Shell and code output capture is bounded by `max_output_bytes` (Python captures unbounded);
   timeout and cancellation failures keep partial output in `data`.
-- A *streaming* run loses its timeout and its cancellation once both output pipes reach EOF:
-  `drive_child` (`src/shell/process.rs`) leaves the event loop when the reader channel closes and
-  then awaits `child.wait()` outside any `select!`, so a command that closes stdout/stderr
-  (e.g. `sh -c 'cmd >/dev/null 2>&1'`) runs past `timeout_secs` and cannot be cancelled through
-  `execute_cmd_stream`/`execute_code_stream`; captured runs (`run_captured`) are unaffected
-  because they select on `child.wait()` directly.
+- A *streaming* run keeps its deadline and cancellation even after both output pipes reach EOF:
+  `drive_child` (`src/shell/process.rs`) selects on `child.wait()` alongside the deadline and the
+  cancellation tokens for the whole run, so a command that closes stdout/stderr
+  (`sh -c 'cmd >/dev/null 2>&1'`) still times out, is still cancellable, and gets its whole process
+  group killed; a killed child is reaped within `REAP_GRACE` instead of being awaited unbounded.
 - Dropping a stream before it ends does not kill the child's process group: `ProcessGroup` has no
   `Drop`, `Child::kill_on_drop` signals only the direct child, and the reader tasks spawned by
   `stream_child`/`stream_pty_child` are never aborted, so a shell's descendants and their pipe
@@ -450,6 +469,11 @@ Sandbox lifecycle (`sandbox/gateway/gateway.py`, `sandbox/launchers/`):
   encoding, known byte fixtures, unknown and unrepresentable failures), `file_locks.rs` (10:
   contention, timeout, and a genuine second-process proof by re-executing the test binary),
   `process_group.rs` (5: timeout/cancel/background-stop leave no grandchild),
+  `stream_interrupts.rs` (3: a timeout and a cancellation both reach a child that closed its
+  own pipes, and a 20 000-byte single line is captured within the output budget),
+  `bounded_read.rs` (10: the default whole-file ceiling and its typed `Validation` gate, the
+  `unrestricted` opt-out, bounded windows with offset/EOF/zero-window shapes, a window above
+  the ceiling, and typed path/directory/lock failures),
   `pty_streaming.rs` (5: terminal detection, line-buffered chunks, exit codes),
   `sandbox_lifecycle.rs` (27: registry, reuse/resume/release/idle-stop, isolation keys, config
   hash/metadata, `aio`/`jiuwenbox`/`yuanrong` interop with local registries),
@@ -466,8 +490,8 @@ Sandbox lifecycle (`sandbox/gateway/gateway.py`, `sandbox/launchers/`):
 - Gates: `cargo fmt -p openjiuwen-sysop`, `cargo test -p openjiuwen-sysop`,
   `cargo test -p openjiuwen-sysop --features sandbox`,
   `cargo clippy -p openjiuwen-sysop --all-targets -- -D warnings` (both feature sets).
-- Current counts: 343 unit tests (355 with `sandbox`, 1 `#[ignore]`d live probe), 173
-  integration tests across 13 files (192 across 15 with `sandbox`), 35 doc tests.
+- Current counts: 343 unit tests (355 with `sandbox`, 1 `#[ignore]`d live probe), 186
+  integration tests across 15 files (205 across 17 with `sandbox`), 35 doc tests.
 
 ## Routing Table
 
