@@ -102,7 +102,7 @@ mod tests {
     use crate::controller::base::Controller;
     use crate::controller::config::ControllerConfig;
     use crate::controller::intent::{IntentRule, RuleIntentRecognizer};
-    use crate::controller::schema::{IntentType, TaskStatus};
+    use crate::controller::schema::{IntentType, Task, TaskStatus};
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
@@ -163,16 +163,44 @@ mod tests {
         )
         .await
         .unwrap();
+        // The turn's task already completed, so the control intent is refused:
+        // a terminal task has nothing left to pause or cancel.
         let task_id = controller.tasks().await[0].task_id.clone();
-        let paused = control_turn(&controller, &session, &task_id, "pause it").await;
-        assert_eq!(paused.status, TaskStatus::Paused);
-        assert_eq!(controller.tasks().await[0].status, TaskStatus::Paused);
-        let canceled = control_turn(&controller, &session, &task_id, "cancel it").await;
-        assert_eq!(canceled.status, TaskStatus::Canceled);
-        assert_eq!(controller.tasks().await[0].status, TaskStatus::Canceled);
-        let missing = control_turn(&controller, &session, "nope", "pause it").await;
-        assert_eq!(missing.status, TaskStatus::Failed);
-        assert!(missing.output.contains("not found"));
+        let refused = control_turn(&controller, &session, &task_id, "pause it").await;
+        assert_eq!(refused.status, TaskStatus::Failed);
+        assert!(refused.output.contains("not found"));
+        assert_eq!(controller.tasks().await[0].status, TaskStatus::Completed);
+        // Without a started scheduler the same controls are manager-only status
+        // flips (a fresh controller never ran a turn), and the status survives
+        // the session snapshot.
+        let manual = BaseController::new(AgentCard::new("ctrl"), ControllerConfig::new());
+        manual
+            .task_manager()
+            .add_task(Task::new("s1", "manual", "agent"))
+            .unwrap();
+        assert!(manual.pause_task("manual").await);
+        assert_eq!(manual.tasks().await[0].status, TaskStatus::Paused);
+        // A paused task is out of the manager-only cancel's reach (neither
+        // submitted nor running); a submitted one is cancelled outright.
+        assert!(!manual.cancel_task("manual").await);
+        manual
+            .task_manager()
+            .add_task(Task::new("s1", "manual-cancel", "agent"))
+            .unwrap();
+        assert!(manual.cancel_task("manual-cancel").await);
+        assert!(!manual.pause_task("missing").await);
+        manual.save_state(session.as_ref()).await.unwrap();
+        let restored = BaseController::new(AgentCard::new("ctrl"), ControllerConfig::new());
+        restored.load_state(session.as_ref()).await.unwrap();
+        let status = |id: &str| {
+            restored
+                .task_manager()
+                .task(id)
+                .expect("the restored store holds it")
+                .status
+        };
+        assert_eq!(status("manual"), TaskStatus::Paused);
+        assert_eq!(status("manual-cancel"), TaskStatus::Canceled);
     }
 
     #[tokio::test]
