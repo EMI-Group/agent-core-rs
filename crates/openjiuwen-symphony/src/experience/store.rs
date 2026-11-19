@@ -240,17 +240,39 @@ impl JsonFileExperienceStore {
     }
 }
 
-/// Atomically replaces `path` with `bytes` through a `<path>.tmp` sibling and a rename.
+/// Atomically replaces `path` with `bytes` through a unique temp sibling and a rename.
 ///
 /// Missing parent directories are created first, so a backend can publish into a fresh
-/// directory. A reader therefore observes either the previous document or the complete new
-/// one, never a partial write.
+/// directory. The temp file is flushed to stable storage and the containing directory is
+/// synced after the rename, so a crash leaves either the previous document or the complete
+/// new one, never a partial write. The temp name carries the process id and a process-wide
+/// counter, so two writers publishing the same path never share a scratch file.
 ///
 /// # Errors
 ///
 /// Returns [`Error::External`] when a directory cannot be created, the temporary file
-/// cannot be written, or the rename fails.
+/// cannot be written or synced, or the rename fails.
 pub(crate) async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temporary = write_temporary(path, bytes).await?;
+    publish_temporary(&temporary, path).await?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent).await?;
+    }
+    Ok(())
+}
+
+/// Writes `bytes` to a unique temp sibling of `path`, syncing the file, and returns it.
+///
+/// This is the first half of an atomic replacement: a caller that publishes several files
+/// writes every temp first (so a failure leaves the previous snapshot untouched) and then
+/// renames them with [`publish_temporary`].
+///
+/// # Errors
+///
+/// Returns [`Error::External`] when the parent directory cannot be created or the file
+/// cannot be written or synced.
+pub(crate) async fn write_temporary(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    use tokio::io::AsyncWriteExt;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             tokio::fs::create_dir_all(parent)
@@ -259,12 +281,61 @@ pub(crate) async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         }
     }
     let temporary = temporary_path(path);
-    tokio::fs::write(&temporary, bytes)
+    let mut file = tokio::fs::File::create(&temporary)
         .await
-        .map_err(Error::external)?;
-    tokio::fs::rename(&temporary, path)
+        .map_err(|error| external_path("creating", &temporary, error))?;
+    file.write_all(bytes)
         .await
-        .map_err(Error::external)
+        .map_err(|error| external_path("writing", &temporary, error))?;
+    // Flush the data before the rename makes it reachable, so a crash cannot publish a file
+    // whose contents are still in the page cache.
+    file.sync_all()
+        .await
+        .map_err(|error| external_path("syncing", &temporary, error))?;
+    Ok(temporary)
+}
+
+/// Renames a temp sibling written by [`write_temporary`] over its destination.
+///
+/// # Errors
+///
+/// Returns [`Error::External`] when the rename fails; the destination keeps its previous
+/// contents in that case.
+pub(crate) async fn publish_temporary(temporary: &Path, path: &Path) -> Result<()> {
+    tokio::fs::rename(temporary, path)
+        .await
+        .map_err(|error| external_path("publishing", path, error))
+}
+
+/// Syncs `dir` to stable storage, so a completed rename survives a crash.
+///
+/// Directories can only be opened and synced on Unix; elsewhere this is a no-op (the rename
+/// itself is still atomic).
+///
+/// # Errors
+///
+/// Returns [`Error::External`] when the directory cannot be opened or synced.
+pub(crate) async fn sync_directory(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        match tokio::fs::File::open(dir).await {
+            Ok(handle) => handle
+                .sync_all()
+                .await
+                .map_err(|error| external_path("syncing", dir, error)),
+            Err(error) => Err(external_path("opening", dir, error)),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// Wraps `error` as an [`Error::External`] naming `path` and the failed operation.
+fn external_path(action: &str, path: &Path, error: std::io::Error) -> Error {
+    Error::external(error).with_context(format!("{action} `{}`", path.display()))
 }
 
 #[async_trait]
@@ -395,10 +466,15 @@ impl ExperienceStore for SqliteExperienceStore {
     }
 }
 
-/// The `<file>.tmp` sibling used for the atomic document swap.
+/// A unique temp sibling of `path` (`<path>.<pid>.<counter>.tmp`).
+///
+/// The process id and a process-wide counter make two concurrent writers — in this process
+/// or another one — use different scratch files, so neither can publish the other's bytes.
 pub(crate) fn temporary_path(path: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut name = path.as_os_str().to_os_string();
-    name.push(".tmp");
+    name.push(format!(".{}.{sequence}.tmp", std::process::id()));
     PathBuf::from(name)
 }
 

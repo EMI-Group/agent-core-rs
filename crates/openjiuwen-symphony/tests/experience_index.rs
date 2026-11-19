@@ -1044,3 +1044,27 @@ async fn a_failed_persist_leaves_the_catalog_unchanged() {
     assert_eq!(index.count(), 1);
     assert_eq!(index_ids(&index), vec!["exp_0001"]);
 }
+
+#[tokio::test]
+async fn concurrent_adds_both_survive_a_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let index = ExperienceIndex::open(dir.path(), Arc::new(KeywordEmbedding))
+        .await
+        .expect("open");
+    // Two publishes overlap at their await points; the per-directory lock serialises them,
+    // so neither snapshot can lose the other's item.
+    let (first, second) = tokio::join!(
+        index.add(item("Summarize the report", &["summarizer"])),
+        index.add(item("Deploy the service", &["deployer"])),
+    );
+    assert!(first.is_ok(), "{:?}", first.err());
+    assert!(second.is_ok(), "{:?}", second.err());
+    assert_eq!(index.count(), 2);
+
+    let reopened = ExperienceIndex::open(dir.path(), Arc::new(KeywordEmbedding))
+        .await
+        .expect("reopen");
+    assert_eq!(reopened.count(), 2);
+    assert_eq!(index_ids(&reopened), index_ids(&index));
+    assert_eq!(reopened.meta().vector_count, 2);
+}

@@ -278,6 +278,76 @@ impl CoarseIndex {
         &self.lists
     }
 
+    /// Assigns every stored id to a list without retraining the centroids.
+    ///
+    /// An id the quantiser already knows keeps its stored list; a new id is placed in the
+    /// list of its nearest centroid (the nearest-point rule [`Self::build`] uses, ties broken
+    /// by list index). This is what lets a new item join an existing IVF index instead of
+    /// rebuilding the whole quantiser: the geometry is unchanged, only the inverted lists
+    /// grow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`](crate::error::Error::Validation) when the quantiser has
+    /// no coarse lists, the inputs are misaligned, a row is not [`Self::dimension`] long, or
+    /// an id the quantiser knows is absent from `ids` (a removed item needs a rebuild, not a
+    /// patched list).
+    pub(crate) fn assign_all(&self, ids: &[String], vectors: &[Vec<f32>]) -> Result<Self> {
+        if self.nlist == 0 {
+            return Err(validation(
+                "ivf",
+                "the coarse quantiser has no lists to assign the vectors to",
+            ));
+        }
+        if ids.len() != vectors.len() {
+            return Err(validation(
+                "ivf",
+                format!(
+                    "{} ids do not match the {} vectors",
+                    ids.len(),
+                    vectors.len()
+                ),
+            ));
+        }
+        if let Some((id, row)) = ids
+            .iter()
+            .zip(vectors)
+            .find(|(_, row)| row.len() != self.dimension)
+        {
+            return Err(validation(
+                "ivf",
+                format!(
+                    "the vector of `{id}` has {} components but the index dimension is {}",
+                    row.len(),
+                    self.dimension
+                ),
+            ));
+        }
+        if let Some(missing) = self.ids.iter().find(|id| ids.binary_search(id).is_err()) {
+            return Err(validation(
+                "ivf",
+                format!(
+                    "the coarse quantiser knows `{missing}`, which is no longer stored; the \
+                     index has to be rebuilt"
+                ),
+            ));
+        }
+        let mut lists = Vec::with_capacity(ids.len());
+        for (id, row) in ids.iter().zip(vectors) {
+            lists.push(match self.ids.binary_search(id) {
+                Ok(position) => self.lists[position],
+                Err(_) => nearest_centroid(&normalize(row), &self.centroids),
+            });
+        }
+        Self::from_parts(
+            self.dimension,
+            self.nlist,
+            ids.to_vec(),
+            self.centroids.clone(),
+            lists,
+        )
+    }
+
     /// The ids of the `nprobe` lists nearest to `query`, in probe then id order.
     ///
     /// The query is L2-normalised first, so the inner product against a normalised centroid
@@ -426,20 +496,25 @@ fn assign(points: &[Vec<f32>], centroids: &[Vec<f32>]) -> Vec<usize> {
     assignment
 }
 
+/// The nearest centroid of one (already normalised) point, ties broken by list index.
+fn nearest_centroid(point: &[f32], centroids: &[Vec<f32>]) -> usize {
+    let mut best = 0;
+    let mut best_distance = f64::INFINITY;
+    for (index, centroid) in centroids.iter().enumerate() {
+        let distance = squared_distance(point, centroid);
+        // Strictly closer wins, so an exact tie keeps the lower list index.
+        if distance < best_distance {
+            best = index;
+            best_distance = distance;
+        }
+    }
+    best
+}
+
 /// Fills `assignment` with the nearest centroid of every point.
 fn assign_into(points: &[Vec<f32>], centroids: &[Vec<f32>], assignment: &mut [usize]) {
     for (position, point) in points.iter().enumerate() {
-        let mut best = 0;
-        let mut best_distance = f64::INFINITY;
-        for (index, centroid) in centroids.iter().enumerate() {
-            let distance = squared_distance(point, centroid);
-            // Strictly closer wins, so an exact tie keeps the lower list index.
-            if distance < best_distance {
-                best = index;
-                best_distance = distance;
-            }
-        }
-        assignment[position] = best;
+        assignment[position] = nearest_centroid(point, centroids);
     }
 }
 
