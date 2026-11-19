@@ -96,7 +96,8 @@ pub trait SpecBuild {
 /// One built, live team: the leader handle, its roster and its seams.
 ///
 /// Every accessor is a cheap read over an [`Arc`]; the only mutable state is the started flag, the
-/// cancellation token of the current run, the chunk fan-out and the single-consumer bus receiver.
+/// cancellation token of the current run, the chunk fan-out and the single-consumer bus receiver,
+/// which is leased to one run at a time and returned when that run ends.
 pub struct TeamAgent {
     /// All team state; cloned by value, shared by pointer.
     inner: Arc<TeamAgentInner>,
@@ -191,7 +192,7 @@ pub(crate) struct TeamAgentInner {
     pub(crate) cancel: Mutex<CancellationToken>,
     /// Fan-out of this handle's runtime chunks to [`TeamAgent::subscribe_chunks`] callers.
     pub(crate) chunk_sinks: Arc<Mutex<Vec<UnboundedSender<Value>>>>,
-    /// Single-consumer bus receiver, taken once by [`super::leader::run`].
+    /// Single-consumer bus receiver, leased by one run at a time and returned when it ends.
     pub(crate) events: Mutex<Option<UnboundedReceiver<EventMessage>>>,
     /// Queued steering messages the leader takes per model call.
     pub(crate) steer_batch_size: usize,
@@ -398,12 +399,19 @@ impl TeamAgent {
         self.inner.cancel.lock().clone()
     }
 
-    /// Takes the bus receiver of the leader.
+    /// Takes the bus receiver of the leader for one run.
     ///
-    /// One receiver serves one run: a second concurrent run gets `None` and simply observes no bus
-    /// events, which is why one run per team is supported (documented in `src/runtime/CONTEXT.md`).
-    pub(crate) fn take_events(&self) -> Option<UnboundedReceiver<EventMessage>> {
-        self.inner.events.lock().take()
+    /// The receiver is a single-consumer value, so it is *leased* rather than consumed: it leaves
+    /// the handle for the duration of the run and goes back when the returned `EventsLease`
+    /// drops, which means every later run gets a live receiver again.
+    /// A second *concurrent* run still gets `None` and simply observes no bus events, which is why
+    /// one run at a time per team is supported (documented in `src/runtime/CONTEXT.md`).
+    pub(crate) fn take_events(&self) -> Option<EventsLease> {
+        let receiver = self.inner.events.lock().take()?;
+        Some(EventsLease {
+            agent: self.clone(),
+            receiver: Some(receiver),
+        })
     }
 
     /// Returns the description of the team: `team_desc`, else the leader's default blurb.
@@ -413,5 +421,54 @@ impl TeamAgent {
             .team_desc
             .clone()
             .unwrap_or_else(|| self.inner.blueprint.leader.desc_or_default().to_owned())
+    }
+}
+
+/// One run's exclusive lease on the leader's bus receiver.
+///
+/// The receiver is removed from [`TeamAgentInner::events`] while the lease is alive and put back
+/// when it drops, so a *sequential* second run gets a live receiver again instead of a receiver
+/// whose sender was dropped at the end of the first run.
+/// Holding the handle clone keeps the restore target alive for the lifetime of the lease.
+/// `Drop` takes the short `parking_lot` guard and never awaits, so it is safe on every exit path
+/// of the run loop, including a panic and an early `?`.
+pub(crate) struct EventsLease {
+    /// Handle the receiver goes back to when the lease ends.
+    agent: TeamAgent,
+    /// The receiver while this lease owns it; `None` only inside `drop`.
+    receiver: Option<UnboundedReceiver<EventMessage>>,
+}
+
+impl EventsLease {
+    /// Waits for the next bus event of this run; `None` once every sender is gone.
+    ///
+    /// Cancel-safe in the same sense as [`UnboundedReceiver::recv`]: nothing is consumed when the
+    /// future is dropped.
+    pub(crate) async fn recv(&mut self) -> Option<EventMessage> {
+        match self.receiver.as_mut() {
+            Some(receiver) => receiver.recv().await,
+            None => None,
+        }
+    }
+
+    /// Returns the receiver to the handle so the next run can lease it again.
+    ///
+    /// Events that arrived while this lease was out stay queued in the restored receiver, so a
+    /// later run still sees the mail and board activity that happened between two runs.
+    fn restore(&mut self) {
+        let Some(receiver) = self.receiver.take() else {
+            return;
+        };
+        let mut slot = self.agent.inner.events.lock();
+        if slot.is_none() {
+            *slot = Some(receiver);
+        }
+    }
+}
+
+impl Drop for EventsLease {
+    /// Returns the receiver to the handle, so a later run is not blind.
+    fn drop(&mut self) {
+        self.restore();
     }
 }

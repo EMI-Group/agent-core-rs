@@ -24,7 +24,8 @@
 //!    (the turn seam) and on the spawner (the teammate toolkits), and mounts the leader's own
 //!    `MemberMemoryToolkit` on its harness context. A resolution failure fails the build.
 //! 6. One `unstarted` row per roster teammate, so `snapshot()` answers before the first spawn.
-//! 7. One bus subscription for the leader (drained only by [`leader`]) and the interaction
+//! 7. One bus subscription for the leader (its receiver is leased by every [`leader`] run and
+//!    returned to the handle when that run ends, so a second run is not blind) and the interaction
 //!    gate/inbox.
 //!
 //! The build always produces the *leader* handle: a teammate is not a second public constructor but
@@ -261,11 +262,21 @@ impl SpecBuild for TeamAgentSpec {
         backend.add_member(Arc::clone(&leader_member));
         insert_teammate_rows(&store, &backend, &spawner, &routing, &leader_name).await?;
         let (tx, rx) = mpsc::unbounded_channel();
+        let sink_team = team_name.clone();
         messager.subscribe(
             &leader_name,
             &[TeamTopic::Team, TeamTopic::Task, TeamTopic::Message],
             Arc::new(move |event| {
-                let _ = tx.send(event);
+                // The receiver lives on the handle between runs, so a closed channel only means the
+                // handle itself is gone (or a run panicked while holding the lease). Never silent:
+                // a blind leader is exactly the state this subscription exists to prevent.
+                if let Err(error) = tx.send(event) {
+                    warn!(
+                        team = %sink_team,
+                        event_type = %error.0.event_type,
+                        "dropped a leader bus event: the team handle no longer holds a receiver"
+                    );
+                }
             }),
         )?;
         let gate = Arc::new(InteractGate::new());

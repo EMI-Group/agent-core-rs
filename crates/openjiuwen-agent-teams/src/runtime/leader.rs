@@ -24,8 +24,11 @@
 //!   -> AgentOutput::answer(answer)
 //! ```
 //!
-//! One run per team is supported: the bus receiver is a single-consumer value
-//! (`TeamAgent::take_events`), so a second concurrent run sees chunks and the settle tick only.
+//! One run at a time per team is supported: the bus receiver is a single-consumer value
+//! (`team_agent::EventsLease`), so a second *concurrent* run sees chunks and the settle tick only.
+//! The receiver is leased per run and returned to the handle when the run ends, so a second
+//! *sequential* run on the same team gets a live receiver — and with it the mail and board events
+//! published between the two runs.
 use std::time::Duration;
 
 use openjiuwen_agent::{AgentChunk, AgentOutput};
@@ -34,7 +37,7 @@ use openjiuwen_harness_protocol::HarnessState;
 use openjiuwen_session::Session;
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::{self, MissedTickBehavior};
 use tracing::{debug, warn};
 
@@ -71,6 +74,29 @@ enum RunExit {
     Settled,
     /// The caller cancelled the run.
     Cancelled,
+}
+
+/// Where the run loop takes bus events from.
+///
+/// The lane is leased from the handle for the length of one run and handed back when the run ends,
+/// so a later sequential run gets a live receiver instead of a dead one.
+/// A second concurrent run finds the receiver already leased and gets a detached channel that never
+/// fires, which keeps the `select!` arms identical.
+enum BusFeed {
+    /// This run holds the handle's receiver.
+    Leased(super::team_agent::EventsLease),
+    /// The receiver belongs to a concurrent run; nothing is delivered here.
+    Detached(UnboundedReceiver<EventMessage>),
+}
+
+impl BusFeed {
+    /// Waits for the next event, or `None` when this lane carries no events.
+    async fn recv(&mut self) -> Option<EventMessage> {
+        match self {
+            Self::Leased(lease) => lease.recv().await,
+            Self::Detached(receiver) => receiver.recv().await,
+        }
+    }
 }
 
 /// Runs one team request to completion and returns the leader's answer.
@@ -139,13 +165,13 @@ pub(crate) async fn run(
         }
     }
 
-    let (events_keeper, mut events) = if let Some(receiver) = agent.take_events() {
-        (None, receiver)
+    let (events_keeper, mut events) = if let Some(lease) = agent.take_events() {
+        (None, BusFeed::Leased(lease))
     } else {
         // No bus receiver left (a second concurrent run): hold a live sender so the branch
         // never fires spuriously, and drain chunks/tick/cancellation only.
         let (tx, rx) = mpsc::unbounded_channel();
-        (Some(tx), rx)
+        (Some(tx), BusFeed::Detached(rx))
     };
     let cancel = agent.cancellation_token();
     let mut ticker = time::interval(SETTLE_POLL_INTERVAL);
@@ -209,6 +235,8 @@ pub(crate) async fn run(
     };
 
     drop(events_keeper);
+    // The lease ends here, so the receiver is back on the handle and a later run leases it again.
+    drop(events);
     if flush(&agent, &mut batch).await {
         acknowledge_org(&agent, &mut org_acks).await;
     }
@@ -632,6 +660,77 @@ mod tests {
         assert!(
             !line.contains("all hands"),
             "the rendered broadcast is not repeated: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_sequential_run_still_receives_bus_events() {
+        let (agent, factory, _workspace) = built(&blueprint("alpha", "boss", &["dev-1"])).await;
+        let first = agent.invoke(json!("hello"), None).await.unwrap();
+        assert_eq!(first.output, "done: boss");
+
+        // Traffic published between the two runs: one mailbox broadcast and one settled task.
+        agent
+            .backend()
+            .send_message("dev-1", None, "all hands")
+            .await
+            .unwrap();
+        let record = agent
+            .create_task(TaskGraphSpec {
+                title: "ship it".to_owned(),
+                content: "do the thing".to_owned(),
+                ..TaskGraphSpec::default()
+            })
+            .await
+            .unwrap();
+        let mutation = agent.backend().tasks().cancel(&record.task_id).await.unwrap();
+        agent.backend().publish_mutation(&mutation).await.unwrap();
+
+        let second = time::timeout(BOUND, agent.invoke(json!("again"), None))
+            .await
+            .expect("the second run must not hang on a dead bus receiver")
+            .unwrap();
+        // The scripted harness answers every `send`, including the steering batches, so the run's
+        // answer accumulates one scripted reply per turn; the assertion is that the run produced
+        // answers at all instead of settling blind.
+        assert_eq!(second.output, "done: boss".repeat(3), "{:?}", second.output);
+
+        let sends = factory.harness("boss").unwrap().sends();
+        assert!(sends.iter().any(|send| send == "again"), "{sends:?}");
+        assert!(
+            sends
+                .iter()
+                .any(|send| send.contains("dev-1 -> all: all hands")),
+            "the second run steers on mail it received: {sends:?}"
+        );
+        assert!(
+            sends
+                .iter()
+                .any(|send| send.contains(&record.task_id) && send.contains("cancelled")),
+            "the second run steers on board events: {sends:?}"
+        );
+        assert!(agent.is_started(), "the team stays live between runs");
+    }
+
+    #[tokio::test]
+    async fn a_second_sequential_run_still_receives_mailbox_events() {
+        let (agent, factory, _workspace) = built(&blueprint("alpha", "boss", &["dev-1"])).await;
+        agent.invoke(json!("hello"), None).await.unwrap();
+        agent
+            .backend()
+            .send_message("dev-1", Some("boss"), "status again?")
+            .await
+            .unwrap();
+        let output = time::timeout(BOUND, agent.invoke(json!("hello"), None))
+            .await
+            .expect("the second run must not hang")
+            .unwrap();
+        // One scripted answer for the query and one for the flushed steering batch.
+        assert_eq!(output.output, "done: boss".repeat(2), "{:?}", output.output);
+        let sends = factory.harness("boss").unwrap().sends();
+        assert!(
+            sends.iter().any(|send| send.contains("status again?")),
+            "{sends:?}"
         );
     }
 
