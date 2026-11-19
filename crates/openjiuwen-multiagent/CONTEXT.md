@@ -508,6 +508,12 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - No round-robin/selector/scheduled strategies exist in Python's `core.multi_agent`; custom strategies plug in through `TeamStrategy`.
 - `P2PAbilityManager` subclassing — replaced by a shared-semaphore dispatcher with an injectable `AbilityExecutor`.
 
+## Known Issues
+
+- `TeamRuntime::subscribe`/`unsubscribe` (`src/runtime.rs`) and card-driven auto-subscription (`src/autosubscribe.rs`, `src/team.rs`) write through `self.bus`, while `publish`/`list_subscriptions` go through `self.transport()`; with a `RedisTransport` installed the transport's own registry is never populated, so `Team::subscribe` has no effect and `publish` silently fans out to nobody.
+- `MessageBus::send`/`publish` await a bounded per-topic channel *before* their deadline is applied (`src/message_bus.rs`), so a full FIFO can block a call past its `timeout`/`process_timeout` with no bound.
+- `MemberCheckpointer::restore` (`src/member_checkpoint.rs`) lists every checkpoint of the team session and restores before every member invocation, and each save appends a new checkpoint, so the per-message cost grows with the number of prior invocations.
+
 ## Notes for Agents
 
 - `team_id` is `card.name`; topics, sessions, and registries key on `card.id` (Python parity — keep both).
