@@ -11,6 +11,12 @@
 //! generator fed by a background pump task; Rust exposes the same single-consumer contract as a
 //! boxed [`futures::Stream`].
 //!
+//! The channel between the pump and that single consumer is **bounded**
+//! ([`DEFAULT_CHUNK_BUFFER_CAPACITY`] chunks unless
+//! [`HarnessIOAdapterConfig::chunk_buffer_capacity`] overrides it): a stream nobody consumes, or a
+//! consumer slower than the harness, drops and counts the overflowing chunks
+//! ([`HarnessIOAdapter::dropped_chunks`]) instead of growing memory without limit.
+//!
 //! # Structure
 //!
 //! - this module — the adapter, its configuration, the two host-service traits, lifecycle,
@@ -33,7 +39,7 @@ mod interactions;
 mod projection;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
@@ -81,6 +87,13 @@ pub trait ProviderInteractionHandler: Send + Sync {
     ) -> HarnessResult<ProviderInteractionResponse>;
 }
 
+/// Capacity of the adapter's chunk channel when
+/// [`HarnessIOAdapterConfig::chunk_buffer_capacity`] is zero (1024 chunks).
+///
+/// The chunk channel is bounded on purpose: an adapter whose stream is never consumed (or is
+/// consumed far slower than the harness produces) must not grow memory without limit.
+pub const DEFAULT_CHUNK_BUFFER_CAPACITY: usize = 1024;
+
 /// Configuration of a [`HarnessIOAdapter`].
 ///
 /// The defaults match Python's adapter: no observer, no turn-lifecycle or turn-failure chunks,
@@ -102,6 +115,12 @@ pub struct HarnessIOAdapterConfig {
     pub stop_on_unsupported_force_abort: bool,
     /// Handler answering provider-specific interaction requests, when one is configured.
     pub provider_interaction_handler: Option<Arc<dyn ProviderInteractionHandler>>,
+    /// Capacity of the bounded chunk channel; `0` selects [`DEFAULT_CHUNK_BUFFER_CAPACITY`].
+    ///
+    /// Overflow never blocks the harness: the chunk that would exceed the capacity is dropped and
+    /// counted (see [`HarnessIOAdapter::dropped_chunks`]), so a consumer that stalls or never
+    /// attaches degrades the tail instead of growing memory.
+    pub chunk_buffer_capacity: usize,
 }
 
 impl Default for HarnessIOAdapterConfig {
@@ -113,6 +132,7 @@ impl Default for HarnessIOAdapterConfig {
             auto_approve_tools: true,
             stop_on_unsupported_force_abort: false,
             provider_interaction_handler: None,
+            chunk_buffer_capacity: DEFAULT_CHUNK_BUFFER_CAPACITY,
         }
     }
 }
@@ -153,9 +173,13 @@ pub struct HarnessIOAdapter {
     /// Whether [`outputs`](Self::outputs) already took the receiver.
     outputs_taken: AtomicBool,
     /// Chunk producer side, cloned into the event pump.
-    event_tx: mpsc::UnboundedSender<AgentChunk>,
+    event_tx: mpsc::Sender<AgentChunk>,
     /// Chunk consumer side, handed out once by [`outputs`](Self::outputs).
-    event_rx: Mutex<Option<mpsc::UnboundedReceiver<AgentChunk>>>,
+    event_rx: Mutex<Option<mpsc::Receiver<AgentChunk>>>,
+    /// Number of chunks dropped because the bounded channel was full.
+    dropped_chunks: AtomicU64,
+    /// Whether the current overflow episode was already reported.
+    overflow_warned: AtomicBool,
     /// The event-pump task of the current cycle.
     pump: Mutex<Option<JoinHandle<()>>>,
     /// Monotonic chunk index for the adapter lifetime.
@@ -173,7 +197,12 @@ impl HarnessIOAdapter {
     /// [`start`](Self::start).
     #[must_use]
     pub fn new(harness: DynHarness, config: HarnessIOAdapterConfig) -> Arc<Self> {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let capacity = if config.chunk_buffer_capacity == 0 {
+            DEFAULT_CHUNK_BUFFER_CAPACITY
+        } else {
+            config.chunk_buffer_capacity
+        };
+        let (event_tx, event_rx) = mpsc::channel(capacity);
         Arc::new(Self {
             harness,
             config,
@@ -182,11 +211,26 @@ impl HarnessIOAdapter {
             outputs_taken: AtomicBool::new(false),
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
+            dropped_chunks: AtomicU64::new(0),
+            overflow_warned: AtomicBool::new(false),
             pump: Mutex::new(None),
             next_index: AtomicI64::new(0),
             pending: Mutex::new(HashMap::new()),
             tool_gateway: Mutex::new(None),
         })
+    }
+
+    /// Returns how many chunks were dropped because the bounded chunk channel was full.
+    ///
+    /// The channel holds at most [`chunk_buffer_capacity`](HarnessIOAdapterConfig::chunk_buffer_capacity)
+    /// chunks (1024 by default). When no consumer is attached, or one consumes slower than the
+    /// harness produces, the pump never blocks: it drops the chunk that would overflow, counts it
+    /// here and logs the first drop of each overflow episode at `warn`. A consumer therefore sees a
+    /// contiguous prefix of the chunk stream followed by the newest chunks once it catches up; the
+    /// counter makes the loss explicit instead of silent.
+    #[must_use]
+    pub fn dropped_chunks(&self) -> u64 {
+        self.dropped_chunks.load(Ordering::SeqCst)
     }
 
     /// Returns the wrapped harness.
@@ -305,7 +349,6 @@ impl HarnessIOAdapter {
         let projector = Projector::new(&self.config, self.harness.card().name.clone());
         let observer = self.config.event_observer.clone();
         let adapter = Arc::downgrade(self);
-        let event_tx = self.event_tx.clone();
         let handle = tokio::spawn(async move {
             loop {
                 match cursor.next_event().await {
@@ -318,7 +361,7 @@ impl HarnessIOAdapter {
                         };
                         let chunk = projector.project(&event, || adapter.next_chunk_index());
                         if let Some(chunk) = chunk {
-                            let _ = event_tx.send(chunk);
+                            adapter.offer_chunk(chunk);
                         }
                     }
                     Ok(None) => break,
@@ -357,6 +400,11 @@ impl HarnessIOAdapter {
     }
 
     /// Takes the single stream of projected chunks.
+    ///
+    /// The stream is fed by a bounded channel, so the adapter never buffers more than
+    /// [`chunk_buffer_capacity`](HarnessIOAdapterConfig::chunk_buffer_capacity) chunks while it is
+    /// not consumed; chunks produced beyond that are dropped and counted in
+    /// [`dropped_chunks`](Self::dropped_chunks).
     ///
     /// # Errors
     ///
@@ -494,6 +542,33 @@ impl HarnessIOAdapter {
             )));
         }
         self.harness.resume(query).await
+    }
+
+    /// Hands `chunk` to the bounded chunk channel without ever blocking the pump.
+    ///
+    /// A full channel drops the newest chunk, counts it and logs the first drop of the episode; a
+    /// closed channel (the consumer dropped the stream) discards the chunk silently, exactly like
+    /// the previous unbounded channel did.
+    fn offer_chunk(&self, chunk: AgentChunk) {
+        match self.event_tx.try_send(chunk) {
+            Ok(()) => self.overflow_warned.store(false, Ordering::SeqCst),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let dropped = self.dropped_chunks.fetch_add(1, Ordering::SeqCst) + 1;
+                if !self.overflow_warned.swap(true, Ordering::SeqCst) {
+                    let capacity = if self.config.chunk_buffer_capacity == 0 {
+                        DEFAULT_CHUNK_BUFFER_CAPACITY
+                    } else {
+                        self.config.chunk_buffer_capacity
+                    };
+                    tracing::warn!(
+                        capacity,
+                        dropped,
+                        "the harness IO adapter chunk buffer is full; dropping chunks"
+                    );
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
     }
 
     /// Returns the next chunk index for this adapter.

@@ -95,6 +95,7 @@ use uuid::Uuid;
 
 use crate::input::harness_input_text;
 use crate::skills::install_for_provider;
+use crate::vendor_cli::child::DEFAULT_MAX_LINE_BYTES;
 use crate::vendor_cli::{
     checkpoint_str, derive_session_id, failed_turn, interrupted_turn, resolve_resume_id,
     ChildProcess, ChildProcessConfig, PermissionPolicy, TurnContext, TurnRequest, VendorDriver,
@@ -570,12 +571,15 @@ impl VendorDriver for ClaudeDriver {
         );
         let provider_session_id = resume.unwrap_or_else(|| session_id.clone());
         let env = build_env(&self.config, context);
+        // `max_buffer_size` is the per-line stdout ceiling. A `u64` that does not fit `usize` (only
+        // possible on a 32-bit target) falls back to the transport's documented 32 MiB default
+        // instead of disabling the ceiling.
         let max_line_bytes = usize::try_from(
             self.config
                 .max_buffer_size
                 .unwrap_or(DEFAULT_CLAUDE_MAX_BUFFER_SIZE),
         )
-        .unwrap_or(usize::MAX);
+        .unwrap_or(DEFAULT_MAX_LINE_BYTES);
         {
             let mut state = lock(&self.state);
             state.session_id = Some(provider_session_id.clone());

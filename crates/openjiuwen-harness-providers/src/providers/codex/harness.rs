@@ -132,6 +132,13 @@ const CLIENT_VERSION: &str = "1";
 /// Upper bound of one `turn/interrupt` request.
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound of one handshake request (`initialize`, `thread/start`, `thread/resume`).
+///
+/// An app-server that spawns but never answers would otherwise hang `open` forever; the vendor
+/// harness shell bounds the whole `open` too, but this turns the common case into a precise
+/// per-request protocol error naming the method.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Session facts learned at `open`.
 #[derive(Default)]
 pub(super) struct DriverState {
@@ -257,13 +264,14 @@ impl CodexDriver {
         resume: Option<&str>,
     ) -> HarnessResult<String> {
         client
-            .request(
+            .request_with_timeout(
                 "initialize",
                 json!({"clientInfo": {
                     "name": CLIENT_NAME,
                     "title": self.config.client_title,
                     "version": CLIENT_VERSION,
                 }}),
+                HANDSHAKE_TIMEOUT,
             )
             .await?;
         client.notify("initialized", json!({})).await?;
@@ -273,7 +281,9 @@ impl CodexDriver {
         } else {
             "thread/start"
         };
-        let result = client.request(method, params_value(&params)).await?;
+        let result = client
+            .request_with_timeout(method, params_value(&params), HANDSHAKE_TIMEOUT)
+            .await?;
         let thread_id = result
             .get("thread")
             .and_then(|thread| thread.get("id"))

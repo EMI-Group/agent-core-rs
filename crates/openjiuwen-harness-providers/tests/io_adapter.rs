@@ -625,6 +625,16 @@ async fn wait_until_pending(adapter: &HarnessIOAdapter) {
     .await
     .expect("the interaction becomes pending before the deadline");
 }
+/// Waits until the bounded chunk channel has dropped `expected` chunks, without sleeping.
+async fn wait_until_dropped(adapter: &HarnessIOAdapter, expected: u64) {
+    tokio::time::timeout(WAIT, async {
+        while adapter.dropped_chunks() < expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the bounded chunk buffer overflows before the deadline");
+}
 
 /// Awaits a spawned interaction handler and returns its result.
 async fn join_handler(
@@ -1308,6 +1318,46 @@ async fn second_outputs_call_is_rejected() {
         error.message().contains("single-consumer"),
         "unexpected message: {}",
         error.message()
+    );
+}
+
+/// A stream with no consumer keeps at most the configured number of chunks and counts the rest.
+#[tokio::test]
+async fn an_unconsumed_stream_drops_and_counts_chunks() {
+    const CAPACITY: usize = 4;
+    let fake = Arc::new(FakeHarness::new());
+    let adapter = adapter_with(
+        &fake,
+        HarnessIOAdapterConfig {
+            chunk_buffer_capacity: CAPACITY,
+            ..HarnessIOAdapterConfig::default()
+        },
+    );
+    adapter.start(context()).await.expect("the harness starts");
+    // Ten projected chunks against a four-chunk buffer: the channel stays bounded at four.
+    for sequence in 1..=10 {
+        fake.push(text_output(sequence, "partial", OutputOperation::Delta));
+    }
+    wait_until_dropped(&adapter, 6).await;
+    assert_eq!(adapter.dropped_chunks(), 6);
+
+    // The retained chunks are the oldest four, and the adapter is still usable.
+    let mut stream = adapter.outputs().expect("the stream is handed out once");
+    let chunks = read_chunks(&mut stream, CAPACITY).await;
+    assert_eq!(
+        chunks.iter().map(|chunk| chunk.index).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    fake.push(text_output(11, "partial", OutputOperation::Delta));
+    let chunk = next_chunk(&mut stream).await;
+    assert_eq!(
+        chunk.index, 10,
+        "a chunk produced after the overflow arrives"
+    );
+    assert_eq!(
+        adapter.dropped_chunks(),
+        6,
+        "a consumer that keeps up drops nothing"
     );
 }
 

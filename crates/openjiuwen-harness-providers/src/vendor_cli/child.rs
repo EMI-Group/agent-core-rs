@@ -9,7 +9,9 @@
 //! - stderr is drained by a background task into a bounded tail (the last
 //!   [`STDERR_TAIL_LINES`] lines, at most [`STDERR_TAIL_CHARS`] characters) that is appended to
 //!   transport errors — a vendor CLI usually explains itself on stderr;
-//! - every read has a hard per-line byte ceiling, so a runaway CLI cannot exhaust memory;
+//! - every read has a hard per-line byte ceiling enforced *while* reading, so a runaway CLI cannot
+//!   exhaust memory; a line above it is truncated at the ceiling, the surplus is drained without
+//!   being retained, and the line is reported as a protocol error;
 //! - waits are bounded, so a wedged child cannot hang a stop.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -187,25 +189,9 @@ impl ChildProcess {
     /// fails. Invalid UTF-8 is decoded lossily so the diagnostic still reports the line.
     pub async fn read_json(&mut self) -> HarnessResult<Option<JsonValue>> {
         loop {
-            let mut buffer = Vec::new();
-            let read = match self.stdout.read_until(b'\n', &mut buffer).await {
-                Ok(read) => read,
-                Err(error) => {
-                    return Err(self.with_tail(format!(
-                        "failed to read from the {} CLI: {error}",
-                        self.label
-                    )))
-                }
-            };
-            if read == 0 {
+            let Some(buffer) = self.read_bounded_line().await? else {
                 return Ok(None);
-            }
-            if read > self.max_line_bytes {
-                return Err(HarnessError::protocol(format!(
-                    "a {} CLI output line exceeded {} bytes",
-                    self.label, self.max_line_bytes
-                )));
-            }
+            };
             let text = String::from_utf8_lossy(&buffer);
             let trimmed = text.trim();
             if trimmed.is_empty() {
@@ -223,6 +209,57 @@ impl ChildProcess {
                 }
             };
         }
+    }
+
+    /// Reads one line, enforcing [`max_line_bytes`](Self::max_line_bytes) **while** reading.
+    ///
+    /// At most `max_line_bytes` bytes are ever retained. A longer line is truncated at the ceiling,
+    /// the surplus is drained to the next newline (or to end of file) without being buffered — so a
+    /// runaway CLI never blocks on a pipe the harness stopped reading — and the line is reported as
+    /// a [`HarnessError::Protocol`] naming the ceiling. Returns `Ok(None)` at end of file with no
+    /// bytes read.
+    async fn read_bounded_line(&mut self) -> HarnessResult<Option<Vec<u8>>> {
+        let mut buffer = Vec::new();
+        let mut overflowed = false;
+        loop {
+            let available = match self.stdout.fill_buf().await {
+                Ok(available) => available,
+                Err(error) => {
+                    return Err(self.with_tail(format!(
+                        "failed to read from the {} CLI: {error}",
+                        self.label
+                    )))
+                }
+            };
+            if available.is_empty() {
+                break;
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(available.len(), |position| position + 1);
+            if !overflowed {
+                let retained = self.max_line_bytes.saturating_sub(buffer.len());
+                if take > retained {
+                    buffer.extend_from_slice(&available[..retained]);
+                    overflowed = true;
+                } else {
+                    buffer.extend_from_slice(&available[..take]);
+                }
+            }
+            self.stdout.consume(take);
+            if newline.is_some() {
+                break;
+            }
+        }
+        if overflowed {
+            return Err(HarnessError::protocol(format!(
+                "a {} CLI output line exceeded {} bytes",
+                self.label, self.max_line_bytes
+            )));
+        }
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(buffer))
     }
 
     /// Returns the retained stderr tail, trimmed, with one line per element.
