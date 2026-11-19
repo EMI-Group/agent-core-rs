@@ -27,7 +27,7 @@
 //! `chat --resume` adopts the same id with
 //! [`Repl::with_session_id`](openjiuwen_harness::cli::Repl::with_session_id)
 //! before seeding the transcript, so every following REPL turn appends to the
-//! persisted `<home>/sessions/<id>.json` record instead of minting a new
+//! persisted `<home>/sessions/<id>.jsonl` record instead of minting a new
 //! `cli-*` session; the note on stderr is the catalogue summary alone.
 //!
 //! Everything else defaults to today's behaviour: without these flags the calls
@@ -179,7 +179,7 @@ async fn chat_entry(args: &ChatCliArgs, cli: &Cli) -> Result<()> {
 ///
 /// The REPL adopts the resolved session id before the transcript is seeded, so
 /// the restored history lands in that kernel session and every following turn
-/// appends to the same `<home>/sessions/<id>.json` record. Only the catalogue
+/// appends to the same `<home>/sessions/<id>.jsonl` record. Only the catalogue
 /// summary is announced on stderr: there is no second, freshly minted id.
 async fn run_chat_resumed(request: ResumeRequest<'_>, cli: &Cli) -> Result<()> {
     let options = CliOptions::resolve(cli)?;

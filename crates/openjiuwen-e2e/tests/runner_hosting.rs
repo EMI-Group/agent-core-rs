@@ -402,8 +402,15 @@ async fn active_spawns_track_each_hosted_child_until_its_own_handle_ends() {
         .monitor()
         .snapshot(&first_id)
         .expect("the dropped run is retained by the monitor");
-    assert_eq!(dropped.phase, RunPhase::Completed);
+    // An abandoned handle is not a run that finished: silently reporting
+    // success for work that never completed is the bug, so a dropped run is
+    // `Cancelled` and its detail says why.
+    assert_eq!(dropped.phase, RunPhase::Cancelled);
     assert_eq!(dropped.detail, json!({"reason": "handle_dropped"}));
+    assert!(
+        dropped.finished_at.is_some(),
+        "a cancelled run still records its end"
+    );
 }
 
 // --- health -----------------------------------------------------------------
