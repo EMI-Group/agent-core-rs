@@ -537,11 +537,14 @@ fn pulsar_feature_reaches_the_message_queue_surface() {
 #[cfg(feature = "mcp")]
 #[test]
 fn mcp_feature_is_wired_and_the_team_mcp_surface_resolves() {
-    // The umbrella's `mcp` feature wires `openjiuwen-extensions/mcp`, which currently gates
-    // no source; the runtime MCP server ships from `openjiuwen-agent-teams`, whose `mcp`
-    // feature is on by default. This test keeps the umbrella feature exercised and proves
-    // that surface resolves.
+    // The umbrella's `mcp` feature wires `openjiuwen-extensions/mcp` — that crate's real
+    // `McpToolGateway` bridge over kernel MCP tools — and the runtime MCP server ships from
+    // `openjiuwen-agent-teams`, whose `mcp` feature is on by default. Both surfaces are
+    // asserted; nothing is instantiated, so no server is reached.
     same_paths! {
+        openjiuwen::extensions::mcp::McpToolGateway => openjiuwen_extensions::mcp::McpToolGateway,
+        openjiuwen::extensions::mcp::McpToolEntry => openjiuwen_extensions::mcp::McpToolEntry,
+        openjiuwen::extensions::mcp::PermissionFilter => openjiuwen_extensions::mcp::PermissionFilter,
         openjiuwen::agent_teams::mcp::TeamMcpServer => openjiuwen_agent_teams::mcp::TeamMcpServer,
     }
     assert_eq!(
