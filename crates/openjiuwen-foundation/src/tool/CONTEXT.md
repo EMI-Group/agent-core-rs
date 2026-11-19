@@ -109,6 +109,19 @@ Root re-exports from `crate::tool` (for call sites that should not care about mo
 - `FunctionTool::default_render` duplicates the `Tool::render_for_llm` default body (Rust cannot call a trait default from an override); change both together.
 - `Tool` is object-safe with an `Arc<Self>` `stream`; adding a `&self` streaming method instead would break `'static` streams.
 
+## Known Issues
+
+- The MCP HTTP client is built with `reqwest::Client::builder().build()` (`mcp/http.rs:144`): no `connect_timeout` and no per-request timeout, so a server that accepts the connection but never answers stalls the POST (`mcp/http.rs:377`), the JSON body read (`mcp/http.rs:414`), the `GET` stream connect and the `close` `DELETE`; because `rmcp`'s serve loop awaits `transport.close()`, `RmcpClient::disconnect` hangs with it.
+- `SseParser::push` decodes every body chunk with `String::from_utf8_lossy` (`mcp/http.rs:719`), so a chunk boundary inside a multi-byte UTF-8 sequence injects U+FFFD and silently corrupts non-ASCII JSON-RPC payloads instead of erroring.
+- The SSE parser's line buffer and frame `data` grow without a size cap (`mcp/http.rs:719`, `mcp/http.rs:762`) and completed frames go into an unbounded channel (`mcp/http.rs:322`, `mcp/http/sse.rs:54`, sends at `mcp/http.rs:494`/`681`), so a server that never emits a newline or outruns `rmcp`'s consumer grows memory without bound; only `ServerStreamState` notifications are bounded (64).
+- `RestfulApiTool` checks `max_response_bytes` only after `HttpClient` buffered the whole body (`restful/tool.rs:220`) because its client is built without `with_max_response_bytes` (`restful/tool.rs:91`), so the documented cap does not bound memory; enabling it still surfaces as `Error::Tool` through the execute-error mapping in `invoke`.
+- `collect_operations` never resolves a path-item `$ref` (`mcp/openapi/spec.rs:416`), so an OpenAPI document that factors path items into `components/pathItems` (or any `$ref` path item) yields no tools for those paths, silently.
+- OpenAPI tool-name de-duplication is not collision-free (`mcp/openapi/spec.rs:595`): operations `foo`, `foo_2`, `foo` produce two `foo_2` entries, and `call_tool_with`'s `find` (`mcp/openapi/mod.rs:196`) can reach only the first; the `_N` suffix can also push a name past the documented 64-character bound (`generate_name`, `mcp/openapi/spec.rs:591`).
+- `SseTransport::send` posts the configured `auth_headers` to the `endpoint` URL the server announces without a same-origin check (`mcp/http/sse.rs:116`), so a malicious or compromised MCP server can redirect those credentials to another host.
+- Every `Tool::invoke` deep-clones `input_params` and compiles a fresh JSON Schema validator (`schema.rs:130`, from `function.rs:164`, `restful/tool.rs:187`, `mcp/tool.rs:125`), so each tool call pays a schema compile on the ReAct hot path.
+- `wait_post_endpoint` tests its state and only then awaits `endpoint_ready.notified()` (`mcp/http/sse.rs:186`) while producers call `notify_waiters` (which stores no permit), so a notification landing between the check and the registration is lost and the POST waits out the 30 s deadline.
+- The `send` that reopens a stopped SSE stream returns the previous `SseStop` before the fresh loop clears it (`mcp/http/sse.rs:101` versus the clear at `mcp/http/sse.rs:255`), so one POST fails per stream restart although a new stream was just spawned.
+
 ## Test Strategy
 
 - Unit tests live inline as `#[cfg(test)] mod tests` in each file, except `card`'s wire-conversion suite (`card/flat_tests.rs`, declared as `mod flat_tests;` in `card.rs` to keep the module file under the size baseline); there is no `tests/` subdirectory under this module.
