@@ -25,7 +25,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 
 ## Scenario Matrix
 
-125 test functions across 26 scenario binaries: 125 are collected with `--features sqlite,a2a,otel` (124 pass plus the one documented `#[ignore]`), and 115 with default features (114 pass plus the ignored one), because the `a2a` binary (4), the `otel` binary (4) and two `sqlite`-gated tests are compiled out.
+126 test functions across 26 scenario binaries: 126 are collected with `--features sqlite,a2a,otel` (125 pass plus the one documented `#[ignore]`), and 116 with default features (115 pass plus the ignored one), because the `a2a` binary (4), the `otel` binary (4) and two `sqlite`-gated tests are compiled out.
 All four `plugin_observability.rs` scenarios use `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` (the span flush blocks its calling thread), so a plain `#[tokio::test]` grep or count misses them entirely.
 Counts per binary are the compiled functions; the `sqlite`/`a2a`/`otel` markers name the gate on the extra ones.
 
@@ -114,7 +114,7 @@ Counts per binary are the compiled functions; the `sqlite`/`a2a`/`otel` markers 
 - Assert on recorded evidence, not timing: `ScriptedModel::calls()`/`call_count()`/`remaining()`, harness event sequences, collected frames, task board and mailbox state, store/file/journal contents, `MockLlmServer::request_count`, `FakeCommandRunner::invocations()`, ledger `totals()`/`events()`, the fake servers' recorded commands and requests, exported OTLP payloads, reloader snapshots.
 - Fake only what a scenario cannot own: harness protocols, member factories, symphony capability runners, RSI harness runners, evolving targets, Docker (`FakeCommandRunner`), the subprocess child (the test binary itself), the Redis server, the object-storage APIs, the OTLP collector, and the dream consolidator. Each fake is copied into the scenario that needs it, keeping every binary's contract explicit; the genuinely shipped seams (team-memory wiring, `OtlpMemoryObserver`, `DreamService`, `ReloadHub`, `persistent_agent::resume`) are driven for real.
 - Fixtures that the library keeps private are rebuilt from public primitives inside the scenario (`build_zip` for the DOCX/XLSX fixtures uses `parsing::crc32`; the tokenizer fixture is a hand-written byte-level `tokenizer.json`; the damaged journal entry lines are serialized public `ExecutionEntry` values), never by widening library visibility.
-- Gates: `cargo fmt -p openjiuwen-e2e -- --check`; `cargo test -p openjiuwen-e2e --offline`; `--features sqlite,a2a,otel`; `cargo clippy -p openjiuwen-e2e --all-targets [--all-features] --offline -- -D warnings`. Default features run 114 scenarios + 1 ignored, the feature set runs 124 + 1 ignored, and the whole suite finishes in seconds of test time (the subprocess, attach, federation, watcher, journal and artifact scenarios included) and is stable across repeated runs.
+- Gates: `cargo fmt -p openjiuwen-e2e -- --check`; `cargo test -p openjiuwen-e2e --offline`; `--features sqlite,a2a,otel`; `cargo clippy -p openjiuwen-e2e --all-targets [--all-features] --offline -- -D warnings`. Default features run 115 scenarios + 1 ignored, the feature set runs 125 + 1 ignored, and the whole suite finishes in seconds of test time (the subprocess, attach, federation, watcher, journal and artifact scenarios included) and is stable across repeated runs.
 
 ## Design Decisions
 
