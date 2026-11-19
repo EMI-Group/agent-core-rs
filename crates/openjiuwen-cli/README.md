@@ -152,7 +152,7 @@ window and the persisted `deepagent` state to the harness's resumed-turn seam,
 which continues that id's kernel session and appends to that id's CLI record.
 `chat --resume` makes the REPL adopt the same id before the transcript is seeded,
 so every following REPL turn appends to the persisted
-`<home>/sessions/<id>.json` record; the note on stderr is the catalogue summary
+`<home>/sessions/<id>.jsonl` record; the note on stderr is the catalogue summary
 and names no second id.
 
 A window rebuilt from a journal carries the harness's replay decorations as
@@ -478,7 +478,8 @@ the keys `id`, `kind`, `created_at`, `detail`, `messages: [{"role", "content"}]`
 `prune` prints `would prune <kind>\t<id>` for a dry run, `pruned <kind>\t<id>`
 otherwise, and `nothing to prune` when the selector matches nothing; `--json`
 prints `{"dry_run", "pruned", "entries"}`. Deleting a session removes **every**
-source it has — the `<home>/sessions/<id>.json` CLI record, each
+source it has — the `<home>/sessions/<id>.jsonl` CLI record (and any legacy
+`<id>.json` document the store still reads), each
 `persistent_agent/logs/<exec>/` journal directory and the
 `persistent_agent/sessions/<agent>/<session>/` directory — so a pruned session
 cannot reappear from a leftover store.
@@ -670,7 +671,7 @@ terminal.
 | `tests/cli_features.rs` | `run --worktree` end to end (worktree created, stderr announcement, run inside it), `--worktree` outside a repository as a typed `config` error, and `chat --watch` starting the watcher on stderr and exiting on stdin EOF. |
 | `tests/cron.rs` | The empty store, `create`/`list`/`get` persistence, `toggle` both ways, `preview --count`, `run` plus the `runs` receipt, `status` counts, `cancel`, and the `not_found`/`validation` failures. |
 | `tests/lsp.rs` | The action and flag help, an unknown action as a usage error, a missing `--file` as `not_found` (also with `--json`), and a failing or unspawnable `--server-command` as a typed `tool` error. |
-| `tests/sessions.rs` | The catalogue command on hand-written CLI records and a damaged journal tree: the empty listing (text and JSON), newest-first rows with `--limit` and `--kind`, `show` in both modes, a corrupt journal being skipped, the unknown-id `not_found`, `prune` dry run/`--all`/`--older-than`, the selector-less `validation` error and the `--all`/`--older-than` clap conflict, and the three help pages; a session seeded into all three stores being listed once (`kind: state`, every `--kind` matching it, one prune line, every source deleted); and a real `run` being one row that `--continue` continues. |
+| `tests/sessions.rs` | The catalogue command on CLI records written through the harness `SessionStore` and a damaged journal tree: the empty listing (text and JSON), newest-first rows with `--limit` and `--kind`, `show` in both modes, a corrupt journal being skipped, the unknown-id `not_found`, `prune` dry run/`--all`/`--older-than`, the selector-less `validation` error and the `--all`/`--older-than` clap conflict, and the three help pages; a session seeded into all three stores being listed once (`kind: state`, every `--kind` matching it, one prune line, every source deleted); and a real `run` being one row that `--continue` continues. |
 | `tests/resume.rs` | The resume surface against the loopback mock model: `run --resume <cli-id>` continuing the record and the request transcript through the run's own persistent session record, `--continue` picking the newest session twice in a row, the unknown-id and empty-catalogue `not_found`s, a persistent-agent state record resuming through its execution plan, an execution id resuming its journal and creating the session's CLI record, and `chat --resume` appending the REPL turn to the persisted record. |
 | `tests/team.rs` | A stub attach host behind a Unix socket: the grammar, one request per command with the documented arguments, the member/task/message/outcome renderings and empty markers, the JSON documents, a remote `not_found`, an unknown `--status`, and the missing-socket validation error. |
 | `tests/watch.rs` | `watch --list` text and JSON plans (targets plus skipped roots), an empty plan as a typed `config` error, and a live change reported as one JSON event with `--max-events 1` shutting the watcher down. |

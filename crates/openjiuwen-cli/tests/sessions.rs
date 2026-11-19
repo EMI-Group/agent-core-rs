@@ -5,8 +5,9 @@
 //! ([`support::Sandbox`]), so the three stores it merges are the ones a user
 //! really has:
 //!
-//! - **cli** — hand-written `<home>/sessions/<id>.json` records, in the
-//!   documented shape the CLI itself writes;
+//! - **cli** — records written through the harness
+//!   [`openjiuwen_harness::cli::SessionStore`], the same store the CLI itself
+//!   uses, so no fixture hand-constructs a record path or encoding;
 //! - **execution** — a `persistent_agent/logs` tree, here deliberately damaged
 //!   (a `meta.json` that is not JSON, a directory without one) to prove a broken
 //!   journal is skipped instead of failing the listing;
@@ -15,11 +16,11 @@
 //!
 //! Covered: the empty catalogue, newest-first listing with its kind filter and
 //! limit, `show` in both output modes, the skip-a-corrupt-journal rule, the
-//! `not_found` of an unknown id, `prune` (dry run, `--all`, `--older-than`), the
-//! `validation` error of a selector-less prune, the clap conflict of `--all` with
-//! `--older-than`, and the three help pages.
+//! `not_found` of an unknown id, `prune` (dry run, `--all`, `--older-than`, and
+//! both record extensions), the `validation` error of a selector-less prune, the
+//! clap conflict of `--all` with `--older-than`, and the three help pages.
 //!
-//! Two cases go further and pin the dedupe: one hand-written fixture that writes
+//! Two cases go further and pin the dedupe: one store-written fixture that writes
 //! the *same* session id into all three stores (one row, `--kind` matching every
 //! store, `prune` clearing all three trees), and one real `run` against the
 //! loopback mock model server, whose `--continue` must report the session it just
@@ -29,9 +30,11 @@
 mod support;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-use chrono::{SecondsFormat, Utc};
+use openjiuwen_common::config::OpenJiuwenHome;
 use openjiuwen_core::foundation::prompt::BaseMessage;
+use openjiuwen_harness::cli::SessionStore;
 use openjiuwen_harness::{
     EntryPayload, ExecutionIdentity, ExecutionLog, FileSessionStore, LogCapacity, ModelUsage,
     PersistentAgentLayout, PersistentSessionRecord, RecordEnding, SessionBinding,
@@ -58,31 +61,33 @@ fn args(sandbox: &Sandbox, tail: &[&str]) -> Vec<String> {
     args
 }
 
-/// Returns `now` as the RFC 3339 timestamp a freshly written record carries.
-fn now() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+/// Returns the store the binary itself reads and writes CLI records through.
+fn cli_store(sandbox: &Sandbox) -> SessionStore {
+    SessionStore::new(&OpenJiuwenHome::from_root(sandbox.home()))
 }
 
-/// Writes a CLI session record for `id` with the documented on-disk shape.
+/// Writes a CLI session record for `id` through [`openjiuwen_harness::cli::SessionStore`].
 ///
-/// The path is the one [`openjiuwen_harness::cli::SessionStore`] reads
-/// (`<home>/sessions/<id>.json`), so the suite does not depend on the CLI to
-/// create the fixture it then inspects.
-fn write_record(sandbox: &Sandbox, id: &str, created_at: &str, messages: &[(&str, &str)]) {
-    let messages: Vec<serde_json::Value> = messages
-        .iter()
-        .map(|(role, content)| json!({"role": role, "content": content, "timestamp": created_at}))
-        .collect();
-    let record = json!({
-        "session_id": id,
-        "model": "mock-model",
-        "created_at": created_at,
-        "messages": messages,
-    });
-    sandbox.write(
-        format!("home/sessions/{id}.json"),
-        serde_json::to_string_pretty(&record).expect("a JSON record"),
-    );
+/// The store owns the on-disk path, file name and encoding (today an append-only
+/// journal at `<home>/sessions/<id>.jsonl`, historically a single JSON document),
+/// so the suite never hand-constructs a record path or assumes an extension: a
+/// future format change cannot silently break these fixtures. The creation
+/// timestamp the store recorded is returned, because it is what `list` reports.
+fn write_record(sandbox: &Sandbox, id: &str, messages: &[(&str, &str)]) -> String {
+    let store = cli_store(sandbox);
+    store
+        .new_session(id, "mock-model")
+        .expect("a fresh session record");
+    for (role, content) in messages {
+        store
+            .append_message(id, role, content)
+            .expect("an appended message");
+    }
+    store
+        .load(id)
+        .expect("the record loads")
+        .expect("the record exists")
+        .created_at
 }
 
 /// Returns the four tab-separated columns of one `list` row.
@@ -102,19 +107,25 @@ fn an_empty_catalogue_prints_no_sessions() {
 }
 
 #[test]
-fn hand_written_records_are_listed_newest_first() {
+fn written_records_are_listed_newest_first() {
     let sandbox = Sandbox::new();
-    write_record(
+    let older = write_record(
         &sandbox,
         "cli-aaaa1111",
-        "2024-01-02T03:04:05Z",
         &[("user", "first question"), ("assistant", "first answer")],
     );
-    write_record(
+    // The store timestamps a record with the wall clock, so a small gap between
+    // the two writes keeps "newest first" deterministic instead of relying on
+    // clock resolution.
+    std::thread::sleep(Duration::from_millis(5));
+    let newer = write_record(
         &sandbox,
         "cli-bbbb2222",
-        "2024-06-07T08:09:10Z",
         &[("user", "later question"), ("assistant", "later answer")],
+    );
+    assert_ne!(
+        older, newer,
+        "the two records were created at distinct times"
     );
 
     let text = assert_success(&sandbox.run_blocking(&args(&sandbox, &["list"])));
@@ -122,12 +133,12 @@ fn hand_written_records_are_listed_newest_first() {
     assert_eq!(lines.len(), 2, "both records are listed: {text:?}");
     let newest = columns(lines[0]);
     assert_eq!(newest[0], "cli-bbbb2222", "newest first: {text:?}");
-    assert_eq!(newest[1], "2024-06-07T08:09:10Z");
+    assert_eq!(newest[1], newer);
     assert_eq!(newest[2], "cli");
     assert_eq!(newest[3], "2 messages, model mock-model");
     let oldest = columns(lines[1]);
     assert_eq!(oldest[0], "cli-aaaa1111");
-    assert_eq!(oldest[1], "2024-01-02T03:04:05Z");
+    assert_eq!(oldest[1], older);
     assert_eq!(oldest[2], "cli");
 
     let value = parse_json(&assert_success(
@@ -137,7 +148,7 @@ fn hand_written_records_are_listed_newest_first() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["id"], "cli-bbbb2222");
     assert_eq!(rows[0]["kind"], "cli");
-    assert_eq!(rows[0]["created_at"], "2024-06-07T08:09:10Z");
+    assert_eq!(rows[0]["created_at"], newer.as_str());
     assert_eq!(rows[0]["detail"], "2 messages, model mock-model");
     assert_eq!(rows[1]["id"], "cli-aaaa1111");
 
@@ -164,10 +175,9 @@ fn hand_written_records_are_listed_newest_first() {
 #[test]
 fn showing_a_cli_record_prints_its_transcript() {
     let sandbox = Sandbox::new();
-    write_record(
+    let created = write_record(
         &sandbox,
         "cli-aaaa1111",
-        "2024-01-02T03:04:05Z",
         &[("user", "first question"), ("assistant", "first answer")],
     );
 
@@ -175,7 +185,7 @@ fn showing_a_cli_record_prints_its_transcript() {
     assert!(text.contains("session cli-aaaa1111\n"), "got {text:?}");
     assert!(text.contains("kind cli\n"), "got {text:?}");
     assert!(
-        text.contains("created 2024-01-02T03:04:05Z\n"),
+        text.contains(&format!("created {created}\n")),
         "got {text:?}"
     );
     assert!(text.contains("messages 2\n"), "got {text:?}");
@@ -197,7 +207,7 @@ fn showing_a_cli_record_prints_its_transcript() {
     ));
     assert_eq!(value["id"], "cli-aaaa1111");
     assert_eq!(value["kind"], "cli");
-    assert_eq!(value["created_at"], "2024-01-02T03:04:05Z");
+    assert_eq!(value["created_at"], created.as_str());
     assert_eq!(value["detail"], "2 messages, model mock-model");
     assert!(value["plan"].is_null(), "no plan for a CLI record: {value}");
     assert_eq!(
@@ -223,12 +233,7 @@ fn a_corrupt_journal_is_skipped_instead_of_failing_the_listing() {
     );
     std::fs::create_dir_all(sandbox.path("workspace/persistent_agent/logs/metadata-less"))
         .expect("a journal directory without metadata");
-    write_record(
-        &sandbox,
-        "cli-aaaa1111",
-        "2024-01-02T03:04:05Z",
-        &[("user", "first question")],
-    );
+    write_record(&sandbox, "cli-aaaa1111", &[("user", "first question")]);
 
     let text = assert_success(&sandbox.run_blocking(&args(&sandbox, &["list", "--json"])));
     let value = parse_json(&text);
@@ -257,18 +262,11 @@ fn an_unknown_id_is_a_typed_not_found() {
 #[test]
 fn prune_reports_the_selection_then_deletes_it() {
     let sandbox = Sandbox::new();
-    write_record(
-        &sandbox,
-        "cli-aaaa1111",
-        "2024-01-02T03:04:05Z",
-        &[("user", "first question")],
-    );
-    write_record(
-        &sandbox,
-        "cli-bbbb2222",
-        "2024-06-07T08:09:10Z",
-        &[("user", "later question")],
-    );
+    write_record(&sandbox, "cli-aaaa1111", &[("user", "first question")]);
+    // The store stamps each record with the wall clock; the gap keeps the
+    // newest-first expectation deterministic.
+    std::thread::sleep(Duration::from_millis(5));
+    write_record(&sandbox, "cli-bbbb2222", &[("user", "later question")]);
 
     let text =
         assert_success(&sandbox.run_blocking(&args(&sandbox, &["prune", "--all", "--dry-run"])));
@@ -311,9 +309,52 @@ fn prune_reports_the_selection_then_deletes_it() {
 }
 
 #[test]
+fn prune_removes_a_legacy_document_record_too() {
+    let sandbox = Sandbox::new();
+    write_record(&sandbox, "cli-aaaa1111", &[("user", "old question")]);
+    let store = cli_store(&sandbox);
+    // Simulate a record written before the store moved to the journal format:
+    // the same bytes sit at the legacy path, which the store still reads.
+    std::fs::rename(
+        store.path_for("cli-aaaa1111"),
+        store.legacy_path_for("cli-aaaa1111"),
+    )
+    .expect("the record moved to its legacy path");
+    assert!(
+        store
+            .load("cli-aaaa1111")
+            .expect("the legacy record loads")
+            .is_some(),
+        "the store still recognises the legacy record"
+    );
+
+    let text = assert_success(&sandbox.run_blocking(&args(&sandbox, &["prune", "--all"])));
+    assert_eq!(
+        non_empty_lines(&text),
+        vec!["pruned cli\tcli-aaaa1111"],
+        "the legacy record is selected"
+    );
+
+    assert!(
+        !store.path_for("cli-aaaa1111").exists(),
+        "no canonical record is left behind"
+    );
+    assert!(
+        !store.legacy_path_for("cli-aaaa1111").exists(),
+        "the legacy record is deleted too"
+    );
+    let text = assert_success(&sandbox.run_blocking(&args(&sandbox, &["list"])));
+    assert_eq!(
+        text.trim(),
+        "no sessions",
+        "a pruned legacy record does not reappear"
+    );
+}
+
+#[test]
 fn prune_needs_a_selector() {
     let sandbox = Sandbox::new();
-    write_record(&sandbox, "cli-aaaa1111", &now(), &[("user", "just now")]);
+    write_record(&sandbox, "cli-aaaa1111", &[("user", "just now")]);
 
     let text =
         assert_success(&sandbox.run_blocking(&args(&sandbox, &["prune", "--older-than", "7"])));
@@ -406,18 +447,22 @@ struct Seeded {
     journal: PathBuf,
     /// The directory holding the fixture's `state.json`.
     state_dir: PathBuf,
+    /// The canonical CLI record path.
+    cli_record: PathBuf,
+    /// The legacy CLI record path, which a prune must also remove.
+    cli_legacy: PathBuf,
 }
 
 /// Writes one session id into all three stores, the way a CLI run leaves it.
 ///
-/// The CLI record is hand-written (the shape `openjiuwen run` writes); the journal
-/// and the session record go through the harness API, because nothing outside the
-/// harness can produce a valid `meta.json`/`state.json` pair.
+/// The CLI record goes through [`SessionStore`] (the store `run`/`chat` write
+/// through); the journal and the session record go through the persistent-agent
+/// API, because nothing outside the harness can produce a valid
+/// `meta.json`/`state.json` pair.
 async fn seed_all_three_stores(sandbox: &Sandbox) -> Seeded {
     write_record(
         sandbox,
         SHARED_SESSION,
-        "2024-01-02T03:04:05Z",
         &[("user", FIXTURE_QUESTION), ("assistant", FIXTURE_ANSWER)],
     );
     let layout = PersistentAgentLayout::for_workspace(&Workspace::new(sandbox.workspace()));
@@ -462,12 +507,15 @@ async fn seed_all_three_stores(sandbox: &Sandbox) -> Seeded {
         })
         .expect("an ended record");
     store.save(&record).await.expect("a saved record");
+    let cli = cli_store(sandbox);
     Seeded {
         journal,
         state_dir: state_path
             .parent()
             .expect("the state file lives in a directory")
             .to_path_buf(),
+        cli_record: cli.path_for(SHARED_SESSION),
+        cli_legacy: cli.legacy_path_for(SHARED_SESSION),
     }
 }
 
@@ -484,7 +532,6 @@ fn listed_rows(text: &str) -> Vec<serde_json::Value> {
 async fn a_session_in_all_three_stores_is_listed_and_pruned_once() {
     let sandbox = Sandbox::new();
     let seeded = seed_all_three_stores(&sandbox).await;
-    let cli_record = sandbox.path(format!("home/sessions/{SHARED_SESSION}.json"));
 
     let text = assert_success(&sandbox.run(&args(&sandbox, &["list"])).await);
     let lines = non_empty_lines(&text);
@@ -569,7 +616,14 @@ async fn a_session_in_all_three_stores_is_listed_and_pruned_once() {
     assert_eq!(text.trim(), "no sessions", "every source is gone");
     assert!(!seeded.journal.exists(), "the journal directory is deleted");
     assert!(!seeded.state_dir.exists(), "the state directory is deleted");
-    assert!(!cli_record.exists(), "the CLI record is deleted");
+    assert!(
+        !seeded.cli_record.exists(),
+        "the canonical CLI record is deleted"
+    );
+    assert!(
+        !seeded.cli_legacy.exists(),
+        "a legacy CLI record would be deleted too"
+    );
 }
 
 /// Builds the model-connection and workspace flags of one real `run`.

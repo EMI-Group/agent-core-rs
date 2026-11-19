@@ -3,8 +3,9 @@
 //! Three independent stores hold state a conversation can be continued from,
 //! and this module presents them as one catalogue:
 //!
-//! 1. **cli** — the CLI session records under `<home>/sessions/<id>.json`
-//!    ([`SessionStore`]). These are what `run`/`chat` write, and they hold the
+//! 1. **cli** — the CLI session records under `<home>/sessions/<id>.jsonl`
+//!    ([`SessionStore`]), with a legacy `<id>.json` document still read (and
+//!    removed by a prune). These are what `run`/`chat` write, and they hold the
 //!    plain transcript.
 //! 2. **execution** — the persistent-agent execution journals under the
 //!    workspace's `persistent_agent/logs` ([`ExecutionCatalog`]). One journal is
@@ -851,10 +852,17 @@ impl Catalog {
     }
 
     /// Deletes the store entry behind one [`Detail`].
+    ///
+    /// A CLI record can live at either of the store's two paths: the canonical
+    /// `.jsonl` journal and the legacy `.json` document written before the
+    /// switch. Both are removed, so a record that has not been migrated yet
+    /// cannot survive a prune and reappear on the next listing.
     async fn remove_detail(&self, detail: &Detail) -> Result<()> {
         match detail {
             Detail::Cli(summary) => {
-                remove_file(&self.cli_store().path_for(&summary.session_id)).await
+                let store = self.cli_store();
+                remove_file(&store.path_for(&summary.session_id)).await?;
+                remove_file(&store.legacy_path_for(&summary.session_id)).await
             }
             Detail::Execution(summary) => {
                 remove_dir(&self.execution_catalog().path_for(&summary.execution_id)).await
