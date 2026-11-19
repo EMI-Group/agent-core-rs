@@ -21,6 +21,7 @@ mod support;
 
 use std::sync::Arc;
 
+use openjiuwen::core::common::error::ErrorKind;
 use openjiuwen::core::foundation::Model;
 use openjiuwen::core::runner::{RunOptions, Runner, WorkflowRef};
 use openjiuwen::core::session::{
@@ -54,6 +55,23 @@ fn http_component(params: &Value) -> HttpRequestComponent {
 /// `start → http → end`; the request url is the run's `base` input plus `url_path`,
 /// so the loopback address never has to be baked into the card.
 fn http_workflow(id: &str, url_path: &str, end_inputs: Value) -> Workflow {
+    http_workflow_with(id, url_path, &json!({}), end_inputs)
+}
+
+/// The same topology with extra `request_params` merged into the http node, which is
+/// how a card sets `response_handling` (e.g. `throw_on_http_error`).
+fn http_workflow_with(
+    id: &str,
+    url_path: &str,
+    extra_params: &Value,
+    end_inputs: Value,
+) -> Workflow {
+    let mut params = json!({"url": format!("{{{{base}}}}{url_path}"), "method": "GET"});
+    if let (Some(params), Some(extra)) = (params.as_object_mut(), extra_params.as_object()) {
+        for (key, value) in extra {
+            params.insert(key.clone(), value.clone());
+        }
+    }
     let mut workflow = Workflow::new(WorkflowCard::new(id));
     workflow
         .set_start_comp(
@@ -63,7 +81,7 @@ fn http_workflow(id: &str, url_path: &str, end_inputs: Value) -> Workflow {
         )
         .add_workflow_comp(
             "http",
-            http_component(&json!({"url": format!("{{{{base}}}}{url_path}"), "method": "GET"})),
+            http_component(&params),
             ComponentOptions::new().with_inputs_schema(json!({"base": "${start.base}"})),
         )
         .set_end_comp(
@@ -170,16 +188,17 @@ async fn start_http_end_resolves_the_body_field_and_status() {
     assert_eq!(recorded_paths(&server).await, vec!["/item".to_owned()]);
 }
 
-// Non-2xx is data, not a failure: the run completes and the end node can read
-// `ok`, the status and the error body. Only transport failures are errors.
+// With `response_handling.throw_on_http_error` explicitly off, a non-2xx is data: the
+// run completes and the end node can read `ok`, the status and the error body.
 #[tokio::test]
 async fn a_non_2xx_response_is_data_with_its_status() {
     let server = within("the loopback server start", MockServer::start()).await;
     mount_get(&server, "/broken", 503, json!({"error": "boom"})).await;
 
-    let workflow = http_workflow(
+    let workflow = http_workflow_with(
         "http-error",
         "/broken",
+        &json!({"response_handling": {"throw_on_http_error": false}}),
         json!({
             "ok": "${http.ok}",
             "status": "${http.statusCode}",
@@ -202,6 +221,45 @@ async fn a_non_2xx_response_is_data_with_its_status() {
         output.result,
         json!({"output": {"ok": false, "status": 503, "error": "boom"}})
     );
+    assert_eq!(recorded_paths(&server).await, vec!["/broken".to_owned()]);
+}
+
+// `throw_on_http_error` defaults to `true` (Python's default), so a failed status never
+// reaches the end node: the run fails with the component's coded `[102002]` error naming
+// the node, the status and `ok = false`.
+#[tokio::test]
+async fn a_non_2xx_response_throws_by_default() {
+    let server = within("the loopback server start", MockServer::start()).await;
+    mount_get(&server, "/broken", 503, json!({"error": "boom"})).await;
+
+    let workflow = http_workflow(
+        "http-throw",
+        "/broken",
+        json!({"status": "${http.statusCode}"}),
+    );
+
+    let error = within(
+        "the throwing http workflow run",
+        workflow.invoke(
+            json!({"base": server.uri()}),
+            workflow_session("http-throw"),
+        ),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Workflow);
+    let text = error.to_string();
+    assert!(
+        text.contains("node `http` failed at superstep 2"),
+        "the error names the failing node: {text}"
+    );
+    assert!(text.contains("[102002]"), "unexpected error text: {text}");
+    assert!(
+        text.contains("statusCode=503"),
+        "unexpected error text: {text}"
+    );
+    assert!(text.contains("ok=false"), "unexpected error text: {text}");
     assert_eq!(recorded_paths(&server).await, vec!["/broken".to_owned()]);
 }
 

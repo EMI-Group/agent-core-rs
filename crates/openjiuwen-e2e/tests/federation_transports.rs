@@ -997,7 +997,9 @@ async fn broadcast_and_directed_deliveries_follow_the_routing_table() {
         .await
         .unwrap();
     for subscriber in routing.route("crew") {
-        publisher.add_subscription(&subscriber, "crew");
+        publisher
+            .add_subscription(&subscriber, "crew")
+            .expect("the transport accepts the subscription it must fan out to");
     }
     within(
         "the group broadcast",
@@ -1014,7 +1016,9 @@ async fn broadcast_and_directed_deliveries_follow_the_routing_table() {
 
     // A concrete topic resolves through its pattern, so only the routed member receives it.
     for subscriber in routing.route("news.tech") {
-        publisher.add_subscription(&subscriber, "news.tech");
+        publisher
+            .add_subscription(&subscriber, "news.tech")
+            .expect("the transport accepts the pattern-matched subscription");
     }
     within(
         "the routed topic publish",
@@ -1136,8 +1140,12 @@ async fn inbox_filters_gate_what_reaches_a_member() {
     within("the publishing transport starts", publisher.start())
         .await
         .unwrap();
-    publisher.add_subscription("alpha", "news.tech");
-    publisher.add_subscription("alpha", "alerts");
+    publisher
+        .add_subscription("alpha", "news.tech")
+        .expect("the transport accepts the subscription the filter must gate");
+    publisher
+        .add_subscription("alpha", "alerts")
+        .expect("the transport accepts the second subscription");
 
     // A denied sender never reaches the member: the rejection is the sender's typed error.
     let denied = MessageEnvelope::p2p(json!({"n": 1}), "spammer", "alpha")
@@ -1272,8 +1280,11 @@ async fn registry_failures_and_unreachable_servers_are_typed() {
     let index = "fleet:fleet:subs";
     // Every registry write fails while the switch is on.
     server.fail_sets(true);
-    transport.add_subscription("alpha", "news");
-    // The synchronous call neither fails nor hangs: the pair is local at once.
+    // The synchronous call neither fails nor hangs: the pair is local at once and the
+    // write-through failure only surfaces on the next refresh.
+    transport
+        .add_subscription("alpha", "news")
+        .expect("the local subscription is recorded before the remote mirror is attempted");
     assert_eq!(transport.agent_subscriptions("alpha"), vec!["news"]);
     wait_for_command(
         &server,
