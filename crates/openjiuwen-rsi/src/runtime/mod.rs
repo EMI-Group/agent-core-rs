@@ -37,7 +37,7 @@ pub use ci::{
 };
 pub use command::{
     decode_output, CommandOutcome, CommandRunner, CommandSpec, FakeCommandRunner, FakeReply,
-    ProcessCommandRunner,
+    ProcessCommandRunner, DEFAULT_COMMAND_TIMEOUT, MAX_OUTPUT_BYTES,
 };
 pub use git::{
     build_auth_env, scrub_credentials, slugify_topic, GitBranchResult, GitCherryPick,

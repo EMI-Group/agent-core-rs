@@ -66,6 +66,14 @@ fn command_seam_is_implemented() {
 
     let process = ProcessCommandRunner::new();
     assert_eq!(process.name(), "process");
+    assert_eq!(
+        process.default_timeout(),
+        Some(openjiuwen_rsi::runtime::DEFAULT_COMMAND_TIMEOUT)
+    );
+    assert_eq!(
+        process.max_output_bytes(),
+        openjiuwen_rsi::runtime::MAX_OUTPUT_BYTES
+    );
     assert_type::<CommandSpec>();
 }
 
