@@ -210,7 +210,7 @@ impl ProcessorsRegistry {
     #[must_use]
     pub fn new() -> Self {
         let mut registry = Self::default();
-        registry.register_classifier(DEFAULT_CLASSIFIER, |rollouts| classify_rollouts(rollouts));
+        registry.register_classifier(DEFAULT_CLASSIFIER, classify_rollouts);
         registry.register_validator(DEFAULT_VALIDATOR, |pos, neg, _keep| validate_stop(pos, neg));
         registry.register_validator(BALANCED_VALIDATOR, |pos, neg, keep| {
             validate_stop_balanced(pos, neg, keep.unwrap_or(8))

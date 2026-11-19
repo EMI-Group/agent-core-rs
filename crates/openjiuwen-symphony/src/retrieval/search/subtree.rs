@@ -360,7 +360,7 @@ pub fn choices_cache_key(choices: &[RetrieverChoice]) -> String {
 ///
 /// A payload with more than [`MAX_CID_DEPTH`] dot-separated segments is attached to the root
 /// with a warning instead of being expanded: the builder is infallible, and an unbounded
-/// payload path would make [`RootBuilder::freeze`] — which recurses once per level — overflow
+/// payload path would make `RootBuilder::freeze` — which recurses once per level — overflow
 /// the stack. Use [`try_build_progressive_root`] to reject such a payload with a typed error
 /// instead.
 #[must_use]

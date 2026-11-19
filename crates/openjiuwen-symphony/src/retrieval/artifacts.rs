@@ -78,7 +78,7 @@ const EMPTY_TREE_YAML: &str = "nodes: []\n";
 /// an unbounded path is an unbounded stack: a hand-edited index (or a payload from an
 /// untrusted catalog) with tens of thousands of segments would abort the process with a stack
 /// overflow. The load path therefore rejects a deeper `cid` with a typed
-/// [`Error::Validation`](crate::error::Error::Validation) instead of trusting it. Sixty-four
+/// [`Error::Validation`] instead of trusting it. Sixty-four
 /// levels is far beyond any real capability taxonomy (the build schema's own limit is six).
 pub const MAX_CID_DEPTH: usize = 64;
 

@@ -282,7 +282,7 @@ impl ElasticsearchVectorStore {
     /// The index name for `collection`: `"{index_prefix}__{collection}"`.
     ///
     /// This is a pure naming helper and does **not** validate `collection`; every
-    /// [`VectorStore`] operation goes through [`Self::checked_index_name`], which
+    /// [`VectorStore`] operation goes through `checked_index_name`, which
     /// rejects a name that could escape the index namespace.
     #[must_use]
     pub fn index_name(&self, collection: &str) -> String {

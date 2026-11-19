@@ -184,7 +184,7 @@ impl AnthropicClient {
     /// preserves the turn's `thinking`/`redacted_thinking` blocks (signatures
     /// included), which the [`StreamChunk`] surface deliberately does not carry:
     /// drain the stream, build the message with
-    /// [`StreamAccumulator`](crate::llm::model::StreamAccumulator), then call
+    /// [`StreamAccumulator`], then call
     /// [`apply_thinking_blocks`](AnthropicStreamState::apply_thinking_blocks) on
     /// it. That makes a streamed extended-thinking turn replayable on the next
     /// request exactly like the non-streaming parser's message;
