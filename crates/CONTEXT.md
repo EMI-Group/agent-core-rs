@@ -144,7 +144,7 @@ Default builds need no network and no external service; every feature except the
 | `openjiuwen-agent-teams` | `live-tests` | no | empty opt-in test gate (no test reads it) |
 | `openjiuwen-extensions` | `a2a` | no | A2A client/server, wire types, REST binding, harness bridge |
 | `openjiuwen-extensions` | `otel` | no | real OTel SDK provider, sink, handlers, tracing layer, OTLP/HTTP export in JSON and protobuf, Grafana/Langfuse presets, the file exporter |
-| `openjiuwen-extensions` | `mcp` | no | dead gate: pulls `rmcp`/`tokio-stream`, no source file reads it, and it gates no module (MCP itself is `openjiuwen-foundation`'s default `mcp` feature) |
+| `openjiuwen-extensions` | `mcp` | no | `src/mcp`: `McpToolGateway`, `McpToolEntry` and `PermissionFilter`, bridging kernel MCP tools to the harness `ToolGateway` (MCP client/server tooling itself is `openjiuwen-foundation`'s default `mcp` feature) |
 | `openjiuwen-extensions` | `sqlite` | no | SQLite checkpointer/store backends |
 | `openjiuwen-extensions` | `redis` | no | Redis KV/checkpointer adapters plus the document and vector stores, over an in-crate RESP client that speaks `redis://` and `rediss://` and follows `MOVED`/`ASK` |
 | `openjiuwen-extensions` | `pulsar` | no | Pulsar queue surface — construction returns `Error::Unsupported` |
