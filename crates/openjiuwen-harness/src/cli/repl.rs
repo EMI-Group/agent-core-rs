@@ -510,12 +510,12 @@ impl Repl {
         self.conversation.push(ROLE_ASSISTANT, &outcome.answer);
 
         let store = self.options.sessions();
-        if let Err(error) = store.append_message(&self.session_id, ROLE_USER, input) {
-            tracing::warn!(%error, "failed to persist REPL user message");
-        }
-        if let Err(error) = store.append_message(&self.session_id, ROLE_ASSISTANT, &outcome.answer)
-        {
-            tracing::warn!(%error, "failed to persist REPL assistant message");
+        let turn = vec![
+            MessageRecord::new(ROLE_USER, input),
+            MessageRecord::new(ROLE_ASSISTANT, &outcome.answer),
+        ];
+        if let Err(error) = store.append_turn(&self.session_id, turn).await {
+            tracing::warn!(%error, "failed to persist the REPL turn");
         }
         Ok(outcome)
     }
@@ -665,7 +665,8 @@ impl Repl {
         if let Err(error) = self
             .options
             .sessions()
-            .replace_messages(&self.session_id, messages)
+            .replace_messages_async(&self.session_id, messages)
+            .await
         {
             tracing::warn!(%error, "failed to persist the compacted transcript");
         }

@@ -711,7 +711,7 @@ async fn permission_host_non_interactive_fails_without_prompt() {
 // --- session store --------------------------------------------------------
 
 #[test]
-fn session_store_new_session_writes_python_shape() {
+fn session_store_new_session_writes_the_journal_header() {
     let temp = TempDir::new().unwrap();
     let home = OpenJiuwenHome::from_root(temp.path());
     let store = SessionStore::new(&home);
@@ -721,11 +721,23 @@ fn session_store_new_session_writes_python_shape() {
 
     let path = store.path_for("cli-test");
     assert!(path.ends_with("sessions/cli-test.json"));
-    let json: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_object_keys(&json, &["session_id", "model", "created_at", "messages"]);
+    // The record is append-only JSONL: one header line carrying the Python fields, and no
+    // message line yet.
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        text.lines().count(),
+        1,
+        "an empty record is its header line"
+    );
+    let json: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_object_keys(&json, &["type", "session_id", "model", "created_at"]);
+    assert_eq!(json["type"], "header");
     assert_eq!(json["session_id"], "cli-test");
     assert_eq!(json["model"], "gpt-4o");
-    assert_eq!(json["messages"], json!([]));
+    let loaded = store.load("cli-test").unwrap().unwrap();
+    assert_eq!(loaded.model, "gpt-4o");
+    assert_eq!(loaded.created_at, record.created_at);
+    assert!(loaded.messages.is_empty());
 }
 
 #[test]

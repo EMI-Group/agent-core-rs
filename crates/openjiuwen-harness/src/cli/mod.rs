@@ -75,7 +75,9 @@ pub use run::{
     build_agent, build_agent_with, new_session, result_json_line, run_once, run_with_model,
     session_id, stream_json_line, FoundationMcpToolProvider, McpToolProvider, RunOutcome,
 };
-pub use session_store::{MessageRecord, SessionRecord, SessionStore, SessionSummary};
+pub use session_store::{
+    MessageRecord, SessionRecord, SessionStore, SessionSummary, MAX_RECORD_BYTES, MIN_RECORD_BYTES,
+};
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
