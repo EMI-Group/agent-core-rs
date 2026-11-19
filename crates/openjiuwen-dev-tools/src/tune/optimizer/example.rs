@@ -15,8 +15,15 @@
 //!    count); an invalid or unparsable list logs and falls back to an empty
 //!    proposal, so greedy selection starts from scratch.
 //! 3. Greedily append the example that maximises the evaluator score, one at a
-//!    time, until `num_examples` examples (or every case) are in the prompt.
-//!    Ties go to the smaller `case_id`.
+//!    time, until `num_examples` examples (or every case) are in the prompt, and
+//!    stop after [`OptimizerConfig::iterations`] rounds at the latest, like the
+//!    instruction and joint optimizers. A round proposes one candidate per
+//!    still-unselected case, so ranking them all on the whole case set would cost
+//!    a quadratic number of evaluations; each round ranks its candidates on a
+//!    deterministic, evenly spaced subsample of at most
+//!    [`MAX_SCORED_CASES_PER_ROUND`] cases, and the winning prompt is re-scored on
+//!    the whole set so the reported score stays the full-case mean. Ties go to
+//!    the smaller `case_id`.
 //! 4. Return the best-scoring prompt seen, which is the seed when no addition
 //!    helped.
 //!
@@ -93,6 +100,31 @@ pub fn render_examples(cases: &[Case]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// How many cases one greedy round scores every candidate on.
+///
+/// A round proposes one candidate per still-unselected case, so ranking the
+/// candidates on the whole case set costs a quadratic number of evaluations
+/// (500 cases is about 5·10⁶ evaluator calls over three rounds). The round ranks
+/// its candidates on a deterministic, evenly spaced subsample of at most this
+/// many cases instead, and re-scores only the winner on the whole set, which
+/// keeps a page-sized case set linear. A case set that already fits is scored
+/// whole, so a small configuration behaves exactly as before.
+const MAX_SCORED_CASES_PER_ROUND: usize = 16;
+
+/// A deterministic, evenly spaced subsample of `cases` holding at most `limit` cases.
+///
+/// A set that fits the limit is returned whole. Otherwise every `cases.len() /
+/// limit`-th case is taken, starting at the first, so the sample is spread across
+/// the whole set instead of being biased toward its front.
+fn score_sample(cases: &[Case], limit: usize) -> Vec<Case> {
+    if cases.len() <= limit || limit == 0 {
+        return cases.to_vec();
+    }
+    (0..limit)
+        .filter_map(|position| cases.get(position * cases.len() / limit).cloned())
+        .collect()
 }
 
 /// Appends a rendered example block to a prompt.
@@ -233,7 +265,7 @@ impl ExampleOptimizer {
         }
 
         let mut iterations = 0;
-        while selected.len() < target {
+        while selected.len() < target && iterations < self.config.iterations {
             if best_score + 1e-12 >= self.config.early_stop_score {
                 break;
             }
@@ -252,21 +284,14 @@ impl ExampleOptimizer {
             if candidates.is_empty() {
                 break;
             }
+            let sample = score_sample(cases, MAX_SCORED_CASES_PER_ROUND);
             let scores =
-                score_candidates(&*evaluator, &candidates, cases, self.config.num_parallel).await?;
+                score_candidates(&*evaluator, &candidates, &sample, self.config.num_parallel)
+                    .await?;
             iterations += 1;
 
             let mut chosen: Option<usize> = None;
             for position in 0..candidates.len() {
-                if is_better(
-                    scores[position],
-                    &candidates[position],
-                    best_score,
-                    &best_prompt,
-                ) {
-                    best_score = scores[position];
-                    best_prompt.clone_from(&candidates[position]);
-                }
                 let better = match chosen {
                     None => true,
                     Some(current) => {
@@ -284,6 +309,16 @@ impl ExampleOptimizer {
                 break;
             };
             selected.push(indices[position]);
+
+            // Re-score the winning prompt on every case: the reported score stays
+            // the full-case mean (comparable with the seed) and the per-case
+            // results cover the whole set, not just the ranking subsample.
+            let chosen_prompt = &candidates[position];
+            let (score, _) = evaluator.score_cases(chosen_prompt, cases).await?;
+            if is_better(score, chosen_prompt, best_score, &best_prompt) {
+                best_score = score;
+                best_prompt.clone_from(chosen_prompt);
+            }
         }
 
         Ok(OptimizationResult {
@@ -385,6 +420,7 @@ fn selection_messages(seed: &str, cases: &[Case], target: usize) -> Vec<BaseMess
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use openjiuwen_test_support::ScriptedModel;
@@ -680,5 +716,101 @@ mod tests {
     #[test]
     fn debug_reports_the_model_choice() {
         assert!(format!("{:?}", ExampleOptimizer::new()).contains("model: \"none\""));
+    }
+
+    /// A case set large enough that full-case ranking would be quadratic.
+    fn many_cases(count: usize) -> Vec<Case> {
+        (0..count)
+            .map(|index| case(&format!("c{index:03}"), &format!("q{index}"), "a"))
+            .collect()
+    }
+
+    /// Counts every per-case evaluation and rewards a prompt that carries the
+    /// case's question.
+    struct Counting {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CaseEvaluator for Counting {
+        async fn evaluate(&self, prompt: &str, case: &Case) -> Result<EvaluatedCase> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let question = case
+                .inputs
+                .get("question")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let score = if prompt.contains(question) { 1.0 } else { 0.5 };
+            EvaluatedCase::new(case.clone(), BTreeMap::new(), score, "counted")
+        }
+    }
+
+    #[tokio::test]
+    async fn the_round_budget_bounds_the_evaluation_count() {
+        let cases = many_cases(200);
+        let evaluator = Arc::new(Counting {
+            calls: AtomicUsize::new(0),
+        });
+        let result = ExampleOptimizer::new()
+            .with_config(OptimizerConfig::default().with_iterations(2))
+            .with_evaluator(evaluator.clone())
+            .optimize(SEED, &cases, 20)
+            .await
+            .unwrap();
+
+        // Post-conditions: the round budget bound the selection even though the
+        // target was 20 examples, and the seed is still the prefix.
+        assert_eq!(result.iterations, 2, "the round budget stops the search");
+        assert!(
+            result.best_prompt.starts_with(SEED),
+            "{}",
+            result.best_prompt
+        );
+        assert!(
+            result.best_prompt.contains("example 2:"),
+            "{}",
+            result.best_prompt
+        );
+        assert!(
+            !result.best_prompt.contains("example 3:"),
+            "{}",
+            result.best_prompt
+        );
+
+        // seed scoring (200) + two rounds of `<= 200 candidates x <= 16 sampled
+        // cases` plus one full-set re-score of each winner (200): 6 984 calls.
+        // Ranking every candidate on every case, as before, cost about 10^6.
+        let calls = evaluator.calls.load(Ordering::Relaxed);
+        assert!(
+            calls <= 8_000,
+            "{calls} evaluations for 200 cases, 2 rounds"
+        );
+
+        // The reported score is the winner's mean over the whole case set, not a
+        // subsample estimate.
+        let (expected, evaluated) = evaluator
+            .score_cases(&result.best_prompt, &cases)
+            .await
+            .unwrap();
+        assert_eq!(evaluated.len(), cases.len());
+        assert!(
+            (result.score - expected).abs() < 1e-12,
+            "{} != {expected}",
+            result.score
+        );
+    }
+
+    #[test]
+    fn the_round_sample_is_bounded_and_evenly_spaced() {
+        let cases = many_cases(100);
+        let small = score_sample(&cases[..10], MAX_SCORED_CASES_PER_ROUND);
+        assert_eq!(small, cases[..10].to_vec(), "a small set is scored whole");
+
+        let sampled = score_sample(&cases, MAX_SCORED_CASES_PER_ROUND);
+        assert_eq!(sampled.len(), MAX_SCORED_CASES_PER_ROUND);
+        assert_eq!(sampled[0].case_id, "c000", "the first case is sampled");
+        assert!(sampled
+            .windows(2)
+            .all(|pair| pair[0].case_id < pair[1].case_id));
     }
 }
