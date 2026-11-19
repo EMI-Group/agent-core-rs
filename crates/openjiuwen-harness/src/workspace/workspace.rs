@@ -167,12 +167,16 @@ impl Workspace {
 
     /// Returns the path of a **top-level** node named `name`, without default fallback.
     ///
-    /// Nested names (`MEMORY.md`, `daily_memory`, `session_memory.md`) return `None`.
+    /// Nested names (`MEMORY.md`, `daily_memory`, `session_memory.md`) return `None`, and so
+    /// does a node whose path is unsafe: joining an absolute or `..`-escaping node path would
+    /// redirect the caller's write outside the workspace.
     #[must_use]
     pub fn get_node_path(&self, name: &str) -> Option<PathBuf> {
         self.directories
             .iter()
-            .find(|node| node.name == name)
+            .find(|node| {
+                node.name == name && crate::workspace::is_safe_relative_path(node.resolved_path())
+            })
             .map(|node| self.root_path.join(node.resolved_path()))
     }
 
