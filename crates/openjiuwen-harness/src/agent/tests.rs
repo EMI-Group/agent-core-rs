@@ -158,6 +158,48 @@ impl Model for GateModel {
     }
 }
 
+/// A model whose every call suspends forever, signalling when a call is entered.
+///
+/// Proves that cancellation and the completion timeout end a turn that is parked inside the
+/// model, instead of waiting for an answer that never comes.
+struct HangModel {
+    entered: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl Model for HangModel {
+    fn provider(&self) -> &str {
+        "hang"
+    }
+
+    fn model_name(&self) -> &str {
+        "hang"
+    }
+
+    async fn invoke(
+        &self,
+        _messages: &[BaseMessage],
+        _request: &ModelRequestConfig,
+    ) -> Result<ChatResponse> {
+        self.entered.add_permits(1);
+        std::future::pending().await
+    }
+
+    fn stream(
+        &self,
+        _messages: Vec<BaseMessage>,
+        _request: ModelRequestConfig,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        let entered = self.entered.clone();
+        async_stream::stream! {
+            entered.add_permits(1);
+            std::future::pending::<()>().await;
+            yield Ok(StreamChunk::Done);
+        }
+        .boxed()
+    }
+}
+
 /// Builds a scripted-model agent over the default workspace.
 fn build_agent(model: impl Model + 'static) -> Arc<DeepAgent> {
     DeepAgentBuilder::new(AgentCard::new("test-agent").with_description("Test DeepAgent"))
@@ -624,6 +666,112 @@ async fn abort_is_idempotent_and_a_later_invocation_still_runs() {
         .expect("a fresh invocation succeeds after an abort");
     assert_eq!(output.output, "after abort");
     assert_ne!(agent.phase(), InteractionPhase::Terminated);
+}
+
+#[tokio::test]
+async fn abort_interrupts_a_hung_model_promptly() {
+    let entered = Arc::new(Semaphore::new(0));
+    let agent = Arc::new(
+        DeepAgentBuilder::new(AgentCard::new("hung-agent"))
+            .config(DeepAgentConfig::default().with_language("en".to_string()))
+            .model(Arc::new(HangModel {
+                entered: entered.clone(),
+            }))
+            .build()
+            .unwrap(),
+    );
+    let running = {
+        let agent = agent.clone();
+        tokio::spawn(async move { agent.invoke(json!({"query": "hang"}), None).await })
+    };
+    // Park the turn inside the model before aborting it.
+    let permit = tokio::time::timeout(std::time::Duration::from_secs(10), entered.acquire())
+        .await
+        .expect("the model call must be entered")
+        .unwrap();
+    drop(permit);
+
+    agent.abort();
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+        .await
+        .expect("abort must end a hung turn")
+        .unwrap()
+        .expect_err("an aborted turn reports an error");
+    assert!(
+        error.to_string().contains("aborted"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn dropping_the_stream_cancels_the_run_and_frees_the_slot() {
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let model = GateModel {
+        inner: ScriptedModel::text("second answer"),
+        entered: entered.clone(),
+        release: release.clone(),
+    };
+    let agent = Arc::new(
+        DeepAgentBuilder::new(AgentCard::new("dropped-stream-agent"))
+            .config(DeepAgentConfig::default().with_language("en".to_string()))
+            .model(Arc::new(model))
+            .build()
+            .unwrap(),
+    );
+
+    let stream = agent.stream(json!({"query": "stream"}), None);
+    let permit = tokio::time::timeout(std::time::Duration::from_secs(10), entered.acquire())
+        .await
+        .expect("the streamed model call must be entered")
+        .unwrap();
+    drop(permit);
+    drop(stream);
+    // The gate only stays closed for the abandoned call; later calls (the retry) proceed.
+    release.add_permits(16);
+
+    // The cancelled run must release the single-run slot so a later invoke is accepted.
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match agent.invoke(json!({"query": "again"}), None).await {
+                Ok(output) => break output,
+                Err(error) if error.to_string().contains("already running") => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("unexpected error: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("a dropped stream must end its run");
+    assert_eq!(output.output, "second answer");
+}
+
+#[tokio::test]
+async fn the_single_round_path_honours_the_completion_timeout() {
+    let entered = Arc::new(Semaphore::new(0));
+    let agent = DeepAgentBuilder::new(AgentCard::new("timeout-agent"))
+        .config(
+            DeepAgentConfig::default()
+                .with_language("en".to_string())
+                .with_completion_timeout_secs(0.05),
+        )
+        .model(Arc::new(HangModel { entered }))
+        .build()
+        .unwrap();
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent.invoke(json!({"query": "hang"}), None),
+    )
+    .await
+    .expect("the completion timeout must fire")
+    .expect_err("a timed-out turn reports an error");
+    assert!(
+        error.to_string().contains("completion timeout"),
+        "unexpected error: {error}"
+    );
 }
 
 #[tokio::test]
