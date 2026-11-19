@@ -321,6 +321,23 @@ fn validate_dimensions(records: &IndexMap<String, VectorRecord>, query_len: usiz
     Ok(())
 }
 
+/// Orders two hit scores best-first, sorting `NaN` last.
+///
+/// [`f32::total_cmp`] is a total order, so the comparator is transitive even when
+/// a stored vector holds `NaN` and produces a `NaN` score — the previous
+/// `partial_cmp(…).unwrap_or(Equal)` treated every `NaN` pair as equal, which made
+/// the ordering intransitive. `NaN` is not a similarity, so it sorts below every
+/// real score and never displaces a finite hit.
+fn score_order(left: f32, right: f32) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        // Descending: the larger score comes first.
+        (false, false) => right.total_cmp(&left),
+    }
+}
+
 /// Converts a record into a hit, injecting the ids into the result metadata.
 fn search_result(record: &VectorRecord, score: f32) -> SearchResult {
     let metadata = effective_metadata(record).into_owned();
@@ -406,6 +423,10 @@ impl VectorStore for InMemoryVectorStore {
     /// `Error::Validation("vector dimension mismatch: …")`. No record is silently
     /// dropped for its width.
     ///
+    /// Candidates are scored, ordered, and truncated by reference, so only the
+    /// `top_k` hits that are actually returned clone their text and metadata — a
+    /// wide store never pays for payload copies of records it discards.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`] for either dimension validation failure.
@@ -413,29 +434,30 @@ impl VectorStore for InMemoryVectorStore {
         if query.top_k == 0 {
             return Ok(Vec::new());
         }
-        let mut hits: Vec<SearchResult> = {
-            let stored = self.records.read();
-            validate_dimensions(&stored, query.vector.len())?;
-            stored
-                .values()
-                .filter(|record| {
-                    query
-                        .filter
-                        .as_ref()
-                        .is_none_or(|filter| record_matches(record, filter))
-                })
-                .map(|record| {
-                    let score = normalize_cosine(cosine_similarity(&record.vector, &query.vector));
-                    (record, score)
-                })
-                .filter(|(_, score)| query.score_threshold.is_none_or(|min| *score >= min))
-                .map(|(record, score)| search_result(record, score))
-                .collect()
-        };
-        // Rust's sort is stable, so equal scores keep their insertion order.
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-        hits.truncate(query.top_k);
-        Ok(hits)
+        let stored = self.records.read();
+        validate_dimensions(&stored, query.vector.len())?;
+        let mut candidates: Vec<(&VectorRecord, f32)> = stored
+            .values()
+            .filter(|record| {
+                query
+                    .filter
+                    .as_ref()
+                    .is_none_or(|filter| record_matches(record, filter))
+            })
+            .map(|record| {
+                let score = normalize_cosine(cosine_similarity(&record.vector, &query.vector));
+                (record, score)
+            })
+            .filter(|(_, score)| query.score_threshold.is_none_or(|min| *score >= min))
+            .collect();
+        // The comparator is a total order and `sort_by` is stable, so equal
+        // scores keep their insertion order.
+        candidates.sort_by(|(_, left), (_, right)| score_order(*left, *right));
+        candidates.truncate(query.top_k);
+        Ok(candidates
+            .into_iter()
+            .map(|(record, score)| search_result(record, score))
+            .collect())
     }
 
     async fn len(&self) -> Result<usize> {

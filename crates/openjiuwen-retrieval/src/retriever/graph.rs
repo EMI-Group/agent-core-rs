@@ -14,7 +14,8 @@
 //!    no duplicate entity logic lives here;
 //! 3. fetch `neighbors(entity, max_hops)` triples, deduplicated by normalized key
 //!    and bounded to [`MAX_TRIPLES`];
-//! 4. expand by querying the chunk retriever with each triple's text, bounded to
+//! 4. expand by querying the chunk retriever with each triple's text, in
+//!    `triple_mode` and with the caller's metadata filter, bounded to
 //!    `expansion_limit` triples;
 //! 5. fuse the expanded chunks with the original chunks through
 //!    [`rrf_fusion`] and truncate to `top_k`.
@@ -366,9 +367,13 @@ impl GraphRetriever {
         for triple in triples.iter().take(self.expansion_limit) {
             let text = triple.text();
             report.expanded_queries += 1;
+            // The caller's filter applies to every chunk query, not just the
+            // first one: a chunk reachable only through expansion must satisfy
+            // the same metadata predicate, or a filtered retrieve would answer
+            // with documents the caller excluded.
             match self
                 .chunk_retriever
-                .retrieve_search_results(&text, 1, self.triple_mode, None)
+                .retrieve_search_results(&text, 1, self.triple_mode, filters)
                 .await
             {
                 Ok(hits) => {
@@ -462,6 +467,8 @@ impl Retriever for GraphRetriever {
     clippy::assert_is_empty
 )]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
     use super::*;
     use async_trait::async_trait;
 
@@ -523,6 +530,65 @@ mod tests {
         }
     }
 
+    /// Returns `hit(id, text, 0.5)` carrying `source` in its metadata.
+    fn sourced_hit(id: &str, text: &str, source: &str) -> SearchResult {
+        let mut result = hit(id, text, 0.5);
+        result
+            .metadata
+            .insert("source".to_owned(), Value::String(source.to_owned()));
+        result
+    }
+
+    /// Channel that recognises query keywords *and* honours the metadata filter.
+    ///
+    /// Unlike [`ProbeChannel`] it applies the caller's filter to every hit and
+    /// counts the filtered calls, so a test can prove the graph expansion pushed
+    /// the filter down instead of relying on the returned texts alone.
+    struct FilteringChannel {
+        hits: Vec<(&'static str, SearchResult)>,
+        filtered_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Retriever for FilteringChannel {
+        async fn retrieve(
+            &self,
+            query: &str,
+            top_k: usize,
+            _score_threshold: Option<f32>,
+            mode: RetrieveMode,
+            filters: Option<&MetadataFilter>,
+        ) -> Result<Vec<RetrievalResult>> {
+            Ok(self
+                .retrieve_search_results(query, top_k, mode, filters)
+                .await?
+                .into_iter()
+                .map(search_result_to_retrieval)
+                .collect())
+        }
+
+        async fn retrieve_search_results(
+            &self,
+            query: &str,
+            top_k: usize,
+            _mode: RetrieveMode,
+            filters: Option<&MetadataFilter>,
+        ) -> Result<Vec<SearchResult>> {
+            if filters.is_some() {
+                self.filtered_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+            let lowered = query.to_lowercase();
+            Ok(self
+                .hits
+                .iter()
+                .filter(|(keyword, _)| lowered.contains(keyword))
+                .filter(|(_, hit)| filters.is_none_or(|filter| filter.matches(&hit.metadata)))
+                .map(|(_, hit)| hit.clone())
+                .take(top_k)
+                .collect())
+        }
+    }
+
     fn channel() -> Arc<dyn Retriever> {
         Arc::new(ProbeChannel {
             hits: vec![
@@ -574,6 +640,44 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].text, "Rust ownership model");
         assert_eq!(results[0].chunk_id.as_deref(), Some("chunk-a"));
+    }
+
+    #[tokio::test]
+    async fn an_expansion_query_honours_the_callers_filter() {
+        // `chunk-b` is reachable only through the graph ("Borrow Checker") and
+        // its metadata excludes it from the caller's filter; before the fix the
+        // expansion query passed `None` and handed it back anyway.
+        let channel = Arc::new(FilteringChannel {
+            hits: vec![
+                (
+                    "ownership",
+                    sourced_hit("chunk-a", "Rust ownership model", "book"),
+                ),
+                (
+                    "borrow checker",
+                    sourced_hit("chunk-b", "the Borrow Checker guide", "blog"),
+                ),
+            ],
+            filtered_calls: AtomicUsize::new(0),
+        });
+        let retriever = GraphRetriever::new(channel.clone(), store());
+        let filter: MetadataFilter =
+            serde_json::from_value(serde_json::json!({"source": "book"})).unwrap();
+        let (results, report) = retriever
+            .retrieve_search_results_with_report(
+                "Rust ownership",
+                2,
+                RetrieveMode::Sparse,
+                Some(&filter),
+            )
+            .await
+            .unwrap();
+        let texts: Vec<&str> = results.iter().map(|result| result.text.as_str()).collect();
+        assert_eq!(texts, vec!["Rust ownership model"]);
+        // The initial retrieve and both triple-text expansion queries all carried
+        // the filter, so the channel itself could never return a violating chunk.
+        assert_eq!(report.expanded_queries, 2);
+        assert_eq!(channel.filtered_calls.load(AtomicOrdering::SeqCst), 3);
     }
 
     #[tokio::test]
