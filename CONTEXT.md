@@ -24,7 +24,7 @@ The complete per-package matrix, deviations, and deferred list live in `docs/PAR
 - `openjiuwen-core` — kernel umbrella: `common`, `foundation`, `session`, `graph`, `workflow`, `context_engine`, `memory`, `retrieval`, `sys_operation`, `security`, `single_agent`, `application`, `multi_agent`, `runner`.
 - `openjiuwen-cli` — binary `openjiuwen` (`run`, `chat`); `team-member` and `openjiuwen-team-mcp` ship from `openjiuwen-agent-teams`.
 - `crates/` — every workspace crate, layering, status, and per-crate routing.
-- `crates/openjiuwen-examples/examples/` — 12 runnable examples mirroring the Python `examples/` tree (offline by default, live with `OPENJIUWEN_LIVE=1`).
+- `crates/openjiuwen-examples/examples/` — 26 runnable examples mirroring the Python `examples/` tree (offline by default, live with `OPENJIUWEN_LIVE=1`); a few are feature-gated (`a2a`, `mcp`).
 - `crates/openjiuwen-examples/src/support/` — the shared example harness (`RunMode`, logging, banner) used by every example.
 - `docs/PARITY.md` — status legend, Python→Rust package matrix, wire compatibility, deferred features, intentional differences, verification.
 
