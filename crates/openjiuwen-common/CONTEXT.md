@@ -99,6 +99,15 @@ Panics are isolated with `FutureExt::catch_unwind` and recorded as `Failed`; `jo
 - The task manager is structured concurrency, not an asyncio task-group wrapper: spawn registers before polling, every task keeps its `AbortHandle`, panics are caught with `catch_unwind`, and `Drop` aborts leftovers.
 - `OpenJiuwenHome::ensure()` creates only the root; callers that need `logs/` or `sessions/` create them explicitly.
 
+## Known Issues
+
+- `src/utils/json.rs:263` — `set_segments` pads an array with `Value::Null` up to the requested `[index]` with no cap, so a caller-supplied path such as `items[1000000000]` (reachable via `openjiuwen_session::state::paths::set_value` and the graph state API) allocates until the process aborts; reject indices above a documented maximum with `Error::Validation`.
+- `src/task/manager.rs:509` — terminal tasks leave the registry only through an explicit `remove_finished()`, so a long-lived manager (including `TaskManager::global()`) grows per spawn and `list()` clones every dead snapshot while holding the registry lock.
+- `src/task/` has no consumer anywhere else in the workspace (`openjiuwen_core::common::task` is reachable but unused), so the structured-task guarantees are exercised only by this crate's tests.
+- `src/logging/subscriber.rs:363` — the file writer performs a blocking `write(2)` under a process-wide `parking_lot::Mutex` on whatever thread emits the record (usually a tokio worker) and returns `Ok(buf.len())` even when the write failed or was short.
+- `src/logging/events.rs:613` — `emit` builds the redacted JSON payload (a full clone of the event tree plus serialization) before `tracing` consults the level filter, so a filtered-out level still pays the whole cost.
+- `src/http/client.rs:349` — an invalid proxy URL is formatted into `Error::Validation` verbatim, so `http://user:password@proxy` leaks credentials into logs and error strings; `security::redact_url_password` exists but has no caller in `src`.
+
 ## Notes for Agents
 
 - Import errors from `openjiuwen_common::error::{Error, Result}`; `use openjiuwen_common::error::ResultExt;` enables `.context("...")` on any `E: Into<Error>` result.
