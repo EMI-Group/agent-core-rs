@@ -160,6 +160,16 @@ Python name mapping: `GuardrailResult.pass_` → `GuardrailResult::pass`, `Guard
 - No process-global registration helper: Python's `register_guardrail`/`unregister_guardrail` bind to `Runner.callback_framework`; the runner crate owns that wiring (see `docs/PARITY.md` security row).
 - Python quirks deliberately not reproduced: `PromptInjectionGuardrail.with_rules()` (documented but never defined), double-registration bookkeeping bug, and `GuardrailContext(content_type=type(None))` fallback.
 
+## Known Issues
+
+- `backends::http::http_client` builds the shared client without `max_response_bytes` (`HttpClientConfig::default()` leaves it `None`), so a moderation endpoint can stream an unbounded body into memory, and `body_snippet` then copies it again (`from_utf8_lossy`, a `split_whitespace` vector, a `join`) before keeping 200 characters.
+- The text projection is recomputed per detector and per backend: `GuardrailPipeline::run` projects once and discards it, then `PromptInjectionGuardrail::check`, its rule/API/LLM backend, `SensitiveDataGuardrail::check`, `ContentRuleGuardrail::check` and `ToolArgumentGuardrail::check` each call `text_view_checked()` again, so a `Messages` prompt scan under `SecurityConfig::protected()` joins the whole conversation four times and a tool-input scan serializes the arguments two to four times.
+- Range claiming and redaction are quadratic: `rules::find_all` and `SensitiveDataGuardrail::redact_text` compare every candidate against a `Vec` of claimed ranges, and `rules::redact_ranges` does one overlap scan plus one `String::replace_range` (an O(n) memmove) per range, so a tool result holding thousands of PII matches costs O(matches²) comparisons and O(matches × len) byte moves inside the async task running the scan.
+- `redact_ranges` applies ranges from the end backwards, so when two input ranges overlap the rightmost one wins; any single-pass rewrite must keep that tie-break.
+- The vendor adapters (`vendors::{openai, azure, aliyun}`) grade `GuardrailContext::text_view()` instead of the checked projection, so an unscannable payload is posted as its compact JSON (`null` becomes the literal `"null"`) and answered Safe rather than failing with `Error::Validation` when the adapter runs through `BackendGuardrail` directly or under `FailurePolicy::FailOpen`.
+- `ToolArgumentGuardrail` scans argument text twice when redaction is on (the joined text in `sensitive_verdict`, then every string leaf again in `redact_value`), serializes the whole argument value just to measure `max_argument_bytes`, and redacts per leaf so PII split across two leaves is reported but not redacted in `sanitized_arguments`.
+- `tool_arguments::collect_strings` and `redact_value` recurse over caller-supplied JSON without a depth cap; serde_json's default 128-level parse limit covers parsed input, but a programmatically built `Value` can overflow the stack.
+
 ## Python Mapping
 
 | Python (`openjiuwen/core/security/guardrail/`) | Rust |
