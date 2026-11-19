@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 use super::super::runtime::SubAgentRuntime;
 use super::super::task_tool::description_for;
+use super::super::RuntimeSubAgentSpawner;
 use super::util::{new_task_id, non_empty, render_payload};
 use crate::tools::{tool_card, ToolPayload};
 
@@ -57,13 +58,13 @@ impl Tool for SubagentSendInputTool {
             Some(_) => return Ok(ToolPayload::fail("'interrupt' must be a boolean").to_json()),
         };
         if let Err(error) = self
-            .runtime
+            .runtime()
             .send_input(&subagent_id, &query, interrupt)
             .await
         {
             return Ok(ToolPayload::fail(error.to_string()).to_json());
         }
-        let status = self.runtime.get_status(&subagent_id).as_str();
+        let status = self.runtime().get_status(&subagent_id).as_str();
         Ok(ToolPayload::ok(json!({
             "subagent_id": subagent_id,
             "task_id": new_task_id(),
@@ -103,7 +104,7 @@ impl Tool for SubagentCloseTool {
         let Some(subagent_id) = non_empty(&inputs, "subagent_id") else {
             return Ok(ToolPayload::fail("'subagent_id' is required").to_json());
         };
-        match self.runtime.close(&subagent_id).await {
+        match self.runtime().close(&subagent_id).await {
             Ok(previous) => Ok(ToolPayload::ok(json!({
                 "subagent_id": subagent_id,
                 "previous_status": previous.as_str(),
@@ -144,7 +145,7 @@ impl Tool for SubagentResumeTool {
         let Some(subagent_id) = non_empty(&inputs, "subagent_id") else {
             return Ok(ToolPayload::fail("'subagent_id' is required").to_json());
         };
-        match self.runtime.resume(&subagent_id).await {
+        match self.runtime().resume(&subagent_id).await {
             Ok(report) => {
                 let mut data = json!({
                     "subagent_id": subagent_id,

@@ -16,8 +16,8 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 use super::{
-    general_purpose_config, SubAgentConfig, SubAgentFactory, SubAgentRegistry, SubAgentRuntime,
-    SubAgentSpec,
+    general_purpose_config, SubAgentConfig, SubAgentFactory, SubAgentQuota, SubAgentRegistry,
+    SubAgentRuntime, SubAgentSpec,
 };
 
 /// How a [`FakeAgent`] answers one turn.
@@ -130,6 +130,23 @@ pub(crate) fn build_runtime(factory: Arc<FakeFactory>) -> Arc<SubAgentRuntime> {
     ))
 }
 
+/// Builds a runtime over [`build_registry`] with an explicit quota.
+#[must_use]
+pub(crate) fn build_runtime_with_quota(
+    factory: Arc<FakeFactory>,
+    quota: SubAgentQuota,
+) -> Arc<SubAgentRuntime> {
+    Arc::new(SubAgentRuntime::new(build_registry(), factory, "parent-session").with_quota(quota))
+}
+/// Builds an echoing runtime with an explicit quota, returning it with its factory.
+#[must_use]
+pub(crate) fn echo_runtime_with_quota(
+    quota: SubAgentQuota,
+) -> (Arc<SubAgentRuntime>, Arc<FakeFactory>) {
+    let factory = FakeFactory::new(Behavior::Echo);
+    let runtime = build_runtime_with_quota(Arc::clone(&factory), quota);
+    (runtime, factory)
+}
 /// Builds an echoing runtime and returns it together with its factory.
 #[must_use]
 pub(crate) fn echo_runtime() -> (Arc<SubAgentRuntime>, Arc<FakeFactory>) {

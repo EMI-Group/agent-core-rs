@@ -181,7 +181,8 @@ pub use subagents::EVICTION_REASON;
 pub use subagents::SUBAGENTS_KEY;
 pub use subagents::{
     load_bucket_file, save_bucket_file, select_lru_candidate, subagent_tools,
-    subagent_tools_with_transcript, ActivityEvent, ActivityKind, ActivityStream,
+    subagent_tools_with_spawner, subagent_tools_with_transcript,
+    subagent_tools_with_transcript_spawner, ActivityEvent, ActivityKind, ActivityStream,
     ActivitySubscription, ActivitySummary, ActivityThrottle, CallbackLifecycleHook, Clock,
     EvictionSchedulerConfig, EvictionSchedulerHandle, EvictionSchedulerStats, LifecycleCallback,
     LifecycleFailure, LifecycleHooks, LifecycleReport, LifecycleStage, LoadReport, LruCandidate,

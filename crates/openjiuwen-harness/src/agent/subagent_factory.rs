@@ -21,8 +21,8 @@ use openjiuwen_foundation::tool::{Tool, ToolCard};
 
 use crate::schema::{DeepAgentConfig, PromptMode, SubAgentConfig};
 use crate::subagents::{
-    general_purpose_config, subagent_tools_with_transcript, SubAgentFactory, SubAgentRegistry,
-    SubAgentRuntime, SubAgentSpec, TaskTool,
+    general_purpose_config, subagent_tools_with_transcript_spawner, RuntimeSubAgentSpawner,
+    SubAgentFactory, SubAgentRegistry, SubAgentRuntime, SubAgentSpec, TaskTool,
 };
 use crate::workspace::Workspace;
 
@@ -185,8 +185,13 @@ pub(crate) fn subagent_mode(config: &DeepAgentConfig) -> SubagentMode {
 /// [`subagent_tools_with_transcript`] set, [`SubagentMode::AsyncSession`] adds its four
 /// lifecycle tools, and [`SubagentMode::SyncTask`] adds none of them.
 ///
-/// A wired sub-agent runtime with its model-facing tools and their cards.
-pub(crate) type SubagentWiring = (Arc<SubAgentRuntime>, Vec<Arc<dyn Tool>>, Vec<ToolCard>);
+/// A wired sub-agent runtime, its shared bounded spawner, and its model-facing tools/cards.
+pub(crate) type SubagentWiring = (
+    Arc<SubAgentRuntime>,
+    Arc<RuntimeSubAgentSpawner>,
+    Vec<Arc<dyn Tool>>,
+    Vec<ToolCard>,
+);
 ///
 /// # Errors
 ///
@@ -216,18 +221,24 @@ pub(crate) fn wire_subagents(
         )),
     };
     let runtime = Arc::new(SubAgentRuntime::new(registry, factory, ""));
-    let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(TaskTool::new(runtime.clone()))];
+    // One bounded spawner backs every model-facing spawn, so the task tool, the persistent
+    // tools and the subagent rail all share the same concurrency ledger.
+    let spawner = Arc::new(RuntimeSubAgentSpawner::new(Arc::clone(&runtime)));
+    let mut tools: Vec<Arc<dyn Tool>> =
+        vec![Arc::new(TaskTool::with_spawner(Arc::clone(&spawner)))];
     match subagent_mode(config) {
-        SubagentMode::Runtime => tools.extend(subagent_tools_with_transcript(runtime.clone())),
+        SubagentMode::Runtime => {
+            tools.extend(subagent_tools_with_transcript_spawner(Arc::clone(&spawner)));
+        }
         SubagentMode::AsyncSession => tools.extend(
-            subagent_tools_with_transcript(runtime.clone())
+            subagent_tools_with_transcript_spawner(Arc::clone(&spawner))
                 .into_iter()
                 .filter(|tool| ASYNC_SESSION_TOOL_NAMES.contains(&tool.card().name.as_str())),
         ),
         SubagentMode::SyncTask => {}
     }
     let cards = tools.iter().map(|tool| tool.card().clone()).collect();
-    Ok((runtime, tools, cards))
+    Ok((runtime, spawner, tools, cards))
 }
 
 #[cfg(test)]
@@ -291,7 +302,8 @@ mod tests {
         let config = DeepAgentConfig::default()
             .with_add_general_purpose_agent(true)
             .with_enable_subagent_runtime(true);
-        let (runtime, tools, cards) = wire_subagents(&config, &workspace, None, None).unwrap();
+        let (runtime, _spawner, tools, cards) =
+            wire_subagents(&config, &workspace, None, None).unwrap();
         // Five built-in presets plus the general-purpose fallback.
         assert_eq!(runtime.registry().len(), 6);
         // `task_tool` plus the seven-tool `subagent_*` set.
@@ -314,7 +326,7 @@ mod tests {
         let temp = TempWorkspace::new().unwrap();
         let workspace = Workspace::for_language(temp.workspace(), "en");
         let config = DeepAgentConfig::default().with_add_general_purpose_agent(true);
-        let (_, tools, cards) = wire_subagents(&config, &workspace, None, None).unwrap();
+        let (_, _, tools, cards) = wire_subagents(&config, &workspace, None, None).unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].name, "task_tool");
@@ -327,7 +339,7 @@ mod tests {
         let async_config = DeepAgentConfig::default()
             .with_add_general_purpose_agent(true)
             .with_enable_async_subagent(true);
-        let (_, _, cards) = wire_subagents(&async_config, &workspace, None, None).unwrap();
+        let (_, _, _, cards) = wire_subagents(&async_config, &workspace, None, None).unwrap();
         let names: Vec<&str> = cards.iter().map(|card| card.name.as_str()).collect();
         assert_eq!(
             names,
@@ -341,7 +353,7 @@ mod tests {
         );
 
         let both = async_config.clone().with_enable_subagent_runtime(true);
-        let (_, _, cards) = wire_subagents(&both, &workspace, None, None).unwrap();
+        let (_, _, _, cards) = wire_subagents(&both, &workspace, None, None).unwrap();
         assert_eq!(cards.len(), 8, "the runtime mode wins over the async mode");
     }
 

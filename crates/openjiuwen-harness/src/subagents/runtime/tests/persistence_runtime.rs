@@ -275,9 +275,14 @@ async fn loading_the_same_bucket_twice_restores_nothing_new() {
 #[tokio::test]
 async fn save_trims_closed_tombstones_to_the_retention_bound() {
     let runtime = build_runtime(&["worker"], FakeFactory::new(Behavior::Echo))
-        .with_quota(SubAgentQuota::default().with_max_subagents(1))
+        .with_quota(
+            SubAgentQuota::default()
+                .with_max_subagents(1)
+                .with_total_spawned(64),
+        )
         .with_clock(Arc::new(ManualClock::new(T0)));
     let bound = max_persisted_records(runtime.quota().max_subagents);
+    assert_eq!(bound, 40);
     for index in 0..bound + 5 {
         let id = spawn(&runtime, "worker", &format!("task {index}")).await;
         wait_one(&runtime, &id).await;

@@ -37,7 +37,7 @@ use crate::rails::{
 use crate::schema::{
     resolve_inner_react_max_iterations, AgentMode, DeepAgentConfig, PlanModeState,
 };
-use crate::subagents::{RuntimeSubAgentSpawner, SubAgentFactory};
+use crate::subagents::SubAgentFactory;
 use crate::task_loop::LoopQueues;
 use crate::tools::{BuiltinTool, ToolRegistry, UserAsker};
 use crate::workspace::Workspace;
@@ -257,16 +257,17 @@ impl DeepAgentBuilder {
         }
 
         let mounts_subagents = !config.subagents.is_empty() || config.add_general_purpose_agent;
-        let subagent_runtime = if mounts_subagents {
-            let (runtime, subagent_tools, subagent_cards) = subagent_factory::wire_subagents(
-                &config,
-                &workspace,
-                model.clone(),
-                subagent_factory,
-            )?;
+        let subagent_wiring = if mounts_subagents {
+            let (runtime, spawner, subagent_tools, subagent_cards) =
+                subagent_factory::wire_subagents(
+                    &config,
+                    &workspace,
+                    model.clone(),
+                    subagent_factory,
+                )?;
             tools.extend(subagent_tools);
             cards.extend(subagent_cards);
-            Some(runtime)
+            Some((runtime, spawner))
         } else {
             None
         };
@@ -286,20 +287,17 @@ impl DeepAgentBuilder {
         }
         // The default subagent rail carries the production spawner over the runtime built
         // above; a caller rail named `subagent` wins and keeps its own seam.
-        let subagent_spawner: Option<Arc<dyn SubAgentSpawner>> = match (
-            &subagent_runtime,
-            caller_names.contains(&SUBAGENT_RAIL_NAME),
-        ) {
-            (Some(runtime), false) => {
-                let spawner: Arc<dyn SubAgentSpawner> =
-                    Arc::new(RuntimeSubAgentSpawner::new(Arc::clone(runtime)));
-                rails.register(Arc::new(
-                    SubagentRail::new().with_spawner(Arc::clone(&spawner)),
-                ));
-                Some(spawner)
-            }
-            _ => None,
-        };
+        let subagent_spawner: Option<Arc<dyn SubAgentSpawner>> =
+            match (&subagent_wiring, caller_names.contains(&SUBAGENT_RAIL_NAME)) {
+                (Some((_, spawner)), false) => {
+                    let spawner: Arc<dyn SubAgentSpawner> = spawner.clone();
+                    rails.register(Arc::new(
+                        SubagentRail::new().with_spawner(Arc::clone(&spawner)),
+                    ));
+                    Some(spawner)
+                }
+                _ => None,
+            };
         if cards.iter().any(|card| is_goal_tool_name(&card.name))
             && !caller_names.contains(&GOAL_RAIL_NAME)
         {
@@ -331,7 +329,9 @@ impl DeepAgentBuilder {
             permission,
             permission_host: permission_host
                 .unwrap_or_else(|| Arc::new(crate::permission::NoopPermissionHost)),
-            subagent_runtime: Arc::new(RwLock::new(subagent_runtime)),
+            subagent_runtime: Arc::new(RwLock::new(
+                subagent_wiring.map(|(runtime, _spawner)| runtime),
+            )),
             subagent_spawner,
             model: model_slot,
             initialized: Arc::new(std::sync::atomic::AtomicBool::new(initialized)),

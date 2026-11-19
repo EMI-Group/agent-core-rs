@@ -2,6 +2,18 @@
 //!
 //! Kept beside `workspace_backend.rs` (through a `#[path]` module) so the implementation file
 //! stays within the crate's per-file size budget.
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+use openjiuwen_sysop::fs::types::{
+    DownloadFileData, DownloadFileParams, ListDirsParams, ListFilesData, ListFilesParams,
+    ReadChunkData, ReadFileData, ReadFileParams, SearchFilesData, SearchFilesParams,
+    TransferChunkData, UploadFileData, UploadFileParams, WriteFileData,
+};
+use openjiuwen_sysop::{OpResult, OpStream, SysOpStatus};
+
 use super::*;
 
 /// Builds a backend over a throwaway English workspace.
@@ -9,6 +21,238 @@ fn backend() -> (tempfile::TempDir, WorkspaceMemoryBackend) {
     let dir = tempfile::tempdir().expect("temp workspace");
     let workspace = Workspace::for_language(dir.path(), "en");
     (dir, WorkspaceMemoryBackend::new(workspace))
+}
+
+/// How [`SpyFs`] answers a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpyMode {
+    /// Create the temporary file at the requested path (a normal backend).
+    Write,
+    /// Fail the write without touching the disk (a refusing seam).
+    Fail,
+    /// Report success without creating the file, so the caller's rename cannot find it.
+    Skip,
+}
+
+/// A filesystem backend that records every write and can refuse or hide it.
+///
+/// The spy is the assertion that a write actually goes through the [`FsOperation`] seam: a
+/// counting backend sees the temporary-sibling write, a refusing one makes the whole write fail,
+/// and a skipping one makes the rename step fail.
+struct SpyFs {
+    mode: SpyMode,
+    root: PathBuf,
+    writes: AtomicUsize,
+    observed: Mutex<Vec<(String, String)>>,
+}
+
+impl SpyFs {
+    /// Builds a spy over `root` answering writes with `mode`.
+    fn new(mode: SpyMode, root: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            mode,
+            root,
+            writes: AtomicUsize::new(0),
+            observed: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Number of `write_file` calls the backend made through the seam.
+    fn writes(&self) -> usize {
+        self.writes.load(Ordering::SeqCst)
+    }
+
+    /// The `(path, text)` pairs the spy was asked to write.
+    fn observed(&self) -> Vec<(String, String)> {
+        self.observed.lock().expect("spy lock").clone()
+    }
+}
+
+fn unsupported<T>() -> OpResult<T> {
+    OpResult::failure(SysOpStatus::Error, "unsupported by the spy")
+}
+
+#[async_trait]
+impl FsOperation for SpyFs {
+    async fn read_file(&self, _params: ReadFileParams) -> OpResult<ReadFileData> {
+        unsupported()
+    }
+    fn read_file_stream(self: Arc<Self>, _params: ReadFileParams) -> OpStream<ReadChunkData> {
+        Box::pin(futures::stream::empty())
+    }
+    async fn write_file(&self, params: WriteFileParams) -> OpResult<WriteFileData> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        if self.mode == SpyMode::Fail {
+            return OpResult::failure(SysOpStatus::FsExecutionError, "seam refused the write");
+        }
+        let text = params.content.as_text().unwrap_or_default().to_owned();
+        self.observed
+            .lock()
+            .expect("spy lock")
+            .push((params.path.clone(), text.clone()));
+        if self.mode == SpyMode::Write {
+            let path = self.root.join(&params.path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("spy parent directory");
+            }
+            std::fs::write(&path, &text).expect("spy temporary file");
+        }
+        OpResult::success(WriteFileData {
+            path: params.path,
+            size: text.len() as u64,
+            mode: openjiuwen_sysop::fs::types::ReadMode::Text,
+        })
+    }
+    async fn upload_file(&self, _params: UploadFileParams) -> OpResult<UploadFileData> {
+        unsupported()
+    }
+    fn upload_file_stream(
+        self: Arc<Self>,
+        _params: UploadFileParams,
+    ) -> OpStream<TransferChunkData> {
+        Box::pin(futures::stream::empty())
+    }
+    async fn download_file(&self, _params: DownloadFileParams) -> OpResult<DownloadFileData> {
+        unsupported()
+    }
+    fn download_file_stream(
+        self: Arc<Self>,
+        _params: DownloadFileParams,
+    ) -> OpStream<TransferChunkData> {
+        Box::pin(futures::stream::empty())
+    }
+    async fn list_files(&self, _params: ListFilesParams) -> OpResult<ListFilesData> {
+        unsupported()
+    }
+    async fn list_directories(&self, _params: ListDirsParams) -> OpResult<ListFilesData> {
+        unsupported()
+    }
+    async fn search_files(&self, _params: SearchFilesParams) -> OpResult<SearchFilesData> {
+        unsupported()
+    }
+}
+
+/// Builds a backend over `dir` whose writes go through `spy`.
+fn spied_backend(dir: &tempfile::TempDir, spy: Arc<SpyFs>) -> WorkspaceMemoryBackend {
+    WorkspaceMemoryBackend::new(Workspace::for_language(dir.path(), "en")).with_fs_operation(spy)
+}
+
+/// Every file name below `root` that contains `.tmp`.
+fn temp_siblings(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(temp_siblings(&path));
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.contains(".tmp") {
+            found.push(name);
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn writes_go_through_the_filesystem_seam() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let spy = SpyFs::new(SpyMode::Write, dir.path().to_path_buf());
+    let backend = spied_backend(&dir, Arc::clone(&spy));
+
+    let data = backend
+        .write(MemoryScope::Memory, "MEMORY.md", "seam text", false)
+        .await
+        .expect("the spied write succeeds");
+
+    assert_eq!(data.path, "memory/MEMORY.md");
+    assert_eq!(spy.writes(), 1, "the backend must not bypass the seam");
+    let observed = spy.observed();
+    assert_eq!(observed.len(), 1);
+    assert!(
+        observed[0].0.contains(".tmp"),
+        "the seam is handed the temporary sibling, got {}",
+        observed[0].0
+    );
+    assert_eq!(observed[0].1, "seam text");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("memory/MEMORY.md")).expect("written file"),
+        "seam text"
+    );
+    assert!(
+        temp_siblings(dir.path()).is_empty(),
+        "the temporary sibling is renamed away"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_seam_write_keeps_the_previous_content() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let target = dir.path().join("memory/MEMORY.md");
+    std::fs::create_dir_all(target.parent().expect("parent")).expect("memory directory");
+    std::fs::write(&target, "original").expect("fixture");
+
+    let spy = SpyFs::new(SpyMode::Fail, dir.path().to_path_buf());
+    let backend = spied_backend(&dir, Arc::clone(&spy));
+    let error = backend
+        .write(MemoryScope::Memory, "MEMORY.md", "replacement", false)
+        .await
+        .expect_err("a refusing seam fails the write");
+
+    assert!(
+        error.message().contains("seam refused the write"),
+        "the seam error surfaces, got {error}"
+    );
+    assert_eq!(
+        spy.writes(),
+        1,
+        "the backend reached the seam before failing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("unchanged file"),
+        "original"
+    );
+    assert!(
+        temp_siblings(dir.path()).is_empty(),
+        "no .tmp sibling survives"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_rename_keeps_the_previous_content_and_removes_no_temp() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let target = dir.path().join("memory/MEMORY.md");
+    std::fs::create_dir_all(target.parent().expect("parent")).expect("memory directory");
+    std::fs::write(&target, "original").expect("fixture");
+
+    // The seam reports success but never creates the temporary sibling, so the rename that
+    // commits the write fails and the old content must survive.
+    let spy = SpyFs::new(SpyMode::Skip, dir.path().to_path_buf());
+    let backend = spied_backend(&dir, Arc::clone(&spy));
+    let error = backend
+        .write(MemoryScope::Memory, "MEMORY.md", "replacement", false)
+        .await
+        .expect_err("a missing temporary file fails the rename");
+
+    assert!(
+        error.message().contains("failed to write memory file"),
+        "the rename failure surfaces, got {error}"
+    );
+    assert_eq!(spy.writes(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("unchanged file"),
+        "original"
+    );
+    assert!(
+        temp_siblings(dir.path()).is_empty(),
+        "no .tmp sibling survives"
+    );
 }
 
 #[test]

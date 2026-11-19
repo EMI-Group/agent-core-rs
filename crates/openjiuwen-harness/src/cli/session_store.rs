@@ -1,7 +1,7 @@
 //! Append-only session records written by the CLI.
 //!
-//! Each CLI session is one JSONL file at `<home>/sessions/<session_id>.json` — the Python
-//! shape, stored as a journal instead of a document so a turn costs one append:
+//! Each CLI session is one JSONL file at `<home>/sessions/<session_id>.jsonl`, carrying the
+//! Python document's fields as a journal instead of a document so a turn costs one append:
 //!
 //! ```text
 //! {"type":"header","session_id":"cli-1a2b3c4d","model":"gpt-4o","created_at":"…"}
@@ -13,6 +13,14 @@
 //! every reader (`sessions list`, `sessions show`, `--resume`/`--continue`) sees the same
 //! transcript. A legacy single-document record (pretty-printed or one line, without a
 //! `"type"` tag) is still read, so records written before the journal format keep working.
+//!
+//! # On-disk extension
+//!
+//! The JSONL journal uses its own `.jsonl` extension: handing a journal to a reader that
+//! expects a JSON document would silently break it. Records written before the switch sit at
+//! the legacy `<session_id>.json` path (see [`SessionStore::legacy_path_for`]); `load` and
+//! `list` read both, and the next append migrates a legacy record to `<session_id>.jsonl` and
+//! removes the old file. `list` sees both shapes and never reports one session twice.
 //!
 //! # Cost
 //!
@@ -43,7 +51,7 @@
 //! file past the usual 1000-line bound; the tests stay here because they exercise the private
 //! journal lines, the lock table and the compaction policy directly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -57,6 +65,10 @@ use serde_json::Value;
 /// Default cap on the retained size of one session record, in bytes.
 pub const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Extension of the canonical CLI session record: one append-only JSONL journal per session.
+pub(crate) const SESSION_RECORD_EXTENSION: &str = "jsonl";
+/// Extension records written before the JSONL switch used; still read, never written.
+pub(crate) const LEGACY_SESSION_RECORD_EXTENSION: &str = "json";
 /// Bytes of a record head inspected when deciding whether it needs the legacy migration.
 const MIGRATION_SNIFF_BYTES: usize = 4096;
 
@@ -183,10 +195,39 @@ impl SessionStore {
         self.max_bytes
     }
 
-    /// Returns the record path: `<home>/sessions/<session_id>.json`.
+    /// Returns the canonical record path: `<home>/sessions/<session_id>.jsonl`.
+    ///
+    /// New records always use the JSONL extension, so a document reader can never be handed
+    /// journal lines by mistake. A record written before the switch still loads from the
+    /// legacy path documented on [`SessionStore::legacy_path_for`].
     #[must_use]
     pub fn path_for(&self, session_id: &str) -> PathBuf {
-        self.home.sessions_dir().join(format!("{session_id}.json"))
+        self.home
+            .sessions_dir()
+            .join(format!("{session_id}.{SESSION_RECORD_EXTENSION}"))
+    }
+    /// Returns the legacy record path: `<home>/sessions/<session_id>.json`.
+    ///
+    /// This is where a record written before the JSONL switch lives. It is only ever read:
+    /// the next [`SessionStore::append_turn`] migrates its content to
+    /// [`SessionStore::path_for`] and removes the legacy file.
+    #[must_use]
+    pub fn legacy_path_for(&self, session_id: &str) -> PathBuf {
+        self.home
+            .sessions_dir()
+            .join(format!("{session_id}.{LEGACY_SESSION_RECORD_EXTENSION}"))
+    }
+    /// Returns the path that currently holds `session_id`, preferring the canonical record.
+    fn existing_path_for(&self, session_id: &str) -> PathBuf {
+        let canonical = self.path_for(session_id);
+        if canonical.exists() {
+            return canonical;
+        }
+        let legacy = self.legacy_path_for(session_id);
+        if legacy.exists() {
+            return legacy;
+        }
+        canonical
     }
 
     /// Creates (or overwrites) the record for `session_id` with an empty transcript.
@@ -293,7 +334,7 @@ impl SessionStore {
     /// Returns [`Error::Session`] naming the path when the file cannot be read
     /// or does not contain a valid record.
     pub fn load(&self, session_id: &str) -> Result<Option<SessionRecord>> {
-        let path = self.path_for(session_id);
+        let path = self.existing_path_for(session_id);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -310,8 +351,10 @@ impl SessionStore {
     /// Lists every readable session record, ordered by session id.
     ///
     /// A missing sessions directory is not an error: it yields an empty list. The
-    /// entries are the `*.json` files of the sessions directory, sorted by file
-    /// name, which is the session-id order Python's `/sessions` uses.
+    /// entries are the `*.jsonl` records plus any legacy `*.json` record of the sessions
+    /// directory, sorted by file name, which is the session-id order Python's `/sessions`
+    /// uses. A legacy file whose canonical `.jsonl` record exists is skipped, so a migrated
+    /// session is listed once.
     ///
     /// Listing is best effort per file, matching Python: a file that cannot be
     /// read or parsed is logged with `tracing::warn!` and skipped, so one corrupt
@@ -335,7 +378,7 @@ impl SessionStore {
             }
         };
 
-        let mut paths = Vec::new();
+        let mut records: Vec<(String, bool, PathBuf)> = Vec::new();
         for entry in read_dir {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -349,12 +392,29 @@ impl SessionStore {
                 }
             };
             let path = entry.path();
-            let is_json = path.extension().and_then(std::ffi::OsStr::to_str) == Some("json");
-            if !is_json || !matches!(entry.file_type(), Ok(kind) if kind.is_file()) {
+            let extension = path.extension().and_then(std::ffi::OsStr::to_str);
+            let canonical = extension == Some(SESSION_RECORD_EXTENSION);
+            let legacy = extension == Some(LEGACY_SESSION_RECORD_EXTENSION);
+            if !(canonical || legacy) || !matches!(entry.file_type(), Ok(kind) if kind.is_file()) {
                 continue;
             }
-            paths.push(path);
+            let stem = path
+                .file_stem()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or_default()
+                .to_owned();
+            records.push((stem, canonical, path));
         }
+        let canonical_stems: HashSet<String> = records
+            .iter()
+            .filter(|(_, canonical, _)| *canonical)
+            .map(|(stem, _, _)| stem.clone())
+            .collect();
+        let mut paths: Vec<PathBuf> = records
+            .into_iter()
+            .filter(|(stem, canonical, _)| *canonical || !canonical_stems.contains(stem))
+            .map(|(_, _, path)| path)
+            .collect();
         paths.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
 
         let mut summaries = Vec::with_capacity(paths.len());
@@ -440,7 +500,9 @@ impl SessionStore {
         let path = self.path_for(&record.session_id);
         let guard = record_lock(&path);
         let _held = guard.lock();
-        write_journal(&path, record)
+        write_journal(&path, record)?;
+        remove_legacy(&self.legacy_path_for(&record.session_id));
+        Ok(())
     }
 }
 
@@ -467,29 +529,64 @@ fn write_journal(path: &Path, record: &SessionRecord) -> Result<()> {
 /// The caller holds the path lock. The check reads only the first
 /// [`MIGRATION_SNIFF_BYTES`] bytes of the record, so an append stays O(1): the whole file is
 /// read exactly once, when a record written in the old document format is migrated.
-fn migrate_legacy(path: &Path) -> Result<()> {
-    let Some(prefix) = read_prefix(path, MIGRATION_SNIFF_BYTES)? else {
-        return Ok(());
-    };
-    let first_line = prefix.lines().find(|line| !line.trim().is_empty());
-    let Some(first_line) = first_line else {
-        return Ok(());
-    };
-    let journal_line = serde_json::from_str::<RecordLine>(first_line).is_ok()
-        || matches!(
-            serde_json::from_str::<Value>(first_line),
-            Ok(Value::Object(map)) if map.contains_key("type")
+fn migrate_legacy(canonical: &Path) -> Result<()> {
+    let legacy = canonical.with_extension(LEGACY_SESSION_RECORD_EXTENSION);
+    if canonical.exists() {
+        // A document that already sits at the canonical path (a record written before the
+        // extension moved) is rewritten in place.
+        if is_journal_path(canonical)? {
+            return Ok(());
+        }
+        let record = read_document(canonical)?;
+        tracing::debug!(
+            path = %canonical.display(),
+            "migrating a legacy session record to the append-only journal format"
         );
-    if journal_line {
+        return write_journal(canonical, &record);
+    }
+    if !legacy.exists() {
         return Ok(());
     }
-    let text = std::fs::read_to_string(path).map_err(|error| io_error("read", path, &error))?;
-    let record = parse_record(&text, path)?;
+    if is_journal_path(&legacy)? {
+        // A journal that was already written under the legacy name only needs the rename.
+        return std::fs::rename(&legacy, canonical)
+            .map_err(|error| io_error("rename", &legacy, &error));
+    }
+    let record = read_document(&legacy)?;
     tracing::debug!(
-        path = %path.display(),
-        "migrating a legacy session record to the append-only journal format"
+        path = %legacy.display(),
+        "migrating a legacy session record to the JSONL extension"
     );
-    write_journal(path, &record)
+    write_journal(canonical, &record)?;
+    remove_legacy(&legacy);
+    Ok(())
+}
+/// Reports whether the record at `path` is already an append-only journal.
+fn is_journal_path(path: &Path) -> Result<bool> {
+    let Some(prefix) = read_prefix(path, MIGRATION_SNIFF_BYTES)? else {
+        return Ok(true);
+    };
+    let Some(first_line) = prefix.lines().find(|line| !line.trim().is_empty()) else {
+        return Ok(true);
+    };
+    Ok(is_journal(first_line))
+}
+/// Reads a legacy single-document record from `path`.
+fn read_document(path: &Path) -> Result<SessionRecord> {
+    let text = std::fs::read_to_string(path).map_err(|error| io_error("read", path, &error))?;
+    parse_record(&text, path)
+}
+/// Removes a migrated legacy record; a file that is already gone is not an error.
+fn remove_legacy(legacy: &Path) {
+    match std::fs::remove_file(legacy) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            path = %legacy.display(),
+            %error,
+            "failed to remove the migrated legacy session record"
+        ),
+    }
 }
 
 /// Reads at most `limit` bytes from the head of `path`, or `None` when the file is empty.
@@ -798,7 +895,7 @@ mod tests {
             );
         }
         // No temporary file survives an append-only record.
-        assert!(!temp.path().join("sessions/cli-append.json.tmp").exists());
+        assert!(!temp.path().join("sessions/cli-append.jsonl.tmp").exists());
         let loaded = store.load("cli-append").unwrap().unwrap();
         assert_eq!(loaded.messages.len(), 50);
         assert_eq!(loaded.messages[0].role, "user");
@@ -823,7 +920,7 @@ mod tests {
         assert_eq!(loaded.model, "gpt-4o");
         assert_eq!(loaded.messages, messages);
 
-        let raw = std::fs::read_to_string(temp.path().join("sessions/cli-turn.json")).unwrap();
+        let raw = std::fs::read_to_string(temp.path().join("sessions/cli-turn.jsonl")).unwrap();
         let lines: Vec<&str> = raw.lines().collect();
         assert_eq!(lines.len(), 3, "one header plus one line per message");
         assert!(lines[0].contains("\"type\":\"header\""), "{}", lines[0]);
@@ -995,7 +1092,17 @@ mod tests {
         assert_eq!(loaded.messages[0].content, "earlier");
         assert_eq!(loaded.messages[1].content, "later");
         assert_eq!(loaded.created_at, legacy.created_at);
-        assert_eq!(store.list().unwrap()[0].messages, 2);
+        assert!(
+            sessions.join("cli-legacy.jsonl").exists(),
+            "the next append migrates the record to the JSONL extension"
+        );
+        assert!(
+            !sessions.join("cli-legacy.json").exists(),
+            "the migrated legacy file is removed"
+        );
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1, "the migrated session is listed once");
+        assert_eq!(listed[0].messages, 2);
     }
 
     #[test]
@@ -1069,6 +1176,42 @@ mod tests {
         assert_eq!(listed[0].messages, 0);
     }
 
+    #[test]
+    fn list_sees_legacy_and_jsonl_records_and_skips_migrated_duplicates() {
+        let (temp, store) = store();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        store.new_session("cli-new", "gpt-4o").unwrap();
+        store.append_message("cli-new", "user", "hi").unwrap();
+        let legacy = SessionRecord {
+            session_id: "cli-old".to_owned(),
+            model: "gpt-4o-mini".to_owned(),
+            created_at: "2026-01-01T00:00:00+00:00".to_owned(),
+            messages: vec![MessageRecord::new("user", "earlier")],
+        };
+        std::fs::write(
+            sessions.join("cli-old.json"),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+        // A stale legacy file next to its canonical record must not list the session twice.
+        std::fs::write(
+            sessions.join("cli-new.json"),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+        let listed = store.list().unwrap();
+        let ids: Vec<&str> = listed
+            .iter()
+            .map(|summary| summary.session_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["cli-new", "cli-old"]);
+        assert_eq!(listed[0].messages, 1, "the canonical JSONL journal is read");
+        assert_eq!(
+            listed[1].messages, 1,
+            "the legacy document is read as written"
+        );
+    }
     #[test]
     fn list_of_a_missing_sessions_directory_is_empty() {
         let (_temp, store) = store();

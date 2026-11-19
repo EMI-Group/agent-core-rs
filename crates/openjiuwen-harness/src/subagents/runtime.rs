@@ -272,8 +272,9 @@ pub struct SubAgentRuntime {
 impl SubAgentRuntime {
     /// Creates a runtime for `parent_session_id` over `registry` and `factory`.
     ///
-    /// Defaults match Python: 10 live instances, 5 concurrent turns, 2400 s per turn, no
-    /// cumulative/per-parent/depth cap, LRU eviction policy enabled.
+    /// Defaults keep Python's 10 live instances, 5 concurrent turns and 2400 s per turn, add the
+    /// documented 32 cumulative spawns, 4 children per parent and depth-3 caps, and leave LRU
+    /// eviction enabled.
     #[must_use]
     pub fn new(
         registry: Arc<SubAgentRegistry>,
