@@ -55,7 +55,7 @@ Four `ControllerConfig` fields change the loop; the remaining fields keep their 
 - Recognized intents are filtered by `ControllerConfig::accepts` (`intent_type_list`), truncated to `max_intents`, and an empty set for an input event falls back to the default intent.
 - `UnknownTask` short-circuits the event with a clarification output (status `InputRequired`, `data.clarification_prompt`), discarding any work accumulated for that event.
 - Planned intents are routed once per turn through the `TaskRouter` (only with at least two registered executors) and planned by `Planner` into `Submitted` tasks with ids `{session_id}_task_{seq}`.
-- `PauseTask`/`CancelTask` intents only flip the stored task's status (`Paused`/`Canceled`) and do not stop a task already running in the background loop; `ResumeTask` sets `Submitted`, claims the task, and re-dispatches it synchronously in the same turn.
+- `PauseTask`/`CancelTask` intents go through `BaseController::pause_task`/`cancel_task`, so a task running in the background loop really stops (executor hooks, token cancellation, awaited driver) and its `Paused`/`Canceled` survives the driver; an unknown, terminal, or refused target yields the `task <id> not found` failure output. `ResumeTask` sets `Submitted`, claims the task, and re-dispatches it synchronously in the same turn.
 - Dispatch is the value-type `TaskScheduler` (sequential, `max_tasks`, `task_timeout_ms`); a task enters the `TaskManager` only after its batch ran, so the background loop never sees a turn's submitted tasks.
 - Aggregation precedence is `InputRequired` > `Completed` > `Failed`; completed texts join with `\n\n`, `default_response.text` fills an empty answer, and `data.tasks` lists `{task_id, status, output}` (plus `reasoning` when the config exposes it).
 - The last event's produced output wins; a turn with no output falls back to the default response with status `Completed`.
@@ -79,17 +79,18 @@ Four `ControllerConfig` fields change the loop; the remaining fields keep their 
 
 - Single-turn, in-process loop with a `VecDeque` drained by the turn that enqueued into it; no asyncio queue or pub/sub.
 - Tasks are persisted only after they ran, and the turn's `max_tasks` budget is enforced by the scheduler, not by the manager.
-- Control intents are manager-only status flips and bypass the loop's executor hooks.
+- Control intents drive the started loop's executor hooks and cancellation before recording the status; without a loop they are manager-only status flips. Python only rewrites the task status.
 - `tasks()` is unscoped (whole shared store), unlike Python's session-scoped views.
 - Persistence is one session key holding the manager snapshot plus the planner sequence; the ordering key `created_seq` is never on the wire.
 - `stream` is the only path that writes turn frames to the session stream; `invoke` returns them on the output.
 
 ## Test Strategy
 
-- 42 offline tests: `tests.rs` 32, `state.rs` 5, `mod.rs` 5.
+- Offline `#[cfg(test)]` tests in `tests.rs`, `state.rs`, `mod.rs`, and `fixtures.rs`.
 - `tests.rs` covers router selection and the single-executor shortcut, unregistered task types with the default response, stream shape, the three handler outcomes, signal events, `max_intents`, the started loop running a manager-inserted task, start/stop idempotency, shutdown of an in-flight run, manager-only pause/cancel fallbacks, loop-delegated pause/cancel/resume, group routing with typed errors, the `with_group`/`group_router` round-trip, reasoner create → loop execution, and the sentinel written once per idle stretch.
 - The enforcement tests cover history recording shape (user then assistant, task id on the assistant entry), the append-time window, recognizer/executor history parity with the current turn excluded, `history_limit == 0` retaining nothing, `clear_history`, read-time re-trim after `set_config`, the reasoning frame and `data.tasks[].reasoning` (and their absence with the flag off), the event deadline cancelling a stalled run and surfacing as the stream's single `Err` frame (`0` completing), and the first-frame deadline ending a slow stream while `invoke` stays unbounded (`0` streaming the slow turn).
 - `state.rs` covers persistence across turns and instances, pause/cancel status persistence, corrupt-state recovery, disabling persistence, and the exact snapshot wire shape.
+- `../../tests/controller_run_control.rs` covers the LLM-requested control path against a live scheduler: a model `pause_task`/`cancel_task` intent stops the running task through the executor hook and leaves the recorded status in place once the driver settles, and a control intent for an unknown task changes nothing.
 - `mod.rs` covers the state key, lifecycle/queue behaviour (binding, executor registry, queue capacity and FIFO drain), the `TaskSchedulerState` wire names, the `Stopped → Running → Stopped` transitions around `start`/`stop`, `Stopping` outside a runtime, and `wake_scheduler`/`running_tasks` with and without a loop.
 - `fixtures.rs` supplies `StubExecutor`, `CooperativeExecutor` (pause/cancel aware, token-driven), `ContextExecutor` (records `TaskContext::history` and `expose_reasoning`, optional reasoning), `StallingExecutor` (`started`/`finished` counters that prove cancellation), `StubHandler`, `CountingRecognizer`, `RecordingRecognizer` (records each `recognize_with_history` slice), `RecordingSession`, the `bounded` 10 s await guard, and the session/controller/control-turn helpers; `ScriptedModel` is used only by the router test.
 

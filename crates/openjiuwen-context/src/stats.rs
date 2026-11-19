@@ -63,6 +63,67 @@ impl ContextStats {
         self.estimated = estimated;
         self
     }
+
+    /// Folds one message's counts and `tokens` into the totals.
+    ///
+    /// This is the increment an in-place append applies to a cached
+    /// [`ContextStats`], so the statistics after `n` appends equal one
+    /// [`compute_stats`] over the whole history without re-counting it.
+    /// [`ContextStats::total_dialogues`] is **not** maintained here: a round
+    /// boundary depends on the neighbouring messages, so the caller recomputes
+    /// it from the trimmed history.
+    pub(crate) fn record_message(&mut self, message: &BaseMessage, tokens: usize) {
+        self.total_messages = self.total_messages.saturating_add(1);
+        self.total_tokens = self.total_tokens.saturating_add(tokens);
+        match message.role {
+            Role::System => {
+                self.system_messages = self.system_messages.saturating_add(1);
+                self.system_tokens = self.system_tokens.saturating_add(tokens);
+            }
+            Role::User => {
+                self.user_messages = self.user_messages.saturating_add(1);
+                self.user_tokens = self.user_tokens.saturating_add(tokens);
+            }
+            Role::Assistant => {
+                self.assistant_messages = self.assistant_messages.saturating_add(1);
+                self.assistant_tokens = self.assistant_tokens.saturating_add(tokens);
+            }
+            Role::Tool => {
+                self.tool_messages = self.tool_messages.saturating_add(1);
+                self.tool_tokens = self.tool_tokens.saturating_add(tokens);
+            }
+            Role::Other(_) => {}
+        }
+    }
+
+    /// Removes one message's contribution, saturating at zero.
+    ///
+    /// Only an append's eviction path uses this; it is the inverse of
+    /// [`ContextStats::record_message`] and leaves
+    /// [`ContextStats::total_dialogues`] to the caller.
+    pub(crate) fn unrecord_message(&mut self, message: &BaseMessage, tokens: usize) {
+        self.total_messages = self.total_messages.saturating_sub(1);
+        self.total_tokens = self.total_tokens.saturating_sub(tokens);
+        match message.role {
+            Role::System => {
+                self.system_messages = self.system_messages.saturating_sub(1);
+                self.system_tokens = self.system_tokens.saturating_sub(tokens);
+            }
+            Role::User => {
+                self.user_messages = self.user_messages.saturating_sub(1);
+                self.user_tokens = self.user_tokens.saturating_sub(tokens);
+            }
+            Role::Assistant => {
+                self.assistant_messages = self.assistant_messages.saturating_sub(1);
+                self.assistant_tokens = self.assistant_tokens.saturating_sub(tokens);
+            }
+            Role::Tool => {
+                self.tool_messages = self.tool_messages.saturating_sub(1);
+                self.tool_tokens = self.tool_tokens.saturating_sub(tokens);
+            }
+            Role::Other(_) => {}
+        }
+    }
 }
 
 /// Computes the statistics of `messages`.

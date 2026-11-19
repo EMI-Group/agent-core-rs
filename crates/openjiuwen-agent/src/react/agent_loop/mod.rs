@@ -356,18 +356,18 @@ pub(crate) async fn run_with(
     // The run's text turns, forwarded to the memory provider when this run owns
     // the session.
     let mut turns: Vec<ConversationTurn> = Vec::new();
-    let result = match control
-        .race(run_inner(
-            runtime,
-            &input,
-            &session,
-            publisher.as_ref(),
-            &mut ctx,
-            &mut turns,
-            control,
-        ))
-        .await
-    {
+    // Boxed so the loop's large future does not inflate the wrapper's own
+    // future (`clippy::large_futures`); one allocation per invocation.
+    let inner = Box::pin(run_inner(
+        runtime,
+        &input,
+        &session,
+        publisher.as_ref(),
+        &mut ctx,
+        &mut turns,
+        control,
+    ));
+    let result = match control.race(inner).await {
         Ok(result) => result,
         Err(error) => Err(error),
     };

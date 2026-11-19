@@ -59,7 +59,7 @@ pub struct AgentOutput {
     pub result_type: ResultType,
     pub finish_reason: Option<String>,
     pub reasoning_present: bool,
-    pub termination_reason: Option<String>,               // "max_iterations" | "token_budget" | "cancelled"
+    pub termination_reason: Option<String>,               // "max_iterations" | "token_budget" | "workflow_error"
     pub truncated_by_max_iterations: bool,
     pub iterations_used: Option<usize>,
     pub observations: Vec<Observation>,
@@ -120,10 +120,14 @@ pub struct ReActAgentConfig {                       // Python ReActAgentConfig f
     pub parallel_tool_calls: bool,                  // true
     pub retain_tool_facts_on_abort: bool,           // false
     pub max_total_tokens: Option<usize>,            // None; extension over Python (budget across a run)
+    pub completion_timeout_secs: f64,               // DEFAULT_COMPLETION_TIMEOUT_SECS (600.0); 0 disables the run deadline
+    pub tool_timeout_secs: f64,                     // DEFAULT_TOOL_TIMEOUT_SECS (600.0); 0 disables the per-call deadline
 }
 impl ReActAgentConfig { pub fn new() -> Self; /* configure_model, configure_model_provider, configure_prompt,
     configure_prompt_template, configure_max_iterations, configure_model_client, configure_parallel_tool_calls,
-    configure_context_engine, configure_mem_scope, configure_custom_headers (all builder-style) */ }
+    configure_context_engine, configure_mem_scope, configure_custom_headers, configure_completion_timeout,
+    configure_tool_timeout (all builder-style) */ }
+// `react::config::{DEFAULT_COMPLETION_TIMEOUT_SECS, DEFAULT_TOOL_TIMEOUT_SECS}` are `pub const f64 = 600.0`.
 
 pub struct ReActAgent { /* card, RwLock<ReActAgentConfig>, RwLock<Option<Arc<dyn Model>>>, RwLock<SystemPromptBuilder>,
                             RwLock<AbilityManager>, RwLock<Arc<RailRegistry>>, RwLock<Arc<ContextEngine>>,
@@ -134,6 +138,7 @@ impl ReActAgent {
     pub fn config(&self) -> ReActAgentConfig;
     pub fn set_model(&self, model: Arc<dyn Model>);
     pub fn model(&self) -> Result<Arc<dyn Model>>;               // Error::Config when unconfigured
+    pub fn abort(&self);                                         // cancels the most recently started run
     pub fn add_tool(&self, tool: Arc<dyn Tool>) -> AddAbilityResult;
     pub fn add_tools(&self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> Vec<AddAbilityResult>;
     pub fn remove_tool(&self, name: &str) -> Option<Arc<dyn Tool>>;
@@ -177,7 +182,9 @@ Loop semantics (Python `_inner_invoke`): iteration `1..=limit`; per iteration bu
 No tool calls → `{"output": content, "result_type": "answer"}`; empty content → one retry after injecting a notice, then `result_type: "error"` with `finish_reason`/`reasoning_present`.
 Exhaustion → `termination_reason: "max_iterations"`, `iterations_used`, `truncated_by_max_iterations: true` and the configured policy (`Error` → error output; `ReturnObservations` → observations attached; `FinalAnswer` → one extra tool-free model call).
 Interrupts pause the loop into an `AgentOutput` with `result_type: "interrupt"`, `state` frames and `interrupt_ids`; state is persisted under `__react_agent_interruption__` and cleared on resume.
-The loop never observes cancellation: `run_with` takes no `CancellationToken` and `retain_tool_facts_on_abort` is never read, so only tool execution sees a token (`ToolExecutionOptions::cancellation`, reported as a failed tool result).
+Run control (`react/control.rs`) spans every path: each `invoke`/`stream` installs a fresh `CancellationToken` on the agent, `ReActAgent::abort()` cancels the most recently started one, and dropping a returned stream cancels its own token through a `CancelOnDrop` guard.
+`RunControl::race` races the loop future, every model-stream poll, and the tool-free `FinalAnswer` call against that token and the run deadline (`completion_timeout_secs`), and the tool calls also get `tool_timeout_secs`; a cancelled run ends with `Error::Cancelled` (one terminal `Err` item on a stream) and an expired one with `Error::Timeout`.
+`retain_tool_facts_on_abort` is still read by no code path.
 
 ### Context usage frames (`react/frames.rs`)
 
@@ -479,6 +486,8 @@ Each has its own `CONTEXT.md` with the full API.
 - Dependency scheduling is a documented extension: a task with `metadata["depends_on"] = [ids]` and status `Waiting` is promoted to `Submitted` once every dependency is `Completed`; Python declares the `waiting` status but never gates on it.
 - The background scheduler admits in deterministic priority-descending order (`created_seq`, then `task_id` tiebreaks), treats `max_concurrent_tasks = 0` as unlimited (documented divergence from Python's bug), and emits `all_tasks_processed` once per idle stretch unless `suppress_completion_signal` is set.
 - `TaskExecutor` pause/cancel hooks are defaulted, so every executor that does not support them keeps compiling; a `Submitted` cancel short-circuits to `Canceled`, terminal states are idempotent, and a resume flips `Paused` → `Submitted`.
+- A turn's `PauseTask`/`CancelTask` intents go through `BaseController::pause_task`/`cancel_task`, so a task running on the background scheduler is stopped (executor hooks, token cancellation, awaited driver) and its recorded `Paused`/`Canceled` survives a driver that still returns a completion (the background loop keeps a recorded decision over its own `Completed`).
+- Every background driver releases its run through `RunGuard`, so a returned, early-returning, or unwinding driver always untracks the task, wakes the loop, and fails a still-running task instead of leaking its concurrency slot.
 - `TaskQueue` (legacy `IntentDetectionController`) allows one running task per conversation: a new message aborts the previous handler fire-and-forget, cancels the tracked run, then enqueues. `GroupRouter` is optional; without one `send_to_agent`/`publish` return `Error::Config` naming the method (and agent).
 - `TaskQueue` is legacy-only (`BaseController` exposes no queue); `BaseController::scheduler_state()`/`running_tasks()`/`wake_scheduler()` are the live background-scheduler view, with `TaskSchedulerState::{Stopped, Running, Stopping}` derived from the running flag plus a live `TaskSchedulerLoop`.
 - `reasoner` is the task-operation layer behind Python's intent tools: `plan_ops` maps create/pause/resume/cancel/continue/supplement/modify intents, degrades to `Unknown` below `intent_confidence_threshold`, and `apply_task_ops` never aborts a batch.
@@ -504,19 +513,21 @@ Each has its own `CONTEXT.md` with the full API.
 
 ## Test Strategy
 
-- Unit tests beside every module (996) cover the seams in isolation: card/`AgentInput`/`AgentOutput` serde, `match_answers`/`parse_approval`, prompt section ordering, rail registry dispatch, guardrail stages, memory recall injection and memory prompt variables, model-backup ordering, interrupt rail flows, tool-argument repair, parallel tool batching, callback dispatch ordering, steering FIFO/thread sharing, exposure/allowlist projection, client-tool registry, resilience backoff, final-request decisions, skill front matter/discovery/rail, multimodal part extraction, controller routing/intents/tasks/legacy controllers, the four enforced controller knobs (history window + recognizer/executor observation, reasoning gate both ways, per-event deadline cancellation, first-frame deadline frame sequence), task-manager filters/indexes/persistence, background scheduling/timeouts/cancellation/sentinel, executor pause/cancel, `TaskQueue` preemption, group routing, the controller scheduler facade and `group_router` round-trip, reasoner task ops, KV-cache identity/LRU/eviction/metadata plus the action runtime (non-blocking prefetch, idle-gated offload, fail-open, revision guard), the loop's KV-cache touch point, the memory provider rail/tools/prompt block/finalization gate, the usage identity helpers and telemetry buffer, operator tunables/state/propagation plus the legacy `LLMCall`, memory `max_retries`, experience preview/staging, `ReActAgentEvolve` parameter sync, and prompt-pack YAML + directory/front-matter loading.
+- Unit tests beside every module cover the seams in isolation: card/`AgentInput`/`AgentOutput` serde, `match_answers`/`parse_approval`, prompt section ordering, rail registry dispatch, guardrail stages, memory recall injection and memory prompt variables, model-backup ordering, interrupt rail flows, tool-argument repair, parallel tool batching, callback dispatch ordering, steering FIFO/thread sharing, exposure/allowlist projection, client-tool registry, resilience backoff, final-request decisions, skill front matter/discovery/rail, multimodal part extraction, controller routing/intents/tasks/legacy controllers, the four enforced controller knobs (history window + recognizer/executor observation, reasoning gate both ways, per-event deadline cancellation, first-frame deadline frame sequence), task-manager filters/indexes/persistence, background scheduling/timeouts/cancellation/sentinel, executor pause/cancel, `TaskQueue` preemption, group routing, the controller scheduler facade and `group_router` round-trip, reasoner task ops, KV-cache identity/LRU/eviction/metadata plus the action runtime (non-blocking prefetch, idle-gated offload, fail-open, revision guard), the loop's KV-cache touch point, the memory provider rail/tools/prompt block/finalization gate, the usage identity helpers and telemetry buffer, operator tunables/state/propagation plus the legacy `LLMCall`, memory `max_retries`, experience preview/staging, `ReActAgentEvolve` parameter sync, and prompt-pack YAML + directory/front-matter loading.
 - `src/react/wiring/` holds the loop-integration suites for the six side seams (callbacks, steering — including the `before_steering_drain` firing/capping/error paths — exposure/MCP/resilience, client tools, final-request check); they live under `src/` to observe crate-internal state (`react/wiring/CONTEXT.md`).
-- `tests/agent_card.rs` (16) pins the wire contract: `AgentCard` field set/`Card` trait/JSON round-trip, `AgentOutput` result-type strings and `state` frames, the absent-when-empty key shapes, Python-shaped result dicts, and the `AgentChunk` ↔ `StreamItem` bridge.
-- `tests/react_agent.rs` (12) drives the loop end to end: no-tool answer, single/parallel/failing tools, the three max-iteration policies, empty-response retry, prompt rendering, and input/config errors.
-- `tests/streaming.rs` (4) assembles `llm_output`/`llm_reasoning`/`llm_usage`/`answer` frames and checks the session mirror.
-- `tests/rails.rs` (7) proves rails steer a running agent: priority ordering per event, force-finish before the model and before a tool, `ModelBackupRail` failover, `GuardrailRail` blocking (`ErrorKind::Security`), `MemoryRail` recall + write-back, and `skip_tool`.
-- `tests/interrupt.rs` (8) covers the HITL contract: confirm pause shape and persistence, approve resume, reject with and without feedback, session-seeded auto-confirm, ask-user answer as the tool result, two pending calls pausing once and resuming individually, and the streaming pause path emitting and mirroring its `__interaction__` frame.
-- `tests/llm_agent.rs` (7) covers config mapping onto `ReActAgent`, provider fallback, invoke/stream output filtering, prompt-template override, and interrupt pass-through.
-- `tests/workflow_agent.rs` (5) covers single-workflow invoke/stream, model-driven selection with default-response fallback, workflow interrupt/resume, and the no-workflow error.
-- `tests/memory_provider.rs` (9) drives the provider end to end: prompt block and prefetch in the model window, an empty block leaving the identity alone, schema-mounted tools and dispatch, `sync_turn` plus `on_session_end` for an owned session, a supplied session left unfinalized, failing provider calls not changing the output, an unavailable provider still mounted, `clear_memory_provider` dropping the rail but keeping the tools, and no-provider `end_memory_session`.
-- `tests/usage.rs` (7) pins the usage seam: pre/post-call `context.usage` frames with their snapshots and session mirror, one buffered snapshot per model call on a plain `invoke`, the provider report reaching the KV-cache rollup, the analyzer-less run (pre-call frame, no snapshot, `Error::Config` from `usage_report`), `usage_report` reconciling a supplied provider total, and `configure` keeping an installed analyzer/recorder.
-- `tests/kv_cache_seam.rs` (6) pins the KV-cache seam: the default config installing an inert hook, enabled affinity recording the prefix and input tokens, an action runtime prefetching and releasing its lease without changing the answer, `Redis`/`Distributed` surfacing `Error::Unsupported` while the hook survives, an unchanged run without a hook, and the promoted types reachable from the crate root.
-- The crate suite (996 unit + 81 integration + 5 doc tests) is offline and deterministic on `ScriptedModel`; no network and no wall-clock assertions beyond short timeouts.
+- `tests/agent_card.rs` pins the wire contract: `AgentCard` field set/`Card` trait/JSON round-trip, `AgentOutput` result-type strings and `state` frames, the absent-when-empty key shapes, Python-shaped result dicts, and the `AgentChunk` ↔ `StreamItem` bridge.
+- `tests/react_agent.rs` drives the loop end to end: no-tool answer, single/parallel/failing tools, the three max-iteration policies, empty-response retry, prompt rendering, and input/config errors.
+- `tests/streaming.rs` assembles `llm_output`/`llm_reasoning`/`llm_usage`/`answer` frames and checks the session mirror.
+- `tests/rails.rs` proves rails steer a running agent: priority ordering per event, force-finish before the model and before a tool, `ModelBackupRail` failover, `GuardrailRail` blocking (`ErrorKind::Security`), `MemoryRail` recall + write-back, and `skip_tool`.
+- `tests/interrupt.rs` covers the HITL contract: confirm pause shape and persistence, approve resume, reject with and without feedback, session-seeded auto-confirm, ask-user answer as the tool result, two pending calls pausing once and resuming individually, and the streaming pause path emitting and mirroring its `__interaction__` frame.
+- `tests/llm_agent.rs` covers config mapping onto `ReActAgent`, provider fallback, invoke/stream output filtering, prompt-template override, and interrupt pass-through.
+- `tests/workflow_agent.rs` covers single-workflow invoke/stream, model-driven selection with default-response fallback, workflow interrupt/resume, and the no-workflow error.
+- `tests/memory_provider.rs` drives the provider end to end: prompt block and prefetch in the model window, an empty block leaving the identity alone, schema-mounted tools and dispatch, `sync_turn` plus `on_session_end` for an owned session, a supplied session left unfinalized, failing provider calls not changing the output, an unavailable provider still mounted, `clear_memory_provider` dropping the rail but keeping the tools, and no-provider `end_memory_session`.
+- `tests/usage.rs` pins the usage seam: pre/post-call `context.usage` frames with their snapshots and session mirror, one buffered snapshot per model call on a plain `invoke`, the provider report reaching the KV-cache rollup, the analyzer-less run (pre-call frame, no snapshot, `Error::Config` from `usage_report`), `usage_report` reconciling a supplied provider total, and `configure` keeping an installed analyzer/recorder.
+- `tests/kv_cache_seam.rs` pins the KV-cache seam: the default config installing an inert hook, enabled affinity recording the prefix and input tokens, an action runtime prefetching and releasing its lease without changing the answer, `Redis`/`Distributed` surfacing `Error::Unsupported` while the hook survives, an unchanged run without a hook, and the promoted types reachable from the crate root.
+- `tests/run_control.rs` pins the run's escape hatches: the completion deadline ending a hung model stream, `ReActAgent::abort` cancelling one, a hung tool failing its call after `tool_timeout_secs`, and a dropped stream stopping its run.
+- `tests/controller_run_control.rs` pins the LLM-requested task control against the background scheduler: a pause/cancel intent stops the in-flight task through the executor hooks and the recorded status survives the driver's completion, and a control intent for an unknown task changes nothing.
+- The crate suite is offline and deterministic on `ScriptedModel`; no network and no wall-clock assertions beyond short timeouts.
 
 ## Routing Table
 

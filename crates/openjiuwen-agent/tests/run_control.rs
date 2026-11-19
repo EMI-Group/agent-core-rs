@@ -24,10 +24,10 @@ struct HangingModel {
 }
 #[async_trait]
 impl Model for HangingModel {
-    fn provider(&self) -> &str {
+    fn provider(&self) -> &'static str {
         "fake"
     }
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "hanging"
     }
     async fn invoke(
@@ -152,7 +152,7 @@ async fn dropping_the_stream_stops_the_run() {
         let mut frames = agent.stream(json!("hi"), Some(common::session("drop")));
         // Consume one frame, then drop the stream mid-run.
         let first = frames.next().await.expect("a first frame").unwrap();
-        assert!(!first.kind.is_empty());
+        assert_ne!(first.kind, "");
     }
     // The dropped consumer cancelled the run before it could call the model
     // again for a second iteration.

@@ -14,7 +14,6 @@ use crate::reload::{inject_reload_hint, ReloadLanguage};
 use crate::stats::{compute_stats, PreparedContext};
 use crate::telemetry::recorder::TokenProvenance;
 use crate::telemetry::CompressionStatePhase;
-use crate::tokens::count_messages;
 use crate::window::{assemble_window, drop_orphan_tool_results, WindowOptions};
 
 use super::{ConversationContext, ModelContext};
@@ -144,7 +143,10 @@ impl ConversationContext {
         // estimate.
         let stats = compute_stats(&messages, self.counter.as_ref())
             .with_estimated(self.counts_are_estimated());
-        let token_count = count_messages(self.counter.as_ref(), &messages);
+        // `compute_stats` already measured the window: `total_tokens` is the sum
+        // of the same per-message counts `count_messages` would produce, so
+        // counting the window a second time would only re-tokenize it.
+        let token_count = stats.total_tokens;
         // The LLM-bound window splits at the leading system messages; the split
         // feeds both the usage snapshot and the KV-cache diff.
         let system_count = messages

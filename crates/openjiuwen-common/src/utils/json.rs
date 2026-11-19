@@ -10,7 +10,28 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
+use crate::constants::MAX_COLLECTION_SIZE;
 use crate::error::{Error, Result};
+
+/// Largest array index a JSON path may address.
+///
+/// Paths reach [`set_path`] from user- and model-supplied state keys
+/// (`openjiuwen_session::state::set_value`, `openjiuwen_graph::state::set_path`),
+/// and a bracketed index of `usize::MAX` would otherwise pad the array with that
+/// many [`Value::Null`] entries. The cap is the shared
+/// [`MAX_COLLECTION_SIZE`] (Python `MAX_COLLECTION_SIZE`), which leaves ample
+/// headroom for any realistic state tree while bounding one padding operation to
+/// roughly 3 MiB of `Value`s.
+pub const MAX_JSON_INDEX: usize = MAX_COLLECTION_SIZE;
+
+/// Maximum total number of array slots a single path may create by padding.
+///
+/// Every index segment pads up to its own index, so a crafted path such as
+/// `a[99999][99999]...` could otherwise multiply [`MAX_JSON_INDEX`] by the number
+/// of index segments. One path may address a very large index or chain several
+/// moderately sized ones, but not both: the sum of `index + 1` over all index
+/// segments is capped here (about 6 MiB of `Value`s at the limit).
+const MAX_JSON_PATH_GROWTH: usize = MAX_JSON_INDEX * 2;
 
 /// Deep-merges `overlay` into `base`.
 ///
@@ -44,7 +65,8 @@ pub fn merge(base: &mut Value, overlay: Value) {
 /// Looks up a dotted path inside `value`.
 ///
 /// An empty path returns `value` itself. Missing keys, out-of-range indices,
-/// type mismatches, and malformed paths all return `None`.
+/// type mismatches, malformed paths, and indices above [`MAX_JSON_INDEX`] all
+/// return `None`.
 ///
 /// ```
 /// use serde_json::json;
@@ -80,7 +102,9 @@ pub fn get_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
 ///
 /// Returns [`Error::Validation`] when `path` is empty or malformed (empty
 /// segment, unterminated index, non-numeric index, or trailing characters after
-/// an index).
+/// an index), when an index exceeds [`MAX_JSON_INDEX`], or when the path would
+/// create more array slots in total than that limit allows. The check happens
+/// before anything is written, so a rejected path leaves `value` untouched.
 ///
 /// ```
 /// use serde_json::json;
@@ -92,8 +116,7 @@ pub fn get_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
 /// ```
 pub fn set_path(value: &mut Value, path: &str, new_value: Value) -> Result<()> {
     let segments = parse_path(path)?;
-    set_segments(value, &segments, new_value);
-    Ok(())
+    set_segments(value, &segments, new_value)
 }
 
 /// Flattens nested objects and arrays into a map of dotted paths to leaves.
@@ -201,7 +224,24 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
             "invalid JSON path `{path}`: no segments"
         )));
     }
+    let growth = total_growth(&segments);
+    if growth > MAX_JSON_PATH_GROWTH {
+        return Err(Error::validation(format!(
+            "invalid JSON path `{path}`: padding the array to these indices would create \
+             {growth} entries, exceeding the maximum of {MAX_JSON_PATH_GROWTH}"
+        )));
+    }
     Ok(segments)
+}
+
+/// Sums the `index + 1` slot counts a path implies, saturating at `usize::MAX`.
+fn total_growth(segments: &[PathSegment]) -> usize {
+    segments
+        .iter()
+        .fold(0_usize, |total, segment| match segment {
+            PathSegment::Key(_) => total,
+            PathSegment::Index(index) => total.saturating_add(index.saturating_add(1)),
+        })
 }
 
 /// Parses the `[n][m]...` suffix of a dotted path part.
@@ -223,6 +263,12 @@ fn parse_indices(path: &str, mut rest: &str, segments: &mut Vec<PathSegment>) ->
                 "invalid JSON path `{path}`: index `{digits}` out of range"
             ))
         })?;
+        if index > MAX_JSON_INDEX {
+            return Err(Error::validation(format!(
+                "invalid JSON path `{path}`: array index {index} exceeds the maximum of \
+                 {MAX_JSON_INDEX}"
+            )));
+        }
         segments.push(PathSegment::Index(index));
 
         rest = &rest[close + 1..];
@@ -236,10 +282,14 @@ fn parse_indices(path: &str, mut rest: &str, segments: &mut Vec<PathSegment>) ->
 }
 
 /// Writes `new_value` at `segments`, creating containers along the way.
-fn set_segments(target: &mut Value, segments: &[PathSegment], new_value: Value) {
+///
+/// Indices are validated by [`parse_path`] before this runs; the guards here only
+/// make a future caller that bypasses the parser fail with a typed error instead
+/// of allocating unboundedly.
+fn set_segments(target: &mut Value, segments: &[PathSegment], new_value: Value) -> Result<()> {
     let Some((first, rest)) = segments.split_first() else {
         *target = new_value;
-        return;
+        return Ok(());
     };
 
     match first {
@@ -248,25 +298,36 @@ fn set_segments(target: &mut Value, segments: &[PathSegment], new_value: Value) 
                 *target = Value::Object(Map::new());
             }
             let Some(map) = target.as_object_mut() else {
-                return;
+                return Ok(());
             };
             let entry = map.entry(key.clone()).or_insert(Value::Null);
-            set_segments(entry, rest, new_value);
+            set_segments(entry, rest, new_value)
         }
         PathSegment::Index(index) => {
+            if *index > MAX_JSON_INDEX {
+                return Err(Error::validation(format!(
+                    "cannot address JSON array index {index}: the maximum is {MAX_JSON_INDEX}"
+                )));
+            }
             if !target.is_array() {
                 *target = Value::Array(Vec::new());
             }
             let Some(items) = target.as_array_mut() else {
-                return;
+                return Ok(());
             };
-            while items.len() <= *index {
-                items.push(Value::Null);
+            let needed = index.saturating_add(1);
+            if needed > items.len() {
+                // Reserve up front so an allocation failure is a typed error
+                // rather than an abort, and so `resize` cannot reallocate.
+                items.try_reserve(needed - items.len()).map_err(|err| {
+                    Error::validation(format!("cannot pad JSON array to index {index}: {err}"))
+                })?;
+                items.resize(needed, Value::Null);
             }
             let Some(slot) = items.get_mut(*index) else {
-                return;
+                return Ok(());
             };
-            set_segments(slot, rest, new_value);
+            set_segments(slot, rest, new_value)
         }
     }
 }
@@ -410,6 +471,77 @@ mod tests {
             );
         }
         assert_eq!(value, json!({}), "invalid paths must not mutate the input");
+    }
+
+    #[test]
+    fn set_path_rejects_an_oversized_index_without_allocating() {
+        let mut value = json!({});
+        let error = set_path(&mut value, "a[1000000000]", json!(1)).unwrap_err();
+
+        assert_eq!(error.kind(), crate::error::ErrorKind::Validation);
+        let message = error.to_string();
+        assert!(message.contains("1000000000"), "message: {message}");
+        assert!(
+            message.contains(&MAX_JSON_INDEX.to_string()),
+            "the message names the limit: {message}"
+        );
+        assert_eq!(
+            value,
+            json!({}),
+            "a rejected path must not mutate the input"
+        );
+
+        // `usize::MAX` is rejected by the same guard rather than overflowing.
+        let error = set_path(&mut value, &format!("a[{}]", usize::MAX), json!(1)).unwrap_err();
+        assert_eq!(error.kind(), crate::error::ErrorKind::Validation);
+        assert_eq!(value, json!({}));
+    }
+
+    #[test]
+    fn set_path_rejects_indices_that_would_pad_the_whole_path_too_far() {
+        // Each index is legal on its own; together they would pad two arrays past
+        // the cumulative limit, so the path is rejected before any work is done.
+        let path = format!("a[{MAX_JSON_INDEX}][{MAX_JSON_INDEX}]");
+        let mut value = json!({});
+        let error = set_path(&mut value, &path, json!(1)).unwrap_err();
+
+        assert_eq!(error.kind(), crate::error::ErrorKind::Validation);
+        assert!(
+            error
+                .to_string()
+                .contains(&MAX_JSON_PATH_GROWTH.to_string()),
+            "the message names the limit: {error}"
+        );
+        assert_eq!(
+            value,
+            json!({}),
+            "a rejected path must not mutate the input"
+        );
+    }
+
+    #[test]
+    fn set_path_accepts_a_large_but_sane_index() {
+        let mut value = json!({});
+        set_path(&mut value, "items[1000]", json!("end")).unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1001);
+        assert!(items[..1000].iter().all(Value::is_null));
+        assert_eq!(items[1000], json!("end"));
+
+        // The documented cap itself is inclusive.
+        let mut value = json!({});
+        set_path(&mut value, &format!("at[{MAX_JSON_INDEX}]"), json!(1)).unwrap();
+        let items = value["at"].as_array().unwrap();
+        assert_eq!(items.len(), MAX_JSON_INDEX + 1);
+        assert_eq!(items[MAX_JSON_INDEX], json!(1));
+    }
+
+    #[test]
+    fn get_path_ignores_an_oversized_index() {
+        let value = json!({"items": [1, 2]});
+        assert_eq!(get_path(&value, "items[1000000000]"), None);
+        assert_eq!(get_path(&value, "items[1]"), Some(&json!(2)));
     }
 
     #[test]

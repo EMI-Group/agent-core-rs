@@ -14,12 +14,14 @@ use crate::config::env;
 use crate::error::{Error, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc;
+use std::sync::{Arc, Weak};
+use std::thread;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -292,15 +294,188 @@ fn target_writer(writer: &LogWriter) -> Result<TargetWriter> {
     })
 }
 
+/// Number of records that may wait for the writer thread before a logging caller
+/// is told the queue is full.
+///
+/// The queue is bounded so a stalled disk cannot grow memory without limit, and it
+/// is drained by [`FileWriter::write`] with `try_send`, so a logging call never
+/// blocks whatever thread produced the record (usually a tokio worker).
+const WRITER_QUEUE_CAPACITY: usize = 4096;
+
+/// One unit of work for the dedicated writer thread.
+#[derive(Debug)]
+enum WriterCommand {
+    /// Append these bytes to the sink.
+    Write(Vec<u8>),
+    /// Flush the sink, then answer on the channel with the outcome.
+    Flush(mpsc::Sender<io::Result<()>>),
+}
+
+/// State shared by [`FileMakeWriter`] and the [`FileWriter`]s it hands out.
+///
+/// The blocking file I/O lives on one dedicated thread; callers only enqueue (they
+/// never hold this mutex across an I/O call) and read back the failure the writer
+/// thread recorded.
+#[derive(Debug)]
+struct WriterShared {
+    /// Queue to the writer thread; `None` once the thread has been shut down.
+    commands: Mutex<Option<mpsc::SyncSender<WriterCommand>>>,
+    /// First write/flush failure reported by the writer thread.
+    failure: Mutex<Option<(io::ErrorKind, String)>>,
+    /// The writer thread, joined when the last handle is dropped.
+    thread: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl WriterShared {
+    /// Spawns the writer thread that owns `sink`.
+    fn start(sink: Box<dyn Write + Send>, capacity: usize) -> io::Result<Arc<Self>> {
+        let (sender, receiver) = mpsc::sync_channel::<WriterCommand>(capacity);
+        let shared = Arc::new(Self {
+            commands: Mutex::new(Some(sender)),
+            failure: Mutex::new(None),
+            thread: Mutex::new(None),
+        });
+        let weak = Arc::downgrade(&shared);
+        let handle = thread::Builder::new()
+            .name("openjiuwen-log-writer".to_owned())
+            .spawn(move || writer_loop(sink, &receiver, &weak))?;
+        *shared.thread.lock() = Some(handle);
+        Ok(shared)
+    }
+
+    /// Returns the recorded failure, if the sink has already failed.
+    fn failure(&self) -> Option<io::Error> {
+        self.failure
+            .lock()
+            .as_ref()
+            .map(|(kind, message)| io::Error::new(*kind, message.clone()))
+    }
+
+    /// Records the first failure; later failures are follow-on symptoms.
+    fn record_failure(&self, error: &io::Error) {
+        let mut slot = self.failure.lock();
+        if slot.is_none() {
+            *slot = Some((error.kind(), error.to_string()));
+        }
+    }
+
+    /// Queues one record without blocking.
+    fn enqueue(&self, bytes: Vec<u8>) -> io::Result<()> {
+        if let Some(error) = self.failure() {
+            return Err(error);
+        }
+        let guard = self.commands.lock();
+        let Some(sender) = guard.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the log writer thread has been shut down",
+            ));
+        };
+        match sender.try_send(WriterCommand::Write(bytes)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("the log writer queue is full ({WRITER_QUEUE_CAPACITY} records)"),
+            )),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the log writer thread has been shut down",
+            )),
+        }
+    }
+
+    /// Waits until every queued record has been written and the sink flushed.
+    fn flush(&self) -> io::Result<()> {
+        let (acknowledge, acknowledged) = mpsc::channel();
+        {
+            let guard = self.commands.lock();
+            let Some(sender) = guard.as_ref() else {
+                return self.failure().map_or(Ok(()), Err);
+            };
+            // `send` (not `try_send`) is right here: a flush is an explicit,
+            // inherently synchronous request that must not drop earlier records.
+            sender
+                .send(WriterCommand::Flush(acknowledge))
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "the log writer thread has been shut down",
+                    )
+                })?;
+        }
+        match acknowledged.recv() {
+            Ok(result) => result.and_then(|()| self.failure().map_or(Ok(()), Err)),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the log writer thread has been shut down",
+            )),
+        }
+    }
+}
+
+impl Drop for WriterShared {
+    fn drop(&mut self) {
+        // Dropping the queue lets the writer thread drain what is left and exit.
+        drop(self.commands.lock().take());
+        if let Some(handle) = self.thread.lock().take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Body of the dedicated writer thread: writes every queued record in order.
+fn writer_loop(
+    mut sink: Box<dyn Write + Send>,
+    receiver: &mpsc::Receiver<WriterCommand>,
+    shared: &Weak<WriterShared>,
+) {
+    let record = |error: &io::Error| {
+        if let Some(shared) = shared.upgrade() {
+            shared.record_failure(error);
+        }
+    };
+
+    while let Ok(command) = receiver.recv() {
+        match command {
+            WriterCommand::Write(bytes) => {
+                // `write_all` retries short writes, so a partial write is never
+                // reported as a complete one.
+                if let Err(error) = sink.write_all(&bytes) {
+                    record(&error);
+                }
+            }
+            WriterCommand::Flush(acknowledge) => {
+                let result = sink.flush();
+                if let Err(error) = &result {
+                    record(error);
+                }
+                let _ = acknowledge.send(result);
+            }
+        }
+    }
+
+    if let Err(error) = sink.flush() {
+        record(&error);
+    }
+}
+
 /// [`MakeWriter`] that appends every record to one shared log file.
 ///
-/// The file is opened once (`append` + `create`), and all writers obtained from
-/// [`FileMakeWriter::make_writer`] share it through a mutex, so concurrent
-/// threads cannot interleave partial lines. Rotation is deliberately not
-/// implemented: a binary (the CLI) owns log rotation.
+/// The file is opened once (`append` + `create`), and every writer obtained from
+/// [`FileMakeWriter::make_writer`] enqueues into one bounded queue drained by a
+/// dedicated writer thread, so concurrent threads cannot interleave partial lines
+/// and no logging call performs (or waits for) blocking file I/O.
+///
+/// Records are written in the order they were queued. [`FileMakeWriter::flush`]
+/// waits for the queue to drain and reports the first write/flush failure; writes
+/// issued after a failure also fail, so a caller can observe the problem instead of
+/// losing records silently. Dropping the last handle closes the queue and joins the
+/// writer thread.
+///
+/// Rotation is deliberately not implemented: a binary (the CLI) owns log rotation.
 #[derive(Debug, Clone)]
 pub struct FileMakeWriter {
-    file: Arc<Mutex<File>>,
+    shared: Arc<WriterShared>,
 }
 
 impl FileMakeWriter {
@@ -308,8 +483,9 @@ impl FileMakeWriter {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Config`] when the parent directory cannot be created or
-    /// the file cannot be opened (permissions, a directory in the way, ...).
+    /// Returns [`Error::Config`] when the parent directory cannot be created, the
+    /// file cannot be opened (permissions, a directory in the way, ...), or the
+    /// writer thread cannot be spawned.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -332,9 +508,30 @@ impl FileMakeWriter {
                     path.display()
                 ))
             })?;
-        Ok(Self {
-            file: Arc::new(Mutex::new(file)),
-        })
+        Self::with_sink(Box::new(file), WRITER_QUEUE_CAPACITY)
+    }
+
+    /// Builds the writer around any blocking sink; the queue capacity is injectable
+    /// so tests can exercise backpressure and failure paths.
+    fn with_sink(sink: Box<dyn Write + Send>, capacity: usize) -> Result<Self> {
+        let shared = WriterShared::start(sink, capacity).map_err(|err| {
+            Error::config(format!("failed to start the log writer thread: {err}"))
+        })?;
+        Ok(Self { shared })
+    }
+
+    /// Blocks until every queued record has been written and the file flushed.
+    ///
+    /// Logging itself never blocks; call this before a short-lived process exits if
+    /// the tail of the log matters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when a write or the flush failed.
+    pub fn flush(&self) -> Result<()> {
+        self.shared
+            .flush()
+            .map_err(|err| Error::config(format!("flushing the log file failed: {err}")))
     }
 }
 
@@ -342,30 +539,29 @@ impl<'a> MakeWriter<'a> for FileMakeWriter {
     type Writer = FileWriter;
     fn make_writer(&'a self) -> Self::Writer {
         FileWriter {
-            file: Arc::clone(&self.file),
+            shared: Arc::clone(&self.shared),
         }
     }
 }
 
 /// Handle returned by [`FileMakeWriter::make_writer`]; writes append to the file.
+///
+/// The handle only queues the record: [`Write::write`] returns as soon as the bytes
+/// are accepted by the writer thread, and reports the real outcome — a full queue, a
+/// shut-down thread, or a write failure already reported by the thread. Batching
+/// belongs to the caller (the `tracing` layer writes one formatted record per call).
 #[derive(Debug)]
 pub struct FileWriter {
-    file: Arc<Mutex<File>>,
+    shared: Arc<WriterShared>,
 }
 
 impl Write for FileWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // `tracing_subscriber`'s fmt layer discards the `io::Result` of its
-        // writer, and a logging backend cannot abort the application either, so a
-        // failed write is dropped instead of being surfaced as a panic. The
-        // failure mode that matters (an unwritable path) is reported by
-        // `FileMakeWriter::new`.
-        let _ = self.file.lock().write(buf);
+        self.shared.enqueue(buf.to_vec())?;
         Ok(buf.len())
     }
     fn flush(&mut self) -> io::Result<()> {
-        let _ = self.file.lock().flush();
-        Ok(())
+        self.shared.flush()
     }
 }
 
@@ -374,7 +570,9 @@ impl Write for FileWriter {
 mod tests {
     use super::*;
     use crate::config::test_support::EnvGuard;
+    use std::fs::File;
     use std::io::Read;
+    use std::time::Duration;
 
     // port of tests/unit_tests/core/common/log/test_log_config.py
     #[test]
@@ -469,5 +667,175 @@ mod tests {
         // A directory cannot be opened as an append target.
         let error = FileMakeWriter::new(dir.path()).unwrap_err();
         assert_eq!(error.kind(), crate::error::ErrorKind::Config);
+    }
+
+    /// Sink whose writes always fail, standing in for a full or broken disk.
+    struct FailingSink;
+
+    impl Write for FailingSink {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "simulated write failure",
+            ))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "simulated flush failure",
+            ))
+        }
+    }
+
+    /// Sink that blocks every write until it is released, recording what it got.
+    #[derive(Clone, Default)]
+    struct BlockingSink {
+        released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl BlockingSink {
+        fn release(&self) {
+            let (lock, condvar) = &*self.released;
+            *lock.lock().unwrap() = true;
+            condvar.notify_all();
+        }
+
+        fn written(&self) -> Vec<u8> {
+            self.written.lock().clone()
+        }
+    }
+
+    impl Write for BlockingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let (lock, condvar) = &*self.released;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = condvar.wait(released).unwrap();
+            }
+            drop(released);
+            self.written.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn file_writer_reports_a_failing_sink() {
+        let writer = FileMakeWriter::with_sink(Box::new(FailingSink), 8).unwrap();
+        let mut handle = writer.make_writer();
+
+        // The record may be accepted (queued before the thread fails) or already
+        // rejected; either way the failure must surface instead of being swallowed.
+        if let Err(error) = handle.write_all(b"record\n") {
+            assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        }
+
+        let error = handle.flush().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert!(
+            error.to_string().contains("simulated"),
+            "the real sink error is propagated: {error}"
+        );
+
+        // Once the writer thread has failed, later writes fail too.
+        let error = handle.write(b"again").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+
+        let error = writer.flush().unwrap_err();
+        assert_eq!(error.kind(), crate::error::ErrorKind::Config);
+        assert!(error.to_string().contains("simulated"), "{error}");
+    }
+
+    #[test]
+    fn file_writer_does_not_block_the_caller_on_a_slow_sink() {
+        let sink = BlockingSink::default();
+        let writer = FileMakeWriter::with_sink(Box::new(sink.clone()), 8).unwrap();
+
+        // The first record parks the writer thread inside `write`.
+        let mut first = writer.make_writer();
+        first.write_all(b"first\n").unwrap();
+
+        // A second write from another thread must return without waiting for the
+        // sink: the queue accepts it and the caller is released immediately.
+        let mut second = writer.make_writer();
+        let (done, finished) = mpsc::channel();
+        let caller = thread::spawn(move || {
+            let result = second.write_all(b"second\n");
+            let _ = done.send(result.is_ok());
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "a logging call must not wait for the file I/O"
+        );
+        caller.join().unwrap();
+        assert!(
+            sink.written().is_empty(),
+            "nothing is written while the sink is blocked"
+        );
+
+        sink.release();
+        writer.flush().unwrap();
+        assert_eq!(
+            sink.written(),
+            b"first\nsecond\n".to_vec(),
+            "queued records keep their order"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_all_reach_the_file_intact_and_in_order() {
+        const TASKS: usize = 8;
+        const RECORDS: usize = 25;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.log");
+        let writer = FileMakeWriter::new(&path).unwrap();
+
+        let mut tasks = Vec::new();
+        for task in 0..TASKS {
+            let writer = writer.clone();
+            tasks.push(tokio::spawn(async move {
+                for record in 0..RECORDS {
+                    let mut handle = writer.make_writer();
+                    handle
+                        .write_all(format!("task-{task}-record-{record}\n").as_bytes())
+                        .unwrap();
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        writer.flush().unwrap();
+
+        let mut contents = String::new();
+        File::open(&path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), TASKS * RECORDS, "every record was written");
+
+        let mut next_per_task = [0_usize; TASKS];
+        for line in lines {
+            // No interleaving or truncation: every line is one whole record.
+            let rest = line
+                .strip_prefix("task-")
+                .unwrap_or_else(|| panic!("torn line: {line:?}"));
+            let (task, record) = rest
+                .split_once("-record-")
+                .unwrap_or_else(|| panic!("torn line: {line:?}"));
+            let task: usize = task.parse().unwrap();
+            let record: usize = record.parse().unwrap();
+            assert_eq!(
+                record, next_per_task[task],
+                "records from one task keep their order: {line:?}"
+            );
+            next_per_task[task] += 1;
+        }
+        assert_eq!(next_per_task, [RECORDS; TASKS]);
     }
 }

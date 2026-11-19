@@ -76,18 +76,19 @@ impl RunControl {
     /// returned unchanged otherwise.
     pub(crate) async fn race<F: Future>(&self, future: F) -> Result<F::Output> {
         self.check()?;
-        match self.deadline {
-            Some(deadline) => tokio::select! {
+        if let Some(deadline) = self.deadline {
+            tokio::select! {
                 biased;
                 () = self.cancellation.cancelled() => Err(Error::Cancelled),
                 () = tokio::time::sleep_until(deadline) => Err(self.timeout_error()),
                 output = future => Ok(output),
-            },
-            None => tokio::select! {
+            }
+        } else {
+            tokio::select! {
                 biased;
                 () = self.cancellation.cancelled() => Err(Error::Cancelled),
                 output = future => Ok(output),
-            },
+            }
         }
     }
 
