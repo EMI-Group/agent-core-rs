@@ -982,8 +982,7 @@ prunable gitdir file points to non-existent location\n";
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
-                .map(|status| status.success())
-                .unwrap_or(false);
+                .is_ok_and(|status| status.success());
             if !alive {
                 gone = true;
                 break;
@@ -1001,6 +1000,6 @@ prunable gitdir file points to non-existent location\n";
         let runner = ProcessGitRunner::with_program(script.to_string_lossy().into_owned());
         let output = runner.run(&["status"], dir.path()).await.expect("output");
         assert_eq!(output.stdout.len(), GIT_OUTPUT_LIMIT_BYTES);
-        assert!(output.stderr.is_empty());
+        assert_eq!(output.stderr, "");
     }
 }
