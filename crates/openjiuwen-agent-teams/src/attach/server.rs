@@ -37,6 +37,27 @@
 //! stream is served by its own task, so a slow handler blocks only its own connection.
 //! A failed `accept` is logged and does not end the loop.
 //!
+//! # Connection limits
+//!
+//! Concurrency is bounded by [`AttachLimits`]: at most
+//! [`max_connections`](AttachLimits::max_connections) connections are served at once, and every
+//! connection is closed once it has been silent for
+//! [`idle_timeout`](AttachLimits::idle_timeout), so a hostile or stalled peer cannot accumulate
+//! tasks or hold a slot forever.
+//!
+//! * A connection arriving while every slot is taken is *not* served: the server logs a `warn!`
+//!   naming the limit, answers one frame-level error with id `0` and the `Transport` kind
+//!   ("attach server reached its connection limit (N)"), and closes it. A rejected connection
+//!   never sees a handler and never takes a slot.
+//! * A connection that sends nothing for `idle_timeout` is answered with a `Timeout` frame-level
+//!   error ("attach connection idle for N ms") and closed. The clock restarts on every frame, so a
+//!   busy client is never cut off.
+//!
+//! Both bounds are per [`AttachServer::serve`] call, and both keep the graceful-shutdown path: the
+//! token still closes idle connections and lets in-flight frames finish.
+//! [`AttachServer::bind`] uses [`AttachLimits::default`]; [`AttachServer::bind_with_limits`] takes
+//! the caller's values (a zero limit is a `Validation` error rather than a silent clamp).
+//!
 //! Per connection the server reads one request line at a time and writes exactly one response
 //! echoing the request `id`:
 //!
@@ -97,7 +118,9 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(unix)]
-use super::protocol::{read_frame_line, write_all_line, AttachResult, RequestFrame, ResponseFrame};
+use super::protocol::{
+    read_frame_line, write_all_line, AttachError, AttachResult, RequestFrame, ResponseFrame,
+};
 
 /// Deadline for probing an existing socket file during [`AttachServer::bind`].
 #[cfg(unix)]
@@ -110,6 +133,82 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// Mode the socket file is created with: owner read and write only.
 #[cfg(unix)]
 const SOCKET_MODE: u32 = 0o600;
+
+/// How long the server tries to hand a typed rejection to a refused connection.
+#[cfg(unix)]
+const REJECT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Resource bounds an [`AttachServer`] enforces on its connections.
+///
+/// The attach bridge serves one peer per connection and the peers are local processes, so the
+/// defaults are generous for a host that also runs the team: [`DEFAULT_MAX_CONNECTIONS`] slots and
+/// [`DEFAULT_IDLE_TIMEOUT`] of silence.
+/// Both bounds exist so a slow or hostile client cannot exhaust the host: without them every
+/// accepted connection took a task and a file descriptor for as long as the peer cared to keep it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachLimits {
+    /// Connections served at once; at least one.
+    pub max_connections: usize,
+    /// How long one connection may stay silent before the server closes it; greater than zero.
+    pub idle_timeout: Duration,
+}
+
+impl AttachLimits {
+    /// Default number of concurrently served connections.
+    pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
+
+    /// Default idle (read) timeout of one connection.
+    pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Builds the default limits (`64` connections, `30 s` idle).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            max_connections: Self::DEFAULT_MAX_CONNECTIONS,
+            idle_timeout: Self::DEFAULT_IDLE_TIMEOUT,
+        }
+    }
+
+    /// Returns these limits with the concurrency ceiling replaced.
+    #[must_use]
+    pub const fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections;
+        self
+    }
+
+    /// Returns these limits with the idle timeout replaced.
+    #[must_use]
+    pub const fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
+    /// Rejects a limit that cannot be enforced.
+    ///
+    /// # Errors
+    ///
+    /// `Validation` when `max_connections` is zero (no connection could ever be served) or when
+    /// `idle_timeout` is zero (every connection would be cut off before it could send a frame).
+    pub fn validate(&self) -> Result<()> {
+        if self.max_connections == 0 {
+            return Err(Error::validation(
+                "attach max_connections must be at least 1",
+            ));
+        }
+        if self.idle_timeout.is_zero() {
+            return Err(Error::validation(
+                "attach idle_timeout must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for AttachLimits {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Hosting end of the attach bridge: a bound Unix socket serving one team.
 ///
@@ -126,6 +225,8 @@ pub struct AttachServer {
     listener: UnixListener,
     /// Token that stops the accept loop and closes idle connections.
     cancel: CancellationToken,
+    /// Concurrency and idle bounds enforced on every connection.
+    limits: AttachLimits,
 }
 
 #[cfg(unix)]
@@ -146,6 +247,20 @@ impl AttachServer {
     ///   the socket mode cannot be set.
     /// - `Transport` when the listener itself cannot be bound.
     pub async fn bind(path: impl AsRef<Path>) -> Result<Self> {
+        Self::bind_with_limits(path, AttachLimits::default()).await
+    }
+
+    /// Binds the attach socket at `path` with explicit connection limits.
+    ///
+    /// Same binding contract as [`AttachServer::bind`]; `limits` bounds the connections
+    /// [`AttachServer::serve`] accepts at once and how long one may stay silent.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`AttachServer::bind`] reports, plus `Validation` when `limits` cannot be
+    /// enforced (a zero `max_connections` or a zero `idle_timeout`).
+    pub async fn bind_with_limits(path: impl AsRef<Path>, limits: AttachLimits) -> Result<Self> {
+        limits.validate()?;
         let path = path.as_ref().to_path_buf();
         validate_path(&path).await?;
         ensure_parent(&path).await?;
@@ -157,12 +272,24 @@ impl AttachServer {
             let _ = std::fs::remove_file(&path);
             return Err(error);
         }
-        tracing::info!(path = %path.display(), "attach server listening");
+        tracing::info!(
+            path = %path.display(),
+            max_connections = limits.max_connections,
+            idle_ms = u64::try_from(limits.idle_timeout.as_millis()).unwrap_or(u64::MAX),
+            "attach server listening"
+        );
         Ok(Self {
             path,
             listener,
             cancel: CancellationToken::new(),
+            limits,
         })
+    }
+
+    /// The connection bounds this server enforces.
+    #[must_use]
+    pub fn limits(&self) -> AttachLimits {
+        self.limits
     }
 
     /// The socket path this server is bound to.
@@ -193,6 +320,9 @@ impl AttachServer {
     ///
     /// Every accepted connection is served by its own task, so connections do not block each
     /// other; the `handler` is shared between them and must therefore be `Send + Sync`.
+    /// At most [`AttachLimits::max_connections`] connections are served at once, each one is closed
+    /// after [`AttachLimits::idle_timeout`] of silence, and a connection arriving with every slot
+    /// taken is refused with a typed error and logged (see the module documentation).
     /// An `accept` failure is logged and the loop continues.
     /// When the token is cancelled the loop stops, connections close (finishing the frame they are
     /// on), and the socket file is removed.
@@ -204,6 +334,7 @@ impl AttachServer {
     /// a supervisor only has to distinguish "stopped" from "panicked".
     pub async fn serve(&self, handler: Arc<dyn AttachHandler>) -> Result<()> {
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        let permits = Arc::new(tokio::sync::Semaphore::new(self.limits.max_connections));
         loop {
             tokio::select! {
                 () = self.cancel.cancelled() => {
@@ -212,12 +343,32 @@ impl AttachServer {
                 }
                 accepted = self.listener.accept() => {
                     match accepted {
-                        Ok((stream, _peer)) => {
-                            let handler = Arc::clone(&handler);
+                        Ok((stream, peer)) => {
                             let cancel = self.cancel.clone();
-                            tasks.spawn(async move {
-                                serve_connection(stream, handler, cancel).await;
-                            });
+                            match Arc::clone(&permits).try_acquire_owned() {
+                                Ok(permit) => {
+                                    let handler = Arc::clone(&handler);
+                                    let idle = self.limits.idle_timeout;
+                                    tasks.spawn(async move {
+                                        // The permit is held for the whole connection, which is
+                                        // what bounds the number of live connection tasks.
+                                        serve_connection(stream, handler, cancel, idle, permit)
+                                            .await;
+                                    });
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        peer = ?peer,
+                                        path = %self.path.display(),
+                                        limit = self.limits.max_connections,
+                                        "attach connection rejected: server at its connection limit"
+                                    );
+                                    let limit = self.limits.max_connections;
+                                    tasks.spawn(async move {
+                                        reject_connection(stream, limit, cancel).await;
+                                    });
+                                }
+                            }
                             while tasks.try_join_next().is_some() {}
                         }
                         Err(error) => {
@@ -378,13 +529,38 @@ async fn drain(tasks: &mut tokio::task::JoinSet<()>) {
     tracing::debug!("attach server aborted lingering connections");
 }
 
-/// Serves one connection until EOF, a frame-level fault, or shutdown.
+/// Tells a refused peer why it is not being served, then closes the connection.
+///
+/// The peer sent no request yet, so the frame-level error carries id `0`; the write is bounded so a
+/// peer that never reads cannot hold this task either.
+#[cfg(unix)]
+async fn reject_connection(stream: UnixStream, limit: usize, cancel: CancellationToken) {
+    let (_read_half, mut write_half) = stream.into_split();
+    let error = AttachError::transport(format!(
+        "attach server reached its connection limit ({limit})"
+    ));
+    let response = ResponseFrame::err(0, error);
+    let _ = tokio::select! {
+        () = cancel.cancelled() => Ok(()),
+        written = tokio::time::timeout(REJECT_WRITE_TIMEOUT, send_frame(&mut write_half, response)) => {
+            written.unwrap_or(Ok(()))
+        }
+    };
+}
+
+/// Serves one connection until EOF, a frame-level fault, an idle timeout, or shutdown.
+///
+/// The `permit` keeps this connection counted against [`AttachLimits::max_connections`] and is
+/// released when the task ends, whatever path it took.
 #[cfg(unix)]
 async fn serve_connection(
     stream: UnixStream,
     handler: Arc<dyn AttachHandler>,
     cancel: CancellationToken,
+    idle_timeout: Duration,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) {
+    let _permit = permit;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     loop {
@@ -393,7 +569,25 @@ async fn serve_connection(
                 tracing::debug!("attach connection closed on shutdown");
                 return;
             }
-            read = read_frame_line(&mut reader) => read,
+            read = tokio::time::timeout(idle_timeout, read_frame_line(&mut reader)) => {
+                match read {
+                    Ok(read) => read,
+                    Err(_elapsed) => {
+                        // A peer that stopped talking must not hold its slot: answer the idle
+                        // timeout with a typed frame-level error and drop the connection.
+                        tracing::warn!(
+                            idle_ms = u64::try_from(idle_timeout.as_millis()).unwrap_or(u64::MAX),
+                            "attach connection idle for too long; closing it"
+                        );
+                        let error = AttachError::timeout(format!(
+                            "attach connection idle for {} ms",
+                            idle_timeout.as_millis()
+                        ));
+                        let _ = send_frame(&mut write_half, ResponseFrame::err(0, error)).await;
+                        return;
+                    }
+                }
+            },
         };
         let line = match read {
             Ok(Some(line)) => line,
@@ -505,6 +699,8 @@ fn drop_bound_socket(path: &Path) {
 pub struct AttachServer {
     /// Socket path a bound server would own.
     path: PathBuf,
+    /// Connection bounds a bound server would enforce.
+    limits: AttachLimits,
 }
 
 #[cfg(not(unix))]
@@ -520,10 +716,28 @@ impl AttachServer {
         Err(unix_only())
     }
 
+    /// Fails on this target: cross-process attach requires Unix domain sockets.
+    ///
+    /// # Errors
+    ///
+    /// Always returns an `Unsupported` error with the message
+    /// "cross-process attach requires Unix domain sockets", and the same `Validation` errors as the
+    /// Unix implementation for limits that cannot be enforced.
+    pub async fn bind_with_limits(_path: impl AsRef<Path>, limits: AttachLimits) -> Result<Self> {
+        limits.validate()?;
+        Err(unix_only())
+    }
+
     /// The socket path a bound server would own.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The connection bounds a bound server would enforce.
+    #[must_use]
+    pub fn limits(&self) -> AttachLimits {
+        self.limits
     }
 
     /// No-op on this target: there is never an accept loop to stop.

@@ -25,7 +25,7 @@ use super::client::AttachClient;
 use super::protocol::{
     AttachError, AttachHandler, AttachOp, AttachResult, ResponseFrame, MAX_FRAME_BYTES,
 };
-use super::server::AttachServer;
+use super::server::{AttachLimits, AttachServer};
 use crate::schema::{
     ExecutionStatus, MemberSnapshot, MemberStatus, TaskDetail, TaskStatus, TaskSummary, TeamRole,
     TeamSnapshot,
@@ -220,11 +220,15 @@ struct Harness {
 }
 
 impl Harness {
-    /// Binds `<tmp>/s` and starts serving it with `handler`.
+    /// Binds `<tmp>/s` and starts serving it with `handler` under the default limits.
     async fn start(handler: Arc<dyn AttachHandler>) -> Self {
+        Self::start_with_limits(handler, AttachLimits::default()).await
+    }
+    /// Binds `<tmp>/s` and starts serving it with `handler` under `limits`.
+    async fn start_with_limits(handler: Arc<dyn AttachHandler>, limits: AttachLimits) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s");
-        let server = Arc::new(AttachServer::bind(&path).await.unwrap());
+        let server = Arc::new(AttachServer::bind_with_limits(&path, limits).await.unwrap());
         let serving = Arc::clone(&server);
         let handle = tokio::spawn(async move { serving.serve(handler).await });
         Self {
@@ -257,6 +261,38 @@ async fn echo_harness() -> (Harness, Arc<EchoHandler>) {
     let handler = Arc::new(EchoHandler::default());
     let shared: Arc<dyn AttachHandler> = handler.clone();
     (Harness::start(shared).await, handler)
+}
+
+/// The same harness under explicit connection limits.
+async fn echo_harness_with_limits(limits: AttachLimits) -> (Harness, Arc<EchoHandler>) {
+    let handler = Arc::new(EchoHandler::default());
+    let shared: Arc<dyn AttachHandler> = handler.clone();
+    (Harness::start_with_limits(shared, limits).await, handler)
+}
+
+/// Reports whether a fresh connection is currently served (a rejected one answers with an error).
+async fn served(path: &Path) -> bool {
+    let Ok(mut client) = AttachClient::connect(path).await else {
+        return false;
+    };
+    client.read_inbox().await.is_ok()
+}
+
+/// Waits until a fresh connection is served again, bounded by [`BOUND`].
+///
+/// A freed slot is released by the connection task, so the retry loop is what makes the assertion
+/// independent of scheduling; the bound keeps a regression a failure instead of a hang.
+async fn await_free_slot(path: &Path) {
+    tokio::time::timeout(BOUND, async {
+        loop {
+            if served(path).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no connection slot was released within the bound");
 }
 
 // --- raw socket helpers ----------------------------------------------------
@@ -662,4 +698,130 @@ async fn drop_leaves_a_replaced_regular_file_in_place() {
     drop(server);
 
     assert_eq!(std::fs::read(&path).unwrap(), b"precious");
+}
+
+// --- connection limits -----------------------------------------------------
+#[tokio::test]
+async fn the_default_limits_bound_connections_and_idle_reads() {
+    let (harness, _echo) = echo_harness().await;
+    assert_eq!(harness.server.limits(), AttachLimits::default());
+    assert_eq!(AttachLimits::DEFAULT_MAX_CONNECTIONS, 64);
+    assert_eq!(AttachLimits::DEFAULT_IDLE_TIMEOUT, Duration::from_secs(30));
+    assert_eq!(AttachLimits::new().max_connections, 64);
+    assert_eq!(AttachLimits::new().idle_timeout, Duration::from_secs(30));
+}
+
+#[tokio::test]
+async fn bind_rejects_limits_it_cannot_enforce() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s");
+    let error = AttachServer::bind_with_limits(&path, AttachLimits::new().with_max_connections(0))
+        .await
+        .expect_err("a zero connection limit must be refused");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.message().contains("max_connections"), "{error}");
+    assert!(!path.exists(), "a refused limit must not bind the socket");
+    let error = AttachServer::bind_with_limits(
+        &path,
+        AttachLimits::new().with_idle_timeout(Duration::ZERO),
+    )
+    .await
+    .expect_err("a zero idle timeout must be refused");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.message().contains("idle_timeout"), "{error}");
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn a_connection_over_the_limit_is_refused_then_the_slot_frees_up() {
+    let (harness, _echo) =
+        echo_harness_with_limits(AttachLimits::new().with_max_connections(2)).await;
+    // Two live clients hold both slots; each round trip proves the connection is being served.
+    let mut first = harness.client().await;
+    let mut second = harness.client().await;
+    assert_eq!(first.read_inbox().await.unwrap(), "2 unread messages");
+    assert_eq!(second.read_inbox().await.unwrap(), "2 unread messages");
+    assert_eq!(first.list_members().await.unwrap().len(), 2);
+    assert_eq!(second.list_members().await.unwrap().len(), 2);
+
+    // The third connection is refused instead of queued: typed error, id 0, then EOF.
+    let lines = raw_exchange(harness.path(), b"").await;
+    assert_eq!(
+        lines.len(),
+        1,
+        "a refused connection gets exactly one frame"
+    );
+    let response = ResponseFrame::decode(&lines[0]).unwrap();
+    assert!(
+        !response.ok,
+        "a refused connection is answered with an error"
+    );
+    assert_eq!(response.id, 0, "the peer had not sent a request yet");
+    let error = response.error.unwrap();
+    assert_eq!(error.kind, ErrorKind::Transport);
+    assert!(error.message.contains("connection limit"), "{error}");
+    assert!(error.message.contains('2'), "the limit is named: {error}");
+
+    // The two existing connections are untouched by the refusal.
+    assert_eq!(first.read_inbox().await.unwrap(), "2 unread messages");
+    assert_eq!(second.list_members().await.unwrap().len(), 2);
+
+    // Dropping one client releases its slot, so a new connection is served again.
+    drop(first);
+    await_free_slot(harness.path()).await;
+}
+
+#[tokio::test]
+async fn an_idle_connection_is_closed_after_the_timeout() {
+    let (harness, _echo) = echo_harness_with_limits(
+        AttachLimits::new()
+            .with_max_connections(4)
+            .with_idle_timeout(Duration::from_millis(80)),
+    )
+    .await;
+    // A connection that never sends a frame is answered with a typed idle timeout and closed.
+    let stream = UnixStream::connect(harness.path()).await.unwrap();
+    let (read_half, _write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let mut line = Vec::new();
+    tokio::time::timeout(BOUND, reader.read_until(b'\n', &mut line))
+        .await
+        .expect("the idle connection was never closed")
+        .unwrap();
+    let response = ResponseFrame::decode(&line).unwrap();
+    assert!(!response.ok);
+    assert_eq!(response.id, 0);
+    let error = response.error.unwrap();
+    assert_eq!(error.kind, ErrorKind::Timeout);
+    assert!(error.message.contains("idle"), "{error}");
+    let mut tail = Vec::new();
+    let read = tokio::time::timeout(BOUND, reader.read_until(b'\n', &mut tail))
+        .await
+        .expect("the idle connection stayed open")
+        .unwrap();
+    assert_eq!(read, 0, "the connection is closed after the idle frame");
+
+    // The server keeps serving: the slot and the accept loop survived.
+    tokio::time::timeout(BOUND, await_free_slot(harness.path()))
+        .await
+        .expect("the server stopped accepting after an idle timeout");
+}
+
+#[tokio::test]
+async fn an_idle_timeout_does_not_close_a_busy_connection() {
+    let (harness, _echo) = echo_harness_with_limits(
+        AttachLimits::new()
+            .with_max_connections(4)
+            .with_idle_timeout(Duration::from_millis(150)),
+    )
+    .await;
+    let mut client = harness.client().await;
+    for round in 0..3 {
+        assert_eq!(
+            client.read_inbox().await.unwrap(),
+            "2 unread messages",
+            "round {round} must be served: the idle clock restarts on every frame"
+        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
 }

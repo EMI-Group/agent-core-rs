@@ -174,8 +174,8 @@ pub use monitor::{
 // Listed explicitly instead of `attach::*`: the glob would re-export the `attach::protocol`
 // module, which collides with the `member::protocol` module already re-exported above.
 pub use attach::{
-    AttachClient, AttachError, AttachHandler, AttachOp, AttachResult, AttachServer, RequestFrame,
-    ResponseFrame, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    AttachClient, AttachError, AttachHandler, AttachLimits, AttachOp, AttachResult, AttachServer,
+    RequestFrame, ResponseFrame, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 // The protocol crate owns this type; agent-teams re-exports it so hosts can branch on member
 // state without depending on the protocol crate directly.

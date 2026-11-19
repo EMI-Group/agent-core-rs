@@ -11,7 +11,7 @@ Everything is in-process-tokio and offline: no broker, no network, no new depend
 
 ## API Surface
 
-Flat re-exports from `mod.rs`: `AttachError`, `AttachHandler`, `AttachOp`, `AttachResult`, `AttachClient`, `AttachServer`, `RequestFrame`, `ResponseFrame`, `MAX_FRAME_BYTES`, `PROTOCOL_VERSION`.
+Flat re-exports from `mod.rs`: `AttachError`, `AttachHandler`, `AttachLimits`, `AttachOp`, `AttachResult`, `AttachClient`, `AttachServer`, `RequestFrame`, `ResponseFrame`, `MAX_FRAME_BYTES`, `PROTOCOL_VERSION`.
 The frame IO helpers (`read_frame_line`, `write_all_line`) and `to_data` stay in `attach::protocol`.
 
 ```rust
@@ -95,10 +95,21 @@ impl AttachClient {
 
 ```rust
 // server.rs — same surface on every target
+pub struct AttachLimits { pub max_connections: usize, pub idle_timeout: Duration }   // 64, 30 s
+impl AttachLimits {
+    pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
+    pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+    pub const fn new() -> Self;                                  // the defaults
+    pub const fn with_max_connections(self, usize) -> Self;
+    pub const fn with_idle_timeout(self, Duration) -> Self;
+    pub fn validate(&self) -> openjiuwen_common::error::Result<()>;   // zero either -> Validation
+}
 pub struct AttachServer;
 impl AttachServer {
-    pub async fn bind(path: impl AsRef<Path>) -> openjiuwen_common::error::Result<Self>;
+    pub async fn bind(path: impl AsRef<Path>) -> openjiuwen_common::error::Result<Self>;   // default limits
+    pub async fn bind_with_limits(path: impl AsRef<Path>, limits: AttachLimits) -> openjiuwen_common::error::Result<Self>;
     #[must_use] pub fn path(&self) -> &Path;
+    #[must_use] pub fn limits(&self) -> AttachLimits;
     pub fn shutdown(&self);
     #[must_use] pub fn cancellation_token(&self) -> CancellationToken;
     pub async fn serve(&self, handler: Arc<dyn AttachHandler>) -> openjiuwen_common::error::Result<()>;
@@ -153,7 +164,11 @@ Handlers must still treat every payload as untrusted: validate names, ids and to
 `MAX_FRAME_BYTES` (1 MiB) bounds one line; `read_frame_line` drains the rest of an oversized line, and the server treats it as a frame-level fault, answers once and closes.
 Bind refuses to clobber a live socket (`ErrorKind::Config`, "attach socket already in use"), reclaims a stale socket file left by a dead process, refuses to unlink a regular file at the path, and removes the file on shutdown and on drop.
 A socket path is limited by the OS (`sun_path`, ~108 bytes on Linux); tests and callers keep socket paths short (`<tmpdir>/s`).
-The server has no connection cap and no per-request deadline: each connection is a task and an in-flight handler call may run until the handler returns (shutdown waits a 2 s grace, then aborts).
+`AttachLimits` bounds the server: at most `max_connections` connections are served at once (a semaphore permit is held for the whole connection), and each connection is closed after `idle_timeout` without a frame.
+A connection arriving with every slot taken is not served: it is logged at `warn!`, answered with one frame-level `Transport` error ("attach server reached its connection limit (N)") and closed, and it never reaches a handler.
+An idle connection is answered with one frame-level `Timeout` error ("attach connection idle for N ms") and closed; the idle clock restarts on every frame, so a busy client is never cut off.
+`bind` uses `AttachLimits::default()`; a zero `max_connections` or a zero `idle_timeout` is refused with `ErrorKind::Validation` instead of being clamped.
+There is still no per-request deadline: an in-flight handler call may run until the handler returns (shutdown waits a 2 s grace, then aborts).
 The client bounds everything it does: `CONNECT_TIMEOUT` per connect, `DEFAULT_TIMEOUT` (or the per-client timeout) per call covering write plus read, and a 1 s `is_available` probe.
 One client owns one connection with at most one in-flight request (`&mut self`); request ids start at 1 and wrap back to 1 (never 0) after `u64::MAX`.
 `is_available` proves the socket accepts connections, not that the hosted team is healthy.
@@ -163,7 +178,7 @@ One client owns one connection with at most one in-flight request (`&mut self`);
 | Target | `protocol` | `AttachClient` | `AttachServer` |
 | --- | --- | --- | --- |
 | Unix | full | real Unix socket client | real Unix socket server, unlinks on shutdown/drop |
-| non-Unix | full (platform independent) | `connect`/`call`/typed wrappers return `AttachError::remote(Unsupported, "cross-process attach requires Unix domain sockets")`; `is_available` is `false` | `bind`/`serve` return `Error::Unsupported` with the same text; `shutdown` is a no-op |
+| non-Unix | full (platform independent) | `connect`/`call`/typed wrappers return `AttachError::remote(Unsupported, "cross-process attach requires Unix domain sockets")`; `is_available` is `false` | `bind`/`bind_with_limits`/`serve` return `Error::Unsupported` with the same text (`bind_with_limits` still validates its limits first); `shutdown` is a no-op; `limits()` reports what would be enforced |
 
 The cfg split is per method block, not per file: the public API is identical on both targets so callers compile unchanged.
 
@@ -182,7 +197,7 @@ The cfg split is per method block, not per file: the public API is identical on 
 
 - `./protocol.rs` → envelope types, `AttachOp`, serde, validation, frame IO, `AttachError`, `AttachHandler`, `to_data`
 - `./client.rs` → `AttachClient`: connect, one-in-flight `call`, typed wrappers, `is_available`, non-Unix stubs
-- `./server.rs` → `AttachServer`: `bind` (parents, stale reclaim, `0600`), concurrent `serve`, cancellation, socket cleanup
+- `./server.rs` → `AttachServer`: `bind`/`bind_with_limits` (parents, stale reclaim, `0600`), `AttachLimits` (connection cap, idle timeout), concurrent `serve`, cancellation, socket cleanup
 - `./protocol_tests.rs` → contract unit tests (`#[cfg(test)]`, no sockets)
 - `./client_tests.rs` → client tests against a raw in-test Unix listener (`#![cfg(unix)]`)
 - `./server_tests.rs` → server tests driven through `AttachClient` plus raw streams (`#![cfg(unix)]`)
