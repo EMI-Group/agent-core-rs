@@ -88,7 +88,7 @@ use crate::context::ComponentContext;
 use crate::engine::node::{interaction_wires, project_output};
 use crate::interrupt::{find_interrupt, InteractionState};
 use crate::output::{FrameWriter, WorkflowExecutionState, WorkflowOutput};
-use crate::reference;
+use crate::reference::{self, CompiledSchema};
 
 /// Per-call data mapping and seeded answers for [`execute_single_component_with`].
 ///
@@ -199,10 +199,14 @@ pub async fn execute_single_component_with(
     match component.invoke(resolved.clone(), &context).await {
         Ok(raw) => Ok(WorkflowOutput {
             result: project_output(
-                options.outputs_schema.as_ref(),
+                options
+                    .outputs_schema
+                    .as_ref()
+                    .map(CompiledSchema::compile)
+                    .as_ref(),
                 &resolved,
                 component_id,
-                &raw,
+                raw,
             ),
             state: WorkflowExecutionState::Completed,
         }),

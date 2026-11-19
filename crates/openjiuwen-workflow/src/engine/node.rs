@@ -44,7 +44,7 @@ use openjiuwen_common::utils::json as json_utils;
 use openjiuwen_graph::{GraphContext, GraphState, Node, NodeOutcome};
 use openjiuwen_session::tracer::SpanHandle;
 use parking_lot::Mutex;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::ability::ComponentAbility;
 use crate::component::Component;
@@ -53,7 +53,7 @@ use crate::engine::definition::NodeConfig;
 use crate::error;
 use crate::interrupt::{find_interrupt, InteractionState};
 use crate::output::{FrameWriter, OutputFrame, END_NODE_STREAM};
-use crate::reference;
+use crate::reference::CompiledSchema;
 
 // The interaction-wire builder sits with the invoke path that reports it in the private
 // `engine::run` module; re-export it so crate-level callers (such as `crate::single`)
@@ -120,6 +120,8 @@ pub(crate) struct NodeRuntime {
     pub(crate) component: Arc<dyn Component>,
     /// The node's configuration (schemas, retries, timeout, display name).
     pub(crate) node: NodeConfig,
+    /// The node's templates, compiled once at graph build.
+    pub(crate) schemas: NodeSchemas,
     /// The single ability this node is driven with.
     pub(crate) ability: ComponentAbility,
     /// Whether this node is the workflow's end component.
@@ -136,6 +138,7 @@ impl std::fmt::Debug for NodeRuntime {
             .field("id", &self.id)
             .field("component_type", &self.component.component_type())
             .field("node", &self.node)
+            .field("schemas", &self.schemas)
             .field("ability", &self.ability)
             .field("is_end", &self.is_end)
             .field("workflow_id", &self.workflow_id)
@@ -159,8 +162,9 @@ impl ComponentNode {
     /// Starts the component's trace span, when the session has a tracer.
     ///
     /// The span gets the node's display name (its configured `name`, else the
-    /// component card's name) and records the resolved inputs immediately.
-    fn start_span(&self, ctx: &GraphContext, inputs: Value) -> Option<SpanHandle> {
+    /// component card's name) and records the resolved inputs immediately. Nothing is
+    /// cloned when the session has no tracer, which is the common case.
+    fn start_span(&self, ctx: &GraphContext, inputs: &Value) -> Option<SpanHandle> {
         let tracer = ctx.session().tracer()?;
         let name = self
             .rt
@@ -169,7 +173,7 @@ impl ComponentNode {
             .clone()
             .unwrap_or_else(|| self.rt.component.card().name);
         let span = tracer.start_workflow_span(self.rt.id.clone(), name);
-        span.set_inputs(inputs);
+        span.set_inputs(inputs.clone());
         Some(span)
     }
 
@@ -278,29 +282,33 @@ impl Node for ComponentNode {
     }
 
     async fn run(&self, state: &mut GraphState, ctx: &GraphContext) -> Result<NodeOutcome> {
-        let source = state.as_value();
-        let inputs = resolve_inputs(&self.rt.node, self.rt.ability, &source);
-        let scope = self.rt.scope.as_ref().ok_or_else(|| {
+        let rt = &*self.rt;
+        let scope = rt.scope.as_ref().ok_or_else(|| {
             Error::workflow(format!(
                 "component '{}' executed without a run scope",
-                self.rt.id
+                rt.id
             ))
         })?;
         let context = ComponentContext::new(
             Arc::clone(ctx.session()),
-            self.rt.id.clone(),
-            self.rt.workflow_id.clone(),
+            rt.id.clone(),
+            rt.workflow_id.clone(),
         )
         .with_interactions(Arc::clone(&scope.interactions))
         .with_writer(Arc::clone(&scope.writer))
         .with_cancellation(ctx.cancellation().clone())
         .with_depth(scope.depth);
 
-        let span = self.start_span(ctx, inputs.clone());
+        // Hold the state's map instead of deep-cloning it into a `Value`; the view hands it
+        // back when it drops, so the state survives every outcome below.
+        let mut view = StateView::new(state);
+        let inputs = rt.schemas.resolve_inputs(rt.ability, view.source());
+        // Nothing is cloned for the span unless the session really has a tracer.
+        let span = self.start_span(ctx, view.source());
 
-        match self.dispatch(&source, inputs, &context, scope).await {
+        match self.dispatch(view.source(), inputs, &context, scope).await {
             Ok(Dispatch::Route(targets)) => {
-                scope.clear_failures(&self.rt.id);
+                scope.clear_failures(&rt.id);
                 if let Some(span) = &span {
                     // A branch produces no output; the span still closes.
                     span.finish(Value::Null);
@@ -308,17 +316,12 @@ impl Node for ComponentNode {
                 Ok(NodeOutcome::Route { targets })
             }
             Ok(Dispatch::Output(raw)) => {
-                scope.clear_failures(&self.rt.id);
-                let output = project_output(
-                    self.rt.node.outputs_schema.as_ref(),
-                    &source,
-                    &self.rt.id,
-                    &raw,
-                );
+                scope.clear_failures(&rt.id);
+                let output = rt.schemas.project_output(view.source(), &rt.id, raw);
                 if let Some(span) = &span {
                     span.finish(output.clone());
                 }
-                state.set(self.rt.id.clone(), output);
+                view.set(rt.id.clone(), output);
                 Ok(NodeOutcome::Continue)
             }
             Err(failure) => {
@@ -334,23 +337,19 @@ impl Node for ComponentNode {
                 }
                 // Python recovers only once every retry is exhausted, so the failed
                 // attempts are counted here; the graph owns the retry loop itself.
-                let attempts = scope.record_failure(&self.rt.id);
-                if attempts > self.rt.node.max_retries {
+                let attempts = scope.record_failure(&rt.id);
+                if attempts > rt.node.max_retries {
                     if let Some(defaults) = self.recovered_output() {
                         // Python's `_run_error_recovery` calls `_post_invoke` with the
                         // handler's value, so the defaults go through `outputs_schema` too.
-                        let output = project_output(
-                            self.rt.node.outputs_schema.as_ref(),
-                            &source,
-                            &self.rt.id,
-                            defaults,
-                        );
+                        let output =
+                            rt.schemas
+                                .project_output(view.source(), &rt.id, defaults.clone());
                         if let Some(span) = &span {
                             span.set_metadata(
                                 "error_recovery",
                                 serde_json::json!({
-                                    "handle_type": self
-                                        .rt
+                                    "handle_type": rt
                                         .node
                                         .exception_config
                                         .as_ref()
@@ -362,20 +361,20 @@ impl Node for ComponentNode {
                             span.finish(output.clone());
                         }
                         tracing::warn!(
-                            component = %self.rt.id,
+                            component = %rt.id,
                             error = %failure,
                             "recovered a failed component with its configured default outputs"
                         );
-                        scope.clear_failures(&self.rt.id);
-                        state.set(self.rt.id.clone(), output);
+                        scope.clear_failures(&rt.id);
+                        view.set(rt.id.clone(), output);
                         return Ok(NodeOutcome::Continue);
                     }
                 }
                 let failure = error::component_execution_error(
-                    self.rt.component.component_type(),
-                    self.rt.ability.as_str(),
+                    rt.component.component_type(),
+                    rt.ability.as_str(),
                     failure.to_string().as_str(),
-                    &self.rt.workflow_id,
+                    &rt.workflow_id,
                 );
                 if let Some(span) = &span {
                     span.fail(failure.to_string());
@@ -394,25 +393,154 @@ enum Dispatch {
     Route(Vec<String>),
 }
 
-/// Resolves a node's input template (plus its stream template for `collect`/`transform`).
+/// The node's templates, compiled once when the graph is built.
 ///
-/// Without an `inputs_schema` the whole state object is handed to the component, which
-/// is what Python's components do when no explicit input mapping exists.
-fn resolve_inputs(node: &NodeConfig, ability: ComponentAbility, source: &Value) -> Value {
-    let inputs = node.inputs_schema.as_ref().map_or_else(
-        || source.clone(),
-        |schema| reference::resolve_schema(schema, source),
-    );
-    if !matches!(
-        ability,
-        ComponentAbility::Collect | ComponentAbility::Transform
-    ) {
-        return inputs;
+/// Every `${node.field}` reference in an input, stream-input or output template is split
+/// into [`PathSegment`](crate::reference::PathSegment)s here, at graph build, instead of
+/// on every node execution ([`crate::reference::resolve_schema`] re-parses them and stays
+/// the entry point for a one-off template).
+///
+/// `None` means the node has no template for that slot; an input node without a template
+/// hands its component the whole workflow state.
+#[derive(Debug)]
+pub(crate) struct NodeSchemas {
+    inputs: Option<CompiledSchema>,
+    stream_inputs: Option<CompiledSchema>,
+    outputs: Option<CompiledSchema>,
+}
+
+impl NodeSchemas {
+    /// Compiles `node`'s input, stream-input and output templates.
+    pub(crate) fn compile(node: &NodeConfig) -> Self {
+        Self {
+            inputs: node.inputs_schema.as_ref().map(CompiledSchema::compile),
+            stream_inputs: node
+                .stream_inputs_schema
+                .as_ref()
+                .map(CompiledSchema::compile),
+            outputs: node.outputs_schema.as_ref().map(CompiledSchema::compile),
+        }
     }
-    let Some(schema) = node.stream_inputs_schema.as_ref() else {
-        return inputs;
+
+    /// Resolves the node's input template (plus its stream template for
+    /// `collect`/`transform`).
+    ///
+    /// Without an input template the whole state object is handed to the component, which
+    /// is what Python's components do when no explicit input mapping exists.
+    fn resolve_inputs(&self, ability: ComponentAbility, source: &Value) -> Value {
+        let inputs = match &self.inputs {
+            Some(schema) => schema.resolve(source),
+            None => source.clone(),
+        };
+        if !matches!(
+            ability,
+            ComponentAbility::Collect | ComponentAbility::Transform
+        ) {
+            return inputs;
+        }
+        let Some(schema) = self.stream_inputs.as_ref() else {
+            return inputs;
+        };
+        merge_stream_inputs(inputs, schema.resolve(source))
+    }
+
+    /// Projects a component's raw output through the node's output template.
+    ///
+    /// The template resolves against the workflow state plus `{"<id>": raw, "output":
+    /// raw}`, so it can reference its own component id or the bare `output` key. The
+    /// extra keys are root bindings rather than a copy of the state, so projecting an
+    /// output costs nothing when the node has no output template.
+    fn project_output(&self, source: &Value, id: &str, raw: Value) -> Value {
+        project_output(self.outputs.as_ref(), source, id, raw)
+    }
+}
+
+/// Projects a component's raw output through `schema` (see [`NodeSchemas::project_output`]).
+///
+/// This is the engine's state convention; `crate::single` reuses it against a
+/// single-component call's resolved inputs so both paths project outputs identically.
+pub(crate) fn project_output(
+    schema: Option<&CompiledSchema>,
+    source: &Value,
+    id: &str,
+    raw: Value,
+) -> Value {
+    let Some(schema) = schema else {
+        return raw;
     };
-    merge_stream_inputs(inputs, reference::resolve_schema(schema, source))
+    schema.resolve_with(source, &[(id, &raw), ("output", &raw)])
+}
+
+/// One node's view of the graph state as the JSON root its templates resolve against.
+///
+/// [`GraphState`] stores its data as a `Map` and `Value::Object` needs ownership, so
+/// reading the state as a `Value` used to mean a deep clone of the whole state on every
+/// node execution (and a second one for the component's inputs). The view *moves* the map
+/// out of the state — an O(1) `take` — hands out a `&Value`, and puts the map back (with
+/// the node's output, if it produced one) when it is dropped, including when the node
+/// fails or its future is dropped for a timeout/cancellation. `openjiuwen-graph` hands each
+/// node its own cloned state (`run_node` clones per attempt) and reads it only after the
+/// node returns, so nothing observes the map while the view holds it.
+struct StateView<'a> {
+    state: &'a mut GraphState,
+    value: Value,
+}
+
+impl<'a> StateView<'a> {
+    /// Takes the state's map into a JSON object value.
+    fn new(state: &'a mut GraphState) -> Self {
+        #[cfg(test)]
+        crate::engine::node::view_metrics::record();
+        Self {
+            value: Value::Object(std::mem::take(&mut state.0)),
+            state,
+        }
+    }
+
+    /// The state as the JSON object templates resolve against.
+    fn source(&self) -> &Value {
+        &self.value
+    }
+
+    /// Writes `value` under `key`, as `GraphState::set` would.
+    fn set(&mut self, key: impl Into<String>, value: Value) {
+        if let Value::Object(map) = &mut self.value {
+            map.insert(key.into(), value);
+        }
+    }
+}
+
+impl Drop for StateView<'_> {
+    fn drop(&mut self) {
+        if let Value::Object(map) = std::mem::take(&mut self.value) {
+            self.state.0 = map;
+        }
+    }
+}
+
+/// Test-only observation of how many times a node took the state view on this thread.
+///
+/// A regression that went back to materializing the state with `GraphState::as_value()` (a
+/// deep clone per node) would take no views at all, so the engine's regression suite asserts
+/// one view per executed node. The counter is thread-local so tests running in parallel do
+/// not disturb it, and it only exists in test builds.
+#[cfg(test)]
+pub(crate) mod view_metrics {
+    use std::cell::Cell;
+
+    thread_local! {
+        static TAKEN: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Records one [`super::StateView::new`] on this thread.
+    pub(crate) fn record() {
+        TAKEN.with(|taken| taken.set(taken.get().saturating_add(1)));
+    }
+
+    /// How many state views were taken on this thread so far.
+    pub(crate) fn views() -> usize {
+        TAKEN.with(Cell::get)
+    }
 }
 
 /// Deep-merges the streamed inputs over the batch inputs, stream keys winning.
@@ -425,33 +553,6 @@ fn merge_stream_inputs(batch: Value, streamed: Value) -> Value {
     merged
 }
 
-/// Projects a component's raw output through the node's `outputs_schema`.
-///
-/// The schema resolves against the full workflow state plus `{"<id>": raw, "output":
-/// raw}`, so a template can reference its own component id or the bare `output` key.
-/// This is the engine's state convention; `crate::single` reuses it against a
-/// single-component call's resolved inputs so both paths project outputs identically.
-pub(crate) fn project_output(
-    schema: Option<&Value>,
-    source: &Value,
-    id: &str,
-    raw: &Value,
-) -> Value {
-    let Some(schema) = schema else {
-        return raw.clone();
-    };
-    let mut scope = if source.is_object() {
-        source.clone()
-    } else {
-        Value::Object(Map::new())
-    };
-    if let Value::Object(map) = &mut scope {
-        map.insert(id.to_owned(), raw.clone());
-        map.insert("output".to_owned(), raw.clone());
-    }
-    reference::resolve_schema(schema, &scope)
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::assert_is_empty)]
 mod tests {
@@ -459,11 +560,22 @@ mod tests {
 
     use super::*;
 
+    /// Compiles `node` and resolves its inputs, exactly as one node execution does.
+    fn inputs(node: &NodeConfig, ability: ComponentAbility, source: &Value) -> Value {
+        NodeSchemas::compile(node).resolve_inputs(ability, source)
+    }
+
+    /// Projects `raw` through `schema`, exactly as one node execution does.
+    fn outputs(schema: Option<&Value>, source: &Value, id: &str, raw: Value) -> Value {
+        let schema = schema.map(CompiledSchema::compile);
+        project_output(schema.as_ref(), source, id, raw)
+    }
+
     #[test]
     fn input_schema_falls_back_to_the_whole_state() {
         let source = json!({"query": "hello"});
         assert_eq!(
-            resolve_inputs(&NodeConfig::default(), ComponentAbility::Invoke, &source),
+            inputs(&NodeConfig::default(), ComponentAbility::Invoke, &source),
             source
         );
     }
@@ -476,7 +588,7 @@ mod tests {
         };
         let source = json!({"start": {"query": "hello"}});
         assert_eq!(
-            resolve_inputs(&node, ComponentAbility::Invoke, &source),
+            inputs(&node, ComponentAbility::Invoke, &source),
             json!({"q": "hello"})
         );
     }
@@ -490,12 +602,12 @@ mod tests {
         };
         let source = json!({"start": {"query": "hello"}});
         assert_eq!(
-            resolve_inputs(&node, ComponentAbility::Collect, &source),
+            inputs(&node, ComponentAbility::Collect, &source),
             json!({"q": "streamed", "keep": 1})
         );
         // Batch abilities ignore the stream template.
         assert_eq!(
-            resolve_inputs(&node, ComponentAbility::Invoke, &source),
+            inputs(&node, ComponentAbility::Invoke, &source),
             json!({"q": "hello", "keep": 1})
         );
     }
@@ -509,7 +621,7 @@ mod tests {
         };
         let source = json!({"start": {"query": "hello"}});
         assert_eq!(
-            resolve_inputs(&node, ComponentAbility::Transform, &source),
+            inputs(&node, ComponentAbility::Transform, &source),
             json!(["a", "b"])
         );
     }
@@ -519,41 +631,46 @@ mod tests {
         let source = json!({"start": {"query": "hello"}});
         let raw = json!({"text": "hi"});
         assert_eq!(
-            project_output(
+            outputs(
                 Some(&json!({"answer": "${fake.text}"})),
                 &source,
                 "fake",
-                &raw
+                raw.clone()
             ),
             json!({"answer": "hi"})
         );
         assert_eq!(
-            project_output(
+            outputs(
                 Some(&json!({"answer": "${output.text}"})),
                 &source,
                 "fake",
-                &raw
+                raw.clone()
             ),
             json!({"answer": "hi"})
         );
         // A missing path resolves to null and never fails.
         assert_eq!(
-            project_output(Some(&json!({"answer": "${nope.x}"})), &source, "fake", &raw),
+            outputs(
+                Some(&json!({"answer": "${nope.x}"})),
+                &source,
+                "fake",
+                raw.clone()
+            ),
             json!({"answer": null})
         );
         // Without a schema the raw value is stored verbatim.
-        assert_eq!(project_output(None, &source, "fake", &raw), raw);
+        assert_eq!(outputs(None, &source, "fake", raw.clone()), raw);
     }
 
     #[test]
     fn output_schema_projects_against_a_non_object_state() {
         let raw = json!(7);
         assert_eq!(
-            project_output(
+            outputs(
                 Some(&json!({"value": "${output}"})),
                 &json!("scalar"),
                 "c",
-                &raw
+                raw
             ),
             json!({"value": 7})
         );
@@ -569,5 +686,34 @@ mod tests {
             merge_stream_inputs(json!({"a": 1}), json!({"b": 2})),
             json!({"a": 1, "b": 2})
         );
+    }
+
+    #[test]
+    fn the_state_view_moves_the_map_instead_of_cloning_it() {
+        let mut state = GraphState::from_map(
+            json!({"payload": {"big": [1, 2, 3]}, "other": "kept"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let payload = std::ptr::from_ref(state.get("payload").unwrap());
+        {
+            let mut view = StateView::new(&mut state);
+            // Same allocation: the view took the map instead of cloning it (`Value::clone`
+            // would have produced a fresh `payload` allocation).
+            assert_eq!(
+                std::ptr::from_ref(view.source().pointer("/payload").unwrap()),
+                payload
+            );
+            view.set("out", json!(true));
+        }
+        assert_eq!(state.get("payload").unwrap(), &json!({"big": [1, 2, 3]}));
+        assert_eq!(state.get("other").unwrap(), &json!("kept"));
+        assert_eq!(state.get("out").unwrap(), &json!(true));
+        // A dropped view restores the state even without a write.
+        {
+            let _view = StateView::new(&mut state);
+        }
+        assert_eq!(state.get("other").unwrap(), &json!("kept"));
     }
 }

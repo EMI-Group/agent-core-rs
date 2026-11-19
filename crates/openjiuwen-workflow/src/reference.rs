@@ -182,30 +182,49 @@ pub fn resolve_path(source: &Value, path: &str) -> Option<Value> {
 
 /// Resolves an already-split path; `Some(value.clone())` for an empty path.
 fn resolve_segments(value: &Value, segments: &[PathSegment]) -> Option<Value> {
+    resolve_segments_with(value, segments, &[])
+}
+
+/// Resolves an already-split path, honouring `bindings` at the path's root.
+///
+/// `bindings` are extra root keys that shadow the source's own keys (the engine binds a
+/// node's own id and `output` to its raw result this way, instead of cloning the whole
+/// state into a projection scope). They apply only at the root of each path, so a nested
+/// key of the same name resolves from the source as usual.
+fn resolve_segments_with<'a>(
+    value: &'a Value,
+    segments: &[PathSegment],
+    bindings: &[(&str, &'a Value)],
+) -> Option<Value> {
     let Some((segment, rest)) = segments.split_first() else {
         return Some(value.clone());
     };
     match segment {
         PathSegment::Index(index) => match value {
-            Value::Array(items) => resolve_segments(index_at(items, *index)?, rest),
+            Value::Array(items) => resolve_segments_with(index_at(items, *index)?, rest, &[]),
             _ => None,
         },
-        PathSegment::Key(key) => match value {
-            Value::Object(map) => resolve_segments(map.get(key)?, rest),
-            Value::Array(items) => {
-                if let Ok(index) = key.parse::<i64>() {
-                    return resolve_segments(index_at(items, index)?, rest);
-                }
-                let mut projected = Vec::with_capacity(items.len());
-                for item in items {
-                    if let Some(resolved) = resolve_segments(item, segments) {
-                        projected.push(resolved);
-                    }
-                }
-                Some(Value::Array(projected))
+        PathSegment::Key(key) => {
+            if let Some((_, bound)) = bindings.iter().find(|(name, _)| name == key) {
+                return resolve_segments_with(bound, rest, &[]);
             }
-            _ => None,
-        },
+            match value {
+                Value::Object(map) => resolve_segments_with(map.get(key)?, rest, &[]),
+                Value::Array(items) => {
+                    if let Ok(index) = key.parse::<i64>() {
+                        return resolve_segments_with(index_at(items, index)?, rest, &[]);
+                    }
+                    let mut projected = Vec::with_capacity(items.len());
+                    for item in items {
+                        if let Some(resolved) = resolve_segments_with(item, segments, &[]) {
+                            projected.push(resolved);
+                        }
+                    }
+                    Some(Value::Array(projected))
+                }
+                _ => None,
+            }
+        }
     }
 }
 
@@ -253,6 +272,97 @@ pub fn resolve_schema(schema: &Value, source: &Value) -> Value {
 #[must_use]
 pub fn project(value: &Value, path: &str) -> Value {
     resolve_path(value, path).unwrap_or(Value::Null)
+}
+
+/// A JSON template whose pure `${...}` references were parsed once.
+///
+/// [`resolve_schema`] is the dynamic entry point: it re-parses every reference on each
+/// call, which is the right trade-off for a one-off template. A node's schemas are
+/// immutable, so the engine compiles them once at graph build and resolves the cached
+/// [`PathSegment`]s on every node execution instead.
+///
+/// The resolved value is identical to [`resolve_schema`]'s: a whole-string reference
+/// resolves to the referenced value (any JSON type, `null` when missing or when the path
+/// itself is malformed), and every other string is a literal.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CompiledSchema {
+    template: CompiledTemplate,
+}
+
+/// One node of a [`CompiledSchema`].
+#[derive(Debug, Clone, PartialEq)]
+enum CompiledTemplate {
+    /// A pure `${...}` string whose path was split at compile time.
+    Reference(Vec<PathSegment>),
+    /// Any other value, stored verbatim.
+    Literal(Value),
+    /// An array template, resolved element-wise.
+    Array(Vec<CompiledTemplate>),
+    /// An object template, resolved value-wise.
+    Object(Vec<(String, CompiledTemplate)>),
+}
+
+impl CompiledSchema {
+    /// Parses every `${...}` reference in `schema` once.
+    pub(crate) fn compile(schema: &Value) -> Self {
+        Self {
+            template: CompiledTemplate::compile(schema),
+        }
+    }
+
+    /// Resolves the template against `source`, exactly like [`resolve_schema`].
+    pub(crate) fn resolve(&self, source: &Value) -> Value {
+        self.template.resolve(source, &[])
+    }
+
+    /// Resolves the template with `bindings` shadowing `source`'s keys at the root.
+    ///
+    /// The engine binds a node's own id and `output` to the node's raw result this way, so
+    /// projecting an output does not have to clone the whole workflow state.
+    pub(crate) fn resolve_with(&self, source: &Value, bindings: &[(&str, &Value)]) -> Value {
+        self.template.resolve(source, bindings)
+    }
+}
+
+impl CompiledTemplate {
+    fn compile(value: &Value) -> Self {
+        match value {
+            Value::String(text) => match extract_origin_key(text) {
+                // A malformed path resolves to `null` in `resolve_schema` too, because
+                // `resolve_path` maps the parse failure to `None`.
+                Some(path) => split_path(path).map_or(Self::Literal(Value::Null), Self::Reference),
+                None => Self::Literal(value.clone()),
+            },
+            Value::Array(items) => Self::Array(items.iter().map(Self::compile).collect()),
+            Value::Object(map) => Self::Object(
+                map.iter()
+                    .map(|(key, value)| (key.clone(), Self::compile(value)))
+                    .collect(),
+            ),
+            scalar => Self::Literal(scalar.clone()),
+        }
+    }
+
+    fn resolve(&self, source: &Value, bindings: &[(&str, &Value)]) -> Value {
+        match self {
+            Self::Reference(segments) => {
+                resolve_segments_with(source, segments, bindings).unwrap_or(Value::Null)
+            }
+            Self::Literal(value) => value.clone(),
+            Self::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| item.resolve(source, bindings))
+                    .collect(),
+            ),
+            Self::Object(entries) => Value::Object(
+                entries
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.resolve(source, bindings)))
+                    .collect(),
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -465,6 +575,74 @@ mod tests {
         for schema in [json!(null), json!(true), json!(3.5), json!(-2), json!([])] {
             assert_eq!(resolve_schema(&schema, &source), schema);
         }
+    }
+
+    #[test]
+    fn a_compiled_schema_resolves_exactly_like_the_dynamic_one() {
+        let source = state();
+        let templates = [
+            json!({
+                "literal": "plain text",
+                "embedded": "prefix ${start.a}",
+                "whole": "${start.a}",
+                "missing": "${nope}",
+                "null_field": "${start.null_field}",
+                "nested": {"deep": "${start.nested.b[0]}", "keep": 7},
+                "index": "${start.nested.b[-1]}",
+                "quoted": "${start['a b']}",
+                "projected": "${start.items.name}",
+                "list": ["${query}", "literal", null, true],
+                "concatenated": "${start.a}${start.a}",
+                "malformed": "${start[}",
+            }),
+            json!(["${start.a}", {"n": "${nope.x}"}]),
+            json!("literal"),
+            json!(null),
+            json!(12),
+        ];
+        for template in templates {
+            assert_eq!(
+                CompiledSchema::compile(&template).resolve(&source),
+                resolve_schema(&template, &source),
+                "compiled resolution must match for {template}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_compiled_schema_binds_root_keys_over_the_source() {
+        let source = state();
+        let schema = CompiledSchema::compile(&json!({
+            "own": "${node.text}",
+            "bare": "${output}",
+            "missing": "${node.nope}",
+            // A nested key of the same name still resolves from the source.
+            "nested": "${start.a}",
+        }));
+        let raw = json!({"text": "hi"});
+        assert_eq!(
+            schema.resolve_with(&source, &[("node", &raw), ("output", &raw)]),
+            json!({"own": "hi", "bare": {"text": "hi"}, "missing": null, "nested": 1})
+        );
+        // Without the bindings the same template resolves against the source alone.
+        assert_eq!(
+            schema.resolve(&source),
+            json!({"own": null, "bare": null, "missing": null, "nested": 1})
+        );
+    }
+
+    #[test]
+    fn a_compiled_schema_handles_a_non_object_root() {
+        let schema = CompiledSchema::compile(&json!({"own": "${node.x}", "other": "${x}"}));
+        let raw = json!(7);
+        assert_eq!(
+            schema.resolve_with(&json!("scalar"), &[("node", &raw)]),
+            json!({"own": null, "other": null})
+        );
+        assert_eq!(
+            schema.resolve_with(&Value::Null, &[("node", &raw)]),
+            json!({"own": null, "other": null})
+        );
     }
 
     #[test]

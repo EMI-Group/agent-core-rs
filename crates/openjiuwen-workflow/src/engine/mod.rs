@@ -77,7 +77,7 @@ use openjiuwen_common::error::{Error, Result};
 use crate::ability::ComponentAbility;
 use crate::card::{WorkflowCard, WorkflowConfig, WorkflowSpec};
 use crate::engine::definition::EdgeKind as DefinitionEdgeKind;
-use crate::engine::node::{ComponentNode, NodeRuntime, RunScope};
+use crate::engine::node::{ComponentNode, NodeRuntime, NodeSchemas, RunScope};
 use crate::error;
 
 pub use definition::{ConditionalSource, Edge, EdgeKind, Entry, NodeConfig, WorkflowDefinition};
@@ -468,6 +468,7 @@ impl CompiledWorkflow {
             let runtime = NodeRuntime {
                 id: id.to_owned(),
                 component: Arc::clone(&entry.component),
+                schemas: NodeSchemas::compile(&entry.node),
                 node: entry.node.clone(),
                 ability: self.ability_or_default(id),
                 is_end: id == inner.end_id.as_str(),

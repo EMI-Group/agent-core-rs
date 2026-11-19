@@ -980,7 +980,7 @@ async fn a_slow_consumer_backpressures_the_run_instead_of_buffering_every_frame(
         WorkflowRunOptions::default(),
     );
     // Poll once so the run starts and the first frame reaches the consumer.
-    let first = stream.next().await.expect("a frame").unwrap();
+    let first = stream.next().await.unwrap().unwrap();
     assert_eq!(first.item_type, END_NODE_STREAM);
 
     let stopped_at = settled_production(&produced).await;
@@ -1003,7 +1003,7 @@ async fn dropping_the_stream_aborts_the_producing_run() {
         session("drop-aborts"),
         WorkflowRunOptions::default(),
     );
-    stream.next().await.expect("a frame").unwrap();
+    stream.next().await.unwrap().unwrap();
     let before_drop = settled_production(&produced).await;
     assert!(
         before_drop < 10_000,
@@ -1048,4 +1048,36 @@ async fn the_run_paths_attach_no_frame_collector() {
         before,
         "the engine's run paths must not retain frames in a collector"
     );
+}
+
+#[tokio::test]
+async fn a_run_of_n_nodes_takes_one_state_view_per_node() {
+    // The state view is what replaced the full-state deep copy every node used to make:
+    // each executed node takes the map out of its state, borrows it, and puts it back. A
+    // future change that goes back to `GraphState::as_value()` takes no views at all, so
+    // the count is the regression guard for the borrow path.
+    let before = crate::engine::node::view_metrics::views();
+    let workflow = CompiledWorkflow::build(linear(echo(), NodeConfig::default())).unwrap();
+    let output = workflow
+        .invoke(
+            json!({"query": "hi"}),
+            session("state-views"),
+            WorkflowRunOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(output.state, WorkflowExecutionState::Completed);
+    // `start`, `mid` and `end` each run once.
+    assert_eq!(
+        crate::engine::node::view_metrics::views() - before,
+        3,
+        "every executed node must borrow the state exactly once"
+    );
+    // Taking the map out of the state must not lose it: the graph state still carries the
+    // run's inputs and the nodes' outputs when the run finishes.
+    // Taking the map out of the state must not lose it: the end component receives the
+    // whole state, inputs included, as its default output.
+    assert_eq!(output.result["output"]["query"], json!("hi"));
+    assert_eq!(output.result["output"]["inputs"]["query"], json!("hi"));
 }
