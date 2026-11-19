@@ -6,7 +6,7 @@ build:
 
 # Default test gate: the whole workspace, offline (no network or credentials).
 test:
-	cargo test --workspace
+	cargo test --workspace --offline --no-fail-fast
 
 # Feature-gated suites: integrations and optional backends.
 test-all:
@@ -31,7 +31,7 @@ clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
 doc:
-	cargo doc --workspace --no-deps
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # Compile all runnable examples (offline set + A2A/MCP-gated set).
 examples:
@@ -39,7 +39,7 @@ examples:
 	cargo build -p openjiuwen-examples --examples --features a2a,mcp
 
 # Full local verification, mirroring the documented gates.
-verify: fmt-check clippy test test-all
+verify: fmt-check clippy test doc test-all
 	cargo build -p openjiuwen-examples --examples
 	cargo build -p openjiuwen-examples --examples --features a2a,mcp
 
