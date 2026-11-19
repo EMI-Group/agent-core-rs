@@ -24,14 +24,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use openjiuwen_common::error::{Error, Result};
 
 use crate::code::types::{CodeChunk, CodeExecParams, CodeOutput};
 use crate::fs::types::{
     CopyData, CopyParams, DeleteData, DeleteParams, DownloadFileData, DownloadFileParams, FileStat,
     ListDirsParams, ListFilesData, ListFilesParams, MkdirData, MkdirParams, MoveData, MoveParams,
-    ReadChunkData, ReadFileData, ReadFileParams, SearchFilesData, SearchFilesParams,
-    SearchPatternMode, TransferChunkData, UploadFileData, UploadFileParams, WriteFileData,
-    WriteFileParams,
+    ReadBytesData, ReadBytesParams, ReadChunkData, ReadFileData, ReadFileParams, SearchFilesData,
+    SearchFilesParams, SearchPatternMode, TransferChunkData, UploadFileData, UploadFileParams,
+    WriteFileData, WriteFileParams,
 };
 use crate::result::OpResult;
 use crate::shell::types::{
@@ -46,10 +47,12 @@ pub type OpStream<T> = BoxStream<'static, OpResult<T>>;
 
 /// Filesystem operations shared by the local and sandbox backends.
 ///
-/// The ten methods are exactly Python's `BaseFsOperation` surface; the extra convenience
-/// operations (`mkdir`, `delete`, `copy`, `move_path`, `stat`, `exists`, regex search)
-/// live in [`FsExtOperation`] and are not rendered as tool cards, so the generated tool
-/// list stays Python-compatible.
+/// The ten required methods are exactly Python's `BaseFsOperation` surface, plus one
+/// defaulted Rust addition — [`FsOperation::read_bytes_limited`] — that lets a caller read a
+/// window of a file without allocating the whole of it. The extra convenience operations
+/// (`mkdir`, `delete`, `copy`, `move_path`, `stat`, `exists`, regex search) live in
+/// [`FsExtOperation`] and are not rendered as tool cards, so the generated tool list stays
+/// Python-compatible.
 #[async_trait]
 pub trait FsOperation: Send + Sync {
     /// Whether this backend implements compare-and-swap writes.
@@ -61,7 +64,40 @@ pub trait FsOperation: Send + Sync {
     }
 
     /// Reads a file, honoring head/tail/line-range slicing in text mode.
+    ///
+    /// The whole file is loaded, so a file above
+    /// [`LocalWorkConfig::max_file_size_bytes`](crate::config::LocalWorkConfig::max_file_size_bytes)
+    /// is refused instead of allocated: the failure reason comes from
+    /// [`PathPolicy::check_read_size`](crate::workspace::PathPolicy::check_read_size) and names
+    /// the file size and the limit. Use [`Self::read_bytes_limited`] for a window of a larger
+    /// file.
     async fn read_file(&self, params: ReadFileParams) -> OpResult<ReadFileData>;
+
+    /// Reads at most `params.max_bytes` bytes from `params.offset` **without** loading the
+    /// rest of the file.
+    ///
+    /// Rust addition (Python's `read_file` is whole-file only): the returned buffer is bounded
+    /// by the caller's window, `total_bytes` reports the real file length, and `truncated`
+    /// says whether more bytes remained. Reading the first lines of a multi-gigabyte log costs
+    /// the window, not the file.
+    ///
+    /// The default implementation reports
+    /// [`openjiuwen_common::error::ErrorKind::Unsupported`], so a backend that implements only
+    /// Python's ten-method surface keeps compiling and says it cannot bound a read instead of
+    /// silently degrading to a whole-file read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`openjiuwen_common::error::ErrorKind::Unsupported`] for a backend that does not
+    /// implement it, [`openjiuwen_common::error::ErrorKind::Validation`] when `max_bytes` is
+    /// above the configured whole-file ceiling (the message names the requested window and the
+    /// limit), and [`openjiuwen_common::error::ErrorKind::SysOp`] for path/lock/I/O failures.
+    async fn read_bytes_limited(&self, params: ReadBytesParams) -> Result<ReadBytesData> {
+        let _ = params;
+        Err(Error::unsupported(
+            "this filesystem backend does not implement bounded byte reads",
+        ))
+    }
 
     /// Streams a file: one line per chunk in text mode, `chunk_size` bytes per chunk in
     /// bytes mode.

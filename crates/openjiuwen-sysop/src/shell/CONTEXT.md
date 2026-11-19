@@ -28,6 +28,9 @@ The parent `../CONTEXT.md` "Behavior contract" section is the authoritative Pyth
 - `RunOptions::timeout_secs == 0` means no deadline.
 - A timeout or any of the cancellation tokens kills the child exactly once, keeps partial output, and sets `timed_out`/`cancelled`.
 - `stream_child` emits exactly one terminal event (`Exit`, `TimedOut`, or `Cancelled`) and joins its pipe readers with a grace period.
+- `drive_child` keeps `child.wait()` inside the same `select!` as the deadline and the cancellation tokens for the whole run, so the deadline stays reachable after both pipes reach EOF (a child that closes stdout/stderr and keeps running is still killed on time and still cancellable) and the loop ends only when the child is reaped *and* the pipes are closed.
+- A killed child is reaped through `reap_killed_child`, bounded by `REAP_GRACE`: an unkillable process reports exit code `-1` (logged at `warn!`) instead of hanging the caller.
+- Streaming readers read in `DEFAULT_TEXT_CHUNK_SIZE` slices under channel backpressure and stop at `max_output_bytes`, so a child emitting one enormous line costs the per-stream budget, not the line's length (asserted by `tests/stream_interrupts.rs`).
 - Reader failures end the affected pipe and never panic; anything other than clean EOF / `EIO` / `BrokenPipe` is logged at `warn!` with the path or stream name, so truncated output is never silent.
 - Best-effort steps log their outcome instead of discarding it: a failed `start_kill`, a failed reap, a failed group termination, a session-map poison, and the PTY→pipe fallback each emit `warn!`/`debug!` with the pid or stream and the underlying error.
 - A child that was signalled (or whose status could not be read) still reports exit code `-1` (Python parity), with a `debug!`/`warn!` naming the case.
@@ -58,6 +61,7 @@ The parent `../CONTEXT.md` "Behavior contract" section is the authoritative Pyth
 - Facade tests that need `sh` or `echo` skip with a message when the binary is missing.
 - Inline engine tests in `process.rs` cover the incremental UTF-8 decoder (split characters, invalid and incomplete bytes), the line-buffering wrapper decision (applied, skipped without a wrapper, skipped when disabled, empty argv), and the `ProcessGroup` guard (never after the reap, kill-at-most-once, pid 0 rejected).
 - `tests/process_group.rs` proves the tree kill with a shell that leaves a `sleep 30` grandchild: timeout, per-instance cancellation, session cancellation, and the background stop path all leave no live grandchild (bounded `/proc` polling, `kill -0` elsewhere), and `execute_argv` inherits no `stdbuf` wrapper.
+- `tests/stream_interrupts.rs` covers the pipe-EOF case: a `sh -c 'exec >/dev/null 2>&1; sleep 30'` run ends with the timeout error, the same run ends with the cancellation error when the per-instance token fires, and a 20 000-byte single line is captured within `max_output_bytes` with the truncation marker.
 - `tests/pty_streaming.rs` asserts the PTY path is really a terminal (`[ -t 1 ]`), that four lines arrive as several chunks with no `\r`, that `exit 3` is reported on the terminal chunk, and that pipes are still used when `pty_streaming` is off.
 - Inline PTY tests in `pty.rs` cover `\r` stripping, the configured terminal attributes, and an end-to-end terminal run.
 - Every test is offline and deterministic (`tempfile` workspaces, no network).

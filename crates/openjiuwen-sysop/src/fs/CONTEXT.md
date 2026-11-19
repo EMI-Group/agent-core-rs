@@ -14,8 +14,10 @@ checklist; this file records only what is specific to this subtree.
 - `local::LocalFsOperation` — `new(config)`, `policy()`, `config()`, `impl FsOperation` (all ten
   Python methods, `supports_conditional_write() == true`) and `impl FsExtOperation`
   (`stat`, `exists`, `mkdir`, `delete`, `copy`, `move_path`, `search_files_with`).
-- `read::{read_file, read_file_stream}` — `pub(crate)` entry points behind the two read trait
-  methods; `prepare_read_stream`, `load_for_read`, `read_bytes_locked` are the private steps.
+- `read::{read_file, read_file_stream, read_bytes_limited}` — `pub(crate)` entry points behind
+  the read trait methods; `prepare_read_stream`, `load_for_read`, `read_bytes_locked`,
+  `read_window`, `read_window_locked` are the private steps (`read_window*` are the seek-and-take
+  bounded read).
 - `write::write_file` — `pub(crate)` entry point behind the write trait method;
   `validate_write`, `write_locked`, `version_conflict`, `metadata_if_exists`,
   `apply_permissions` are private.
@@ -73,7 +75,14 @@ checklist; this file records only what is specific to this subtree.
   `head and line_range … cannot be specified simultaneously`; conditional-write flag clash →
   `conditional write options are incompatible`; non-directory roots → `Path is not a directory: …`.
 - Missing read target → `File does not exist: <path>`; directory read → `Is a directory: <path>`;
-  read over `max_file_size_bytes` → a reason naming both the size and the limit.
+  read over `max_file_size_bytes` (64 MiB by default, `None` for `unrestricted`) → a reason naming
+  both the size and the limit, produced from the metadata *before* the file is opened. The typed
+  source is `PathPolicy::check_read_size` → `Error::Validation`.
+- `read_bytes_limited` is the whole-file read's bounded counterpart: it seeks to `offset`, reads at
+  most `max_bytes` (`take`), and returns `total_bytes`/`truncated` from the metadata and the window
+  end, so a huge file costs the window. A window wider than `max_file_size_bytes` is
+  `Error::Validation` naming the window and the limit; a missing/denied path is `Error::SysOp`; a
+  directory is `Error::Validation`; an offset past EOF is an empty, non-truncated window.
 - `read_file` reports `ReadFileData.encoding` only for `encoding = "auto"`.
 - Transfer streams emit a terminal `TransferChunkData` (`chunk_size 0`) for an EMPTY source; text
   read streams emit ZERO items for an empty file, except tail mode which emits one empty terminal
@@ -130,7 +139,9 @@ checklist; this file records only what is specific to this subtree.
   `slice.rs` (validation order, line splitting, selection, chunk math, write-content
   composition, `try_encoded_len` vs the `encoded_len` fallback), `read.rs` (read
   text/bytes/slicing/max-size/binary policy/traversal denial/symlink escape, text and byte
-  stream shapes, the empty-file and tail-terminal-chunk cases), `write.rs` (newline defaults,
+  stream shapes, the empty-file and tail-terminal-chunk cases; `tests/bounded_read.rs` covers
+  the default whole-file ceiling and its typed gate, the `unrestricted` opt-out, and the bounded
+  window's offset/EOF/zero-window/ceiling shapes), `write.rs` (newline defaults,
   append semantics, flag-combination rejection, stale-digest and `create_if_absent` conflicts
   with a byte-identical file, the declared write encodings, encoding rejection, and
   `metadata_if_exists` distinguishing a missing file from an unreadable one), `transfer.rs`
@@ -162,7 +173,7 @@ checklist; this file records only what is specific to this subtree.
 - `./types.rs` → frozen parameter/data types (`ReadFileParams`, `WriteFileParams`, `FileSystemItem`, ext types)
 - `./local.rs` → `LocalFsOperation` facade, `new`/`policy`/`config`, two-layer lock helpers (`read_guard`, `write_guard`, `acquire_ordered`, `PathGuard`, re-exported `LockMode`), `len_u64`, delegating trait impls, shared `test_util` fixtures
 - `./lock.rs` → cross-process advisory `flock`: `FileLockManager`, `FileLockGuard`, `LockMode`, `LockError`, `lock_path_for`, `default_lock_root`, polling and timeout, non-Unix no-op fallback
-- `./read.rs` → `read_file`, `read_file_stream`, `prepare_read_stream`, `load_for_read`, `read_bytes_locked`, read stream plan types
+- `./read.rs` → `read_file`, `read_file_stream`, `read_bytes_limited`, `prepare_read_stream`, `load_for_read`, `read_bytes_locked`, `read_window`, `read_window_locked`, read stream plan types
 - `./write.rs` → `write_file`, `validate_write`, `write_locked`, conditional compare-and-swap, permission application
 - `./transfer.rs` → `upload_file`/`download_file` (+ streams), `prepare_upload`/`prepare_download`, ordered-lock copy engine, chunk streaming, host-path expansion
 - `./slice.rs` → pure read validation/slicing, chunk sizes, write-content composition

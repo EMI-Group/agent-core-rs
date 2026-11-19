@@ -35,6 +35,8 @@ const STDERR_JOIN_GRACE: Duration = Duration::from_millis(100);
 const READ_CHUNK_SIZE: usize = 65_536;
 /// How long to wait for a pipe reader once the child has been reaped.
 const READER_GRACE: Duration = Duration::from_secs(5);
+/// How long to wait for a killed child's exit status before giving up on it.
+const REAP_GRACE: Duration = Duration::from_secs(5);
 /// Capacity of the streamed-event channel.
 pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// Program that switches a POSIX child to line buffering (Python's Linux wrapper).
@@ -233,6 +235,12 @@ fn wrap_with(wrapper: Option<&str>, mut argv: Vec<String>) -> Vec<String> {
 /// Output is drained concurrently with the wait, so a chatty child cannot deadlock on
 /// a full pipe. A timeout or a cancellation token kills the child, keeps the partial
 /// output, and sets the matching flag.
+///
+/// Each reader retains at most [`RunOptions::max_output_bytes`] bytes and reads in
+/// [`READ_CHUNK_SIZE`] slices, so a child that emits one enormous line costs the buffer's
+/// ceiling rather than the line's length. The wait races the deadline and the cancellation
+/// tokens directly; a killed child is reaped within [`REAP_GRACE`] so an unkillable process
+/// cannot hang the call.
 pub(crate) async fn run_captured(mut child: Child, options: RunOptions) -> RunOutcome {
     let started = Instant::now();
     let max_output_bytes = options.max_output_bytes;
@@ -243,20 +251,23 @@ pub(crate) async fn run_captured(mut child: Child, options: RunOptions) -> RunOu
     let cancel = cancellation_future(&options.cancellation);
     let mut timed_out = false;
     let mut cancelled = false;
-    let mut reaped = false;
+    let mut status: Option<std::io::Result<ExitStatus>> = None;
     // The branch handlers must not touch `child`: the wait future borrows it.
     tokio::select! {
-        _ = child.wait() => reaped = true,
+        waited = child.wait() => status = Some(waited),
         () = deadline => timed_out = true,
         () = cancel => cancelled = true,
     }
-    if !reaped {
+    if status.is_none() {
         // Kill the whole tree before reaping: the group is still addressable while the
         // unreaped child leads it, so grandchildren die with it.
         group.terminate(false);
         kill_direct_child(&mut child);
     }
-    let exit_code = exit_code_of(child.wait().await);
+    let exit_code = match status {
+        Some(waited) => exit_code_of(waited),
+        None => exit_code_of(reap_killed_child(&mut child).await),
+    };
     let stdout = join_reader(stdout_task).await;
     let stderr = join_reader(stderr_task).await;
     let duration_ms = elapsed_ms(started);
@@ -308,6 +319,13 @@ pub(crate) fn stream_child(
 /// The readers feeding `receiver` are already running; this driver owns the timeout, the
 /// cancellation tokens, and the process-group kill, so the pipe path and the PTY path
 /// share exactly one set of run semantics.
+///
+/// The child's own `wait()` stays inside the same `select!` as the deadline and the
+/// cancellation tokens for the *whole* run. That is what makes the deadline reachable once
+/// both pipes reach EOF: a child that closes its output but keeps running (a daemonising
+/// `sh -c 'cmd >/dev/null 2>&1 &'`, a shell whose only descendant re-opened `/dev/null`) is
+/// still killed on time and still cancellable. The loop ends only when the child was reaped
+/// *and* the pipes closed, or when an interrupt fired.
 pub(crate) fn drive_child(
     mut child: Child,
     timeout_secs: u64,
@@ -319,37 +337,40 @@ pub(crate) fn drive_child(
         let mut deadline = deadline_future(timeout_secs);
         let mut cancel = cancellation_future(&cancellation);
         let mut interrupted = None;
-        loop {
+        let mut status: Option<std::io::Result<ExitStatus>> = None;
+        let mut pipes_open = true;
+        // Continue while nothing interrupted the run and the child has not both exited and
+        // closed its pipes: the wait below must stay selectable for the whole run.
+        while interrupted.is_none() && (status.is_none() || pipes_open) {
             let mut event: Option<EngineEvent> = None;
-            let mut finished = false;
             // `yield` is not allowed inside a branch, so the event is buffered.
             tokio::select! {
-                incoming = receiver.recv() => match incoming {
+                incoming = receiver.recv(), if pipes_open => match incoming {
                     Some(item) => event = Some(item),
-                    None => finished = true,
+                    None => pipes_open = false,
                 },
-                () = &mut deadline => {
+                waited = child.wait(), if status.is_none() => status = Some(waited),
+                () = &mut deadline, if interrupted.is_none() => {
                     interrupted = Some(EngineEvent::TimedOut { code: -1 });
-                    finished = true;
                 }
-                () = &mut cancel => {
+                () = &mut cancel, if interrupted.is_none() => {
                     interrupted = Some(EngineEvent::Cancelled { code: -1 });
-                    finished = true;
                 }
             }
             if let Some(item) = event {
                 yield item;
             }
-            if finished {
-                break;
-            }
         }
         if interrupted.is_some() {
-            // The child has not been reaped here, so its group is still addressable.
+            // The child has not necessarily been reaped here, so its group is still
+            // addressable: kill the whole tree, not just the direct child.
             group.terminate(false);
             kill_direct_child(&mut child);
         }
-        let code = exit_code_of(child.wait().await);
+        let code = match status {
+            Some(waited) => exit_code_of(waited),
+            None => exit_code_of(reap_killed_child(&mut child).await),
+        };
         match interrupted {
             Some(event) => yield event,
             None => yield EngineEvent::Exit { code },
@@ -358,6 +379,13 @@ pub(crate) fn drive_child(
 }
 
 /// Reads `pipe`, sending bounded UTF-8 chunks to `sender`.
+///
+/// The reader is bounded on both axes: it reads at most
+/// [`constants::DEFAULT_TEXT_CHUNK_SIZE`] bytes per `read` (never a whole line, so one enormous
+/// line costs a chunk, not the line), and it retains at most `max_output_bytes` bytes before
+/// appending [`constants::OUTPUT_TRUNCATION_MARKER`] and draining the rest without emitting it.
+/// The channel has [`EVENT_CHANNEL_CAPACITY`] slots, so a slow consumer throttles the reader
+/// instead of letting it buffer the child's output in memory.
 async fn stream_reader<R>(
     mut pipe: R,
     kind: StreamKind,
@@ -568,6 +596,27 @@ fn kill_direct_child(child: &mut Child) {
             %error,
             "the direct child could not be signalled; it has most likely exited already"
         );
+    }
+}
+
+/// Reaps a child that was just killed, giving up after [`REAP_GRACE`].
+///
+/// `SIGKILL` cannot be ignored, so this normally returns the real status immediately; the
+/// bound exists for a child stuck in an uninterruptible wait, which must not be able to hang
+/// the caller forever. A reap that does not complete is logged and reported as `-1`, and the
+/// dropped [`Child`] still applies `kill_on_drop`.
+async fn reap_killed_child(child: &mut Child) -> std::io::Result<ExitStatus> {
+    if let Ok(result) = tokio::time::timeout(REAP_GRACE, child.wait()).await {
+        result
+    } else {
+        tracing::warn!(
+            timeout_ms = REAP_GRACE.as_millis(),
+            "the killed child did not exit in time; reporting exit code -1"
+        );
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the killed child did not exit in time",
+        ))
     }
 }
 
