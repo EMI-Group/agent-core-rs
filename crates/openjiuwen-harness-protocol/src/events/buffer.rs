@@ -20,17 +20,27 @@ use crate::validation::Validate;
 #[serde(rename_all = "snake_case")]
 pub struct EventBufferConfig {
     /// Maximum number of retained events; must be positive.
-    #[serde(default)]
+    #[serde(default = "default_capacity")]
     pub capacity: u64,
     /// Behavior applied when the buffer is full.
     #[serde(default)]
     pub overflow: EventOverflowPolicy,
 }
 
+/// Default `capacity` of a buffer, shared by `Default` and the serde default.
+///
+/// A plain `#[serde(default)]` on a `u64` would decode a missing key as `0`,
+/// which [`EventBufferConfig::validate`] then rejects — so Python's
+/// `{"overflow": "coalesce_or_block"}` (no `capacity`) would fail to validate,
+/// and a consumer that skips validation would run a one-slot buffer.
+fn default_capacity() -> u64 {
+    1024
+}
+
 impl Default for EventBufferConfig {
     fn default() -> Self {
         Self {
-            capacity: 1024,
+            capacity: default_capacity(),
             overflow: EventOverflowPolicy::CoalesceOrBlock,
         }
     }
@@ -90,6 +100,36 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(keys, ["capacity", "overflow"]);
+    }
+
+    #[test]
+    fn a_missing_capacity_decodes_and_validates_as_1024() {
+        // Python's shape: the overflow policy alone, no `capacity` key.
+        let decoded: EventBufferConfig = serde_json::from_value(json!({
+            "overflow": "coalesce_or_block",
+        }))
+        .expect("a missing capacity is a default, not a decode error");
+        assert_eq!(decoded.capacity, 1024);
+        assert_eq!(decoded, EventBufferConfig::default());
+        assert!(
+            decoded.validate().is_ok(),
+            "the serde default must agree with `Default`: {decoded:?}"
+        );
+
+        let empty: EventBufferConfig = serde_json::from_value(json!({})).expect("all keys default");
+        assert_eq!(empty, EventBufferConfig::default());
+    }
+
+    #[test]
+    fn an_explicit_zero_capacity_still_fails_validation_after_decoding() {
+        let decoded: EventBufferConfig = serde_json::from_value(json!({
+            "capacity": 0,
+            "overflow": "coalesce_or_block",
+        }))
+        .expect("zero is a representable u64");
+        assert_eq!(decoded.capacity, 0, "an explicit 0 is not defaulted");
+        let error = decoded.validate().expect_err("capacity must be positive");
+        assert_eq!(error.message(), "event buffer capacity must be positive");
     }
 
     #[test]
