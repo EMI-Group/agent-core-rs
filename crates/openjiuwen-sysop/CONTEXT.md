@@ -409,6 +409,26 @@ Sandbox lifecycle (`sandbox/gateway/gateway.py`, `sandbox/launchers/`):
   `-lc` path normalization are not ported.
 - Shell and code output capture is bounded by `max_output_bytes` (Python captures unbounded);
   timeout and cancellation failures keep partial output in `data`.
+- A *streaming* run loses its timeout and its cancellation once both output pipes reach EOF:
+  `drive_child` (`src/shell/process.rs`) leaves the event loop when the reader channel closes and
+  then awaits `child.wait()` outside any `select!`, so a command that closes stdout/stderr
+  (e.g. `sh -c 'cmd >/dev/null 2>&1'`) runs past `timeout_secs` and cannot be cancelled through
+  `execute_cmd_stream`/`execute_code_stream`; captured runs (`run_captured`) are unaffected
+  because they select on `child.wait()` directly.
+- Dropping a stream before it ends does not kill the child's process group: `ProcessGroup` has no
+  `Drop`, `Child::kill_on_drop` signals only the direct child, and the reader tasks spawned by
+  `stream_child`/`stream_pty_child` are never aborted, so a shell's descendants and their pipe
+  ends survive the consumer (a session-cancel token still tears the group down; a plain drop does
+  not).
+- `copy_file`/`copy_chunks` (`src/fs/transfer.rs`) allocate `vec![0; chunk_size]` from the
+  unvalidated `UploadFileParams`/`DownloadFileParams` `chunk_size` via
+  `usize::try_from(chunk_size).unwrap_or(usize::MAX)`, so an oversized tool argument inflates
+  virtual memory and past the address space aborts the process instead of returning 199003;
+  `chunk_size = 0` on the non-stream path also reads the whole source file into memory, and no
+  transfer path applies `max_file_size_bytes`.
+- `FileLockManager::acquire` (`src/fs/lock.rs`) computes `started + timeout` with the panicking
+  `Instant + Duration` operator and `timeout_from_config` does not clamp `lock_timeout_secs`, so a
+  near-`u64::MAX` value panics instead of waiting (tokio's own `sleep` clamps; this does not).
 
 ## Test Strategy
 
