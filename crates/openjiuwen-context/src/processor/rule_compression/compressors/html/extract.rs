@@ -277,14 +277,30 @@ fn remove_tag_subtrees(html: &str, tags: &[&str]) -> (String, usize) {
     }
     (current, removed)
 }
+/// Finds the first `needle` in `haystack` at or after `from`, ignoring ASCII case.
+///
+/// The scan runs over the bytes of the original string instead of a lower-cased
+/// copy, so every offset it returns can slice `haystack` directly. That is the
+/// whole point: [`str::to_lowercase`] can change the byte length of a character
+/// (`İ` U+0130 becomes `i̇`, `ẞ` becomes `ß`), which shifts every later offset in
+/// the copy away from the original.
+///
+/// A match always starts on a char boundary, because `needle` starts with an
+/// ASCII byte and a byte holding an ASCII value can never be a UTF-8
+/// continuation byte.
+fn find_ascii_case_insensitive(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    let last_start = haystack.len().checked_sub(needle.len())?;
+    (from..=last_start)
+        .find(|start| haystack[*start..*start + needle.len()].eq_ignore_ascii_case(needle))
+}
 /// Finds the next `<tag …>` and reports its span and whether it self-closes.
 fn find_open_tag(html: &str, tag: &str) -> Option<(usize, usize, bool)> {
-    let lowered = html.to_lowercase();
     let needle = format!("<{tag}");
     let mut from = 0;
-    while let Some(offset) = lowered[from..].find(&needle) {
-        let start = from + offset;
-        let after = lowered.as_bytes().get(start + needle.len()).copied();
+    while let Some(start) = find_ascii_case_insensitive(html, &needle, from) {
+        let after = html.as_bytes().get(start + needle.len()).copied();
         if matches!(after, Some(b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/')) {
             let open_end = find_tag_end(html, start)?;
             let self_closing = html.as_bytes().get(open_end.saturating_sub(2)) == Some(&b'/');
@@ -312,12 +328,9 @@ fn find_tag_end(html: &str, start: usize) -> Option<usize> {
 }
 /// Finds the end of `</tag>` after `from`.
 fn find_close_tag(html: &str, tag: &str, from: usize) -> Option<usize> {
-    let lowered = html.to_lowercase();
     let needle = format!("</{tag}");
-    let offset = lowered[from..].find(&needle)?;
-    let close_start = from + offset;
-    let end = find_tag_end(html, close_start)?;
-    Some(end)
+    let close_start = find_ascii_case_insensitive(html, &needle, from)?;
+    find_tag_end(html, close_start)
 }
 /// Reads `<title>`, `og:title`, author, date and description.
 fn read_metadata(html: &str) -> BTreeMap<String, String> {
@@ -328,10 +341,8 @@ fn read_metadata(html: &str) -> BTreeMap<String, String> {
             metadata.insert("title".to_owned(), title);
         }
     }
-    let lowered = html.to_lowercase();
     let mut from = 0;
-    while let Some(offset) = lowered[from..].find("<meta") {
-        let start = from + offset;
+    while let Some(start) = find_ascii_case_insensitive(html, "<meta", from) {
         let Some(end) = find_tag_end(html, start) else {
             break;
         };
@@ -368,10 +379,8 @@ fn element_text(html: &str, tag: &str) -> Option<String> {
 }
 /// The value of `name` in a tag's attribute text.
 fn attribute(attrs: &str, name: &str) -> Option<String> {
-    let lowered = attrs.to_lowercase();
     let mut from = 0;
-    while let Some(offset) = lowered[from..].find(name) {
-        let start = from + offset;
+    while let Some(start) = find_ascii_case_insensitive(attrs, name, from) {
         let before_ok = start == 0
             || attrs[..start]
                 .chars()
