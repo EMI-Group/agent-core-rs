@@ -13,7 +13,9 @@ use openjiuwen_sysop::{LocalWorkConfig, SysOperation};
 use crate::tools::support::ToolEnv;
 use crate::workspace::Workspace;
 
-use super::grep::apply_head_limit;
+use super::grep::{
+    apply_head_limit, scan_grep_with, FsSource, GrepFile, GrepSource, CHUNK_BYTES, MAX_FILE_BYTES,
+};
 use super::*;
 
 /// A local filesystem backend rooted at `dir`.
@@ -537,5 +539,127 @@ fn head_limit_helper_matches_python() {
     assert_eq!(
         apply_head_limit(items, Some(0), 3),
         (vec!["3".to_owned(), "4".to_owned()], None)
+    );
+}
+
+/// A [`GrepSource`] wrapper that records every candidate it opens.
+struct CountingSource {
+    inner: FsSource,
+    opened: std::sync::Mutex<Vec<std::path::PathBuf>>,
+}
+
+impl CountingSource {
+    fn new() -> Self {
+        Self {
+            inner: FsSource,
+            opened: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The file names opened so far, sorted by open order.
+    fn opened(&self) -> Vec<String> {
+        self.opened
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+}
+
+impl GrepSource for CountingSource {
+    fn size(&self, path: &std::path::Path) -> Option<u64> {
+        self.inner.size(path)
+    }
+
+    fn open(&self, path: &std::path::Path) -> std::io::Result<Box<dyn GrepFile>> {
+        self.opened.lock().unwrap().push(path.to_path_buf());
+        self.inner.open(path)
+    }
+}
+
+/// Parses `grep` arguments out of their JSON wire form.
+fn grep_args(inputs: Value) -> GrepArgs {
+    serde_json::from_value(inputs).unwrap()
+}
+
+#[tokio::test]
+async fn grep_finds_a_match_that_spans_a_chunk_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    // `needle` starts three bytes before the first chunk ends, so the match itself is split
+    // across the boundary between the two chunks of the same line.
+    let mut content = String::new();
+    content.push_str(&"q".repeat(CHUNK_BYTES - 3));
+    content.push_str("needle");
+    content.push_str(&"q".repeat(20));
+    content.push('\n');
+    content.push_str("tail\n");
+    write(&dir, "long.txt", &content);
+
+    let tool = grep_tool(&dir);
+    let out = invoke(&tool, json!({"pattern": "needle"})).await;
+    assert_eq!(out["data"]["exit_code"], json!(0));
+    let stdout = out["data"]["stdout"].as_str().unwrap();
+    assert!(stdout.starts_with("long.txt:1:"), "{}", &stdout[..40]);
+    assert!(stdout.contains("needle"), "the boundary match is reported");
+    assert!(
+        stdout.len() > CHUNK_BYTES,
+        "the whole line came through the carry"
+    );
+
+    // A pattern that only exists on the far side of the boundary is found too.
+    let tail = invoke(&tool, json!({"pattern": "^tail$"})).await;
+    assert_eq!(tail["data"]["stdout"], json!("long.txt:2:tail"));
+}
+
+#[test]
+fn grep_stops_scanning_once_head_limit_is_exhausted() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir, "a.txt", "hit\nhit\nhit\nhit\n");
+    write(&dir, "zzz.txt", "hit\n");
+    let source = CountingSource::new();
+    let data = scan_grep_with(
+        dir.path(),
+        &grep_args(json!({"pattern": "hit", "head_limit": 2})),
+        &source,
+    )
+    .unwrap();
+    assert_eq!(data["stdout"], json!("a.txt:1:hit\na.txt:2:hit"));
+    assert_eq!(data["appliedLimit"], json!(2));
+    assert_eq!(source.opened(), vec!["a.txt".to_string()]);
+}
+
+#[test]
+fn grep_skips_files_above_the_size_cap_with_a_counted_note() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir, "a.txt", "hit\n");
+    // One byte over the cap: the scan never opens it, it only counts it.
+    let oversized = format!(
+        "hit\n{}",
+        "q".repeat(usize::try_from(MAX_FILE_BYTES).unwrap())
+    );
+    write(&dir, "big.txt", &oversized);
+    let source = CountingSource::new();
+    let data = scan_grep_with(dir.path(), &grep_args(json!({"pattern": "hit"})), &source).unwrap();
+    assert_eq!(data["exit_code"], json!(0));
+    assert_eq!(data["stdout"], json!("a.txt:1:hit"));
+    assert_eq!(data["skippedLargeFiles"], json!(1));
+    assert_eq!(
+        data["note"],
+        json!(format!(
+            "skipped 1 file(s) larger than {MAX_FILE_BYTES} bytes"
+        ))
+    );
+    assert_eq!(source.opened(), vec!["a.txt".to_string()]);
+    // The note reaches the model, not just the payload.
+    let tool = grep_tool(&dir);
+    let rendered = tool.render_for_llm(&json!({"success": true, "data": data, "error": null}));
+    assert!(
+        rendered.contains("skipped 1 file(s) larger than"),
+        "{rendered}"
     );
 }

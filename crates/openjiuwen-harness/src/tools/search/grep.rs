@@ -2,6 +2,7 @@
 //!
 //! Python parity: `openjiuwen/harness/tools/filesystem.py::GrepTool`.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -27,6 +28,18 @@ const VCS_DIRECTORIES: [&str; 6] = [".git", ".svn", ".hg", ".bzr", ".jj", ".sl"]
 
 /// How many leading bytes of a file are sniffed for a NUL byte before `grep` calls it binary.
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+/// Bytes read from a candidate file per chunk.
+///
+/// The bytes after the last newline of a chunk are carried into the next chunk, so a match
+/// that spans a chunk boundary is still found; the carry is bounded by the file size cap.
+pub(super) const CHUNK_BYTES: usize = 64 * 1024;
+
+/// Largest candidate file `grep` scans; a bigger file is skipped and counted in the payload.
+///
+/// A workspace can hold build artefacts or data dumps far larger than any source file;
+/// scanning them costs unbounded time and memory, so they are reported instead of grepped.
+pub(super) const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Python message for an `output_mode` outside the three supported values.
 const INVALID_OUTPUT_MODE: &str = "output_mode must be one of: content, files_with_matches, count";
@@ -255,6 +268,13 @@ impl Tool for GrepTool {
                 "{matches}\n(Results truncated to {limit} entries; pass offset to see more.)"
             );
         }
+        if let Some(note) = data.get("note").and_then(Value::as_str) {
+            matches = if matches.is_empty() {
+                note.to_owned()
+            } else {
+                format!("{matches}\n({note})")
+            };
+        }
         if parsed.success {
             return if matches.is_empty() {
                 "No matches found.".to_owned()
@@ -282,6 +302,19 @@ impl Tool for GrepTool {
 
 /// Validates `args`, scans `base` and returns the ripgrep-shaped payload data.
 fn scan_grep(base: &Path, args: &GrepArgs) -> std::result::Result<Value, ToolPayload> {
+    scan_grep_with(base, args, &FsSource)
+}
+
+/// Validates `args`, scans `base` through `source` and returns the ripgrep-shaped payload data.
+///
+/// The scan collects at most one entry more than `offset + head_limit` (the sentinel that
+/// proves truncation) and then stops walking candidates, so a bounded `head_limit` bounds the
+/// work instead of merely slicing its result.
+pub(super) fn scan_grep_with(
+    base: &Path,
+    args: &GrepArgs,
+    source: &dyn GrepSource,
+) -> std::result::Result<Value, ToolPayload> {
     let (mode, regex, filters) = prepare_grep(args)?;
     let (root, candidates) = candidate_files(base);
     let (before, after) = context_window(args);
@@ -295,15 +328,105 @@ fn scan_grep(base: &Path, args: &GrepArgs) -> std::result::Result<Value, ToolPay
         line_numbers: args.line_numbers,
     };
 
+    let mut budget = ScanBudget::new(args);
     let mut emitted: Vec<String> = Vec::new();
     let mut any_match = false;
     for path in candidates {
-        any_match |= scan_candidate(&context, &path, &mut emitted);
+        if budget.saturated(emitted.len()) {
+            break;
+        }
+        any_match |= scan_candidate(&context, source, &path, &mut emitted, &mut budget);
     }
 
     let offset = args.offset.map_or(0, to_usize);
     let (selected, applied_limit) = apply_head_limit(emitted, args.head_limit, offset);
-    Ok(grep_data(mode, any_match, &selected, applied_limit, offset))
+    Ok(grep_data(
+        mode,
+        any_match,
+        &selected,
+        applied_limit,
+        offset,
+        budget.skipped_large,
+    ))
+}
+
+/// Entry budget of one scan, derived from `offset`/`head_limit`.
+struct ScanBudget {
+    /// Entries the scan may collect: `offset + limit + 1`, the sentinel proving truncation.
+    ///
+    /// `usize::MAX` when `head_limit` is `0` (unlimited).
+    capacity: usize,
+    /// Candidate files skipped because they exceed [`MAX_FILE_BYTES`].
+    skipped_large: usize,
+}
+
+impl ScanBudget {
+    /// Derives the budget the same way [`apply_head_limit`] resolves the effective limit.
+    fn new(args: &GrepArgs) -> Self {
+        let limit = match args.head_limit {
+            Some(0) => None,
+            Some(limit) => Some(to_usize(limit)),
+            None => Some(DEFAULT_HEAD_LIMIT),
+        };
+        let offset = args.offset.map_or(0, to_usize);
+        let capacity = limit.map_or(usize::MAX, |limit| {
+            offset.saturating_add(limit).saturating_add(1)
+        });
+        Self {
+            capacity,
+            skipped_large: 0,
+        }
+    }
+
+    /// Whether `collected` entries already exhaust the budget.
+    fn saturated(&self, collected: usize) -> bool {
+        collected >= self.capacity
+    }
+
+    /// Records one candidate skipped by the size cap.
+    fn note_skipped_large(&mut self) {
+        self.skipped_large += 1;
+    }
+}
+
+/// Source of candidate contents for the scan.
+///
+/// Production scans read the filesystem ([`FsSource`]); tests inject a counting source to
+/// prove that the scan stops as soon as the budget is exhausted.
+pub(super) trait GrepSource {
+    /// Returns the length of `path` in bytes, or `None` when it is not a readable file.
+    fn size(&self, path: &Path) -> Option<u64>;
+
+    /// Opens `path` for chunked reading.
+    fn open(&self, path: &Path) -> std::io::Result<Box<dyn GrepFile>>;
+}
+
+/// One candidate opened for chunked reading.
+pub(super) trait GrepFile {
+    /// Reads up to `buffer.len()` bytes, returning `Ok(0)` at end of file.
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize>;
+}
+
+impl GrepFile for std::fs::File {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(self, buffer)
+    }
+}
+
+/// The filesystem implementation of [`GrepSource`].
+pub(super) struct FsSource;
+
+impl GrepSource for FsSource {
+    fn size(&self, path: &Path) -> Option<u64> {
+        std::fs::metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map(|meta| meta.len())
+    }
+
+    fn open(&self, path: &Path) -> std::io::Result<Box<dyn GrepFile>> {
+        Ok(Box::new(std::fs::File::open(path)?))
+    }
 }
 
 /// Validates the `grep` arguments, returning the compiled scan configuration.
@@ -360,8 +483,16 @@ struct ScanContext<'a> {
 
 /// Scans one candidate file, appending its entries to `emitted`.
 ///
-/// Returns whether the file matched at all.
-fn scan_candidate(context: &ScanContext<'_>, path: &Path, emitted: &mut Vec<String>) -> bool {
+/// Returns whether the file matched at all. Files that pass their glob filter are read in
+/// [`CHUNK_BYTES`] chunks through `source`; a file above [`MAX_FILE_BYTES`] is skipped and
+/// counted in `budget` instead.
+fn scan_candidate(
+    context: &ScanContext<'_>,
+    source: &dyn GrepSource,
+    path: &Path,
+    emitted: &mut Vec<String>,
+    budget: &mut ScanBudget,
+) -> bool {
     let relative = relative_name(context.root, path);
     if !context.filters.is_empty()
         && !context
@@ -371,47 +502,196 @@ fn scan_candidate(context: &ScanContext<'_>, path: &Path, emitted: &mut Vec<Stri
     {
         return false;
     }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::debug!(path = %path.display(), %error, "skipping unreadable grep candidate");
-            return false;
-        }
-    };
-    if is_binary(&bytes) {
-        tracing::debug!(path = %path.display(), "skipping binary grep candidate");
+    if source.size(path).is_some_and(|size| size > MAX_FILE_BYTES) {
+        budget.note_skipped_large();
+        tracing::debug!(
+            path = %path.display(),
+            cap = MAX_FILE_BYTES,
+            "skipping oversized grep candidate"
+        );
         return false;
     }
-    let text = String::from_utf8_lossy(&bytes);
     match context.mode {
-        GrepOutputMode::Content => push_content_matches(
-            context.regex,
-            &text,
-            &relative,
-            context.before,
-            context.after,
-            context.line_numbers,
-            emitted,
-        ),
+        GrepOutputMode::Content => scan_content(context, source, path, &relative, emitted, budget),
         GrepOutputMode::FilesWithMatches => {
-            if !text.lines().any(|line| context.regex.is_match(line)) {
-                return false;
+            let mut found = false;
+            let _ = read_lines(source, path, |_number, line| {
+                found = context.regex.is_match(line);
+                !found
+            });
+            if found {
+                emitted.push(relative);
+                true
+            } else {
+                false
             }
-            emitted.push(relative);
-            true
         }
         GrepOutputMode::Count => {
-            let count = text
-                .lines()
-                .filter(|line| context.regex.is_match(line))
-                .count();
+            let mut count = 0usize;
+            let _ = read_lines(source, path, |_number, line| {
+                if context.regex.is_match(line) {
+                    count += 1;
+                }
+                true
+            });
             if count == 0 {
-                return false;
+                false
+            } else {
+                emitted.push(format!("{relative}:{count}"));
+                true
             }
-            emitted.push(format!("{relative}:{count}"));
-            true
         }
     }
+}
+
+/// Streams the lines of `path`, stopping early once the entry budget is exhausted.
+///
+/// Matching lines render as `{path}:{line}:{text}`, context lines as `{path}-{line}-{text}`;
+/// the line number is dropped when `line_numbers` is off. Blank lines are never emitted and
+/// overlapping context groups are merged, like the whole-file scan this replaces.
+fn scan_content(
+    context: &ScanContext<'_>,
+    source: &dyn GrepSource,
+    path: &Path,
+    relative: &str,
+    emitted: &mut Vec<String>,
+    budget: &ScanBudget,
+) -> bool {
+    let mut matched = false;
+    let mut last_emitted = 0usize;
+    let mut pending_after = 0usize;
+    // The `before` window of the next match: lines already read but not emitted yet.
+    let mut before: VecDeque<(usize, String)> = VecDeque::with_capacity(context.before.min(64));
+    let _ = read_lines(source, path, |number, line| {
+        if context.regex.is_match(line) {
+            matched = true;
+            for (context_number, context_line) in before.drain(..) {
+                if context_number > last_emitted {
+                    push_content_line(
+                        context,
+                        relative,
+                        context_number,
+                        &context_line,
+                        false,
+                        emitted,
+                    );
+                    last_emitted = context_number;
+                }
+            }
+            push_content_line(context, relative, number, line, true, emitted);
+            last_emitted = number;
+            pending_after = context.after;
+        } else if pending_after > 0 {
+            pending_after -= 1;
+            push_content_line(context, relative, number, line, false, emitted);
+            last_emitted = number;
+        } else {
+            before.push_back((number, line.to_owned()));
+            while before.len() > context.before {
+                before.pop_front();
+            }
+        }
+        !budget.saturated(emitted.len())
+    });
+    matched
+}
+
+/// Pushes one rendered content entry unless the line is blank.
+fn push_content_line(
+    context: &ScanContext<'_>,
+    relative: &str,
+    number: usize,
+    line: &str,
+    matched: bool,
+    emitted: &mut Vec<String>,
+) {
+    if line.trim().is_empty() {
+        return;
+    }
+    let separator = if matched { ':' } else { '-' };
+    if context.line_numbers {
+        emitted.push(format!("{relative}{separator}{number}{separator}{line}"));
+    } else {
+        emitted.push(format!("{relative}{separator}{line}"));
+    }
+}
+
+/// Result of a chunked line read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineVisit {
+    /// The whole file was read.
+    Completed,
+    /// `visit` asked to stop.
+    Stopped,
+    /// The file turned out to be binary and was not visited.
+    Binary,
+}
+
+/// Calls `visit` with every line of `path`, in order, reading in bounded chunks.
+///
+/// `visit` returns whether reading should continue. The bytes after the last newline of a
+/// chunk are carried into the next chunk, so a line (and therefore a match) spanning a chunk
+/// boundary is still seen; the carry stays bounded by [`MAX_FILE_BYTES`]. A NUL byte in the
+/// first [`BINARY_SNIFF_BYTES`] short-circuits to [`LineVisit::Binary`].
+fn read_lines(
+    source: &dyn GrepSource,
+    path: &Path,
+    mut visit: impl FnMut(usize, &str) -> bool,
+) -> LineVisit {
+    let mut file = match source.open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::debug!(path = %path.display(), %error, "skipping unreadable grep candidate");
+            return LineVisit::Completed;
+        }
+    };
+    let mut chunk = vec![0u8; CHUNK_BYTES];
+    let mut carry: Vec<u8> = Vec::new();
+    let mut line_number = 0usize;
+    let mut sniffed = false;
+    loop {
+        let read = match file.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::debug!(path = %path.display(), %error, "skipping unreadable grep candidate");
+                return LineVisit::Completed;
+            }
+        };
+        if !sniffed {
+            sniffed = true;
+            if is_binary(&chunk[..read]) {
+                tracing::debug!(path = %path.display(), "skipping binary grep candidate");
+                return LineVisit::Binary;
+            }
+        }
+        let mut data = &chunk[..read];
+        while let Some(index) = data.iter().position(|byte| *byte == b'\n') {
+            let mut line = std::mem::take(&mut carry);
+            line.extend_from_slice(&data[..index]);
+            data = &data[index + 1..];
+            line_number += 1;
+            if !visit(line_number, &decode_line(&line)) {
+                return LineVisit::Stopped;
+            }
+        }
+        carry.extend_from_slice(data);
+        if read == 0 {
+            break;
+        }
+    }
+    if !carry.is_empty() {
+        line_number += 1;
+        if !visit(line_number, &decode_line(&carry)) {
+            return LineVisit::Stopped;
+        }
+    }
+    LineVisit::Completed
+}
+
+/// Decodes one line, dropping a `\r` line ending and replacing invalid UTF-8.
+fn decode_line(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// Assembles the Python-shaped `grep` payload data.
@@ -421,6 +701,7 @@ fn grep_data(
     selected: &[String],
     applied_limit: Option<usize>,
     offset: usize,
+    skipped_large: usize,
 ) -> Value {
     let stdout = selected.join("\n");
     let mut data = Map::from_iter([
@@ -440,7 +721,16 @@ fn grep_data(
             "appliedLimit".to_owned(),
             applied_limit.map_or(Value::Null, |limit| json!(limit)),
         ),
+        ("skippedLargeFiles".to_owned(), json!(skipped_large)),
     ]);
+    if skipped_large > 0 {
+        data.insert(
+            "note".to_owned(),
+            json!(format!(
+                "skipped {skipped_large} file(s) larger than {MAX_FILE_BYTES} bytes"
+            )),
+        );
+    }
 
     let counts = |lines: &[String]| -> (usize, u64) {
         let parsed: Vec<u64> = lines
@@ -521,58 +811,6 @@ fn is_vcs_directory(name: &std::ffi::OsStr) -> bool {
 /// Whether the leading bytes of `bytes` mark it as binary (a NUL byte).
 fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(BINARY_SNIFF_BYTES).any(|byte| *byte == 0)
-}
-
-/// Appends the matching lines of `text` and their context to `emitted`.
-///
-/// Matching lines render as `{path}:{line}:{text}`, context lines as
-/// `{path}-{line}-{text}`; the line number is dropped when `show_numbers` is false. Blank
-/// lines are dropped and overlapping context groups are merged. Returns whether `text`
-/// matched at all.
-fn push_content_matches(
-    regex: &regex::Regex,
-    text: &str,
-    relative: &str,
-    before: usize,
-    after: usize,
-    show_numbers: bool,
-    emitted: &mut Vec<String>,
-) -> bool {
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.is_empty() {
-        return false;
-    }
-    let mut is_match = vec![false; lines.len()];
-    let mut in_group = vec![false; lines.len()];
-    let mut any = false;
-    for (index, line) in lines.iter().enumerate() {
-        if !regex.is_match(line) {
-            continue;
-        }
-        any = true;
-        is_match[index] = true;
-        let start = index.saturating_sub(before);
-        let end = index.saturating_add(after).min(lines.len() - 1);
-        for flag in &mut in_group[start..=end] {
-            *flag = true;
-        }
-    }
-    if !any {
-        return false;
-    }
-    for (index, line) in lines.iter().enumerate() {
-        if !in_group[index] || line.trim().is_empty() {
-            continue;
-        }
-        let separator = if is_match[index] { ':' } else { '-' };
-        let number = index + 1;
-        emitted.push(if show_numbers {
-            format!("{relative}{separator}{number}{separator}{line}")
-        } else {
-            format!("{relative}{separator}{line}")
-        });
-    }
-    true
 }
 
 /// The `(before, after)` context window of `args`.
