@@ -241,6 +241,35 @@ pub trait TeamStore: Send + Sync {
     /// Returns whatever the backend fails with.
     async fn dependencies(&self, team_name: &str, task_id: &str) -> Result<Vec<String>>;
 
+    /// Returns the dependency edges of several tasks at once, in the order `task_ids` were given.
+    ///
+    /// This exists so a whole-board read costs a bounded number of calls instead of one per task:
+    /// the settle poll ([`crate::runtime`]) reads the board on a timer, and a per-task round trip
+    /// would put the task count on the polling frequency.
+    ///
+    /// The default implementation asks [`TeamStore::dependencies`] once per id and runs those calls
+    /// concurrently ([`futures::future::join_all`]), so a backend that cannot batch still pays one
+    /// round trip per task but not one *latency* per task.
+    /// [`InMemoryTeamStore`] and `SqliteTeamStore` override it with a single read.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the backend fails with; the first failure wins.
+    async fn dependencies_many(
+        &self,
+        team_name: &str,
+        task_ids: &[String],
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        let pending = task_ids.iter().map(|task_id| async move {
+            let dependencies = self.dependencies(team_name, task_id).await?;
+            Ok::<(String, Vec<String>), Error>((task_id.clone(), dependencies))
+        });
+        futures::future::join_all(pending)
+            .await
+            .into_iter()
+            .collect()
+    }
+
     /// Returns the ids that directly depend on `task_id`, sorted.
     ///
     /// # Errors

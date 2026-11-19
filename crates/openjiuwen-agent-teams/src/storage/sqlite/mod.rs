@@ -721,6 +721,37 @@ impl TeamStore for SqliteTeamStore {
         .map_err(rows::sqlite_error)
     }
 
+    async fn dependencies_many(
+        &self,
+        team_name: &str,
+        task_ids: &[String],
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pool = self.pool().await?;
+        let placeholders = std::iter::repeat_n("?", task_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let statement = format!(
+            "SELECT task_id, depends_on FROM team_task_dependency \
+             WHERE team_name = ? AND task_id IN ({placeholders}) ORDER BY task_id, depends_on"
+        );
+        let mut query = sqlx::query_as::<_, (String, String)>(&statement).bind(team_name);
+        for task_id in task_ids {
+            query = query.bind(task_id);
+        }
+        let rows = query.fetch_all(pool).await.map_err(rows::sqlite_error)?;
+        let mut grouped: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (task_id, depends_on) in rows {
+            grouped.entry(task_id).or_default().push(depends_on);
+        }
+        Ok(task_ids
+            .iter()
+            .map(|task_id| (task_id.clone(), grouped.remove(task_id).unwrap_or_default()))
+            .collect())
+    }
     async fn dependents(&self, team_name: &str, task_id: &str) -> Result<Vec<String>> {
         let pool = self.pool().await?;
         sqlx::query_scalar(

@@ -55,6 +55,8 @@ pub mod review;
 
 #[cfg(test)]
 mod board_tests;
+#[cfg(test)]
+mod probe_tests;
 
 pub use board::{TaskBoard, REASON_STALE_CONTENT};
 pub use graph::{depth_of, detect_cycle};

@@ -72,6 +72,8 @@ pub mod org_bind;
 pub mod pool;
 /// Model pool + router selection per member.
 pub mod routing;
+/// The adaptive settle policy of a run: two-tick debounce plus the board poll schedule.
+pub(crate) mod settle;
 /// The harness-backed member spawner.
 pub mod spawner;
 /// The team agent: one type for the leader and every teammate.
@@ -93,7 +95,6 @@ pub use deps::TeamBuildDeps;
 pub use dispatch::{decide_run_action, LiveTeamState, RunAction, RunActionKind};
 pub use health::{MemberHealth, TeamHealth};
 pub use initial_input::{parse_initial_input, InitialInput};
-pub use leader::SETTLE_POLL_INTERVAL;
 pub use manager::{
     clear_global_registry, global_registry, set_global_registry, try_global_registry,
     TeamRuntimeManager,
@@ -102,6 +103,7 @@ pub use observability_bind::TeamSignals;
 pub use org_bind::OrgBinding;
 pub use pool::TeamRuntimePool;
 pub use routing::{ModelSelection, TeamModelRouter};
+pub use settle::{SETTLE_MAX_POLL_INTERVAL, SETTLE_POLL_INTERVAL};
 pub use spawner::TeamMemberSpawner;
 pub use spec_meta::{
     checkpoint_config, AttachConfig, CheckpointConfig, CheckpointStoreConfig, ForkDirective,

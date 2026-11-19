@@ -927,6 +927,23 @@ impl TaskBoard {
         Ok(snapshot.tasks.values().all(TaskRecord::is_terminal))
     }
 
+    /// Reads the settle state of the board in a bounded number of store calls.
+    ///
+    /// One `list_tasks`, one batched [`TeamStore::dependencies_many`] and one `list_members` — three
+    /// calls, whatever the number of tasks. The settle poll of a run reads this on a timer
+    /// ([`crate::runtime::SETTLE_POLL_INTERVAL`]), so a per-task query would put the board size on
+    /// the polling frequency.
+    ///
+    /// [`SettleProbe::settled`] carries the same decision as [`TaskBoard::is_settled`] (an empty
+    /// board is settled), and [`SettleProbe::fingerprint`] changes whenever a task row changed, which
+    /// is what lets the caller back off while the board sits still.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store fails with.
+    pub(crate) async fn settle_probe(&self) -> Result<SettleProbe> {
+        Ok(self.snapshot().await?.probe())
+    }
     /// Returns `true` when the board has tasks and every one of them is terminal.
     ///
     /// Stricter than [`TaskBoard::is_settled`] by requiring at least one task, so an untouched board
@@ -1006,22 +1023,30 @@ impl TaskBoard {
     }
 
     /// Reads the whole board: every task, its dependency edges and the roster statuses.
+    ///
+    /// Bounded store traffic: one `list_tasks`, one batched [`TeamStore::dependencies_many`] for
+    /// every task and one `list_members`, whatever the size of the board. The dependency reads are
+    /// independent, so a backend that cannot batch still issues them concurrently.
     async fn snapshot(&self) -> Result<Snapshot> {
         let records = self
             .store
             .list_tasks(&self.team_name, &TaskFilter::default())
             .await?;
+        let task_ids: Vec<String> = records
+            .iter()
+            .map(|record| record.task_id.clone())
+            .collect();
+        let dependencies = self
+            .store
+            .dependencies_many(&self.team_name, &task_ids)
+            .await?;
         let mut tasks = BTreeMap::new();
         let mut edges = BTreeMap::new();
+        for (task_id, dependencies) in dependencies {
+            edges.insert(task_id, dependencies.into_iter().collect::<BTreeSet<_>>());
+        }
         for record in records {
-            let dependencies = self
-                .store
-                .dependencies(&self.team_name, &record.task_id)
-                .await?;
-            edges.insert(
-                record.task_id.clone(),
-                dependencies.into_iter().collect::<BTreeSet<_>>(),
-            );
+            edges.entry(record.task_id.clone()).or_default();
             tasks.insert(record.task_id.clone(), record);
         }
         let members = self
@@ -1128,6 +1153,22 @@ fn distinct(values: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// One settle read of the board, taken by every settle poll of a run.
+///
+/// [`settled`](Self::settled) is the decision ([`TaskBoard::is_settled`]);
+/// [`fingerprint`](Self::fingerprint) changes whenever a task row changed, so a poller can tell
+/// "nothing moved" from "something moved" and back off only in the first case.
+/// The value is pure data: no clock, no store handle, no ordering of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SettleProbe {
+    /// Whether every task on the board is terminal (an empty board is settled).
+    pub(crate) settled: bool,
+    /// How many tasks the board holds.
+    pub(crate) tasks: usize,
+    /// Order-independent digest of the task rows (id, status, revision, assignee, timestamp).
+    pub(crate) fingerprint: u64,
+}
+
 /// One consistent read of the whole board, used to answer every query without re-reading rows.
 #[derive(Debug)]
 struct Snapshot {
@@ -1140,6 +1181,39 @@ struct Snapshot {
 }
 
 impl Snapshot {
+    /// Projects this read into a [`SettleProbe`].
+    ///
+    /// The digest is order-independent (tasks are keyed in a `BTreeMap` and mixed with wrapping
+    /// arithmetic and rotations), so two reads of the same rows produce the same fingerprint and a
+    /// changed row produces a different one. It is not a cryptographic hash and is never persisted.
+    fn probe(&self) -> SettleProbe {
+        let mut fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
+        for (task_id, record) in &self.tasks {
+            let mut field: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in task_id.as_bytes() {
+                field ^= u64::from(*byte);
+                field = field.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            for byte in record.status.as_str().bytes() {
+                field ^= u64::from(byte);
+                field = field.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            for byte in record.assignee.as_deref().unwrap_or_default().bytes() {
+                field ^= u64::from(byte);
+                field = field.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            fingerprint = fingerprint
+                .rotate_left(7)
+                .wrapping_add(field)
+                .wrapping_add(u64::from(record.revision))
+                .wrapping_add(record.updated_at);
+        }
+        SettleProbe {
+            settled: self.tasks.values().all(TaskRecord::is_terminal),
+            tasks: self.tasks.len(),
+            fingerprint,
+        }
+    }
     /// Returns `true` when `task_id` is unknown or not terminal.
     fn is_terminal(&self, task_id: &str) -> bool {
         self.tasks.get(task_id).is_some_and(TaskRecord::is_terminal)

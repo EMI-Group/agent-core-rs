@@ -357,6 +357,25 @@ impl TeamStore for InMemoryTeamStore {
             .unwrap_or_default())
     }
 
+    async fn dependencies_many(
+        &self,
+        team_name: &str,
+        task_ids: &[String],
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        let inner = self.inner.read();
+        Ok(task_ids
+            .iter()
+            .map(|task_id| {
+                let key = (team_name.to_owned(), task_id.clone());
+                let dependencies = inner
+                    .depends_on
+                    .get(&key)
+                    .map(|ids| ids.iter().cloned().collect())
+                    .unwrap_or_default();
+                (task_id.clone(), dependencies)
+            })
+            .collect())
+    }
     async fn dependents(&self, team_name: &str, task_id: &str) -> Result<Vec<String>> {
         let inner = self.inner.read();
         let mut rows: Vec<String> = inner
