@@ -29,13 +29,20 @@ mod wire;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use axum::body::Body;
+use axum::Router;
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::{ModelClientConfig, ModelRequestConfig, OpenAiCompatibleClient};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tower_service::Service as _;
 
 use state::{ServerConfig, ServerState};
 
@@ -51,10 +58,69 @@ pub const TEST_API_KEY: &str = "test-api-key";
 /// wait is bounded and the task is aborted when the bound expires.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often a drain re-checks the live connection tasks.
+const DRAIN_POLL: Duration = Duration::from_millis(5);
+
+/// The connection tasks one server spawned, so they can be aborted on `Drop`.
+///
+/// `axum::serve` spawns one task per accepted connection and hands no handle
+/// back, so aborting it left every in-flight connection — and its SSE stream —
+/// running after the test finished. The mock server owns its accept loop instead
+/// and records each task it spawns here; [`MockLlmServer`]'s `Drop` aborts them
+/// all.
+///
+/// A handle obtained with [`MockLlmServer::connections`] stays usable after the
+/// server is dropped, which is how a test asserts that nothing is still running.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionTasks {
+    /// Every connection task that has not been pruned yet.
+    handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl ConnectionTasks {
+    /// Number of connection tasks that have not finished yet.
+    #[must_use]
+    pub fn live(&self) -> usize {
+        state::lock(&self.handles)
+            .iter()
+            .filter(|handle| !handle.is_finished())
+            .count()
+    }
+
+    /// Number of connection tasks this server ever spawned.
+    #[must_use]
+    pub fn spawned(&self) -> usize {
+        state::lock(&self.handles).len()
+    }
+
+    /// Records one spawned connection task, dropping the handles that finished.
+    fn track(&self, handle: JoinHandle<()>) {
+        let mut handles = state::lock(&self.handles);
+        handles.retain(|tracked| !tracked.is_finished());
+        handles.push(handle);
+    }
+
+    /// Aborts every connection task that is still running.
+    fn abort_all(&self) {
+        for handle in state::lock(&self.handles).drain(..) {
+            handle.abort();
+        }
+    }
+
+    /// Waits up to `timeout` for every connection task to finish on its own.
+    async fn wait_idle(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while self.live() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(DRAIN_POLL).await;
+        }
+    }
+}
+
 /// A running mock server plus the handle to its task.
 ///
-/// Dropping the handle aborts the server task; call [`MockLlmServer::shutdown`]
-/// for a graceful stop that drains in-flight responses first.
+/// Dropping the handle aborts the server task and every connection it spawned;
+/// call [`MockLlmServer::shutdown`] for a graceful stop that drains in-flight
+/// responses first.
 pub struct MockLlmServer {
     /// Shared script queue, recordings, and configuration.
     state: Arc<ServerState>,
@@ -64,10 +130,12 @@ pub struct MockLlmServer {
     base_url: String,
     /// `base_url` plus `/chat/completions`.
     endpoint: String,
-    /// Wakes the graceful-shutdown future of `axum::serve`.
+    /// Wakes the accept loop out of `accept`.
     shutdown_signal: Arc<Notify>,
-    /// The server task, taken by [`MockLlmServer::shutdown`] and `Drop`.
+    /// The accept-loop task, taken by [`MockLlmServer::shutdown`] and `Drop`.
     task: Mutex<Option<JoinHandle<()>>>,
+    /// The connection tasks the accept loop spawned.
+    connections: Arc<ConnectionTasks>,
 }
 
 impl MockLlmServer {
@@ -204,9 +272,19 @@ impl MockLlmServer {
         self.state.last_request()
     }
 
-    /// Waits indefinitely until at least `count` requests have been recorded.
-    pub async fn wait_for_requests(&self, count: usize) {
-        self.state.wait_for_requests(count).await;
+    /// Waits until at least `count` requests have been recorded, bounded by
+    /// [`DEFAULT_EVENTUALLY_TIMEOUT`](crate::DEFAULT_EVENTUALLY_TIMEOUT).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Timeout`] when the bound expires first; the message
+    /// reports the expected and the observed count, so a script mismatch fails
+    /// the test instead of hanging it. Use
+    /// [`MockLlmServer::wait_for_requests_timeout`] for another bound.
+    pub async fn wait_for_requests(&self, count: usize) -> Result<()> {
+        self.state
+            .wait_for_requests_timeout(count, crate::DEFAULT_EVENTUALLY_TIMEOUT)
+            .await
     }
 
     /// Waits until at least `count` requests have been recorded.
@@ -219,8 +297,29 @@ impl MockLlmServer {
         self.state.wait_for_requests_timeout(count, timeout).await
     }
 
+    /// The connection tasks this server spawned.
+    ///
+    /// The handle stays valid after the server is dropped, so a test can assert
+    /// that no connection task outlives it.
+    #[must_use]
+    pub fn connections(&self) -> ConnectionTasks {
+        ConnectionTasks {
+            handles: Arc::clone(&self.connections.handles),
+        }
+    }
+
+    /// Number of connection tasks that have not finished yet.
+    #[must_use]
+    pub fn live_connections(&self) -> usize {
+        self.connections.live()
+    }
+
     /// Stops the server gracefully, aborting the task if it does not wind down
     /// within `SHUTDOWN_TIMEOUT`.
+    ///
+    /// In-flight connections are given `SHUTDOWN_TIMEOUT` to finish on their
+    /// own; whatever is still running after that is aborted, so no connection
+    /// task survives the call.
     pub async fn shutdown(self) {
         self.shutdown_signal.notify_one();
         let handle = state::lock(&self.task).take();
@@ -232,6 +331,8 @@ impl MockLlmServer {
                 handle.abort();
             }
         }
+        self.connections.wait_idle(SHUTDOWN_TIMEOUT).await;
+        self.connections.abort_all();
     }
 }
 
@@ -241,7 +342,77 @@ impl Drop for MockLlmServer {
         if let Some(handle) = state::lock(&self.task).take() {
             handle.abort();
         }
+        // The accept task only owns the listener: every connection it spawned is
+        // a separate task, so aborting them is what actually stops the server.
+        self.connections.abort_all();
     }
+}
+
+/// Accepts connections until `shutdown` is signalled, tracking every task spawned.
+///
+/// This replaces `axum::serve`, which spawns connection tasks internally and
+/// hands out no handle: an aborted `axum::serve` left its connections running.
+async fn serve(
+    listener: TcpListener,
+    app: Router,
+    shutdown: Arc<Notify>,
+    connections: Arc<ConnectionTasks>,
+) {
+    // The graceful signal every connection watches: once it flips, a connection
+    // finishes the response it is writing and closes, which is what `axum::serve`'s
+    // graceful shutdown did.
+    let (graceful, _) = tokio::sync::watch::channel(false);
+    loop {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            () = shutdown.notified() => break,
+        };
+        let Ok((stream, _peer)) = accepted else {
+            // The listener is gone; there is nothing left to accept.
+            break;
+        };
+        spawn_connection(stream, app.clone(), &connections, graceful.subscribe());
+    }
+    // Nothing is accepted any more: tell the open connections to wind down.
+    let _ = graceful.send(true);
+}
+
+/// Serves one accepted connection on a task recorded in `connections`.
+fn spawn_connection(
+    stream: TcpStream,
+    app: Router,
+    connections: &ConnectionTasks,
+    mut graceful: tokio::sync::watch::Receiver<bool>,
+) {
+    let io = TokioIo::new(stream);
+    let handle = tokio::spawn(async move {
+        let service = service_fn(move |request: hyper::Request<Incoming>| {
+            let mut app = app.clone();
+            async move {
+                match app.call(request.map(Body::new)).await {
+                    Ok(response) => Ok::<_, std::convert::Infallible>(response),
+                    Err(never) => match never {},
+                }
+            }
+        });
+        let builder = Builder::new(TokioExecutor::new());
+        let mut connection = std::pin::pin!(builder.serve_connection_with_upgrades(io, service));
+        loop {
+            tokio::select! {
+                // A client that disconnects mid-stream is the normal end of a
+                // test, so the connection error is deliberately dropped.
+                _ = connection.as_mut() => break,
+                changed = graceful.changed() => {
+                    if changed.is_err() {
+                        // The server is gone; nothing will close this connection.
+                        break;
+                    }
+                    connection.as_mut().graceful_shutdown();
+                }
+            }
+        }
+    });
+    connections.track(handle);
 }
 
 /// Builder for [`MockLlmServer`].
@@ -340,13 +511,11 @@ impl MockLlmServerBuilder {
         let state = Arc::new(ServerState::new(self.config));
         let app = routes::router(Arc::clone(&state));
         let shutdown_signal = Arc::new(Notify::new());
+        let connections = Arc::new(ConnectionTasks::default());
         let signal = Arc::clone(&shutdown_signal);
+        let tracked = Arc::clone(&connections);
         let task = tokio::spawn(async move {
-            // A serve error means the listener went away; there is nothing left
-            // to report to the test, so it is deliberately dropped.
-            let _ = axum::serve(listener, app)
-                .with_graceful_shutdown(async move { signal.notified().await })
-                .await;
+            serve(listener, app, signal, tracked).await;
         });
 
         let base_url = format!("http://{addr}/v1");
@@ -358,6 +527,7 @@ impl MockLlmServerBuilder {
             endpoint,
             shutdown_signal,
             task: Mutex::new(Some(task)),
+            connections,
         })
     }
 }

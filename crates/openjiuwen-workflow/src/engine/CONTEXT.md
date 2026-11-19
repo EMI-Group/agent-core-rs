@@ -185,11 +185,15 @@ Run wiring: when `session.checkpointer()` is `Some`, compile with
 `CompileOptions { store: Some(Arc::new(CheckpointerStore::new(cp, card.id))), namespace: Some(card.id), checkpoint_every_superstep: true }`
 and delete the namespace after a successful completed run. `invoke` merges object inputs into the session
 global lane (unless resuming), seeds `InteractionState` from `options.answers` (`append`, so a nested run replays what its child already consumed) before `options.interactive` (`seed`), and runs inside a timeout
-(`options.timeout`, else `SessionConfig::execute_timeout_ms` when non-zero); `stream` performs the same merge and two-step seeding but applies no timeout wrapper. An interrupt error drains
+(`options.timeout`, else `SessionConfig::execute_timeout_ms` when non-zero); `stream` performs the same merge and
+two-step seeding and races its spawned run against that same timeout and the cancellation token (`sleep_until` in
+`run.rs`), so a component that hangs ends the stream with one terminal typed `Timeout` / `Cancelled` item instead
+of keeping it open. An interrupt error drains
 `InteractionState::pending` into `{"type", "index", "payload"}` wires and reports `InputRequired`, keeping the
 pre-superstep snapshot; a graph that halts via `NodeOutcome::Halt` reports the same state with its halt value;
 success → the end output value, or the collected `end node stream` wires when the end streams. `stream` forwards
-frames through an unbounded channel, filters by `stream_modes` when set, yields one `workflow_final` frame on
+frames through a bounded channel (`STREAM_CHANNEL_CAPACITY`, so a slow consumer backpressures the run) with no
+frame collector attached, filters by `stream_modes` when set, yields one `workflow_final` frame on
 success when the end output is non-null, ends quietly after the interaction frames of an interrupted run, and
 yields exactly one `Err` on any other failure; a guard aborts the run task when the stream is dropped.
 `resume` requires a checkpointer, sets `resume = true` and seeds `interactive`; continuing from the failure

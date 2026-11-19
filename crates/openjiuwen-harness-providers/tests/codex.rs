@@ -34,14 +34,15 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use openjiuwen_agent::AgentChunk;
 use openjiuwen_harness_protocol::{
-    json_object_from_value, DeliveryMode, HarnessCheckpoint, HarnessContext, HarnessError,
-    HarnessErrorKind, HarnessEvent, HarnessEventCursor, HarnessEventPayload, HarnessInput,
-    HarnessInteractionHandler, HarnessInteractionRequest, HarnessInteractionResponse,
+    json_object_from_value, DeliveryMode, EventBufferConfig, HarnessCheckpoint, HarnessContext,
+    HarnessError, HarnessErrorKind, HarnessEvent, HarnessEventCursor, HarnessEventPayload,
+    HarnessInput, HarnessInteractionHandler, HarnessInteractionRequest, HarnessInteractionResponse,
     HarnessProtocol, HarnessProvider, HarnessResult, HarnessState, HostCapability,
     InteractionCancelReason, JsonObject, JsonValue, ResumePolicy, ToolApprovalDecision,
     ToolApprovalResponse, TurnStatus, TurnTerminationKind,
 };
-use openjiuwen_harness_providers::providers::codex;
+use openjiuwen_harness_providers::providers::codex::{self, CodexDriver, CodexHarnessConfig};
+use openjiuwen_harness_providers::vendor_cli::VendorHarness;
 use openjiuwen_harness_providers::{HarnessIOAdapter, HarnessIOAdapterConfig};
 use serde_json::json;
 use support::FakeCli;
@@ -682,4 +683,81 @@ async fn a_stream_without_turn_completed_fails_the_turn() {
         "Codex ended the stream without completing the turn"
     );
     harness.stop().await.expect("the harness stops");
+}
+
+// ---------------------------------------------------------------------------
+// Unbounded-wait guards
+// ---------------------------------------------------------------------------
+
+/// Returns the pid the fake CLI recorded on its first transcript line.
+fn recorded_pid(cli: &FakeCli) -> u32 {
+    cli.lines()
+        .iter()
+        .find_map(|line| {
+            line.strip_prefix("PID ")
+                .and_then(|pid| pid.trim().parse().ok())
+        })
+        .expect("the fake CLI records its pid")
+}
+
+/// Returns whether `pid` still exists.
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -0 {pid} 2>/dev/null"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Waits until `pid` no longer exists, failing the test past the deadline.
+async fn wait_until_gone(pid: u32) {
+    tokio::time::timeout(WAIT, async {
+        while process_alive(pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the fake CLI process {pid} must be killed and reaped"));
+}
+
+/// An app-server that spawns but never answers must time out instead of wedging the harness.
+///
+/// The child is reaped, and `stop` stays reachable (it would block forever on the start lock a
+/// hung `open` used to hold).
+#[tokio::test]
+async fn a_silent_cli_times_out_and_its_child_is_reaped() {
+    let cli = FakeCli::script(
+        "printf 'PID %s\\n' \"$$\" >> \"$FAKE_CLI_LOG\"\n\
+         while IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$FAKE_CLI_LOG\"; done",
+    );
+    let driver = CodexDriver::new(CodexHarnessConfig::default(), cli.path().to_path_buf());
+    let harness = VendorHarness::new(
+        codex::card(),
+        EventBufferConfig::default(),
+        Arc::new(driver),
+    )
+    .with_open_timeout(Duration::from_millis(200));
+
+    let error = tokio::time::timeout(WAIT, harness.start(context()))
+        .await
+        .expect("start is bounded by the open timeout")
+        .expect_err("a silent CLI cannot complete the handshake");
+    assert_eq!(error.kind(), HarnessErrorKind::Protocol);
+    assert!(
+        error.message().contains("did not open within"),
+        "unexpected message: {}",
+        error.message()
+    );
+    assert_eq!(harness.state(), HarnessState::Terminated);
+    assert_eq!(harness.provider_session_id(), None);
+
+    let pid = recorded_pid(&cli);
+    wait_until_gone(pid).await;
+
+    // The start lock was released: stop does not wait on it, and a terminated stop is a no-op.
+    tokio::time::timeout(WAIT, harness.stop())
+        .await
+        .expect("stop must not wait on the start lock")
+        .expect("stopping a terminated harness is a no-op");
 }

@@ -167,6 +167,77 @@ async fn an_over_long_output_line_is_rejected() {
 }
 
 #[tokio::test]
+async fn an_over_long_line_is_truncated_and_its_surplus_drained() {
+    const CAP: usize = 1024 * 1024;
+    // 20 MiB without a newline, then a newline and a well-formed line.
+    let fake = FakeCli::script(
+        "head -c 20971520 /dev/zero | tr '\\0' 'a'\nprintf '\\n'\necho '{\"ok\":true}'",
+    );
+    let env = fake.env();
+    let mut child = ChildProcess::spawn(ChildProcessConfig {
+        program: fake.path(),
+        args: &[],
+        cwd: None,
+        env: &env,
+        inherit_env: true,
+        label: "Fake",
+        max_line_bytes: CAP,
+    })
+    .await
+    .expect("the fake CLI must spawn");
+
+    let started = std::time::Instant::now();
+    let error = read(&mut child)
+        .await
+        .expect_err("the line exceeds the ceiling");
+    assert_eq!(error.kind(), HarnessErrorKind::Protocol);
+    assert_eq!(
+        error.message(),
+        "a Fake CLI output line exceeded 1048576 bytes"
+    );
+    assert!(
+        started.elapsed() < BOUND,
+        "the read must stop retaining at the cap instead of buffering 20 MiB"
+    );
+
+    // The surplus was drained without being retained, so the next line is intact and the child
+    // never blocked on a pipe the harness stopped reading.
+    assert_eq!(
+        read(&mut child).await.expect("valid JSON"),
+        Some(json!({"ok": true}))
+    );
+    child.close_stdin().await;
+    assert_eq!(child.wait().await, Some(0));
+}
+
+#[tokio::test]
+async fn a_newline_free_line_is_capped_at_end_of_file() {
+    let fake = FakeCli::script("head -c 1048576 /dev/zero | tr '\\0' 'a'");
+    let env = fake.env();
+    let mut child = ChildProcess::spawn(ChildProcessConfig {
+        program: fake.path(),
+        args: &[],
+        cwd: None,
+        env: &env,
+        inherit_env: true,
+        label: "Fake",
+        max_line_bytes: 64 * 1024,
+    })
+    .await
+    .expect("the fake CLI must spawn");
+
+    let error = read(&mut child)
+        .await
+        .expect_err("the line exceeds the ceiling before end of file");
+    assert_eq!(
+        error.message(),
+        "a Fake CLI output line exceeded 65536 bytes"
+    );
+    assert!(read(&mut child).await.expect("clean EOF").is_none());
+    assert_eq!(child.wait().await, Some(0));
+}
+
+#[tokio::test]
 async fn kill_reaps_the_process() {
     let fake = FakeCli::script("while :; do sleep 1; done");
     let env = fake.env();

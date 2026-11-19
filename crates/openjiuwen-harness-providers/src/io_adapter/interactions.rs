@@ -239,7 +239,7 @@ async fn ask_host(
         adapter.next_chunk_index(),
         json!({"id": request_id.clone(), "value": value}),
     );
-    let _ = adapter.event_tx.send(chunk);
+    adapter.offer_chunk(chunk);
 
     let response = receiver.await;
     lock(&adapter.pending).remove(&request_id);

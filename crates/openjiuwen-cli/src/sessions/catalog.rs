@@ -32,7 +32,7 @@
 //! Everything here is read-only apart from [`Catalog::prune`], so listing works
 //! on a home and a workspace that were never materialised.
 use std::cmp::Ordering;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use openjiuwen_common::config::OpenJiuwenHome;
@@ -43,8 +43,9 @@ use openjiuwen_harness::cli::{
 };
 use openjiuwen_harness::{
     resume, Capacity, Continuation, ExecutionCatalog, ExecutionSummary, FileLinkStore,
-    FileSessionStore, LogCapacity, PersistentAgentLayout, ResumePlan, RootLogSource,
-    SessionStateStore, SessionSummary as StateSummary, WindowAssembler, Workspace,
+    FileSessionStore, LogCapacity, PersistentAgentLayout, PersistentSessionRecord, ResumePlan,
+    RootLogSource, SessionBinding, SessionStateStore, SessionSummary as StateSummary,
+    WindowAssembler, Workspace,
 };
 
 /// Kind tag of a CLI session record.
@@ -197,6 +198,15 @@ pub(crate) struct Resolved {
     pub(crate) record: Option<SessionRecord>,
 }
 
+/// What one prune did: the rows it selected and the deletions that failed.
+#[derive(Debug, Clone)]
+pub(crate) struct PruneReport {
+    /// Rows the selectors matched, in listing order.
+    pub(crate) pruned: Vec<Row>,
+    /// One line per store entry that could not be deleted, naming the row.
+    pub(crate) failures: Vec<String>,
+}
+
 /// The persisted session state of one home and one workspace.
 #[derive(Debug, Clone)]
 pub(crate) struct Catalog {
@@ -244,12 +254,15 @@ impl Catalog {
     /// session id)`, so a conversation that left state everywhere is listed once
     /// — from its richest source — with the rest kept in [`Row::sources`].
     ///
+    /// This is the only command that reads every store: `show`, `run --resume`
+    /// and `--continue` resolve a single id directly (see [`Catalog::resolve_detail`]).
+    ///
     /// # Errors
     ///
     /// Returns whatever the three stores report when a root exists but cannot be
     /// read at all; a single damaged record is skipped by the store itself.
     pub(crate) async fn list(&self) -> Result<Vec<Row>> {
-        let mut rows = self.cli_rows()?;
+        let mut rows = self.cli_rows().await?;
         rows.extend(self.execution_rows().await?);
         rows.extend(self.state_rows().await?);
         let mut rows = merge_rows(rows);
@@ -258,38 +271,24 @@ impl Catalog {
     }
 
     /// Builds one row per CLI session record.
-    fn cli_rows(&self) -> Result<Vec<Row>> {
-        let mut rows = Vec::new();
-        for summary in self.cli_store().list()? {
-            rows.push(Row {
-                id: summary.session_id.clone(),
-                kind: KIND_CLI,
-                created_at: non_empty(&summary.created_at),
-                detail: format!("{} messages, model {}", summary.messages, summary.model),
-                data: Detail::Cli(summary),
-                sources: Vec::new(),
-            });
-        }
-        Ok(rows)
+    async fn cli_rows(&self) -> Result<Vec<Row>> {
+        Ok(self
+            .list_cli()
+            .await?
+            .into_iter()
+            .map(Self::cli_row)
+            .collect())
     }
 
     /// Builds one row per persistent-agent execution journal.
     async fn execution_rows(&self) -> Result<Vec<Row>> {
-        let mut rows = Vec::new();
-        for summary in self.execution_catalog().list().await? {
-            rows.push(Row {
-                id: summary.execution_id.clone(),
-                kind: KIND_EXECUTION,
-                created_at: non_empty(&summary.created_at),
-                detail: format!(
-                    "{} entries, session {}, usable {}",
-                    summary.entries, summary.session_id, summary.usable
-                ),
-                data: Detail::Execution(summary),
-                sources: Vec::new(),
-            });
-        }
-        Ok(rows)
+        Ok(self
+            .execution_catalog()
+            .list()
+            .await?
+            .into_iter()
+            .map(Self::execution_row)
+            .collect())
     }
 
     /// Builds one row per persistent-agent session record.
@@ -299,19 +298,110 @@ impl Catalog {
     async fn state_rows(&self) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         for summary in self.state_store().list().await? {
-            rows.push(Row {
-                id: summary.binding.session_id.clone(),
-                kind: KIND_STATE,
-                created_at: state_timestamp(&summary).await.map(format_timestamp),
-                detail: format!(
-                    "agent {}, waiting {}, ending {}",
-                    summary.binding.agent_id, summary.waiting, summary.has_ending
-                ),
-                data: Detail::State(summary),
-                sources: Vec::new(),
-            });
+            rows.push(Self::state_row(summary).await);
         }
         Ok(rows)
+    }
+
+    /// Builds the row of one CLI session record.
+    fn cli_row(summary: SessionSummary) -> Row {
+        Row {
+            id: summary.session_id.clone(),
+            kind: KIND_CLI,
+            created_at: non_empty(&summary.created_at),
+            detail: format!("{} messages, model {}", summary.messages, summary.model),
+            data: Detail::Cli(summary),
+            sources: Vec::new(),
+        }
+    }
+
+    /// Builds the row of one execution journal.
+    fn execution_row(summary: ExecutionSummary) -> Row {
+        Row {
+            id: summary.execution_id.clone(),
+            kind: KIND_EXECUTION,
+            created_at: non_empty(&summary.created_at),
+            detail: format!(
+                "{} entries, session {}, usable {}",
+                summary.entries, summary.session_id, summary.usable
+            ),
+            data: Detail::Execution(summary),
+            sources: Vec::new(),
+        }
+    }
+
+    /// Builds the row of one persistent session record, stamped with its `state.json` mtime.
+    async fn state_row(summary: StateSummary) -> Row {
+        Row {
+            id: summary.binding.session_id.clone(),
+            kind: KIND_STATE,
+            created_at: state_timestamp(&summary).await.map(format_timestamp),
+            detail: format!(
+                "agent {}, waiting {}, ending {}",
+                summary.binding.agent_id, summary.waiting, summary.has_ending
+            ),
+            data: Detail::State(summary),
+            sources: Vec::new(),
+        }
+    }
+
+    /// Runs one blocking session-record operation on the blocking pool.
+    ///
+    /// `SessionStore::load`/`list` are synchronous `std::fs` reads of whole
+    /// transcripts, so running them on a worker would stall every other task on
+    /// that thread for the length of the read.
+    async fn off_reactor<T, F>(label: &'static str, work: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::task::spawn_blocking(work)
+            .await
+            .map_err(|error| Error::session(format!("{label} failed to run: {error}")))?
+    }
+
+    /// Lists the CLI session records off the reactor.
+    async fn list_cli(&self) -> Result<Vec<SessionSummary>> {
+        let store = self.cli_store();
+        Self::off_reactor("listing the CLI session records", move || store.list()).await
+    }
+
+    /// Loads one CLI session record off the reactor.
+    async fn load_cli(&self, id: &str) -> Result<Option<SessionRecord>> {
+        let store = self.cli_store();
+        let id = id.to_owned();
+        Self::off_reactor("loading a CLI session record", move || store.load(&id)).await
+    }
+
+    /// Summarises a loaded CLI record the way `SessionStore::list` reports it.
+    fn cli_summary(id: &str, record: &SessionRecord) -> SessionSummary {
+        SessionSummary {
+            session_id: if record.session_id.is_empty() {
+                id.to_owned()
+            } else {
+                record.session_id.clone()
+            },
+            model: record.model.clone(),
+            created_at: record.created_at.clone(),
+            messages: record.messages.len(),
+        }
+    }
+
+    /// Summarises a loaded persistent record the way `FileSessionStore::list` reports it.
+    fn state_summary(
+        binding: &SessionBinding,
+        record: &PersistentSessionRecord,
+        state_path: PathBuf,
+    ) -> StateSummary {
+        StateSummary {
+            binding: binding.clone(),
+            waiting: record.is_waiting(),
+            current_window_id: record.current_window_id.clone(),
+            window_seq: record.window_seq,
+            has_checkpoint: record.checkpoint.is_some(),
+            has_ending: record.ending.is_some(),
+            state_path,
+        }
     }
 
     /// Resolves `request` into the turn a resumed run continues.
@@ -321,7 +411,7 @@ impl Catalog {
     /// own identifier. They differ in how the id is chosen:
     /// [`ResumeRequest::Id`] takes the caller's id, while
     /// [`ResumeRequest::Continue`] takes the newest resumable row of
-    /// [`Catalog::list`] and then resolves that row's id the same way.
+    /// [`Catalog::list`] and then resolves that row's richest source.
     ///
     /// # Errors
     ///
@@ -339,68 +429,85 @@ impl Catalog {
     /// `most_recent` only changes the note: a `--continue` run says it continued
     /// the most recent session, not the one the user named.
     async fn resolve_id(&self, id: &str, most_recent: bool) -> Result<Resolved> {
-        let state = self
-            .state_store()
-            .list()
-            .await?
-            .into_iter()
-            .find(|summary| summary.binding.session_id == id);
-        if let Some(summary) = state {
-            if let Some(resolved) = self.resolve_state(&summary, most_recent).await? {
-                return Ok(resolved);
-            }
+        let (resolved, _) = self.resolve_detail(id, most_recent).await?;
+        Ok(resolved)
+    }
+
+    /// Resolves one id directly, without listing the stores, and reports its entry.
+    ///
+    /// Each store is probed by the id it owns — `FileSessionStore::load` for a
+    /// persistent record, `SessionStore::load` for a CLI record,
+    /// `ExecutionCatalog::open` for a journal — so a resolution reads the records
+    /// behind the id instead of every transcript in the home. The returned
+    /// [`Detail`] is what a listing would have reported for that id, so
+    /// [`Catalog::show`] never lists either.
+    async fn resolve_detail(&self, id: &str, most_recent: bool) -> Result<(Resolved, Detail)> {
+        if let Some(found) = self.resolve_state_by_id(id, most_recent).await? {
+            return Ok(found);
         }
-        let cli = self.cli_store();
-        let cli_summary = cli
-            .list()?
-            .into_iter()
-            .find(|summary| summary.session_id == id);
-        if let Some(summary) = cli_summary {
-            if let Some(resolved) = Self::resolve_cli(&cli, &summary, most_recent)? {
-                return Ok(resolved);
-            }
+        if let Some(found) = self.resolve_cli_by_id(id, most_recent).await? {
+            return Ok(found);
         }
-        let catalog = self.execution_catalog();
-        let execution = catalog
-            .list()
-            .await?
-            .into_iter()
-            .find(|summary| summary.execution_id == id);
-        if let Some(summary) = execution {
-            return self
-                .resolve_execution(&catalog, &summary, most_recent)
-                .await;
+        if let Some(found) = self.resolve_execution_by_id(id, most_recent).await? {
+            return Ok(found);
         }
         Err(Error::not_found(format!("unknown session: {id}")))
     }
 
-    /// Resolves the newest resumable session.
+    /// Resolves a persistent session record by session id.
     ///
-    /// The merged listing is newest-first, so the first row a resume could
-    /// restore is the session to continue; ties break by id. Its id then resolves
-    /// through the same precedence as [`ResumeRequest::Id`], so a session with
-    /// state in every store is continued from the richest one.
-    async fn resolve_most_recent(&self) -> Result<Resolved> {
-        let Some(row) = self.list().await?.into_iter().find(Row::is_resumable) else {
-            return Err(Error::not_found("no resumable session found"));
+    /// The CLI binds its state under [`CLI_AGENT_ID`], so that binding is loaded
+    /// first and the store is only scanned (record heads, no transcripts) when it
+    /// misses, which is the case for a session a persistent agent named itself.
+    async fn resolve_state_by_id(
+        &self,
+        id: &str,
+        most_recent: bool,
+    ) -> Result<Option<(Resolved, Detail)>> {
+        if let Ok(binding) = SessionBinding::new(CLI_AGENT_ID, id) {
+            if let Some(found) = self.resolve_state_binding(&binding, most_recent).await? {
+                return Ok(Some(found));
+            }
+        }
+        let store = self.state_store();
+        let Some(summary) = store
+            .list()
+            .await?
+            .into_iter()
+            .find(|summary| summary.binding.session_id == id)
+        else {
+            return Ok(None);
         };
-        self.resolve_id(&row.id, true).await
+        self.resolve_state_binding(&summary.binding, most_recent)
+            .await
     }
 
-    /// Loads one persistent session record and rebuilds its window.
+    /// Loads one persistent record by binding and resolves it.
     ///
-    /// `Ok(None)` means the record vanished between the listing and the load, so
-    /// the caller can fall through to the next store.
+    /// `Ok(None)` means no record exists for the binding, so the caller falls
+    /// through to the next store.
+    async fn resolve_state_binding(
+        &self,
+        binding: &SessionBinding,
+        most_recent: bool,
+    ) -> Result<Option<(Resolved, Detail)>> {
+        let store = self.state_store();
+        let Some(record) = store.load(binding).await? else {
+            return Ok(None);
+        };
+        let summary = Self::state_summary(binding, &record, store.path_for(binding));
+        let resolved = self.resolve_state(&summary, &record, most_recent).await?;
+        Ok(Some((resolved, Detail::State(summary))))
+    }
+
+    /// Rebuilds the window and the resume plan of one loaded persistent record.
     async fn resolve_state(
         &self,
         summary: &StateSummary,
+        record: &PersistentSessionRecord,
         most_recent: bool,
-    ) -> Result<Option<Resolved>> {
+    ) -> Result<Resolved> {
         let binding = summary.binding.clone();
-        let store = self.state_store();
-        let Some(record) = store.load(&binding).await? else {
-            return Ok(None);
-        };
         let prefix = history_prefix(&binding.session_id, most_recent);
         let recovery = record
             .ending
@@ -424,7 +531,7 @@ impl Catalog {
         if let Some(execution_id) = recovery {
             let continuation = Continuation::new(execution_id.clone(), None, CHAIN_LIMIT)?;
             let plan = resume(
-                &store,
+                &self.state_store(),
                 &RootLogSource::new(self.layout.logs_root(), LogCapacity::default()),
                 &FileLinkStore::new(self.layout.links_root()),
                 &binding,
@@ -444,7 +551,7 @@ impl Catalog {
                  ({} messages restored)",
                 history.len()
             );
-            return Ok(Some(Resolved {
+            return Ok(Resolved {
                 id: binding.session_id,
                 kind: KIND_STATE,
                 summary: note,
@@ -452,35 +559,47 @@ impl Catalog {
                 state,
                 plan: Some(plan),
                 record: None,
-            }));
+            });
         }
         let history = record.messages.clone();
         let note = format!(
             "{prefix} from the persistent session record ({} messages restored)",
             history.len()
         );
-        Ok(Some(Resolved {
+        Ok(Resolved {
             id: binding.session_id,
             kind: KIND_STATE,
             summary: note,
             history,
-            state: record.deepagent_state.filter(serde_json::Value::is_object),
+            state: record
+                .deepagent_state
+                .clone()
+                .filter(serde_json::Value::is_object),
             plan: None,
             record: None,
-        }))
+        })
     }
 
-    /// Loads one CLI session record and maps its transcript.
-    ///
-    /// `Ok(None)` means the record vanished between the listing and the load.
-    fn resolve_cli(
-        store: &SessionStore,
-        summary: &SessionSummary,
+    /// Resolves one CLI record by session id.
+    async fn resolve_cli_by_id(
+        &self,
+        id: &str,
         most_recent: bool,
-    ) -> Result<Option<Resolved>> {
-        let Some(record) = store.load(&summary.session_id)? else {
+    ) -> Result<Option<(Resolved, Detail)>> {
+        let Some(record) = self.load_cli(id).await? else {
             return Ok(None);
         };
+        let summary = Self::cli_summary(id, &record);
+        let resolved = Self::resolve_cli(&summary, &record, most_recent);
+        Ok(Some((resolved, Detail::Cli(summary))))
+    }
+
+    /// Maps one loaded CLI record onto a resumable turn.
+    fn resolve_cli(
+        summary: &SessionSummary,
+        record: &SessionRecord,
+        most_recent: bool,
+    ) -> Resolved {
         // The record's own id wins; an empty one continues under the id the file
         // was found with, so a hand-written record still resumes under that name.
         let id = if record.session_id.is_empty() {
@@ -498,26 +617,59 @@ impl Catalog {
             history_prefix(&id, most_recent),
             history.len()
         );
-        Ok(Some(Resolved {
+        Resolved {
             id,
             kind: KIND_CLI,
             summary: note,
             history,
             state: None,
             plan: None,
-            record: Some(record),
-        }))
+            record: Some(record.clone()),
+        }
     }
 
-    /// Reopens one execution journal and reassembles its window.
-    async fn resolve_execution(
+    /// Resolves one execution journal by its own id.
+    ///
+    /// `ExecutionCatalog::open` is the direct lookup: it reads the journal's own
+    /// metadata and segments instead of scanning and re-reading every journal.
+    async fn resolve_execution_by_id(
         &self,
-        catalog: &ExecutionCatalog,
-        summary: &ExecutionSummary,
+        id: &str,
         most_recent: bool,
-    ) -> Result<Resolved> {
-        let log = catalog.open(&summary.execution_id).await?;
+    ) -> Result<Option<(Resolved, Detail)>> {
+        let catalog = self.execution_catalog();
+        let log = match catalog.open(id).await {
+            Ok(log) => log,
+            Err(Error::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let snapshot = log.read().await?;
+        let identity = log.identity();
+        // The journal reader exposes no creation timestamp without a catalogue
+        // scan, so `show` reports `-` for it; `list` still has the real value.
+        let summary = ExecutionSummary {
+            execution_id: identity.execution_id.clone(),
+            namespace_id: identity.namespace_id.clone(),
+            agent_id: identity.agent_id.clone(),
+            session_id: identity.session_id.clone(),
+            request_id: identity.request_id.clone(),
+            source_ref: identity.source_ref.clone(),
+            created_at: String::new(),
+            generation: log.cursor().await.generation,
+            entries: snapshot.entries.len(),
+            last_seq: snapshot.entries.last().map(|entry| entry.seq),
+            usable: snapshot.is_usable(),
+        };
+        let resolved = Self::resolve_execution(&summary, &snapshot, most_recent);
+        Ok(Some((resolved, Detail::Execution(summary))))
+    }
+
+    /// Reassembles the window of one open journal.
+    fn resolve_execution(
+        summary: &ExecutionSummary,
+        snapshot: &openjiuwen_harness::LogSnapshot,
+        most_recent: bool,
+    ) -> Resolved {
         let history = WindowAssembler::new(Capacity::default())
             .assemble(&snapshot.entries)
             .messages;
@@ -532,7 +684,7 @@ impl Catalog {
             summary.execution_id,
             history.len()
         );
-        Ok(Resolved {
+        Resolved {
             id,
             kind: KIND_EXECUTION,
             summary: summary_text,
@@ -540,35 +692,92 @@ impl Catalog {
             state: None,
             plan: None,
             record: None,
-        })
+        }
+    }
+
+    /// Resolves the newest resumable session.
+    ///
+    /// The merged listing is newest-first, so the first row a resume could
+    /// restore is the session to continue; ties break by id. That row is then
+    /// resolved from its richest source directly, so `--continue` pays for one
+    /// listing plus one record read, never a second scan.
+    async fn resolve_most_recent(&self) -> Result<Resolved> {
+        for row in self.list().await?.iter().filter(|row| row.is_resumable()) {
+            if let Some(resolved) = self.resolve_row(row, true).await? {
+                return Ok(resolved);
+            }
+        }
+        Err(Error::not_found("no resumable session found"))
+    }
+
+    /// Resolves one listed row from its richest source, without listing again.
+    ///
+    /// A source that disappeared between the listing and the load falls through
+    /// to the next one, and `Ok(None)` means every source of the row is gone.
+    async fn resolve_row(&self, row: &Row, most_recent: bool) -> Result<Option<Resolved>> {
+        for detail in std::iter::once(&row.data).chain(row.sources.iter()) {
+            if let Some(resolved) = self.resolve_detail_entry(detail, most_recent).await? {
+                return Ok(Some(resolved));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolves one already-listed store entry by reading only its own record.
+    async fn resolve_detail_entry(
+        &self,
+        detail: &Detail,
+        most_recent: bool,
+    ) -> Result<Option<Resolved>> {
+        match detail {
+            Detail::State(summary) => Ok(self
+                .resolve_state_binding(&summary.binding, most_recent)
+                .await?
+                .map(|(resolved, _)| resolved)),
+            Detail::Cli(summary) => {
+                let Some(record) = self.load_cli(&summary.session_id).await? else {
+                    return Ok(None);
+                };
+                Ok(Some(Self::resolve_cli(summary, &record, most_recent)))
+            }
+            Detail::Execution(summary) => {
+                let catalog = self.execution_catalog();
+                let log = match catalog.open(&summary.execution_id).await {
+                    Ok(log) => log,
+                    Err(Error::NotFound(_)) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                let snapshot = log.read().await?;
+                Ok(Some(Self::resolve_execution(
+                    summary,
+                    &snapshot,
+                    most_recent,
+                )))
+            }
+        }
     }
 
     /// Returns the row and the resolution behind one id.
     ///
-    /// The row is looked up by its id alone: after the merge a session can resolve
-    /// from a different store than the one its row is reported from (a journal
-    /// reached through its own id resolves under the session id the state record
-    /// kept), and `show` prints the resolution either way.
+    /// The row is built from the entry the resolution read — its kind, its
+    /// creation timestamp and its detail line — so `show` costs one record read
+    /// instead of a full listing. A journal is reported without a creation
+    /// timestamp, because the journal reader exposes none without a scan.
     ///
     /// # Errors
     ///
     /// Everything [`Catalog::resolve`] reports.
     pub(crate) async fn show(&self, id: &str) -> Result<(Row, Resolved)> {
-        let resolved = self.resolve(ResumeRequest::Id(id)).await?;
-        let rows = self.list().await?;
-        let row = rows
-            .into_iter()
-            .find(|row| row.id == resolved.id)
-            // A record that disappeared between the two scans has no row left;
-            // the resolution itself already carries everything `show` prints.
-            .unwrap_or_else(|| Row {
-                id: resolved.id.clone(),
-                kind: resolved.kind,
-                created_at: None,
-                detail: resolved.summary.clone(),
-                data: Detail::Cli(SessionSummary::default()),
-                sources: Vec::new(),
-            });
+        let (resolved, detail) = self.resolve_detail(id, false).await?;
+        let mut row = match &detail {
+            Detail::Cli(summary) => Self::cli_row(summary.clone()),
+            Detail::Execution(summary) => Self::execution_row(summary.clone()),
+            Detail::State(summary) => Self::state_row(summary.clone()).await,
+        };
+        // `show` reports the id the resume continues, which is the entry's own id
+        // except for a journal reached through its execution id.
+        row.id.clone_from(&resolved.id);
+        row.kind = resolved.kind;
         Ok((row, resolved))
     }
 
@@ -578,16 +787,20 @@ impl Catalog {
     /// whose creation timestamp is older than that many days. Rows without a
     /// timestamp are only selected by `all`, never by an age filter.
     ///
+    /// Deletion is best effort: one unremovable store entry never stops the
+    /// others, and every failure is reported back in the [`PruneReport`], so a
+    /// prune that could not finish says so instead of stopping silently.
+    ///
     /// # Errors
     ///
-    /// `Error::validation` when neither selector is given, plus the listing and
-    /// deletion errors of the stores.
+    /// `Error::validation` when neither selector is given, plus the listing errors
+    /// of the stores. Deletion failures are reported, not returned.
     pub(crate) async fn prune(
         &self,
         older_than_days: Option<f64>,
         all: bool,
         dry_run: bool,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<PruneReport> {
         if !all && older_than_days.is_none() {
             return Err(Error::validation(
                 "prune needs --older-than <DAYS> or --all",
@@ -606,24 +819,35 @@ impl Catalog {
             })
             .collect();
         if dry_run {
-            return Ok(selected);
+            return Ok(PruneReport {
+                pruned: selected,
+                failures: Vec::new(),
+            });
         }
+        let mut failures = Vec::new();
         for row in &selected {
-            self.remove(row).await?;
+            failures.extend(self.remove(row).await);
         }
-        Ok(selected)
+        Ok(PruneReport {
+            pruned: selected,
+            failures,
+        })
     }
 
-    /// Deletes the store entries behind one row.
+    /// Deletes the store entries behind one row, returning the deletions that failed.
     ///
     /// A session that left state in several stores is deleted from **every** one
     /// of them: deleting only the richest source would let the session reappear
-    /// from a leftover record on the next listing.
-    async fn remove(&self, row: &Row) -> Result<()> {
+    /// from a leftover record on the next listing. A failure on one entry does not
+    /// stop the next one, so a half-deleted session stays prunable.
+    async fn remove(&self, row: &Row) -> Vec<String> {
+        let mut failures = Vec::new();
         for detail in std::iter::once(&row.data).chain(row.sources.iter()) {
-            self.remove_detail(detail).await?;
+            if let Err(error) = self.remove_detail(detail).await {
+                failures.push(format!("{} {}: {error}", detail.kind(), row.id));
+            }
         }
-        Ok(())
+        failures
     }
 
     /// Deletes the store entry behind one [`Detail`].

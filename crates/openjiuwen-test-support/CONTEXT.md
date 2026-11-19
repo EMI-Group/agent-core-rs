@@ -77,9 +77,11 @@ impl MockLlmServer {
     pub fn request_count(&self) -> usize;
     pub fn requests(&self) -> Vec<RecordedRequest>;
     pub fn last_request(&self) -> Option<RecordedRequest>;
-    pub async fn wait_for_requests(&self, count: usize);                // waits indefinitely
+    pub async fn wait_for_requests(&self, count: usize) -> Result<()>;  // bounded by DEFAULT_EVENTUALLY_TIMEOUT
     pub async fn wait_for_requests_timeout(&self, count: usize, timeout: Duration) -> Result<()>;
-    pub async fn shutdown(self);                                        // graceful; aborts the task on Drop otherwise
+    pub fn connections(&self) -> ConnectionTasks;                       // stays valid after Drop
+    pub fn live_connections(&self) -> usize;
+    pub async fn shutdown(self);                                        // graceful; aborts every task on Drop otherwise
 }
 
 pub struct MockLlmServerBuilder;                                        // Default; every method consumes and returns Self
@@ -139,7 +141,8 @@ Response ids are deterministic: `chatcmpl-{id_prefix}{seq:04}`, `seq` counting p
 A fallback answer reuses the current `seq` without advancing it: an empty script answers `chatcmpl-{id_prefix}0000`, and a fallback after N pops repeats the N-th id.
 Recordings describe chat-completion traffic only; `/health` and the JSON 404s never appear in `requests()`/`request_count()`.
 `client_config()` uses `TEST_API_KEY` (`"test-api-key"`) and `max_retries = 0`, so a scripted 5xx fails on the first request.
-`shutdown` drives the graceful-shutdown future and awaits the server task with a 5 s bound, aborting it if a connection refuses to drain; `Drop` notifies and aborts.
+Both waiters are bounded: `wait_for_requests` uses `DEFAULT_EVENTUALLY_TIMEOUT` and returns `Error::Timeout` reporting the expected and observed counts, so a script mismatch fails the suite instead of hanging it; the unbounded loop is the crate-private `ServerState::wait_for_requests_until` behind `wait_for_requests_timeout`.
+`MockLlmServer` owns its accept loop instead of `axum::serve` (which spawns connection tasks with no handle), so `ConnectionTasks` records every connection task: `shutdown` flips the graceful signal, waits up to 5 s for the connections to drain and aborts what is left, and `Drop` aborts the accept task and every connection task.
 
 ### Scripted model — `src/scripted_model.rs`
 
@@ -156,7 +159,7 @@ impl ScriptedModel {
     pub fn call_count(&self) -> usize;
     pub fn calls(&self) -> Vec<ModelCall>;
     pub fn last_call(&self) -> Option<ModelCall>;
-    pub async fn wait_for_calls(&self, count: usize);
+    pub async fn wait_for_calls(&self, count: usize) -> Result<()>;     // bounded by DEFAULT_EVENTUALLY_TIMEOUT
     pub async fn wait_for_calls_timeout(&self, count: usize, timeout: Duration) -> Result<()>;
 }
 impl Model for ScriptedModel;                                           // provider/model_name echo the builder values
@@ -294,7 +297,7 @@ let response = client
     .await
     .expect("mock server answers");
 assert_eq!(response.message().expect("choice").text(), "hello");
-server.wait_for_requests(1).await;
+server.wait_for_requests(1).await.expect("one request");
 assert_eq!(server.requests()[0].path, "/v1/chat/completions");
 server.shutdown().await;
 ```

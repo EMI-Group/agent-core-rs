@@ -29,7 +29,9 @@ use openjiuwen_foundation::llm::{
     StreamChunk,
 };
 use openjiuwen_foundation::prompt::{BaseMessage, ToolCall, Usage};
-use openjiuwen_test_support::{MockCompletion, MockHttpError, MockLlmServer, ScriptedResponse};
+use openjiuwen_test_support::{
+    eventually, MockCompletion, MockHttpError, MockLlmServer, ScriptedResponse,
+};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -472,7 +474,10 @@ async fn requests_are_recorded_with_their_wire_shape() {
         .invoke(&conversation("hi"), &request_for(&server))
         .await
         .expect("the mock server answers");
-    server.wait_for_requests(1).await;
+    server
+        .wait_for_requests(1)
+        .await
+        .expect("the request is recorded");
 
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
@@ -496,7 +501,10 @@ async fn requests_are_recorded_with_their_wire_shape() {
     )
     .await;
     assert_eq!(streamed_text(&chunks), "streamed");
-    server.wait_for_requests(2).await;
+    server
+        .wait_for_requests(2)
+        .await
+        .expect("both requests are recorded");
 
     let requests = server.requests();
     let streamed = requests.last().expect("the streaming request is recorded");
@@ -566,7 +574,10 @@ async fn wait_for_requests_wakes_when_the_request_arrives_later() {
                 .expect("the mock server answers the late request")
         });
 
-        server.wait_for_requests(1).await;
+        server
+            .wait_for_requests(1)
+            .await
+            .expect("the late request is recorded");
         assert_eq!(server.request_count(), 1);
         assert_eq!(
             server.last_request().expect("one recording").user_texts(),
@@ -764,6 +775,63 @@ async fn several_servers_are_alive_without_cross_talk() {
 
     first.shutdown().await;
     second.shutdown().await;
+}
+
+#[tokio::test]
+async fn wait_for_requests_fails_within_its_bound_instead_of_hanging() {
+    // No request is ever made, so the waiter can never be satisfied: it must
+    // report the expected and observed counts inside its default bound instead of
+    // parking the suite until the CI timeout. The outer bound fails the test if
+    // the helper really waits forever.
+    let server = MockLlmServer::with_script([ScriptedResponse::text("unused")]).await;
+    let error = tokio::time::timeout(Duration::from_secs(5), server.wait_for_requests(1))
+        .await
+        .expect("wait_for_requests is bounded by DEFAULT_EVENTUALLY_TIMEOUT")
+        .expect_err("no request was ever made");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(
+        error.message().contains("wait_for_requests(1)"),
+        "{}",
+        error.message()
+    );
+    assert!(
+        error.message().contains("saw 0 request(s)"),
+        "{}",
+        error.message()
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_dropped_server_leaves_no_connection_task_running() {
+    let server = MockLlmServer::with_script([ScriptedResponse::text("unused")]).await;
+    let connections = server.connections();
+    assert_eq!(
+        connections.live(),
+        0,
+        "a fresh server has no connection task"
+    );
+    // A connection that never finishes its request headers keeps one task parked
+    // inside the HTTP server: exactly the task an aborted `axum::serve` used to
+    // leave running after the test.
+    let mut stalled = TcpStream::connect(server.addr()).await.expect("connect");
+    stalled
+        .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: loopback\r\n")
+        .await
+        .expect("write a partial request");
+    eventually(Duration::from_secs(2), || {
+        let connections = connections.clone();
+        async move { connections.live() == 1 }
+    })
+    .await
+    .expect("the server spawned one connection task");
+    drop(server);
+    eventually(Duration::from_secs(2), || {
+        let connections = connections.clone();
+        async move { connections.live() == 0 }
+    })
+    .await
+    .expect("dropping the server aborts every connection task");
 }
 
 #[tokio::test]

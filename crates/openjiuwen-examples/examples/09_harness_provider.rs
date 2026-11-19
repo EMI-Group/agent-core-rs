@@ -222,6 +222,31 @@ async fn observe_turn(cursor: &mut Box<dyn HarnessEventCursor>, turn_id: &str) -
     }
 }
 
+/// Returns the answer one observed turn produced, or an error naming why it has none.
+///
+/// A turn that ends without a single `answer` output is an event-stream
+/// regression, not a reason to print the scripted text: the example would exit
+/// `0` with a convincing transcript that never happened. The error carries the
+/// event count and the terminal status, so the failure says what was observed.
+fn require_answer(observation: &Observation) -> Result<String> {
+    if !observation.answer.is_empty() {
+        return Ok(observation.answer.clone());
+    }
+    let ending = match &observation.result {
+        Some(result) => format!(
+            "turn {} (stop reason: {})",
+            status_label(result.status),
+            result.stop_reason.as_deref().unwrap_or("<none>")
+        ),
+        None => "no terminal turn result".to_owned(),
+    };
+    Err(anyhow::anyhow!(
+        "the turn produced no `answer` output after {} event(s), {ending}: the harness \
+         event stream is not delivering the model's output (scripted answer was {:?})",
+        observation.events,
+        SCRIPTED_ANSWER,
+    ))
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     let mode = common::setup()?;
@@ -321,10 +346,60 @@ async fn main() -> Result<()> {
 
     server.shutdown().await;
 
-    if observation.answer.is_empty() {
-        common::banner::answer(SCRIPTED_ANSWER);
-    } else {
-        common::banner::answer(&observation.answer);
-    }
+    // No fallback text: an empty turn is a regression this example must report,
+    // not paper over with the answer it scripted.
+    common::banner::answer(&require_answer(&observation)?);
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    /// Builds the observation of a turn that delivered no `answer` output.
+    fn silent_turn(events: usize, result: Option<TurnResult>) -> Observation {
+        Observation {
+            events,
+            answer: String::new(),
+            result,
+        }
+    }
+
+    #[test]
+    fn an_empty_turn_fails_with_the_observed_counts() {
+        let error = require_answer(&silent_turn(3, None)).expect_err("silence is a regression");
+        let text = error.to_string();
+        assert!(text.contains("no `answer` output"), "{text}");
+        assert!(text.contains("after 3 event(s)"), "{text}");
+        assert!(text.contains("no terminal turn result"), "{text}");
+    }
+
+    #[test]
+    fn a_terminal_turn_without_output_names_its_status() {
+        let result: TurnResult = serde_json::from_value(serde_json::json!({
+            "status": "failed",
+            "error": {"message": "the model failed"},
+        }))
+        .expect("a terminal failed result");
+        let error = require_answer(&silent_turn(7, Some(result))).expect_err("still no answer");
+        let text = error.to_string();
+        assert!(text.contains("after 7 event(s)"), "{text}");
+        assert!(text.contains("turn failed"), "{text}");
+    }
+
+    #[test]
+    fn a_produced_answer_is_returned_verbatim() {
+        let observation = Observation {
+            events: 2,
+            answer: SCRIPTED_ANSWER.to_owned(),
+            result: None,
+        };
+        assert_eq!(
+            require_answer(&observation).expect("the turn answered"),
+            SCRIPTED_ANSWER
+        );
+    }
 }

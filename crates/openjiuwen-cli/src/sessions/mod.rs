@@ -22,7 +22,12 @@
 //! `--json` (group-global) prints exactly one pretty JSON document on stdout:
 //! the row array of `list`, the `show` object (`id`, `kind`, `created_at`,
 //! `detail`, `messages`, `plan`, `record`), or the `prune` object (`dry_run`,
-//! `pruned`, `entries`).
+//! `pruned`, `entries`, `failures`).
+//!
+//! `show` and the resume paths resolve one id directly, so they read that
+//! session's records instead of every transcript in the home. A `prune` deletes
+//! everything it can and then fails with a `session` error naming the entries it
+//! could not delete — never a silent stop halfway through.
 //!
 //! Text mode prints one item per line:
 //!
@@ -228,23 +233,38 @@ async fn prune(
     dry_run: bool,
     json: bool,
 ) -> Result<()> {
-    let entries = catalog.prune(older_than, all, dry_run).await?;
+    let report = catalog.prune(older_than, all, dry_run).await?;
+    let entries = &report.pruned;
     if json {
-        return print_json(&PruneView {
+        print_json(&PruneView {
             dry_run,
             pruned: entries.len(),
-            entries: &entries,
-        });
-    }
-    if entries.is_empty() {
+            entries,
+            failures: &report.failures,
+        })?;
+    } else if entries.is_empty() {
         println!("nothing to prune");
+    } else {
+        let verb = if dry_run { "would prune" } else { "pruned" };
+        for row in entries {
+            println!("{verb} {}\t{}", row.kind, row.id);
+        }
+    }
+    // Everything that could be deleted was deleted; report the rest and exit
+    // non-zero instead of pretending the prune finished.
+    if report.failures.is_empty() {
         return Ok(());
     }
-    let verb = if dry_run { "would prune" } else { "pruned" };
-    for row in &entries {
-        println!("{verb} {}\t{}", row.kind, row.id);
-    }
-    Ok(())
+    Err(openjiuwen_common::error::Error::session(format!(
+        "prune could not delete {} store entr{}: {}",
+        report.failures.len(),
+        if report.failures.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        report.failures.join("; ")
+    )))
 }
 
 /// One seeded message as `sessions show --json` reports it.
@@ -284,6 +304,8 @@ struct PruneView<'a> {
     pruned: usize,
     /// The matched rows.
     entries: &'a [Row],
+    /// One line per store entry that could not be deleted.
+    failures: &'a [String],
 }
 
 /// Prints `value` as one pretty JSON document on stdout.

@@ -20,7 +20,7 @@ use crate::component::Component;
 use crate::components::{BranchRouterAdapter, EndComponent, StartComponent};
 use crate::condition::{Branch, BranchRouter, Condition};
 use crate::engine::run::STREAM_CHANNEL_CAPACITY;
-use crate::output::{WorkflowExecutionState, END_NODE_STREAM, WORKFLOW_FINAL};
+use crate::output::{WorkflowChunk, WorkflowExecutionState, END_NODE_STREAM, WORKFLOW_FINAL};
 
 fn session(name: &str) -> Arc<dyn Session> {
     Arc::new(WorkflowSession::new(name))
@@ -265,6 +265,116 @@ async fn invoke_reports_cancellation_and_timeouts() {
         .unwrap_err();
     assert_eq!(timed_out.kind(), ErrorKind::Timeout);
     assert!(timed_out.to_string().contains("execution timed out"));
+}
+
+/// How long the hanging component blocks: far past any test bound.
+const HANG: Duration = Duration::from_secs(30);
+
+/// The bound every streaming deadline test gives itself, so a regression fails instead of
+/// hanging the suite.
+const STREAM_BOUND: Duration = Duration::from_secs(5);
+
+/// A workflow whose `mid` component never finishes within a test's lifetime.
+fn hanging_workflow() -> CompiledWorkflow {
+    CompiledWorkflow::build(linear(echo().with_delay(HANG), NodeConfig::default())).unwrap()
+}
+
+/// Drains a stream to its end under [`STREAM_BOUND`], so a stream that never ends fails the
+/// test instead of hanging it.
+async fn drain(
+    mut stream: futures::stream::BoxStream<'static, Result<WorkflowChunk>>,
+) -> Vec<Result<WorkflowChunk>> {
+    match tokio::time::timeout(STREAM_BOUND, async move {
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+        items
+    })
+    .await
+    {
+        Ok(items) => items,
+        Err(elapsed) => {
+            panic!("a bounded workflow stream must end instead of staying open: {elapsed}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn stream_ends_with_one_timeout_error_when_the_deadline_passes() {
+    // `invoke` bounds a hung component with the run timeout; `stream` must do the same
+    // instead of keeping the stream open for as long as the component blocks.
+    let workflow = hanging_workflow();
+    let mut items = drain(workflow.stream(
+        json!({"query": "hi"}),
+        session("stream-timeout"),
+        WorkflowRunOptions::default().with_timeout(Duration::from_millis(20)),
+    ))
+    .await;
+
+    assert_eq!(
+        items.len(),
+        1,
+        "the deadline must end the stream with exactly one terminal item"
+    );
+    let failure = items.pop().unwrap().unwrap_err();
+    assert_eq!(failure.kind(), ErrorKind::Timeout);
+    assert!(
+        failure.to_string().contains("execution timed out"),
+        "{failure}"
+    );
+}
+
+#[tokio::test]
+async fn stream_ends_with_one_cancelled_error_when_the_token_fires() {
+    let token = CancellationToken::new();
+    let workflow = hanging_workflow();
+    let stream = workflow.stream(
+        json!({"query": "hi"}),
+        session("stream-cancelled"),
+        WorkflowRunOptions::default().with_cancellation(token.clone()),
+    );
+    // Cancel while the run is in flight, not before it starts.
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        token.cancel();
+    });
+    let mut items = drain(stream).await;
+    canceller.await.unwrap();
+
+    assert_eq!(
+        items.len(),
+        1,
+        "cancellation must end the stream with exactly one terminal item"
+    );
+    let failure = items.pop().unwrap().unwrap_err();
+    assert_eq!(failure.kind(), ErrorKind::Cancelled);
+}
+
+#[tokio::test]
+async fn a_deadline_leaves_a_normal_streaming_run_unchanged() {
+    let workflow = CompiledWorkflow::build(linear(echo(), streaming_end())).unwrap();
+    let unbounded = drain(workflow.stream(
+        json!({"query": "hi"}),
+        session("deadline-baseline"),
+        WorkflowRunOptions::default(),
+    ))
+    .await;
+    let bounded = drain(workflow.stream(
+        json!({"query": "hi"}),
+        session("deadline-bounded"),
+        WorkflowRunOptions::default().with_timeout(Duration::from_secs(5)),
+    ))
+    .await;
+
+    let unbounded: Vec<WorkflowChunk> = unbounded.into_iter().map(Result::unwrap).collect();
+    let bounded: Vec<WorkflowChunk> = bounded.into_iter().map(Result::unwrap).collect();
+    assert_eq!(bounded, unbounded, "a deadline must not change the frames");
+    assert!(!bounded.is_empty());
+    assert_eq!(bounded.last().unwrap().item_type, WORKFLOW_FINAL);
+    assert!(bounded[..bounded.len() - 1]
+        .iter()
+        .all(|chunk| chunk.item_type == END_NODE_STREAM));
 }
 
 #[tokio::test]
@@ -989,6 +1099,31 @@ async fn a_slow_consumer_backpressures_the_run_instead_of_buffering_every_frame(
     assert!(
         stopped_at <= slack,
         "a stalled consumer must backpressure the run: {stopped_at} frames produced, \
+         capacity is {STREAM_CHANNEL_CAPACITY}"
+    );
+    drop(stream);
+}
+
+#[tokio::test]
+async fn a_timed_stream_still_backpressures_instead_of_retaining_every_frame() {
+    // The deadline wrapper must not reintroduce a frame collector on the streaming path:
+    // with a (generous, never reached) deadline set, a stalled consumer still stops the
+    // producer at the channel capacity instead of letting the run buffer every frame.
+    let produced = Arc::new(AtomicUsize::new(0));
+    let workflow = counted_stream_workflow(10_000, &produced);
+    let mut stream = workflow.stream(
+        json!({}),
+        session("timed-backpressure"),
+        WorkflowRunOptions::default().with_timeout(Duration::from_secs(30)),
+    );
+    let first = stream.next().await.unwrap().unwrap();
+    assert_eq!(first.item_type, END_NODE_STREAM);
+
+    let stopped_at = settled_production(&produced).await;
+    let slack = STREAM_CHANNEL_CAPACITY + 4;
+    assert!(
+        stopped_at <= slack,
+        "a timed stream must still backpressure the run: {stopped_at} frames produced, \
          capacity is {STREAM_CHANNEL_CAPACITY}"
     );
     drop(stream);

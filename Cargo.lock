@@ -2364,6 +2364,8 @@ dependencies = [
  "axum",
  "chrono",
  "futures",
+ "hyper",
+ "hyper-util",
  "openjiuwen-common",
  "openjiuwen-foundation",
  "openjiuwen-session",
@@ -2372,6 +2374,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tower-service",
  "uuid",
  "wiremock",
 ]

@@ -72,6 +72,14 @@ use super::driver::{
 use super::events::{EnvelopeBuilder, EventBus};
 use super::lock;
 
+/// Default bound on how long [`start`](HarnessProtocol::start) waits for
+/// [`VendorDriver::open`] to complete its handshake.
+///
+/// Every other wait of the shell is bounded, so a vendor CLI that spawns but never answers must
+/// not wedge the handle (and with it the `start_lock` that [`stop`](HarnessProtocol::stop) needs).
+/// A harness can override it with [`VendorHarness::with_open_timeout`].
+pub const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Bound on how long `stop` waits for the vendor driver to release its session.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -131,6 +139,8 @@ pub struct VendorHarness {
     state: Arc<Mutex<VendorState>>,
     /// Serializes `start` and `stop`.
     start_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Bound on how long `start` waits for [`VendorDriver::open`] to answer.
+    open_timeout: Duration,
     /// Provider session id of the first successful `start`.
     provider_session: Arc<OnceLock<String>>,
 }
@@ -164,8 +174,21 @@ impl VendorHarness {
             driver,
             state: Arc::new(Mutex::new(VendorState::default())),
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            open_timeout: DEFAULT_OPEN_TIMEOUT,
             provider_session: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Bounds how long [`start`](HarnessProtocol::start) waits for the driver's `open`.
+    ///
+    /// Defaults to [`DEFAULT_OPEN_TIMEOUT`]. The timeout is part of the handle, so it applies to
+    /// every `start` of this harness; a driver that does not answer within it fails the start with
+    /// [`HarnessError::Protocol`], is closed best-effort, and leaves the handle `Terminated` and
+    /// reusable.
+    #[must_use]
+    pub fn with_open_timeout(mut self, timeout: Duration) -> Self {
+        self.open_timeout = timeout;
+        self
     }
 
     /// Returns the human label of the wrapped driver, for example `"Claude Code"`.
@@ -217,6 +240,27 @@ impl VendorHarness {
                 "the {} harness cannot be restarted with a different provider session",
                 self.driver.label()
             ))),
+        }
+    }
+
+    /// Closes a driver whose `open` failed or timed out, under the teardown bound.
+    ///
+    /// The start path owns no cycle yet, so this is best-effort: a close error or a close that
+    /// misses [`CLOSE_TIMEOUT`] is logged and never replaces the start error the caller sees. It
+    /// runs while `start` still holds the start lock, but it is bounded, so it can never make
+    /// `stop` unreachable.
+    async fn close_after_failed_open(&self) {
+        match tokio::time::timeout(CLOSE_TIMEOUT, self.driver.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "the vendor driver failed to close after a failed start");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    label = self.driver.label(),
+                    "the vendor driver did not close after a failed start within the timeout"
+                );
+            }
         }
     }
 
@@ -310,12 +354,18 @@ impl HarnessProtocol for VendorHarness {
 
     /// Validates the host, opens the driver session, and settles in `Idle`.
     ///
+    /// The driver's `open` runs under [`open_timeout`](Self::with_open_timeout)
+    /// ([`DEFAULT_OPEN_TIMEOUT`] unless overridden), so a CLI that spawns but never answers fails
+    /// the start instead of wedging the handle and the start lock. Every failure path closes the
+    /// driver best-effort (bounded) and leaves the harness `Terminated`; the start lock is released
+    /// on every exit path, so `stop` and a later `start` stay reachable.
+    ///
     /// # Errors
     ///
     /// [`HarnessError::State`] when a cycle already runs or a restart would change the provider
-    /// session id, [`HarnessError::Protocol`] for a host/protocol mismatch, and the driver's own
-    /// error unchanged when it cannot open its session (the observation bus is closed and the
-    /// harness stays `Terminated`).
+    /// session id, [`HarnessError::Protocol`] for a host/protocol mismatch or when the driver does
+    /// not open within the timeout, and the driver's own error unchanged when it cannot open its
+    /// session (the observation bus is closed and the harness stays `Terminated`).
     async fn start(&self, context: HarnessContext) -> HarnessResult<()> {
         let _guard = self.start_lock.lock().await;
         if self.state_snapshot() != HarnessState::Terminated {
@@ -332,14 +382,28 @@ impl HarnessProtocol for VendorHarness {
             context.agent_id.clone(),
         ));
         let session = TurnContext::new(Arc::clone(&bus), Arc::clone(&envelopes));
-        let opened = match self.driver.open(&context, &session).await {
-            Ok(opened) => opened,
-            Err(error) => {
-                bus.close();
-                return Err(error);
-            }
-        };
+        let opened =
+            match tokio::time::timeout(self.open_timeout, self.driver.open(&context, &session))
+                .await
+            {
+                Ok(Ok(opened)) => opened,
+                Ok(Err(error)) => {
+                    self.close_after_failed_open().await;
+                    bus.close();
+                    return Err(error);
+                }
+                Err(_) => {
+                    self.close_after_failed_open().await;
+                    bus.close();
+                    return Err(HarnessError::protocol(format!(
+                        "the {} harness did not open within {}s",
+                        self.driver.label(),
+                        self.open_timeout.as_secs_f64()
+                    )));
+                }
+            };
         if let Err(error) = self.adopt_session(opened.as_deref()) {
+            self.close_after_failed_open().await;
             bus.close();
             return Err(error);
         }

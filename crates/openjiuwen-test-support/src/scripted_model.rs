@@ -37,6 +37,7 @@ use openjiuwen_foundation::llm::{
 };
 use openjiuwen_foundation::prompt::BaseMessage;
 
+use crate::eventually::DEFAULT_EVENTUALLY_TIMEOUT;
 use crate::internal::{lock, DEFAULT_FALLBACK_TEXT};
 use crate::responses::{text_chunks, MockCompletion};
 
@@ -301,11 +302,44 @@ impl ScriptedModel {
         lock(&self.inner.calls).last().cloned()
     }
 
-    /// Waits until at least `count` calls have been recorded.
+    /// Waits until at least `count` calls have been recorded, bounded by
+    /// [`DEFAULT_EVENTUALLY_TIMEOUT`].
     ///
     /// Python parity: `MockLLMModel` exposes `call_count` for polling; the
     /// notification keeps a concurrent test from sleeping.
-    pub async fn wait_for_calls(&self, count: usize) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Timeout`] when fewer than `count` calls were recorded
+    /// before the default bound elapsed; the message reports the expected and the
+    /// observed count, so a wrong script fails the suite instead of burning the CI
+    /// timeout. [`ScriptedModel::wait_for_calls_timeout`] takes another bound.
+    pub async fn wait_for_calls(&self, count: usize) -> Result<()> {
+        self.wait_for_calls_timeout(count, DEFAULT_EVENTUALLY_TIMEOUT)
+            .await
+    }
+
+    /// [`ScriptedModel::wait_for_calls`] with an explicit deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Timeout`] when fewer than `count` calls were
+    /// recorded before `timeout` elapsed.
+    pub async fn wait_for_calls_timeout(&self, count: usize, timeout: Duration) -> Result<()> {
+        match tokio::time::timeout(timeout, self.wait_for_calls_until(count)).await {
+            Ok(()) => Ok(()),
+            Err(_elapsed) => Err(Error::timeout(format!(
+                "scripted model: expected {count} call(s) within {timeout:?}, observed {}",
+                self.call_count()
+            ))),
+        }
+    }
+
+    /// Waits until at least `count` calls have been recorded, without a deadline.
+    ///
+    /// Private on purpose: every public waiter wraps it in a timeout, so a script
+    /// that is never consumed cannot park a suite forever.
+    async fn wait_for_calls_until(&self, count: usize) {
         loop {
             // Register before checking so a call landing in between cannot be
             // missed, and `enable` closes the poll-registration window.
@@ -316,21 +350,6 @@ impl ScriptedModel {
                 return;
             }
             notified.await;
-        }
-    }
-
-    /// [`ScriptedModel::wait_for_calls`] with a deadline.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::Timeout`] when fewer than `count` calls were
-    /// recorded before `timeout` elapsed.
-    pub async fn wait_for_calls_timeout(&self, count: usize, timeout: Duration) -> Result<()> {
-        match tokio::time::timeout(timeout, self.wait_for_calls(count)).await {
-            Ok(()) => Ok(()),
-            Err(_elapsed) => Err(Error::timeout(format!(
-                "scripted model: expected {count} call(s) within {timeout:?}"
-            ))),
         }
     }
 
@@ -865,9 +884,27 @@ mod tests {
                 .await
         });
 
-        model.wait_for_calls(1).await;
+        model.wait_for_calls(1).await.expect("the call is recorded");
         assert_eq!(model.call_count(), 1);
         handle.await.expect("task joins").expect("scripted turn");
+    }
+
+    #[tokio::test]
+    async fn wait_for_calls_fails_within_the_default_bound_instead_of_hanging() {
+        let model = ScriptedModel::text("hi");
+        // Nothing was invoked, so the waiter can never be satisfied: it must
+        // report the expected and observed counts instead of waiting forever.
+        let error = tokio::time::timeout(
+            DEFAULT_EVENTUALLY_TIMEOUT + Duration::from_secs(1),
+            model.wait_for_calls(1),
+        )
+        .await
+        .expect("wait_for_calls is bounded by DEFAULT_EVENTUALLY_TIMEOUT")
+        .expect_err("no call is ever recorded");
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+        let message = error.message().into_owned();
+        assert!(message.contains("expected 1 call(s)"), "{message}");
+        assert!(message.contains("observed 0"), "{message}");
     }
 
     #[tokio::test]
@@ -884,8 +921,9 @@ mod tests {
             .expect_err("the second call never happens");
         assert_eq!(error.kind(), ErrorKind::Timeout);
         let message = error.message().into_owned();
-        assert!(message.contains('2'), "{message}");
+        assert!(message.contains("expected 2 call(s)"), "{message}");
         assert!(message.contains("20ms"), "{message}");
+        assert!(message.contains("observed 1"), "{message}");
 
         model
             .wait_for_calls_timeout(1, Duration::from_millis(20))
