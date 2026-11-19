@@ -45,7 +45,7 @@ mod legacy;
 mod messages;
 mod storage;
 
-pub(crate) use messages::MessageStore;
+pub(crate) use messages::{require_message_scope, MessageStore};
 pub use messages::{MessageCursor, MessagePage, StoredMessage};
 pub(crate) use storage::MemoryStorage;
 

@@ -561,6 +561,29 @@ fn rejects_zlib_trailers_that_are_too_short() {
     let error = zlib_decompress(&[0x78, 0x9C, 0x03], 16).unwrap_err();
     assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Retrieval);
 }
+
+#[test]
+fn rejects_zlib_inputs_that_cannot_hold_a_trailer_without_panicking() {
+    // A 4- or 5-byte stream has a well-formed header, but `len - 4` lands before
+    // the end of the header, so the payload slice `2..payload_end` used to be
+    // built backwards and panic. Every short input must be a typed error instead.
+    // 0x78 0x9C is a valid DEFLATE/32 KiB header; the trailing bytes are too few
+    // to hold the 4-byte Adler-32.
+    for stream in [
+        vec![0x78, 0x9C, 0x03, 0x00],
+        vec![0x78, 0x9C, 0x03, 0x00, 0x00],
+        vec![0x78, 0x9C, 0x03, 0x00, 0x00, 0x00],
+    ] {
+        let error = zlib_decompress(&stream, DEFAULT_MAX_OUTPUT_BYTES).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Retrieval,
+            "{stream:02x?}"
+        );
+        assert!(error.to_string().contains("truncated"), "{error}");
+    }
+}
+
 /// `zlib` stream (level 9) produced by a reference encoder for
 /// [`real_encoder_text`]; it holds a dynamic-Huffman block with
 /// back-references, the shape real DOCX/XLSX producers emit.

@@ -356,7 +356,9 @@ impl GuardrailBackend for AzureContentSafetyBackend {
     }
 
     async fn analyze(&self, ctx: &GuardrailContext) -> Result<RiskAssessment> {
-        let text = ctx.text_view();
+        // The checked projection, like every local detector: an unscannable
+        // payload is a failure for the failure policy to resolve, never a pass.
+        let text = ctx.text_view_checked()?;
         if text.trim().is_empty() {
             return Ok(safe_assessment());
         }

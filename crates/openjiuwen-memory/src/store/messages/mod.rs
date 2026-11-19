@@ -7,9 +7,11 @@
 //! RFC 3339 timestamp, so history can be replayed without the foundation prompt types.
 //!
 //! Ids are deterministic ([`derived_message_id`]:
-//! `msg_{fnv64(content + role + millis):016x}_{millis}`), which reproduces the Python
-//! `msg_{sha256(...)}_{ms}` shape without a crypto dependency: re-appending the same
-//! message in the same millisecond replaces the same row.
+//! `msg_{fnv64(user + scope + session + role + millis + ordinal + content):016x}_{millis}`), which
+//! reproduces the Python `msg_{sha256(...)}_{ms}` shape without a crypto dependency. The
+//! preimage folds the row's `user_id`, `scope_id`, `session_id`, and its position in the
+//! appended batch, so two tenants (or two identical turns of one batch) never share a
+//! row, while re-appending the same batch in the same millisecond replaces its own rows.
 //!
 //! The collection name comes from the [`KvPrefixRegistry`] (`messages` by default), so a
 //! deployment can rename it exactly like the KV families; existing rows then stay reachable
@@ -22,10 +24,11 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::prompt::BaseMessage;
 use openjiuwen_foundation::store::{Document, DocumentStore, Query, SortOrder};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::record::{MemoryFilter, MemoryScope};
 
@@ -131,6 +134,11 @@ impl MessageStore {
     /// Each row is upserted into the collection named by the prefix layout (`messages` by
     /// default) and the built [`StoredMessage`]s are returned in input order. An empty input
     /// writes nothing.
+    ///
+    /// The id of a row folds the scope and the row's position in the batch
+    /// ([`derived_message_id`]), so two identical turns of one batch (which share the batch
+    /// `timestamp`) stay two rows and the same text in two scopes never overwrites another
+    /// tenant's row.
     pub(crate) async fn append(
         &self,
         scope: &MemoryScope,
@@ -142,10 +150,18 @@ impl MessageStore {
         }
         let mut stored = Vec::with_capacity(messages.len());
         let mut documents = Vec::with_capacity(messages.len());
-        for message in messages {
+        for (ordinal, message) in messages.iter().enumerate() {
             let content = plain_text(&message.content);
             let role = message.role.as_str().to_owned();
-            let id = derived_message_id(&content, &role, timestamp);
+            let id = derived_message_id(DerivedMessageId {
+                user_id: &scope.user_id,
+                scope_id: &scope.scope_id,
+                session_id: scope.session_id.as_deref(),
+                content: &content,
+                role: &role,
+                timestamp,
+                ordinal,
+            });
             let message = StoredMessage {
                 user_id: scope.user_id.clone(),
                 scope_id: scope.scope_id.clone(),
@@ -164,9 +180,12 @@ impl MessageStore {
 
     /// Returns the `limit` most recent messages of `scope`, in chronological order.
     ///
-    /// The newest rows are selected by timestamp descending, then reversed so the
-    /// caller always replays oldest-first. `limit == 0` returns an empty vector; a
-    /// missing collection is empty history, not an error.
+    /// The newest rows are selected by `(timestamp, id)` descending — the same total order
+    /// [`MessageStore::page`] walks ascending — then reversed so the caller always replays
+    /// oldest-first. Rows sharing a timestamp (one appended batch carries exactly one)
+    /// therefore come back in ascending id order, which makes `recent(n)` exactly the tail
+    /// of `page()`. `limit == 0` returns an empty vector; a missing collection is empty
+    /// history, not an error.
     pub(crate) async fn recent(
         &self,
         scope: &MemoryScope,
@@ -179,7 +198,10 @@ impl MessageStore {
             filter: scope_filter(scope),
             limit: Some(limit),
             offset: 0,
-            order_by: vec![(FIELD_TIMESTAMP.to_owned(), SortOrder::Desc)],
+            order_by: vec![
+                (FIELD_TIMESTAMP.to_owned(), SortOrder::Desc),
+                (FIELD_ID.to_owned(), SortOrder::Desc),
+            ],
         };
         let documents = self.document.query(self.collection(), &query).await?;
         let mut messages = decode(documents);
@@ -256,28 +278,124 @@ impl MessageStore {
         })
     }
 
-    /// Deletes every message matching `filter`, returning how many rows were removed.
+    /// Deletes every message of one tenant scope matching `filter`, returning how many
+    /// rows were removed.
     ///
-    /// Scope clauses, `ids`, and the exclusive `created_after`/`created_before` bounds
-    /// are translated into the document filter language; the other record clauses
+    /// The delete is always scoped: `filter` must name a non-empty `user_id` and
+    /// `scope_id` ([`require_message_scope`]), and those clauses are `AND`ed into the
+    /// document filter, so no filter shape can reach another tenant's rows or wipe the
+    /// whole collection. `session_id`, `ids`, and the exclusive `created_after`/
+    /// `created_before` bounds narrow the delete further; the other record clauses
     /// (kinds, importance, text) do not apply to message rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] when `filter` names no `user_id` or no `scope_id`,
+    /// before anything is deleted, and the storage error when the delete fails.
+    ///
+    /// [`Error::Validation`]: openjiuwen_common::error::Error::Validation
     pub(crate) async fn delete_for(&self, filter: &MemoryFilter) -> Result<usize> {
         let query = Query {
-            filter: message_filter(filter),
+            filter: delete_filter(filter)?,
             ..Query::default()
         };
         self.document.delete(self.collection(), &query).await
     }
 }
 
-/// The deterministic id of one message: `msg_{fnv64(content + role + millis):016x}_{millis}`.
+/// Rejects a message query that names no tenant scope.
+///
+/// Conversation history is never deleted without an explicit `user_id` and `scope_id`:
+/// an empty [`MemoryFilter`] renders `{}`,
+/// which the document filter language reads as "match every row", and Python's history
+/// API has no cross-tenant delete. Callers build the scope with
+/// [`MemoryFilter::for_scope`].
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] naming the missing field(s).
+///
+/// [`Error::Validation`]: openjiuwen_common::error::Error::Validation
+pub(crate) fn require_message_scope(filter: &MemoryFilter) -> Result<()> {
+    let mut missing = Vec::new();
+    if filter.user_id.as_deref().is_none_or(str::is_empty) {
+        missing.push("user_id");
+    }
+    if filter.scope_id.as_deref().is_none_or(str::is_empty) {
+        missing.push("scope_id");
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Error::validation(format!(
+        "message history requires an explicit tenant scope: filter.{} is missing \
+         (build the filter with MemoryFilter::for_scope)",
+        missing.join(" and filter.")
+    )))
+}
+
+/// Builds the document filter of one scoped message delete.
+///
+/// The validated `user_id`/`scope_id` are written into the filter unconditionally, so the
+/// scope clauses are always part of the delete no matter what the caller's filter carries.
+fn delete_filter(filter: &MemoryFilter) -> Result<Value> {
+    require_message_scope(filter)?;
+    let mut clauses = match message_filter(filter) {
+        Value::Object(clauses) => clauses,
+        _ => Map::new(),
+    };
+    if let Some(user_id) = &filter.user_id {
+        clauses.insert(FIELD_USER_ID.to_owned(), Value::String(user_id.clone()));
+    }
+    if let Some(scope_id) = &filter.scope_id {
+        clauses.insert(FIELD_SCOPE_ID.to_owned(), Value::String(scope_id.clone()));
+    }
+    Ok(Value::Object(clauses))
+}
+
+/// The fields [`derived_message_id`] hashes into a message id.
+///
+/// The scope parts make the id tenant-unique, and `ordinal` disambiguates identical turns
+/// of one batch (which shares a single [`DateTime`]).
+pub(crate) struct DerivedMessageId<'a> {
+    /// Owning user id.
+    pub user_id: &'a str,
+    /// Owning scope id.
+    pub scope_id: &'a str,
+    /// Session id, when the scope is session-bound.
+    pub session_id: Option<&'a str>,
+    /// Plain-text content.
+    pub content: &'a str,
+    /// Author role as its wire string.
+    pub role: &'a str,
+    /// The batch timestamp.
+    pub timestamp: DateTime<Utc>,
+    /// The row's position in the appended batch.
+    pub ordinal: usize,
+}
+
+/// The deterministic id of one message:
+/// `msg_{fnv64(scope + role + millis + ordinal + content):016x}_{millis}`.
 ///
 /// The derivation is public to the crate so a legacy-row import and [`MessageStore::append`]
-/// can never drift apart: the same content, wire role, and millisecond always yield the same
-/// id, which is what makes re-appending replace the existing row.
-pub(crate) fn derived_message_id(content: &str, role: &str, timestamp: DateTime<Utc>) -> String {
-    let millis = timestamp.timestamp_millis();
-    let digest = fnv1a_64(format!("{content}{role}{millis}").as_bytes());
+/// can never drift apart: the same scope, content, wire role, millisecond, and batch
+/// position always yield the same id, which is what makes re-appending replace the existing
+/// row. The scope is part of the preimage because the document collection is shared by every
+/// tenant: without it the same text in two scopes would collapse into one row.
+pub(crate) fn derived_message_id(fields: DerivedMessageId<'_>) -> String {
+    let millis = fields.timestamp.timestamp_millis();
+    // A unit separator keeps the parts unambiguous: no id, role, or content can forge the
+    // boundary between two neighbouring fields.
+    let preimage = format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{millis}\u{1f}{}\u{1f}{}",
+        fields.user_id,
+        fields.scope_id,
+        fields.session_id.unwrap_or_default(),
+        fields.role,
+        fields.ordinal,
+        fields.content
+    );
+    let digest = fnv1a_64(preimage.as_bytes());
     format!("msg_{digest:016x}_{millis}")
 }
 
@@ -369,14 +487,161 @@ mod tests {
 
     #[test]
     fn message_ids_are_deterministic_and_content_specific() {
-        let first = derived_message_id("hello", "user", time(0));
-        assert_eq!(first, derived_message_id("hello", "user", time(0)));
-        assert_ne!(first, derived_message_id("hello", "assistant", time(0)));
-        assert_ne!(first, derived_message_id("other", "user", time(0)));
-        assert_ne!(first, derived_message_id("hello", "user", time(1)));
+        fn id(
+            user_id: &str,
+            scope_id: &str,
+            session_id: &str,
+            content: &str,
+            role: &str,
+            ordinal: usize,
+            timestamp: DateTime<Utc>,
+        ) -> String {
+            derived_message_id(DerivedMessageId {
+                user_id,
+                scope_id,
+                session_id: Some(session_id),
+                content,
+                role,
+                timestamp,
+                ordinal,
+            })
+        }
+        let first = id("alice", "ws", "s1", "hello", "user", 0, time(0));
+        assert_eq!(first, id("alice", "ws", "s1", "hello", "user", 0, time(0)));
+        assert_ne!(
+            first,
+            id("alice", "ws", "s1", "hello", "assistant", 0, time(0))
+        );
+        assert_ne!(first, id("alice", "ws", "s1", "other", "user", 0, time(0)));
+        assert_ne!(
+            first,
+            id("alice", "ws", "s1", "hello", "user", 1, time(0)),
+            "a batch ordinal is part of the id"
+        );
+        assert_ne!(
+            first,
+            id("alice", "ws", "s1", "hello", "user", 0, time(1)),
+            "the millisecond is part of the id"
+        );
+        assert_ne!(
+            first,
+            id("bob", "ws", "s1", "hello", "user", 0, time(0)),
+            "the owning user is part of the id"
+        );
+        assert_ne!(
+            first,
+            id("alice", "other", "s1", "hello", "user", 0, time(0)),
+            "the scope is part of the id"
+        );
+        assert_ne!(
+            first,
+            id("alice", "ws", "s2", "hello", "user", 0, time(0)),
+            "the session is part of the id"
+        );
+        assert_ne!(
+            first,
+            derived_message_id(DerivedMessageId {
+                user_id: "alice",
+                scope_id: "ws",
+                session_id: None,
+                content: "hello",
+                role: "user",
+                timestamp: time(0),
+                ordinal: 0,
+            }),
+            "a session-free row is not a session-bound one"
+        );
         assert!(first.starts_with("msg_"));
         let (_, suffix) = first.rsplit_once('_').expect("millis suffix");
         assert_eq!(suffix, time(0).timestamp_millis().to_string());
+        let (hash, _) = first
+            .strip_prefix("msg_")
+            .and_then(|rest| rest.split_once('_'))
+            .expect("hash segment");
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn a_batch_of_identical_messages_keeps_every_row() {
+        let store = store();
+        let scope = scope();
+        let stored = store
+            .append(
+                &scope,
+                &[
+                    BaseMessage::user("same text"),
+                    BaseMessage::user("same text"),
+                ],
+                time(0),
+            )
+            .await
+            .expect("append");
+        assert_eq!(stored.len(), 2);
+        assert_ne!(stored[0].id, stored[1].id, "one batch, two rows");
+        let history = store.recent(&scope, 10).await.expect("recent");
+        assert_eq!(
+            history
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            ["same text", "same text"],
+            "both rows are readable"
+        );
+        let mut expected: Vec<String> = stored.iter().map(|message| message.id.clone()).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            history
+                .iter()
+                .map(|message| message.id.clone())
+                .collect::<Vec<_>>(),
+            expected,
+            "both rows share one timestamp and paginate in ascending id order"
+        );
+        // Re-appending the identical batch replaces its own rows instead of adding more.
+        let again = store
+            .append(
+                &scope,
+                &[
+                    BaseMessage::user("same text"),
+                    BaseMessage::user("same text"),
+                ],
+                time(0),
+            )
+            .await
+            .expect("re-append");
+        assert_eq!(
+            again.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            stored.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(store.recent(&scope, 10).await.expect("recent").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_same_text_in_two_scopes_stays_two_rows() {
+        let store = store();
+        let alice = MemoryScope::new("alice", "ws").session("s1");
+        let bob = MemoryScope::new("bob", "ws").session("s1");
+        let other_session = MemoryScope::new("alice", "ws").session("s2");
+        for scope in [&alice, &bob, &other_session] {
+            store
+                .append(scope, &[BaseMessage::user("hello")], time(0))
+                .await
+                .expect("append");
+        }
+        let mut ids: Vec<String> = Vec::new();
+        for scope in [&alice, &bob, &other_session] {
+            let history = store.recent(scope, 10).await.expect("recent");
+            assert_eq!(history.len(), 1, "each scope owns exactly its own row");
+            assert_eq!(history[0].content, "hello");
+            assert_eq!(history[0].user_id, scope.user_id);
+            assert_eq!(history[0].scope_id, scope.scope_id);
+            assert_eq!(history[0].session_id, scope.session_id);
+            ids.push(history[0].id.clone());
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "no two scopes share a row");
     }
 
     #[tokio::test]
@@ -404,11 +669,27 @@ mod tests {
         assert_eq!(stored[1].role, "assistant");
         assert_eq!(
             stored[0].id,
-            derived_message_id("rules", "system", timestamp)
+            derived_message_id(DerivedMessageId {
+                user_id: "alice",
+                scope_id: "ws",
+                session_id: Some("s1"),
+                content: "rules",
+                role: "system",
+                timestamp,
+                ordinal: 0,
+            })
         );
         assert_eq!(
             stored[1].id,
-            derived_message_id("answer", "assistant", timestamp)
+            derived_message_id(DerivedMessageId {
+                user_id: "alice",
+                scope_id: "ws",
+                session_id: Some("s1"),
+                content: "answer",
+                role: "assistant",
+                timestamp,
+                ordinal: 1,
+            })
         );
         let document = store
             .document
@@ -458,6 +739,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recent_is_the_tail_of_the_page_order_within_one_batch() {
+        let store = store();
+        let scope = scope();
+        // One append stamps the whole batch with the same timestamp, so only the id
+        // tie-break can order these rows.
+        let batch: Vec<BaseMessage> = (0..5)
+            .map(|index| BaseMessage::user(format!("row {index}")))
+            .collect();
+        let stored = store.append(&scope, &batch, time(0)).await.expect("append");
+        let mut expected: Vec<String> = stored.iter().map(|message| message.id.clone()).collect();
+        expected.sort_unstable();
+
+        // `page` defines the total order (timestamp, then id ascending).
+        let mut paged = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = store
+                .page(&scope, 2, cursor.as_deref(), None)
+                .await
+                .expect("page");
+            paged.extend(page.items.into_iter().map(|message| message.id));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(paged, expected, "the page order is (timestamp, id)");
+
+        // `recent(n)` is always the tail of that order, never an arbitrary subset.
+        for limit in 1..=expected.len() {
+            let recent = store.recent(&scope, limit).await.expect("recent");
+            let ids: Vec<String> = recent.into_iter().map(|message| message.id).collect();
+            assert_eq!(
+                ids,
+                expected[expected.len() - limit..],
+                "recent({limit}) is the tail of the page order"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn recent_filters_by_session() {
         let store = store();
         let first = MemoryScope::new("alice", "ws").session("s1");
@@ -487,7 +809,7 @@ mod tests {
         let scope = scope();
         let first = append_user(&store, &scope, "keep", 0).await;
         append_user(&store, &scope, "drop", 1).await;
-        let mut by_id = MemoryFilter::new();
+        let mut by_id = MemoryFilter::for_scope(&scope);
         by_id.ids = vec![first.id.clone()];
         assert_eq!(store.delete_for(&by_id).await.expect("delete id"), 1);
         assert_eq!(store.recent(&scope, 1_000).await.expect("recent").len(), 1);
@@ -506,6 +828,72 @@ mod tests {
             1
         );
         assert_eq!(store.recent(&scope, 1_000).await.expect("recent").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_for_never_reaches_another_tenant() {
+        let store = store();
+        let alice = scope();
+        let bob = MemoryScope::new("bob", "ws").session("s1");
+        append_user(&store, &alice, "alice one", 0).await;
+        append_user(&store, &alice, "alice two", 1).await;
+        append_user(&store, &bob, "bob one", 0).await;
+        assert_eq!(
+            store
+                .delete_for(&MemoryFilter::for_scope(&alice))
+                .await
+                .expect("delete alice"),
+            2
+        );
+        assert!(store.recent(&alice, 10).await.expect("alice").is_empty());
+        let bob_history = store.recent(&bob, 10).await.expect("bob");
+        assert_eq!(bob_history.len(), 1, "bob's history is untouched");
+        assert_eq!(bob_history[0].content, "bob one");
+    }
+
+    #[tokio::test]
+    async fn delete_for_without_a_scope_is_a_validation_error() {
+        let store = store();
+        let alice = scope();
+        let bob = MemoryScope::new("bob", "ws").session("s1");
+        append_user(&store, &alice, "alice one", 0).await;
+        append_user(&store, &bob, "bob one", 0).await;
+        for filter in [
+            MemoryFilter::new(),
+            MemoryFilter {
+                user_id: Some("alice".to_owned()),
+                ..MemoryFilter::default()
+            },
+            MemoryFilter {
+                scope_id: Some("ws".to_owned()),
+                ..MemoryFilter::default()
+            },
+            MemoryFilter {
+                user_id: Some("alice".to_owned()),
+                scope_id: Some(String::new()),
+                ..MemoryFilter::default()
+            },
+        ] {
+            let error = store
+                .delete_for(&filter)
+                .await
+                .expect_err("an unscoped delete is refused");
+            assert!(matches!(error, Error::Validation(_)), "{error:?}");
+        }
+        assert_eq!(store.recent(&alice, 10).await.expect("alice").len(), 1);
+        assert_eq!(store.recent(&bob, 10).await.expect("bob").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_for_rejects_a_missing_field_naming_it() {
+        let store = store();
+        let error = store
+            .delete_for(&MemoryFilter::new())
+            .await
+            .expect_err("unscoped");
+        let message = error.to_string();
+        assert!(message.contains("user_id"), "{message}");
+        assert!(message.contains("scope_id"), "{message}");
     }
 
     #[tokio::test]
@@ -581,7 +969,18 @@ mod tests {
         let history = store.recent(&scope, 10).await.expect("recent");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].content, "hello");
-        assert_eq!(history[0].id, derived_message_id("hello", "user", time(0)));
+        assert_eq!(
+            history[0].id,
+            derived_message_id(DerivedMessageId {
+                user_id: "alice",
+                scope_id: "ws",
+                session_id: Some("s1"),
+                content: "hello",
+                role: "user",
+                timestamp: time(0),
+                ordinal: 0,
+            })
+        );
         assert_eq!(
             store
                 .delete_for(&MemoryFilter::for_scope(&scope))

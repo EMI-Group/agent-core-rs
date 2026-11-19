@@ -51,7 +51,7 @@ use openjiuwen_common::error::Result;
 use openjiuwen_common::security::REDACTED;
 
 use crate::guardrail::{Guardrail, DEFAULT_PRIORITY};
-use crate::rules::{find_all, luhn_valid, redact_ranges, CompiledRule};
+use crate::rules::{find_all, luhn_valid, redact_ranges, CompiledRule, RangeClaims};
 use crate::{GuardrailContext, GuardrailResult, RiskLevel, ScanStage};
 
 /// Stable guardrail name, mirrored in findings and logs.
@@ -371,9 +371,12 @@ impl SensitiveDataGuardrail {
     /// when it overlaps a range an earlier pattern already claimed. The result's
     /// `redacted` field equals `text` and `matches` is empty when nothing
     /// matched.
+    ///
+    /// Claims live in an ordered `RangeClaims` map, so thousands of matches cost
+    /// `O(m log m)` overlap tests instead of `O(m²)`.
     #[must_use]
     pub fn redact_text(&self, text: &str) -> RedactionOutcome {
-        let mut claimed: Vec<(usize, usize)> = Vec::new();
+        let mut claimed = RangeClaims::new();
         let mut matches = Vec::new();
         for pattern in &self.patterns {
             let rules = std::slice::from_ref(&pattern.rule);
@@ -387,13 +390,9 @@ impl SensitiveDataGuardrail {
                 if self.config.allowlist.iter().any(|entry| entry == token) {
                     continue;
                 }
-                let overlaps = claimed
-                    .iter()
-                    .any(|&(start, end)| found.start < end && start < found.end);
-                if overlaps {
+                if !claimed.try_claim((found.start, found.end)) {
                     continue;
                 }
-                claimed.push((found.start, found.end));
                 matches.push(SensitiveMatch {
                     pattern: pattern.rule.name.clone(),
                     risk_level: pattern.risk_level,
@@ -403,7 +402,7 @@ impl SensitiveDataGuardrail {
             }
         }
         RedactionOutcome {
-            redacted: redact_ranges(text, &claimed, &self.config.marker),
+            redacted: redact_ranges(text, &claimed.ranges(), &self.config.marker),
             matches,
         }
     }

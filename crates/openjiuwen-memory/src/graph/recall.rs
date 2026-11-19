@@ -14,13 +14,14 @@
 
 use std::collections::HashSet;
 
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::store::{Direction, GraphStore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::entity::Entity;
 use crate::recall::{keyword_score, normalized_similarity};
+use crate::record::CallOptions;
 
 /// Weight of the embedding similarity in [`seed_score`].
 const SIMILARITY_WEIGHT: f32 = 0.7;
@@ -28,6 +29,18 @@ const SIMILARITY_WEIGHT: f32 = 0.7;
 const KEYWORD_WEIGHT: f32 = 0.3;
 /// Score factor applied per expansion hop (`0.5^depth`).
 const HOP_ATTENUATION: f32 = 0.5;
+/// Maximum number of [`GraphStore::neighbors`] queries one expansion may issue.
+///
+/// The frontier can grow by `max_neighbors` per parent each round, so even clamped knobs
+/// describe a walk that is large on a dense graph. Reaching this many queries means the
+/// requested search cannot be answered completely, and [`expand`] returns
+/// [`Error::Graph`] instead of a truncated hit list that would look complete.
+pub const EXPANSION_QUERY_BUDGET: usize = 1_024;
+/// Maximum number of entities one expansion may add to its result.
+///
+/// See [`EXPANSION_QUERY_BUDGET`]: exceeding either budget is reported, never silently
+/// truncated.
+pub const EXPANSION_NODE_BUDGET: usize = 4_096;
 
 /// One recalled entity with its score and graph distance from the closest seed.
 ///
@@ -112,13 +125,54 @@ pub fn sort_hits(hits: &mut Vec<GraphRecallHit>) {
     });
 }
 
+/// The bounds of one neighbor expansion.
+///
+/// `max_depth` and `max_neighbors` are the knobs
+/// [`GraphMemory::search`](super::GraphMemory::search) resolves from the per-call options
+/// clamped to the validated bounds; `max_queries` and `max_nodes` are the total budget of
+/// the walk, so a dense graph fails loudly instead of expanding without bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpansionLimits {
+    /// Rounds of breadth-first expansion (`0` returns the sorted seeds).
+    pub max_depth: usize,
+    /// Neighbors kept per parent entity (first `max_neighbors` in
+    /// [`GraphStore::neighbors`] order); `0` returns the sorted seeds.
+    pub max_neighbors: usize,
+    /// Maximum number of `GraphStore::neighbors` queries the walk may issue.
+    pub max_queries: usize,
+    /// Maximum number of entities the walk may add to its result.
+    pub max_nodes: usize,
+}
+
+impl ExpansionLimits {
+    /// Builds the documented limits for `max_depth`/`max_neighbors` with the default total
+    /// budgets ([`EXPANSION_QUERY_BUDGET`], [`EXPANSION_NODE_BUDGET`]).
+    #[must_use]
+    pub fn new(max_depth: usize, max_neighbors: usize) -> Self {
+        Self {
+            max_depth,
+            max_neighbors,
+            max_queries: EXPANSION_QUERY_BUDGET,
+            max_nodes: EXPANSION_NODE_BUDGET,
+        }
+    }
+}
+
+impl Default for ExpansionLimits {
+    /// Returns the seeds-only limits (`0`/`0`) with the default total budgets.
+    fn default() -> Self {
+        Self::new(0, 0)
+    }
+}
+
 /// Expands `seeds` with their graph neighbors, breadth-first.
 ///
-/// Every round `d` in `1..=max_depth` visits each hit of the previous frontier (sorted
-/// by [`sort_hits`]), follows all of its edges
+/// Every round `d` in `1..=limits.max_depth` visits each hit of the previous frontier
+/// (sorted by [`sort_hits`]), follows all of its edges
 /// ([`GraphStore::neighbors`] with [`Direction::Both`], so an entity can be reached
-/// through an incoming or an outgoing relation), and keeps the first `max_neighbors`
-/// not-yet-visited neighbors per parent. A neighbor's score is
+/// through an incoming or an outgoing relation), and keeps the first
+/// `limits.max_neighbors` not-yet-visited neighbors per parent, in the store's own
+/// neighbor order, so the cap is deterministic. A neighbor's score is
 /// `parent.score * 0.5^d` and its depth is `d`; nodes that do not convert to an
 /// [`Entity`] (relation mirror nodes, foreign nodes) are skipped silently.
 ///
@@ -126,11 +180,24 @@ pub fn sort_hits(hits: &mut Vec<GraphRecallHit>) {
 /// (a hit is only added the first time it is reached, at the shallowest depth), and the
 /// returned vector is sorted by [`sort_hits`]. `max_depth == 0` or `max_neighbors == 0`
 /// therefore returns exactly the sorted seeds.
+///
+/// The walk is bounded by [`ExpansionLimits::max_queries`] and
+/// [`ExpansionLimits::max_nodes`]; `call` is checked before every store query, so a
+/// cancelled search stops between two queries rather than finishing the walk.
+///
+/// # Errors
+///
+/// Returns [`Error::Cancelled`] when `call` has been triggered, [`Error::Graph`] when the
+/// walk would exceed its query or node budget (never a truncated result), and the store
+/// error kind when a neighbor query fails.
+///
+/// [`Error::Cancelled`]: openjiuwen_common::error::Error::Cancelled
+/// [`Error::Graph`]: openjiuwen_common::error::Error::Graph
 pub async fn expand(
     store: &dyn GraphStore,
     seeds: Vec<GraphRecallHit>,
-    max_depth: usize,
-    max_neighbors: usize,
+    limits: &ExpansionLimits,
+    call: &CallOptions,
 ) -> Result<Vec<GraphRecallHit>> {
     let mut visited: HashSet<String> = seeds
         .iter()
@@ -138,24 +205,31 @@ pub async fn expand(
         .collect::<HashSet<_>>();
     let mut result = seeds;
     sort_hits(&mut result);
-    if max_depth == 0 || max_neighbors == 0 {
+    if limits.max_depth == 0 || limits.max_neighbors == 0 {
         return Ok(result);
     }
     let mut frontier = result.clone();
     let mut depth = 0;
-    while depth < max_depth && !frontier.is_empty() {
+    let mut queries = 0usize;
+    let mut nodes = 0usize;
+    while depth < limits.max_depth && !frontier.is_empty() {
         depth += 1;
         // `0.5^depth`, without a lossy `usize as i32` cast.
         let attenuation = HOP_ATTENUATION.powi(i32::try_from(depth).unwrap_or(i32::MAX));
         sort_hits(&mut frontier);
         let mut next_frontier = Vec::new();
         for parent in &frontier {
+            call.check()?;
+            if queries >= limits.max_queries {
+                return Err(budget_exceeded(limits, queries, nodes));
+            }
+            queries += 1;
             let neighbors = store
                 .neighbors(&parent.entity.id, Direction::Both, None)
                 .await?;
             let mut taken = 0;
             for node in neighbors {
-                if taken >= max_neighbors {
+                if taken >= limits.max_neighbors {
                     break;
                 }
                 let Some(entity) = Entity::from_node(&node) else {
@@ -164,7 +238,11 @@ pub async fn expand(
                 if !visited.insert(entity.id.clone()) {
                     continue;
                 }
+                if nodes >= limits.max_nodes {
+                    return Err(budget_exceeded(limits, queries, nodes));
+                }
                 taken += 1;
+                nodes += 1;
                 let hit = GraphRecallHit {
                     entity,
                     score: parent.score * attenuation,
@@ -178,6 +256,15 @@ pub async fn expand(
     }
     sort_hits(&mut result);
     Ok(result)
+}
+
+/// The typed error of a walk that would exceed its budget.
+fn budget_exceeded(limits: &ExpansionLimits, queries: usize, nodes: usize) -> Error {
+    Error::graph(format!(
+        "graph expansion exceeded its budget (max_queries={}, max_nodes={} after {queries} \
+         queries and {nodes} nodes; max_depth={}, max_neighbors={}); narrow the search",
+        limits.max_queries, limits.max_nodes, limits.max_depth, limits.max_neighbors
+    ))
 }
 
 #[cfg(test)]
@@ -309,7 +396,14 @@ mod tests {
     async fn expand_orders_the_seed_before_its_neighbors() {
         let store = connected_store().await;
         let seed = hit(entity("Alice"), 0.8, 0);
-        let hits = expand(&store, vec![seed], 2, 4).await.expect("expand");
+        let hits = expand(
+            &store,
+            vec![seed],
+            &ExpansionLimits::new(2, 4),
+            &CallOptions::default(),
+        )
+        .await
+        .expect("expand");
 
         let order: Vec<&str> = hits.iter().map(|hit| hit.entity.name.as_str()).collect();
         assert_eq!(order, vec!["Alice", "Acme", "Bob"]);
@@ -321,9 +415,14 @@ mod tests {
     #[tokio::test]
     async fn expand_attenuates_the_score_by_half_per_depth() {
         let store = connected_store().await;
-        let hits = expand(&store, vec![hit(entity("Alice"), 0.8, 0)], 2, 4)
-            .await
-            .expect("expand");
+        let hits = expand(
+            &store,
+            vec![hit(entity("Alice"), 0.8, 0)],
+            &ExpansionLimits::new(2, 4),
+            &CallOptions::default(),
+        )
+        .await
+        .expect("expand");
         let score_of = |name: &str| {
             hits.iter()
                 .find(|hit| hit.entity.name == name)
@@ -339,9 +438,14 @@ mod tests {
     #[tokio::test]
     async fn expand_reaches_both_edge_directions() {
         let store = connected_store().await;
-        let hits = expand(&store, vec![hit(entity("Bob"), 0.6, 0)], 1, 4)
-            .await
-            .expect("expand");
+        let hits = expand(
+            &store,
+            vec![hit(entity("Bob"), 0.6, 0)],
+            &ExpansionLimits::new(1, 4),
+            &CallOptions::default(),
+        )
+        .await
+        .expect("expand");
         let names: Vec<&str> = hits.iter().map(|hit| hit.entity.name.as_str()).collect();
         assert_eq!(names, vec!["Bob", "Acme"]);
     }
@@ -350,7 +454,14 @@ mod tests {
     async fn expand_with_zero_depth_returns_sorted_seeds() {
         let store = connected_store().await;
         let seeds = vec![hit(entity("Bob"), 0.2, 0), hit(entity("Alice"), 0.9, 0)];
-        let hits = expand(&store, seeds, 0, 4).await.expect("expand");
+        let hits = expand(
+            &store,
+            seeds,
+            &ExpansionLimits::new(0, 4),
+            &CallOptions::default(),
+        )
+        .await
+        .expect("expand");
         let names: Vec<&str> = hits.iter().map(|hit| hit.entity.name.as_str()).collect();
         assert_eq!(names, vec!["Alice", "Bob"]);
     }
@@ -358,9 +469,14 @@ mod tests {
     #[tokio::test]
     async fn expand_with_zero_neighbors_returns_the_seeds_only() {
         let store = connected_store().await;
-        let hits = expand(&store, vec![hit(entity("Alice"), 0.8, 0)], 3, 0)
-            .await
-            .expect("expand");
+        let hits = expand(
+            &store,
+            vec![hit(entity("Alice"), 0.8, 0)],
+            &ExpansionLimits::new(3, 0),
+            &CallOptions::default(),
+        )
+        .await
+        .expect("expand");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entity.name, "Alice");
     }
@@ -369,7 +485,14 @@ mod tests {
     async fn expand_never_duplicates_a_hit() {
         let store = connected_store().await;
         let seeds = vec![hit(entity("Alice"), 0.8, 0), hit(entity("Acme"), 0.7, 0)];
-        let hits = expand(&store, seeds, 2, 4).await.expect("expand");
+        let hits = expand(
+            &store,
+            seeds,
+            &ExpansionLimits::new(2, 4),
+            &CallOptions::default(),
+        )
+        .await
+        .expect("expand");
         let ids: HashSet<&str> = hits.iter().map(|hit| hit.entity.id.as_str()).collect();
         assert_eq!(ids.len(), hits.len());
         assert_eq!(hits.len(), 3);
@@ -392,9 +515,14 @@ mod tests {
     async fn expand_caps_neighbors_per_parent() {
         let store = connected_store().await;
         // "Acme" neighbours are Alice and Bob, sorted by id: acme -> alice, bob.
-        let hits = expand(&store, vec![hit(entity("Acme"), 0.5, 0)], 1, 1)
-            .await
-            .expect("expand");
+        let hits = expand(
+            &store,
+            vec![hit(entity("Acme"), 0.5, 0)],
+            &ExpansionLimits::new(1, 1),
+            &CallOptions::default(),
+        )
+        .await
+        .expect("expand");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[1].entity.name, "Alice");
     }
@@ -413,12 +541,93 @@ mod tests {
             .await
             .expect("relation");
 
-        let hits = expand(&store, vec![hit(entity("Alice"), 0.8, 0)], 2, 8)
-            .await
-            .expect("expand");
+        let hits = expand(
+            &store,
+            vec![hit(entity("Alice"), 0.8, 0)],
+            &ExpansionLimits::new(2, 8),
+            &CallOptions::default(),
+        )
+        .await
+        .expect("expand");
         assert!(hits.iter().all(|hit| hit.entity.scope.scope_id == "ws"));
         assert!(hits.iter().all(|hit| hit.entity.name != "Zed"));
         let ids: HashSet<&str> = hits.iter().map(|hit| hit.entity.id.as_str()).collect();
         assert_eq!(ids.len(), hits.len());
+    }
+
+    #[tokio::test]
+    async fn expand_stops_with_a_typed_error_when_the_query_budget_is_exhausted() {
+        let store = connected_store().await;
+        // Alice -> Acme -> Bob: round one needs one query, round two needs a second, and a
+        // one-query budget can therefore not answer the request completely.
+        let limits = ExpansionLimits {
+            max_depth: 3,
+            max_neighbors: 4,
+            max_queries: 1,
+            max_nodes: 100,
+        };
+        let error = expand(
+            &store,
+            vec![hit(entity("Alice"), 0.8, 0)],
+            &limits,
+            &CallOptions::default(),
+        )
+        .await
+        .expect_err("the walk cannot complete within its budget");
+        assert!(matches!(error, Error::Graph(_)), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains("max_queries=1"), "{message}");
+        assert!(message.contains("max_depth=3"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn expand_stops_with_a_typed_error_when_the_node_budget_is_exhausted() {
+        let store = connected_store().await;
+        // Acme has two neighbors (Alice and Bob); a one-node budget cannot keep both.
+        let limits = ExpansionLimits {
+            max_depth: 1,
+            max_neighbors: 4,
+            max_queries: 10,
+            max_nodes: 1,
+        };
+        let error = expand(
+            &store,
+            vec![hit(entity("Acme"), 0.5, 0)],
+            &limits,
+            &CallOptions::default(),
+        )
+        .await
+        .expect_err("the walk cannot complete within its budget");
+        assert!(matches!(error, Error::Graph(_)), "{error:?}");
+        assert!(error.to_string().contains("max_nodes=1"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn expand_stops_when_the_call_is_cancelled() {
+        let store = connected_store().await;
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let call = CallOptions::default().with_cancellation(token);
+        let error = expand(
+            &store,
+            vec![hit(entity("Alice"), 0.8, 0)],
+            &ExpansionLimits::new(3, 8),
+            &call,
+        )
+        .await
+        .expect_err("a cancelled expansion stops");
+        assert!(matches!(error, Error::Cancelled), "{error:?}");
+
+        // The same walk completes with a live token, so the cancelled case is not
+        // failing for an unrelated reason.
+        let hits = expand(
+            &store,
+            vec![hit(entity("Alice"), 0.8, 0)],
+            &ExpansionLimits::new(3, 8),
+            &CallOptions::default(),
+        )
+        .await
+        .expect("uncancelled");
+        assert_eq!(hits.len(), 3);
     }
 }

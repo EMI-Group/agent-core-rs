@@ -66,6 +66,7 @@ use openjiuwen_retrieval::embedding::Embedding;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::graph::{MAX_SEARCH_DEPTH, MAX_SEARCH_NEIGHBORS};
 use crate::config::GraphMemoryConfig;
 use crate::record::{CallOptions, MemoryScope, RecallHit};
 
@@ -125,19 +126,23 @@ impl fmt::Debug for GraphAddOptions {
 /// The zero values defer to the instance's [`GraphMemoryConfig`]: `top_k == 0` means
 /// every qualifying seed, `threshold == 0.0` means [`GraphMemoryConfig::min_score`],
 /// `max_depth == 0` means [`GraphMemoryConfig::max_depth`], and `max_neighbors == 0`
-/// means [`GraphMemoryConfig::max_neighbors`]. `include_relations` defaults to `true`,
-/// so a default search expands the seeds to their graph neighbors; set it to `false`
-/// to return the scored seeds only.
+/// means [`GraphMemoryConfig::max_neighbors`]. A positive `max_depth`/`max_neighbors` is
+/// clamped to the validated bounds ([`MAX_SEARCH_DEPTH`], [`MAX_SEARCH_NEIGHBORS`]), so a
+/// call may narrow a setting or widen it within those bounds but never request an
+/// unbounded walk. `include_relations` defaults to `true`, so a default search expands
+/// the seeds to their graph neighbors; set it to `false` to return the scored seeds only.
 #[derive(Debug, Clone)]
 pub struct GraphSearchOptions {
     /// Maximum number of scored seeds; `0` keeps every seed above the threshold.
     pub top_k: usize,
     /// Minimum seed score in `0.0..=1.0`; `0.0` uses [`GraphMemoryConfig::min_score`].
     pub threshold: f32,
-    /// Expansion depth from the seeds; `0` uses [`GraphMemoryConfig::max_depth`].
+    /// Expansion depth from the seeds; `0` uses [`GraphMemoryConfig::max_depth`] and a
+    /// positive value is clamped to [`MAX_SEARCH_DEPTH`].
     pub max_depth: usize,
     /// Neighbors expanded per seed entity; `0` uses
-    /// [`GraphMemoryConfig::max_neighbors`].
+    /// [`GraphMemoryConfig::max_neighbors`] and a positive value is clamped to
+    /// [`MAX_SEARCH_NEIGHBORS`].
     pub max_neighbors: usize,
     /// Whether the seeds are expanded to their neighbors (`true` by default).
     pub include_relations: bool,
@@ -442,20 +447,28 @@ impl GraphMemory {
     ///
     /// Knob resolution: a positive `threshold` is clamped to `0.0..=1.0`, otherwise
     /// [`GraphMemoryConfig::min_score`] applies; `max_depth == 0` and
-    /// `max_neighbors == 0` fall back to the graph config. `top_k == 0` keeps every
-    /// seed above the threshold; a positive `top_k` also bounds the candidate scan to
-    /// `top_k * 8` (at least `16`) entities so a large graph is not fully loaded.
+    /// `max_neighbors == 0` fall back to the graph config, and a positive per-call value
+    /// is clamped to the validated bounds — [`MAX_SEARCH_DEPTH`] and
+    /// [`MAX_SEARCH_NEIGHBORS`] — so one call can neither walk deeper than
+    /// `GraphMemoryConfig::validate` allows nor read thousands of edges per entity.
+    /// `top_k == 0` keeps every seed above the threshold; a positive `top_k` also bounds
+    /// the candidate scan to `top_k * 8` (at least `16`) entities so a large graph is not
+    /// fully loaded.
     ///
     /// Seeds are scored with [`recall::seed_score`] (query similarity when an embedder
     /// is attached, plus keyword coverage), sorted by score, and truncated to `top_k`.
     /// With [`GraphSearchOptions::include_relations`] they are then expanded
-    /// breadth-first by [`recall::expand`]; otherwise the seeds are returned as is.
+    /// breadth-first by [`recall::expand`], which is bounded by
+    /// [`recall::EXPANSION_QUERY_BUDGET`]/[`recall::EXPANSION_NODE_BUDGET`]; otherwise
+    /// the seeds are returned as is.
     ///
     /// # Errors
     ///
     /// Returns `Error::Validation` for an invalid scope or blank `query`,
     /// `Error::Cancelled` when the options' token has been triggered (or fires during
-    /// the query embedding), and the store/embedding error kind otherwise.
+    /// the query embedding or between two expansion queries), `Error::Graph` when the
+    /// expansion cannot complete within its budget, and the store/embedding error kind
+    /// otherwise.
     pub async fn search(
         &self,
         scope: &MemoryScope,
@@ -474,15 +487,19 @@ impl GraphMemory {
         } else {
             self.config.min_score
         };
+        // A per-call knob narrows the validated bounds and never widens them: the config's
+        // own `max_depth` is already `<= MAX_SEARCH_DEPTH` (`GraphMemoryConfig::validate`),
+        // while `max_neighbors` only has to be positive there, so the absolute ceiling
+        // applies to it.
         let max_depth = if options.max_depth == 0 {
-            self.config.max_depth
+            self.config.max_depth.min(MAX_SEARCH_DEPTH)
         } else {
-            options.max_depth
+            options.max_depth.min(MAX_SEARCH_DEPTH)
         };
         let max_neighbors = if options.max_neighbors == 0 {
-            self.config.max_neighbors
+            self.config.max_neighbors.min(MAX_SEARCH_NEIGHBORS)
         } else {
-            options.max_neighbors
+            options.max_neighbors.min(MAX_SEARCH_NEIGHBORS)
         };
         let top_k = options.top_k;
         let limit = if top_k == 0 {
@@ -513,7 +530,8 @@ impl GraphMemory {
             seeds.truncate(top_k);
         }
         if options.include_relations && max_depth > 0 && max_neighbors > 0 {
-            return recall::expand(self.store.as_ref(), seeds, max_depth, max_neighbors).await;
+            let limits = recall::ExpansionLimits::new(max_depth, max_neighbors);
+            return recall::expand(self.store.as_ref(), seeds, &limits, &options.call).await;
         }
         Ok(seeds)
     }

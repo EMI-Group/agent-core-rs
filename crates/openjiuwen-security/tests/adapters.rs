@@ -31,9 +31,10 @@ use openjiuwen_security::backends::vendors::openai::{
     OpenAiModerationBackend, OpenAiModerationConfig, NAME as OPENAI,
 };
 use openjiuwen_security::{
-    ApiModelBackend, ApiModelBackendConfig, BackendGuardrail, FailurePolicy, GuardrailBackend,
-    GuardrailContext, GuardrailOutcome, GuardrailPipeline, RiskLevel, ScanStage, SecurityDecision,
-    SecurityPolicy,
+    ApiModelBackend, ApiModelBackendConfig, BackendGuardrail, ContentRule, ContentRuleGuardrail,
+    FailurePolicy, Guardrail, GuardrailBackend, GuardrailContentType, GuardrailContext,
+    GuardrailOutcome, GuardrailPipeline, PromptInjectionGuardrail, RiskLevel, ScanStage,
+    SecurityDecision, SecurityPolicy, SensitiveDataGuardrail, ToolArgumentGuardrail,
 };
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
@@ -782,5 +783,193 @@ async fn generic_json_non_object_reply_blocks_instead_of_reading_as_safe() {
         server.received_requests().await.unwrap().len(),
         1,
         "a bad 2xx body is never retried"
+    );
+}
+
+// --- unscannable payloads (fail-open regression) ----------------------------
+
+// No Python equivalent: Python's vendor adapters projected the payload with an
+// unchecked total projection, so a payload no detector could read was posted as
+// its compact JSON and graded safe. Every adapter now uses the same checked
+// projection as the local detectors, so an unscannable payload is a typed
+// failure and the fail-closed default blocks it.
+
+/// A `text` context whose content is not a JSON string (the unchecked
+/// projection renders it as compact JSON, the checked one rejects it).
+fn non_string_text() -> GuardrailContext {
+    let mut context = GuardrailContext::text("", ScanStage::UserInput);
+    context.content = json!({"cmd": "ls"});
+    context
+}
+
+/// A `messages` context holding only a multimodal (image) part.
+fn image_only_messages() -> GuardrailContext {
+    let mut context = GuardrailContext::text("", ScanStage::UserInput);
+    context.content_type = GuardrailContentType::Messages;
+    context.content = json!([{
+        "role": "user",
+        "content": [{"type": "image_url", "image_url": {"url": "https://example.invalid/i.png"}}],
+    }]);
+    context
+}
+
+/// A `text` context whose content is `null` (`text_view` renders `"null"`).
+fn null_content() -> GuardrailContext {
+    let mut context = GuardrailContext::text("", ScanStage::UserInput);
+    context.content = Value::Null;
+    context
+}
+
+/// Every payload shape no detector can read.
+fn unscannable_contexts() -> Vec<GuardrailContext> {
+    vec![non_string_text(), image_only_messages(), null_content()]
+}
+
+/// Asserts the crate still fails closed by default (the policy this regression
+/// depends on).
+#[test]
+fn the_default_failure_policy_is_fail_closed() {
+    assert_eq!(
+        SecurityPolicy::default().failure_policy,
+        FailurePolicy::FailClosed
+    );
+}
+
+/// Asserts an adapter never grades an unscannable payload safe.
+///
+/// The payload is rejected by `analyze` itself, by the `BackendGuardrail`
+/// wrapper, and by the default pipeline; only the explicit `FailOpen` opt-in
+/// lets the call through, and then only with the failure recorded.
+async fn assert_unscannable_never_safe(backend: Arc<dyn GuardrailBackend>) {
+    let name = backend.name().to_owned();
+    for context in unscannable_contexts() {
+        let error = backend
+            .analyze(&context)
+            .await
+            .expect_err("an unscannable payload is never graded safe");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(
+            error.message().contains("unscannable content"),
+            "the adapter reports the checked projection's error: {error}"
+        );
+
+        let guardrail = BackendGuardrail::new(name.clone(), Arc::clone(&backend));
+        let error = guardrail
+            .check(&context)
+            .await
+            .expect_err("the wrapped guardrail never grades it safe either");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+
+        let outcome = pipeline_with(Arc::clone(&backend)).run(&context).await;
+        assert_eq!(
+            outcome.decision,
+            SecurityDecision::Block,
+            "the default fail-closed policy blocks an unscannable payload"
+        );
+        assert_eq!(outcome.blocked_by.as_deref(), Some("context"));
+        assert_eq!(outcome.findings.len(), 1);
+        assert_eq!(outcome.findings[0].risk_type, "unscannable_content");
+        assert!(!outcome.errors.is_empty());
+        assert!(outcome.enforce().is_err(), "a blocked scan must enforce");
+
+        let open = fail_open(Arc::clone(&backend)).run(&context).await;
+        assert_eq!(open.decision, SecurityDecision::Allow);
+        assert!(open.findings.is_empty());
+        // The projection failure and the adapter's own failure are both
+        // recorded: the pipeline keeps running under `FailOpen`.
+        assert_eq!(open.errors.len(), 2, "{:?}", open.errors);
+        assert!(
+            open.errors
+                .iter()
+                .all(|error| error.contains("unscannable content")),
+            "{:?}",
+            open.errors
+        );
+    }
+}
+
+#[tokio::test]
+async fn openai_unscannable_payload_is_a_failure_not_a_safe_verdict() {
+    let server = MockServer::start().await;
+    assert_unscannable_never_safe(openai_backend(&server)).await;
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "an unscannable payload never reaches the wire"
+    );
+}
+
+#[tokio::test]
+async fn azure_unscannable_payload_is_a_failure_not_a_safe_verdict() {
+    let server = MockServer::start().await;
+    assert_unscannable_never_safe(azure_backend(&server)).await;
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "an unscannable payload never reaches the wire"
+    );
+}
+
+#[tokio::test]
+async fn aliyun_unscannable_payload_is_a_failure_not_a_safe_verdict() {
+    let server = MockServer::start().await;
+    assert_unscannable_never_safe(aliyun_backend(&server)).await;
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "an unscannable payload never reaches the wire"
+    );
+}
+
+#[tokio::test]
+async fn the_vendors_and_the_local_detectors_agree_on_unscannable_payloads() {
+    let server = MockServer::start().await;
+    let vendors: Vec<Arc<dyn GuardrailBackend>> = vec![
+        openai_backend(&server),
+        azure_backend(&server),
+        aliyun_backend(&server),
+    ];
+    let content_rules = ContentRuleGuardrail::from_patterns(vec![ContentRule {
+        name: "secret".to_owned(),
+        pattern: r"SECRET-\d+".to_owned(),
+        risk_type: "secret".to_owned(),
+        ..ContentRule::default()
+    }])
+    .unwrap();
+    let locals: Vec<Arc<dyn Guardrail>> = vec![
+        Arc::new(PromptInjectionGuardrail::new()),
+        Arc::new(SensitiveDataGuardrail::new()),
+        Arc::new(content_rules),
+        Arc::new(ToolArgumentGuardrail::new()),
+    ];
+
+    for context in unscannable_contexts() {
+        let mut messages = Vec::new();
+        for detector in &locals {
+            let error = detector
+                .check(&context)
+                .await
+                .expect_err("a local detector never grades it safe");
+            assert_eq!(error.kind(), ErrorKind::Validation);
+            messages.push((detector.name().to_owned(), error.message().into_owned()));
+        }
+        for vendor in &vendors {
+            let error = vendor
+                .analyze(&context)
+                .await
+                .expect_err("a vendor adapter never grades it safe");
+            assert_eq!(error.kind(), ErrorKind::Validation);
+            messages.push((vendor.name().to_owned(), error.message().into_owned()));
+        }
+        let expected = &messages[0].1;
+        assert!(expected.contains("unscannable content"), "{messages:?}");
+        for (name, message) in &messages[1..] {
+            assert_eq!(
+                message, expected,
+                "{name} must report the same checked projection error"
+            );
+        }
+    }
+
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "no adapter reaches the wire for an unscannable payload"
     );
 }

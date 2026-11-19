@@ -92,7 +92,8 @@ impl PredictorParams {
 ///
 /// [`PredictorParams::validate`] errors, [`Error::Retrieval`] for data that ends
 /// mid-row or names an unknown PNG row filter, and [`Error::Validation`] when the
-/// reconstructed bytes would exceed `max_output`.
+/// reconstructed bytes — or the computed row geometry itself — would exceed
+/// `max_output`, so a hostile `/Columns` can never force an oversized allocation.
 pub(crate) fn apply(data: &[u8], params: &PredictorParams, max_output: usize) -> Result<Vec<u8>> {
     params.validate()?;
     if params.is_identity() {
@@ -116,6 +117,9 @@ fn apply_tiff(data: &[u8], params: &PredictorParams, max_output: usize) -> Resul
     let row_bytes = samples_per_row.saturating_mul(bits).div_ceil(8);
     if row_bytes == 0 {
         return Ok(Vec::new());
+    }
+    if row_bytes > max_output {
+        return Err(oversized_row(params, row_bytes, max_output));
     }
     if data.len() % row_bytes != 0 {
         return Err(Error::Retrieval(
@@ -142,6 +146,19 @@ fn apply_tiff(data: &[u8], params: &PredictorParams, max_output: usize) -> Resul
 /// Undoes the PNG row predictors (`10`..`15`): each row starts with its type.
 fn apply_png(data: &[u8], params: &PredictorParams, max_output: usize) -> Result<Vec<u8>> {
     let row_bytes = row_geometry(params)?;
+    // Guard before allocating the previous-row buffer: `/Columns 4000000000`
+    // would otherwise ask for gigabytes from a few hundred input bytes.
+    if row_bytes > max_output {
+        return Err(oversized_row(params, row_bytes, max_output));
+    }
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    if row_bytes > data.len() {
+        return Err(Error::Retrieval(
+            "PNG predictor data ends in the middle of a row".to_owned(),
+        ));
+    }
     let bpp = params.colors;
     let mut out = Vec::with_capacity(data.len());
     let mut previous = vec![0u8; row_bytes];
@@ -226,6 +243,19 @@ fn row_geometry(params: &PredictorParams) -> Result<usize> {
             params.predictor, params.columns, params.colors
         ))
     })
+}
+
+/// Rejects a row wider than the caller's output budget.
+///
+/// A predictor row is reconstructed in full before anything else happens, so a
+/// row above `max_output` can neither fit the result nor be honest about the
+/// declared limit: `/Predictor 10 /Columns 4000000000` from a few hundred input
+/// bytes must be an error, never a multi-gigabyte allocation.
+fn oversized_row(params: &PredictorParams, row_bytes: usize, max_output: usize) -> Error {
+    Error::Validation(format!(
+        "PDF predictor {} describes a {row_bytes}-byte row, above the {max_output}-byte output limit",
+        params.predictor
+    ))
 }
 
 /// Returns the PNG Paeth predictor of `left`, `above`, and `upper_left`.
@@ -527,6 +557,51 @@ mod tests {
         assert_eq!(
             apply(&[1, 2, 3], &tiff, 64).unwrap_err().kind(),
             ErrorKind::Retrieval
+        );
+    }
+
+    #[test]
+    fn a_hostile_column_count_is_rejected_before_allocating() {
+        // `/Predictor 10 /Columns 4000000000` from a handful of bytes used to
+        // allocate the described row (~4 GB) before any size comparison.
+        let hostile = PredictorParams {
+            predictor: 10,
+            columns: 4_000_000_000,
+            colors: 1,
+            bits_per_component: 8,
+        };
+        let error = apply(&[0, 1, 2, 3], &hostile, 64 * 1024).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation, "{error}");
+        assert!(error.to_string().contains("predictor 10"), "{error}");
+        assert!(error.to_string().contains("output limit"), "{error}");
+
+        // The TIFF predictor derives its row from the same geometry and must not
+        // allocate an oversized row either (nor overflow the sample product).
+        let tiff = PredictorParams {
+            predictor: 2,
+            columns: 2_000_000_000,
+            colors: 1,
+            bits_per_component: 16,
+        };
+        let error = apply(&[1, 2, 3, 4], &tiff, 64 * 1024).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation, "{error}");
+
+        // A row wider than the (implausibly short) input but inside `max_output`
+        // is a truncated row, not an allocation.
+        let wider_than_input = PredictorParams {
+            predictor: 11,
+            columns: 1024,
+            colors: 1,
+            bits_per_component: 8,
+        };
+        let error = apply(&[0, 1, 2], &wider_than_input, 4096).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Retrieval, "{error}");
+        assert!(error.to_string().contains("middle of a row"), "{error}");
+
+        // An empty payload stays an empty result rather than a row-sized buffer.
+        assert_eq!(
+            apply(&[], &wider_than_input, 4096).unwrap(),
+            Vec::<u8>::new()
         );
     }
 

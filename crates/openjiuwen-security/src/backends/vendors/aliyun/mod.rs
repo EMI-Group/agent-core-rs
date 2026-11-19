@@ -389,13 +389,15 @@ impl GuardrailBackend for AliyunGreenBackend {
     ///
     /// # Errors
     ///
-    /// [`Error::Validation`] when the endpoint carries no host or the reply
-    /// does not carry the `TextModeration` envelope, [`Error::Transport`] for
-    /// connection, status, business-code, and decoding failures, and
-    /// [`Error::Timeout`] when the deadline expires. Errors never carry the
-    /// scanned text.
+    /// [`Error::Validation`] when the payload cannot be scanned, the endpoint
+    /// carries no host, or the reply does not carry the `TextModeration`
+    /// envelope, [`Error::Transport`] for connection, status, business-code,
+    /// and decoding failures, and [`Error::Timeout`] when the deadline expires.
+    /// Errors never carry the scanned text.
     async fn analyze(&self, ctx: &GuardrailContext) -> Result<RiskAssessment> {
-        let text = ctx.text_view();
+        // The checked projection, like every local detector: an unscannable
+        // payload is a failure for the failure policy to resolve, never a pass.
+        let text = ctx.text_view_checked()?;
         if text.trim().is_empty() {
             return Ok(safe_assessment());
         }

@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-//! Cross-format integration tests for the three office-reader silent-loss paths.
+//! Cross-format integration tests for the office-reader silent-loss and
+//! untrusted-input paths.
 //!
 //! Each of the three readers used to lose information without saying so; the
 //! public API now reports it:
@@ -13,11 +14,15 @@
 //! - **`ODT`** — body elements that contribute no text are listed, sorted, with
 //!   an occurrence count in `OdtDocument::unsupported_elements`.
 //!
+//! The `XLSX` reader also enforces the real spreadsheet bounds, so a hostile
+//! `A1` reference can never size a grid: a column past `XFD` (16 383) or a row
+//! past 1 048 576 is a typed `Error::Validation` naming the cell reference.
+//!
 //! Containers are built in memory with the crate's own stored-entry `ZipWriter`
 //! (or the public `loaders::fixtures` builders), so the suite needs no office
 //! fixture files and no temporary files. The per-module unit tests cover the
 //! internal helpers; this file is the public-API, cross-format statement of the
-//! same three fixes, with deterministic assertions only.
+//! same fixes, with deterministic assertions only.
 use openjiuwen_common::error::{Error, ErrorKind};
 use openjiuwen_retrieval::loaders::fixtures;
 use openjiuwen_retrieval::parsing::{
@@ -181,6 +186,63 @@ fn xlsx_shared_string_count_declarations_are_informational() {
     let table = &workbook.sheets[0].table;
     assert_eq!(table.headers, vec!["Name"]);
     assert_eq!(table.rows, vec![vec!["alice".to_owned()]]);
+}
+
+// ---------------------------------------------------------------------------
+// XLSX: a cell reference past the spreadsheet bounds is a typed error
+// ---------------------------------------------------------------------------
+
+#[test]
+fn xlsx_a_cell_reference_with_too_many_letters_is_rejected() {
+    // `AAAAAAAA1` is a well-formed reference whose column index is ~2e11; it
+    // used to size the row grid from that number (an allocation bomb). Eight
+    // letters decode but are past XFD, so this is a bounds error.
+    let bytes = xlsx_archive(r#"<row r="1"><c r="AAAAAAAA1"><v>1</v></c></row>"#, None);
+    let error = XlsxParser::new().parse_bytes(&bytes).unwrap_err();
+    assert_error(
+        &error,
+        ErrorKind::Validation,
+        &[XLSX_SHEET_PART, "AAAAAAAA1"],
+    );
+    // Nine letters no longer decode at all and must be rejected, never guessed
+    // into the next free column.
+    let bytes = xlsx_archive(r#"<row r="1"><c r="AAAAAAAAA1"><v>1</v></c></row>"#, None);
+    let error = XlsxParser::new().parse_bytes(&bytes).unwrap_err();
+    assert_error(
+        &error,
+        ErrorKind::Validation,
+        &[XLSX_SHEET_PART, "AAAAAAAAA1"],
+    );
+}
+
+#[test]
+fn xlsx_a_cell_reference_past_xfd_is_rejected() {
+    // XFD is the last column (index 16 383); XFE is the first one past it.
+    let bytes = xlsx_archive(r#"<row r="1"><c r="XFE1"><v>1</v></c></row>"#, None);
+    let error = XlsxParser::new().parse_bytes(&bytes).unwrap_err();
+    assert_error(
+        &error,
+        ErrorKind::Validation,
+        &[XLSX_SHEET_PART, "XFE1", "16383", "XFD"],
+    );
+    // The limit itself still parses, as does a sheet that reaches it.
+    let bytes = xlsx_archive(r#"<row r="1"><c r="XFD1"><v>1</v></c></row>"#, None);
+    let workbook = XlsxParser::new().parse_bytes(&bytes).unwrap();
+    let table = &workbook.sheets[0].table;
+    assert_eq!(table.headers.len(), 16_384);
+    assert_eq!(table.headers[16_383], "1");
+}
+
+#[test]
+fn xlsx_a_row_past_the_spreadsheet_limit_is_rejected() {
+    // The last addressable row is 1 048 576; one past it must not overflow the
+    // row counter or stretch the grid.
+    let bytes = xlsx_archive(
+        r#"<row r="1048577"><c r="A1048577"><v>1</v></c></row>"#,
+        None,
+    );
+    let error = XlsxParser::new().parse_bytes(&bytes).unwrap_err();
+    assert_error(&error, ErrorKind::Validation, &[XLSX_SHEET_PART, "1048577"]);
 }
 
 // ---------------------------------------------------------------------------

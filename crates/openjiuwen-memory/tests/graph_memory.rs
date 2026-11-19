@@ -653,3 +653,105 @@ async fn embeddings_are_only_computed_when_configured() {
         .expect("acme");
     assert_eq!(stored.embedding().expect("embedding").len(), 16);
 }
+
+/// A chain `Root -> Hop1 -> ... -> Hop<hops>` in one scope.
+async fn store_hops(memory: &GraphMemory, scope: &MemoryScope, hops: usize) {
+    let mut entities = vec![entity("Root", "Concept", None)];
+    let mut relations = Vec::new();
+    let mut previous = "Root".to_owned();
+    for hop in 1..=hops {
+        let name = format!("Hop{hop}");
+        entities.push(entity(&name, "Concept", None));
+        relations.push(relation(&previous, &name, "next"));
+        previous = name;
+    }
+    memory
+        .add_extracted(
+            scope,
+            &Extraction {
+                entities,
+                relations,
+                degraded: None,
+            },
+        )
+        .await
+        .expect("chain");
+}
+
+/// A hub plus `leaves` one-hop neighbors.
+async fn store_hub(memory: &GraphMemory, scope: &MemoryScope, leaves: usize) {
+    let mut entities = vec![entity("Hub", "Concept", None)];
+    let mut relations = Vec::new();
+    for leaf in 0..leaves {
+        let name = format!("Leaf{leaf:03}");
+        entities.push(entity(&name, "Concept", None));
+        relations.push(relation("Hub", &name, "owns"));
+    }
+    memory
+        .add_extracted(
+            scope,
+            &Extraction {
+                entities,
+                relations,
+                degraded: None,
+            },
+        )
+        .await
+        .expect("hub");
+}
+
+#[tokio::test]
+async fn per_call_depth_is_clamped_to_the_validated_bound() {
+    let memory = memory(GraphMemoryConfig::default());
+    let scope = scope();
+    store_hops(&memory, &scope, 8).await;
+    let options = GraphSearchOptions {
+        top_k: 0,
+        threshold: 0.01,
+        // Both are far past the validated bounds; the search must clamp them.
+        max_depth: 20,
+        max_neighbors: 10_000,
+        include_relations: true,
+        call: CallOptions::default(),
+    };
+    let hits = memory
+        .search(&scope, "Root", &options)
+        .await
+        .expect("clamped search");
+    let depths: Vec<usize> = hits.iter().map(|hit| hit.depth).collect();
+    assert!(
+        depths.iter().all(|depth| *depth <= 4),
+        "depth 20 is clamped to 4: {depths:?}"
+    );
+    assert_eq!(
+        depths.iter().max(),
+        Some(&4),
+        "the clamp still expands four hops"
+    );
+    assert_eq!(hits.len(), 5, "Root plus four hops, not the whole chain");
+}
+
+#[tokio::test]
+async fn per_call_neighbors_are_clamped_to_the_validated_bound() {
+    let memory = memory(GraphMemoryConfig::default());
+    let scope = scope();
+    store_hub(&memory, &scope, 300).await;
+    let options = GraphSearchOptions {
+        top_k: 0,
+        threshold: 0.01,
+        max_depth: 1,
+        max_neighbors: 10_000,
+        include_relations: true,
+        call: CallOptions::default(),
+    };
+    let hits = memory
+        .search(&scope, "Hub", &options)
+        .await
+        .expect("clamped search");
+    assert_eq!(
+        hits.len(),
+        1 + 256,
+        "10_000 neighbors per parent is clamped to the documented 256"
+    );
+    assert!(hits.iter().all(|hit| hit.depth <= 1));
+}

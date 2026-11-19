@@ -229,23 +229,29 @@ impl LongTermMemory {
         self.get_message_page(scope, page_size, cursor, None).await
     }
 
-    /// Deletes the conversation history rows matching `filter`, returning how many were
-    /// removed.
+    /// Deletes the conversation history rows of one tenant scope matching `filter`,
+    /// returning how many were removed.
     ///
     /// Only message history is cleared; memory records and variables are untouched (use
-    /// [`LongTermMemory::clear`] for those). Scope clauses, `ids`, and the
-    /// `created_after`/`created_before` bounds select the rows; kind, importance, and
-    /// text clauses do not apply to messages.
+    /// [`LongTermMemory::clear`] for those). `filter` must name a non-empty `user_id` and
+    /// `scope_id` — build it with [`MemoryFilter::for_scope`] — and those clauses are
+    /// `AND`ed into the delete, so no caller can delete another tenant's history (or the
+    /// whole collection) by passing an empty filter; Python's
+    /// `delete_by_user_and_scope` cannot express that either. `session_id`, `ids`, and the
+    /// `created_after`/`created_before` bounds narrow the delete further; kind,
+    /// importance, and text clauses do not apply to messages.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Cancelled`] when the call is cancelled before the delete and the
-    /// storage error when the delete fails.
+    /// Returns [`Error::Validation`] (before deleting anything) when `filter` names no
+    /// `user_id` or no `scope_id`, [`Error::Cancelled`] when the call is cancelled before
+    /// the delete, and the storage error when the delete fails.
     pub async fn clear_messages(
         &self,
         filter: &MemoryFilter,
         options: &CallOptions,
     ) -> Result<usize> {
+        crate::store::require_message_scope(filter)?;
         options.check()?;
         let deleted = options
             .run(self.engine.message_store().delete_for(filter))
@@ -1498,6 +1504,112 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].text().as_ref(), "history message 3");
         assert_eq!(recent[1].text().as_ref(), "history message 4");
+    }
+
+    #[tokio::test]
+    async fn clearing_one_tenant_leaves_the_other_tenant_history_intact() {
+        let ltm = facade(MemoryEngineConfig::default()).await;
+        let alice = scope();
+        let bob = MemoryScope::new("bob", "ws").session("s1");
+        seeded_history(&ltm, &alice, 3).await;
+        seeded_history(&ltm, &bob, 2).await;
+
+        let deleted = ltm
+            .clear_messages(&MemoryFilter::for_scope(&alice), &CallOptions::default())
+            .await
+            .expect("clear alice");
+        assert_eq!(deleted, 3);
+        assert_eq!(
+            ltm.get_recent_messages(&alice, 10)
+                .await
+                .expect("alice")
+                .len(),
+            0
+        );
+        let bob_history = ltm.get_recent_messages(&bob, 10).await.expect("bob");
+        assert_eq!(bob_history.len(), 2, "bob's history is untouched");
+        assert_eq!(bob_history[0].text().as_ref(), "history message 0");
+        assert_eq!(bob_history[1].text().as_ref(), "history message 1");
+
+        // The narrower forms still only reach the named tenant.
+        let mut by_id = MemoryFilter::for_scope(&bob);
+        by_id.ids = vec![
+            ltm.engine()
+                .message_store()
+                .recent(&bob, 1)
+                .await
+                .expect("bob tail")
+                .remove(0)
+                .id,
+        ];
+        assert_eq!(
+            ltm.clear_messages(&by_id, &CallOptions::default())
+                .await
+                .expect("clear one row"),
+            1
+        );
+        assert_eq!(
+            ltm.get_recent_messages(&bob, 10).await.expect("bob").len(),
+            1
+        );
+        assert_eq!(
+            ltm.get_recent_messages(&alice, 10)
+                .await
+                .expect("alice")
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_without_a_scope_is_refused_and_deletes_nothing() {
+        let ltm = facade(MemoryEngineConfig::default()).await;
+        let alice = scope();
+        let bob = MemoryScope::new("bob", "ws").session("s1");
+        seeded_history(&ltm, &alice, 3).await;
+        seeded_history(&ltm, &bob, 2).await;
+
+        let unscoped = [
+            (MemoryFilter::default(), vec!["user_id", "scope_id"]),
+            (
+                MemoryFilter {
+                    user_id: Some("alice".to_owned()),
+                    ..MemoryFilter::default()
+                },
+                vec!["scope_id"],
+            ),
+            (
+                MemoryFilter {
+                    scope_id: Some("ws".to_owned()),
+                    ..MemoryFilter::default()
+                },
+                vec!["user_id"],
+            ),
+        ];
+        for (filter, missing) in unscoped {
+            let error = ltm
+                .clear_messages(&filter, &CallOptions::default())
+                .await
+                .expect_err("an unscoped clear is refused");
+            assert!(matches!(error, CommonError::Validation(_)), "{error:?}");
+            let message = error.to_string();
+            for field in missing {
+                assert!(message.contains(field), "{field} missing from {message}");
+            }
+        }
+        assert_eq!(
+            ltm.get_recent_messages(&alice, 10)
+                .await
+                .expect("alice")
+                .len(),
+            3,
+            "nothing was deleted"
+        );
+        assert_eq!(
+            ltm.get_recent_messages(&bob, 10).await.expect("bob").len(),
+            2,
+            "nothing was deleted"
+        );
     }
 
     #[tokio::test]

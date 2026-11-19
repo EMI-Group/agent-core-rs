@@ -117,6 +117,35 @@ async fn search_keeps_insertion_order_for_equal_scores() {
 }
 
 #[tokio::test]
+async fn search_sorts_nan_scores_last_in_a_transitive_order() {
+    // A stored vector holding a NaN produces a NaN score. `partial_cmp(…)
+    // .unwrap_or(Equal)` treated every NaN pair as equal, so a NaN hit could
+    // keep a position above a real score; the total order must push every NaN
+    // below every finite score and still keep insertion order among the NaNs.
+    let store = store_with(vec![
+        record("nan-first", vec![f32::NAN, 1.0]),
+        record("exact", vec![1.0, 0.0]),
+        record("nan-second", vec![f32::NAN, 0.0]),
+        record("near", vec![0.8, 0.6]),
+    ])
+    .await;
+    let hits = store
+        .search(VectorQuery::new(vec![1.0, 0.0]))
+        .await
+        .unwrap();
+    assert_eq!(ids(&hits), ["exact", "near", "nan-first", "nan-second"]);
+    assert!(hits[0].score.is_finite() && hits[1].score.is_finite());
+    assert!(hits[2].score.is_nan() && hits[3].score.is_nan());
+    // Truncation happens before the payload clone, so a NaN never survives a
+    // `top_k` that the finite hits already fill.
+    let top = store
+        .search(VectorQuery::new(vec![1.0, 0.0]).with_top_k(1))
+        .await
+        .unwrap();
+    assert_eq!(ids(&top), ["exact"]);
+}
+
+#[tokio::test]
 async fn search_truncates_to_top_k_and_zero_returns_empty() {
     let store = store_with(vec![
         record("a", vec![1.0, 0.0]),

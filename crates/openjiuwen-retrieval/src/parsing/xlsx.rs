@@ -75,6 +75,11 @@ const WORKBOOK_DIR: &str = "xl";
 /// Longest accepted `A1`-style column prefix, which bounds the decoded index.
 const MAX_COLUMN_LETTERS: usize = 8;
 
+/// Largest zero-based column a spreadsheet can address (`XFD`, the 16 384th).
+const MAX_COLUMN_INDEX: usize = 16_383;
+/// Largest one-based row number a spreadsheet can address (1 048 576).
+const MAX_ROW_NUMBER: usize = 1_048_576;
+
 /// One worksheet: its name, workbook position, and decoded table.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -438,15 +443,26 @@ fn build_table(markup: &str, part: &str, shared_strings: &SharedStrings) -> Resu
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|number| *number > 0)
             .unwrap_or(next_row);
-        next_row = row_number + 1;
+        if row_number > MAX_ROW_NUMBER {
+            return Err(Error::Validation(format!(
+                "worksheet {part} row {row_number} is past the spreadsheet row limit {MAX_ROW_NUMBER}"
+            )));
+        }
+        next_row = row_number.checked_add(1).ok_or_else(|| {
+            Error::Validation(format!(
+                "worksheet {part} row {row_number} cannot advance the row counter"
+            ))
+        })?;
         let mut cells: Vec<String> = Vec::new();
         let mut next_column = 0usize;
         for cell in row.children_named("c") {
-            let column = cell
-                .attr("r")
-                .and_then(column_index_from_reference)
-                .unwrap_or(next_column);
-            next_column = column + 1;
+            let column = resolve_column(cell, next_column, part, row_number)?;
+            next_column = column.checked_add(1).ok_or_else(|| {
+                Error::Validation(format!(
+                    "worksheet {part} cell {} cannot advance the column counter",
+                    cell_reference(cell, column, row_number)
+                ))
+            })?;
             if cells.len() <= column {
                 cells.resize(column + 1, String::new());
             }
@@ -589,6 +605,40 @@ fn normalize_number(raw: &str) -> String {
     } else {
         raw.to_owned()
     }
+}
+
+/// Resolves a cell's zero-based column from its `r` reference.
+///
+/// A cell without a usable `r` attribute falls back to `fallback` (the column
+/// after the previous cell); a named column must stay inside the spreadsheet's
+/// last column ([`MAX_COLUMN_INDEX`]), so `AAAAAAAA1`/`XFE1` are a
+/// [`Error::Validation`] rather than an allocation-sized column index.
+fn resolve_column(
+    cell: &XmlElement,
+    fallback: usize,
+    part: &str,
+    row_number: usize,
+) -> Result<usize> {
+    let reference = cell
+        .attr("r")
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let column = match reference {
+        Some(reference) => column_index_from_reference(reference).ok_or_else(|| {
+            Error::Validation(format!(
+                "worksheet {part} cell {reference} does not carry a usable column reference"
+            ))
+        })?,
+        None => fallback,
+    };
+    if column > MAX_COLUMN_INDEX {
+        return Err(Error::Validation(format!(
+            "worksheet {part} cell {} addresses column {column}, past the spreadsheet column limit {} (XFD)",
+            cell_reference(cell, column, row_number),
+            MAX_COLUMN_INDEX
+        )));
+    }
+    Ok(column)
 }
 
 /// Decodes the column part of an `A1` reference (`A1` → 0, `AA3` → 26).

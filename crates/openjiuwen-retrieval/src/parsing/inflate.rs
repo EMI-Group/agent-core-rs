@@ -41,6 +41,10 @@ use openjiuwen_common::error::{Error, Result};
 /// this limit so a malicious archive cannot exhaust memory.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Shortest input [`zlib_decompress`] can read: the 2-byte header, one payload
+/// byte, and the 4-byte `Adler-32` trailer.
+const ZLIB_MIN_LEN: usize = 7;
+
 /// Base lengths for the `DEFLATE` length codes 257..=285.
 const LENGTH_BASE: [u16; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
@@ -548,7 +552,9 @@ fn copy_back_reference(
 /// - [`Error::Validation`] for a header whose method is not `DEFLATE`, a window
 ///   exponent above 7, or a failed header check; plus every [`inflate`] error.
 /// - [`Error::Unsupported`] when the header flags a preset dictionary.
-/// - [`Error::Retrieval`] for a short payload or a mismatched `Adler-32`.
+/// - [`Error::Retrieval`] for an input too short to hold the header, a payload,
+///   and the trailer, for a payload that ends mid-structure, or for a mismatched
+///   `Adler-32`.
 ///
 /// ```
 /// # use openjiuwen_retrieval::parsing::zlib_decompress;
@@ -583,9 +589,13 @@ pub fn zlib_decompress(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
             "zlib preset dictionaries (FDICT) are not supported".to_owned(),
         ));
     }
-    let Some(payload_end) = data.len().checked_sub(4) else {
+    // A stream needs the 2-byte header, at least one payload byte, and the
+    // 4-byte trailer; anything shorter would make `payload_end < 2` and panic on
+    // the payload slice below.
+    if data.len() < ZLIB_MIN_LEN {
         return Err(truncated("reading the zlib trailer"));
-    };
+    }
+    let payload_end = data.len() - 4;
     let output = inflate(&data[2..payload_end], max_output)?;
     let expected = u32::from_be_bytes([
         data[payload_end],

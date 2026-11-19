@@ -102,7 +102,7 @@ Confidence is the maximum `Data.Result[].Confidence` (`0..=100`) banded at `90`/
 ## Constraints
 
 - `GuardrailBackend` is object-safe and async; `name()` returns the module `NAME` constant.
-- Every adapter short-circuits blank/whitespace `text_view()` to `crate::backends::safe_assessment()` inside `analyze` without any HTTP call, before `parse_response`.
+- Every adapter projects with `GuardrailContext::text_view_checked()`, never the total `text_view()`: an unscannable payload is `Error::Validation` naming `unscannable content`, and only blank *scannable* text short-circuits to `crate::backends::safe_assessment()` inside `analyze` without any HTTP call, before `parse_response`.
 - Secrets are `SecretString`; `Debug` prints presence/kind only, and serialization keeps plaintext for config round-trips.
 - Findings never carry scanned text or vendor matched words; errors carry service, status, vendor code, the vendor name, the mismatched field names, and a bounded body excerpt only.
 - Failure mapping is uniform: `Error::Validation` for unusable construction input and for a reply whose schema is not recognized, `Error::Transport` for status/decoding/vendor-code failures, `Error::Timeout` when the deadline expires, `Error::Config` when the shared client cannot be built.

@@ -326,10 +326,13 @@ impl GuardrailBackend for OpenAiModerationBackend {
     ///
     /// [`Error::Transport`] for connection, status, and decoding failures,
     /// [`Error::Timeout`] when the deadline expires, and [`Error::Validation`]
-    /// for a reply that does not match the moderations schema. Blank text is
-    /// safe without a request. Errors never carry the scanned text.
+    /// for a payload the projection cannot read or a reply that does not match
+    /// the moderations schema. Blank scannable text is safe without a request.
+    /// Errors never carry the scanned text.
     async fn analyze(&self, ctx: &GuardrailContext) -> Result<RiskAssessment> {
-        let text = ctx.text_view();
+        // The checked projection, like every local detector: an unscannable
+        // payload is a failure for the failure policy to resolve, never a pass.
+        let text = ctx.text_view_checked()?;
         if text.trim().is_empty() {
             return Ok(safe_assessment());
         }
