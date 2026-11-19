@@ -284,7 +284,9 @@ fn emit(out: &mut impl std::io::Write, kind: SpawnMessageKind, payload: Value) {
 /// healthy `health_check_response`, and a `shutdown` with `shutdown_ack`.
 /// `FAKE_CHILD_MODE=silent_input` ignores invocations (so a caller deadline must
 /// expire), `FAKE_CHILD_MODE=silent_shutdown` ignores a shutdown and never exits
-/// (so the parent must enforce its deadline and kill it), and
+/// (so the parent must enforce its deadline and kill it),
+/// `FAKE_CHILD_MODE=big_stderr` writes one 50 MiB newline-free stderr line before
+/// serving requests, and
 /// `FAKE_CHILD_MODE=cancel_echo` holds an invocation open, records the request id
 /// it is holding in the file named by `FAKE_CHILD_MARKER` (the parent's barrier:
 /// one ordered stdin pipe means the cancel is written after the invoke frame), and
@@ -304,6 +306,18 @@ fn fake_child() {
     // on a line of its own (the parent skips the noise line).
     let _ = writeln!(out);
     let _ = out.flush();
+    if mode == "big_stderr" {
+        // One 50 MiB newline-free stderr line: a bounded drain must keep only its
+        // cap and never let the child block on a full pipe.
+        let chunk = vec![b'x'; 64 * 1024];
+        let stderr = std::io::stderr();
+        let mut err = stderr.lock();
+        for _ in 0..800 {
+            err.write_all(&chunk).expect("the parent drains stderr");
+        }
+        err.write_all(b"\n").expect("the parent drains stderr");
+        err.flush().expect("the parent drains stderr");
+    }
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -543,6 +557,33 @@ async fn a_spawned_child_reports_its_backend_and_health_through_the_seam() {
         .expect("the fake child answers");
     assert_eq!(output.output, "pong");
 
+    assert!(
+        tokio::time::timeout(BOUND, agent.shutdown(Duration::from_secs(5)))
+            .await
+            .expect("shutdown must not hang")
+            .expect("the fake child acknowledges the shutdown")
+    );
+}
+
+#[tokio::test]
+async fn a_single_huge_stderr_line_is_bounded_and_never_blocks_the_child() {
+    // The child writes a 50 MiB newline-free stderr line before it serves the
+    // invocation. The bounded drain keeps only `STDERR_LINE_CAP_BYTES`, discards
+    // the rest, and keeps reading, so the child is never blocked on a full pipe
+    // and the exchange completes normally.
+    let agent: Arc<dyn SpawnedAgent> = tokio::time::timeout(
+        BOUND,
+        SubprocessSpawner::new(child_config_in("big_stderr"))
+            .spawn(SpawnSpec::class_agent("tests.spawn", "FakeAgent")),
+    )
+    .await
+    .expect("spawn must not hang")
+    .expect("the fake child launches");
+    let output = tokio::time::timeout(BOUND, agent.send(json!({"query": "ping"})))
+        .await
+        .expect("the child must not block on its stderr line")
+        .expect("the fake child answers after its stderr line");
+    assert_eq!(output.output, "pong");
     assert!(
         tokio::time::timeout(BOUND, agent.shutdown(Duration::from_secs(5)))
             .await

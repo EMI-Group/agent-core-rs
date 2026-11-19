@@ -530,7 +530,11 @@ mod tests {
         drop(child);
         assert!(runner.active_spawns().is_empty());
         let finished = runner.monitor().snapshot(&run_id).unwrap();
-        assert_eq!(finished.phase, RunPhase::Completed);
+        assert_eq!(
+            finished.phase,
+            RunPhase::Cancelled,
+            "an abandoned spawn is not a successful run"
+        );
         assert_eq!(finished.detail, json!({"reason": "handle_dropped"}));
         assert_eq!(
             runner.monitor().history(&run_id).unwrap().len(),

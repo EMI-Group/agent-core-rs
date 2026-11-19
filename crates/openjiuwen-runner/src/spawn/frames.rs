@@ -100,6 +100,75 @@ pub fn frame_bytes(frame: &SpawnMessage) -> Result<Vec<u8>> {
     Ok(frame.to_line()?.into_bytes())
 }
 
+/// One line read under a hard cap.
+///
+/// `bytes` is the retained prefix (at most the requested cap), and `truncated`
+/// says whether the rest of that line was dropped after being drained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundedLine {
+    /// The retained bytes, without the terminating newline.
+    pub bytes: Vec<u8>,
+    /// Whether the line was longer than the cap and its tail was discarded.
+    pub truncated: bool,
+}
+
+/// Reads one newline-terminated line, keeping at most `cap` bytes and draining
+/// the rest of that line.
+///
+/// This is the lossy counterpart of `read_line_bounded`: instead of failing on
+/// an oversized line it keeps the first `cap` bytes, consumes the remainder up
+/// to (and including) the newline so the writer can never block on a full pipe,
+/// and reports the truncation. It is what the stderr drain uses, where a single
+/// runaway line must not be buffered whole.
+///
+/// Returns `Ok(None)` at end of input with nothing buffered; a partial final line
+/// is returned as-is. The cap is honoured while streaming: only the retained
+/// prefix is ever copied into the accumulator.
+pub(crate) async fn read_line_capped<R>(reader: &mut R, cap: usize) -> Result<Option<BoundedLine>>
+where
+    R: AsyncBufRead + Unpin + Send,
+{
+    let mut line: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    loop {
+        let chunk = reader.fill_buf().await.map_err(|error| {
+            crate::error::transport(format!("reading from the child process failed: {error}"))
+        })?;
+        if chunk.is_empty() {
+            return Ok(if line.is_empty() && !truncated {
+                None
+            } else {
+                Some(BoundedLine {
+                    bytes: line,
+                    truncated,
+                })
+            });
+        }
+        let available = chunk.len();
+        let newline = chunk.iter().position(|byte| *byte == b'\n');
+        let take = newline.unwrap_or(available);
+        if line.len() < cap {
+            let keep = take.min(cap - line.len());
+            line.extend_from_slice(&chunk[..keep]);
+            if keep < take {
+                truncated = true;
+            }
+        } else if take > 0 {
+            truncated = true;
+        }
+        match newline {
+            Some(index) => {
+                reader.consume(index + 1);
+                return Ok(Some(BoundedLine {
+                    bytes: line,
+                    truncated,
+                }));
+            }
+            None => reader.consume(available),
+        }
+    }
+}
+
 /// Reads one newline-terminated line, never buffering more than
 /// `max_frame_bytes` plus the reader's own chunk.
 ///
@@ -113,30 +182,12 @@ async fn read_line_bounded<R>(reader: &mut R, max_frame_bytes: usize) -> Result<
 where
     R: AsyncBufRead + Unpin + Send,
 {
-    let mut line: Vec<u8> = Vec::new();
-    loop {
-        let chunk = reader.fill_buf().await.map_err(|error| {
-            crate::error::transport(format!("reading from the child process failed: {error}"))
-        })?;
-        if chunk.is_empty() {
-            return Ok(if line.is_empty() { None } else { Some(line) });
-        }
-        let available = chunk.len();
-        let newline = chunk.iter().position(|byte| *byte == b'\n');
-        let take = newline.unwrap_or(available);
-        if line.len().saturating_add(take) > max_frame_bytes {
-            return Err(Error::validation(format!(
-                "spawn frame line exceeds the {max_frame_bytes} byte cap"
-            )));
-        }
-        line.extend_from_slice(&chunk[..take]);
-        match newline {
-            Some(index) => {
-                reader.consume(index + 1);
-                return Ok(Some(line));
-            }
-            None => reader.consume(available),
-        }
+    match read_line_capped(reader, max_frame_bytes).await? {
+        None => Ok(None),
+        Some(line) if line.truncated => Err(Error::validation(format!(
+            "spawn frame line exceeds the {max_frame_bytes} byte cap"
+        ))),
+        Some(line) => Ok(Some(line.bytes)),
     }
 }
 
@@ -330,6 +381,60 @@ mod tests {
             error.to_string().contains("64 byte cap"),
             "unexpected message: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_keeps_the_cap_and_drains_the_rest_of_the_line() {
+        // One 50 MiB line without a newline until the very end, followed by a
+        // second line: only the cap is retained, the excess is drained, and the
+        // next line is still readable.
+        const CAP: usize = 4096;
+        let mut input = vec![b'x'; 50 * 1024 * 1024];
+        input.push(b'\n');
+        input.extend_from_slice(b"next line\n");
+        let mut reader: &[u8] = &input;
+
+        let line = read_line_capped(&mut reader, CAP)
+            .await
+            .unwrap()
+            .expect("one line");
+        assert_eq!(line.bytes.len(), CAP, "only the cap is retained");
+        assert!(line.truncated, "the truncation is reported");
+        assert!(line.bytes.iter().all(|byte| *byte == b'x'));
+
+        let next = read_line_capped(&mut reader, CAP)
+            .await
+            .unwrap()
+            .expect("the drained line ended at its newline");
+        assert_eq!(next.bytes, b"next line");
+        assert!(!next.truncated);
+        assert!(read_line_capped(&mut reader, CAP).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_reports_a_truncated_final_line() {
+        let mut reader: &[u8] = &[b'y'; 32];
+        let line = read_line_capped(&mut reader, 8).await.unwrap().unwrap();
+        assert_eq!(line.bytes, b"yyyyyyyy");
+        assert!(line.truncated);
+        assert!(read_line_capped(&mut reader, 8).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_keeps_a_short_line_whole() {
+        let mut reader: &[u8] = b"short\nshort too";
+        let line = read_line_capped(&mut reader, DEFAULT_MAX_FRAME_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.bytes, b"short");
+        assert!(!line.truncated);
+        let last = read_line_capped(&mut reader, DEFAULT_MAX_FRAME_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.bytes, b"short too");
+        assert!(!last.truncated);
     }
 
     #[tokio::test]

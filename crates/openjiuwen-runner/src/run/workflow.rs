@@ -13,7 +13,7 @@
 //! token, and the timeout, so the runner neither wraps nor re-times the call.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures::stream::{BoxStream, StreamExt};
 use openjiuwen_common::error::{Error, Result};
@@ -23,8 +23,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{
-    record_stream_outcome, resolve_session_id, resolve_workflow, to_value, trace_failure,
-    trace_finish, trace_start, RunOptions, RunServices, RunSpan, Teardown, WorkflowRef, LOG_TARGET,
+    effective_deadline, record_stream_outcome, resolve_session_id, resolve_workflow,
+    stream_frame_output, to_value, trace_failure, trace_finish, trace_start, RunOptions,
+    RunServices, RunSpan, Teardown, WorkflowRef, LOG_TARGET,
 };
 use crate::callback::{CallbackContext, CallbackEvent};
 
@@ -104,7 +105,7 @@ pub async fn invoke_workflow(
     trace_start("workflow", &run_id, &card.id, session.id());
     let span = RunSpan::start(session.tracer(), "run_workflow", inputs.clone());
     let teardown = workflow_teardown(owned);
-    let run_options = run_options(&options);
+    let run_options = run_options(&options, effective_deadline(&services, &options));
 
     let result = workflow
         .invoke_with(inputs, Arc::clone(&session), run_options)
@@ -258,22 +259,20 @@ pub fn stream_workflow(
         trace_start("workflow", &run_id, &card.id, session.id());
         let span = RunSpan::start(session.tracer(), "run_workflow_stream", inputs.clone());
         let teardown = workflow_teardown(owned);
-        let mut inner = workflow.stream_with(inputs, Arc::clone(&session), run_options(&options));
+        let deadline = effective_deadline(&services, &options);
+        let mut inner = workflow.stream_with(
+            inputs,
+            Arc::clone(&session),
+            run_options(&options, deadline),
+        );
         let mut index: i64 = 0;
         let mut failure: Option<Error> = None;
 
         while let Some(frame) = inner.next().await {
             match frame {
                 Ok(chunk) => {
-                    let context = CallbackContext::new(CallbackEvent::WorkflowStreamOutput)
-                        .with_component(card.id.clone())
-                        .with_index(index)
-                        .with_output(chunk.to_wire())
-                        .with_session(Arc::clone(&session));
-                    if let Err(error) = services
-                        .callbacks
-                        .trigger(CallbackEvent::WorkflowStreamOutput, &context)
-                        .await
+                    if let Err(error) =
+                        emit_stream_output(&services, &card, index, &chunk, &session).await
                     {
                         failure = Some(error);
                         break;
@@ -310,6 +309,37 @@ pub fn stream_workflow(
     .boxed()
 }
 
+/// Fires `WorkflowStreamOutput` for one frame.
+///
+/// The frame is projected with [`WorkflowChunk::to_wire`] only when the event has
+/// subscribers: a run with none must not serialise every frame for a callback
+/// that would return immediately.
+async fn emit_stream_output(
+    services: &RunServices,
+    card: &openjiuwen_workflow::WorkflowCard,
+    index: i64,
+    chunk: &WorkflowChunk,
+    session: &Arc<dyn Session>,
+) -> Result<()> {
+    let Some(output) = stream_frame_output(
+        &services.callbacks,
+        CallbackEvent::WorkflowStreamOutput,
+        || chunk.to_wire(),
+    ) else {
+        return Ok(());
+    };
+    let context = CallbackContext::new(CallbackEvent::WorkflowStreamOutput)
+        .with_component(card.id.clone())
+        .with_index(index)
+        .with_output(output)
+        .with_session(Arc::clone(session));
+    services
+        .callbacks
+        .trigger(CallbackEvent::WorkflowStreamOutput, &context)
+        .await
+        .map(|_report| ())
+}
+
 /// Resolves the run's session: the caller's, or a fresh owned
 /// [`WorkflowSession`].
 fn prepare_session(
@@ -336,11 +366,18 @@ fn prepare_session(
     (session, Some(owned))
 }
 
-/// Projects the run options onto the engine's [`WorkflowRunOptions`].
-fn run_options(options: &RunOptions) -> WorkflowRunOptions {
+/// Projects the run options and the resolved deadline onto the engine's
+/// [`WorkflowRunOptions`].
+///
+/// The deadline comes from `effective_deadline` — the caller's explicit
+/// timeout, else `RunnerConfig::default_run_timeout`, else none — exactly as
+/// the agent paths resolve it, so a configured default really bounds a workflow
+/// run instead of being silently ignored. The engine owns the race between the
+/// run, the token, and the timeout, so the runner does not re-time the call.
+fn run_options(options: &RunOptions, deadline: Option<Duration>) -> WorkflowRunOptions {
     WorkflowRunOptions {
         cancellation: options.cancellation.clone(),
-        timeout: options.timeout,
+        timeout: deadline,
         stream_modes: options.stream_modes.clone(),
         ..WorkflowRunOptions::default()
     }
@@ -367,8 +404,10 @@ fn workflow_teardown(session: Option<Arc<WorkflowSession>>) -> Teardown {
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use openjiuwen_common::error::ErrorKind;
     use openjiuwen_workflow::{
-        ComponentOptions, EndComponent, StartComponent, Workflow, WorkflowCard,
+        Component, ComponentCard, ComponentContext, ComponentOptions, EndComponent, StartComponent,
+        Workflow, WorkflowCard,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -420,6 +459,139 @@ mod tests {
             )
             .add_connection("start", "end");
         workflow
+    }
+
+    /// A component that never returns within a test's lifetime.
+    struct HangingComponent;
+
+    #[async_trait::async_trait]
+    impl Component for HangingComponent {
+        fn card(&self) -> ComponentCard {
+            ComponentCard::new("hang", "hang")
+        }
+
+        fn component_type(&self) -> &'static str {
+            "hang"
+        }
+
+        async fn invoke(&self, _inputs: Value, _ctx: &ComponentContext) -> Result<Value> {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(json!({"done": true}))
+        }
+    }
+
+    /// A component that finishes shortly after any 1 ms deadline would fire.
+    struct SlowComponent;
+
+    #[async_trait::async_trait]
+    impl Component for SlowComponent {
+        fn card(&self) -> ComponentCard {
+            ComponentCard::new("slow", "slow")
+        }
+
+        fn component_type(&self) -> &'static str {
+            "slow"
+        }
+
+        async fn invoke(&self, _inputs: Value, _ctx: &ComponentContext) -> Result<Value> {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(json!({"done": true}))
+        }
+    }
+
+    /// start → `middle` → end, where `middle` is the component under test.
+    fn middle_workflow(middle: impl Component + 'static) -> Workflow {
+        let mut workflow = Workflow::new(WorkflowCard::new("wf"));
+        workflow
+            .set_start_comp("start", StartComponent::new(), ComponentOptions::new())
+            .add_workflow_comp("middle", middle, ComponentOptions::new())
+            .set_end_comp(
+                "end",
+                EndComponent::new(),
+                ComponentOptions::new().with_inputs_schema(json!({"answer": "${middle.done}"})),
+            )
+            .add_connection("start", "middle")
+            .add_connection("middle", "end");
+        workflow
+    }
+
+    /// A services bundle whose configuration carries `secs` as the default run
+    /// deadline.
+    fn services_with_default(secs: Option<f64>) -> RunServices {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut services = services(&events);
+        services.config = services.config.with_default_run_timeout_secs(secs);
+        services
+    }
+
+    // The runner-level default deadline must bound a workflow run, exactly as it
+    // bounds an agent run (`effective_deadline`).
+    #[tokio::test]
+    async fn a_configured_default_deadline_bounds_a_workflow_run() {
+        let services = services_with_default(Some(0.02));
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            invoke_workflow(
+                services,
+                WorkflowRef::of(Arc::new(middle_workflow(HangingComponent))),
+                json!({}),
+                RunOptions::default(),
+            ),
+        )
+        .await
+        .expect("the configured default deadline must bound the run")
+        .expect_err("a hanging component cannot complete");
+        assert_eq!(
+            error.kind(),
+            ErrorKind::Timeout,
+            "the engine reports the deadline as a timeout: {error}"
+        );
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_timeout_wins_over_the_configured_default() {
+        // A 1 ms default would fail this 20 ms component; the explicit 5 s
+        // deadline must take precedence.
+        let services = services_with_default(Some(0.001));
+        let output = invoke_workflow(
+            services,
+            WorkflowRef::of(Arc::new(middle_workflow(SlowComponent))),
+            json!({}),
+            RunOptions::default().with_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .expect("the explicit deadline wins");
+        assert_eq!(output.result, json!({"output": {"answer": true}}));
+    }
+
+    #[test]
+    fn a_disabled_default_deadline_leaves_the_workflow_unbounded() {
+        for secs in [Some(0.0), Some(-1.0), None] {
+            let services = services_with_default(secs);
+            assert_eq!(
+                effective_deadline(&services, &RunOptions::default()),
+                None,
+                "configured default {secs:?} must not bound the run"
+            );
+            assert_eq!(
+                run_options(
+                    &RunOptions::default(),
+                    effective_deadline(&services, &RunOptions::default())
+                )
+                .timeout,
+                None
+            );
+        }
+        // An explicit per-run timeout is still projected on its own.
+        let explicit = Duration::from_millis(25);
+        assert_eq!(
+            run_options(&RunOptions::default(), Some(explicit)).timeout,
+            Some(explicit)
+        );
     }
 
     // ports tests/unit_tests/core/runner/test_runner.py (run_workflow)
@@ -511,6 +683,72 @@ mod tests {
                 .filter(|event| **event == CallbackEvent::WorkflowStreamOutput)
                 .count(),
             frames.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_without_subscribers_yields_the_same_frames() {
+        // No handler is registered: frames must be delivered unchanged and never
+        // projected for the callback hot path.
+        let services = RunServices::new(
+            ResourceMgr::new(),
+            CallbackFramework::new(),
+            RunnerConfig::default(),
+            None,
+        );
+        let frames: Vec<Result<WorkflowChunk>> = stream_workflow(
+            services,
+            WorkflowRef::of(Arc::new(linear_workflow())),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .collect()
+        .await;
+        assert!(!frames.is_empty());
+        assert!(
+            frames.iter().all(Result::is_ok),
+            "unexpected error: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_subscriber_receives_every_frame_in_order() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let services = RunServices::new(
+            ResourceMgr::new(),
+            CallbackFramework::new(),
+            RunnerConfig::default(),
+            None,
+        );
+        let seen = Arc::clone(&observed);
+        services.callbacks.register_sync(
+            CallbackEvent::WorkflowStreamOutput,
+            0,
+            move |ctx: &CallbackContext| {
+                seen.lock().unwrap().push((ctx.index, ctx.output.clone()));
+                Ok(CallbackVerdict::Continue)
+            },
+        );
+        let frames: Vec<Result<WorkflowChunk>> = stream_workflow(
+            services,
+            WorkflowRef::of(Arc::new(linear_workflow())),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .collect()
+        .await;
+        assert!(!frames.is_empty());
+        let observed = observed.lock().unwrap().clone();
+        assert_eq!(
+            observed.len(),
+            frames.len(),
+            "one callback per frame, in order"
+        );
+        assert_eq!(
+            observed.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            (0..frames.len())
+                .map(|index| Some(i64::try_from(index).expect("a frame index fits i64")))
+                .collect::<Vec<_>>()
         );
     }
 

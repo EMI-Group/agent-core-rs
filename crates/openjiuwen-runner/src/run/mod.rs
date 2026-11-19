@@ -47,7 +47,7 @@ use openjiuwen_workflow::Workflow;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::callback::CallbackFramework;
+use crate::callback::{CallbackEvent, CallbackFramework};
 use crate::config::{RunnerConfig, CONVERSATION_ID_KEY};
 use crate::resources::ResourceMgr;
 
@@ -674,6 +674,30 @@ pub(crate) fn effective_deadline(services: &RunServices, options: &RunOptions) -
         .or_else(|| services.config.default_run_timeout())
 }
 
+/// Projects one streamed frame to the callback wire form, but only when `event`
+/// has subscribers.
+///
+/// [`CallbackFramework::trigger`] returns immediately when an event has no
+/// handlers, so a run without subscribers must not pay for `to_value`/`to_wire`
+/// on every frame of a hot stream. The projection closure is therefore evaluated
+/// only when a handler is registered; the run then builds the
+/// [`CallbackContext`](crate::callback::CallbackContext) and triggers it exactly
+/// as before.
+pub(crate) fn stream_frame_output<F>(
+    callbacks: &CallbackFramework,
+    event: CallbackEvent,
+    project: F,
+) -> Option<Value>
+where
+    F: FnOnce() -> Value,
+{
+    if callbacks.has_subscribers(event) {
+        Some(project())
+    } else {
+        None
+    }
+}
+
 /// Projects a serializable value to JSON, falling back to `Null` when the
 /// projection cannot be represented.
 pub(crate) fn to_value<T: serde::Serialize>(value: &T) -> Value {
@@ -970,6 +994,53 @@ mod tests {
             ),
             Some(Duration::from_secs(1))
         );
+    }
+
+    #[test]
+    fn a_zero_or_negative_default_deadline_means_no_deadline() {
+        let mut services = services();
+        for secs in [Some(0.0), Some(-1.0), None] {
+            services.config = services.config.with_default_run_timeout_secs(secs);
+            assert_eq!(
+                effective_deadline(&services, &RunOptions::default()),
+                None,
+                "configured default {secs:?} must not bound the run"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stream_frame_is_projected_only_when_the_event_has_subscribers() {
+        let services = services();
+        let projects = std::cell::Cell::new(0_u32);
+        let project = || {
+            projects.set(projects.get() + 1);
+            json!({"frame": true})
+        };
+        assert_eq!(
+            stream_frame_output(
+                &services.callbacks,
+                CallbackEvent::AgentStreamOutput,
+                project
+            ),
+            None
+        );
+        assert_eq!(projects.get(), 0, "no subscriber means no projection");
+
+        services
+            .callbacks
+            .register_sync(CallbackEvent::AgentStreamOutput, 0, |_ctx| {
+                Ok(crate::callback::CallbackVerdict::Continue)
+            });
+        assert_eq!(
+            stream_frame_output(
+                &services.callbacks,
+                CallbackEvent::AgentStreamOutput,
+                project
+            ),
+            Some(json!({"frame": true}))
+        );
+        assert_eq!(projects.get(), 1, "a subscriber gets the projected frame");
     }
 
     #[test]

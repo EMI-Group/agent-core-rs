@@ -450,7 +450,7 @@ async fn force_kill_finishes_the_run_as_cancelled() {
 }
 
 #[test]
-fn dropping_an_unfinished_handle_finishes_it() {
+fn dropping_an_unfinished_handle_finishes_it_as_cancelled() {
     let monitor = Arc::new(RunMonitor::new());
     let child: Arc<dyn SpawnedAgent> = Arc::new(FakeChild::new("child-8", SpawnBackend::InProcess));
     let handle = MonitoredSpawnedAgent::track(
@@ -462,7 +462,11 @@ fn dropping_an_unfinished_handle_finishes_it() {
     let run_id = handle.run_id().to_owned();
     drop(handle);
     let status = monitor.snapshot(&run_id).unwrap();
-    assert_eq!(status.phase, RunPhase::Completed);
+    assert_eq!(
+        status.phase,
+        RunPhase::Cancelled,
+        "an abandoned handle is not a successful run"
+    );
     assert_eq!(status.detail, json!({"reason": "handle_dropped"}));
     assert_eq!(monitor.list_active().len(), 0);
 }
@@ -813,7 +817,11 @@ async fn shutdown_and_drop_stop_the_supervised_loop() {
         .await
         .expect("the drop reports its terminal transition")
         .expect("an event");
-    assert_eq!(terminal.phase, RunPhase::Completed);
+    assert_eq!(
+        terminal.phase,
+        RunPhase::Cancelled,
+        "an abandoned handle is not a successful run"
+    );
     assert!(
         tokio::time::timeout(Duration::from_millis(120), events.recv())
             .await
