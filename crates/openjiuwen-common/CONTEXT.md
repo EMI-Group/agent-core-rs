@@ -31,7 +31,7 @@ Card JSON is one-to-one with Python `BaseCard.model_dump()` for the shared field
 
 ### `logging` — `crate::logging`
 `levels`: `normalize_level(&str) -> tracing::level_filters::LevelFilter` with Python aliases (`CRITICAL`/`FATAL` → `ERROR`, `WARN` → `WARN`, case-insensitive), unknown → `WARNING`; `parse_level(&str) -> Option<tracing::Level>`; `DEFAULT_CONFIG_LEVEL = INFO`, `DEFAULT_FALLBACK_LEVEL = WARN`.
-`subscriber`: `LoggingConfig { level, format, writer, ansi, filter }`, `LogFormat::{Text, Json}`, `LogWriter::{Stdout, Stderr, File(PathBuf)}`, `init() -> Result<()>` (reads `OPENJIUWEN_LOG_LEVEL`/`OPENJIUWEN_LOG_FORMAT`, defaults `INFO`/`Text`), `init_with(config: &LoggingConfig) -> Result<()>`, both idempotent (second call returns `Ok(())`), `is_initialized() -> bool`; never panics and never installs a second global subscriber; file writer is a `MakeWriter` (rotation is deferred — a binary owns log rotation).
+`subscriber`: `LoggingConfig { level, format, writer, ansi, filter }`, `LogFormat::{Text, Json}`, `LogWriter::{Stdout, Stderr, File(PathBuf)}`, `init() -> Result<()>` (reads `OPENJIUWEN_LOG_LEVEL`/`OPENJIUWEN_LOG_FORMAT`, defaults `INFO`/`Text`), `init_with(config: &LoggingConfig) -> Result<()>`, both idempotent (second call returns `Ok(())`), `is_initialized() -> bool`; never panics and never installs a second global subscriber; `FileMakeWriter` is a `MakeWriter` whose writers only enqueue into one bounded (4096-record) queue drained by a dedicated `openjiuwen-log-writer` thread, so a logging call never performs or waits for file I/O; `FileWriter::write` reports a full queue (`WouldBlock`), a shut-down thread, or the first failure the writer thread recorded, `FileWriter::flush` and `FileMakeWriter::flush() -> Result<()>` drain the queue and return the real `write_all`/`flush` outcome, and dropping the last handle closes the queue and joins the thread; rotation is deferred — a binary owns log rotation.
 `scope`: `LogScope { trace_id, member_id, session_id, invocation_id, agent_id, conversation_id }` (all optional except trace_id), `LogScope::new()` (generates trace id), builders, `span() -> tracing::Span` (records scope fields), `with_scope(Arc<LogScope>, fut)` (tokio task-local), `Arc<LogScope>::instrument(fut)` (span + task-local in one future, the supported way to cross `tokio::spawn`), `current() -> Option<Arc<LogScope>>`, `current_trace_id() -> String` (default `"default_trace_id"`, Python parity), `current_member_id() -> String` (default `""`; `DEFAULT_TRACE_ID` names the default).
 `events`: `ModuleType`, `EventStatus`, `EventType` (string newtype + well-known consts), `LogEvent` with Python `BaseLogEvent` fields (`event_id`, `event_type`, `log_level`, `timestamp`, `module_type`, `module_id`, `module_name`, `session_id`, `conversation_id`, `trace_id`, `correlation_id`, `parent_event_id`, `status`, `error_code`, `error_message`, `message`, `stacktrace`, `exception`, `metadata`) plus `to_dict()`/`to_value()` dropping nulls, serializing enums as their Python values, timestamps as ISO-8601, and setting `error_code = "-1"` for attached exceptions (Python parity); `redacted(fields)` applies `security::redact`.
 `targets`: `&'static str` target names for the Python loggers (`COMMON`, `AGENT`, `WORKFLOW`, `LLM`, `TOOL`, `SESSION`, ...).
@@ -51,6 +51,7 @@ Card JSON is one-to-one with Python `BaseCard.model_dump()` for the shared field
 `RetryPolicy` with `backoff(attempt) -> Duration` (exponential, capped, jittered) and `is_retryable_status`.
 `HttpClient::{new, with_defaults, request, get, get_json, post_json, execute, execute_cancellable, stream}`; `HttpRequest` builder (method, url, `query`, `header`/`with_headers`, `SecretString` `bearer`, JSON/text/bytes body, per-request `timeout`, `cancel` token — `headers()` is the accessor, the bulk builder is `with_headers`); `HttpResponse { status, headers, url, body }` with `text`, `json<T>`, `is_success`, `error_for_status`; `HttpStream = BoxStream<'static, Result<Bytes>>`; dropping the stream cancels the transfer.
 Retries cover transport errors, timeouts, and retryable statuses (default 429/500/502/503/504) with replayable bodies; non-2xx responses are returned, not raised (Python `raise_for_status=False` default); cancellation maps to `Error::Cancelled`, timeouts to `Error::Timeout`, transport failures to `Error::Transport`.
+Every URL that reaches an error string (invalid proxy, invalid request URL, `error_for_status`, `json`) passes through a private `redact_credentials` that applies `security::redact_url_password` and, when the URL is unparseable, masks the userinfo password itself, so `user:password@host` never appears in logs or errors.
 
 ### `task` — `crate::task::{TaskManager, TaskHandle, TaskStatus, TaskInfo, TaskOptions, TaskId}`
 `TaskManager::{new, global, spawn, spawn_in_group, spawn_with, list, get, len, is_empty, cancel, cascade_cancel, cancel_group, cancel_all, wait_all, remove_finished, shutdown, subscribe}` (Clone over one `Arc`; `new() -> Self`, `global() -> Self`); `TaskHandle::{id, name, group, status, info, cancellation, cancel, abort, join, detach}`; `TaskStatus::{Pending, Running, Completed, Failed, Cancelled, Timeout}` with `is_terminal`; `TaskOptions` (`name`, `group`, `timeout`, `metadata`); `TaskInfo` is a serializable snapshot (`id`, `name`, `group`, `status`, `parent_id`, timestamps, `error`, `cancel_reason`, `cancelled_by`, `metadata`) with `display_name()` and `duration_ms()`.
@@ -60,6 +61,7 @@ Panics are isolated with `FutureExt::catch_unwind` and recorded as `Failed`; `jo
 
 ### `utils` — `crate::utils::{json, id, string, hash}`
 `json`: `merge(&mut Value, Value)` (deep object merge, otherwise replace), `get_path(&Value, "a.b[0].c")`, `set_path(&mut Value, path, value)`, `content_to_text(&Value) -> Option<String>` (tolerant string / text-part array / `{"text": ...}`), `flatten(&Value, "...")`, `is_empty_object`.
+`json::MAX_JSON_INDEX` (= `constants::MAX_COLLECTION_SIZE`, 100 000) bounds the address space: `parse_path` rejects an index above it and a path whose `index + 1` slots sum past `MAX_JSON_INDEX * 2` with `Error::Validation` naming the index and the limit, before anything is written, so `set_path("a[1000000000]", …)` allocates nothing; `get_path` returns `None` for the same paths and `set_segments` re-checks defensively and reserves with `try_reserve`.
 `id`: `uuid_v4()`, `uuid_hex()` (Python card/event id form), `now_utc()`, `now_local()`, `format_iso8601`, `now_rfc3339`, `unix_millis()`.
 `string`: `sanitize_message` (escapes control chars as `\r \n \t \b \v \f \0` / `\xNN`, Python `_sanitize_message`), `truncate_chars`, `format_log_filename` (Python `{name} {ext} {pid} {timestamp=...} {date} {time} {datetime}` placeholders, UTC), `format_schema_error`.
 `hash`: `generate_key(api_key, api_base, model_provider)` = sha256 hex of the sorted concatenation (Python `utils.hash_util` parity).
@@ -81,8 +83,8 @@ Panics are isolated with `FutureExt::catch_unwind` and recorded as `Failed`; `jo
 
 ## Test Strategy
 
-- Unit tests live beside each module (`#[cfg(test)] mod tests`) and are deterministic and offline: 182 tests.
-- Integration tests exercise the crate as an external consumer (public paths only) and live in `tests/`: `error_contract.rs` (15), `card_json.rs` (12), `config_env.rs` (17), `logging_scope.rs` (16), `http_retry.rs` (11, `wiremock`), `task_manager.rs` (4).
+- Unit tests live beside each module (`#[cfg(test)] mod tests`) and are deterministic and offline: 193 tests.
+- Integration tests exercise the crate as an external consumer (public paths only) and live in `tests/`: `error_contract.rs` (15), `card_json.rs` (12), `config_env.rs` (17), `logging_scope.rs` (16), `http_retry.rs` (11, `wiremock`), `task_manager.rs` (4), `json_path_limits.rs` (3, the bounded path address space via `MAX_JSON_INDEX`).
 - Doc tests cover every public helper's documented example (26).
 - Env-var tests serialize with a shared mutex and restore the previous value, because environment variables are process-global.
 - Behavior ports cite the Python test file in a comment, e.g. `// port of tests/unit_tests/core/common/test_errors.py`.
@@ -101,12 +103,9 @@ Panics are isolated with `FutureExt::catch_unwind` and recorded as `Failed`; `jo
 
 ## Known Issues
 
-- `src/utils/json.rs:263` — `set_segments` pads an array with `Value::Null` up to the requested `[index]` with no cap, so a caller-supplied path such as `items[1000000000]` (reachable via `openjiuwen_session::state::paths::set_value` and the graph state API) allocates until the process aborts; reject indices above a documented maximum with `Error::Validation`.
 - `src/task/manager.rs:509` — terminal tasks leave the registry only through an explicit `remove_finished()`, so a long-lived manager (including `TaskManager::global()`) grows per spawn and `list()` clones every dead snapshot while holding the registry lock.
 - `src/task/` has no consumer anywhere else in the workspace (`openjiuwen_core::common::task` is reachable but unused), so the structured-task guarantees are exercised only by this crate's tests.
-- `src/logging/subscriber.rs:363` — the file writer performs a blocking `write(2)` under a process-wide `parking_lot::Mutex` on whatever thread emits the record (usually a tokio worker) and returns `Ok(buf.len())` even when the write failed or was short.
 - `src/logging/events.rs:613` — `emit` builds the redacted JSON payload (a full clone of the event tree plus serialization) before `tracing` consults the level filter, so a filtered-out level still pays the whole cost.
-- `src/http/client.rs:349` — an invalid proxy URL is formatted into `Error::Validation` verbatim, so `http://user:password@proxy` leaks credentials into logs and error strings; `security::redact_url_password` exists but has no caller in `src`.
 
 ## Notes for Agents
 
@@ -119,6 +118,8 @@ Panics are isolated with `FutureExt::catch_unwind` and recorded as `Failed`; `jo
 - `HttpClientConfig.headers` are sanitized: `authorization`, `host`, `content-length`, `transfer-encoding`, and `connection` are dropped; pass credentials through `HttpRequest::bearer` or per-request headers.
 - Timeouts and cancellation surface as `ErrorKind::Timeout` / `ErrorKind::Cancelled`; non-2xx responses are returned normally — call `error_for_status()` when a failure must become an error.
 - `Error` itself is not `Serialize`/`Deserialize` (it wraps `dyn Error` and is `#[derive(Debug, thiserror::Error)]` only); serialize `ErrorKind` and `Error::message()` instead.
+- JSON paths are bounded: an index above `utils::json::MAX_JSON_INDEX` (or a path whose padding would exceed twice that) is `Error::Validation`, so treat `set_path`'s error as a caller-input error, not an internal one.
+- `FileMakeWriter` writes asynchronously: call `FileMakeWriter::flush()` before a short-lived process exits if the log tail matters, and expect the first write failure to surface on `flush` or on the next `write`.
 - Header builder names clash by design: `HttpClientConfig::with_headers` *replaces* the default header map, while `HttpRequest::with_headers` *extends* it (`header()` inserts one).
 
 ## Routing Table

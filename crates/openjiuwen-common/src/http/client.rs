@@ -26,7 +26,7 @@ use crate::config::env;
 use crate::error::{Error, Result};
 use crate::http::config::HttpClientConfig;
 use crate::security::redact::sanitize_headers;
-use crate::security::SecretString;
+use crate::security::{redact_url_password, SecretString};
 
 /// The maximum number of redirects followed when enabled.
 const MAX_REDIRECTS: usize = 10;
@@ -258,7 +258,10 @@ impl HttpResponse {
     /// Returns [`Error::Validation`] when the body is not valid JSON for `T`.
     pub fn json<T: DeserializeOwned>(&self) -> Result<T> {
         serde_json::from_slice(&self.body).map_err(|err| {
-            Error::validation(format!("decoding JSON response from {}: {err}", self.url))
+            Error::validation(format!(
+                "decoding JSON response from {}: {err}",
+                redact_credentials(&self.url)
+            ))
         })
     }
 
@@ -280,7 +283,8 @@ impl HttpResponse {
         } else {
             Err(Error::transport(format!(
                 "HTTP {} for {}",
-                self.status, self.url
+                self.status,
+                redact_credentials(&self.url)
             )))
         }
     }
@@ -346,7 +350,10 @@ impl HttpClient {
         let proxy_url = config.proxy.clone().or_else(env::http_proxy);
         if let Some(proxy_url) = proxy_url {
             let proxy = reqwest::Proxy::all(&proxy_url).map_err(|err| {
-                Error::validation(format!("invalid proxy URL {proxy_url:?}: {err}"))
+                Error::validation(format!(
+                    "invalid proxy URL {:?}: {err}",
+                    redact_credentials(&proxy_url)
+                ))
             })?;
             let no_proxy = env::no_proxy()
                 .as_deref()
@@ -688,14 +695,84 @@ fn validate_url(raw: &str) -> Result<String> {
         return Err(Error::validation("URL must not be empty"));
     }
 
-    let parsed = url::Url::parse(trimmed)
-        .map_err(|err| Error::validation(format!("invalid URL {trimmed:?}: {err}")))?;
+    let parsed = url::Url::parse(trimmed).map_err(|err| {
+        Error::validation(redact_credentials(&format!(
+            "invalid URL {trimmed:?}: {err}"
+        )))
+    })?;
     match parsed.scheme() {
         "http" | "https" => Ok(trimmed.to_owned()),
         scheme => Err(Error::validation(format!(
             "unsupported URL scheme {scheme:?}: only http and https are allowed"
         ))),
     }
+}
+
+/// Masks every password embedded in a URL (or inside a message quoting one).
+///
+/// [`redact_url_password`] is the canonical helper, but it deliberately returns an
+/// unparseable URL unchanged — and a malformed proxy URL is exactly the value that
+/// reaches an error message. When the parsed helper leaves the text untouched, the
+/// userinfo password is masked by scanning the authority of each `scheme://...`
+/// occurrence, so `http://user:secret@proxy:port` (invalid port, hence unparseable)
+/// is reported as `http://user:***@proxy:port`.
+#[must_use]
+fn redact_credentials(text: &str) -> String {
+    let redacted = redact_url_password(text);
+    if redacted != text {
+        return redacted;
+    }
+    mask_userinfo_passwords(text).unwrap_or_else(|| text.to_owned())
+}
+
+/// Replaces the password of every `scheme://user:password@host` occurrence.
+///
+/// Returns `None` when the text contains no password to mask. Authorities end at
+/// the characters that terminate a URL inside prose (`/ ? #`, quotes, brackets,
+/// parentheses, whitespace, ...) so a message quoting two URLs masks both instead
+/// of treating everything up to the last `@` as one authority.
+#[must_use]
+fn mask_userinfo_passwords(text: &str) -> Option<String> {
+    let mut masked = String::with_capacity(text.len());
+    let mut changed = false;
+    let mut rest = text;
+
+    while let Some(scheme) = rest.find("://") {
+        let start = scheme + 3;
+        let end = authority_end(rest, start);
+        let authority = &rest[start..end];
+
+        if let Some(at) = authority.rfind('@') {
+            let userinfo = &authority[..at];
+            if let Some((user, password)) = userinfo.split_once(':') {
+                if !password.is_empty() {
+                    masked.push_str(&rest[..start]);
+                    masked.push_str(user);
+                    masked.push_str(":***@");
+                    masked.push_str(&authority[at + 1..]);
+                    changed = true;
+                    rest = &rest[end..];
+                    continue;
+                }
+            }
+        }
+
+        // Nothing to mask in this authority; keep it verbatim and keep scanning.
+        masked.push_str(&rest[..end]);
+        rest = &rest[end..];
+    }
+
+    masked.push_str(rest);
+    changed.then_some(masked)
+}
+
+/// Returns the offset where the URL authority starting at `start` ends.
+fn authority_end(text: &str, start: usize) -> usize {
+    text[start..]
+        .find(|character: char| {
+            character.is_whitespace() || "/?#\"'`<>(),;\\|}{^".contains(character)
+        })
+        .map_or(text.len(), |offset| start + offset)
 }
 
 /// The error returned when a body exceeds `max_response_bytes`.
@@ -863,5 +940,89 @@ mod tests {
         let sanitized = sanitize_headers(&headers);
         assert!(!sanitized.contains_key("Authorization"));
         assert_eq!(sanitized.get("X-Custom").map(String::as_str), Some("value"));
+    }
+
+    #[test]
+    fn invalid_proxy_url_does_not_leak_its_password() {
+        // `proxy:port` is not a numeric port, so the URL stays unparseable and the
+        // parsed redaction helper cannot mask it.
+        let config = HttpClientConfig::default().with_proxy("http://user:s3cr3t@proxy:port");
+        let error = HttpClient::new(config).unwrap_err();
+
+        assert_eq!(error.kind(), crate::error::ErrorKind::Validation);
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(!display.contains("s3cr3t"), "display: {display}");
+        assert!(!debug.contains("s3cr3t"), "debug: {debug}");
+        assert!(
+            display.contains("user:***@proxy:port"),
+            "the password is masked in place: {display}"
+        );
+    }
+
+    #[test]
+    fn invalid_url_does_not_leak_its_password() {
+        let error = validate_url("https://user:s3cr3t@example.com:badport/x").unwrap_err();
+        assert_eq!(error.kind(), crate::error::ErrorKind::Validation);
+        assert!(!error.to_string().contains("s3cr3t"), "{error}");
+        assert!(
+            error.to_string().contains("user:***@example.com:badport"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn status_and_json_errors_mask_credentials_in_the_url() {
+        let failed = HttpResponse {
+            status: 401,
+            headers: HeaderMap::new(),
+            url: "https://user:s3cr3t@example.com/missing".to_owned(),
+            body: Bytes::new(),
+        };
+        let error = failed.error_for_status().unwrap_err();
+        assert!(!error.to_string().contains("s3cr3t"), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "transport: HTTP 401 for https://user:***@example.com/missing"
+        );
+
+        let invalid = HttpResponse {
+            status: 200,
+            headers: HeaderMap::new(),
+            url: "https://user:s3cr3t@example.com/v1".to_owned(),
+            body: Bytes::from_static(b"not json"),
+        };
+        let error = invalid.json::<serde_json::Value>().unwrap_err();
+        assert!(!error.to_string().contains("s3cr3t"), "{error}");
+        assert!(
+            error.to_string().contains("user:***@example.com"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn redact_credentials_masks_every_occurrence_and_leaves_clean_text_alone() {
+        assert_eq!(
+            redact_credentials("https://user:secret@example.com/a"),
+            "https://user:***@example.com/a"
+        );
+        assert_eq!(
+            redact_credentials("bad proxy \"http://u:p@h:port\" and echo (http://u:p@h:port) here"),
+            "bad proxy \"http://u:***@h:port\" and echo (http://u:***@h:port) here"
+        );
+        // No credentials, no host:port to mask, or an empty password: unchanged.
+        assert_eq!(
+            redact_credentials("https://example.com/a?b=c#d"),
+            "https://example.com/a?b=c#d"
+        );
+        assert_eq!(
+            redact_credentials("max_retries must be >= 0"),
+            "max_retries must be >= 0"
+        );
+        assert_eq!(
+            redact_credentials("redis://:secret@host:6379/0"),
+            "redis://:***@host:6379/0"
+        );
+        assert_eq!(redact_credentials(""), "");
     }
 }
