@@ -68,6 +68,9 @@ impl DispatchTable {
     /// static targets come first, followed by every router's result, deduped in
     /// order. An empty [`NodeOutcome::Route`] falls back to normal routing.
     ///
+    /// `state` is the run's shared state: one [`RouterContext`] serves every
+    /// router of this dispatch, so routing never copies the state.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::graph`] when a target is not a node of the graph, or
@@ -76,7 +79,7 @@ impl DispatchTable {
         &self,
         node_id: &str,
         outcome: &NodeOutcome,
-        state: &crate::state::GraphState,
+        state: &Arc<crate::state::GraphState>,
         ctx: &GraphContext,
     ) -> Result<Vec<String>> {
         if let NodeOutcome::Route { targets } = outcome {
@@ -88,23 +91,25 @@ impl DispatchTable {
             return Ok(Vec::new());
         };
         let mut targets: Vec<String> = entry.static_targets.clone();
-        for router in &entry.routers {
-            let router_ctx = RouterContext::new(
+        if !entry.routers.is_empty() {
+            let router_ctx = RouterContext::new_shared(
                 node_id.to_string(),
-                state.clone(),
+                Arc::clone(state),
                 ctx.superstep(),
                 Arc::clone(ctx.session()),
                 ctx.metadata_arc(),
             );
-            let result = router.route(&router_ctx).await.map_err(|error| {
-                error.with_context(format!(
-                    "router `{}` for node `{node_id}` failed",
-                    router.name()
-                ))
-            })?;
-            for target in result {
-                if !targets.contains(&target) {
-                    targets.push(target);
+            for router in &entry.routers {
+                let result = router.route(&router_ctx).await.map_err(|error| {
+                    error.with_context(format!(
+                        "router `{}` for node `{node_id}` failed",
+                        router.name()
+                    ))
+                })?;
+                for target in result {
+                    if !targets.contains(&target) {
+                        targets.push(target);
+                    }
                 }
             }
         }
@@ -181,8 +186,8 @@ mod tests {
         )
     }
 
-    fn state() -> GraphState {
-        GraphState::from_value(json!({"go": true})).unwrap()
+    fn state() -> Arc<GraphState> {
+        Arc::new(GraphState::from_value(json!({"go": true})).unwrap())
     }
 
     #[tokio::test]
@@ -267,6 +272,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.message().contains("unknown node `zzz`"));
+    }
+
+    #[tokio::test]
+    async fn routers_share_the_state_instead_of_copying_it() {
+        // Every router of one dispatch must observe the very same allocation.
+        let seen: Arc<std::sync::Mutex<Vec<usize>>> = Arc::default();
+        let router = |name: &'static str| {
+            let seen = Arc::clone(&seen);
+            Arc::new(FnRouter::new(name, move |ctx: &RouterContext| {
+                let observed = Arc::as_ptr(ctx.state_arc()) as usize;
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    seen.lock().unwrap().push(observed);
+                    Ok(vec!["c".to_string()])
+                })
+            })) as Arc<dyn Router>
+        };
+        let table = DispatchTable::compile(
+            &spec(Vec::new()),
+            &[("a".to_string(), router("first")), ("a".to_string(), router("second"))],
+        )
+        .unwrap();
+        let shared = state();
+        let pointer = Arc::as_ptr(&shared) as usize;
+        let targets = table
+            .targets_for("a", &NodeOutcome::Continue, &shared, &context())
+            .await
+            .unwrap();
+        assert_eq!(targets, vec!["c".to_string()]);
+        let seen = seen.lock().unwrap();
+        assert_eq!(*seen, vec![pointer, pointer]);
     }
 
     #[test]

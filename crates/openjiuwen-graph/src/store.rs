@@ -85,10 +85,19 @@ pub trait GraphStore: Send + Sync + std::fmt::Debug {
     /// Saves `snapshot` for `session_id` in `namespace`, replacing any previous
     /// snapshot.
     ///
+    /// The snapshot is borrowed: the executor keeps the boundary it just saved
+    /// as the resume point of a later failure, so a backend that can serialize
+    /// or copy only what it stores never forces a second deep copy.
+    ///
     /// # Errors
     ///
     /// Returns an error when the backend cannot write the snapshot.
-    async fn save(&self, session_id: &str, namespace: &str, snapshot: GraphSnapshot) -> Result<()>;
+    async fn save(
+        &self,
+        session_id: &str,
+        namespace: &str,
+        snapshot: &GraphSnapshot,
+    ) -> Result<()>;
 
     /// Deletes the snapshot of `session_id` in `namespace`, or every snapshot of
     /// the session when `namespace` is `None`.
@@ -150,9 +159,16 @@ impl GraphStore for InMemoryGraphStore {
             .cloned())
     }
 
-    async fn save(&self, session_id: &str, namespace: &str, snapshot: GraphSnapshot) -> Result<()> {
-        self.lock()
-            .insert((session_id.to_string(), namespace.to_string()), snapshot);
+    async fn save(
+        &self,
+        session_id: &str,
+        namespace: &str,
+        snapshot: &GraphSnapshot,
+    ) -> Result<()> {
+        self.lock().insert(
+            (session_id.to_string(), namespace.to_string()),
+            snapshot.clone(),
+        );
         Ok(())
     }
 
@@ -222,8 +238,13 @@ impl GraphStore for CheckpointerStore {
         }
     }
 
-    async fn save(&self, session_id: &str, namespace: &str, snapshot: GraphSnapshot) -> Result<()> {
-        let global_state = serde_json::to_value(&snapshot).map_err(|error| {
+    async fn save(
+        &self,
+        session_id: &str,
+        namespace: &str,
+        snapshot: &GraphSnapshot,
+    ) -> Result<()> {
+        let global_state = serde_json::to_value(snapshot).map_err(|error| {
             Error::graph(format!("graph snapshot is not serializable: {error}"))
         })?;
         let checkpoint = Checkpoint::new(
@@ -301,9 +322,9 @@ mod tests {
         assert!(store.is_empty());
         assert!(store.get("s1", "ns").await.unwrap().is_none());
 
-        store.save("s1", "ns", snapshot()).await.unwrap();
-        store.save("s1", "other", snapshot()).await.unwrap();
-        store.save("s2", "ns", snapshot()).await.unwrap();
+        store.save("s1", "ns", &snapshot()).await.unwrap();
+        store.save("s1", "other", &snapshot()).await.unwrap();
+        store.save("s2", "ns", &snapshot()).await.unwrap();
         assert_eq!(store.len(), 3);
 
         let loaded = store.get("s1", "ns").await.unwrap().unwrap();
@@ -328,7 +349,7 @@ mod tests {
         assert_eq!(store.entity_id(), "workflow-1");
         assert!(store.get("s1", "ns").await.unwrap().is_none());
 
-        store.save("s1", "ns", snapshot()).await.unwrap();
+        store.save("s1", "ns", &snapshot()).await.unwrap();
         let checkpoint = checkpointer.load("s1", "ns").await.unwrap().unwrap();
         assert_eq!(checkpoint.namespace, CheckpointNamespace::WorkflowGraph);
         assert_eq!(checkpoint.entity_id, "workflow-1");
@@ -339,7 +360,7 @@ mod tests {
         store.delete("s1", Some("ns")).await.unwrap();
         assert!(store.get("s1", "ns").await.unwrap().is_none());
 
-        store.save("s1", "ns", snapshot()).await.unwrap();
+        store.save("s1", "ns", &snapshot()).await.unwrap();
         store.delete("s1", None).await.unwrap();
         assert!(store.get("s1", "ns").await.unwrap().is_none());
         assert!(!checkpointer.session_exists("s1").await.unwrap());

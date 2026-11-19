@@ -520,7 +520,7 @@ mod tests {
             .unwrap();
         let stored: Arc<dyn GraphStore> = graph.inner.store.clone().unwrap();
         stored
-            .save("s1", "ns", crate::store::GraphSnapshot::default())
+            .save("s1", "ns", &crate::store::GraphSnapshot::default())
             .await
             .unwrap();
         assert_eq!(store.len(), 1);
@@ -538,7 +538,7 @@ mod tests {
         assert_eq!(graph.inner.namespace, "g");
         let stored = graph.inner.store.clone().unwrap();
         stored
-            .save("s1", "g", crate::store::GraphSnapshot::default())
+            .save("s1", "g", &crate::store::GraphSnapshot::default())
             .await
             .unwrap();
         assert_eq!(checkpointer.len("s1"), 1);

@@ -181,8 +181,8 @@ async fn in_memory_store_deletes_per_namespace_and_per_session() {
         channels: std::collections::BTreeMap::new(),
         buffer: Vec::new(),
     };
-    store.save("s1", "chain", snapshot.clone()).await.unwrap();
-    store.save("s2", "chain", snapshot).await.unwrap();
+    store.save("s1", "chain", &snapshot).await.unwrap();
+    store.save("s2", "chain", &snapshot).await.unwrap();
     assert_eq!(store.len(), 2);
 
     store.delete("s1", Some("chain")).await.unwrap();

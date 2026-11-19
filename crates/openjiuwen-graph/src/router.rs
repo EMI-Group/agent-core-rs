@@ -20,20 +20,24 @@ use openjiuwen_session::Session;
 use crate::state::GraphState;
 
 /// The read-only view a [`Router`] receives.
+///
+/// The state is shared through an [`Arc`], so every router of one dispatch reads
+/// the very same allocation and routing never copies the state.
 #[derive(Clone)]
 pub struct RouterContext {
     source: String,
-    state: GraphState,
+    state: Arc<GraphState>,
     superstep: u32,
     session: Arc<dyn Session>,
     metadata: Arc<BTreeMap<String, Value>>,
 }
 
 impl RouterContext {
-    /// Builds a context; the engine is the only constructor.
-    pub(crate) fn new(
+    /// Builds a context over an already shared state; the engine is the only
+    /// constructor.
+    pub(crate) fn new_shared(
         source: impl Into<String>,
-        state: GraphState,
+        state: Arc<GraphState>,
         superstep: u32,
         session: Arc<dyn Session>,
         metadata: Arc<BTreeMap<String, Value>>,
@@ -56,6 +60,15 @@ impl RouterContext {
     /// Returns the state after the source node's result was merged.
     #[must_use]
     pub fn state(&self) -> &GraphState {
+        self.state.as_ref()
+    }
+
+    /// Returns the shared handle of [`RouterContext::state`].
+    ///
+    /// Cloning it is free and never copies the state, so a router that needs to
+    /// keep the state can retain the handle instead of cloning the map.
+    #[must_use]
+    pub fn state_arc(&self) -> &Arc<GraphState> {
         &self.state
     }
 
@@ -172,9 +185,9 @@ mod tests {
 
     #[allow(clippy::unused_async)]
     async fn context() -> RouterContext {
-        RouterContext::new(
+        RouterContext::new_shared(
             "source",
-            GraphState::from_value(json!({"go": true})).unwrap(),
+            Arc::new(GraphState::from_value(json!({"go": true})).unwrap()),
             2,
             Arc::new(WorkflowSession::new("s1")) as Arc<dyn Session>,
             Arc::new(BTreeMap::new()),
@@ -221,5 +234,17 @@ mod tests {
         assert_eq!(ctx.session().id(), "s1");
         assert!(ctx.metadata().is_empty());
         assert!(format!("{ctx:?}").contains("source"));
+    }
+
+    #[tokio::test]
+    async fn context_state_is_shared_not_copied() {
+        let ctx = context().await;
+        let shared = Arc::clone(ctx.state_arc());
+        assert!(Arc::ptr_eq(&shared, ctx.state_arc()));
+        assert!(std::ptr::eq(ctx.state(), shared.as_ref()));
+        // Cloning a context clones the handle, never the state.
+        let cloned = ctx.clone();
+        assert!(Arc::ptr_eq(cloned.state_arc(), ctx.state_arc()));
+        assert_eq!(Arc::strong_count(&shared), 3);
     }
 }

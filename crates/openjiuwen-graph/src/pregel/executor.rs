@@ -9,6 +9,8 @@
 //! node's top-level key removals propagate to the run state.
 
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::Future;
@@ -73,6 +75,34 @@ impl EventSink {
 /// The outcome of one node's attempts within a superstep.
 type NodeRunResult = Result<(GraphState, NodeOutcome)>;
 
+/// Counts the boundary snapshots a run builds.
+///
+/// A test-only seam: production runs carry [`BoundaryProbe::default`], whose
+/// [`BoundaryProbe::record`] compiles away, while unit tests pass a counter and
+/// prove that a store-less run copies no state for a snapshot no backend could
+/// persist, and that a stored run builds exactly one snapshot per boundary.
+#[derive(Clone, Default)]
+struct BoundaryProbe {
+    #[cfg(test)]
+    count: Option<Arc<AtomicUsize>>,
+}
+
+impl BoundaryProbe {
+    /// Counts every snapshot into `count`.
+    #[cfg(test)]
+    fn counting(count: Arc<AtomicUsize>) -> Self {
+        Self { count: Some(count) }
+    }
+
+    /// Records one built snapshot.
+    fn record(&self) {
+        #[cfg(test)]
+        if let Some(count) = &self.count {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// A node result tagged with its declaration index and id, so outcomes of a
 /// concurrent superstep can be applied deterministically.
 type OrderedNodeResult = (usize, String, NodeRunResult);
@@ -90,6 +120,18 @@ pub(crate) async fn execute(
     input: serde_json::Value,
     session: Arc<dyn Session>,
     options: ExecutionOptions,
+) -> Result<GraphRunResult> {
+    execute_probed(inner, input, session, options, BoundaryProbe::default()).await
+}
+
+/// [`execute`] with the boundary-snapshot probe the unit tests count with.
+#[allow(clippy::too_many_lines)] // the superstep loop reads best as one sequence
+async fn execute_probed(
+    inner: Arc<CompiledInner>,
+    input: serde_json::Value,
+    session: Arc<dyn Session>,
+    options: ExecutionOptions,
+    probe: BoundaryProbe,
 ) -> Result<GraphRunResult> {
     let mut state = GraphState::new();
     let mut channels = inner.channels.clone();
@@ -148,13 +190,23 @@ pub(crate) async fn execute(
     let mut visited: Vec<String> = Vec::new();
     let mut halted: Option<HaltInfo> = None;
 
+    // The run state is shared with routers through an `Arc`: routing never
+    // copies it, and `Arc::make_mut` keeps merges copy-on-write (a merge copies
+    // the state only while a router still holds the pre-merge one).
+    let mut state = Arc::new(state);
+
+    // The boundary a failed run persists: the initial state before the first
+    // superstep, then the last completed superstep's snapshot. It is built only
+    // when a store is attached, so a store-less run never deep-copies the state
+    // for a snapshot no backend could persist.
+    let mut boundary = snapshot_if_stored(&inner, &state, &channels, superstep, &probe);
+
     loop {
         if options.cancellation.is_cancelled() {
-            let boundary = boundary_snapshot(&inner, &state, &channels, superstep);
             let error = fail(
                 &inner,
                 &session,
-                Some(boundary),
+                boundary.as_ref(),
                 superstep,
                 Error::cancelled(),
                 &sink,
@@ -168,16 +220,14 @@ pub(crate) async fn execute(
             break;
         }
         if superstep as usize >= max_supersteps {
-            let boundary = boundary_snapshot(&inner, &state, &channels, superstep);
             let error = Error::graph(format!(
                 "graph `{}` exceeded the maximum of {max_supersteps} supersteps",
                 inner.graph_id
             ));
-            let error = fail(&inner, &session, Some(boundary), superstep, error, &sink).await;
+            let error = fail(&inner, &session, boundary.as_ref(), superstep, error, &sink).await;
             return Err(error);
         }
 
-        let boundary = boundary_snapshot(&inner, &state, &channels, superstep);
         superstep += 1;
 
         sink.emit(GraphEvent::new(
@@ -221,13 +271,14 @@ pub(crate) async fn execute(
                 }
             }
             Err(error) => {
-                let error = fail(&inner, &session, Some(boundary), superstep, error, &sink).await;
+                let error =
+                    fail(&inner, &session, boundary.as_ref(), superstep, error, &sink).await;
                 return Err(error);
             }
         }
 
         if let Err(error) = channels.flush() {
-            let error = fail(&inner, &session, Some(boundary), superstep, error, &sink).await;
+            let error = fail(&inner, &session, boundary.as_ref(), superstep, error, &sink).await;
             return Err(error);
         }
 
@@ -239,13 +290,19 @@ pub(crate) async fn execute(
         ))
         .await;
 
-        if inner.checkpoint_every_superstep {
-            if let Some(store) = inner.store.as_ref() {
-                let snapshot = boundary_snapshot(&inner, &state, &channels, superstep);
-                if let Err(error) = store.save(session.id(), &inner.namespace, snapshot).await {
-                    warn!(%error, "failed to save a graph snapshot after a superstep");
+        // One snapshot per durable boundary: it is both this superstep's
+        // checkpoint and the boundary a later failure restores, so the state is
+        // copied once here instead of once per boundary site.
+        if let Some(snapshot) = snapshot_if_stored(&inner, &state, &channels, superstep, &probe) {
+            if inner.checkpoint_every_superstep {
+                if let Some(store) = inner.store.as_ref() {
+                    if let Err(error) = store.save(session.id(), &inner.namespace, &snapshot).await
+                    {
+                        warn!(%error, "failed to save a graph snapshot after a superstep");
+                    }
                 }
             }
+            boundary = Some(snapshot);
         }
 
         if let Some(halt) = &halted {
@@ -274,7 +331,7 @@ pub(crate) async fn execute(
 
     Ok(GraphRunResult {
         graph_id: inner.graph_id.clone(),
-        state,
+        state: Arc::try_unwrap(state).unwrap_or_else(|shared| shared.as_ref().clone()),
         supersteps: superstep,
         visited,
         halted,
@@ -347,8 +404,17 @@ async fn run_node(
     max_retries: u32,
 ) -> NodeRunResult {
     let mut last_error: Option<Error> = None;
+    // The given state is consumed by the first attempt, so a run without retries
+    // never copies it. A retry needs a pristine copy, which is cloned right
+    // before an attempt that can still be retried (never after the last one).
+    let mut pristine = Some(state);
     for attempt in 0..=max_retries {
-        let mut attempt_state = state.clone();
+        let Some(mut attempt_state) = pristine.take() else {
+            break;
+        };
+        if attempt < max_retries {
+            pristine = Some(attempt_state.clone());
+        }
         let raced = async {
             tokio::select! {
                 biased;
@@ -378,6 +444,8 @@ async fn run_node(
 
 /// Applies node outcomes in declaration order.
 ///
+/// The run state is the shared [`Arc`] the routers read: `Arc::make_mut` keeps a
+/// merge copy-on-write, so a superstep whose routers all finished costs no copy.
 /// Each node receives a clone of the pre-superstep state, so its result is
 /// merged as a delta relative to that baseline: top-level keys the node changed
 /// are deep-merged and top-level keys the node removed are deleted from the run
@@ -390,11 +458,11 @@ async fn apply_outcomes(
     options: &ExecutionOptions,
     superstep: u32,
     results: Vec<OrderedNodeResult>,
-    state: &mut GraphState,
+    state: &mut Arc<GraphState>,
     channels: &mut ChannelManager,
     visited: &mut Vec<String>,
 ) -> Result<Option<HaltInfo>> {
-    let base = state.clone();
+    let base = state.as_ref().clone();
     let mut halted: Option<HaltInfo> = None;
     for (_, id, result) in results {
         let (node_state, outcome) = match result {
@@ -413,7 +481,7 @@ async fn apply_outcomes(
             }
         };
 
-        state.merge_node_delta(&base, node_state);
+        Arc::make_mut(state).merge_node_delta(&base, node_state);
         visited.push(id.clone());
         sink.emit(GraphEvent::new(
             GraphEventKind::NodeCompleted,
@@ -482,12 +550,29 @@ fn boundary_snapshot(
     }
 }
 
+/// Captures the run at a superstep boundary, but only when a store is attached.
+///
+/// A snapshot no backend can persist is pure cost — it deep-copies the whole
+/// state and every channel — so a graph compiled without a store never builds
+/// one, and a stored graph builds exactly one per boundary.
+fn snapshot_if_stored(
+    inner: &CompiledInner,
+    state: &GraphState,
+    channels: &ChannelManager,
+    superstep: u32,
+    probe: &BoundaryProbe,
+) -> Option<GraphSnapshot> {
+    inner.store.as_ref()?;
+    probe.record();
+    Some(boundary_snapshot(inner, state, channels, superstep))
+}
+
 /// Saves the boundary snapshot (when possible), emits `GraphFailed`, and returns
 /// the original error unchanged.
 async fn fail(
     inner: &CompiledInner,
     session: &Arc<dyn Session>,
-    boundary: Option<GraphSnapshot>,
+    boundary: Option<&GraphSnapshot>,
     superstep: u32,
     error: Error,
     sink: &EventSink,
