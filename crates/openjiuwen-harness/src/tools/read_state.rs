@@ -193,6 +193,36 @@ impl ReadStateRegistry {
         }
     }
 
+    /// Decide whether a `write_file` may proceed using only the recorded fingerprint.
+    ///
+    /// The counterpart of [`Self::write_gate`] for a target too large to load: the fingerprint
+    /// alone settles "unchanged" (the observed version) and "changed" (`Stale`); the content
+    /// comparison is unavailable, so a partial read stays partial. No allocation depends on the
+    /// file size.
+    #[must_use]
+    pub fn write_gate_metadata(&self, path: &Path, fingerprint: FileFingerprint) -> WriteGate {
+        let states = self.states.lock();
+        let Some(state) = states.get(path) else {
+            return WriteGate::NotRead;
+        };
+        if state.fingerprint != fingerprint {
+            return WriteGate::Stale;
+        }
+        let fully_read = state.total_lines > 0
+            && state
+                .read_ranges
+                .as_deref()
+                .is_some_and(|ranges| ranges_cover(ranges, 1, state.total_lines));
+        if fully_read {
+            return WriteGate::Ok;
+        }
+        WriteGate::Partial {
+            lines_read: lines_read(state.read_ranges.as_deref()),
+            total_lines: state.total_lines,
+            resume_offset: first_unread_offset(state.read_ranges.as_deref()),
+        }
+    }
+
     /// Decide whether an `edit_file` may proceed for the current on-disk content.
     #[must_use]
     pub fn edit_gate(&self, path: &Path, fingerprint: FileFingerprint, current: &str) -> EditGate {
