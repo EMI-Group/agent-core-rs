@@ -16,11 +16,15 @@
 //! Security: interactive credential prompts are suppressed
 //! (`GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=""`) and stdin is `/dev/null`, so a git
 //! command can never hang waiting for input.
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use openjiuwen_common::error::{Error, Result};
@@ -30,6 +34,43 @@ use super::sparse::SparseConfig;
 
 /// Name of the git executable.
 pub const GIT_BINARY: &str = "git";
+
+/// Default deadline of one git invocation.
+///
+/// A credential helper, ssh prompt or repository hook can otherwise block a worktree operation
+/// (and the repository lock it holds) forever.
+const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Maximum bytes retained from each captured stream of one git invocation.
+///
+/// Output past the cap is drained (so the child never blocks on a full pipe) but not buffered,
+/// which bounds the memory a noisy command can make the runner allocate.
+const GIT_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// Process-global cache of `which::which` answers, keyed by program name.
+///
+/// `PATH` is scanned once per program instead of once per command. The cache is deliberate and
+/// documented global state: a program that appears on `PATH` after the first lookup stays
+/// "not installed" for the process lifetime, which is the correct answer for a missing binary.
+static WHICH_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+
+/// Whether `program` can be found, memoised per program name.
+fn program_available(program: &str) -> bool {
+    if program.contains('/') || program.contains('\\') {
+        // A path is resolved by the OS at spawn time; `which` adds nothing to cache.
+        return which::which(program).is_ok();
+    }
+    let cache = WHICH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(available) = cache.get(program) {
+        return *available;
+    }
+    let available = which::which(program).is_ok();
+    cache.insert(program.to_owned(), available);
+    available
+}
 
 /// Substring of the [`Error::config`] message used when git is not installed.
 pub const NOT_INSTALLED_MARKER: &str = "git is not installed";
@@ -44,7 +85,7 @@ pub const SPARSE_FAILURE_MARKER: &str = "sparse checkout failed";
 /// Whether a `git` executable is on `PATH`.
 #[must_use]
 pub fn git_available() -> bool {
-    which::which(GIT_BINARY).is_ok()
+    program_available(GIT_BINARY)
 }
 
 /// Builds the typed "git is not installed" error for `program`.
@@ -136,9 +177,14 @@ pub trait GitRunner: Send + Sync {
 }
 
 /// The real [`GitRunner`], spawning `git` through `tokio::process`.
+///
+/// Every invocation is bounded: the child is killed when it outlives
+/// [`Self::timeout`] (or when the future is dropped), and each captured stream
+/// is drained but only the first `GIT_OUTPUT_LIMIT_BYTES` bytes are retained.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessGitRunner {
     program: String,
+    timeout: Duration,
 }
 
 impl Default for ProcessGitRunner {
@@ -153,6 +199,7 @@ impl ProcessGitRunner {
     pub fn new() -> Self {
         Self {
             program: GIT_BINARY.to_owned(),
+            timeout: DEFAULT_GIT_TIMEOUT,
         }
     }
 
@@ -162,7 +209,24 @@ impl ProcessGitRunner {
     pub fn with_program(program: impl Into<String>) -> Self {
         Self {
             program: program.into(),
+            timeout: DEFAULT_GIT_TIMEOUT,
         }
+    }
+
+    /// Replaces the per-command deadline (default [`DEFAULT_GIT_TIMEOUT`]).
+    ///
+    /// A zero deadline disables the bound, which only a host that already
+    /// imposes its own timeout should do.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// The per-command deadline.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// The executable this runner spawns.
@@ -175,17 +239,20 @@ impl ProcessGitRunner {
 #[async_trait]
 impl GitRunner for ProcessGitRunner {
     async fn run(&self, args: &[&str], cwd: &Path) -> Result<GitOutput> {
-        if which::which(&self.program).is_err() {
+        if !program_available(&self.program) {
             return Err(not_installed_error(&self.program));
         }
-        let output = Command::new(&self.program)
+        let mut child = Command::new(&self.program)
             .args(args)
             .current_dir(cwd)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "")
             .stdin(Stdio::null())
-            .output()
-            .await
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // A dropped turn (or an expired deadline) must not leave git writing behind.
+            .kill_on_drop(true)
+            .spawn()
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     not_installed_error(&self.program)
@@ -197,12 +264,82 @@ impl GitRunner for ProcessGitRunner {
                     ))
                 }
             })?;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        if !output.status.success() {
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let collected = async {
+            let (stdout, stderr, status) = tokio::join!(
+                read_capped(stdout_pipe),
+                read_capped(stderr_pipe),
+                child.wait(),
+            );
+            let stdout = stdout.map_err(|error| pipe_error(&self.program, cwd, error))?;
+            let stderr = stderr.map_err(|error| pipe_error(&self.program, cwd, error))?;
+            let status = status.map_err(|error| {
+                Error::tool(format!(
+                    "cannot wait for `{}` in `{}`: {error}",
+                    self.program,
+                    cwd.display()
+                ))
+            })?;
+            Ok::<_, Error>((stdout, stderr, status))
+        };
+        let bounded = async {
+            if self.timeout.is_zero() {
+                return collected.await;
+            }
+            tokio::time::timeout(self.timeout, collected)
+                .await
+                .map_err(|_| {
+                    Error::timeout(format!(
+                        "git {} timed out after {:?} in `{}`",
+                        args.join(" "),
+                        self.timeout,
+                        cwd.display()
+                    ))
+                })?
+        };
+        // The child is owned here, so dropping the future below drops it and
+        // `kill_on_drop` terminates the process before `run` returns.
+        let (stdout, stderr, status) = bounded.await?;
+        let stdout = String::from_utf8_lossy(&stdout).trim().to_owned();
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
+        if !status.success() {
             return Err(git_failure_error(args, &stderr));
         }
         Ok(GitOutput { stdout, stderr })
+    }
+}
+
+/// Builds the typed error of an unreadable git output pipe.
+fn pipe_error(program: &str, cwd: &Path, error: std::io::Error) -> Error {
+    Error::tool(format!(
+        "cannot read `{program}` output in `{}`: {error}",
+        cwd.display()
+    ))
+}
+
+/// Reads `reader` to EOF, retaining at most `GIT_OUTPUT_LIMIT_BYTES`.
+///
+/// Draining past the cap keeps the child from blocking on a full pipe, while
+/// dropping the excess bounds the memory one command can make the runner hold.
+async fn read_capped<R>(reader: Option<R>) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(mut reader) = reader else {
+        return Ok(Vec::new());
+    };
+    let mut retained = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        if retained.len() < GIT_OUTPUT_LIMIT_BYTES {
+            let remaining = GIT_OUTPUT_LIMIT_BYTES - retained.len();
+            retained.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
     }
 }
 
@@ -786,5 +923,84 @@ prunable gitdir file points to non-existent location\n";
     fn default_runner_spawns_git() {
         assert_eq!(ProcessGitRunner::default(), ProcessGitRunner::new());
         assert_eq!(ProcessGitRunner::new().program(), GIT_BINARY);
+        assert_eq!(ProcessGitRunner::new().timeout(), DEFAULT_GIT_TIMEOUT);
+        assert_eq!(
+            ProcessGitRunner::new()
+                .with_timeout(Duration::from_millis(5))
+                .timeout(),
+            Duration::from_millis(5)
+        );
+    }
+
+    /// Writes an executable shell script into `dir` and returns its path.
+    #[cfg(unix)]
+    fn executable_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("script");
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod");
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hung_git_call_times_out_kills_the_child_and_reports_a_typed_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("pid");
+        let script = executable_script(
+            dir.path(),
+            "slow-git",
+            &format!("echo $ > '{}'\nexec sleep 30", pid_file.display()),
+        );
+        let runner = ProcessGitRunner::with_program(script.to_string_lossy().into_owned())
+            .with_timeout(Duration::from_millis(250));
+        let started = std::time::Instant::now();
+        let error = runner
+            .run(&["status"], dir.path())
+            .await
+            .expect_err("the command must time out");
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+        assert!(
+            error.to_string().contains("timed out after"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline must fire promptly, took {:?}",
+            started.elapsed()
+        );
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("the script writes its pid")
+            .trim()
+            .to_owned();
+        let mut gone = false;
+        for _ in 0..100 {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if !alive {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(gone, "the timed-out git process must be killed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_noisy_git_command_is_capped_instead_of_buffered_whole() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let script = executable_script(dir.path(), "noisy-git", "yes openjiuwen | head -c 3000000");
+        let runner = ProcessGitRunner::with_program(script.to_string_lossy().into_owned());
+        let output = runner.run(&["status"], dir.path()).await.expect("output");
+        assert_eq!(output.stdout.len(), GIT_OUTPUT_LIMIT_BYTES);
+        assert!(output.stderr.is_empty());
     }
 }
