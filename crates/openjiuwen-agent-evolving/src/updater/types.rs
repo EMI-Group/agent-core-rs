@@ -294,18 +294,19 @@ impl Updates {
     /// Returns `None` when the key was absent and `Some(old)` when it existed;
     /// `old` is itself an `Option` because a key may map to a `None` value.
     pub fn insert(&mut self, key: UpdateKey, value: Option<Update>) -> Option<Option<Update>> {
-        match self.entries.iter_mut().find(|entry| {
-            entry.operator_id == key.0.as_str() && entry.target == key.1.as_str()
-        }) {
-            Some(entry) => Some(std::mem::replace(&mut entry.value, value)),
-            None => {
-                self.entries.push(UpdateEntry {
-                    operator_id: key.0,
-                    target: key.1,
-                    value,
-                });
-                None
-            }
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.operator_id == key.0.as_str() && entry.target == key.1.as_str())
+        {
+            Some(std::mem::replace(&mut entry.value, value))
+        } else {
+            self.entries.push(UpdateEntry {
+                operator_id: key.0,
+                target: key.1,
+                value,
+            });
+            None
         }
     }
 
@@ -588,7 +589,10 @@ mod tests {
         let keys: Vec<(&str, &str)> = updates.iter().map(|(op, target, _)| (op, target)).collect();
         assert_eq!(keys, [("op-b", "body"), ("op-a", "body")]);
         assert_eq!(
-            updates.get("op-b", "body").and_then(|u| u).map(Update::payload),
+            updates
+                .get("op-b", "body")
+                .and_then(|u| u)
+                .map(Update::payload),
             Some(&json!(3))
         );
         assert_eq!(updates.len(), 2);
@@ -601,7 +605,10 @@ mod tests {
         assert_eq!(updates.len(), 1);
         assert!(updates.contains_key("op", "body"));
         assert!(matches!(updates.get("op", "body"), Some(None)));
-        assert!(normalize_updates(&updates).is_empty());
+        assert!(
+            normalize_updates(&updates).is_empty(),
+            "nothing to normalize"
+        );
     }
 
     #[test]
@@ -685,13 +692,15 @@ mod tests {
             assert_eq!(UpdateDomain::parse(domain.as_str()), Some(domain));
         }
         assert_eq!(UpdateDomain::parse("unknown"), None);
-        assert_eq!(UpdateDomain::ALL, [
-            UpdateDomain::Llm,
-            UpdateDomain::Tool,
-            UpdateDomain::Memory
-        ]);
+        assert_eq!(
+            UpdateDomain::ALL,
+            [UpdateDomain::Llm, UpdateDomain::Tool, UpdateDomain::Memory]
+        );
         assert_eq!(UpdateMode::default().as_str(), "replace");
         assert_eq!(UpdateEffect::default().as_str(), "state");
-        assert_eq!(LifecycleStage::LocalApplyCompleted.as_str(), "local_apply_completed");
+        assert_eq!(
+            LifecycleStage::LocalApplyCompleted.as_str(),
+            "local_apply_completed"
+        );
     }
 }

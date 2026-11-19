@@ -100,10 +100,7 @@ fn rollout_document(step: usize, task_id: &str, rollout: &RolloutMessage) -> Val
     let mut document = serde_json::Map::new();
     document.insert("step".to_owned(), json!(step));
     document.insert("task_id".to_owned(), json!(task_id));
-    document.insert(
-        "origin_task_id".to_owned(),
-        json!(rollout.origin_task_id),
-    );
+    document.insert("origin_task_id".to_owned(), json!(rollout.origin_task_id));
     document.insert("rollout_id".to_owned(), json!(rollout.rollout_id));
     document.insert("turns".to_owned(), rollout.rollout_info.clone());
     document.insert("reward_list".to_owned(), json!(rollout.reward_list));
@@ -224,13 +221,15 @@ impl FileRolloutStore {
     /// The JSONL file a rollout of `phase` at `step` is appended to.
     #[must_use]
     pub fn rollout_path(&self, phase: RolloutPhase, step: usize) -> PathBuf {
-        self.rollout_dir(phase).join(file_name(step, self.flush_interval))
+        self.rollout_dir(phase)
+            .join(file_name(step, self.flush_interval))
     }
 
     /// The JSONL file a step summary at `step` is appended to.
     #[must_use]
     pub fn summary_path(&self, step: usize) -> PathBuf {
-        self.summary_dir().join(file_name(step, self.flush_interval))
+        self.summary_dir()
+            .join(file_name(step, self.flush_interval))
     }
 
     /// Reads the summaries persisted for `step` (used by analysis tooling).
@@ -315,7 +314,9 @@ impl RolloutPersistence for FileRolloutStore {
             for path in paths {
                 for document in read_jsonl(&path).await? {
                     let matches = filters.iter().all(|(key, expected)| {
-                        document.get(key.as_str()).is_some_and(|actual| actual == expected)
+                        document
+                            .get(key.as_str())
+                            .is_some_and(|actual| actual == expected)
                     });
                     if matches {
                         results.push(document);
@@ -409,7 +410,8 @@ mod tests {
         assert_eq!(file_name(0, 100), "steps_000000_000099.jsonl");
         assert_eq!(file_name(99, 100), "steps_000000_000099.jsonl");
         assert_eq!(file_name(100, 100), "steps_000100_000199.jsonl");
-        assert_eq!(file_name(7, 0), "steps_000000_000000.jsonl");
+        // A flush interval below one is clamped to one, so every step is its own file.
+        assert_eq!(file_name(7, 0), "steps_000007_000007.jsonl");
         assert_eq!(file_name(7, 1), "steps_000007_000007.jsonl");
         assert_eq!(step_range(250, 100), (200, 299));
     }
@@ -509,15 +511,13 @@ mod tests {
             )
             .await
             .expect("query none");
-        assert!(none.is_empty());
+        assert!(none.is_empty(), "no rolls in an empty filter");
     }
 
     #[tokio::test]
     async fn summaries_are_appended_per_step() {
         let temp = TempDir::new().expect("temp dir");
-        let store = FileRolloutStore::open(temp.path(), 10)
-            .await
-            .expect("open");
+        let store = FileRolloutStore::open(temp.path(), 10).await.expect("open");
         let mut first = BTreeMap::new();
         first.insert("training/global_step".to_owned(), json!(1));
         store.save_step_summary(1, &first).await.expect("summary");
@@ -532,7 +532,10 @@ mod tests {
         assert_eq!(summaries[1]["metrics"]["training/global_step"], json!(2));
         assert!(summaries[0].get("timestamp").is_none());
 
-        assert!(store.read_summaries(900).await.expect("absent").is_empty());
+        assert!(
+            store.read_summaries(900).await.expect("absent").is_empty(),
+            "absent step has no summary"
+        );
         store.close().await.expect("close");
     }
 
@@ -541,19 +544,20 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let store = FileRolloutStore::new(temp.path().join("absent"), 10);
         assert!(!store.has_rollouts(RolloutPhase::Val));
-        assert!(store
-            .query_rollouts(&BTreeMap::new(), 0)
-            .await
-            .expect("query")
-            .is_empty());
+        assert!(
+            store
+                .query_rollouts(&BTreeMap::new(), 0)
+                .await
+                .expect("query")
+                .is_empty(),
+            "a missing directory holds no rollout"
+        );
     }
 
     #[tokio::test]
     async fn malformed_lines_are_skipped() {
         let temp = TempDir::new().expect("temp dir");
-        let store = FileRolloutStore::open(temp.path(), 10)
-            .await
-            .expect("open");
+        let store = FileRolloutStore::open(temp.path(), 10).await.expect("open");
         store
             .save_rollout(0, "t-1", &rollout("r-1", "t-1", 1.0), RolloutPhase::Train)
             .await
@@ -581,12 +585,15 @@ mod tests {
             .save_step_summary(0, &BTreeMap::new())
             .await
             .expect("no-op");
-        assert!(store
-            .query_rollouts(&BTreeMap::new(), 10)
-            .await
-            .expect("no-op")
-            .is_empty());
+        assert!(
+            store
+                .query_rollouts(&BTreeMap::new(), 10)
+                .await
+                .expect("no-op")
+                .is_empty(),
+            "the null store drops every rollout"
+        );
         store.close().await.expect("no-op");
-        assert_eq!(NullRolloutStore, NullRolloutStore::default());
+        assert_eq!(NullRolloutStore, NullRolloutStore);
     }
 }

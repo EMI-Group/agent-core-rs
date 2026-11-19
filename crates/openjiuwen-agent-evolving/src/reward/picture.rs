@@ -344,8 +344,8 @@ fn gif_size(bytes: &[u8]) -> Option<(u32, u32, bool)> {
                 // An extension: its label byte, then the data sub-blocks.
                 index = skip_sub_blocks(bytes, index.checked_add(2)?)?;
             }
-            0x3b => break, // trailer
-            _ => break,    // an unknown block: stop counting rather than guess
+            // The trailer or an unknown block: stop counting rather than guess.
+            _ => break,
         }
     }
     Some((width, height, frames > 1))
@@ -473,9 +473,9 @@ pub(crate) mod fixtures {
     }
 
     /// Wraps `payload` in a `RIFF`/`WEBP` container as `fourcc`.
-    fn riff(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    fn riff(fourcc: [u8; 4], payload: &[u8]) -> Vec<u8> {
         let mut body = Vec::from(b"WEBP".as_slice());
-        body.extend_from_slice(fourcc);
+        body.extend_from_slice(&fourcc);
         body.extend_from_slice(
             &u32::try_from(payload.len())
                 .expect("a fixture payload fits in u32")
@@ -501,7 +501,7 @@ pub(crate) mod fixtures {
         payload.extend_from_slice(&width.to_le_bytes());
         payload.extend_from_slice(&height.to_le_bytes());
         payload.extend_from_slice(&[0, 0, 0, 0]);
-        riff(b"VP8 ", &payload)
+        riff(*b"VP8 ", &payload)
     }
 
     /// A lossless (`VP8L`) WebP header.
@@ -509,7 +509,7 @@ pub(crate) mod fixtures {
         let bits = ((height - 1) << 14) | (width - 1);
         let mut payload = vec![0x2f];
         payload.extend_from_slice(&bits.to_le_bytes());
-        riff(b"VP8L", &payload)
+        riff(*b"VP8L", &payload)
     }
 
     /// An extended (`VP8X`) WebP header, with the animation flag when `animated`.
@@ -519,7 +519,7 @@ pub(crate) mod fixtures {
         let canvas_height = (height - 1).to_le_bytes();
         payload.extend_from_slice(&canvas_width[..3]);
         payload.extend_from_slice(&canvas_height[..3]);
-        riff(b"VP8X", &payload)
+        riff(*b"VP8X", &payload)
     }
 
     /// A BMP with a 40-byte `BITMAPINFOHEADER`; a negative height is top-down.
@@ -689,7 +689,7 @@ mod tests {
              the judge sees the picture's metadata (format and size), not its pixels"
         );
         // A JPEG of a normal size needs no note: Python would send it as it is.
-        assert!(info.rewrite_reasons().is_empty());
+        assert!(info.rewrite_reasons().is_empty(), "nothing was rewritten");
         assert_eq!(info.longest_side(), 800);
     }
 

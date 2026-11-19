@@ -63,6 +63,13 @@ Ports Python `core/single_agent/agents/react_agent.py` (`ReActAgent`, `ReActAgen
 - KV-cache affinity is best effort and never changes a run's outcome: each model call prepares and records its own scope, and a hook error is logged at `tracing::debug!`; the hook comes from the snapshot, so installing one affects later invocations only, and `KVCacheRuntimeConfig::default()` (affinity disabled) installs an inert hook.
 - A retried model call re-runs `prepare`/`begin_inference` per attempt, so no admission lease outlives the attempt that took it; the `FinalAnswer` finalization call is wrapped exactly like an iteration call.
 
+## Known Issues
+
+- No run-level deadline or cancellation exists on any path: `agent_loop` builds `ToolExecutionOptions` with a fresh never-cancelled `CancellationToken` and `timeout: None` (`agent_loop/mod.rs`), and `call_model_streaming` awaits the provider stream with no timeout (`model_step.rs`), so a hung tool or a provider stream that never ends blocks the turn forever.
+- Dropping a `stream` does not stop its run: `DeltaSink::emit` ignores a closed publisher and the loop never checks for one, so the spawned task keeps calling the model until it answers or `max_iterations` is reached.
+- Both stream channels are unbounded (`react/mod.rs::stream`), so a consumer that polls slowly buffers the whole turn in memory instead of applying backpressure.
+- The prepared window is deep-cloned up to three times per iteration: `ctx.messages.clone_from(&prepared.messages)`, `let messages = ctx.messages.clone()` (`agent_loop/mod.rs`) and `messages.to_vec()` inside `call_model_streaming` (`model_step.rs`); the second copy is avoidable because the next `reset_ctx` clears `ctx.messages` anyway.
+
 ## Test Strategy
 
 - Unit tests beside the modules: `agent_loop::tests` (tool call → answer, empty-response retry, iteration limit, `FinalAnswer` policy, confirm pause/resume, ask-user answer, memory variables reaching every model call, `request_for`, `reset_ctx`, `with_progress`), `model_step::tests` (non-streaming reply, provider error passthrough, streaming content/reasoning/usage frames and their index sequence), `exposure::tests` (allow/deny masks, MCP scoping and prefix stripping, client-tool detection), `frames::tests` (both payload shapes and their stream/mirror delivery), `hooks::tests` (steering rendering, final-check mapping, progress fields), `resume::tests`, `mod.rs` (input/model errors, invoke answer, streaming frames, every wiring setter and its default), `prompt.rs` (field rendering, memory-variable precedence, literal unknown placeholders), and `config.rs`, all on `ScriptedModel`.

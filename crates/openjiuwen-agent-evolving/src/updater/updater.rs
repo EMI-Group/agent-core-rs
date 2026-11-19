@@ -352,7 +352,10 @@ impl MultiDimUpdater {
     }
 
     /// The optimizer of `domain`, mutably, when one is registered.
-    pub fn optimizer_mut(&mut self, domain: UpdateDomain) -> Option<&mut (dyn TextualOptimizer + '_)> {
+    pub fn optimizer_mut(
+        &mut self,
+        domain: UpdateDomain,
+    ) -> Option<&mut (dyn TextualOptimizer + '_)> {
         match self.domain_optimizers.get_mut(&domain) {
             Some(optimizer) => Some(optimizer.as_mut()),
             None => None,
@@ -406,7 +409,7 @@ impl Updater for MultiDimUpdater {
     fn requires_forward_data(&self) -> bool {
         self.domain_optimizers
             .values()
-            .any(|optimizer| optimizer.requires_forward_data())
+            .any(TextualOptimizer::requires_forward_data)
     }
 
     async fn process(
@@ -417,9 +420,9 @@ impl Updater for MultiDimUpdater {
     ) -> Result<Updates> {
         let unattributed: Vec<&str> = signals
             .iter()
-            .map(|signal| domain_for_signal(signal))
+            .map(domain_for_signal)
             .filter(|domain| !self.domain_optimizers.contains_key(domain))
-            .map(|domain| domain.as_str())
+            .map(UpdateDomain::as_str)
             .collect();
         if let Some(domain) = unattributed.first() {
             return Err(Error::validation(format!(
@@ -468,7 +471,9 @@ impl Updater for MultiDimUpdater {
         };
         for (name, domain_state) in domains {
             let domain = UpdateDomain::parse(name).ok_or_else(|| {
-                Error::validation(format!("MultiDimUpdater.load_state: unknown domain {name:?}"))
+                Error::validation(format!(
+                    "MultiDimUpdater.load_state: unknown domain {name:?}"
+                ))
             })?;
             let Some(optimizer) = self.domain_optimizers.get_mut(&domain) else {
                 return Err(Error::validation(format!(
@@ -630,13 +635,11 @@ impl TextualOptimizer for RecordingOptimizer {
         };
         self.steps = match object.get("steps") {
             None => 0,
-            Some(value) => value
-                .as_u64()
-                .ok_or_else(|| {
-                    Error::validation(format!(
-                        "RecordingOptimizer.load_state: steps must be an unsigned integer, got {value}"
-                    ))
-                })? as usize,
+            Some(value) => value.as_u64().ok_or_else(|| {
+                Error::validation(format!(
+                    "RecordingOptimizer.load_state: steps must be an unsigned integer, got {value}"
+                ))
+            })? as usize,
         };
         self.trajectories.clear();
         self.backward_calls.clear();
@@ -670,7 +673,7 @@ fn string_list(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use crate::updater::apply::{RecordingTarget, UpdateTarget};
-    use crate::updater::types::{ApplyResult, UpdateMode};
+    use crate::updater::types::{ApplyResult, Update, UpdateMode};
     use std::sync::Arc;
 
     fn trajectory(id: &str) -> Trajectory {
@@ -693,10 +696,13 @@ mod tests {
     async fn single_dim_process_feeds_every_trajectory_then_steps_once() {
         let mut updater = SingleDimUpdater::new(RecordingOptimizer::new());
         assert!(!updater.requires_forward_data());
-        assert_eq!(updater.bind(&operators(Arc::new(RecordingTarget::new())), None), 1);
+        assert_eq!(
+            updater.bind(&operators(Arc::new(RecordingTarget::new())), None),
+            1
+        );
         let trajectories = [trajectory("t-1"), trajectory("t-2")];
         let signals = [signal(EvolutionTarget::Instruction)];
-        let updates = updater
+        let processed = updater
             .process(&trajectories, &signals, &UpdateConfig::new())
             .await
             .expect("process");
@@ -705,7 +711,7 @@ mod tests {
         assert_eq!(updater.optimizer().signals()[0].len(), 1);
         assert_eq!(updater.optimizer().steps(), 1);
         assert_eq!(
-            updates
+            processed
                 .get("op", "description")
                 .and_then(|update| update)
                 .map(Update::payload),
@@ -717,10 +723,17 @@ mod tests {
     async fn single_dim_backward_before_bind_is_a_validation_error() {
         let mut updater = SingleDimUpdater::new(RecordingOptimizer::new());
         let error = updater
-            .process(&[trajectory("t-1")], &[signal(EvolutionTarget::Body)], &UpdateConfig::new())
+            .process(
+                &[trajectory("t-1")],
+                &[signal(EvolutionTarget::Body)],
+                &UpdateConfig::new(),
+            )
             .await
             .expect_err("unbound optimizer");
-        assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Validation);
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Validation
+        );
         assert!(error.to_string().contains("requires bind first"));
     }
 
@@ -737,22 +750,13 @@ mod tests {
             "wrong",
         )
         .expect("evaluated case");
-        let better = crate::dataset::EvaluatedCase::new(
-            case.case.clone(),
-            None,
-            0.9,
-            "right",
-        )
-        .expect("evaluated case");
+        let better = crate::dataset::EvaluatedCase::new(case.case.clone(), None, 0.9, "right")
+            .expect("evaluated case");
         let mut updater = SingleDimUpdater::new(RecordingOptimizer::new());
         updater.bind(&operators(Arc::new(RecordingTarget::new())), None);
         let config = UpdateConfig::new().with_score_threshold(0.5);
         updater
-            .update(
-                &[trajectory("t-1")],
-                &[case.clone(), better],
-                &config,
-            )
+            .update(&[trajectory("t-1")], &[case.clone(), better], &config)
             .await
             .expect("update");
         let seen = &updater.optimizer().signals()[0];
@@ -764,7 +768,11 @@ mod tests {
     async fn update_rejects_a_non_finite_threshold() {
         let mut updater = SingleDimUpdater::new(RecordingOptimizer::new());
         let error = updater
-            .update(&[], &[], &UpdateConfig::new().with_score_threshold(f64::NAN))
+            .update(
+                &[],
+                &[],
+                &UpdateConfig::new().with_score_threshold(f64::NAN),
+            )
             .await
             .expect_err("nan threshold");
         assert!(error.to_string().contains("must be finite"));
@@ -790,8 +798,8 @@ mod tests {
         let llm = Arc::new(RecordingTarget::new());
         let tool = Arc::new(RecordingTarget::with_domain(UpdateDomain::Tool));
         let mut operators = OperatorMap::new();
-        let llm_target: Arc<dyn UpdateTarget> = Arc::clone(&llm);
-        let tool_target: Arc<dyn UpdateTarget> = Arc::clone(&tool);
+        let llm_target: Arc<dyn UpdateTarget> = Arc::<RecordingTarget>::clone(&llm);
+        let tool_target: Arc<dyn UpdateTarget> = Arc::<RecordingTarget>::clone(&tool);
         operators.insert("agent/llm_1".to_owned(), llm_target);
         operators.insert("agent/tool_1".to_owned(), tool_target);
         let mut updater = MultiDimUpdater::new()
@@ -799,21 +807,27 @@ mod tests {
             .with_optimizer(UpdateDomain::Llm, Box::new(RecordingOptimizer::new()));
         assert_eq!(updater.domains(), [UpdateDomain::Llm, UpdateDomain::Tool]);
         assert_eq!(updater.bind(&operators, None), 2);
-        let updates = updater
+        let processed = updater
             .process(
                 &[trajectory("t-1")],
-                &[signal(EvolutionTarget::Instruction), signal(EvolutionTarget::Tool)],
+                &[
+                    signal(EvolutionTarget::Instruction),
+                    signal(EvolutionTarget::Tool),
+                ],
                 &UpdateConfig::new(),
             )
             .await
             .expect("process");
-        let keys: Vec<(&str, &str)> = updates
+        let keys: Vec<(&str, &str)> = processed
             .iter()
             .map(|(operator_id, target, _)| (operator_id, target))
             .collect();
         assert_eq!(
             keys,
-            [("agent/llm_1", "description"), ("agent/tool_1", "description")]
+            [
+                ("agent/llm_1", "description"),
+                ("agent/tool_1", "description")
+            ]
         );
         let llm = updater.optimizer(UpdateDomain::Llm).expect("llm");
         assert_eq!(llm.state()["bound"], json!(["agent/llm_1"]));
@@ -824,8 +838,8 @@ mod tests {
         let mut operators = OperatorMap::new();
         let erased: Arc<dyn UpdateTarget> = Arc::new(RecordingTarget::new());
         operators.insert("agent/llm_1".to_owned(), erased);
-        let mut updater =
-            MultiDimUpdater::new().with_optimizer(UpdateDomain::Llm, Box::new(RecordingOptimizer::new()));
+        let mut updater = MultiDimUpdater::new()
+            .with_optimizer(UpdateDomain::Llm, Box::new(RecordingOptimizer::new()));
         updater.bind(&operators, None);
         let error = updater
             .process(&[], &[signal(EvolutionTarget::Tool)], &UpdateConfig::new())
@@ -842,7 +856,9 @@ mod tests {
         let state = updater.get_state();
         assert_eq!(state["domains"]["llm"]["bound"], json!([]));
         assert!(updater.load_state(&state).is_ok());
-        assert!(updater.load_state(&json!({"domains": {"audio": {}}})).is_err());
+        assert!(updater
+            .load_state(&json!({"domains": {"audio": {}}}))
+            .is_err());
         assert!(updater.load_state(&json!({})).is_err());
     }
 
@@ -851,8 +867,14 @@ mod tests {
         let mut scripted = Updates::new();
         scripted.insert_update("op", "body", json!("scripted"));
         let mut optimizer = RecordingOptimizer::new().with_updates(vec![scripted.clone()]);
-        optimizer.bind(&operators(Arc::new(RecordingTarget::new())), Some(&["body".to_owned()]));
-        assert_eq!(optimizer.bound_targets(), Some(["body".to_owned()].as_slice()));
+        optimizer.bind(
+            &operators(Arc::new(RecordingTarget::new())),
+            Some(&["body".to_owned()]),
+        );
+        assert_eq!(
+            optimizer.bound_targets(),
+            Some(["body".to_owned()].as_slice())
+        );
         assert_eq!(optimizer.step(), scripted);
         assert!(optimizer.step().is_empty());
         assert_eq!(optimizer.steps(), 2);

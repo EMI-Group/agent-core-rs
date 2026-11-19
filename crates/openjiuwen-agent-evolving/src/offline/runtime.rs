@@ -49,7 +49,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(2);
 #[async_trait]
 pub trait RolloutSource: Send + Sync {
     /// A stable name used in diagnostics.
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "rollout-source"
     }
 
@@ -230,12 +230,15 @@ impl RewardComposer for WeightedRewardComposer {
             global += weight * finite_reward(&candidate);
             lists.push(candidate.reward_list);
         }
-        let global = if global.is_finite() { global / total } else { 0.0 };
+        let global = if global.is_finite() {
+            global / total
+        } else {
+            0.0
+        };
 
-        let reward_list = if lists
-            .first()
-            .is_some_and(|first| !first.is_empty() && lists.iter().all(|list| list.len() == first.len()))
-        {
+        let reward_list = if lists.first().is_some_and(|first| {
+            !first.is_empty() && lists.iter().all(|list| list.len() == first.len())
+        }) {
             (0..lists[0].len())
                 .map(|index| {
                     let weighted: f64 = lists
@@ -425,7 +428,7 @@ impl fmt::Debug for ParallelRuntimeExecutor {
             .field("num_workers", &self.num_workers)
             .field("executor", &self.executor)
             .field("running", &self.running.load(Ordering::Relaxed))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -578,10 +581,9 @@ impl RolloutSource for ScriptedRolloutSource {
     }
 
     async fn rollout(&self, task: &RlTask) -> Result<Vec<Rollout>> {
-        self.turns
-            .get(&task.task_id)
-            .cloned()
-            .ok_or_else(|| Error::validation(format!("no scripted turns for task {}", task.task_id)))
+        self.turns.get(&task.task_id).cloned().ok_or_else(|| {
+            Error::validation(format!("no scripted turns for task {}", task.task_id))
+        })
     }
 }
 
@@ -729,7 +731,10 @@ mod tests {
             }),
             1.0,
         )]);
-        assert!(single.expect_err("single").to_string().contains("at least two"));
+        assert!(single
+            .expect_err("single")
+            .to_string()
+            .contains("at least two"));
 
         let negative = WeightedRewardComposer::new(vec![
             (
@@ -772,16 +777,18 @@ mod tests {
                 0.0,
             ),
         ]);
-        assert!(zero.expect_err("zero").to_string().contains("must not all be zero"));
+        assert!(zero
+            .expect_err("zero")
+            .to_string()
+            .contains("must not all be zero"));
     }
 
     #[tokio::test]
     async fn the_executor_records_turns_and_composes_rewards() {
-        let source = Arc::new(
-            ScriptedRolloutSource::new().with_turns("t-1", vec![turn("q", "42")]),
-        );
-        let executor = RuntimeExecutor::new(source)
-            .with_composer(Arc::new(ExactMatchComposer::new()));
+        let source =
+            Arc::new(ScriptedRolloutSource::new().with_turns("t-1", vec![turn("q", "42")]));
+        let executor =
+            RuntimeExecutor::new(source).with_composer(Arc::new(ExactMatchComposer::new()));
         let outcome = executor.execute(&task("t-1", "42")).await;
         assert!(!outcome.is_error());
         assert!(!outcome.is_reward_error());
@@ -791,12 +798,12 @@ mod tests {
         assert_eq!(outcome.message.origin_task_id.as_deref(), Some("origin"));
         assert_eq!(outcome.message.round_num, 0);
         assert_eq!(outcome.message.start_time, None);
-        assert_eq!(
-            outcome.metadata["rollout_source"],
-            json!("scripted")
-        );
+        assert_eq!(outcome.metadata["rollout_source"], json!("scripted"));
         assert_eq!(outcome.metadata["reward_composer"], json!("exact_match"));
-        assert!(outcome.message.rollout_info[0]["output_response_ids"] == json!([2]));
+        assert_eq!(
+            outcome.message.rollout_info[0]["output_response_ids"],
+            json!([2])
+        );
 
         let message = executor.execute_message(&task("t-1", "42")).await;
         assert_eq!(message.global_reward, 1.0);
@@ -814,14 +821,16 @@ mod tests {
         assert_eq!(outcome.message.global_reward, 0.0);
         assert_eq!(outcome.message.rollout_info, json!([]));
         assert_eq!(outcome.message.turn_count, 0);
-        assert!(outcome.message.reward_list.is_empty());
+        assert!(
+            outcome.message.reward_list.is_empty(),
+            "a failed source clears rewards"
+        );
     }
 
     #[tokio::test]
     async fn a_composer_failure_keeps_the_turns_and_clears_the_reward() {
-        let source = Arc::new(
-            ScriptedRolloutSource::new().with_turns("t-1", vec![turn("q", "42")]),
-        );
+        let source =
+            Arc::new(ScriptedRolloutSource::new().with_turns("t-1", vec![turn("q", "42")]));
         let executor = RuntimeExecutor::new(source).with_composer(Arc::new(FixedComposer {
             name: "broken",
             reward: 1.0,
@@ -834,7 +843,10 @@ mod tests {
             json!("validation: composer exploded")
         );
         assert_eq!(outcome.message.global_reward, 0.0);
-        assert!(outcome.message.reward_list.is_empty());
+        assert!(
+            outcome.message.reward_list.is_empty(),
+            "a failed source clears rewards"
+        );
         assert_eq!(outcome.message.turn_count, 1);
     }
 
@@ -844,7 +856,8 @@ mod tests {
         let source = Arc::new(
             ScriptedRolloutSource::new()
                 .with_turns("t-1", vec![turn("q", "42")])
-                .with_turns("t-2", vec![turn("q", "7")]),
+                .with_turns("t-2", vec![turn("q", "7")])
+                .with_turns("t-3", vec![turn("q", "42")]),
         );
         let executor = Arc::new(
             RuntimeExecutor::new(source).with_composer(Arc::new(ExactMatchComposer::new())),
@@ -862,7 +875,9 @@ mod tests {
         );
         assert!(!parallel.is_running());
 
-        for (id, expected) in [("t-1", "42"), ("t-2", "nope"), ("t-1", "42")] {
+        // Rollouts are keyed by rollout id, which derives from the task id, so
+        // every queued task needs a distinct id.
+        for (id, expected) in [("t-1", "42"), ("t-2", "nope"), ("t-3", "42")] {
             queue.queue_task(task(id, expected)).await;
         }
         parallel.start().await.expect("start");

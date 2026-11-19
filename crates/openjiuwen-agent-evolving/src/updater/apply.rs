@@ -214,7 +214,10 @@ impl RecordingTarget {
 
 impl UpdateTarget for RecordingTarget {
     fn set_parameter(&self, operator_id: &str, target: &str, value: Value) -> Result<()> {
-        if lock(&self.rejected).iter().any(|rejected| rejected == target) {
+        if lock(&self.rejected)
+            .iter()
+            .any(|rejected| rejected == target)
+        {
             return Err(Error::validation(format!(
                 "RecordingTarget rejects target {target:?} for operator {operator_id:?}"
             )));
@@ -252,7 +255,7 @@ mod tests {
         updates.insert(("op".to_owned(), "body".to_owned()), None);
         updates.insert_update("op", "description", json!("new"));
         updates.insert(("missing".to_owned(), "body".to_owned()), None);
-        updates.insert_update("missing", "body", json!("x"));
+        updates.insert_update("missing", "description", json!("x"));
 
         let results = execute_updates(&operators(Arc::clone(&target)), &updates);
         let order: Vec<(&str, &str)> = results
@@ -263,7 +266,7 @@ mod tests {
             order,
             [
                 ("op", "description"),
-                ("missing", "body"),
+                ("missing", "description"),
                 ("op", "body"),
                 ("missing", "body"),
             ]
@@ -275,17 +278,19 @@ mod tests {
         assert!(!results[1].applied);
         assert_eq!(results[2].errors, ["update value is None"]);
         assert_eq!(results[3].errors, ["update value is None"]);
-        assert_eq!(target.writes(), [(
-            "op".to_owned(),
-            "description".to_owned(),
-            json!("new")
-        )]);
+        assert_eq!(
+            target.writes(),
+            [("op".to_owned(), "description".to_owned(), json!("new"))]
+        );
         let summary = summarize_apply_results(&results);
-        assert_eq!(summary, ApplySummary {
-            total: 4,
-            applied: 1,
-            failed: 3
-        });
+        assert_eq!(
+            summary,
+            ApplySummary {
+                total: 4,
+                applied: 1,
+                failed: 3
+            }
+        );
     }
 
     #[test]
@@ -297,7 +302,10 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(!results[0].applied);
         assert_eq!(results[0].mode, UpdateMode::Append);
-        assert_eq!(results[0].change_type.as_deref(), Some(super::super::types::SKILL_EXPERIENCE_ENTRY));
+        assert_eq!(
+            results[0].change_type.as_deref(),
+            Some(super::super::types::SKILL_EXPERIENCE_ENTRY)
+        );
         assert_eq!(
             results[0].errors,
             ["unsupported update mode/effect for compatibility operator: append/pending_change"]

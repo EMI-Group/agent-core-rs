@@ -27,7 +27,7 @@ use serde_json::Value;
 
 use openjiuwen_common::error::{Error, Result};
 
-use crate::rl::{RolloutMessage, RolloutWithReward, RlTask};
+use crate::rl::{RlTask, RolloutMessage, RolloutWithReward};
 
 use super::batch::{BatchBuilder, BatchConfig, BatchPlan};
 use super::encoding::TurnEncoder;
@@ -268,7 +268,10 @@ impl ValidationMetrics {
             "val/average_turn_num".to_owned(),
             Value::from(self.average_turn_num),
         );
-        metrics.insert("val/turn_num".to_owned(), Value::from(self.turn_num.clone()));
+        metrics.insert(
+            "val/turn_num".to_owned(),
+            Value::from(self.turn_num.clone()),
+        );
         metrics.insert(
             "val/reward_list".to_owned(),
             Value::from(self.reward_list.clone()),
@@ -461,14 +464,14 @@ impl TrainingCoordinator {
         neg_cache: &BTreeMap<String, Vec<RolloutWithReward>>,
     ) -> BTreeMap<String, Vec<RolloutWithReward>> {
         let mut merged: BTreeMap<String, Vec<RolloutWithReward>> = BTreeMap::new();
-        for uid in pos_cache.keys().chain(neg_cache.keys()) {
-            let entry = merged.entry(uid.clone()).or_default();
-            if let Some(list) = pos_cache.get(uid) {
-                entry.extend(list.iter().cloned());
-            }
-            if let Some(list) = neg_cache.get(uid) {
-                entry.extend(list.iter().cloned());
-            }
+        for (uid, list) in pos_cache {
+            merged.insert(uid.clone(), list.clone());
+        }
+        for (uid, list) in neg_cache {
+            merged
+                .entry(uid.clone())
+                .or_default()
+                .extend(list.iter().cloned());
         }
         merged
     }
@@ -487,11 +490,7 @@ impl TrainingCoordinator {
     /// an empty final batch; [`Error::timeout`] when a round does not drain
     /// within `round_timeout_ms`; a persistence error from the configured
     /// backend.
-    pub async fn run_rounds(
-        &mut self,
-        rows: &[Value],
-        step: usize,
-    ) -> Result<CoordinatorReport> {
+    pub async fn run_rounds(&mut self, rows: &[Value], step: usize) -> Result<CoordinatorReport> {
         if rows.is_empty() {
             return Err(Error::validation(
                 "TrainingCoordinator::run_rounds needs at least one dataset row",
@@ -525,11 +524,11 @@ impl TrainingCoordinator {
             self.persist_rollouts(step, &collected, RolloutPhase::Train)
                 .await?;
             collected_rollouts += collected.len();
-            self.last_rollouts.extend(collected);
 
             let grouped = self.collect_round(&collected, &mut dropped);
             let finished = self.update_rollout_state(&grouped)?;
-            let (remaining, finished_count) = Self::filter_unfinished_tasks(&self.rollout_state, tasks);
+            let (remaining, finished_count) =
+                Self::filter_unfinished_tasks(&self.rollout_state, tasks);
             tasks = remaining;
             rounds.push(RoundReport {
                 round_id,
@@ -539,6 +538,7 @@ impl TrainingCoordinator {
                 finished_tasks: finished.max(finished_count),
                 remaining_tasks: tasks.len(),
             });
+            self.last_rollouts.extend(collected);
         }
 
         let sampler = self.processors.sampler(&self.config.sampler)?;
@@ -586,11 +586,7 @@ impl TrainingCoordinator {
     /// [`Error::timeout`] when the pass does not drain in time, or a persistence
     /// error from the configured backend. An empty row set yields zero metrics
     /// (Python's `len(next(iter(rl_data.values())))` would raise there).
-    pub async fn validate(
-        &mut self,
-        rows: &[Value],
-        step: usize,
-    ) -> Result<ValidationMetrics> {
+    pub async fn validate(&mut self, rows: &[Value], step: usize) -> Result<ValidationMetrics> {
         self.clear_up_data().await;
         if rows.is_empty() {
             return Ok(ValidationMetrics::default());
@@ -878,7 +874,9 @@ mod tests {
     }
 
     fn rows(count: usize) -> Vec<Value> {
-        (0..count).map(|i| json!({"query": format!("q{i}"), "expected": "42"})).collect()
+        (0..count)
+            .map(|i| json!({"query": format!("q{i}"), "expected": "42"}))
+            .collect()
     }
 
     fn config() -> CoordinatorConfig {
@@ -894,7 +892,7 @@ mod tests {
     }
 
     async fn coordinator() -> TrainingCoordinator {
-        TrainingCoordinator::new(config(), source(1, 2))
+        TrainingCoordinator::new(config(), source(2, 2))
             .expect("coordinator")
             .with_composer(Arc::new(ExactMatchComposer::new()))
     }
@@ -962,7 +960,9 @@ mod tests {
         let registry = ProcessorsRegistry::new();
         let coordinator = TrainingCoordinator::new(CoordinatorConfig::default(), source(1, 1))
             .expect("coordinator");
-        assert!(coordinator.with_processors(registry).is_ok());
+        let coordinator = coordinator
+            .with_processors(registry)
+            .expect("default registry");
         let error = coordinator
             .with_processors(ProcessorsRegistry::default())
             .expect_err("empty registry");
@@ -975,7 +975,8 @@ mod tests {
         let report = coordinator.run_rounds(&rows(2), 1).await.expect("rounds");
 
         assert_eq!(report.step, 1);
-        // 2 rows x 2 rollouts x 2 turns = 8 samples.
+        // 2 rows x 2 rollouts x 2 turns = 8 samples; one rollout of each row
+        // answers correctly and one does not.
         assert_eq!(report.collected_rollouts, 4);
         assert_eq!(report.training_samples, 8);
         assert_eq!(report.unique_prompts, 2);
@@ -983,11 +984,13 @@ mod tests {
         assert_eq!(report.negative_samples, 4);
         assert_eq!(report.avg_turns, 2.0);
         assert!((report.reward_mean - 0.5).abs() < 1e-12);
-        assert_eq!(report.rounds.len(), 2);
+        // Both groups reached the stop rule in the first round, so the loop
+        // never submits a second one.
+        assert_eq!(report.rounds.len(), 1);
         assert_eq!(report.rounds[0].submitted, 4);
         assert_eq!(report.rounds[0].collected, 4);
-        assert!(report.rounds[1].submitted <= 4);
-        assert!(report.dropped_rollouts.is_empty());
+        assert_eq!(report.rounds[0].remaining_tasks, 0);
+        assert!(report.dropped_rollouts.is_empty(), "nothing should drop");
         assert_eq!(report.diagnostics.sample_count, 8);
         assert_eq!(report.batch.sample_count(), 8);
         assert_eq!(report.batch.config.max_prompt_length, 8);
@@ -1019,8 +1022,10 @@ mod tests {
         assert_eq!(report.collected_rollouts, 2);
         assert_eq!(report.training_samples, 2);
         let batch = report.batch.to_rl_batch("b");
-        assert!(batch.samples.iter().all(|sample| sample.metadata["n_turns"]
-            == Value::from(3)));
+        assert!(batch
+            .samples
+            .iter()
+            .all(|sample| sample.metadata["n_turns"] == json!(3)));
     }
 
     #[tokio::test]
@@ -1043,7 +1048,10 @@ mod tests {
     #[tokio::test]
     async fn a_failing_task_yields_a_dropped_empty_rollout() {
         let mut coordinator = TrainingCoordinator::new(
-            config(),
+            CoordinatorConfig {
+                rollout_max_round: 1,
+                ..config()
+            },
             Arc::new(ScriptedSource {
                 correct_every: 1,
                 fail_task: Some("task-1-0-0"),
@@ -1053,12 +1061,12 @@ mod tests {
         .expect("coordinator")
         .with_composer(Arc::new(ExactMatchComposer::new()));
         let report = coordinator.run_rounds(&rows(1), 1).await.expect("rounds");
-        // The failed task still reports a rollout (empty, reward 0); only the
-        // successful task's turns become samples.
+        // The failed task still reports a rollout, but an empty one has no turn
+        // to encode, so only the successful task's turn becomes a sample.
         assert_eq!(report.collected_rollouts, 2);
         assert_eq!(report.training_samples, 1);
-        assert_eq!(report.rewards_by_uid["origin-1-0"].len(), 2);
-        assert_eq!(report.rewards_by_uid["origin-1-0"][0].global, 0.0);
+        assert_eq!(report.rewards_by_uid["origin-1-0"].len(), 1);
+        assert_eq!(report.rewards_by_uid["origin-1-0"][0].global, 1.0);
     }
 
     #[tokio::test]
@@ -1083,7 +1091,9 @@ mod tests {
             .run_rounds(&rows(1), 1)
             .await
             .expect_err("empty batch");
-        assert!(error.to_string().contains("0 samples collected after rollout"));
+        assert!(error
+            .to_string()
+            .contains("0 samples collected after rollout"));
     }
 
     #[tokio::test]
@@ -1114,7 +1124,10 @@ mod tests {
         assert_eq!(rendered["val/sample_count"], json!(2));
 
         // An empty validation set yields zero metrics instead of failing.
-        let empty = coordinator.validate(&[], 4).await.expect("empty validation");
+        let empty = coordinator
+            .validate(&[], 4)
+            .await
+            .expect("empty validation");
         assert_eq!(empty, ValidationMetrics::default());
     }
 

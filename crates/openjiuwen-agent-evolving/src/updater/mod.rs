@@ -58,6 +58,8 @@
 mod apply;
 mod rl_update;
 mod types;
+// The Python package names this module `updater`; the nested path keeps parity.
+#[allow(clippy::module_inception)]
 mod updater;
 
 pub use apply::{
@@ -65,8 +67,9 @@ pub use apply::{
     UpdateTarget,
 };
 pub use rl_update::{
-    compute_advantages, policy_update_key, AdvantageGroupStats, AdvantageReport, GradientOptimizer,
-    GpuGradientOptimizer, OfflinePolicyOptimizer, ParameterUpdate, RlUpdatePipeline, POLICY_TARGET,
+    compute_advantages, policy_update_key, AdvantageGroupStats, AdvantageReport,
+    GpuGradientOptimizer, GradientOptimizer, OfflinePolicyOptimizer, ParameterUpdate,
+    RlUpdatePipeline, POLICY_TARGET,
 };
 pub use types::{
     normalize_update_value, normalize_updates, ApplyResult, ApplySummary, LifecycleStage, Update,

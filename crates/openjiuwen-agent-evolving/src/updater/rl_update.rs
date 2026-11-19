@@ -34,9 +34,7 @@ use crate::rl::{
 };
 
 use super::apply::{execute_updates, summarize_apply_results, OperatorMap, UpdateTarget};
-use super::types::{
-    ApplyResult, ApplySummary, Update, UpdateValue, UpdateKey, Updates,
-};
+use super::types::{ApplyResult, ApplySummary, Update, UpdateKey, UpdateValue, Updates};
 
 /// The target a policy update is written to.
 pub const POLICY_TARGET: &str = "policy";
@@ -326,18 +324,28 @@ impl GradientOptimizer for OfflinePolicyOptimizer {
         let mut weighted = 0.0;
         for (index, sample) in batch.samples.iter().enumerate() {
             let advantage = advantages.advantages[index];
+            // `apply` already replaced each sample's reward with its advantage,
+            // so the raw reward lives on the report, not on the sample.
+            let raw_reward = advantages
+                .rewards
+                .get(index)
+                .copied()
+                .unwrap_or(sample.reward);
             weighted += advantage;
             let mut derived = sample.clone();
             derived.reward = advantage;
             derived.metadata.insert(
                 "reward".to_owned(),
-                serde_json::Number::from_f64(sample.reward).map_or(serde_json::Value::Null, serde_json::Value::Number),
+                serde_json::Number::from_f64(raw_reward)
+                    .map_or(serde_json::Value::Null, serde_json::Value::Number),
             );
             derived.metadata.insert(
                 "advantage".to_owned(),
-                serde_json::Number::from_f64(advantage).map_or(serde_json::Value::Null, serde_json::Value::Number),
+                serde_json::Number::from_f64(advantage)
+                    .map_or(serde_json::Value::Null, serde_json::Value::Number),
             );
-            let single = RlBatch::from_samples(format!("{}-s{index}", batch.batch_id), vec![derived]);
+            let single =
+                RlBatch::from_samples(format!("{}-s{index}", batch.batch_id), vec![derived]);
             self.policy.update(&single).await?;
         }
         let mut metadata = BTreeMap::new();
@@ -346,7 +354,10 @@ impl GradientOptimizer for OfflinePolicyOptimizer {
             serde_json::Value::String(self.name().to_owned()),
         );
         metadata.insert("samples".to_owned(), json!(batch.samples.len()));
-        metadata.insert("mean_advantage".to_owned(), json!(weighted / batch.samples.len() as f64));
+        metadata.insert(
+            "mean_advantage".to_owned(),
+            json!(weighted / batch.samples.len() as f64),
+        );
         updates.insert_update(
             self.policy.name().to_owned(),
             POLICY_TARGET,
@@ -527,11 +538,7 @@ impl RlUpdatePipeline {
             .map(|sample| (sanitise(sample.reward), sample.group_id.clone()))
             .collect();
         let advantages = scalar_advantages(&observed);
-        for (sample, advantage) in validated
-            .samples
-            .iter_mut()
-            .zip(&advantages.advantages)
-        {
+        for (sample, advantage) in validated.samples.iter_mut().zip(&advantages.advantages) {
             sample.reward = *advantage;
         }
 
@@ -658,7 +665,7 @@ mod tests {
         assert_eq!(group.mean_reward, 0.5);
         assert_eq!(group.max_advantage, 0.5);
         assert!(!group.fallback);
-        assert!(report.fallback_groups.is_empty());
+        assert!(report.fallback_groups.is_empty(), "every sample is grouped");
         assert_eq!(report.best_reward(), 2.0);
         assert_eq!(report.mean_reward(), 1.0);
         assert_eq!(report.advantage(1), Some(-0.5));
@@ -666,9 +673,17 @@ mod tests {
 
     #[test]
     fn ungrouped_advantages_fall_back_to_scalar_normalisation() {
-        let mut rollouts = vec![rollout(3.0, None), rollout(1.0, None), rollout(0.0, Some(""))];
+        let mut rollouts = vec![
+            rollout(3.0, None),
+            rollout(1.0, None),
+            rollout(0.0, Some("")),
+        ];
         let report = compute_advantages(&mut rollouts);
-        assert_eq!(report.advantages, [5.0 / 3.0, -1.0 / 3.0, -4.0 / 3.0]);
+        let centre = 4.0 / 3.0;
+        assert_eq!(
+            report.advantages,
+            [3.0 - centre, 1.0 - centre, 0.0 - centre]
+        );
         assert_eq!(report.fallback_groups, [String::new()]);
         let group = report.group("").expect("fallback group");
         assert!(group.fallback);

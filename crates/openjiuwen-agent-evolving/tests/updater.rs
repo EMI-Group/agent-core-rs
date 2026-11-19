@@ -16,10 +16,10 @@ use openjiuwen_agent_evolving::signal::EvolutionTarget;
 use openjiuwen_agent_evolving::trajectory::{Trajectory, TrajectoryOutcome};
 use openjiuwen_agent_evolving::updater::{
     compute_advantages, execute_updates, normalize_update_value, signals_from_cases,
-    summarize_apply_results, AdvantageReport, GradientOptimizer, GpuGradientOptimizer,
-    MultiDimUpdater, OfflinePolicyOptimizer, RecordingOptimizer, RecordingTarget, RlUpdatePipeline,
-    SingleDimUpdater, TextualOptimizer, Update, UpdateConfig, UpdateDomain, UpdateMode,
-    UpdateTarget, UpdateValue, Updater, Updates, EXPERIENCES_TARGET, POLICY_TARGET,
+    summarize_apply_results, AdvantageReport, GpuGradientOptimizer, GradientOptimizer,
+    MultiDimUpdater, OfflinePolicyOptimizer, OperatorMap, RecordingOptimizer, RecordingTarget,
+    RlUpdatePipeline, SingleDimUpdater, TextualOptimizer, Update, UpdateConfig, UpdateDomain,
+    UpdateMode, UpdateTarget, UpdateValue, Updater, Updates, EXPERIENCES_TARGET, POLICY_TARGET,
 };
 use openjiuwen_common::error::{Error, ErrorKind};
 use serde_json::{json, Value};
@@ -176,7 +176,7 @@ fn normalization_mirrors_the_python_compatibility_rules() {
 fn execute_updates_applies_in_write_order_and_reports_none_last() {
     let target = Arc::new(RecordingTarget::new());
     let mut operators = BTreeMap::new();
-    let erased: Arc<dyn UpdateTarget> = Arc::clone(&target);
+    let erased: Arc<dyn UpdateTarget> = target.clone();
     operators.insert("op-1".to_owned(), erased);
 
     let mut updates = Updates::new();
@@ -208,14 +208,14 @@ fn execute_updates_applies_in_write_order_and_reports_none_last() {
 #[tokio::test]
 async fn single_dim_updater_feeds_trajectories_then_applies_its_updates() {
     let target = Arc::new(RecordingTarget::new());
-    let mut operators = BTreeMap::new();
-    operators.insert("agent/llm_1".to_owned(), Arc::clone(&target));
+    let mut operators: BTreeMap<String, Arc<dyn UpdateTarget>> = BTreeMap::new();
+    operators.insert("agent/llm_1".to_owned(), target.clone());
     let mut updater = SingleDimUpdater::new(RecordingOptimizer::new());
     assert_eq!(updater.bind(&operators, None), 1);
 
     let trajectories = [trajectory("t-1"), trajectory("t-2")];
     let signals = [signal(EvolutionTarget::Description)];
-    let updates = updater
+    let processed = updater
         .process(&trajectories, &signals, &UpdateConfig::new())
         .await
         .expect("process");
@@ -224,7 +224,7 @@ async fn single_dim_updater_feeds_trajectories_then_applies_its_updates() {
     assert_eq!(updater.optimizer().backward_calls(), 1);
     assert_eq!(updater.optimizer().steps(), 1);
 
-    let results = execute_updates(&operators, &updates);
+    let results = execute_updates(&operators, &processed);
     assert!(summarize_apply_results(&results).is_ok());
     assert_eq!(
         target.value("agent/llm_1", "description"),
@@ -234,9 +234,13 @@ async fn single_dim_updater_feeds_trajectories_then_applies_its_updates() {
 
 #[tokio::test]
 async fn single_dim_update_filters_cases_by_the_threshold_inclusively() {
-    let cases = [evaluated(0.0, "wrong"), evaluated(0.5, "half"), evaluated(0.9, "right")];
+    let cases = [
+        evaluated(0.0, "wrong"),
+        evaluated(0.5, "half"),
+        evaluated(0.9, "right"),
+    ];
     let mut updater = SingleDimUpdater::new(RecordingOptimizer::new());
-    let mut operators = BTreeMap::new();
+    let mut operators: BTreeMap<String, Arc<dyn UpdateTarget>> = BTreeMap::new();
     operators.insert("agent/llm_1".to_owned(), Arc::new(RecordingTarget::new()));
     updater.bind(&operators, None);
 
@@ -261,7 +265,7 @@ async fn single_dim_update_filters_cases_by_the_threshold_inclusively() {
     assert_eq!(seen.len(), 3);
     assert_eq!(
         seen.iter()
-            .map(|signal| signal.signal_type())
+            .map(openjiuwen_agent_evolving::EvolutionSignal::signal_type)
             .collect::<Vec<_>>(),
         ["low_score", "evaluated", "evaluated"]
     );
@@ -276,15 +280,18 @@ fn signals_from_cases_rejects_a_non_finite_threshold() {
 
 #[tokio::test]
 async fn single_dim_state_round_trips_through_a_fresh_updater() {
-    let mut operators = BTreeMap::new();
+    let mut operators: BTreeMap<String, Arc<dyn UpdateTarget>> = BTreeMap::new();
     operators.insert("agent/llm_1".to_owned(), Arc::new(RecordingTarget::new()));
-    let mut updater = SingleDimUpdater::new(
-        RecordingOptimizer::new().with_requires_forward_data(true),
-    );
+    let mut updater =
+        SingleDimUpdater::new(RecordingOptimizer::new().with_requires_forward_data(true));
     assert!(updater.requires_forward_data());
     updater.bind(&operators, Some(&["description".to_owned()]));
     updater
-        .process(&[trajectory("t-1")], &[signal(EvolutionTarget::Description)], &UpdateConfig::new())
+        .process(
+            &[trajectory("t-1")],
+            &[signal(EvolutionTarget::Description)],
+            &UpdateConfig::new(),
+        )
         .await
         .expect("process");
     let state = updater.get_state();
@@ -292,7 +299,10 @@ async fn single_dim_state_round_trips_through_a_fresh_updater() {
     let mut restored = SingleDimUpdater::new(RecordingOptimizer::new());
     restored.load_state(&state).expect("load state");
     assert_eq!(restored.optimizer().bound(), ["agent/llm_1"]);
-    assert_eq!(restored.optimizer().bound_targets(), Some(["description".to_owned()].as_slice()));
+    assert_eq!(
+        restored.optimizer().bound_targets(),
+        Some(["description".to_owned()].as_slice())
+    );
     assert_eq!(restored.optimizer().steps(), 1);
     assert_eq!(restored.optimizer().trajectory_ids(), Vec::<String>::new());
     assert!(restored.load_state(&json!("nope")).is_err());
@@ -301,28 +311,32 @@ async fn single_dim_state_round_trips_through_a_fresh_updater() {
 
 #[tokio::test]
 async fn a_boxed_optimizer_drives_the_single_dim_updater() {
-    let mut operators = BTreeMap::new();
+    let mut operators: BTreeMap<String, Arc<dyn UpdateTarget>> = BTreeMap::new();
     operators.insert("agent/llm_1".to_owned(), Arc::new(RecordingTarget::new()));
     let boxed: Box<dyn TextualOptimizer> = Box::new(RecordingOptimizer::new());
     let mut updater = SingleDimUpdater::new(boxed);
     assert_eq!(updater.bind(&operators, None), 1);
-    let updates = updater
-        .process(&[trajectory("t-1")], &[signal(EvolutionTarget::Body)], &UpdateConfig::new())
+    let processed = updater
+        .process(
+            &[trajectory("t-1")],
+            &[signal(EvolutionTarget::Body)],
+            &UpdateConfig::new(),
+        )
         .await
         .expect("process");
-    assert!(updates.contains_key("agent/llm_1", "description"));
+    assert!(processed.contains_key("agent/llm_1", "description"));
 }
 
 // ---------------------------------------------------------------------------
 // Multi-dimension updater
 // ---------------------------------------------------------------------------
 
-fn domain_operators() -> (BTreeMap<String, Arc<dyn UpdateTarget>>, Arc<RecordingTarget>, Arc<RecordingTarget>) {
+fn domain_operators() -> (OperatorMap, Arc<RecordingTarget>, Arc<RecordingTarget>) {
     let llm = Arc::new(RecordingTarget::new());
     let tool = Arc::new(RecordingTarget::with_domain(UpdateDomain::Tool));
-    let mut operators = BTreeMap::new();
-    let llm_target: Arc<dyn UpdateTarget> = Arc::clone(&llm);
-    let tool_target: Arc<dyn UpdateTarget> = Arc::clone(&tool);
+    let mut operators = OperatorMap::new();
+    let llm_target: Arc<dyn UpdateTarget> = llm.clone();
+    let tool_target: Arc<dyn UpdateTarget> = tool.clone();
     operators.insert("agent/llm_1".to_owned(), llm_target);
     operators.insert("agent/tool_1".to_owned(), tool_target);
     (operators, llm, tool)
@@ -341,26 +355,38 @@ async fn multi_dim_applies_domains_in_the_documented_order() {
     );
     assert_eq!(updater.bind(&operators, None), 2);
 
-    let updates = updater
+    let processed = updater
         .process(
             &[trajectory("t-1")],
-            &[signal(EvolutionTarget::Tool), signal(EvolutionTarget::Instruction)],
+            &[
+                signal(EvolutionTarget::Tool),
+                signal(EvolutionTarget::Instruction),
+            ],
             &UpdateConfig::new(),
         )
         .await
         .expect("process");
-    let keys: Vec<(&str, &str)> = updates
+    let keys: Vec<(&str, &str)> = processed
         .iter()
         .map(|(operator_id, target, _)| (operator_id, target))
         .collect();
-    assert_eq!(keys, [("agent/llm_1", "description"), ("agent/tool_1", "description")]);
+    assert_eq!(
+        keys,
+        [
+            ("agent/llm_1", "description"),
+            ("agent/tool_1", "description")
+        ]
+    );
     // The memory domain owns no operator and received no signal, so it was never
     // fed or stepped; each stepped domain saw the whole trajectory batch once.
     let memory = updater.optimizer(UpdateDomain::Memory).expect("memory");
     assert_eq!(memory.state()["bound"], json!([]));
     assert_eq!(memory.state()["steps"], json!(0));
     assert_eq!(updater.get_state()["domains"]["llm"]["steps"], json!(1));
-    assert_eq!(updater.get_state()["domains"]["tool"]["trajectories"], json!(1));
+    assert_eq!(
+        updater.get_state()["domains"]["tool"]["trajectories"],
+        json!(1)
+    );
 }
 
 #[tokio::test]
@@ -438,7 +464,10 @@ fn advantages_are_group_centred_and_report_per_group_stats() {
     assert_eq!(report.advantages, [0.5, -0.5, 0.0, 0.0]);
     assert_eq!(report.rewards, [1.0, 0.0, 2.0, 4.0]);
     assert_eq!(
-        rollouts.iter().map(|rollout| rollout.reward).collect::<Vec<_>>(),
+        rollouts
+            .iter()
+            .map(|rollout| rollout.reward)
+            .collect::<Vec<_>>(),
         [0.5, -0.5, 0.0, 0.0]
     );
     let group = report.group("g1").expect("g1");
@@ -456,15 +485,15 @@ fn advantages_are_group_centred_and_report_per_group_stats() {
 async fn pipeline_batches_advantages_and_applies_the_policy_update() {
     let policy = Arc::new(RecordingPolicy::default());
     let target = Arc::new(RecordingTarget::new());
-    let erased_policy: Arc<dyn Policy> = Arc::clone(&policy);
+    let erased_policy: Arc<dyn Policy> = policy.clone();
     let optimizer = Arc::new(OfflinePolicyOptimizer::new(erased_policy));
     assert!(!optimizer.requires_gpu());
     assert_eq!(optimizer.name(), "offline-policy");
-    let erased_optimizer: Arc<dyn GradientOptimizer> = Arc::clone(&optimizer);
-    let erased_target: Arc<dyn UpdateTarget> = Arc::clone(&target);
+    let erased_optimizer: Arc<dyn GradientOptimizer> = optimizer.clone();
+    let erased_target: Arc<dyn UpdateTarget> = target.clone();
     let mut pipeline = RlUpdatePipeline::new(erased_optimizer, erased_target)
-    .with_run_id("run-7")
-    .with_packer(BatchPacker::new().with_max_samples(2));
+        .with_run_id("run-7")
+        .with_packer(BatchPacker::new().with_max_samples(2));
     assert_eq!(pipeline.run_id(), "run-7");
     assert_eq!(pipeline.epoch(), 0);
     assert!(!pipeline.requires_gpu());
@@ -515,7 +544,10 @@ async fn pipeline_batches_advantages_and_applies_the_policy_update() {
     assert_eq!(update.summary.total, 1);
     assert!(update.summary.is_ok());
     assert_eq!(target.written_targets(), [POLICY_TARGET]);
-    assert_eq!(target.value("recording", POLICY_TARGET), Some(policy.parameters()));
+    assert_eq!(
+        target.value("recording", POLICY_TARGET),
+        Some(policy.parameters())
+    );
     assert_eq!(
         target.value("recording", POLICY_TARGET).expect("written")["updates"],
         json!(3)
@@ -532,8 +564,14 @@ async fn pipeline_batches_advantages_and_applies_the_policy_update() {
     assert_eq!(checkpoint.metrics["applied"], 1.0);
     assert_eq!(checkpoint.metrics["failed"], 0.0);
     assert_eq!(checkpoint.policy["optimizer"], json!("offline-policy"));
-    assert_eq!(checkpoint.policy["advantages"]["advantages"], json!([0.5, -0.5, 0.0]));
-    assert_eq!(checkpoint.policy["updates"][0]["operator_id"], json!("recording"));
+    assert_eq!(
+        checkpoint.policy["advantages"]["advantages"],
+        json!([0.5, -0.5, 0.0])
+    );
+    assert_eq!(
+        checkpoint.policy["updates"][0]["operator_id"],
+        json!("recording")
+    );
     assert_eq!(checkpoint.file_name(), "epoch-1.json");
 
     // Persistence is a separate, explicit step.
@@ -558,16 +596,23 @@ async fn pipeline_reports_none_valued_updates_last_and_fails_loudly() {
         gpu: false,
     });
     let erased_optimizer: Arc<dyn GradientOptimizer> = optimizer;
-    let erased_target: Arc<dyn UpdateTarget> = Arc::clone(&target);
+    let erased_target: Arc<dyn UpdateTarget> = target.clone();
     let mut pipeline = RlUpdatePipeline::new(erased_optimizer, erased_target);
     let batch = RlBatch::from_samples("batch-2", vec![sample("s-1", 0.5, Some("g"))]);
-    let error = pipeline.apply(&batch).await.expect_err("a None update fails");
+    let error = pipeline
+        .apply(&batch)
+        .await
+        .expect_err("a None update fails");
     assert_eq!(error.kind(), ErrorKind::Workflow);
     assert!(error.to_string().contains("1 of 2 update(s) failed"));
     assert!(error.to_string().contains("update value is None"));
     // The non-None update still reached the target; nothing was silently dropped.
     assert_eq!(target.written_targets(), ["description"]);
-    assert_eq!(pipeline.epoch(), 0, "a failed step does not advance the epoch");
+    assert_eq!(
+        pipeline.epoch(),
+        0,
+        "a failed step does not advance the epoch"
+    );
 }
 
 #[tokio::test]
@@ -579,7 +624,7 @@ async fn pipeline_rejects_an_empty_batch() {
         gpu: false,
     });
     let erased_optimizer: Arc<dyn GradientOptimizer> = optimizer;
-    let erased_target: Arc<dyn UpdateTarget> = Arc::clone(&target);
+    let erased_target: Arc<dyn UpdateTarget> = target.clone();
     let mut pipeline = RlUpdatePipeline::new(erased_optimizer, erased_target);
     let error = pipeline
         .apply(&RlBatch::from_samples("batch-3", Vec::new()))
@@ -596,7 +641,7 @@ async fn gpu_gradient_optimizer_reports_the_typed_unsupported_error() {
     assert!(optimizer.requires_gpu());
     assert_eq!(optimizer.name(), "gpu");
     let erased_optimizer: Arc<dyn GradientOptimizer> = optimizer;
-    let erased_target: Arc<dyn UpdateTarget> = Arc::clone(&target);
+    let erased_target: Arc<dyn UpdateTarget> = target.clone();
     let mut pipeline = RlUpdatePipeline::new(erased_optimizer, erased_target);
     assert!(pipeline.requires_gpu());
     let batch = RlBatch::from_samples("batch-4", vec![sample("s-1", 1.0, Some("g"))]);
@@ -605,7 +650,10 @@ async fn gpu_gradient_optimizer_reports_the_typed_unsupported_error() {
     let message = error.to_string();
     assert!(message.contains("GpuGradientOptimizer::gradients"));
     for dependency in ["torch", "verl", "ray"] {
-        assert!(message.contains(dependency), "message must name {dependency}");
+        assert!(
+            message.contains(dependency),
+            "message must name {dependency}"
+        );
     }
     assert!(message.contains("docs/PARITY.md"));
     assert!(target.is_empty());
@@ -615,7 +663,7 @@ async fn gpu_gradient_optimizer_reports_the_typed_unsupported_error() {
 #[tokio::test]
 async fn offline_optimizer_rejects_a_mismatched_advantage_report() {
     let policy = Arc::new(RecordingPolicy::default());
-    let erased: Arc<dyn Policy> = Arc::clone(&policy);
+    let erased: Arc<dyn Policy> = policy.clone();
     let optimizer = OfflinePolicyOptimizer::new(erased);
     let batch = RlBatch::from_samples("batch-5", vec![sample("s-1", 1.0, None)]);
     let error = optimizer
@@ -624,5 +672,5 @@ async fn offline_optimizer_rejects_a_mismatched_advantage_report() {
         .expect_err("mismatched advantages");
     assert_eq!(error.kind(), ErrorKind::Validation);
     assert!(error.to_string().contains("1 sample"));
-    assert!(policy.batches().is_empty());
+    assert!(policy.batches().is_empty(), "no update ran");
 }
