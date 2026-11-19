@@ -125,7 +125,7 @@ pub use service::{
 };
 pub use subtree::{
     build_progressive_branch_description, build_progressive_item_label, build_progressive_root,
-    choices_cache_key, DefaultCurrentSubtreeProvider, ItemCounterFn,
+    choices_cache_key, try_build_progressive_root, DefaultCurrentSubtreeProvider, ItemCounterFn,
 };
 pub use truncation::{
     take_budget, truncate_chars, truncate_chars_with_ellipsis, truncate_sorted_by_score,

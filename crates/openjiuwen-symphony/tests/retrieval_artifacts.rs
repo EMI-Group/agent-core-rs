@@ -1202,3 +1202,106 @@ async fn an_empty_index_still_renders_a_sane_visualizer_document() {
     );
     assert_eq!(directory_entries(dir.path()), artifacts_with_html());
 }
+
+/// Writes a hand-built index directory (bypassing `write_index`'s own depth guard).
+fn write_raw_index(dir: &Path, tree: &str, catalog: &str, count: usize) {
+    fs::create_dir_all(dir).expect("create dir");
+    fs::write(dir.join(TREE_INDEX_FILENAME), tree).expect("write tree");
+    fs::write(dir.join(CATALOG_FILENAME), catalog).expect("write catalog");
+    fs::write(
+        dir.join(MANIFEST_FILENAME),
+        format!("{{\"mode\": \"full\", \"count\": {count}, \"item_type\": \"skill\"}}"),
+    )
+    .expect("write manifest");
+}
+
+#[tokio::test]
+async fn a_ten_thousand_segment_cid_is_rejected_typed_instead_of_aborting() {
+    let dir = tempfile::tempdir().unwrap();
+    let deep: Vec<&str> = std::iter::repeat_n("a", 10_000).collect();
+    let deep = deep.join(".");
+    let tree = render_tree_yaml(&[IndexNode::leaf(deep.clone(), "skill")]);
+    let record = CatalogRecord::new("skill", deep);
+    let catalog = serde_json::to_string(&record).unwrap() + "\n";
+    write_raw_index(dir.path(), &tree, &catalog, 1);
+
+    // Parsing the document alone is already bounded.
+    let error = parse_tree_yaml(&tree).expect_err("a 10 000-segment cid must be rejected");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(
+        error.message().contains("10000 dot-separated segments"),
+        "{}",
+        error.message()
+    );
+    assert!(
+        error.message().contains("maximum is 64"),
+        "{}",
+        error.message()
+    );
+
+    // And so is the public load path, instead of recursing once per segment.
+    let error = load_index(dir.path()).await.expect_err("must reject");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(
+        error.message().contains("tree_index.yaml"),
+        "{}",
+        error.message()
+    );
+}
+
+#[tokio::test]
+async fn a_deep_branch_chain_is_rejected_instead_of_overflowing_the_stack() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut nodes = Vec::new();
+    for depth in 1..=200 {
+        let cid = vec!["a"; depth].join(".");
+        if depth == 200 {
+            nodes.push(IndexNode::leaf(cid, "skill"));
+        } else {
+            nodes.push(IndexNode::branch(cid));
+        }
+    }
+    let leaf_cid = vec!["a"; 200].join(".");
+    let tree = render_tree_yaml(&nodes);
+    let record = CatalogRecord::new("skill", leaf_cid);
+    let catalog = serde_json::to_string(&record).unwrap() + "\n";
+    write_raw_index(dir.path(), &tree, &catalog, 1);
+
+    let error = load_index(dir.path()).await.expect_err("must reject");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.message().contains("segments"), "{}", error.message());
+}
+
+#[tokio::test]
+async fn a_normal_five_level_index_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let cids = [
+        "skills",
+        "skills.alpha",
+        "skills.alpha.deploy",
+        "skills.alpha.deploy.k8s",
+    ];
+    let mut nodes: Vec<IndexNode> = cids.iter().map(|cid| IndexNode::branch(*cid)).collect();
+    nodes.push(IndexNode::leaf("skills.alpha.deploy.k8s.helm", "helm"));
+    let records = vec![CatalogRecord::new("helm", "skills.alpha.deploy.k8s.helm")];
+    let manifest = IndexManifest {
+        mode: "full".to_string(),
+        count: records.len(),
+        item_type: "skill".to_string(),
+        ..IndexManifest::default()
+    };
+    write_index(dir.path(), &nodes, &records, &manifest)
+        .await
+        .expect("write");
+    let loaded = load_index(dir.path()).await.expect("load");
+    assert_eq!(loaded.records.len(), 1);
+    assert_eq!(
+        loaded.item_paths.get("skills.alpha.deploy.k8s.helm"),
+        Some(&vec![
+            "skills".to_string(),
+            "skills.alpha".to_string(),
+            "skills.alpha.deploy".to_string(),
+            "skills.alpha.deploy.k8s".to_string(),
+        ])
+    );
+}

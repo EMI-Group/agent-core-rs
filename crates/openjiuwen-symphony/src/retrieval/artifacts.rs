@@ -49,6 +49,7 @@
 //!   write it, and an empty value means "not recorded", so both shapes load.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::io::ErrorKind as IoErrorKind;
 use std::path::Path;
 
@@ -70,6 +71,39 @@ use crate::retrieval::types::{
 /// [`parse_tree_yaml`] rejects, so the empty document spells the
 /// sequence out instead.
 const EMPTY_TREE_YAML: &str = "nodes: []\n";
+
+/// The maximum number of `.`-separated segments a capability `cid` may have.
+///
+/// A `cid` is a dotted path, and the tree it describes is walked and dropped recursively, so
+/// an unbounded path is an unbounded stack: a hand-edited index (or a payload from an
+/// untrusted catalog) with tens of thousands of segments would abort the process with a stack
+/// overflow. The load path therefore rejects a deeper `cid` with a typed
+/// [`Error::Validation`](crate::error::Error::Validation) instead of trusting it. Sixty-four
+/// levels is far beyond any real capability taxonomy (the build schema's own limit is six).
+pub const MAX_CID_DEPTH: usize = 64;
+
+/// The number of non-empty `.`-separated segments in `cid`.
+#[must_use]
+pub fn cid_depth(cid: &str) -> usize {
+    cid.split('.')
+        .filter(|segment| !segment.trim().is_empty())
+        .count()
+}
+
+/// Rejects a `cid` deeper than [`MAX_CID_DEPTH`], naming `file` and the segment count.
+///
+/// The offending path is not echoed: a 10 000-segment id would make the error message itself
+/// megabytes long.
+fn validate_cid_depth(file: &str, cid: &str, context: impl fmt::Display) -> Result<()> {
+    let depth = cid_depth(cid);
+    if depth > MAX_CID_DEPTH {
+        return Err(validation(
+            file,
+            format!("{context} has {depth} dot-separated segments; the maximum is {MAX_CID_DEPTH}"),
+        ));
+    }
+    Ok(())
+}
 
 /// Writes the three index artifacts into `dir`, creating it when missing.
 ///
@@ -290,8 +324,14 @@ pub fn parse_tree_yaml(text: &str) -> Result<Vec<IndexNode>> {
         } else {
             node_type
         };
+        let cid = field_string(fields, "cid").trim().to_string();
+        validate_cid_depth(
+            TREE_INDEX_FILENAME,
+            &cid,
+            format!("the tree node at entry {index}"),
+        )?;
         nodes.push(IndexNode {
-            cid: field_string(fields, "cid").trim().to_string(),
+            cid,
             node_type: node_type.trim().to_string(),
             description: field_string(fields, "description"),
             select_when: field_string(fields, "select_when"),
@@ -372,6 +412,11 @@ pub fn parse_catalog(text: &str) -> Result<Vec<CatalogRecord>> {
             worker_id
         };
         let mut record = CatalogRecord::new(worker_id, field_string(fields, "cid"));
+        validate_cid_depth(
+            CATALOG_FILENAME,
+            &record.cid,
+            format!("line {number}'s cid"),
+        )?;
         let branch_path = string_list(fields.get("branch_path"));
         if !branch_path.is_empty() {
             record.category = branch_path.join(".");
@@ -494,6 +539,16 @@ pub fn build_tree_root(nodes: &[IndexNode], records: &[CatalogRecord]) -> Retrie
         let cid = node.cid.trim();
         if cid.is_empty() {
             warn!("skipping a tree node with a blank cid");
+            continue;
+        }
+        // [`parse_tree_yaml`] rejects a deeper cid, but this entry point is public: skipping
+        // an over-deep node is what keeps the recursive assembly (and every later walk) from
+        // overflowing the stack.
+        if cid_depth(cid) > MAX_CID_DEPTH {
+            warn!(
+                depth = cid_depth(cid),
+                "skipping a tree node deeper than MAX_CID_DEPTH"
+            );
             continue;
         }
         let parent = resolve_parent(cid, &branch_ids);
@@ -713,6 +768,7 @@ fn validate_nodes(nodes: &[IndexNode]) -> Result<()> {
                 format!("duplicate cid `{cid}`"),
             ));
         }
+        validate_cid_depth(TREE_INDEX_FILENAME, cid, "a node cid")?;
     }
     Ok(())
 }

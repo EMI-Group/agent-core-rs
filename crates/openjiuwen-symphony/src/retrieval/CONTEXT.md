@@ -104,6 +104,8 @@ pub fn compose_routing_description(description, select_when, dont_select_when) -
 `write_index` validates the tree, the records and the manifest BEFORE the first byte is written, then writes each file through a same-directory `<name>.tmp` + `rename` (tree, catalog, manifest last).
 `load_index` requires all three files (a missing one is `Error::NotFound` naming it) and rejects: a `count` differing from the record count, a non-empty `content_hash` differing from the recomputed one, a blank `mode`/`item_type`, and any record `cid` with no leaf node in the tree — all `Error::Validation` naming the file.
 It does not check the tree's shape (that is `build::schema`), worker-id agreement between the tree and the catalog, or the derived catalog text.
+One structural bound IS enforced at the load boundary: `MAX_CID_DEPTH` (64 dot-separated segments, `artifacts::cid_depth`, `artifacts::validate_cid_depth`) makes a deeper cid `Error::Validation` naming the file and entry — `parse_tree_yaml` and `parse_catalog` reject it, `write_index` rejects it through `validate_nodes`, and `build_tree_root` skips an over-deep node with a `warn!` instead of recursing.
+The bound exists because the tree walks recurse once per segment: an unbounded cid would turn a hand-edited or hostile `tree_index.yaml` into a stack overflow (a process abort) inside `Retriever::load`.
 
 ### `build` (`src/retrieval/build/`, see [`build`](src/retrieval/build/mod.rs))
 
@@ -143,6 +145,7 @@ pub fn build_exposed_fragment(..) -> Result<ExposedFragment>;   // disclosure ex
 pub fn parse_selected_codes(fragment: &ExposedFragment, output: &str) -> Vec<SelectableResolution>;
 ```
 
+The progressive root builder bounds payloads the same way: `subtree::try_build_progressive_root` answers `Error::Validation` naming `payload` for a payload id deeper than `MAX_CID_DEPTH`, while the infallible `build_progressive_root` attaches such a payload to the root with a `warn!`.
 `search` owns index loading through `artifacts::load_index`, the five traversal seams (`CurrentSubtreeProvider`, `SubtreeRenderer`, `TopKSelector`, `TargetExpander`, `BranchReducer`), disclosure rendering and prompt text, the tolerant reply parser, the code book and truncation helpers, the lexical and embedding scorers, the flat retriever, and the publicization that turns internal leaf cids into public `worker_id`s.
 `types` is the hand-off surface it consumes; nothing in `search` writes an index.
 

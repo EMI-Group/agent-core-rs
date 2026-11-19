@@ -37,6 +37,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 use serde_json::{json, Value};
 
 use crate::error::{unsupported, validation, Error, Result};
+use crate::retrieval::artifacts::{cid_depth, MAX_CID_DEPTH};
 use crate::retrieval::search::config::ProgressiveSearchConfig;
 use crate::retrieval::search::contracts::{CurrentSubtreeProvider, FragmentBuildFn};
 use crate::retrieval::search::flow::{
@@ -356,6 +357,12 @@ pub fn choices_cache_key(choices: &[RetrieverChoice]) -> String {
 /// The root is always [`ROOT_NODE_ID`]/`"ROOT"`; an empty or fully skipped catalog yields
 /// an empty root (Python returns `None` there — this signature returns the node instead,
 /// because a caller of a tree type should not have to unwrap).
+///
+/// A payload with more than [`MAX_CID_DEPTH`] dot-separated segments is attached to the root
+/// with a warning instead of being expanded: the builder is infallible, and an unbounded
+/// payload path would make [`RootBuilder::freeze`] — which recurses once per level — overflow
+/// the stack. Use [`try_build_progressive_root`] to reject such a payload with a typed error
+/// instead.
 #[must_use]
 pub fn build_progressive_root(choices: &[RetrieverChoice]) -> RetrieverNode {
     let mut root = RootBuilder::new(ROOT_NODE_ID, ROOT_NODE_ID);
@@ -377,6 +384,16 @@ pub fn build_progressive_root(choices: &[RetrieverChoice]) -> RetrieverNode {
             root.items.push(item);
             continue;
         }
+        if parts.len() > MAX_CID_DEPTH {
+            tracing::warn!(
+                choice_id,
+                segments = parts.len(),
+                "attaching an over-deep payload to the progressive root; the maximum is \
+                 MAX_CID_DEPTH"
+            );
+            root.items.push(item);
+            continue;
+        }
         let mut current = &mut root;
         for depth in 1..parts.len() {
             let branch_id = parts[..depth].join(".");
@@ -385,6 +402,34 @@ pub fn build_progressive_root(choices: &[RetrieverChoice]) -> RetrieverNode {
         current.items.push(item);
     }
     root.freeze(&[])
+}
+
+/// [`build_progressive_root`], rejecting a payload deeper than [`MAX_CID_DEPTH`].
+///
+/// # Errors
+///
+/// [`Error::Validation`](crate::error::Error) naming `payload` when a choice's payload has
+/// more than [`MAX_CID_DEPTH`] dot-separated segments (the offending path is not echoed, only
+/// its length).
+pub fn try_build_progressive_root(choices: &[RetrieverChoice]) -> Result<RetrieverNode> {
+    for choice in choices {
+        let payload = choice.payload.trim();
+        if payload.is_empty() {
+            continue;
+        }
+        let depth = cid_depth(payload);
+        if depth > MAX_CID_DEPTH {
+            return Err(validation(
+                "payload",
+                format!(
+                    "the payload of `{}` has {depth} dot-separated segments; the maximum is \
+                     {MAX_CID_DEPTH}",
+                    choice.choice_id.trim()
+                ),
+            ));
+        }
+    }
+    Ok(build_progressive_root(choices))
 }
 
 /// One branch node under construction.
