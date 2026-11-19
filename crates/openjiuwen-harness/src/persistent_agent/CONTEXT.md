@@ -33,7 +33,7 @@ Execution journal (`log`):
 - `LOG_ENCODING = "pa-jsonl/1"`, `LOG_ENTRY_FILE = "entries.jsonl"`, `LOG_META_FILE = "meta.json"`.
 Live recording (`recording`):
 - `PersistentRunConfig { agent_id, session_id, request_id, namespace_id, source_ref, capacity }` with `new(agent_id, session_id)` and `with_request_id`/`with_namespace_id`/`with_source_ref`/`with_capacity`; `identity()` fills the optional ids (`DEFAULT_NAMESPACE_ID`/`DEFAULT_SOURCE_REF`, a fresh `req_…`/`exec_…` through `fresh_id`).
-- `ExecutionRecorder { layout, capacity }` with `new(PersistentAgentLayout)`, `for_workspace(&Workspace)`, `with_capacity`, `layout`, `capacity` and `begin(&PersistentRunConfig, query) -> ActiveExecution`, which opens `<logs root>/<execution directory name>` and appends `ExecutionStarted`.
+- `ExecutionRecorder { layout, capacity }` with `new(PersistentAgentLayout)`, `for_workspace(&Workspace)`, `with_capacity`, `layout`, `capacity` and `begin(&PersistentRunConfig, query) -> ActiveExecution`, which opens `<logs root>/<execution directory name>`, appends `ExecutionStarted`, and writes the execution's `ExecutionLink` (`First` for a session's first run, otherwise `Continuation` naming the execution the session record ended with).
 - `ActiveExecution { log, identity, store, model_turns }` with `log`, `identity`, `execution_id`, `binding`, `store`, `record_model_turn(text)` (`ModelTurn` with `deterministic_model_call_id` and `USAGE_UNKNOWN_REASON` usage), `finish(FinalStatus, Option<&str>)` (an answer `ModelTurn` plus `ExecutionFinal` with the output bounded to `DETAIL_LIMIT`), `save_session(messages, state)` (record plus a `SESSION_ENDING_OUTCOME` ending) and `persist_session(&PersistentSessionRecord)`.
 
 Session state (`session`):
@@ -65,8 +65,9 @@ Continuation and handoff (`continuation`, `handoff`):
 - `ExecutionLogSource` trait + `RootLogSource` (`new(root, capacity)`, `with_clock`, `root`, `dir_for(execution_id)`; opens `<root>/<encoded execution>/` from its `meta.json`).
 - `LogPreview::preview(&LogSnapshot)` renders the deterministic per-execution preview block.
 - `resume(store, logs, links, binding, request_id, continuation, assembler) -> ResumePlan`; `ResumePlan { record, cursor, window, chain, background, digest }`.
+- `resume` assembles the window from every traced execution's journal in causal order, then completes it from the loaded record's `messages` when the chain is short (no link, a rotated or missing journal, a run recorded before links existed); the digest and resume cursor stay those of the recovery execution.
 - `ResumePlan` is `Serialize + Deserialize + PartialEq`: the JSON view is stable (snake_case, unknown-field tolerant, no live handles) and may only change additively, so a host can persist a plan and resume from it later.
-- `ResumePlan::seed_messages() -> &[BaseMessage]` and `seed_history() -> Vec<BaseMessage>` return `window.messages` — the reconstructed model window a resumed turn starts from.
+- `ResumePlan::seed_messages() -> &[BaseMessage]` and `seed_history() -> Vec<BaseMessage>` return `window.messages` — every earlier turn once, oldest first, the assembly's summary first and the record's own summary dropped rather than stacked.
 - `continuation_background(continuation, successor_execution_id, chain, snapshots, stop)` renders the deterministic background document.
 - `HandoffTransfer { from, to, record, cursor, window, next_goal, shared_files }` with `validate`, `HandoffReceipt { successor_session, accepted_entries, transferred_at, successor_execution_id }`.
 - `HandoffTarget` trait (`transport`, `accept`), `HandoffTransport { in_process, remote, distributed }` with `as_str`, `reason`, `LocalHandoff::new(clock)`/`take`, `RemoteHandoff`, `DistributedHandoff`.
@@ -110,7 +111,7 @@ Re-exports:
 ## Consumer contract (outside the crate)
 
 - Every item in `mod.rs` is `pub` and flat re-exported from `persistent_agent`, and the crate-root `pub use persistent_agent::{…}` block in `src/lib.rs` re-exports the whole surface — the discovery additions (`ExecutionCatalog`, `ExecutionSummary`, `SessionSummary`, `PersistentAgentLayout`, `percent_decode_identifier`, `PERSISTENT_AGENT_NODE`/`LOGS_DIR`/`SESSIONS_DIR`/`LINKS_DIR`) included — so both `openjiuwen_harness::X` and `openjiuwen_harness::persistent_agent::X` resolve.
-- No other part of the crate consumes this module: `src/cli/`, `src/agent/` and `src/protocol/` contain zero references to `persistent_agent`, `ResumePlan`, `PersistentSessionRecord` or `WindowAssembly`, so nothing feeds a `ResumePlan` or its `WindowAssembly::messages` back into `run_once`, `Repl`, `DeepAgent::invoke`/`stream` or `NativeHarness`.
+- `src/agent/` consumes this module for live recording only: `DeepAgent` calls `ExecutionRecorder::begin` / `ActiveExecution::finish` / `save_session` when `DeepAgentConfig::persistent_agent` is on, best-effort and never failing the turn. `src/cli/` and `src/protocol/` contain zero references, so nothing feeds a `ResumePlan` or its `WindowAssembly::messages` back into `run_once`, `Repl`, `DeepAgent::invoke`/`stream` or `NativeHarness`; a host (the CLI binary) resolves the plan itself and passes plain messages through the `cli::resume` seam.
 - Re-seeding a model window is kernel-shaped, not module-shaped: `ContextOptions::history` / `ContextEngine::load_contexts` (`crates/openjiuwen-context/src/engine_options.rs`, `engine/persistence.rs:60`) or a custom `HarnessRail::before_model_call` mutating `RailContext::messages`; `ResumePlan::seed_messages`/`seed_history` are the plan-side source those paths can be fed from.
 - Discovery is module-side: `ExecutionCatalog::list` enumerates executions under a log root, `FileSessionStore::list` enumerates session records, and `PersistentAgentLayout` names the three standard roots, so a host no longer has to `read_dir` the roots itself or guess the subdirectory names.
 - `ResumePlan` is serde data end to end (`Serialize + Deserialize + PartialEq`), so a plan can be cached as JSON and replayed; `seed_messages` is the reconstructed window it carries.
@@ -170,6 +171,7 @@ Re-exports:
 - Assistant tool-call groups are indivisible: tool intents and their results are elided together, never split by message count.
 - `Capacity` uses Python's integer-floor thresholds (`80%` rollover, `40%` new-window limit) without floating-point arithmetic.
 - Continuation chains are host-owned links stored newest-first (`chain[0]` is the recovery execution); `FileLinkStore` is the in-process implementation, and a missing journal or link stops tracing with a stop note instead of failing the resume.
+- Every recorded run writes its own link: `ExecutionRecorder::begin` reads the session record and names its ending (or checkpoint) execution as the predecessor, so repeated continuations trace back across every run instead of only the newest. A link that cannot be written is logged and the run proceeds; the record fallback then covers the earlier turns.
 - `CONTINUATION_RULES` is a literal `&str` rather than a template, so the rule block cannot drift from the text a resumed execution is given.
 - `resume` passes no successor execution id to `continuation_background`, because the successor's id is assigned by the host after the plan is built.
 - Handoff transports other than in-process are deliberately unimplemented and return `Error::Unsupported` naming the transport; `HandoffTransport::InProcess.reason()` is the empty string.
@@ -188,6 +190,7 @@ Re-exports:
 - Listing is best effort and deterministic: a corrupt `meta.json` is skipped, a journal that exists but cannot be read is reported as `usable = false`, and the fixed sort (`created_at`, then `execution_id`) makes a listing reproducible across runs.
 - `PersistentAgentLayout` is the one place the standard roots are spelled out; `ExecutionLog::for_workspace` and `FileSessionStore::for_workspace` derive their paths from it, so the directory names can never drift apart.
 - Session `list()` decodes the directory names it walked (the store's own encoding is the inverse) and falls back to the record's ids only when a name does not decode, so a summary describes the path the file was actually found at.
+- The seed window is assembled from the traced chain first and completed from the record's transcript second: overlap is detected by role plus text with the `【本次执行】` goal prefix stripped, so a seeded goal and the raw query it renders never both appear, the assembly's summary stays first, and a record summary is dropped rather than stacked. Only journal entries are summarised, so no message already in the seed is summarised again.
 - The plan's JSON view is a contract: `ResumePlan` is data only, so serializing it and parsing it back is lossless, and a host resumes by feeding `seed_messages` into its model window.
 
 ## Known Issues

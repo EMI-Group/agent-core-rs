@@ -52,7 +52,13 @@ use super::util::truncate_chars;
 const NO_CONTENT: &str = "(no content)";
 
 /// Prefix of every extractive summary.
-const SUMMARY_PREFIX: &str = "【窗口摘要】";
+pub(crate) const SUMMARY_PREFIX: &str = "【窗口摘要】";
+
+/// Prefix the window renders an execution's goal with.
+///
+/// A resumed transcript may carry the same goal without it (the raw query a turn was sent), so
+/// overlap detection in [`super::continuation`] compares messages with the prefix stripped.
+pub(crate) const EXECUTION_GOAL_PREFIX: &str = "【本次执行】";
 
 /// Marker carried by the fallback summary, so a degraded summary is never mistaken for a real one.
 const SUMMARY_UNAVAILABLE: &str = "摘要不可用";
@@ -666,7 +672,7 @@ fn build_groups(
             EntryPayload::ExecutionStarted { goal } => {
                 groups.push(Group::single(
                     entry,
-                    BaseMessage::user(format!("【本次执行】{goal}")),
+                    BaseMessage::user(format!("{EXECUTION_GOAL_PREFIX}{goal}")),
                 ));
                 index += 1;
             }
@@ -906,6 +912,15 @@ impl WindowAssembler {
     #[must_use]
     pub fn policy(&self) -> WindowPolicy {
         self.policy
+    }
+
+    /// Counts the tokens of `messages` with this assembler's counter.
+    ///
+    /// [`super::continuation`] uses it after completing an assembled window with messages the
+    /// journal does not carry, so the reported token count keeps describing the messages a
+    /// resumed turn actually sends.
+    pub(crate) fn count_messages(&self, messages: &[BaseMessage]) -> usize {
+        self.counter.count_messages(messages)
     }
 
     /// Assembles the window for `entries`, using [`Capacity::available_input`] as the budget.
