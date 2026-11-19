@@ -15,7 +15,10 @@
 //!   stream is dropped. A slow consumer therefore backpressures the run instead of letting
 //!   it buffer every frame it will ever emit; a write that is blocked on a full channel
 //!   gives up with [`openjiuwen_common::error::Error::Cancelled`] when the run's
-//!   cancellation token fires.
+//!   cancellation token fires. The spawned run is raced against the same timeout and the
+//!   same cancellation token as the blocking path, so a hung component ends the stream
+//!   with one terminal [`openjiuwen_common::error::Error::Timeout`] or
+//!   [`openjiuwen_common::error::Error::Cancelled`] item instead of keeping it open.
 //!
 //! The root state of every run carries a reserved `"inputs"` key with the original
 //! inputs, so both `${query}` (root reference) and `${start.query}` resolve.
@@ -88,6 +91,14 @@ impl CompiledWorkflow {
     /// [`Err`], including a rejected [`StreamDelivery::Interleaved`] (refused before any
     /// session state changes). Dropping the stream aborts the in-flight run and keeps the
     /// graph snapshot when a checkpointer is configured.
+    ///
+    /// The run obeys the same deadline and cancellation contract as
+    /// [`CompiledWorkflow::invoke`]: [`WorkflowRunOptions::timeout`] (else the session's
+    /// `execute_timeout_ms`) and [`WorkflowRunOptions::cancellation`] race the run, so a
+    /// component that never finishes ends the stream with one terminal
+    /// [`openjiuwen_common::error::Error::Timeout`] or
+    /// [`openjiuwen_common::error::Error::Cancelled`] item — the same error the blocking
+    /// path returns — rather than leaving the stream open forever.
     #[allow(clippy::too_many_lines)] // one linear pipeline reads better than fragments
     pub fn stream(
         &self,
@@ -140,7 +151,24 @@ impl CompiledWorkflow {
             };
             let seed = seed_value(inputs);
             let run_session = Arc::clone(&session);
-            let handle = tokio::spawn(async move { graph.run(seed, run_session, execution).await });
+            // The same deadline and cancellation contract the blocking path applies: the
+            // run is raced against the timeout and the cancellation token, and whichever
+            // fires first drops the run future (exactly what `tokio::time::timeout` does
+            // in `run_blocking`) and becomes the run's result. The stream therefore ends
+            // with one terminal typed `Err` instead of staying open on a hung component.
+            let timeout = resolve_timeout(&session, options.timeout);
+            let deadline = timeout.map(|limit| tokio::time::Instant::now() + limit);
+            let cancellation = options.cancellation.clone();
+            let run_id = workflow_id.clone();
+            let handle = tokio::spawn(async move {
+                tokio::select! {
+                    result = graph.run(seed, run_session, execution) => result,
+                    () = cancellation.cancelled() => Err(Error::cancelled()),
+                    () = sleep_until(deadline) => Err(Error::timeout(format!(
+                        "workflow '{run_id}' execution timed out"
+                    ))),
+                }
+            });
             // Held across every yield, so dropping the stream aborts the run.
             let guard = AbortOnDrop(Some(handle.abort_handle()));
 
@@ -387,6 +415,18 @@ fn resolve_timeout(session: &Arc<dyn Session>, requested: Option<Duration>) -> O
         None
     } else {
         Some(Duration::from_millis(millis))
+    }
+}
+
+/// Completes when `deadline` passes, or never when the run has no deadline.
+///
+/// Racing a run against this future is how [`CompiledWorkflow::stream`] bounds a run that
+/// hangs inside a component; [`CompiledWorkflow::invoke`] gets the same bound from
+/// [`tokio::time::timeout`].
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
