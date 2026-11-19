@@ -98,12 +98,16 @@ impl TeamTransport for InProcessTransport {
         self.bus.publish(envelope).await
     }
 
-    fn add_subscription(&self, agent_id: &str, topic: &str) {
+    fn add_subscription(&self, agent_id: &str, topic: &str) -> Result<()> {
+        // The in-process registry cannot fail, so the pair is always observed by
+        // the bus that also fans `publish` out.
         self.bus.add_subscription(agent_id, topic);
+        Ok(())
     }
 
-    fn remove_subscription(&self, agent_id: &str, topic: &str) {
+    fn remove_subscription(&self, agent_id: &str, topic: &str) -> Result<()> {
         self.bus.remove_subscription(agent_id, topic);
+        Ok(())
     }
 
     fn subscribers(&self, topic_id: &str) -> Vec<String> {

@@ -93,8 +93,8 @@ async fn in_process_send_publish_and_subscriptions_match_the_bus() {
     assert_eq!(recorder.p2p_payloads(), vec![json!({"n": 1})]);
     assert_eq!(recorder.p2p.lock()[0].session_id.as_deref(), Some("s1"));
 
-    transport.add_subscription("z", "news");
-    transport.add_subscription("a", "news");
+    transport.add_subscription("z", "news").unwrap();
+    transport.add_subscription("a", "news").unwrap();
     assert_eq!(transport.subscribers("news"), vec!["a", "z"]);
     transport
         .publish(MessageEnvelope::pubsub(
@@ -106,7 +106,7 @@ async fn in_process_send_publish_and_subscriptions_match_the_bus() {
         .unwrap();
     assert_eq!(recorder.pubsub_order(), vec!["a", "z"]);
 
-    transport.remove_subscription("a", "news");
+    transport.remove_subscription("a", "news").unwrap();
     assert_eq!(transport.subscribers("news"), vec!["z"]);
     transport.stop().await.unwrap();
     assert!(!transport.bus().is_started());
@@ -117,9 +117,9 @@ async fn in_process_transport_exposes_the_subscription_registry() {
     let (_recorder, handler) = recording_handler();
     let transport = InProcessTransport::new("team-introspect", MessageBusConfig::new(), handler);
 
-    transport.add_subscription("z", "news");
-    transport.add_subscription("a", "news");
-    transport.add_subscription("a", "*__p2p__");
+    transport.add_subscription("z", "news").unwrap();
+    transport.add_subscription("a", "news").unwrap();
+    transport.add_subscription("a", "*__p2p__").unwrap();
 
     assert_eq!(
         transport.list_subscriptions(),
@@ -132,7 +132,7 @@ async fn in_process_transport_exposes_the_subscription_registry() {
     assert_eq!(transport.agent_subscriptions("ghost"), Vec::<String>::new());
     assert_eq!(transport.subscription_count(), 3);
 
-    transport.remove_subscription("a", "news");
+    transport.remove_subscription("a", "news").unwrap();
     assert_eq!(transport.subscription_count(), 2);
     assert_eq!(transport.agent_subscriptions("a"), vec!["*__p2p__"]);
 }

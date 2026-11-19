@@ -3,8 +3,9 @@
 //! Python parity: `EventDrivenTeamCard.subscriptions` is documented as a
 //! "mapping of `agent_id` to list of subscribed topics" but the Python runtime
 //! leaves the wiring to the caller. This module derives the subscription plan
-//! from a [`TeamCard`] plus that optional override map, and applies it to a
-//! [`TeamRuntime`]'s [`MessageBus`] registry.
+//! from a [`TeamCard`] plus that optional override map, and applies it to the
+//! subscription registry of a [`TeamRuntime`]'s transport (the in-process
+//! [`crate::MessageBus`] by default).
 //!
 //! # Capability carrier
 //!
@@ -42,15 +43,16 @@
 //!
 //! # Applying a plan
 //!
-//! [`apply`] and [`apply_agent`] are synchronous because the bus subscription
-//! registry is synchronous; each call takes short registry locks and never
-//! awaits, so there is no deadlock path. [`AutoSubscriptionMode::Merge`] counts
-//! only the patterns that were not subscribed before the call,
+//! [`apply`] and [`apply_agent`] are synchronous because the transport
+//! subscription registry is synchronous; each call takes short registry locks
+//! and never awaits, so there is no deadlock path. [`AutoSubscriptionMode::Merge`]
+//! counts only the patterns that were not subscribed before the call,
 //! [`AutoSubscriptionMode::Replace`] first removes the agent's stale patterns
 //! and then counts added plus removed patterns, and
-//! [`AutoSubscriptionMode::Disabled`] never touches the bus and returns `0`.
-//! Empty patterns are dropped on application, matching the bus, which ignores
-//! empty agent ids and topics.
+//! [`AutoSubscriptionMode::Disabled`] never touches the registry and returns
+//! `0`. Empty patterns are dropped on application, matching the bus, which
+//! ignores empty agent ids and topics. A write a transport rejects is logged and
+//! skipped ([`TeamRuntime::subscribe`] is the fallible entry point).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -59,8 +61,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::card::{EventDrivenTeamCard, TeamCard};
-use crate::message_bus::MessageBus;
 use crate::runtime::TeamRuntime;
+use crate::transport::TeamTransport;
 
 /// Tag prefix that turns a [`TeamCard`] tag into a subscription directive.
 pub const SUBSCRIBE_TAG_PREFIX: &str = "subscribe:";
@@ -251,7 +253,8 @@ pub fn derive_from_event_card(card: &EventDrivenTeamCard) -> AutoSubscriptionPla
     derive_with_overrides(&card.card, &card.subscriptions)
 }
 
-/// Applies `plan` to the bus of `runtime` and returns the number of changes.
+/// Applies `plan` to the transport registry of `runtime` and returns the number
+/// of changes.
 ///
 /// Only the agents named in the plan are touched: with
 /// [`AutoSubscriptionMode::Replace`] the stale patterns of those agents are
@@ -266,10 +269,10 @@ pub fn apply(
     if mode == AutoSubscriptionMode::Disabled || plan.is_empty() {
         return 0;
     }
-    let bus = runtime.message_bus();
+    let transport = runtime.transport();
     let mut changes = 0usize;
     for (agent_id, patterns) in plan.patterns() {
-        changes += reconcile(&bus, agent_id, patterns, mode);
+        changes += reconcile(transport.as_ref(), agent_id, patterns, mode);
     }
     changes
 }
@@ -290,7 +293,7 @@ pub fn apply_agent(
         return 0;
     }
     let desired = plan.get(agent_id).unwrap_or_default();
-    reconcile(&runtime.message_bus(), agent_id, desired, mode)
+    reconcile(runtime.transport().as_ref(), agent_id, desired, mode)
 }
 
 /// Returns the patterns derivation would give `agent_id`, ignoring overrides.
@@ -314,10 +317,16 @@ fn normalize(patterns: impl IntoIterator<Item = String>) -> Vec<String> {
     patterns
 }
 
-/// Reconciles one agent's bus subscriptions with `desired`, returning the
+/// Reconciles one agent's transport subscriptions with `desired`, returning the
 /// number of added plus removed patterns.
+///
+/// A transport that rejects a write (one without a subscription registry) is
+/// logged and skipped, so applying a plan stays best-effort for a backend that
+/// cannot honour it; [`TeamRuntime::subscribe`] surfaces the typed error.
+///
+/// [`TeamRuntime::subscribe`]: crate::TeamRuntime::subscribe
 fn reconcile(
-    bus: &MessageBus,
+    transport: &dyn TeamTransport,
     agent_id: &str,
     desired: &[String],
     mode: AutoSubscriptionMode,
@@ -330,13 +339,19 @@ fn reconcile(
         .map(String::as_str)
         .filter(|pattern| !pattern.is_empty())
         .collect();
-    let existing: BTreeSet<String> = bus.agent_topics(agent_id).into_iter().collect();
+    let existing: BTreeSet<String> = transport
+        .agent_subscriptions(agent_id)
+        .into_iter()
+        .collect();
 
     let mut changes = 0usize;
     if mode == AutoSubscriptionMode::Replace {
         for stale in &existing {
             if !desired.contains(stale.as_str()) {
-                bus.remove_subscription(agent_id, stale);
+                if let Err(error) = transport.remove_subscription(agent_id, stale) {
+                    tracing::warn!(agent_id, pattern = %stale, %error,
+                        "auto-subscription could not drop a stale pattern");
+                }
                 changes += 1;
             }
         }
@@ -345,7 +360,10 @@ fn reconcile(
         if !existing.contains(pattern) {
             changes += 1;
         }
-        bus.add_subscription(agent_id, pattern);
+        if let Err(error) = transport.add_subscription(agent_id, pattern) {
+            tracing::warn!(agent_id, pattern, %error,
+                "auto-subscription could not add a planned pattern");
+        }
     }
     changes
 }

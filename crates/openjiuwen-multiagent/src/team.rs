@@ -474,9 +474,17 @@ impl BaseTeam {
         }
         let plan = self.subscription_plan();
         let patterns: &[String] = plan.get(agent_id).unwrap_or_default();
-        let bus = self.runtime.message_bus();
+        let transport = self.runtime.transport();
         for pattern in patterns {
-            bus.remove_subscription(agent_id, pattern);
+            if let Err(error) = transport.remove_subscription(agent_id, pattern) {
+                tracing::warn!(
+                    team = %self.team_id,
+                    agent_id,
+                    pattern = %pattern,
+                    %error,
+                    "could not drop a removed member's planned subscription"
+                );
+            }
         }
     }
 }

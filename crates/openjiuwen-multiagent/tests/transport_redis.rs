@@ -32,7 +32,9 @@ use openjiuwen_multiagent::transport::{
     build_transport, RedisTopology, RedisTransport, RedisTransportConfig, TeamTransport,
     TransportConfig, TransportKind,
 };
-use openjiuwen_multiagent::{MessageBusConfig, MessageEnvelope, MessageHandler};
+use openjiuwen_multiagent::{
+    MessageBusConfig, MessageEnvelope, MessageHandler, RuntimeConfig, TeamRuntime,
+};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1018,8 +1020,8 @@ async fn redis_pubsub_fans_out_to_two_watched_subscribers() {
     let publisher = RedisTransport::new(server.config(5), "team-fanout", "team", publisher_handler);
     publisher.start().await.unwrap();
     // The subscriber registry is local to the publishing transport.
-    publisher.add_subscription("sub-b", "news");
-    publisher.add_subscription("sub-a", "news");
+    publisher.add_subscription("sub-b", "news").unwrap();
+    publisher.add_subscription("sub-a", "news").unwrap();
     publisher
         .publish(MessageEnvelope::pubsub(
             json!({"story": 1}),
@@ -1234,6 +1236,57 @@ async fn redis_empty_team_and_prefix_fall_back_to_defaults() {
 }
 
 #[tokio::test]
+async fn runtime_subscriptions_drive_redis_pubsub_delivery() {
+    let server = FakeRedis::start().await;
+    let (recorder, handler) = recording_handler();
+    let transport = RedisTransport::new(
+        server.config(5).with_registry_interval_ms(60_000),
+        "team-runtime-subs",
+        "team",
+        handler,
+    );
+    transport.watch_agent("sub").unwrap();
+    transport.start().await.unwrap();
+
+    let runtime = TeamRuntime::new(RuntimeConfig::new().with_team_id("team-runtime-subs"));
+    let erased: Arc<dyn TeamTransport> = transport.clone();
+    runtime.set_transport(erased).unwrap();
+
+    // Before the fix these pairs only reached the runtime's in-process bus, so
+    // the installed transport fanned out to nobody.
+    runtime.subscribe("sub", "news").await.unwrap();
+    assert_eq!(transport.subscribers("news"), vec!["sub"]);
+    assert_eq!(
+        runtime.list_subscriptions(),
+        BTreeMap::from([("news".to_owned(), vec!["sub".to_owned()])])
+    );
+
+    runtime
+        .publish(json!({"story": 1}), "news", "boss", None)
+        .await
+        .unwrap();
+    wait_for_pubsub(&recorder, 1).await;
+    assert_eq!(recorder.pubsub_order(), vec!["sub"]);
+
+    // Unsubscribing through the runtime stops the fan-out on this backend too.
+    runtime.unsubscribe("sub", "news").await.unwrap();
+    assert!(transport.subscribers("news").is_empty());
+    runtime
+        .publish(json!({"story": 2}), "news", "boss", None)
+        .await
+        .unwrap();
+    assert_eq!(recorder.pubsub.lock().len(), 1);
+    let fanned_out = server
+        .commands_named("XADD")
+        .iter()
+        .filter(|args| args.len() == 5)
+        .count();
+    assert_eq!(fanned_out, 1, "an unsubscribed topic is not fanned out");
+
+    runtime.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn redis_publish_reaches_a_subscriber_registered_by_another_transport() {
     let server = FakeRedis::start().await;
     let (receiver_recorder, receiver_handler) = recording_handler();
@@ -1246,7 +1299,7 @@ async fn redis_publish_reaches_a_subscriber_registered_by_another_transport() {
         receiver_handler,
     );
     receiver.watch_agent("a").unwrap();
-    receiver.add_subscription("a", "news");
+    receiver.add_subscription("a", "news").unwrap();
     receiver.start().await.unwrap();
 
     let (_publisher_recorder, publisher_handler) = recording_handler();
@@ -1338,7 +1391,7 @@ async fn redis_refresh_converges_subscriptions_in_both_directions() {
     subscriber.start().await.unwrap();
 
     // An addition made on one instance becomes visible to the other.
-    subscriber.add_subscription("b", "news");
+    subscriber.add_subscription("b", "news").unwrap();
     wait_for_command(
         &server,
         "SADD",
@@ -1361,7 +1414,7 @@ async fn redis_refresh_converges_subscriptions_in_both_directions() {
     assert!(recorder_a.pubsub.lock().is_empty());
 
     // ...and a removal propagates the same way.
-    subscriber.remove_subscription("b", "news");
+    subscriber.remove_subscription("b", "news").unwrap();
     wait_for_command(
         &server,
         "SREM",
@@ -1398,9 +1451,9 @@ async fn redis_introspection_mirrors_the_local_registry() {
     let server = FakeRedis::start().await;
     let (_recorder, handler) = recording_handler();
     let transport = RedisTransport::new(server.config(5), "team-introspect", "team", handler);
-    transport.add_subscription("zoe", "news");
-    transport.add_subscription("alice", "news");
-    transport.add_subscription("alice", "alerts");
+    transport.add_subscription("zoe", "news").unwrap();
+    transport.add_subscription("alice", "news").unwrap();
+    transport.add_subscription("alice", "alerts").unwrap();
 
     assert_eq!(
         transport.list_subscriptions(),
@@ -1423,7 +1476,7 @@ async fn redis_introspection_mirrors_the_local_registry() {
     assert_eq!(transport.subscribers("news"), vec!["alice", "zoe"]);
     assert_eq!(transport.subscription_count(), 3);
 
-    transport.remove_subscription("alice", "alerts");
+    transport.remove_subscription("alice", "alerts").unwrap();
     assert_eq!(transport.subscription_count(), 2);
     assert_eq!(transport.agent_subscriptions("alice"), vec!["news"]);
     assert_eq!(
@@ -1456,7 +1509,7 @@ async fn redis_registry_errors_never_break_local_subscriptions() {
     );
     // Every SET command fails while the switch is on.
     server.fail_sets(true);
-    transport.add_subscription("a", "news");
+    transport.add_subscription("a", "news").unwrap();
     // The synchronous call neither fails nor panics: the pair is local at once.
     assert_eq!(transport.agent_subscriptions("a"), vec!["news"]);
     wait_for_command(
@@ -1498,8 +1551,8 @@ async fn redis_stop_clears_this_instance_owned_registry_entries() {
         "team",
         handler,
     );
-    transport.add_subscription("a", "news");
-    transport.add_subscription("b", "news");
+    transport.add_subscription("a", "news").unwrap();
+    transport.add_subscription("b", "news").unwrap();
     transport.start().await.unwrap();
     wait_for_command(
         &server,

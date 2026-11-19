@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::envelope::MessageEnvelope;
 use crate::subscription::SubscriptionManager;
@@ -348,8 +349,11 @@ impl MessageBus {
     /// The envelope's [`session_id`](MessageEnvelope::session_id) selects the
     /// transport topic. The deadline is `timeout` when supplied, else
     /// [`process_timeout`](MessageBusConfig::process_timeout); with neither, the
-    /// call waits unbounded. On an elapsed deadline the handler keeps running
-    /// (Python parity).
+    /// call waits unbounded. The deadline starts at call entry and bounds both
+    /// queue admission and the reply wait, so a full FIFO cannot hold the caller
+    /// past its own timeout. On an elapsed deadline a message that was already
+    /// queued still runs (its reply is discarded, Python parity), while a
+    /// message that could not be queued is never enqueued at all.
     ///
     /// # Errors
     ///
@@ -361,29 +365,40 @@ impl MessageBus {
         envelope: MessageEnvelope,
         timeout: Option<Duration>,
     ) -> Result<Value> {
+        let budget = timeout.or_else(|| self.config.process_timeout.map(secs_to_duration));
+        let deadline = budget.and_then(deadline_in);
         self.ensure_started().await?;
         let topic = self.p2p_topic(envelope.session_id.as_deref());
         let sender_id = envelope.sender.clone().unwrap_or_default();
         let recipient_id = envelope.recipient.clone().unwrap_or_default();
         let (reply, reply_rx) = oneshot::channel();
         let sender = self.ensure_topic(&topic)?;
-        sender
-            .send(BusItem::P2p { envelope, reply })
-            .await
-            .map_err(|_| closed_reply_error(&topic))?;
+        let timed_out = || {
+            Error::timeout(format!(
+                "message from '{sender_id}' to '{recipient_id}' timed out after {}s",
+                budget.map_or(0.0, |budget| budget.as_secs_f64())
+            ))
+        };
+        enqueue(
+            &sender,
+            BusItem::P2p { envelope, reply },
+            deadline,
+            closed_reply_error(&topic),
+            timed_out,
+        )
+        .await?;
         drop(sender);
 
-        let deadline = timeout.or_else(|| self.config.process_timeout.map(secs_to_duration));
         match deadline {
-            Some(duration) => match tokio::time::timeout(duration, reply_rx).await {
-                Ok(result) => result.map_err(|_| closed_reply_error(&topic))?,
-                // The worker is not cancelled: the handler runs to completion and
-                // its reply is discarded, matching Python's `wait_for` behaviour.
-                Err(_) => Err(Error::timeout(format!(
-                    "message from '{sender_id}' to '{recipient_id}' timed out after {}s",
-                    duration.as_secs_f64()
-                ))),
-            },
+            Some(deadline) => {
+                match tokio::time::timeout_at(deadline, reply_rx).await {
+                    Ok(result) => result.map_err(|_| closed_reply_error(&topic))?,
+                    // The worker is not cancelled: a message that was already
+                    // queued runs to completion and its reply is discarded,
+                    // matching Python's `wait_for` behaviour.
+                    Err(_) => Err(timed_out()),
+                }
+            }
             None => reply_rx.await.map_err(|_| closed_reply_error(&topic))?,
         }
     }
@@ -394,21 +409,37 @@ impl MessageBus {
     /// transport topic and its [`topic_id`](MessageEnvelope::topic_id) selects
     /// the subscribers (an empty subscriber set is a no-op). The call returns
     /// after every subscriber was delivered to; a failing subscriber is logged
-    /// and never fails the publisher.
+    /// and never fails the publisher. Queue admission is bounded by
+    /// [`process_timeout`](MessageBusConfig::process_timeout) when it is set, so
+    /// a full FIFO cannot block the publisher unbounded.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] when the topic closes before the fan-out
-    /// completes.
+    /// Returns [`Error::Timeout`] when a configured
+    /// [`process_timeout`](MessageBusConfig::process_timeout) elapses before the
+    /// fan-out could start, and [`Error::Transport`] when the topic closes
+    /// before the fan-out completes.
     pub async fn publish(&self, envelope: MessageEnvelope) -> Result<()> {
+        let budget = self.config.process_timeout.map(secs_to_duration);
+        let deadline = budget.and_then(deadline_in);
         self.ensure_started().await?;
         let topic = self.pubsub_topic(envelope.session_id.as_deref());
         let (done, done_rx) = oneshot::channel();
         let sender = self.ensure_topic(&topic)?;
-        sender
-            .send(BusItem::Pubsub { envelope, done })
-            .await
-            .map_err(|_| closed_fan_out_error(&topic))?;
+        let timed_out = || {
+            Error::timeout(format!(
+                "pub/sub message on topic '{topic}' timed out after {}s before the fan-out started",
+                budget.map_or(0.0, |budget| budget.as_secs_f64())
+            ))
+        };
+        enqueue(
+            &sender,
+            BusItem::Pubsub { envelope, done },
+            deadline,
+            closed_fan_out_error(&topic),
+            timed_out,
+        )
+        .await?;
         drop(sender);
         done_rx.await.map_err(|_| closed_fan_out_error(&topic))
     }
@@ -533,6 +564,37 @@ fn secs_to_duration(secs: f64) -> Duration {
         Duration::from_secs_f64(secs)
     } else {
         Duration::ZERO
+    }
+}
+
+/// Turns a budget into an absolute deadline measured from now.
+///
+/// An offset too large to represent is treated as "no deadline" instead of
+/// panicking on the addition.
+fn deadline_in(budget: Duration) -> Option<Instant> {
+    Instant::now().checked_add(budget)
+}
+
+/// Queues `item` on a topic worker, giving up at `deadline` when one is set.
+///
+/// Cancelling a [`mpsc::Sender::send`] future never enqueues its item, so a
+/// caller that gave up leaves nothing behind for the worker to run later;
+/// `on_deadline` builds the typed error for that case.
+async fn enqueue(
+    sender: &mpsc::Sender<BusItem>,
+    item: BusItem,
+    deadline: Option<Instant>,
+    on_closed: Error,
+    on_deadline: impl FnOnce() -> Error,
+) -> Result<()> {
+    let sending = sender.send(item);
+    match deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline, sending).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(on_closed),
+            Err(_) => Err(on_deadline()),
+        },
+        None => sending.await.map_err(|_| on_closed),
     }
 }
 

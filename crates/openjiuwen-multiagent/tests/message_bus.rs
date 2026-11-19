@@ -12,13 +12,16 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
 use openjiuwen_common::error::{Error, ErrorKind, Result};
 use openjiuwen_multiagent::{MessageBus, MessageBusConfig, MessageEnvelope, MessageHandler};
+use parking_lot::Mutex;
 use serde_json::{json, Value};
+use tokio::sync::Notify;
 
 use crate::common::RecordingHandler;
 
@@ -354,5 +357,152 @@ async fn p2p_handler_error_propagates() {
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Validation);
     assert_eq!(error.message(), "boom");
+    bus.stop().await.unwrap();
+}
+
+/// A handler whose first delivery blocks until the test's gate opens, so a
+/// single-slot topic queue can be filled deterministically.
+struct GatedHandler {
+    /// Released once by the test to let the blocked delivery finish.
+    gate: Arc<Notify>,
+    /// Fires when the first delivery is inside the handler.
+    started: Arc<Notify>,
+    /// Whether a delivery is already blocking on the gate.
+    blocking: AtomicBool,
+    /// Every payload the worker actually handed to the handler, in order.
+    payloads: Mutex<Vec<Value>>,
+}
+
+impl GatedHandler {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            gate: Arc::new(Notify::new()),
+            started: Arc::new(Notify::new()),
+            blocking: AtomicBool::new(false),
+            payloads: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn payloads(&self) -> Vec<Value> {
+        self.payloads.lock().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl MessageHandler for GatedHandler {
+    async fn handle_p2p(&self, envelope: &MessageEnvelope) -> Result<Value> {
+        self.payloads.lock().push(envelope.message.clone());
+        if !self.blocking.swap(true, Ordering::SeqCst) {
+            self.started.notify_one();
+            self.gate.notified().await;
+        }
+        Ok(envelope.message.clone())
+    }
+
+    async fn handle_pubsub(&self, _envelope: &MessageEnvelope, _subscriber: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Builds a started one-slot bus with no configured deadline, so only the
+/// caller's timeout can bound a `send`.
+async fn gated_bus(team_id: &str, handler: &Arc<GatedHandler>) -> Arc<MessageBus> {
+    let bus = Arc::new(MessageBus::new(
+        MessageBusConfig::new()
+            .with_team_id(team_id)
+            .with_max_queue_size(1)
+            .with_process_timeout(None),
+        Arc::clone(handler) as Arc<dyn MessageHandler>,
+    ));
+    bus.start().await.unwrap();
+    bus
+}
+
+/// Spawns one `send` with `timeout` so the test can keep filling the queue.
+fn spawn_send(
+    bus: &Arc<MessageBus>,
+    payload: Value,
+    timeout: Option<Duration>,
+) -> tokio::task::JoinHandle<Result<Value>> {
+    let bus = Arc::clone(bus);
+    tokio::spawn(async move {
+        bus.send(MessageEnvelope::p2p(payload, "alice", "bob"), timeout)
+            .await
+    })
+}
+
+#[tokio::test]
+async fn a_full_queue_honours_the_caller_timeout() {
+    let handler = GatedHandler::new();
+    let bus = gated_bus("bounded", &handler).await;
+
+    // The first delivery occupies the single worker and blocks inside it.
+    let first = spawn_send(&bus, json!({"n": 1}), Some(Duration::from_secs(5)));
+    tokio::time::timeout(Duration::from_secs(2), handler.started.notified())
+        .await
+        .expect("the worker never started the first delivery");
+    // The second delivery fills the queue's only slot.
+    let second = spawn_send(&bus, json!({"n": 2}), Some(Duration::from_secs(5)));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The third cannot be admitted, so the caller's deadline must apply to queue
+    // admission as well and the message must never be queued.
+    let started = Instant::now();
+    let error = bus
+        .send(
+            MessageEnvelope::p2p(json!({"n": 3}), "alice", "bob"),
+            Some(Duration::from_millis(40)),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the caller's timeout was not applied to the queue: {:?}",
+        started.elapsed()
+    );
+    let text = error.to_string();
+    assert!(text.contains("timed out after"), "unexpected error: {text}");
+    assert!(
+        text.contains("message from 'alice' to 'bob'"),
+        "unexpected error: {text}"
+    );
+
+    handler.gate.notify_one();
+    assert_eq!(first.await.unwrap().unwrap(), json!({"n": 1}));
+    assert_eq!(second.await.unwrap().unwrap(), json!({"n": 2}));
+    // The abandoned message was never enqueued, let alone handled.
+    assert_eq!(handler.payloads(), vec![json!({"n": 1}), json!({"n": 2})]);
+    bus.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn without_a_deadline_send_waits_for_capacity() {
+    let handler = GatedHandler::new();
+    let bus = gated_bus("unbounded", &handler).await;
+
+    let first = spawn_send(&bus, json!({"n": 1}), None);
+    tokio::time::timeout(Duration::from_secs(2), handler.started.notified())
+        .await
+        .expect("the worker never started the first delivery");
+    let second = spawn_send(&bus, json!({"n": 2}), None);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let third = spawn_send(&bus, json!({"n": 3}), None);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // No deadline was configured and none was passed, so the third send keeps
+    // waiting for capacity instead of failing.
+    assert!(
+        !third.is_finished(),
+        "an undeadlined send must wait for capacity, not give up"
+    );
+
+    handler.gate.notify_one();
+    assert_eq!(first.await.unwrap().unwrap(), json!({"n": 1}));
+    assert_eq!(second.await.unwrap().unwrap(), json!({"n": 2}));
+    assert_eq!(third.await.unwrap().unwrap(), json!({"n": 3}));
+    assert_eq!(
+        handler.payloads(),
+        vec![json!({"n": 1}), json!({"n": 2}), json!({"n": 3})]
+    );
     bus.stop().await.unwrap();
 }

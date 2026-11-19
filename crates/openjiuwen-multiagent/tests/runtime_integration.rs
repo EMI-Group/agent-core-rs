@@ -245,9 +245,13 @@ async fn a_failing_transport_surfaces_errors_and_keeps_the_error_events() {
             Err(Error::transport("transport down"))
         }
 
-        fn add_subscription(&self, _agent_id: &str, _topic: &str) {}
+        fn add_subscription(&self, _agent_id: &str, _topic: &str) -> Result<()> {
+            Ok(())
+        }
 
-        fn remove_subscription(&self, _agent_id: &str, _topic: &str) {}
+        fn remove_subscription(&self, _agent_id: &str, _topic: &str) -> Result<()> {
+            Ok(())
+        }
 
         fn subscribers(&self, _topic_id: &str) -> Vec<String> {
             Vec::new()

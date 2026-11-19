@@ -18,8 +18,11 @@ use std::time::Duration;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use openjiuwen_agent::{Agent, AgentCard, AgentChunk, AgentOutput};
-use openjiuwen_common::error::{ErrorKind, Result};
-use openjiuwen_multiagent::{AgentProvider, RuntimeConfig, TeamAgent, TeamRuntime};
+use openjiuwen_common::error::{Error, ErrorKind, Result};
+use openjiuwen_multiagent::transport::{TeamTransport, TransportKind};
+use openjiuwen_multiagent::{
+    AgentProvider, MessageEnvelope, RuntimeConfig, TeamAgent, TeamRuntime,
+};
 use openjiuwen_session::{AgentTeamSession, AgentTeamSessionOptions, Session};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -305,6 +308,116 @@ async fn publish_delivers_to_subscribers() {
     let mut seen = delivered.lock().clone();
     seen.sort();
     assert_eq!(seen, vec!["a".to_string(), "b".to_string()]);
+}
+
+/// Registers `name` with an agent that records every delivery and answers
+/// `"seen"`, returning the shared delivery log.
+fn recording_member(runtime: &TeamRuntime, name: &str, delivered: &Arc<Mutex<Vec<String>>>) {
+    let delivered = Arc::clone(delivered);
+    let label = name.to_owned();
+    let card = agent_card(name);
+    let agent: Arc<dyn Agent> = FakeAgent::new(card, move |_inputs, _session| {
+        delivered.lock().push(label.clone());
+        Ok(AgentOutput::answer("seen"))
+    });
+    runtime.register_agent(
+        agent_card(name),
+        Arc::new(move || TeamAgent::new(Arc::clone(&agent))),
+    );
+}
+
+#[tokio::test]
+async fn subscribe_and_unsubscribe_gate_pubsub_delivery() {
+    let runtime = TeamRuntime::new(RuntimeConfig::new().with_team_id("gate"));
+    let delivered: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    recording_member(&runtime, "a", &delivered);
+
+    // The runtime's own introspection and the transport's registry agree: the
+    // subscription is recorded where `publish` fans out from.
+    runtime.subscribe("a", "news").await.unwrap();
+    assert_eq!(runtime.list_agent_subscriptions("a"), vec!["news"]);
+    assert_eq!(runtime.transport().subscribers("news"), vec!["a"]);
+
+    runtime
+        .publish(json!({"headline": "one"}), "news", "boss", None)
+        .await
+        .unwrap();
+    assert_eq!(delivered.lock().clone(), vec!["a".to_string()]);
+
+    // Unsubscribing stops delivery, not just introspection.
+    runtime.unsubscribe("a", "news").await.unwrap();
+    assert_eq!(runtime.list_agent_subscriptions("a"), Vec::<String>::new());
+    assert_eq!(
+        runtime.transport().subscribers("news"),
+        Vec::<String>::new()
+    );
+    runtime
+        .publish(json!({"headline": "two"}), "news", "boss", None)
+        .await
+        .unwrap();
+    assert_eq!(delivered.lock().clone(), vec!["a".to_string()]);
+}
+
+/// A transport with no subscription registry: it keeps the trait defaults, which
+/// must report `Unsupported` rather than pretending a subscription was recorded.
+#[derive(Debug)]
+struct NoSubscriptionTransport;
+
+#[async_trait::async_trait]
+impl TeamTransport for NoSubscriptionTransport {
+    fn kind(&self) -> TransportKind {
+        TransportKind::InProcess
+    }
+
+    fn team_id(&self) -> &'static str {
+        "no-subs"
+    }
+
+    async fn start(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn send(&self, _envelope: MessageEnvelope, _timeout: Option<Duration>) -> Result<Value> {
+        Err(Error::transport("not used"))
+    }
+
+    async fn publish(&self, _envelope: MessageEnvelope) -> Result<()> {
+        Err(Error::transport("not used"))
+    }
+
+    fn subscribers(&self, _topic_id: &str) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+#[tokio::test]
+async fn a_transport_without_subscriptions_reports_unsupported() {
+    let runtime = TeamRuntime::new(RuntimeConfig::new().with_team_id("no-subs"));
+    runtime
+        .set_transport(Arc::new(NoSubscriptionTransport))
+        .unwrap();
+
+    let error = runtime.subscribe("a", "news").await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(
+        error
+            .message()
+            .contains("does not support topic subscriptions"),
+        "unexpected error: {error}"
+    );
+
+    let error = runtime.unsubscribe("a", "news").await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(
+        error
+            .message()
+            .contains("does not support topic subscriptions"),
+        "unexpected error: {error}"
+    );
 }
 
 #[tokio::test]

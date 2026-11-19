@@ -374,7 +374,17 @@ impl TeamRuntime {
             registry.order.retain(|id| id != agent_id);
             entry.card
         };
-        self.bus.remove_all_subscriptions(agent_id);
+        let transport = self.transport();
+        for pattern in transport.agent_subscriptions(agent_id) {
+            if let Err(error) = transport.remove_subscription(agent_id, &pattern) {
+                tracing::warn!(
+                    agent_id,
+                    pattern = %pattern,
+                    %error,
+                    "could not drop an unregistered member's subscription"
+                );
+            }
+        }
         self.events
             .emit(TeamEvent::member_left(self.team_id(), agent_id));
         Some(card)
@@ -439,9 +449,10 @@ impl TeamRuntime {
 
     /// Returns the bus this runtime dispatches through.
     ///
-    /// Outbound deliveries route through [`TeamRuntime::transport`], which
-    /// wraps this bus by default. Subscriptions and session cleanup stay on the
-    /// bus, because the in-process transport is bus-driven in both directions.
+    /// Outbound deliveries and the logical subscription registry route through
+    /// [`TeamRuntime::transport`], which wraps this bus by default; the bus wins
+    /// only for inbound sessions ([`TeamRuntime::cleanup_session`]), because the
+    /// in-process transport is bus-driven in both directions.
     #[must_use]
     pub fn message_bus(&self) -> Arc<MessageBus> {
         Arc::clone(&self.bus)
@@ -545,12 +556,16 @@ impl TeamRuntime {
 
     /// Subscribes `agent_id` to `topic` (an exact topic or a `*`/`?` pattern).
     ///
-    /// This only updates the logical subscriber registry; the transport topic is
-    /// created lazily by [`publish`](Self::publish).
+    /// The pair is recorded on [`TeamRuntime::transport`], the same registry
+    /// [`publish`](Self::publish) fans out from, so a subscription is visible to
+    /// delivery on every backend. The transport topic is created lazily by
+    /// [`publish`](Self::publish).
     ///
     /// # Errors
     ///
-    /// [`Error::Validation`] for an empty `agent_id` or `topic`.
+    /// [`Error::Validation`] for an empty `agent_id` or `topic`, and
+    /// [`Error::Unsupported`] when the installed transport cannot maintain
+    /// subscriptions (a failed registration is never reported as success).
     // `async` matches the Python API and leaves room for a distributed transport.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn subscribe(&self, agent_id: &str, topic: &str) -> Result<()> {
@@ -560,15 +575,16 @@ impl TeamRuntime {
         if topic.is_empty() {
             return Err(Error::validation("topic is required"));
         }
-        self.bus.add_subscription(agent_id, topic);
-        Ok(())
+        self.transport().add_subscription(agent_id, topic)
     }
 
     /// Removes the `(agent_id, topic)` subscription; unknown pairs are a no-op.
     ///
     /// # Errors
     ///
-    /// [`Error::Validation`] for an empty `agent_id` or `topic`.
+    /// [`Error::Validation`] for an empty `agent_id` or `topic`, and
+    /// [`Error::Unsupported`] when the installed transport cannot maintain
+    /// subscriptions.
     // `async` matches the Python API and leaves room for a distributed transport.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn unsubscribe(&self, agent_id: &str, topic: &str) -> Result<()> {
@@ -578,8 +594,7 @@ impl TeamRuntime {
         if topic.is_empty() {
             return Err(Error::validation("topic is required"));
         }
-        self.bus.remove_subscription(agent_id, topic);
-        Ok(())
+        self.transport().remove_subscription(agent_id, topic)
     }
 
     /// Tears down the transport topics of `session_id`.

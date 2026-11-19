@@ -201,12 +201,17 @@ impl TeamTransport for RedisTransport {
         Ok(())
     }
 
-    fn add_subscription(&self, agent_id: &str, topic: &str) {
+    fn add_subscription(&self, agent_id: &str, topic: &str) -> Result<()> {
+        // Write-through: the local registry (which `publish` fans out from) is
+        // updated before the call returns, and the remote mirror is pushed on a
+        // detached best-effort task.
         self.registry.add(agent_id, topic);
+        Ok(())
     }
 
-    fn remove_subscription(&self, agent_id: &str, topic: &str) {
+    fn remove_subscription(&self, agent_id: &str, topic: &str) -> Result<()> {
         self.registry.remove(agent_id, topic);
+        Ok(())
     }
 
     fn subscribers(&self, topic_id: &str) -> Vec<String> {

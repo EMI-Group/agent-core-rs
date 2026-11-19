@@ -235,10 +235,35 @@ pub trait TeamTransport: Send + Sync + fmt::Debug {
 
     /// Registers `agent_id` as a subscriber of `topic` (an exact topic or a
     /// `*`/`?` pattern).
-    fn add_subscription(&self, agent_id: &str, topic: &str);
+    ///
+    /// A backend without a logical subscription registry inherits the default,
+    /// which returns [`Error::Unsupported`] rather than pretending the pair was
+    /// recorded, so a caller (`TeamRuntime::subscribe`) can never report a
+    /// subscription the transport does not observe.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] from a backend that cannot maintain subscriptions.
+    fn add_subscription(&self, agent_id: &str, topic: &str) -> Result<()> {
+        let _ = (agent_id, topic);
+        Err(Error::unsupported(format!(
+            "the '{}' team transport does not support topic subscriptions",
+            self.kind()
+        )))
+    }
 
     /// Removes the `(agent_id, topic)` subscription; unknown pairs are a no-op.
-    fn remove_subscription(&self, agent_id: &str, topic: &str);
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] from a backend that cannot maintain subscriptions.
+    fn remove_subscription(&self, agent_id: &str, topic: &str) -> Result<()> {
+        let _ = (agent_id, topic);
+        Err(Error::unsupported(format!(
+            "the '{}' team transport does not support topic subscriptions",
+            self.kind()
+        )))
+    }
 
     /// Returns the sorted ids subscribed to `topic_id`.
     fn subscribers(&self, topic_id: &str) -> Vec<String>;
