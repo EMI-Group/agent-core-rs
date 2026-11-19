@@ -84,6 +84,18 @@ pub use handlers::{
 };
 pub use hub::{FnReloadHandler, ReloadHandler, ReloadHub};
 pub use targets::{WatchPlan, WatchTarget};
+/// Whether this build compiled the real `notify`-backed watcher backend.
+///
+/// `true` when `openjiuwen-harness` was built with the `notify` feature, so
+/// [`WorkspaceWatcher::start`] arms an OS watcher; `false` when it was not, so
+/// `start` answers [`Error::Unsupported`] before it looks at the plan.
+///
+/// Consumers that must branch on the backend at run time should read this
+/// constant instead of their own `cfg!(feature = "notify")`: cargo unifies
+/// features per crate, so a binary that enables `notify` through another
+/// dependency (for example `openjiuwen-cli`, which turns it on unconditionally)
+/// links the `notify`-enabled harness while its own `cfg!` still reads `false`.
+pub const WATCHER_BACKEND_AVAILABLE: bool = cfg!(feature = "notify");
 
 /// Default debounce window: a path has to stay quiet for 250 ms before its event
 /// is published.

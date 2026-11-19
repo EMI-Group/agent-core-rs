@@ -248,43 +248,42 @@ impl ReadFileTool {
             }
         }
 
-        let (raw_text, _total_bytes) = match bounded_size {
-            Some(_) => match read_text_window(fs, &display, offset, limit).await {
+        let (raw_text, _total_bytes) = if bounded_size.is_some() {
+            match read_text_window(fs, &display, offset, limit).await {
                 Ok((text, actual_total)) => (text, actual_total),
                 Err(message) => return ToolPayload::fail(message),
-            },
+            }
+        } else {
             // A backend without a bounded read keeps the whole-file path; its own policy bounds
             // the read, and the size guard above cannot see the file size in advance.
-            None => {
-                let params = ReadFileParams {
-                    path: display.clone(),
-                    mode: ReadMode::Text,
-                    line_range: Some(LineRange {
-                        start: offset.saturating_add(1),
-                        end: offset.saturating_add(limit),
-                    }),
-                    ..ReadFileParams::default()
-                };
+            let params = ReadFileParams {
+                path: display.clone(),
+                mode: ReadMode::Text,
+                line_range: Some(LineRange {
+                    start: offset.saturating_add(1),
+                    end: offset.saturating_add(limit),
+                }),
+                ..ReadFileParams::default()
+            };
 
-                let result = fs.read_file(params).await;
-                if result.is_failure() {
-                    return ToolPayload::fail(result.message);
-                }
-                let Some(data) = result.data else {
-                    return ToolPayload::fail(
-                        "read_file returned no data from the filesystem operation",
-                    );
-                };
-                let total_bytes = data.total_bytes;
-                let text = match data.content {
-                    FileContent::Text(text) => text,
-                    FileContent::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                };
-                if !user_supplied_limit && total_bytes > MAX_SIZE_BYTES {
-                    return ToolPayload::fail(oversized_message(total_bytes));
-                }
-                (text, total_bytes)
+            let result = fs.read_file(params).await;
+            if result.is_failure() {
+                return ToolPayload::fail(result.message);
             }
+            let Some(data) = result.data else {
+                return ToolPayload::fail(
+                    "read_file returned no data from the filesystem operation",
+                );
+            };
+            let total_bytes = data.total_bytes;
+            let text = match data.content {
+                FileContent::Text(text) => text,
+                FileContent::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            };
+            if !user_supplied_limit && total_bytes > MAX_SIZE_BYTES {
+                return ToolPayload::fail(oversized_message(total_bytes));
+            }
+            (text, total_bytes)
         };
 
         let (displayed, line_count) = if raw_text.trim().is_empty() {

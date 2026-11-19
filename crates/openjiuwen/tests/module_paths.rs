@@ -631,12 +631,19 @@ fn notify_feature_gates_the_workspace_watcher_backend() {
     // is rejected before any backend work, so one poll of `start()` covers both builds:
     // with `notify` the plan validation answers `Config`, without it `start()` answers
     // `Unsupported` before it looks at the plan at all. Nothing is watched, touched or
-    // spawned here.
+    // spawned here. The branch reads `WATCHER_BACKEND_AVAILABLE`, the harness's own
+    // compile-time constant, rather than this crate's `cfg!(feature = "notify")`.
     let Err(error) = poll_once(openjiuwen::harness::watcher::WorkspaceWatcher::new().start())
     else {
         panic!("an empty watch plan is never accepted");
     };
-    if cfg!(feature = "notify") {
+    if openjiuwen::harness::watcher::WATCHER_BACKEND_AVAILABLE {
+        // Branch on the harness crate's own constant, never on this crate's
+        // `cfg!(feature = "notify")`: cargo unifies features per crate, and
+        // `openjiuwen-cli` enables `openjiuwen-harness/notify` unconditionally, so a
+        // workspace build links the `notify`-enabled harness while this test binary's
+        // `cfg!` still reads `false`. The constant tracks the harness build that
+        // actually answered `start()`.
         assert_eq!(error.kind(), ErrorKind::Config);
         assert!(
             error.to_string().contains("at least one watch target"),

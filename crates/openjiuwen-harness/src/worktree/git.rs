@@ -213,7 +213,7 @@ impl ProcessGitRunner {
         }
     }
 
-    /// Replaces the per-command deadline (default [`DEFAULT_GIT_TIMEOUT`]).
+    /// Replaces the per-command deadline (default `DEFAULT_GIT_TIMEOUT`, 60 s).
     ///
     /// A zero deadline disables the bound, which only a host that already
     /// imposes its own timeout should do.
@@ -266,14 +266,14 @@ impl GitRunner for ProcessGitRunner {
             })?;
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
-        let collected = async {
+        let collected = Box::pin(async {
             let (stdout, stderr, status) = tokio::join!(
                 read_capped(stdout_pipe),
                 read_capped(stderr_pipe),
                 child.wait(),
             );
-            let stdout = stdout.map_err(|error| pipe_error(&self.program, cwd, error))?;
-            let stderr = stderr.map_err(|error| pipe_error(&self.program, cwd, error))?;
+            let stdout = stdout.map_err(|error| pipe_error(&self.program, cwd, &error))?;
+            let stderr = stderr.map_err(|error| pipe_error(&self.program, cwd, &error))?;
             let status = status.map_err(|error| {
                 Error::tool(format!(
                     "cannot wait for `{}` in `{}`: {error}",
@@ -282,8 +282,8 @@ impl GitRunner for ProcessGitRunner {
                 ))
             })?;
             Ok::<_, Error>((stdout, stderr, status))
-        };
-        let bounded = async {
+        });
+        let bounded = Box::pin(async {
             if self.timeout.is_zero() {
                 return collected.await;
             }
@@ -297,7 +297,7 @@ impl GitRunner for ProcessGitRunner {
                         cwd.display()
                     ))
                 })?
-        };
+        });
         // The child is owned here, so dropping the future below drops it and
         // `kill_on_drop` terminates the process before `run` returns.
         let (stdout, stderr, status) = bounded.await?;
@@ -311,7 +311,7 @@ impl GitRunner for ProcessGitRunner {
 }
 
 /// Builds the typed error of an unreadable git output pipe.
-fn pipe_error(program: &str, cwd: &Path, error: std::io::Error) -> Error {
+fn pipe_error(program: &str, cwd: &Path, error: &std::io::Error) -> Error {
     Error::tool(format!(
         "cannot read `{program}` output in `{}`: {error}",
         cwd.display()

@@ -302,20 +302,21 @@ impl RoundExecutorHandle {
         };
         // The turn races its own cancellation and deadline. Dropping the inner future stops the
         // model request instead of letting it finish into a receiver nobody reads.
-        match self.deadline {
-            Some(deadline) => tokio::select! {
+        if let Some(deadline) = self.deadline {
+            tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => Err(Error::validation(ABORTED_MESSAGE)),
+                () = self.cancel.cancelled() => Err(Error::validation(ABORTED_MESSAGE)),
                 result = tokio::time::timeout_at(deadline, run) => match result {
                     Ok(result) => result,
                     Err(_) => Err(Error::timeout(COMPLETION_TIMEOUT_MESSAGE)),
                 },
-            },
-            None => tokio::select! {
+            }
+        } else {
+            tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => Err(Error::validation(ABORTED_MESSAGE)),
+                () = self.cancel.cancelled() => Err(Error::validation(ABORTED_MESSAGE)),
                 result = run => result,
-            },
+            }
         }
     }
 

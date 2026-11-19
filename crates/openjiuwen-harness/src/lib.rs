@@ -263,6 +263,7 @@ pub use watcher::{
     Subscription, WatchEvent, WatchFailure, WatchPlan, WatchTarget, WatchTargetKind, WatchUpdate,
     WatcherConfig, WatcherHandle, WorkspaceWatcher, DEFAULT_DEBOUNCE, DEFAULT_DISPATCH_CAPACITY,
     DEFAULT_EVENT_CAPACITY, DEFAULT_INTAKE_CAPACITY, DEFAULT_MAX_PENDING,
+    WATCHER_BACKEND_AVAILABLE,
 };
 // --- persistent_agent ------------------------------------------------------
 pub use persistent_agent::{

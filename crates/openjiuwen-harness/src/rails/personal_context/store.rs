@@ -304,7 +304,7 @@ impl PersonalContextStore {
             for document in &report.documents {
                 let draft = ContextEntry::from_document(document, &observed_at);
                 let (outcome, changed) =
-                    apply_document(&mut index, &metadata_store, draft, &observed_at)?;
+                    apply_document(&mut index, &metadata_store, &draft, &observed_at)?;
                 dirty |= changed;
                 match outcome {
                     IngestOutcome::Ingested => aggregate.ingested += 1,
@@ -375,7 +375,7 @@ impl PersonalContextStore {
             let document = document_from_fetched(source);
             let draft = entry_from_fetched(source, &document, &observed_at);
             let (outcome, changed) =
-                apply_document(&mut index, &metadata_store, draft, &observed_at)?;
+                apply_document(&mut index, &metadata_store, &draft, &observed_at)?;
             dirty |= changed;
             match outcome {
                 IngestOutcome::Ingested => aggregate.ingested += 1,
@@ -506,7 +506,7 @@ enum IngestOutcome {
 fn apply_document(
     index: &mut ContextIndex,
     metadata_store: &SourceMetadataStore,
-    draft: ContextEntry,
+    draft: &ContextEntry,
     observed_at: &str,
 ) -> Result<(IngestOutcome, bool)> {
     let mut dirty = false;
@@ -912,7 +912,7 @@ mod tests {
             (0, 0, 0)
         );
         assert_eq!(report.failed, 0);
-        assert!(report.warnings.is_empty());
+        assert_eq!(report.warnings, Vec::<String>::new());
         assert_eq!(report.documents.len(), 2);
         assert!(report.documents[0].relative_path <= report.documents[1].relative_path);
 
@@ -945,7 +945,7 @@ mod tests {
         assert_eq!(report.ingested, 0);
         assert_eq!(report.unchanged, 1);
         assert_eq!(report.updated, 0);
-        assert!(report.documents.is_empty());
+        assert_eq!(report.documents, Vec::new());
 
         let after = store.entries().unwrap();
         assert_eq!(after.len(), 1);
@@ -1045,7 +1045,7 @@ mod tests {
             (report.ingested, report.unchanged, report.updated),
             (0, 0, 0)
         );
-        assert!(report.documents.is_empty());
+        assert_eq!(report.documents, Vec::new());
         assert!(!store.index_path().exists());
 
         store
@@ -1054,7 +1054,7 @@ mod tests {
         let index_before = std::fs::read_to_string(store.index_path()).unwrap();
         let report = store.ingest_fetched(&[], T1).unwrap();
         assert_eq!(report.scanned, 0);
-        assert!(report.documents.is_empty());
+        assert_eq!(report.documents, Vec::new());
         assert_eq!(
             std::fs::read_to_string(store.index_path()).unwrap(),
             index_before

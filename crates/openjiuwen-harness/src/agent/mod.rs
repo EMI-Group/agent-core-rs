@@ -664,28 +664,24 @@ impl Agent for DeepAgent {
             let sender = Some(tx.clone());
             let mut invocation =
                 Box::pin(driver.invoke_inner(inputs, session, sender, cancel.clone()));
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = tx.closed() => {
-                        // Nobody is reading: cancel the turn and let it unwind so the
-                        // running slot is free for the next invocation.
-                        cancel.cancel();
-                        let _ = invocation.as_mut().await;
-                        break;
-                    }
-                    result = &mut invocation => {
-                        match result {
-                            Ok(output) => {
-                                if !output.is_interrupt() {
-                                    let _ = tx.send(Ok(AgentChunk::answer(&output))).await;
-                                }
-                            }
-                            Err(error) => {
-                                let _ = tx.send(Err(error)).await;
+            tokio::select! {
+                biased;
+                () = tx.closed() => {
+                    // Nobody is reading: cancel the turn and let it unwind so the
+                    // running slot is free for the next invocation.
+                    cancel.cancel();
+                    let _ = invocation.as_mut().await;
+                }
+                result = &mut invocation => {
+                    match result {
+                        Ok(output) => {
+                            if !output.is_interrupt() {
+                                let _ = tx.send(Ok(AgentChunk::answer(&output))).await;
                             }
                         }
-                        break;
+                        Err(error) => {
+                            let _ = tx.send(Err(error)).await;
+                        }
                     }
                 }
             }
