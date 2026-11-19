@@ -16,16 +16,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
-use openjiuwen_agent::output::{ANSWER, INTERACTION, LLM_OUTPUT};
+use openjiuwen_agent::output::{ANSWER, INTERACTION};
 use openjiuwen_agent::{
-    Agent, AgentChunk, AgentInput, AgentOutput, OutputFrame, RailContext, RailEvent, ReActAgent,
-    ResultType,
+    Agent, AgentChunk, AgentInput, AgentOutput, OutputFrame, RailContext, RailEvent, ResultType,
 };
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_session::Session;
@@ -54,6 +54,23 @@ const ABORTED_MESSAGE: &str = "DeepAgent invocation aborted";
 
 /// Message returned by [`RoundExecutorHandle::execute`] when the completion timeout expires.
 const COMPLETION_TIMEOUT_MESSAGE: &str = "DeepAgent invocation exceeded its completion timeout";
+
+/// Longest raw frame preview quoted in a decode error, in characters.
+const PREVIEW_LIMIT: usize = 256;
+
+/// Replacement text for a redacted secret in a raw frame preview.
+const REDACTED: &str = "***";
+
+/// Key fragments whose values are redacted from a raw frame preview.
+const SECRET_KEY_FRAGMENTS: [&str; 7] = [
+    "api_key",
+    "apikey",
+    "authorization",
+    "password",
+    "secret",
+    "token",
+    "credential",
+];
 
 /// Keys the task-loop consumes rather than forwarding to the kernel agent.
 const RESERVED_KEYS: [&str; 14] = [
@@ -193,7 +210,7 @@ impl RoundState {
 /// token and recorded state.
 #[derive(Clone)]
 pub struct RoundExecutorHandle {
-    inner: Arc<ReActAgent>,
+    inner: Arc<dyn Agent>,
     rails: HarnessRailRegistry,
     /// Shared steering queue of the owning agent; [`PromptRail`] drains it, the
     /// handle only carries it so later wiring can reuse the same queue.
@@ -218,7 +235,7 @@ impl RoundExecutorHandle {
     /// inner agent, and `state` records the last output and token usage.
     #[must_use]
     pub fn new(
-        inner: Arc<ReActAgent>,
+        inner: Arc<dyn Agent>,
         rails: HarnessRailRegistry,
         queues: LoopQueues,
         cancel: CancellationToken,
@@ -348,27 +365,29 @@ impl RoundExecutorHandle {
     /// Drains the inner stream, forwarding frames and returning the terminal
     /// output.
     async fn stream_turn(&self, inputs: &Value) -> Result<AgentOutput> {
-        let mut stream = self.inner.stream(inputs.clone(), self.session.clone());
+        let stream = self.inner.stream(inputs.clone(), self.session.clone());
+        self.consume_stream(stream).await
+    }
+
+    /// Consumes one agent frame stream, forwarding every frame and returning the
+    /// terminal output.
+    ///
+    /// A stream that ends without a terminal `answer` frame and without any
+    /// interaction frame violated the frame protocol, so it is reported as an
+    /// error rather than turned into an empty answer.
+    async fn consume_stream(
+        &self,
+        mut stream: BoxStream<'static, Result<AgentChunk>>,
+    ) -> Result<AgentOutput> {
         let mut answer: Option<AgentOutput> = None;
         let mut frames: Vec<OutputFrame> = Vec::new();
-        let mut llm_text = String::new();
 
         while let Some(item) = stream.next().await {
             let chunk = item?;
             match chunk.kind.as_str() {
-                ANSWER => answer = Some(decode_answer(&chunk.payload)),
+                ANSWER => answer = Some(decode_answer(&chunk.payload)?),
                 INTERACTION => {
-                    if let Ok(frame) = OutputFrame::from_value(chunk.payload.clone()) {
-                        frames.push(frame);
-                    }
-                    if !self.send(chunk).await {
-                        return Err(Error::cancelled());
-                    }
-                }
-                LLM_OUTPUT => {
-                    if let Some(text) = chunk.payload.get("content").and_then(Value::as_str) {
-                        llm_text.push_str(text);
-                    }
+                    frames.push(decode_interaction(chunk.index, &chunk.payload)?);
                     if !self.send(chunk).await {
                         return Err(Error::cancelled());
                     }
@@ -383,7 +402,13 @@ impl RoundExecutorHandle {
 
         let output = match answer {
             Some(output) => output,
-            None if frames.is_empty() => AgentOutput::answer(llm_text),
+            None if frames.is_empty() => {
+                return Err(frame_decode_error(
+                    ANSWER,
+                    "the stream ended without a terminal answer frame",
+                    &Value::Null,
+                ))
+            }
             None => {
                 let ids = interrupt_ids(&frames);
                 AgentOutput::interrupt(frames, ids)
@@ -494,12 +519,189 @@ fn round_inputs(work: &RoundWorkItem) -> Value {
     Value::Object(inputs)
 }
 
-/// Decodes an `answer` frame payload, falling back to a plain-text output.
-fn decode_answer(payload: &Value) -> AgentOutput {
-    match AgentOutput::from_value(payload.clone()) {
-        Ok(output) => output,
-        Err(_) => AgentOutput::answer(payload.to_string()),
+/// Decodes an `answer` frame payload into the terminal output of the turn.
+///
+/// The payload is normally the JSON object of an [`AgentOutput`]; a JSON string
+/// is parsed first because some transports hand the payload through as text.
+///
+/// # Errors
+///
+/// Returns a typed error carrying the decode reason and a redacted, truncated
+/// raw preview when the payload is not decodable, carries no `output` /
+/// `result_type` field, or is text that is not JSON. A malformed terminal frame
+/// is never turned into a plausible answer.
+fn decode_answer(payload: &Value) -> Result<AgentOutput> {
+    let frame = match payload {
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .map_err(|error| frame_decode_error(ANSWER, &error.to_string(), payload))?,
+        other => other.clone(),
+    };
+    if !carries_answer_fields(&frame) {
+        return Err(frame_decode_error(
+            ANSWER,
+            "missing 'output' and 'result_type'",
+            payload,
+        ));
     }
+    AgentOutput::from_value(frame)
+        .map_err(|error| frame_decode_error(ANSWER, &error.to_string(), payload))
+}
+
+/// Decodes an `__interaction__` frame payload into an [`OutputFrame`].
+///
+/// The kernel publishes the frame *payload* (`{"id", "value"}`) rather than the
+/// full `{"type", "index", "payload"}` wire frame, so a payload without a `type`
+/// key is wrapped into an interaction frame at the position `index`.
+///
+/// # Errors
+///
+/// Returns a typed error when a wire-shaped payload does not decode or the bare
+/// payload is not a JSON object.
+fn decode_interaction(index: i64, payload: &Value) -> Result<OutputFrame> {
+    if payload.get("type").is_some() {
+        return OutputFrame::from_value(payload.clone())
+            .map_err(|error| frame_decode_error(INTERACTION, &error.to_string(), payload));
+    }
+    if !payload.is_object() {
+        return Err(frame_decode_error(
+            INTERACTION,
+            "expected an object payload",
+            payload,
+        ));
+    }
+    Ok(OutputFrame {
+        kind: INTERACTION.to_owned(),
+        index,
+        payload: payload.clone(),
+    })
+}
+
+/// Reports whether a decoded value carries the fields of an answer output.
+fn carries_answer_fields(value: &Value) -> bool {
+    let Some(map) = value.as_object() else {
+        return false;
+    };
+    map.contains_key("output") || map.contains_key("result_type")
+}
+
+/// Builds the typed error of a frame that could not be decoded.
+///
+/// The message carries the frame kind, the decode reason and a truncated raw
+/// preview with secret-looking values redacted, so a malformed provider frame is
+/// diagnosable without leaking credentials into logs.
+fn frame_decode_error(kind: &str, reason: &str, payload: &Value) -> Error {
+    Error::validation(format!(
+        "malformed {kind} frame: {reason}; raw payload: {}",
+        frame_preview(payload)
+    ))
+}
+
+/// Renders a bounded, secret-redacted preview of `payload`.
+///
+/// The preview is bounded *before* it is redacted, so a multi-megabyte frame
+/// costs one bounded scan; a string value that truncation cut in half is still
+/// redacted, because an unterminated secret value swallows the rest of the
+/// preview.
+fn frame_preview(payload: &Value) -> String {
+    let text = match payload {
+        Value::String(text) => truncate_chars(text, PREVIEW_LIMIT),
+        other => truncate_chars(&redact_secrets(other).to_string(), PREVIEW_LIMIT),
+    };
+    redact_text(&text)
+}
+
+/// Redacts `"key": "value"` pairs whose key names a secret in unparsed text.
+///
+/// A frame that failed to parse cannot be redacted key by key, so the preview
+/// is scanned textually: the value after a secret-looking key is replaced with
+/// [`REDACTED`] up to its closing quote (or to the end of a truncated preview).
+fn redact_text(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for fragment in SECRET_KEY_FRAGMENTS {
+        let mut from = 0;
+        while let Some(offset) = lower[from..].find(fragment) {
+            let key_at = from + offset;
+            from = key_at + fragment.len();
+            if let Some(range) = secret_value_range(text, key_at) {
+                ranges.push(range);
+            }
+        }
+    }
+    if ranges.is_empty() {
+        return text.to_owned();
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    let mut redacted = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in ranges {
+        if start < cursor {
+            continue;
+        }
+        redacted.push_str(&text[cursor..start]);
+        redacted.push_str(REDACTED);
+        cursor = end;
+    }
+    redacted.push_str(&text[cursor..]);
+    redacted
+}
+
+/// Returns the byte range of the value of the key at `key_at`.
+///
+/// The range covers the content between the first pair of quotes after the
+/// key's colon, so it is empty for a `null`/numeric value; an unterminated
+/// value extends to the end of `text`.
+fn secret_value_range(text: &str, key_at: usize) -> Option<(usize, usize)> {
+    let colon = text.get(key_at..)?.find(':')?;
+    let value_at = key_at + colon + 1;
+    let start = value_at + text.get(value_at..)?.find('"')? + 1;
+    match text.get(start..).and_then(|tail| tail.find('"')) {
+        Some(len) => Some((start, start + len)),
+        None => Some((start, text.len())),
+    }
+}
+
+/// Replaces the values of secret-looking keys and nested JSON text.
+fn redact_secrets(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, item)| {
+                    let item = if is_secret_key(key) {
+                        Value::String(REDACTED.to_owned())
+                    } else {
+                        redact_secrets(item)
+                    };
+                    (key.clone(), item)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redact_secrets).collect()),
+        Value::String(text) => match serde_json::from_str::<Value>(text) {
+            Ok(nested) => Value::String(redact_secrets(&nested).to_string()),
+            Err(_) => value.clone(),
+        },
+        other => other.clone(),
+    }
+}
+
+/// Reports whether a JSON key names a secret whose value must not be previewed.
+fn is_secret_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    SECRET_KEY_FRAGMENTS
+        .iter()
+        .any(|fragment| key.contains(fragment))
+}
+
+/// Truncates `text` to [`PREVIEW_LIMIT`] characters on a char boundary.
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let mut truncated: String = text.chars().take(limit).collect();
+    truncated.push('…');
+    truncated
 }
 
 /// Collects the interrupt ids carried by `frames`.
@@ -560,6 +762,7 @@ mod tests {
     use crate::rails::HarnessRailRegistry;
     use crate::schema::{RoundWorkItem, RoundWorkKind};
     use crate::task_loop::{LoopQueues, RoundExecutor};
+    use openjiuwen_agent::ResultType;
 
     fn agent(model: ScriptedModel) -> std::sync::Arc<openjiuwen_agent::ReActAgent> {
         let agent = openjiuwen_agent::ReActAgent::new(AgentCard::new("round-test"));
@@ -761,6 +964,219 @@ mod tests {
             Some(openjiuwen_agent::output::ANSWER)
         );
         assert_eq!(terminal, Some(output));
+    }
+
+    /// A fake inner agent that streams a fixed frame list.
+    struct FrameAgent {
+        card: openjiuwen_agent::AgentCard,
+        chunks: Vec<openjiuwen_agent::AgentChunk>,
+    }
+
+    #[async_trait::async_trait]
+    impl openjiuwen_agent::Agent for FrameAgent {
+        fn card(&self) -> &openjiuwen_agent::AgentCard {
+            &self.card
+        }
+
+        async fn invoke(
+            &self,
+            _inputs: serde_json::Value,
+            _session: Option<std::sync::Arc<dyn openjiuwen_session::Session>>,
+        ) -> openjiuwen_common::error::Result<openjiuwen_agent::AgentOutput> {
+            Err(openjiuwen_common::error::Error::validation(
+                "the fake agent only streams",
+            ))
+        }
+
+        fn stream(
+            &self,
+            _inputs: serde_json::Value,
+            _session: Option<std::sync::Arc<dyn openjiuwen_session::Session>>,
+        ) -> futures::stream::BoxStream<
+            'static,
+            openjiuwen_common::error::Result<openjiuwen_agent::AgentChunk>,
+        > {
+            Box::pin(futures::stream::iter(
+                self.chunks.clone().into_iter().map(Ok),
+            ))
+        }
+    }
+
+    /// Builds a stream-path handle over a fixed frame list.
+    fn frame_handle(chunks: Vec<openjiuwen_agent::AgentChunk>) -> RoundExecutorHandle {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        RoundExecutorHandle::new(
+            std::sync::Arc::new(FrameAgent {
+                card: AgentCard::new("frame-agent"),
+                chunks,
+            }),
+            HarnessRailRegistry::new(),
+            LoopQueues::default(),
+            CancellationToken::new(),
+            None,
+            RoundState::new(),
+        )
+        .with_stream_sender(tx)
+    }
+
+    #[tokio::test]
+    async fn a_malformed_terminal_frame_ends_the_run_with_the_typed_error() {
+        let chunk = openjiuwen_agent::AgentChunk::new(
+            openjiuwen_agent::output::ANSWER,
+            0,
+            json!("{not json"),
+        );
+        let handle = frame_handle(vec![chunk]);
+        let error = handle
+            .execute(&json!({"query": "hello"}))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("malformed answer frame"),
+            "{error}"
+        );
+        assert_eq!(handle.last_output(), None);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_terminal_frame_fails_the_round() {
+        let chunk = openjiuwen_agent::AgentChunk::new(
+            openjiuwen_agent::output::ANSWER,
+            0,
+            json!({"output": 5}),
+        );
+        let outcome = frame_handle(vec![chunk])
+            .run_round(work("hello"))
+            .await
+            .unwrap();
+        assert!(outcome.is_error());
+        assert_eq!(outcome.error_code.as_deref(), Some("round_execution_error"));
+        assert!(
+            outcome
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("malformed answer frame")),
+            "{outcome:?}"
+        );
+    }
+
+    /// Builds a stream of `chunks` for [`RoundExecutorHandle::consume_stream`].
+    fn frames(
+        chunks: Vec<openjiuwen_common::error::Result<openjiuwen_agent::AgentChunk>>,
+    ) -> futures::stream::BoxStream<
+        'static,
+        openjiuwen_common::error::Result<openjiuwen_agent::AgentChunk>,
+    > {
+        Box::pin(futures::stream::iter(chunks))
+    }
+
+    #[tokio::test]
+    async fn malformed_answer_object_is_a_typed_error_not_an_answer() {
+        let handle = handle(ScriptedModel::text("unused"));
+        for (payload, expected) in [
+            (json!({"foo": 1}), "missing 'output' and 'result_type'"),
+            (json!({"result_type": 7}), "invalid type"),
+        ] {
+            let chunk =
+                openjiuwen_agent::AgentChunk::new(openjiuwen_agent::output::ANSWER, 0, payload);
+            let error = handle
+                .consume_stream(frames(vec![Ok(chunk)]))
+                .await
+                .unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("malformed answer frame"), "{message}");
+            assert!(message.contains(expected), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_answer_text_is_a_typed_error_with_a_redacted_preview() {
+        let handle = handle(ScriptedModel::text("unused"));
+        let raw = "{\"output\": \"cut off\", \"api_key\": \"sk-super-secret\", ";
+        let chunk =
+            openjiuwen_agent::AgentChunk::new(openjiuwen_agent::output::ANSWER, 0, json!(raw));
+        let error = handle
+            .consume_stream(frames(vec![Ok(chunk)]))
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("malformed answer frame"), "{message}");
+        assert!(message.contains("EOF while parsing a value"), "{message}");
+        assert!(message.contains("cut off"), "{message}");
+        assert!(!message.contains("sk-super-secret"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn malformed_answer_preview_is_redacted_and_truncated() {
+        let payload = json!({
+            "api_key": "sk-leaked",
+            "nested": {"authorization": "Bearer abc", "note": "x".repeat(4096)},
+        });
+        let message = super::frame_decode_error(super::ANSWER, "boom", &payload).to_string();
+        assert!(message.starts_with("validation: malformed answer frame: boom; raw payload: "));
+        assert!(!message.contains("sk-leaked"), "{message}");
+        assert!(!message.contains("Bearer abc"), "{message}");
+        assert!(message.contains("\"api_key\":\"***\""), "{message}");
+        assert!(message.chars().count() < 400, "preview is truncated");
+    }
+
+    #[tokio::test]
+    async fn malformed_interaction_frame_is_a_typed_error() {
+        let handle = handle(ScriptedModel::text("unused"));
+        let chunk = openjiuwen_agent::AgentChunk::new(
+            openjiuwen_agent::output::INTERACTION,
+            1,
+            json!("not-a-frame"),
+        );
+        let error = handle
+            .consume_stream(frames(vec![Ok(chunk)]))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("malformed __interaction__ frame: expected an object payload"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_interaction_payload_is_wrapped_at_its_chunk_position() {
+        let handle = handle(ScriptedModel::text("unused"));
+        let chunk = openjiuwen_agent::AgentChunk::new(
+            openjiuwen_agent::output::INTERACTION,
+            7,
+            json!({"id": "ask-1", "value": {"question": "ok?"}}),
+        );
+        let output = handle
+            .consume_stream(frames(vec![Ok(chunk)]))
+            .await
+            .unwrap();
+        assert_eq!(output.result_type, ResultType::Interrupt);
+        assert_eq!(output.interrupt_ids, vec!["ask-1".to_string()]);
+        assert_eq!(output.state.len(), 1);
+        assert_eq!(output.state[0].kind, openjiuwen_agent::output::INTERACTION);
+        assert_eq!(output.state[0].index, 7);
+    }
+
+    #[tokio::test]
+    async fn a_stream_without_a_terminal_frame_is_a_typed_error() {
+        let handle = handle(ScriptedModel::text("unused"));
+        let chunk = openjiuwen_agent::AgentChunk::new(
+            openjiuwen_agent::output::LLM_OUTPUT,
+            0,
+            json!({"content": "half an answer"}),
+        );
+        let error = handle
+            .consume_stream(frames(vec![Ok(chunk)]))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the stream ended without a terminal answer frame"),
+            "{error}"
+        );
     }
 
     #[test]
