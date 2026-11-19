@@ -22,7 +22,7 @@ use super::search::{
     not_configured_reason, FakeSearchBackend, HttpSearchBackend, SearchBackend, SearchResult,
     WebSearchTool, ENDPOINT_ENV,
 };
-use super::test_support::{http_response, StubFetcher, TestServer};
+use super::test_support::{fetch_response, http_response, StubFetcher, TestServer};
 use crate::permission::{
     NetGuardSection, PermissionEngine, PermissionEngineConfig, PermissionLevel, PermissionsSection,
 };
@@ -552,4 +552,98 @@ async fn http_search_backend_round_trip_over_loopback() {
         head.to_lowercase().contains("accept: application/json"),
         "request: {head}"
     );
+}
+
+/// A fetch environment whose network guard denies loopback and link-local hosts.
+fn guarded_fetch_tool(fetcher: Arc<dyn HttpFetcher>) -> (FetchWebpageTool, TempDir) {
+    let section = PermissionsSection {
+        package_builtin_rules: false,
+        defaults: BTreeMap::from([("*".to_owned(), PermissionLevel::Allow)]),
+        net_guard: NetGuardSection {
+            enabled: true,
+            defaults: PermissionLevel::Allow,
+            urls: BTreeMap::from([
+                ("127.0.0.1".to_owned(), PermissionLevel::Deny),
+                ("169.254.169.254".to_owned(), PermissionLevel::Deny),
+            ]),
+        },
+        ..PermissionsSection::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let env = ToolEnv::new(Workspace::new(dir.path())).with_permission(Arc::new(
+        PermissionEngine::new(PermissionEngineConfig::new(section)),
+    ));
+    (FetchWebpageTool::new(env, Some(fetcher), "en"), dir)
+}
+
+/// A `302` response redirecting to `location`.
+fn redirect_to(location: &str) -> super::fetch::FetchResponse {
+    let mut response = fetch_response(302, "text/html", "");
+    response
+        .headers
+        .push(("Location".to_owned(), location.to_owned()));
+    response
+}
+
+#[tokio::test]
+async fn a_redirect_to_a_denied_host_is_refused_before_the_second_request() {
+    for target in [
+        "http://127.0.0.1:8080/admin",
+        "http://169.254.169.254/latest/meta-data/",
+    ] {
+        let fetcher = StubFetcher::sequence(vec![
+            Ok(redirect_to(target)),
+            Ok(fetch_response(200, "text/plain", &b"metadata"[..])),
+        ]);
+        let (tool, _dir) = guarded_fetch_tool(fetcher.clone());
+        let payload = fetch(&tool, json!({"url": "https://public.example/start"})).await;
+        assert_eq!(payload["success"], json!(false), "target: {target}");
+        let error = payload["error"].as_str().unwrap();
+        assert!(
+            error.contains("refusing to follow a redirect to"),
+            "{error}"
+        );
+        assert!(
+            error.contains(target.split('/').nth(2).unwrap().split(':').next().unwrap()),
+            "error names the offending host: {error}"
+        );
+        assert!(error.contains("net_guard"), "{error}");
+        assert_eq!(fetcher.calls(), 1, "the denied hop is never requested");
+    }
+}
+
+#[tokio::test]
+async fn a_redirect_to_another_public_host_is_followed() {
+    let fetcher = StubFetcher::sequence(vec![
+        Ok(redirect_to("https://second.example/next")),
+        Ok(fetch_response(200, "text/plain", &b"arrived"[..])),
+    ]);
+    let (tool, _dir) = guarded_fetch_tool(fetcher.clone());
+    let payload = fetch(&tool, json!({"url": "https://public.example/start"})).await;
+    assert_eq!(payload["success"], json!(true), "{payload}");
+    assert_eq!(payload["data"]["content"], json!("arrived"));
+    assert_eq!(fetcher.calls(), 2);
+    assert_eq!(
+        fetcher.last_request().unwrap().url,
+        "https://second.example/next"
+    );
+}
+
+#[tokio::test]
+async fn redirect_chains_are_capped() {
+    let hops = super::fetch::REDIRECT_LIMIT;
+    let fetcher = StubFetcher::sequence(
+        (0..=hops)
+            .map(|hop| Ok(redirect_to(&format!("https://hop{hop}.example/"))))
+            .collect(),
+    );
+    let (tool, _dir) = guarded_fetch_tool(fetcher.clone());
+    let payload = fetch(&tool, json!({"url": "https://public.example/start"})).await;
+    assert_eq!(payload["success"], json!(false));
+    let error = payload["error"].as_str().unwrap();
+    assert!(
+        error.contains(&format!("too many redirects (more than {hops})")),
+        "{error}"
+    );
+    assert_eq!(fetcher.calls(), hops + 1);
 }

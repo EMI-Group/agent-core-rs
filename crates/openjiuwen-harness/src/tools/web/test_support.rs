@@ -19,10 +19,10 @@ use openjiuwen_common::error::{Error, Result};
 
 use super::fetch::{FetchRequest, FetchResponse, HttpFetcher};
 
-/// An [`HttpFetcher`] returning one canned response and recording the request it received.
+/// An [`HttpFetcher`] returning canned responses and recording the requests it received.
 pub(crate) struct StubFetcher {
-    /// The response handed to the first call.
-    response: Mutex<Option<Result<FetchResponse>>>,
+    /// The responses handed out, in call order.
+    responses: Mutex<std::collections::VecDeque<Result<FetchResponse>>>,
     /// Number of calls made.
     calls: AtomicUsize,
     /// The request of the last call.
@@ -32,8 +32,13 @@ pub(crate) struct StubFetcher {
 impl StubFetcher {
     /// Builds a stub answer with `response` once.
     pub(crate) fn new(response: Result<FetchResponse>) -> Arc<Self> {
+        Self::sequence(vec![response])
+    }
+
+    /// Builds a stub answering its calls with `responses` in order.
+    pub(crate) fn sequence(responses: Vec<Result<FetchResponse>>) -> Arc<Self> {
         Arc::new(Self {
-            response: Mutex::new(Some(response)),
+            responses: Mutex::new(responses.into_iter().collect()),
             calls: AtomicUsize::new(0),
             last_request: Mutex::new(None),
         })
@@ -65,10 +70,11 @@ impl HttpFetcher for StubFetcher {
     async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.last_request.lock() = Some(request);
-        self.response
-            .lock()
-            .take()
-            .unwrap_or_else(|| Err(Error::tool("stub fetcher called twice")))
+        self.responses.lock().pop_front().unwrap_or_else(|| {
+            Err(Error::tool(
+                "stub fetcher was called more times than it has responses",
+            ))
+        })
     }
 }
 

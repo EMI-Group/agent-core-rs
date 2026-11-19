@@ -52,7 +52,7 @@ pub const MIN_MAX_CHARS: usize = 500;
 /// Default cap of the raw response body, in bytes (Python `_FETCH_WEBPAGE_DEFAULT_MAX_BYTES`).
 pub const DEFAULT_MAX_BYTES: usize = 8_000_000;
 
-/// Number of redirects [`ReqwestFetcher`] follows before giving up.
+/// Number of redirect hops `fetch_webpage` follows before giving up.
 pub const REDIRECT_LIMIT: usize = 10;
 
 /// The `User-Agent` sent by [`ReqwestFetcher`] (Python `_USER_AGENT`).
@@ -108,8 +108,9 @@ impl FetchResponse {
 /// The injected HTTP seam of `fetch_webpage`.
 ///
 /// Implementations must return the transport-level response even for an error status (the tool
-/// renders 4xx/5xx as payload failures) and must never read more than
-/// [`FetchRequest::max_bytes`].
+/// renders 4xx/5xx as payload failures), must never read more than
+/// [`FetchRequest::max_bytes`], and must never follow a redirect: the tool resolves hops itself
+/// so that the network guard runs on every one of them.
 #[async_trait]
 pub trait HttpFetcher: Send + Sync {
     /// Performs one GET request.
@@ -131,7 +132,10 @@ pub struct ReqwestFetcher {
 }
 
 impl ReqwestFetcher {
-    /// Builds a fetcher with [`DEFAULT_USER_AGENT`] and a [`REDIRECT_LIMIT`] redirect cap.
+    /// Builds a fetcher with [`DEFAULT_USER_AGENT`].
+    ///
+    /// Redirects are never followed here: [`FetchWebpageTool`] follows them hop by hop so the
+    /// network guard inspects every target.
     #[must_use]
     pub fn new() -> Self {
         Self::with_user_agent(DEFAULT_USER_AGENT)
@@ -142,7 +146,7 @@ impl ReqwestFetcher {
     pub fn with_user_agent(user_agent: impl Into<String>) -> Self {
         let client = reqwest::Client::builder()
             .user_agent(user_agent.into())
-            .redirect(reqwest::redirect::Policy::limited(REDIRECT_LIMIT))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| error.to_string());
         Self { client }
@@ -311,17 +315,96 @@ impl FetchWebpageTool {
         let Some(fetcher) = self.fetcher.as_ref() else {
             return ToolPayload::fail("http fetcher is not configured");
         };
-        let request = FetchRequest {
-            url: url.clone(),
-            timeout: Duration::from_secs(resolve_timeout_seconds(args.timeout_seconds)),
-            max_bytes: resolve_max_bytes(args.max_bytes),
-            headers: default_headers(),
-        };
-        match fetcher.fetch(request).await {
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(resolve_timeout_seconds(args.timeout_seconds));
+        match self
+            .fetch_following_redirects(fetcher, &url, deadline, resolve_max_bytes(args.max_bytes))
+            .await
+        {
             Ok(response) => render_response(&url, &response, &args),
-            Err(error) => ToolPayload::fail(format!("failed to fetch webpage: {error}")),
+            Err(message) => ToolPayload::fail(message),
         }
     }
+
+    /// Fetches `url`, following redirects hop by hop.
+    ///
+    /// The [`HttpFetcher`] never follows a redirect itself, so every hop is resolved here and
+    /// passes through the same [`ToolEnv::deny_reason`] network guard as the initial URL: a
+    /// public URL that redirects to a denied host (a loopback or link-local address, say) is
+    /// refused before the request to it is made. At most [`REDIRECT_LIMIT`] hops are followed,
+    /// and the whole chain shares one deadline.
+    async fn fetch_following_redirects(
+        &self,
+        fetcher: &Arc<dyn HttpFetcher>,
+        url: &str,
+        deadline: tokio::time::Instant,
+        max_bytes: usize,
+    ) -> std::result::Result<FetchResponse, String> {
+        let mut current = url.to_owned();
+        for _hop in 0..=REDIRECT_LIMIT {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "failed to fetch webpage: timeout: the request deadline expired before {current}"
+                ));
+            }
+            let request = FetchRequest {
+                url: current.clone(),
+                timeout: remaining,
+                max_bytes,
+                headers: default_headers(),
+            };
+            let response = fetcher
+                .fetch(request)
+                .await
+                .map_err(|error| format!("failed to fetch webpage: {error}"))?;
+            let Some(location) = redirect_target(&response) else {
+                return Ok(response);
+            };
+            let next = redirect_url(&current, location)?;
+            let host = url_host(&next).to_owned();
+            if let Some(reason) = self.env.deny_reason(TOOL_NAME, &json!({ "url": next })) {
+                return Err(format!(
+                    "refusing to follow a redirect to '{host}': {reason}"
+                ));
+            }
+            current = next;
+        }
+        Err(format!(
+            "too many redirects (more than {REDIRECT_LIMIT}) fetching {url}"
+        ))
+    }
+}
+
+/// The `Location` of a redirect response, if `response` is one.
+fn redirect_target(response: &FetchResponse) -> Option<&str> {
+    if !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    response
+        .header("location")
+        .map(str::trim)
+        .filter(|location| !location.is_empty())
+}
+
+/// Resolves the `Location` of a redirect against the URL that produced it.
+///
+/// # Errors
+///
+/// Returns a failure payload when the location cannot be resolved into an absolute http(s) URL.
+fn redirect_url(current: &str, location: &str) -> std::result::Result<String, String> {
+    let resolved = html::normalize_url(current, location).ok_or_else(|| {
+        format!("redirect from '{current}' has an unusable Location '{location}'")
+    })?;
+    request_url(&resolved)
+        .map_err(|message| format!("redirect from '{current}' is unusable: {message}"))
+}
+
+/// The authority (`host[:port]`) of an absolute URL.
+fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    authority.rsplit('@').next().unwrap_or(authority)
 }
 
 /// Turns a fetched response into the tool payload.
@@ -890,10 +973,9 @@ mod tests {
         assert_eq!(payload["data"]["caption"], json!("fig 1"));
         let request = fetcher.last_request().unwrap();
         assert_eq!(request.url, "https://e.com/x");
-        assert_eq!(
-            request.timeout,
-            Duration::from_secs(DEFAULT_TIMEOUT_SECONDS)
-        );
+        // The redirect chain shares one deadline, so the first hop receives what is left of it.
+        assert!(request.timeout <= Duration::from_secs(DEFAULT_TIMEOUT_SECONDS));
+        assert!(request.timeout > Duration::from_secs(DEFAULT_TIMEOUT_SECONDS - 1));
         assert_eq!(request.max_bytes, DEFAULT_MAX_BYTES);
         assert!(request
             .headers
