@@ -46,6 +46,14 @@ The in-memory backend in `../../kv/` remains the behavioral reference.
 ## Known Issues and Gaps
 
 - No custom CA, no certificate pinning, no `insecure-skip-verify`, no client certificates; the platform trust store is not read either (`rustls-native-certs` is not a dependency).
+- `delete_by_prefix` re-applies `key_prefix` to keys that `SCAN` already returned prefixed (double prefix), so it deletes nothing and returns `0` in any store with a non-empty `key_prefix`.
+- `get_by_prefix` and `delete_by_prefix` interpolate the caller prefix into `SCAN MATCH` without escaping glob metacharacters, so `*`, `?`, `[`, `]` and `\` over-match in reads and over-delete in `delete_by_prefix`.
+- A failed `AUTH`/`SELECT` during reconnect leaves the fresh socket installed in `RedisConnection::stream`, so later commands skip the handshake and run unauthenticated or against db 0 instead of the configured database.
+- `DEFAULT_TIMEOUT` bounds one socket read rather than a whole reply, and the `SCAN` loop runs under the store-wide `Mutex` for up to `MAX_SCAN_PAGES` round trips, so a slow or dribbling server blocks every caller with no end-to-end deadline.
+- The codec caps nesting depth and aggregate pre-allocation but not an announced bulk length, so a `$999999999` header drives unbounded buffering.
+- A failure during `flush()` after a complete write is classified `wrote: false`, so `command` may replay a mutating command the server already received.
+- A `KvValue::Text` whose payload starts with the `\0ojb:` marker decodes back as `KvValue::Bytes`.
+- `exclusive_set` emits whole-second `EX` TTLs, so a 1–1.999 s TTL expires at 1 s.
 - No `rediss://` cluster/Sentinel topologies, no pipelining, and the reconnect retry is a single best-effort retry rather than a backoff loop.
 - `RedisConfig::tls` cannot express "cleartext even though the URL is `rediss://`", by design.
 
