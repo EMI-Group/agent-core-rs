@@ -220,9 +220,11 @@ impl ToolRegistry {
     /// host has a richer one (for example an embedding-backed store).
     #[must_use]
     pub fn with_workspace_memory(mut self) -> Self {
-        self.memory_backend = Some(Arc::new(WorkspaceMemoryBackend::new(
-            self.env.workspace().clone(),
-        )));
+        let mut backend = WorkspaceMemoryBackend::new(self.env.workspace().clone());
+        if let Some(fs) = self.fs.clone() {
+            backend = backend.with_fs_operation(fs);
+        }
+        self.memory_backend = Some(Arc::new(backend));
         self
     }
 

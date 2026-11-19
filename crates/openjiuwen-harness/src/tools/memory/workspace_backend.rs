@@ -37,16 +37,21 @@
 //!   (Python derives it from the already-truncated read).
 //!
 //! `edit` follows Python: exactly one replacement, an error when `old_text` is absent and an
-//! error when it is ambiguous. No file lock is taken (single-threaded tool calls in one session),
-//! and the write is a plain [`tokio::fs::write`].
+//! error when it is ambiguous. No file lock is taken (single-threaded tool calls in one session).
+//! Every write goes through an [`FsOperation`] seam as a temporary sibling plus a rename, so the
+//! workspace sandbox and permissions apply and a failed write leaves the previous content intact.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_memory::lite::markdown::FrontMatter;
+use openjiuwen_sysop::fs::types::WriteFileParams;
+use openjiuwen_sysop::{FsOperation, LocalWorkConfig, SysOperation};
 
 use crate::workspace::Workspace;
 
@@ -201,6 +206,16 @@ impl CodingChunk {
     }
 }
 
+/// Counter making temporary sibling names unique within the process.
+///
+/// The only mutable global in this module: two concurrent writers of one memory file must not
+/// share a temporary name, and the counter carries no state beyond uniqueness.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Message of a backend that could not obtain a filesystem seam.
+const NO_FILESYSTEM: &str =
+    "the local sys-operation backend exposes no filesystem for memory writes";
+
 /// A file-backed [`MemoryToolBackend`] over a workspace.
 ///
 /// The constructor performs no I/O: every root is derived from the workspace schema when a call
@@ -208,13 +223,45 @@ impl CodingChunk {
 pub struct WorkspaceMemoryBackend {
     /// The workspace the memory trees live in.
     workspace: Workspace,
+    /// The filesystem seam writes go through; built on first write when a host supplied none.
+    fs: OnceLock<Option<Arc<dyn FsOperation>>>,
 }
 
 impl WorkspaceMemoryBackend {
     /// Builds a backend over `workspace`.
     #[must_use]
     pub fn new(workspace: Workspace) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            fs: OnceLock::new(),
+        }
+    }
+    /// Returns this backend writing through `fs` instead of a workspace-rooted local backend.
+    ///
+    /// The seam decides where the files land and which policy applies, so a host that sandboxes
+    /// or spies on filesystem access must supply it here.
+    #[must_use]
+    pub fn with_fs_operation(mut self, fs: Arc<dyn FsOperation>) -> Self {
+        self.fs = OnceLock::from(Some(fs));
+        self
+    }
+    /// The filesystem seam, building the workspace-rooted local backend on first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::sys_op`] when the local backend cannot be initialised.
+    fn filesystem(&self) -> Result<&Arc<dyn FsOperation>> {
+        if self.fs.get().is_none() {
+            let root = self.workspace.root_path.to_string_lossy().to_string();
+            let built = SysOperation::local(LocalWorkConfig::unrestricted(root))
+                .ok()
+                .and_then(|operation| operation.fs());
+            let _ = self.fs.set(built);
+        }
+        self.fs
+            .get()
+            .and_then(Option::as_ref)
+            .ok_or_else(|| Error::sys_op(NO_FILESYSTEM))
     }
 
     /// The workspace this backend reads and writes.
@@ -320,18 +367,35 @@ impl WorkspaceMemoryBackend {
         }
     }
 
-    /// Writes `text` to `target`, creating the parent directories first.
+    /// Writes `text` to `target` atomically, through the filesystem seam.
+    ///
+    /// The text goes to a temporary sibling through [`FsOperation::write_file`] — the seam that
+    /// creates the parent directories, applies the workspace sandbox policy and can be supplied
+    /// (or spied on) by a host — and is then renamed onto the target. A rename within one
+    /// directory is atomic, so a failed or interrupted write leaves the previous content
+    /// byte-identical. The temporary name never ends in `.md`, so a memory scan cannot mistake a
+    /// half-written file for a memory document. `move_path`/`delete` live on `FsExtOperation`,
+    /// which a `dyn FsOperation` seam does not expose, so the rename runs on the already
+    /// policy-checked paths.
     async fn write_text(&self, target: &ResolvedTarget, text: &str) -> Result<()> {
-        if let Some(parent) = target.full.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| write_error(&target.rel, &error))?;
+        let fs = self.filesystem()?;
+        let temp = temp_sibling(&target.rel);
+        let temp_full = target
+            .full
+            .with_file_name(basename_of(&temp))
+            .to_path_buf();
+        let mut params = WriteFileParams::new(temp.clone(), text);
+        // Keep the file byte-identical to what the model wrote: no implicit leading newline.
+        params.prepend_newline = false;
+        fs.write_file(params).await.into_result()?;
+        if let Err(error) = tokio::fs::rename(&temp_full, &target.full).await {
+            if let Err(cleanup) = tokio::fs::remove_file(&temp_full).await {
+                tracing::debug!(%cleanup, "failed to remove a temporary memory file");
+            }
+            return Err(write_error(&target.rel, &error));
         }
-        tokio::fs::write(&target.full, text)
-            .await
-            .map_err(|error| write_error(&target.rel, &error))
+        Ok(())
     }
-
     /// The [`MemoryToolBackend::read`] body.
     async fn read_impl(
         &self,
@@ -617,6 +681,14 @@ fn read_error(rel: &str, error: &std::io::Error) -> Error {
 /// Builds the Python `write_memory` failure for an I/O error.
 fn write_error(rel: &str, error: &std::io::Error) -> Error {
     Error::tool(format!("failed to write memory file {rel}: {error}"))
+}
+/// Returns the temporary sibling an atomic write of `rel` goes through.
+///
+/// The name stays inside the same directory (so the rename is atomic) and never ends in `.md`,
+/// so a memory scan cannot mistake a half-written temporary file for a memory document.
+fn temp_sibling(rel: &str) -> String {
+    let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{rel}.tmp{}-{unique}", std::process::id())
 }
 
 /// Returns the last path segment of `path` (`os.path.basename` over `/` and `\`).
