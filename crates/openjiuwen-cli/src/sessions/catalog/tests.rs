@@ -199,8 +199,9 @@ async fn a_persistent_state_record_lists_resolves_and_prunes() {
         .summary
         .starts_with("resuming the most recent session sess-1"));
 
-    let pruned = catalog.prune(None, true, false).await.expect("prune");
-    assert_eq!(pruned.len(), 1);
+    let report = catalog.prune(None, true, false).await.expect("prune");
+    assert_eq!(report.pruned.len(), 1);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert!(catalog.list().await.expect("list after prune").is_empty());
 }
 
