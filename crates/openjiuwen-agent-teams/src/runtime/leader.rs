@@ -620,12 +620,10 @@ mod tests {
             record.timestamp, 0,
             "a broadcast needs a real stamp or no watermark can ever cover it"
         );
-        let broadcast_event = EventPayload::Broadcast(
-            crate::schema::BroadcastEvent {
-                message_id: record.message_id.clone(),
-                from_member_name: "dev-1".to_owned(),
-            },
-        )
+        let broadcast_event = EventPayload::Broadcast(crate::schema::BroadcastEvent {
+            message_id: record.message_id.clone(),
+            from_member_name: "dev-1".to_owned(),
+        })
         .to_message("dev-1")
         .unwrap();
 
@@ -683,7 +681,12 @@ mod tests {
             })
             .await
             .unwrap();
-        let mutation = agent.backend().tasks().cancel(&record.task_id).await.unwrap();
+        let mutation = agent
+            .backend()
+            .tasks()
+            .cancel(&record.task_id)
+            .await
+            .unwrap();
         agent.backend().publish_mutation(&mutation).await.unwrap();
 
         let second = time::timeout(BOUND, agent.invoke(json!("again"), None))

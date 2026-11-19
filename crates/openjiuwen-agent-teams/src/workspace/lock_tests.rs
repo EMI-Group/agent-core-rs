@@ -130,7 +130,11 @@ async fn a_stolen_lock_is_not_deleted_by_its_previous_holder() {
     let second = acquire(&path, &stealable())
         .await
         .expect("the stale lock is reclaimed");
-    assert_ne!(first.token(), second.token(), "every holder has its own token");
+    assert_ne!(
+        first.token(),
+        second.token(),
+        "every holder has its own token"
+    );
     let holder = std::fs::read_to_string(&path).unwrap();
     assert!(
         holder.contains(second.token()),
@@ -197,7 +201,9 @@ async fn the_lock_file_records_the_holder_pid_and_a_unique_token() {
         "{content}"
     );
     assert!(
-        guard.token().starts_with(&format!("{}-", std::process::id())),
+        guard
+            .token()
+            .starts_with(&format!("{}-", std::process::id())),
         "the token names the holding process: {}",
         guard.token()
     );

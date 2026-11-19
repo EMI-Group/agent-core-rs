@@ -301,8 +301,11 @@ pub async fn acquire(path: &Path, options: &LockOptions) -> Result<WorktreeLockG
                     token: token.clone(),
                     stopped: AtomicBool::new(false),
                 });
-                let heartbeat =
-                    spawn_heartbeat(path.to_path_buf(), Arc::clone(&ownership), options.stale_after);
+                let heartbeat = spawn_heartbeat(
+                    path.to_path_buf(),
+                    Arc::clone(&ownership),
+                    options.stale_after,
+                );
                 return Ok(WorktreeLockGuard {
                     path: path.to_path_buf(),
                     token,
