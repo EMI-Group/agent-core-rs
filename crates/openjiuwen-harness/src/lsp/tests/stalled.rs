@@ -43,11 +43,11 @@ async fn a_full_outgoing_queue_times_out_and_closes_the_transport() {
     let mut enqueue_overruns = 0_usize;
     for result in results {
         match result {
-            Ok(_) => {}
             Err(Error::Timeout(message)) if message.contains("could not be handed") => {
                 enqueue_overruns += 1;
             }
-            Err(Error::Timeout(_)) => {}
+            // An answer that never arrives is the same stall seen from the other side.
+            Ok(_) | Err(Error::Timeout(_)) => {}
             Err(other) => panic!("expected typed timeouts only, got {other}"),
         }
     }
@@ -95,10 +95,9 @@ async fn dropping_a_client_with_a_full_queue_still_closes_the_transport() {
 async fn assert_drained(peer: &mut tokio::io::DuplexStream) {
     let drained = tokio::time::timeout(BOUND, async {
         let mut buffer = [0_u8; 64];
-        loop {
-            match peer.read(&mut buffer).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => continue,
+        while let Ok(read) = peer.read(&mut buffer).await {
+            if read == 0 {
+                break;
             }
         }
     })
