@@ -180,3 +180,18 @@ Integration binaries in `tests/`, one line each:
 - Dreaming is a durable job queue with caller-driven orchestration, lease and retention seams rather than Python's idle scheduler; ML salience is typed `Unsupported`.
 - Team memory is a typed record store with a `MemoryRecord` projection and a lossless `TEAM_MEMORY.md` document view rather than Python's summary-file-only model.
 - `store::kv_lock` carries the lock seam because `lite::lock` already owns `lock` inside `lite`; both stay module paths, never root re-exports.
+
+## Known Issues
+
+Defects verified in non-test library code; the owning module's `CONTEXT.md` holds the detail where it exists.
+
+- `store/messages`: `derived_message_id` is `msg_{fnv64(content+role+millis)}_{millis}`, so identical content+role rows collide across scopes and inside one `add_messages` batch (one `now` for the whole batch) and the upsert re-tenants the surviving row — silent cross-scope message loss.
+- `store/messages`: `recent` orders by `timestamp` only (no id tie-break), so a tied batch returns an arbitrary subset in an order `page` never produces; `delete_for` forwards `message_filter`, whose empty `MemoryFilter` renders `{}`, so `clear_messages(&MemoryFilter::new())` deletes every tenant's rows.
+- `store`: a dry run journals `Skipped` over an existing `Failed` record, so `MigrationRun::is_success()` can report a broken migration as complete; `record_pair` splits a key on `/`, so a `user_id` containing `/` (allowed by `MemoryScope::validate`) decodes as a different scope (`./src/store/CONTEXT.md`).
+- `analyzer/prompt`: `render_conversation`/`render_conflict_input` put HISTORY/EXISTING first and truncate the tail while `max_input_chars` (8192) is also the per-turn bound, so a long history or record list drops the `CURRENT`/`incoming` payload the model must act on, with no `degraded` marker.
+- `analyzer/stage`: cancellation is checked once before the per-fact classification loop and `ConflictClassifier::classify` takes no `CallOptions`, so a cancelled pipeline keeps issuing model calls (`./src/analyzer/CONTEXT.md`).
+- `graph`: `GraphSearchOptions::max_depth`/`max_neighbors` override the validated config values, so the `max_depth <= 4` cap is bypassable per call, and `recall::expand` then issues one `GraphStore::neighbors` query per frontier node with no total-node cap and no cancellation check.
+- `engine`: `WriteLocks` keeps one `Arc<Mutex<()>>` plus two `String`s per `(user_id, scope_id)` for the engine's lifetime with no eviction, so a per-request `scope_id` grows the map without bound; `touch_hits` writes every recalled record back sequentially on each search.
+- `lite/local`: the watcher feed is an unbounded `WatchEvent` channel whose consumer runs a full `ensure_fresh` per queued burst under the state guard, and `stop_watching` aborts that reload mid-flight; `sync_now` materialises a `Vec<SessionChunk>` of every session line only to call `.len()` and rebuilds the whole FTS index on every interval tick even when nothing changed.
+- `lite/watch`: the internal `notify` event channel is unbounded and drained by a consumer that awaits a metadata lookup per path, so a fast producer on a slow filesystem grows it without bound.
+- `external`: `ProviderRegistry::select` documents that it makes the built provider the default but only calls `register`, which keeps an existing default; `lakebase` implements no `next_list_call`, so `list`/`clear` stop at the first page (default 20) (`./src/external/CONTEXT.md`).

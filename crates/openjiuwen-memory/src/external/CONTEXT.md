@@ -107,6 +107,12 @@ Per-vendor decode rules:
 - `SearchMode::Hybrid` is not validated against `ProviderCapabilities`, so a semantic-only vendor (`mem0`, `openviking`) answers a hybrid request with its semantic result instead of a typed `Unsupported`.
 - `OpenVikingSpec::add_result` and the `viking_add_resource` rail tool report success from a `2xx` without decoding it (a client-generated id, an empty `root_uri`), which is deliberate for session-message writes but loses any vendor rejection carried in a `2xx` body.
 - `openviking`'s directory listing decodes a body that carries no `result` array as an empty listing rather than a shape-drift error.
+- `lakebase`'s `list_call` asks for one `offset`/`limit` page and the spec implements no `next_list_call`, so `list` returns at most `options["limit"]` (20 by default) records and `clear`'s list-then-delete fallback deletes only that page and reports success while the rest of the collection remains, despite the spec declaring `pagination: true`.
+- `openviking`'s rail requests (`viking_*`, `prefetch`, `sync_turn`, `on_session_end`) run through `send_rail`, which uses only the first endpoint and the client directly, so they get no endpoint failover, no retry on `429`/`5xx`, and no cancellation while every record verb does.
+- `status_error` and `probe_error` insert `error_detail`'s vendor-supplied message into the error text untruncated; the documented 512-character cap applies only to the raw-body fallback (`truncate_detail`).
+- The default `add_memory` tool schema offers all seven `MemoryType` names, including `variable` and `unknown`, which `NewMemory::validate` rejects, so a model following the schema can produce a call that always fails.
+- `openviking` interpolates the session id into `/api/v1/sessions/{id}/messages` and `/api/v1/sessions/{id}/commit` without percent-encoding, so an id containing `/`, `?` or `#` addresses a different request than the one intended.
+- `ProviderRegistry::select` does not make the provider it built the default when one is already registered, contradicting the doc comment on `select` and the registry module docs.
 
 ## Deferred (not implemented here)
 

@@ -62,6 +62,12 @@ The module is async-free and performs no I/O except `PromptTemplate::load_yaml`.
   `truncate_messages` drops the oldest non-system messages until the budget fits, preserving system messages in order, and returns the dropped count.
   `TiktokenCounter` shares one `Lazy` cl100k_base BPE and falls back to the approx counter (one `tracing::warn`) if it cannot be loaded.
 
+## Known Issues
+- `truncate_messages` evicts the oldest non-system message one at a time, so it can leave a `tool` result whose assistant `tool_calls` message was removed (and a list starting with `assistant`), which provider APIs reject.
+- `truncate_messages` recomputes `count_messages` and rescans the list after every single removal, so truncating a long conversation is quadratic in message count.
+- `assembler::render` emits one `warn` per unresolved placeholder occurrence in addition to `PromptTemplate::format`'s single summary warning, so a partially formatted template logs N+1 events per render.
+- `assembler::scan` re-searches for the suffix from scratch after every rejected match, so brace-heavy template text makes placeholder scanning quadratic.
+
 ## Test Strategy
 
 - Unit tests live beside the module (`#[cfg(test)] mod tests`), one behavior per test, no network.

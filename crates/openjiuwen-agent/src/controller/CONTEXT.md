@@ -174,6 +174,16 @@ Each enforced knob and its unit; the Python-shaped knobs keep Python's defaults 
 - A stream under `stream_first_frame_timeout_ms` emits the turn's own error (an event timeout, a recognizer failure) as the single `Err` frame after the `processing` ack; only a turn that produces no frame at all is replaced by the first-frame timeout error.
 - Reasoning frames are `OutputKind::Reasoning` chunks, and `TaskRun::frames` does not produce them: the turn appends one after each run's own frames, while the background `record_outputs` prepends one before the terminal chunk (and makes it the terminal chunk when the run carries no result frames).
 
+## Known Issues
+
+- A panicking executor escapes `drive` before `finish` (no `Drop` guard on `InFlight`), so the task stays `Working` and its `in_flight` slot is never released; with `max_concurrent_tasks` set, each panic permanently consumes a slot and `ensure_completion_signal` never fires (background.rs `spawn_driver`/`drive`/`finish`).
+- A panic inside `run_loop`/`scan_once` leaves `running == true` forever, so `is_running()`/`scheduler_state()` report `Running` while nothing scans and `BaseController::start` refuses to rebuild the loop.
+- The turn's `PauseTask`/`CancelTask` intents call `set_task_status`, which writes only the store status: a task in flight on the background scheduler keeps running and its driver overwrites the status with `Completed`, so the pause/cancel reply is silently undone (`base/turn.rs::handle_intents`/`set_task_status` vs `TaskSchedulerLoop::pause_task`/`cancel_task`).
+- `invoke_turn` returns early on an event timeout (and on `save_state` failure) before `unbind_session`/`run.finish()`, and the stream first-frame timeout plus the legacy `preempt` abort drop the turn future mid-flight, so the bound `Arc<dyn Session>` stays in `Inner::sessions` and an owned `AgentRun` is never finished.
+- Driver joins (`stop`, `pause_task`, `cancel_task`, `TaskQueue::cancel_running`) have no timeout, so an executor that ignores `TaskContext::cancellation` hangs shutdown forever.
+- Tasks are never pruned from `TaskManager`: every turn's planned tasks stay in the store, and `save_state` re-serializes the whole per-session list into the session state on every turn (linear per-turn cost over a quadratic total).
+- `Inner::history` keeps one entry per session id forever (an empty `Vec` for `history_limit == 0` or a turn that recorded nothing), so the per-session map itself is unbounded.
+
 ## Test Strategy
 
 - Inline `#[cfg(test)]` modules in every file, offline and deterministic; the controller suite is 298 unit tests (50 `executors`, 46 `task_manager`, 42 `base`, 42 `legacy`, 39 `schema`, 26 `intent`, 19 `reasoner`, 9 `history`, 9 `config`, 6 `queue`, 6 `group`, 4 in `mod.rs`) and runs in a couple of seconds.
