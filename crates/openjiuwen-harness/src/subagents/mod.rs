@@ -58,7 +58,8 @@ pub use runtime::{
 };
 pub use spawner::RuntimeSubAgentSpawner;
 pub use subagent_tools::{
-    subagent_tools, subagent_tools_with_transcript, SubagentCloseTool, SubagentListTool,
+    subagent_tools, subagent_tools_with_spawner, subagent_tools_with_transcript,
+    subagent_tools_with_transcript_spawner, SubagentCloseTool, SubagentListTool,
     SubagentResumeTool, SubagentSendInputTool, SubagentSpawnTool, SubagentTranscriptTool,
     SubagentWaitTool,
 };

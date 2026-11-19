@@ -19,12 +19,29 @@ use super::transcript::{DEFAULT_TRANSCRIPT_CAPACITY, DEFAULT_TRANSCRIPT_CHANNEL_
 const DEFAULT_MAX_SUBAGENTS: usize = 10;
 /// Default concurrent-turn cap (Python `max_concurrent_running`).
 const DEFAULT_MAX_CONCURRENT_RUNNING: usize = 5;
+/// Default cumulative spawn budget of one runtime.
+///
+/// Python has no cumulative cap: its registry only bounds live instances, so a long session can
+/// spawn without limit. Three waves of the ten-instance live cap is a bounded, documented
+/// budget for the Rust runtime while still leaving ample room to reuse slots after they close.
+const DEFAULT_MAX_TOTAL_SPAWNED: usize = 32;
+/// Default live children of one spawning parent.
+///
+/// Four is below the ten-instance live cap and the five concurrent-turn cap, so one parent can
+/// fan out widely without monopolising the pool other parents (or the root session) draw from.
+const DEFAULT_MAX_CHILDREN_PER_PARENT: usize = 4;
+/// Default nesting depth of spawned instances (top-level = 1).
+///
+/// Three admits a parent, its children, and their children, while stopping unbounded recursive
+/// delegation before it can consume the spawn budget.
+const DEFAULT_MAX_DEPTH: usize = 3;
 
 /// Tunable limits of one subagent runtime (Python `SubagentRuntimeConfig`).
 ///
-/// The three `Option` fields are unlimited by default: Python only bounds the live instance
-/// count and the concurrent turns, so nesting, cumulative spawns and per-parent fan-out stay
-/// unbounded unless a caller opts in.
+/// Python only bounds the live instance count and the concurrent turns; the Rust runtime adds
+/// three additive caps ([`Self::max_total_spawned`], [`Self::max_children_per_parent`] and
+/// [`Self::max_depth`]) so a model-driven spawn loop cannot fan out forever. Their defaults
+/// are 32, 4 and 3; a caller can raise any of them with the matching `with_*` setter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct SubAgentQuota {
@@ -69,9 +86,9 @@ impl Default for SubAgentQuota {
         Self {
             max_subagents: DEFAULT_MAX_SUBAGENTS,
             max_concurrent_running: DEFAULT_MAX_CONCURRENT_RUNNING,
-            max_total_spawned: None,
-            max_children_per_parent: None,
-            max_depth: None,
+            max_total_spawned: Some(DEFAULT_MAX_TOTAL_SPAWNED),
+            max_children_per_parent: Some(DEFAULT_MAX_CHILDREN_PER_PARENT),
+            max_depth: Some(DEFAULT_MAX_DEPTH),
             enable_lru_eviction: true,
             transcript_capacity: DEFAULT_TRANSCRIPT_CAPACITY,
             transcript_channel_capacity: DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY,
@@ -336,13 +353,13 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_python() {
+    fn defaults_match_python_and_bound_fan_out() {
         let quota = SubAgentQuota::default();
         assert_eq!(quota.max_subagents, 10);
         assert_eq!(quota.max_concurrent_running, 5);
-        assert_eq!(quota.max_total_spawned, None);
-        assert_eq!(quota.max_children_per_parent, None);
-        assert_eq!(quota.max_depth, None);
+        assert_eq!(quota.max_total_spawned, Some(32));
+        assert_eq!(quota.max_children_per_parent, Some(4));
+        assert_eq!(quota.max_depth, Some(3));
         assert!(quota.enable_lru_eviction);
         assert_eq!(quota.transcript_capacity, 256);
         assert_eq!(quota.transcript_channel_capacity, 256);
@@ -445,8 +462,13 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_fields_never_fire() {
-        let quota = SubAgentQuota::default();
+    fn absent_caps_never_fire() {
+        let quota = SubAgentQuota {
+            max_total_spawned: None,
+            max_children_per_parent: None,
+            max_depth: None,
+            ..SubAgentQuota::default()
+        };
         assert!(quota
             .check_spawn(&budget(0, 10_000, 10_000, 1_000), "p")
             .is_ok());

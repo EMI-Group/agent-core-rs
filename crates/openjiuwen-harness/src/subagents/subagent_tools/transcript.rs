@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 
 use super::super::runtime::SubAgentRuntime;
 use super::super::task_tool::description_for;
+use super::super::RuntimeSubAgentSpawner;
 use super::util::{non_empty, payload_error};
 use crate::tools::{tool_card, ToolPayload};
 
@@ -70,28 +71,28 @@ impl Tool for SubagentTranscriptTool {
             Ok(after_seq) => after_seq,
             Err(message) => return Ok(ToolPayload::fail(message).to_json()),
         };
-        let Some(summary) = self.runtime.transcript_summary(&subagent_id) else {
+        let Some(summary) = self.runtime().transcript_summary(&subagent_id) else {
             return Ok(ToolPayload::fail(format!("subagent not found: {subagent_id}")).to_json());
         };
         let entries = self
-            .runtime
+            .runtime()
             .transcript_after(&subagent_id, after_seq, limit)
             .unwrap_or_default();
         let count = entries.len();
         let last_seq = entries.last().map_or(after_seq, |entry| entry.seq);
         let has_more = self
-            .runtime
+            .runtime()
             .transcript_after(&subagent_id, last_seq, 1)
             .is_some_and(|more| !more.is_empty());
         let activity = self
-            .runtime
+            .runtime()
             .get_metadata(&subagent_id)
             .map_or(Value::Null, |metadata| {
                 Value::String(metadata.activity.as_str().to_owned())
             });
         Ok(ToolPayload::ok(json!({
             "subagent_id": subagent_id,
-            "status": self.runtime.get_status(&subagent_id).as_str(),
+            "status": self.runtime().get_status(&subagent_id).as_str(),
             "activity": activity,
             "entries": entries,
             "count": count,

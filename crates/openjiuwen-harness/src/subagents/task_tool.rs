@@ -17,6 +17,7 @@ use openjiuwen_foundation::tool::{Tool, ToolCard, ToolContext};
 use serde_json::{json, Value};
 
 use super::runtime::{SubAgentRuntime, SubAgentSpawnRequest, SubagentStatus};
+use super::RuntimeSubAgentSpawner;
 use crate::tools::{tool_card, ToolPayload};
 
 /// Default delegation ceiling in seconds (Python `DEFAULT_SUBAGENT_TASK_TIMEOUT_S`).
@@ -33,8 +34,8 @@ const MAX_TIMEOUT_SECONDS: f64 = 1_000_000_000.0;
 /// Python parity: `TaskTool`. The instance is ephemeral from the tool's point of view,
 /// although the runtime keeps it alive until the parent closes it.
 pub struct TaskTool {
-    /// The runtime the delegated instance is spawned into.
-    runtime: Arc<SubAgentRuntime>,
+    /// The bounded spawner the delegated instance is started through.
+    spawner: Arc<RuntimeSubAgentSpawner>,
     /// The model-facing card built in the default language.
     card: ToolCard,
     /// How long the first turn may run before the tool reports failure.
@@ -44,16 +45,30 @@ pub struct TaskTool {
 impl TaskTool {
     /// Builds the tool over `runtime` in the default language.
     ///
-    /// The delegation ceiling is read from `TIMEOUT_ENV` on construction.
+    /// The delegation ceiling is read from `TIMEOUT_ENV` on construction. The tool creates its
+    /// own bounded spawner; mount it through [`TaskTool::with_spawner`] when the parent agent
+    /// already owns one, so every model-facing spawn shares a single concurrency ledger.
     #[must_use]
     pub fn new(runtime: Arc<SubAgentRuntime>) -> Self {
+        Self::with_spawner(Arc::new(RuntimeSubAgentSpawner::new(runtime)))
+    }
+
+    /// Builds the tool over the bounded `spawner` in the default language.
+    #[must_use]
+    pub fn with_spawner(spawner: Arc<RuntimeSubAgentSpawner>) -> Self {
         let raw = std::env::var(TIMEOUT_ENV).ok();
         let timeout = resolve_timeout(raw.as_deref());
         Self {
-            runtime,
+            spawner,
             card: Self::card_for(crate::prompts::DEFAULT_LANGUAGE),
             timeout,
         }
+    }
+
+    /// Returns the bounded spawner this tool starts instances through.
+    #[must_use]
+    pub fn spawner(&self) -> &Arc<RuntimeSubAgentSpawner> {
+        &self.spawner
     }
 
     /// Returns this tool with `timeout` as its delegation ceiling.
@@ -121,7 +136,7 @@ impl Tool for TaskTool {
                 ToolPayload::fail("'subagent_type' and 'task_description' are required").to_json(),
             );
         }
-        if !self.runtime.registry().contains(subagent_type) {
+        if !self.spawner.runtime().registry().contains(subagent_type) {
             return Ok(ToolPayload::fail(format!(
                 "Subagent type '{subagent_type}' is not available through task_tool"
             ))
@@ -141,12 +156,13 @@ impl Tool for TaskTool {
             subagent_id: resume_task_id,
             parent_subagent_id: None,
         };
-        let id = match self.runtime.spawn(request).await {
+        let id = match self.spawner.spawn_request(request).await {
             Ok(id) => id,
             Err(error) => return Ok(ToolPayload::fail(error.to_string()).to_json()),
         };
         let Some(outcome) = self
-            .runtime
+            .spawner
+            .runtime()
             .wait(std::slice::from_ref(&id), self.timeout)
             .await
             .pop()
@@ -396,6 +412,115 @@ mod tests {
         let (runtime, _factory) = echo_runtime();
         let tool = TaskTool::new(runtime).with_timeout(Duration::from_secs(3));
         assert_eq!(tool.timeout(), Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn concurrent_task_tool_calls_are_capped_by_the_spawner() {
+        use tokio::sync::Notify;
+
+        use crate::subagents::test_support::{build_runtime_with_quota, Behavior, FakeFactory};
+        use crate::subagents::{RuntimeSubAgentSpawner, SubAgentQuota};
+
+        let gate = Arc::new(Notify::new());
+        let factory = FakeFactory::new(Behavior::Blocked(Arc::clone(&gate)));
+        let runtime = build_runtime_with_quota(
+            factory,
+            SubAgentQuota::default()
+                .with_concurrent_running(2)
+                .with_total_spawned(8),
+        );
+        let spawner = Arc::new(RuntimeSubAgentSpawner::new(Arc::clone(&runtime)));
+        let tool = Arc::new(TaskTool::with_spawner(Arc::clone(&spawner)));
+
+        let first = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            async move {
+                invoke(
+                    &tool,
+                    json!({"subagent_type": "general-purpose", "task_description": "one"}),
+                )
+                .await
+            }
+        });
+        let second = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            async move {
+                invoke(
+                    &tool,
+                    json!({"subagent_type": "general-purpose", "task_description": "two"}),
+                )
+                .await
+            }
+        });
+        for _ in 0..200 {
+            if spawner.active_permits() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(spawner.active_permits(), 2, "both tasks hold a permit");
+
+        let third = invoke(
+            &tool,
+            json!({"subagent_type": "general-purpose", "task_description": "three"}),
+        )
+        .await;
+        assert_eq!(third["success"], false);
+        assert!(
+            third["error"]
+                .as_str()
+                .unwrap()
+                .contains("subagent concurrency limit reached: 2 of 2 slots in use"),
+            "unexpected error: {third}"
+        );
+        // `notify_one` leaves a permit behind when no waiter registered yet, so the two blocked
+        // turns always observe the gate exactly once.
+        gate.notify_one();
+        gate.notify_one();
+        for outcome in [first, second] {
+            let output = outcome.await.expect("the task finishes");
+            assert_eq!(output["success"], true, "unexpected payload: {output}");
+        }
+        for _ in 0..200 {
+            if spawner.active_permits() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            spawner.active_permits(),
+            0,
+            "terminal turns free their slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spawn_past_the_total_budget_is_a_typed_failure() {
+        use crate::subagents::test_support::echo_runtime_with_quota;
+        use crate::subagents::SubAgentQuota;
+
+        let (runtime, _factory) =
+            echo_runtime_with_quota(SubAgentQuota::default().with_total_spawned(1));
+        let tool = TaskTool::new(runtime);
+        let first = invoke(
+            &tool,
+            json!({"subagent_type": "general-purpose", "task_description": "one"}),
+        )
+        .await;
+        assert_eq!(first["success"], true, "unexpected payload: {first}");
+        let second = invoke(
+            &tool,
+            json!({"subagent_type": "general-purpose", "task_description": "two"}),
+        )
+        .await;
+        assert_eq!(second["success"], false);
+        assert!(
+            second["error"]
+                .as_str()
+                .unwrap()
+                .contains("subagent spawn budget exhausted: spawned=1, limit=1"),
+            "unexpected error: {second}"
+        );
     }
 
     #[test]

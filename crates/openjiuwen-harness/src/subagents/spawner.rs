@@ -34,7 +34,7 @@ use crate::rails::{
     SpawnRequest, SubAgentHandle, SubAgentSpawner, SubAgentState, SubAgentStatus as RailStatus,
 };
 
-use super::runtime::{SubAgentOutcome, SubAgentRuntime, SubAgentSpawnRequest};
+use super::runtime::{SubAgentId, SubAgentOutcome, SubAgentRuntime, SubAgentSpawnRequest};
 use super::{SubagentStatus as RuntimeStatus, GENERAL_PURPOSE_NAME};
 
 /// How often the background watcher re-checks a non-final instance.
@@ -124,10 +124,17 @@ impl RuntimeSubAgentSpawner {
         self.tokens.lock().len()
     }
 
-    /// Starts an instance and a background watcher holding its permit.
-    async fn start(&self, request: SpawnRequest) -> Result<SubAgentHandle> {
-        // Take the permit from a clone so the semaphore outlives this borrow, and fail fast:
-        // a model-facing tool must never hang on a saturated spawner.
+    /// Starts an instance through the shared concurrency ledger.
+    ///
+    /// This is the bounded spawn path every model-facing tool uses: the permit is taken with
+    /// `try_acquire_owned` before the runtime reserves a slot, so an over-limit call fails
+    /// immediately with [`Error::Validation`] instead of queueing behind a live task.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Validation`] when the concurrency limit is reached or the request is invalid,
+    /// and every runtime quota/child-construction failure unchanged.
+    pub async fn spawn_request(&self, request: SubAgentSpawnRequest) -> Result<SubAgentId> {
         let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
             return Err(Error::validation(format!(
                 "subagent concurrency limit reached: {} of {} slots in use",
@@ -135,6 +142,21 @@ impl RuntimeSubAgentSpawner {
                 self.limit
             )));
         };
+        let id = match self.runtime.spawn(request).await {
+            Ok(id) => id,
+            Err(error) => {
+                drop(permit);
+                return Err(error);
+            }
+        };
+        let token = Arc::new(CancellationToken::new());
+        self.tokens.lock().insert(id.clone(), Arc::clone(&token));
+        self.spawn_watcher(id.clone(), permit, token);
+        Ok(id)
+    }
+
+    /// Starts an instance and a background watcher holding its permit.
+    async fn start(&self, request: SpawnRequest) -> Result<SubAgentHandle> {
         let subagent_type = request
             .preset
             .clone()
@@ -148,16 +170,7 @@ impl RuntimeSubAgentSpawner {
             subagent_id: request.agent_id,
             ..SubAgentSpawnRequest::default()
         };
-        let id = match self.runtime.spawn(runtime_request).await {
-            Ok(id) => id,
-            Err(error) => {
-                drop(permit);
-                return Err(error);
-            }
-        };
-        let token = Arc::new(CancellationToken::new());
-        self.tokens.lock().insert(id.clone(), Arc::clone(&token));
-        self.spawn_watcher(id.clone(), permit, token);
+        let id = self.spawn_request(runtime_request).await?;
         Ok(SubAgentHandle::new(id, request.preset))
     }
 

@@ -579,8 +579,8 @@ fn read_request(into: &str) -> String {
     format!(
         "printf 'ARGV %s\\n' \"$*\" >> \"$FAKE_CLI_LOG\"\n\
          IFS= read -r {into}\n\
-         printf '%s\\n' \"}}\" >> \"$FAKE_CLI_LOG\"\n\
-         {into}_uuid=$(printf '%s' \"}}\" | sed -n 's/.*\"uuid\":\"\\([^\"]*\\)\".*/\\1/p')\n"
+         printf '%s\\n' \"${{{into}}}\" >> \"$FAKE_CLI_LOG\"\n\
+         {into}_uuid=$(printf '%s' \"${{{into}}}\" | sed -n 's/.*\"uuid\":\"\\([^\"]*\\)\".*/\\1/p')\n"
     )
 }
 

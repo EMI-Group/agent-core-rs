@@ -135,13 +135,13 @@ async fn unknown_or_closed_parent_is_a_validation_error() {
 }
 
 #[tokio::test]
-async fn default_quota_never_refuses_optional_limits() {
+async fn default_quota_bounds_fan_out() {
     let runtime = build_runtime(&["worker"], FakeFactory::new(Behavior::Echo));
     let quota = *runtime.quota();
     assert_eq!(quota, SubAgentQuota::default());
-    assert_eq!(quota.max_total_spawned, None);
-    assert_eq!(quota.max_children_per_parent, None);
-    assert_eq!(quota.max_depth, None);
+    assert_eq!(quota.max_total_spawned, Some(32));
+    assert_eq!(quota.max_children_per_parent, Some(4));
+    assert_eq!(quota.max_depth, Some(3));
     assert!(quota.enable_lru_eviction);
 
     let root = spawn(&runtime, "worker", "root").await;
@@ -150,6 +150,11 @@ async fn default_quota_never_refuses_optional_limits() {
     wait_one(&runtime, &grandchild).await;
     assert_eq!(runtime.get_metadata(&grandchild).unwrap().depth, 3);
     assert_eq!(runtime.spawned_total(), 3);
+    let error = runtime.spawn(split_request(&grandchild)).await.unwrap_err();
+    assert_eq!(
+        config_error(&error),
+        "subagent depth limit exceeded: depth=4, limit=3"
+    );
 }
 
 #[tokio::test]
@@ -255,7 +260,10 @@ async fn metadata_carries_depth_parent_and_last_use() {
     assert_eq!(listed["capacity"]["used"], json!(2));
     assert_eq!(listed["capacity"]["max"], json!(10));
     assert_eq!(listed["capacity"]["spawned"], json!(2));
-    assert_eq!(listed["capacity"]["max_spawned"], Value::Null);
+    assert_eq!(
+        listed["capacity"]["max_spawned"],
+        json!(runtime.quota().max_total_spawned)
+    );
     assert_eq!(listed["subagents"][1]["depth"], json!(2));
     assert_eq!(listed["subagents"][1]["parent_subagent_id"], json!(root));
 }
@@ -275,5 +283,58 @@ async fn with_limits_disables_lru_eviction_and_keeps_the_legacy_message() {
     assert_eq!(
         config_error(&error),
         "subagent capacity exceeded: used=1, limit=1"
+    );
+}
+
+#[tokio::test]
+async fn default_total_budget_refuses_the_spawn_past_it() {
+    let runtime = build_runtime(&["worker"], FakeFactory::new(Behavior::Echo));
+    let quota = *runtime.quota();
+    let limit = quota
+        .max_total_spawned
+        .expect("the default budget is bounded");
+    for index in 0..limit {
+        let id = spawn(&runtime, "worker", &format!("task {index}")).await;
+        wait_one(&runtime, &id).await;
+        runtime.close(&id).await.unwrap();
+    }
+    assert_eq!(runtime.spawned_total(), limit);
+    let error = runtime
+        .spawn(SubAgentSpawnRequest::new("worker", "one too many"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        config_error(&error),
+        format!("subagent spawn budget exhausted: spawned={limit}, limit={limit}")
+    );
+    assert_eq!(runtime.spawned_total(), limit);
+}
+
+#[tokio::test]
+async fn default_per_parent_cap_refuses_the_fifth_live_child() {
+    let runtime = build_runtime(&["worker"], FakeFactory::new(Behavior::Echo));
+    let limit = runtime
+        .quota()
+        .max_children_per_parent
+        .expect("the default per-parent cap is bounded");
+    let root = spawn(&runtime, "worker", "root").await;
+    wait_one(&runtime, &root).await;
+    for index in 0..limit {
+        let id = runtime.spawn(split_request(&root)).await.unwrap();
+        wait_one(&runtime, &id).await;
+        assert_eq!(
+            runtime
+                .get_metadata(&id)
+                .unwrap()
+                .parent_subagent_id
+                .as_deref(),
+            Some(root.as_str()),
+            "child {index} belongs to the root"
+        );
+    }
+    let error = runtime.spawn(split_request(&root)).await.unwrap_err();
+    assert_eq!(
+        config_error(&error),
+        format!("subagent child limit exceeded: parent={root}, used={limit}, limit={limit}")
     );
 }

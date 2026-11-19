@@ -204,7 +204,7 @@ impl RoundState {
 }
 
 /// Adapter between the task-loop [`RoundExecutor`] seam and one inner
-/// [`ReActAgent`].
+/// `ReActAgent`.
 ///
 /// Cloning is cheap and shares the inner agent, rails, queues, cancellation
 /// token and recorded state.

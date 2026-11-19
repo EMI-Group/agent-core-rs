@@ -720,7 +720,7 @@ fn session_store_new_session_writes_the_journal_header() {
     assert_eq!(record.model, "gpt-4o");
 
     let path = store.path_for("cli-test");
-    assert!(path.ends_with("sessions/cli-test.json"));
+    assert!(path.ends_with("sessions/cli-test.jsonl"));
     // The record is append-only JSONL: one header line carrying the Python fields, and no
     // message line yet.
     let text = std::fs::read_to_string(&path).unwrap();

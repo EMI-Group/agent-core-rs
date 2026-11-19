@@ -33,6 +33,7 @@ use util::{
 
 use super::runtime::{SubAgentRuntime, SubAgentSpawnRequest, SubagentStatus};
 use super::task_tool::description_for;
+use super::RuntimeSubAgentSpawner;
 use crate::tools::{tool_card, ToolPayload};
 
 /// Default `subagent_wait` deadline (Python `WAIT_TIMEOUT_MS_DEFAULT`), in milliseconds.
@@ -73,13 +74,23 @@ const SUBAGENT_ROW_KEYS: [&str; 11] = [
 /// Rust-only transcript reader, so this parity list stays exactly six tools.
 #[must_use]
 pub fn subagent_tools(runtime: Arc<SubAgentRuntime>) -> Vec<Arc<dyn Tool>> {
+    subagent_tools_with_spawner(Arc::new(RuntimeSubAgentSpawner::new(runtime)))
+}
+
+/// Builds the six Python parity runtime sub-agent tools over a shared bounded `spawner`.
+///
+/// Every tool reads the runtime through [`RuntimeSubAgentSpawner::runtime`], while
+/// `subagent_spawn` reserves capacity from the spawner's semaphore, so mounts that also hold a
+/// [`TaskTool`](super::TaskTool) can share one concurrency ledger.
+#[must_use]
+pub fn subagent_tools_with_spawner(spawner: Arc<RuntimeSubAgentSpawner>) -> Vec<Arc<dyn Tool>> {
     vec![
-        Arc::new(SubagentSpawnTool::new(Arc::clone(&runtime))),
-        Arc::new(SubagentWaitTool::new(Arc::clone(&runtime))),
-        Arc::new(SubagentListTool::new(Arc::clone(&runtime))),
-        Arc::new(SubagentSendInputTool::new(Arc::clone(&runtime))),
-        Arc::new(SubagentCloseTool::new(Arc::clone(&runtime))),
-        Arc::new(SubagentResumeTool::new(runtime)),
+        Arc::new(SubagentSpawnTool::with_spawner(Arc::clone(&spawner))),
+        Arc::new(SubagentWaitTool::with_spawner(Arc::clone(&spawner))),
+        Arc::new(SubagentListTool::with_spawner(Arc::clone(&spawner))),
+        Arc::new(SubagentSendInputTool::with_spawner(Arc::clone(&spawner))),
+        Arc::new(SubagentCloseTool::with_spawner(Arc::clone(&spawner))),
+        Arc::new(SubagentResumeTool::with_spawner(spawner)),
     ]
 }
 
@@ -91,14 +102,22 @@ pub fn subagent_tools(runtime: Arc<SubAgentRuntime>) -> Vec<Arc<dyn Tool>> {
 /// replacement for it.
 #[must_use]
 pub fn subagent_tools_with_transcript(runtime: Arc<SubAgentRuntime>) -> Vec<Arc<dyn Tool>> {
+    subagent_tools_with_transcript_spawner(Arc::new(RuntimeSubAgentSpawner::new(runtime)))
+}
+
+/// Builds the additive seven-tool set over a shared bounded `spawner`.
+#[must_use]
+pub fn subagent_tools_with_transcript_spawner(
+    spawner: Arc<RuntimeSubAgentSpawner>,
+) -> Vec<Arc<dyn Tool>> {
     vec![
-        Arc::new(SubagentSpawnTool::new(Arc::clone(&runtime))),
-        Arc::new(SubagentWaitTool::new(Arc::clone(&runtime))),
-        Arc::new(SubagentListTool::new(Arc::clone(&runtime))),
-        Arc::new(SubagentTranscriptTool::new(Arc::clone(&runtime))),
-        Arc::new(SubagentSendInputTool::new(Arc::clone(&runtime))),
-        Arc::new(SubagentCloseTool::new(Arc::clone(&runtime))),
-        Arc::new(SubagentResumeTool::new(runtime)),
+        Arc::new(SubagentSpawnTool::with_spawner(Arc::clone(&spawner))),
+        Arc::new(SubagentWaitTool::with_spawner(Arc::clone(&spawner))),
+        Arc::new(SubagentListTool::with_spawner(Arc::clone(&spawner))),
+        Arc::new(SubagentTranscriptTool::with_spawner(Arc::clone(&spawner))),
+        Arc::new(SubagentSendInputTool::with_spawner(Arc::clone(&spawner))),
+        Arc::new(SubagentCloseTool::with_spawner(Arc::clone(&spawner))),
+        Arc::new(SubagentResumeTool::with_spawner(spawner)),
     ]
 }
 
@@ -110,18 +129,32 @@ macro_rules! subagent_tool {
     ($(#[$meta:meta])* $tool:ident, $name:literal, $schema:expr) => {
         $(#[$meta])*
         pub struct $tool {
-            runtime: Arc<SubAgentRuntime>,
+            spawner: Arc<RuntimeSubAgentSpawner>,
             card: ToolCard,
         }
 
         impl $tool {
             /// Builds the tool over `runtime` in the default language.
+            ///
+            /// The tool creates its own bounded spawner; use [`Self::with_spawner`] to share a
+            /// parent agent's concurrency ledger.
             #[must_use]
             pub fn new(runtime: Arc<SubAgentRuntime>) -> Self {
+                Self::with_spawner(Arc::new(RuntimeSubAgentSpawner::new(runtime)))
+            }
+
+            /// Builds the tool over the bounded `spawner` in the default language.
+            #[must_use]
+            pub fn with_spawner(spawner: Arc<RuntimeSubAgentSpawner>) -> Self {
                 Self {
-                    runtime,
+                    spawner,
                     card: Self::card_for(crate::prompts::DEFAULT_LANGUAGE),
                 }
+            }
+
+            /// The runtime behind the spawner, for the tools that do not spawn.
+            fn runtime(&self) -> &Arc<SubAgentRuntime> {
+                self.spawner.runtime()
             }
 
             /// Builds the model-facing card in `language`.
@@ -196,9 +229,9 @@ impl Tool for SubagentSpawnTool {
             subagent_id: None,
             parent_subagent_id: None,
         };
-        match self.runtime.spawn(request).await {
+        match self.spawner.spawn_request(request).await {
             Ok(id) => {
-                let status = self.runtime.get_status(&id).as_str();
+                let status = self.runtime().get_status(&id).as_str();
                 Ok(ToolPayload::ok(json!({
                     "subagent_id": id,
                     "sub_session_id": id,
@@ -258,7 +291,7 @@ impl Tool for SubagentWaitTool {
             Err(message) => return Ok(ToolPayload::fail(message).to_json()),
         };
         let outcomes = self
-            .runtime
+            .runtime()
             .wait(&ids, Duration::from_millis(timeout_ms))
             .await;
         let mut statuses = Map::new();
@@ -345,7 +378,7 @@ impl Tool for SubagentListTool {
     }
 
     async fn invoke(&self, _inputs: Value, _ctx: &ToolContext) -> Result<Value> {
-        Ok(ToolPayload::ok(self.runtime.describe_list()).to_json())
+        Ok(ToolPayload::ok(self.runtime().describe_list()).to_json())
     }
 
     fn render_for_llm(&self, output: &Value) -> String {

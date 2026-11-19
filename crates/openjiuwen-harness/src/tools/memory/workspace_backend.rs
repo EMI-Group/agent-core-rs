@@ -380,10 +380,7 @@ impl WorkspaceMemoryBackend {
     async fn write_text(&self, target: &ResolvedTarget, text: &str) -> Result<()> {
         let fs = self.filesystem()?;
         let temp = temp_sibling(&target.rel);
-        let temp_full = target
-            .full
-            .with_file_name(basename_of(&temp))
-            .to_path_buf();
+        let temp_full = target.full.with_file_name(basename_of(&temp));
         let mut params = WriteFileParams::new(temp.clone(), text);
         // Keep the file byte-identical to what the model wrote: no implicit leading newline.
         params.prepend_newline = false;

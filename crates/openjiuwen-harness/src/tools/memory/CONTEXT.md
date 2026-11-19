@@ -32,6 +32,7 @@ Only the basename of a model-supplied path is used (`os.path.basename`); an abso
 Reported `path`/`full_path` are the workspace-relative path (`memory/MEMORY.md`) and the absolute path.
 
 - `read` windows the whole file by 1-based `offset` (`0` = first line) and `limit`, reporting the real `total_lines`; a missing file is `Error::not_found`.
+- Every file write goes through the injected `FsOperation` seam (`WorkspaceMemoryBackend::with_fs_operation`): the content is written to a temp sibling (`<path>.tmp<pid>-<n>`, never a `.md` name) through the seam and then renamed over the target, so a refused or failed write leaves the previous content intact and no temp sibling behind.
 - `write` creates parent directories, reports `appended`/`file_existed` (non-empty before the write) and, when `append` is set, prepends a newline unless the existing file already ends with one.
 - `edit` replaces exactly one occurrence: `old_text not found in file. Use read_memory tool to check exact content.`, `old_text appears N times in file. Be more specific.`; coding memory keeps Python's own wording (`old_text not found in file`, `old_text appears N times, please be more specific`, `old_text cannot be empty`).
 - Coding-memory `write` requires `---` front matter with `name`/`description`/`type`, `type` one of `user`/`feedback`/`project`/`reference`, and a non-empty body; it renders canonical front matter (via `openjiuwen_memory::lite::markdown::FrontMatter`) with `created_at` on creation and a fresh `updated_at`.

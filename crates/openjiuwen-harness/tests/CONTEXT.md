@@ -88,7 +88,7 @@ pub fn remaining(&self) -> usize;                                // :282
 pub fn call_count(&self) -> usize;                               // :288
 pub fn calls(&self) -> Vec<ModelCall>;                           // :294 (oldest first)
 pub fn last_call(&self) -> Option<ModelCall>;                    // :300
-pub async fn wait_for_calls(&self, count: usize);                // :308
+pub async fn wait_for_calls(&self, count: usize) -> Result<()>;  // :317
 pub async fn wait_for_calls_timeout(&self, count: usize, timeout: Duration) -> Result<()>; // :328
 ```
 

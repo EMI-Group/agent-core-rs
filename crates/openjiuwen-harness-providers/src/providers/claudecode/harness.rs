@@ -78,7 +78,8 @@
 //! onto harness observations, `lifecycle` decides the turn boundary, `failure` classifies CLI
 //! failures and `wire` builds the process invocation (argv, `--settings`, environment).
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -391,6 +392,223 @@ impl ClaudeDriver {
             }
         }
     }
+
+    /// Installs the configured skill bundles into the workspace, when there are any.
+    async fn install_skills(&self, cwd: Option<&Path>) -> HarnessResult<()> {
+        if self.config.skills.is_empty() {
+            return Ok(());
+        }
+        let sources = self.config.skills.clone();
+        let conflict = self.config.skill_conflict;
+        let project = cwd.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let installed = tokio::task::spawn_blocking(move || {
+            install_for_provider(&sources, "claudecode", Some(&project), conflict)
+        })
+        .await
+        .map_err(|error| {
+            HarnessError::protocol(format!("{LABEL} skill installation task failed: {error}"))
+        })?;
+        installed.map(|_| ()).map_err(|error| {
+            HarnessError::protocol(format!("{LABEL} skills could not be installed: {error}"))
+        })
+    }
+
+    /// Resolves the argv, environment and session facts of one CLI launch.
+    ///
+    /// Everything is computed before the process spawns, so a configuration that cannot resume
+    /// fails in `open` without leaving a child behind.
+    fn launch_plan(
+        &self,
+        context: &HarnessContext,
+        policy: PermissionPolicy,
+    ) -> HarnessResult<LaunchPlan> {
+        let session_id =
+            self.config.session_id.clone().unwrap_or_else(|| {
+                derive_session_id(&context.host_session_id, &context.agent_name)
+            });
+        // Our own checkpoints name themselves after the provider session id; older payloads carry
+        // it in `data.session_id`, which wins when both are present.
+        let normalized = context.checkpoint.as_ref().map(|checkpoint| {
+            match checkpoint_str(checkpoint, "session_id") {
+                Some(session) => HarnessCheckpoint {
+                    checkpoint_id: session,
+                    ..checkpoint.clone()
+                },
+                None => checkpoint.clone(),
+            }
+        });
+        let resume = resolve_resume_id(
+            context.resume_policy,
+            normalized.as_ref(),
+            Some(session_id.clone()),
+            "Claude Code cannot resume without a checkpoint or derived session id",
+        )?;
+        let resumed = resume.is_some();
+        let args = build_args(
+            &self.config,
+            context,
+            policy,
+            resume.as_deref(),
+            &session_id,
+        );
+        // `max_buffer_size` is the per-line stdout ceiling. A `u64` that does not fit `usize` (only
+        // possible on a 32-bit target) falls back to the transport's documented 32 MiB default
+        // instead of disabling the ceiling.
+        let max_line_bytes = usize::try_from(
+            self.config
+                .max_buffer_size
+                .unwrap_or(DEFAULT_CLAUDE_MAX_BUFFER_SIZE),
+        )
+        .unwrap_or(DEFAULT_MAX_LINE_BYTES);
+        Ok(LaunchPlan {
+            provider_session_id: resume.unwrap_or_else(|| session_id.clone()),
+            resumed,
+            args,
+            env: build_env(&self.config, context),
+            max_line_bytes,
+        })
+    }
+
+    /// Handles one step of the turn loop: a control command, a frame or an expired deadline.
+    async fn advance(
+        &self,
+        step: TurnStep,
+        turn: &TurnRequest,
+        session: &TurnContext,
+        state: &mut TurnLoop<'_, '_>,
+    ) -> HarnessResult<StepOutcome> {
+        let frame = match step {
+            TurnStep::Deadline => {
+                // A message the CLI never acknowledged stops blocking the turn; a settle here
+                // means nothing else is coming for it.
+                return Ok(if state.cycle.tracker_mut().abandon_unacknowledged() {
+                    StepOutcome::Settled
+                } else {
+                    StepOutcome::Continue
+                });
+            }
+            TurnStep::Command(Some(TurnCommand::Steer { message_id, text })) => {
+                self.submit(&mut state.cycle, state.process, &message_id, &text)
+                    .await?;
+                return Ok(StepOutcome::Continue);
+            }
+            TurnStep::Command(Some(TurnCommand::Interrupt)) => {
+                return Ok(StepOutcome::Done(Box::new(
+                    self.finish_interrupt(state.process, state.receiver).await?,
+                )));
+            }
+            TurnStep::Command(Some(TurnCommand::Close) | None) => {
+                return Ok(StepOutcome::Done(Box::new(interrupted_turn(
+                    TurnTerminationKind::HarnessStop,
+                    format!("the {LABEL} harness is stopping"),
+                ))));
+            }
+            TurnStep::Frame(frame) => frame,
+        };
+        if self.interrupt_requested.swap(false, Ordering::SeqCst) {
+            return Ok(StepOutcome::Done(Box::new(
+                self.finish_interrupt(state.process, state.receiver).await?,
+            )));
+        }
+        match frame {
+            Ok(None) => Ok(StepOutcome::Done(Box::new(failed_turn(stream_failure(
+                MISSING_RESULT_CODE,
+                "Claude Code ended the response stream without a result",
+                STREAM_ENDED_TYPE,
+                &state.process.stderr_tail(),
+            ))))),
+            Err(error) => Ok(StepOutcome::Done(Box::new(failed_turn(stream_failure(
+                TRANSPORT_CODE,
+                error.message(),
+                READ_FAILED_TYPE,
+                &state.process.stderr_tail(),
+            ))))),
+            Ok(Some(value)) => {
+                let Some(frame) = value.as_object() else {
+                    session
+                        .provider_event(&turn.turn_id, PROVIDER_EVENT_NAME, "unknown", value)
+                        .await;
+                    return Ok(StepOutcome::Continue);
+                };
+                self.dispatch(
+                    frame,
+                    &turn.turn_id,
+                    session,
+                    &mut state.accumulator,
+                    state.process,
+                )
+                .await?;
+                let settled = state.cycle.tracker_mut().note_inbound(frame);
+                Ok(if state.accumulator.has_result() && settled {
+                    StepOutcome::Settled
+                } else {
+                    StepOutcome::Continue
+                })
+            }
+        }
+    }
+
+    /// Finalizes a settled turn: reports the receipts it abandoned and returns its result.
+    async fn finish_turn(
+        &self,
+        turn: &TurnRequest,
+        session: &TurnContext,
+        mut state: TurnLoop<'_, '_>,
+    ) -> HarnessResult<TurnResult> {
+        let diagnostics = state.cycle.tracker_mut().drain_diagnostics();
+        let Some(result) = state.accumulator.terminal_result() else {
+            return Ok(failed_turn(stream_failure(
+                MISSING_RESULT_CODE,
+                "Claude Code ended the response stream without a result",
+                STREAM_ENDED_TYPE,
+                &state.process.stderr_tail(),
+            )));
+        };
+        for reported in diagnostics {
+            session
+                .diagnostic(
+                    &turn.turn_id,
+                    DiagnosticLevel::Warning,
+                    &format!("Claude Code {reported}"),
+                    JsonObject::new(),
+                )
+                .await;
+        }
+        Ok(result)
+    }
+
+    /// Publishes the checkpoint of a session that just came up, when a sink is attached.
+    async fn publish_activation_checkpoint(
+        &self,
+        context: &HarnessContext,
+        session_id: &str,
+        resumed: bool,
+    ) {
+        let Some(sink) = context.checkpoint_sink.as_ref() else {
+            return;
+        };
+        let checkpoint = self.checkpoint(session_id, resumed);
+        if let Err(error) = sink
+            .save(&checkpoint, CheckpointReason::SessionActivated, None)
+            .await
+        {
+            tracing::warn!(%error, "failed to publish the Claude Code session checkpoint");
+        }
+    }
+}
+
+/// Everything one CLI launch needs, resolved before anything spawns.
+struct LaunchPlan {
+    /// Provider session id the cycle runs under.
+    provider_session_id: String,
+    /// Whether the CLI resumes an existing session.
+    resumed: bool,
+    /// Final argv.
+    args: Vec<String>,
+    /// Configured environment entries.
+    env: BTreeMap<String, String>,
+    /// Per-line stdout ceiling.
+    max_line_bytes: usize,
 }
 
 /// Message of a turn the host interrupted.
@@ -428,6 +646,28 @@ enum TurnStep {
     Frame(HarnessResult<Option<JsonValue>>),
     /// The acknowledgement deadline of an unanswered message elapsed.
     Deadline,
+}
+
+/// What one handled turn-loop step means for the loop.
+enum StepOutcome {
+    /// Keep reading.
+    Continue,
+    /// The turn settled; [`ClaudeDriver::finish_turn`] produces its result.
+    Settled,
+    /// The turn is over with this result.
+    Done(Box<TurnResult>),
+}
+
+/// Read side of one turn, bundled so the step handler takes one borrow instead of four.
+struct TurnLoop<'a, 'b> {
+    /// Child process the turn reads and writes.
+    process: &'a mut ChildProcess,
+    /// Control channel of the turn.
+    receiver: &'a mut mpsc::UnboundedReceiver<TurnCommand>,
+    /// Receipt tracker of the turn.
+    cycle: TurnCycleGuard<'b>,
+    /// Terminal result accumulator.
+    accumulator: TurnAccumulator,
 }
 
 /// Waits for the next stdout frame, control command or acknowledgement deadline.
@@ -485,16 +725,21 @@ struct TurnCycleGuard<'a> {
 impl TurnCycleGuard<'_> {
     /// Returns the tracker of the running turn.
     fn tracker(&self) -> &TurnCycleTracker {
-        self.tracker
-            .as_ref()
-            .expect("the turn owns its cycle tracker")
+        match self.tracker.as_ref() {
+            Some(tracker) => tracker,
+            // The guard is built with its tracker and only its `Drop` impl empties it, so no
+            // accessor can ever observe an empty guard.
+            None => unreachable!("the turn owns its cycle tracker"),
+        }
     }
 
     /// Returns the tracker of the running turn, mutably.
     fn tracker_mut(&mut self) -> &mut TurnCycleTracker {
-        self.tracker
-            .as_mut()
-            .expect("the turn owns its cycle tracker")
+        match self.tracker.as_mut() {
+            Some(tracker) => tracker,
+            // See [`TurnCycleGuard::tracker`]: the guard always owns its tracker while in use.
+            None => unreachable!("the turn owns its cycle tracker"),
+        }
     }
 }
 
@@ -524,65 +769,12 @@ impl VendorDriver for ClaudeDriver {
             .cwd
             .clone()
             .or_else(|| context.cwd.as_deref().map(PathBuf::from));
-        if !self.config.skills.is_empty() {
-            let sources = self.config.skills.clone();
-            let conflict = self.config.skill_conflict;
-            let project = cwd.clone().unwrap_or_else(|| PathBuf::from("."));
-            let installed = tokio::task::spawn_blocking(move || {
-                install_for_provider(&sources, "claudecode", Some(&project), conflict)
-            })
-            .await
-            .map_err(|error| {
-                HarnessError::protocol(format!("{LABEL} skill installation task failed: {error}"))
-            })?;
-            installed.map_err(|error| {
-                HarnessError::protocol(format!("{LABEL} skills could not be installed: {error}"))
-            })?;
-        }
+        self.install_skills(cwd.as_deref()).await?;
         let policy = PermissionPolicy::from_context(context);
-        let session_id =
-            self.config.session_id.clone().unwrap_or_else(|| {
-                derive_session_id(&context.host_session_id, &context.agent_name)
-            });
-        // Our own checkpoints name themselves after the provider session id; older payloads carry
-        // it in `data.session_id`, which wins when both are present.
-        let normalized = context.checkpoint.as_ref().map(|checkpoint| {
-            match checkpoint_str(checkpoint, "session_id") {
-                Some(session) => HarnessCheckpoint {
-                    checkpoint_id: session,
-                    ..checkpoint.clone()
-                },
-                None => checkpoint.clone(),
-            }
-        });
-        let resume = resolve_resume_id(
-            context.resume_policy,
-            normalized.as_ref(),
-            Some(session_id.clone()),
-            "Claude Code cannot resume without a checkpoint or derived session id",
-        )?;
-        let resumed = resume.is_some();
-        let args = build_args(
-            &self.config,
-            context,
-            policy,
-            resume.as_deref(),
-            &session_id,
-        );
-        let provider_session_id = resume.unwrap_or_else(|| session_id.clone());
-        let env = build_env(&self.config, context);
-        // `max_buffer_size` is the per-line stdout ceiling. A `u64` that does not fit `usize` (only
-        // possible on a 32-bit target) falls back to the transport's documented 32 MiB default
-        // instead of disabling the ceiling.
-        let max_line_bytes = usize::try_from(
-            self.config
-                .max_buffer_size
-                .unwrap_or(DEFAULT_CLAUDE_MAX_BUFFER_SIZE),
-        )
-        .unwrap_or(DEFAULT_MAX_LINE_BYTES);
+        let plan = self.launch_plan(context, policy)?;
         {
             let mut state = lock(&self.state);
-            state.session_id = Some(provider_session_id.clone());
+            state.session_id = Some(plan.provider_session_id.clone());
             state.host_session_id = Some(context.host_session_id.clone());
             state.agent_id = Some(context.agent_id.clone());
             state.policy = policy;
@@ -593,26 +785,19 @@ impl VendorDriver for ClaudeDriver {
         self.interrupt_requested.store(false, Ordering::SeqCst);
         let process = ChildProcess::spawn(ChildProcessConfig {
             program: &self.binary,
-            args: &args,
+            args: &plan.args,
             cwd: cwd.as_deref(),
-            env: &env,
+            env: &plan.env,
             inherit_env: self.config.inherit_process_env,
             label: LABEL,
-            max_line_bytes,
+            max_line_bytes: plan.max_line_bytes,
         })
         .await?;
         *self.process.lock().await = Some(process);
         self.install_cycle_tracker();
-        if let Some(sink) = context.checkpoint_sink.as_ref() {
-            let checkpoint = self.checkpoint(&provider_session_id, resumed);
-            if let Err(error) = sink
-                .save(&checkpoint, CheckpointReason::SessionActivated, None)
-                .await
-            {
-                tracing::warn!(%error, "failed to publish the Claude Code session checkpoint");
-            }
-        }
-        Ok(Some(provider_session_id))
+        self.publish_activation_checkpoint(context, &plan.provider_session_id, plan.resumed)
+            .await;
+        Ok(Some(plan.provider_session_id))
     }
 
     /// Releases the child process, unblocking a running turn first.
@@ -670,96 +855,27 @@ impl VendorDriver for ClaudeDriver {
             link.sender = Some(sender);
         }
         let _link_guard = TurnLinkGuard { driver: self };
-        let mut cycle = self.begin_cycle(&turn.turn_id);
-        self.submit(&mut cycle, process, &turn.message_id, &text)
+        let mut state = TurnLoop {
+            process,
+            receiver: &mut receiver,
+            cycle: self.begin_cycle(&turn.turn_id),
+            accumulator: TurnAccumulator::default(),
+        };
+        self.submit(&mut state.cycle, state.process, &turn.message_id, &text)
             .await?;
-        let mut accumulator = TurnAccumulator::default();
         if self.interrupt_requested.swap(false, Ordering::SeqCst) {
-            return self.finish_interrupt(process, &mut receiver).await;
+            return self.finish_interrupt(state.process, state.receiver).await;
         }
         loop {
-            let deadline = cycle.tracker().straggler_timeout();
-            let outcome = next_step(process, &mut receiver, deadline).await;
-            let frame = match outcome {
-                TurnStep::Deadline => {
-                    // A message the CLI never acknowledged stops blocking the turn; a settle here
-                    // means nothing else is coming for it.
-                    if cycle.tracker_mut().abandon_unacknowledged() {
-                        break;
-                    }
-                    continue;
-                }
-                TurnStep::Command(Some(TurnCommand::Steer { message_id, text })) => {
-                    self.submit(&mut cycle, process, &message_id, &text).await?;
-                    continue;
-                }
-                TurnStep::Command(Some(TurnCommand::Interrupt)) => {
-                    return self.finish_interrupt(process, &mut receiver).await;
-                }
-                TurnStep::Command(Some(TurnCommand::Close) | None) => {
-                    return Ok(interrupted_turn(
-                        TurnTerminationKind::HarnessStop,
-                        format!("the {LABEL} harness is stopping"),
-                    ));
-                }
-                TurnStep::Frame(frame) => frame,
-            };
-            if self.interrupt_requested.swap(false, Ordering::SeqCst) {
-                return self.finish_interrupt(process, &mut receiver).await;
-            }
-            match frame {
-                Ok(None) => {
-                    return Ok(failed_turn(stream_failure(
-                        MISSING_RESULT_CODE,
-                        "Claude Code ended the response stream without a result",
-                        STREAM_ENDED_TYPE,
-                        &process.stderr_tail(),
-                    )));
-                }
-                Err(error) => {
-                    return Ok(failed_turn(stream_failure(
-                        TRANSPORT_CODE,
-                        error.message(),
-                        READ_FAILED_TYPE,
-                        &process.stderr_tail(),
-                    )));
-                }
-                Ok(Some(value)) => {
-                    let Some(frame) = value.as_object() else {
-                        session
-                            .provider_event(&turn.turn_id, PROVIDER_EVENT_NAME, "unknown", value)
-                            .await;
-                        continue;
-                    };
-                    self.dispatch(frame, &turn.turn_id, session, &mut accumulator, process)
-                        .await?;
-                    let settled = cycle.tracker_mut().note_inbound(frame);
-                    if accumulator.has_result() && settled {
-                        break;
-                    }
-                }
+            let deadline = state.cycle.tracker().straggler_timeout();
+            let step = next_step(state.process, state.receiver, deadline).await;
+            match self.advance(step, turn, session, &mut state).await? {
+                StepOutcome::Continue => {}
+                StepOutcome::Settled => break,
+                StepOutcome::Done(result) => return Ok(*result),
             }
         }
-        let diagnostics = cycle.tracker_mut().drain_diagnostics();
-        let Some(result) = accumulator.terminal_result() else {
-            return Ok(failed_turn(stream_failure(
-                MISSING_RESULT_CODE,
-                "Claude Code ended the response stream without a result",
-                STREAM_ENDED_TYPE,
-                &process.stderr_tail(),
-            )));
-        };
-        for reported in diagnostics {
-            session
-                .diagnostic(
-                    &turn.turn_id,
-                    DiagnosticLevel::Warning,
-                    &format!("Claude Code {reported}"),
-                    JsonObject::new(),
-                )
-                .await;
-        }
-        Ok(result)
+        self.finish_turn(turn, session, state).await
     }
 
     /// Writes the steered content as another user frame.
