@@ -19,7 +19,7 @@ The Context Tree (`CONTEXT.md` per crate) is the primary source of intent and AP
 - `PARITY.md` §Verification — the green outcome, the gate commands, the `default-members` caveat, the hermeticity guarantees (offline, loopback, no wall clock), the `#[ignore]` inventory and what each ignored test is for, and the suites that assert the deferred surfaces.
 - `ARCHITECTURE.md` §2 — the public seams whose signatures require updating every dependent crate when changed.
 - `ARCHITECTURE.md` §2.13 — the harness seams a host wires: `MemoryToolBackend`/`WorkspaceMemoryBackend` for the memory tools and `SubAgentSpawner`/`RuntimeSubAgentSpawner` for subagents.
-- `ARCHITECTURE.md` §5 — the complete feature-flag table, including the `default = []` crates, the empty `live-tests` gates and the dead gates.
+- `ARCHITECTURE.md` §5 — the complete feature-flag table: per-crate features, defaults and effects, the `default = []` crates, the empty marker features (`live-tests`, `openjiuwen-harness`'s `native`), the `#![cfg(feature = "…")]` suite gates and the umbrella forwarders.
 
 ## Constraints
 
