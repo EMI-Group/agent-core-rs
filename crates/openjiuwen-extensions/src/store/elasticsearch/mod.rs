@@ -67,6 +67,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
@@ -90,6 +91,11 @@ use credentials::{endpoint_without_userinfo, ElasticsearchCredentials};
 const DEFAULT_INDEX_PREFIX: &str = "agent_vector";
 /// Default vector dimension documented by the Python backend.
 const DEFAULT_DIMENSION: usize = 768;
+/// Default timeout of one HTTP request, matching the kernel's Elasticsearch
+/// document store (`openjiuwen_foundation::store::external::elasticsearch`).
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default TCP/TLS connect timeout, matching the kernel's MCP HTTP transport.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configuration for an [`ElasticsearchVectorStore`].
 ///
@@ -123,6 +129,15 @@ pub struct ElasticsearchVectorStoreConfig {
     /// Optional API key, sent when no basic-auth pair applies.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Timeout of one HTTP request; 30 seconds by default.
+    ///
+    /// The timeout covers the whole exchange (connect, send, and reading the
+    /// body), so a black-holed node fails with
+    /// [`ErrorKind::Timeout`](openjiuwen_common::error::ErrorKind::Timeout)
+    /// instead of pinning the task indefinitely.
+    pub timeout: Duration,
+    /// Timeout of opening a TCP/TLS connection; 10 seconds by default.
+    pub connect_timeout: Duration,
 }
 
 impl Default for ElasticsearchVectorStoreConfig {
@@ -134,7 +149,25 @@ impl Default for ElasticsearchVectorStoreConfig {
             username: None,
             password: None,
             api_key: None,
+            timeout: DEFAULT_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
+    }
+}
+
+impl ElasticsearchVectorStoreConfig {
+    /// Sets the timeout of one HTTP request.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Sets the timeout of opening a connection.
+    #[must_use]
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
     }
 }
 
@@ -180,6 +213,17 @@ impl ElasticsearchVectorStore {
                 "elasticsearch vector dimension must be greater than zero",
             ));
         }
+        validate_index_prefix(&config.index_prefix)?;
+        if config.timeout.is_zero() {
+            return Err(Error::validation(
+                "elasticsearch vector store request timeout must be greater than zero",
+            ));
+        }
+        if config.connect_timeout.is_zero() {
+            return Err(Error::validation(
+                "elasticsearch vector store connect timeout must be greater than zero",
+            ));
+        }
         let parsed = Url::parse(&config.url).map_err(|error| {
             Error::validation(format!(
                 "elasticsearch url `{}` is not a valid URL: {error}",
@@ -198,7 +242,18 @@ impl ElasticsearchVectorStore {
             config.password.as_deref(),
             config.api_key.as_deref(),
         );
-        let rest = RestClient::new(endpoint_without_userinfo(&parsed), credentials)?;
+        let base_url = Url::parse(&endpoint_without_userinfo(&parsed)).map_err(|error| {
+            Error::validation(format!(
+                "elasticsearch url `{}` is not a valid URL: {error}",
+                config.url
+            ))
+        })?;
+        let rest = RestClient::new(
+            base_url,
+            credentials,
+            config.timeout,
+            config.connect_timeout,
+        )?;
         Ok(Self { config, rest })
     }
 
@@ -225,9 +280,25 @@ impl ElasticsearchVectorStore {
     }
 
     /// The index name for `collection`: `"{index_prefix}__{collection}"`.
+    ///
+    /// This is a pure naming helper and does **not** validate `collection`; every
+    /// [`VectorStore`] operation goes through [`Self::checked_index_name`], which
+    /// rejects a name that could escape the index namespace.
     #[must_use]
     pub fn index_name(&self, collection: &str) -> String {
         format!("{}__{collection}", self.config.index_prefix)
+    }
+
+    /// The index name for `collection`, after validating the name.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+    /// for an empty name, a path separator, a dot segment, a NUL byte, or a
+    /// `?`/`#` delimiter.
+    fn checked_index_name(&self, collection: &str) -> Result<String> {
+        validate_collection(collection)?;
+        Ok(self.index_name(collection))
     }
 
     /// The schema of `collection`, or [`ErrorKind::NotFound`] when the index is
@@ -244,23 +315,23 @@ impl VectorStore for ElasticsearchVectorStore {
     async fn create_collection(&self, collection: &str, schema: CollectionSchema) -> Result<()> {
         schema.validate()?;
         let body = client::mapping_body(&schema, self.config.dimension)?;
-        self.rest
-            .create_index(collection, &self.index_name(collection), &body)
-            .await
+        let index = self.checked_index_name(collection)?;
+        self.rest.create_index(collection, &index, &body).await
     }
 
     async fn delete_collection(&self, collection: &str) -> Result<()> {
-        self.rest
-            .delete_index(collection, &self.index_name(collection))
-            .await
+        let index = self.checked_index_name(collection)?;
+        self.rest.delete_index(collection, &index).await
     }
 
     async fn collection_exists(&self, collection: &str) -> Result<bool> {
-        self.rest.index_exists(&self.index_name(collection)).await
+        self.rest
+            .index_exists(&self.checked_index_name(collection)?)
+            .await
     }
 
     async fn get_schema(&self, collection: &str) -> Result<Option<CollectionSchema>> {
-        let index = self.index_name(collection);
+        let index = self.checked_index_name(collection)?;
         let Some(mappings) = self.rest.mapping(&index).await? else {
             return Ok(None);
         };
@@ -279,7 +350,7 @@ impl VectorStore for ElasticsearchVectorStore {
         if prepared.is_empty() {
             return Ok(0);
         }
-        let index = self.index_name(collection);
+        let index = self.checked_index_name(collection)?;
         self.rest.bulk_index(&index, &prepared).await
     }
 
@@ -326,10 +397,8 @@ impl VectorStore for ElasticsearchVectorStore {
             );
         }
         let body = serde_json::json!({ "knn": knn, "size": top_k });
-        let hits = self
-            .rest
-            .knn_search(&self.index_name(collection), &body)
-            .await?;
+        let index = self.checked_index_name(collection)?;
+        let hits = self.rest.knn_search(&index, &body).await?;
         let primary = schema.primary_key().map(|field| field.name.clone());
         let primary_name = primary.as_deref();
         let mut results: Vec<VectorSearchResult> = hits
@@ -362,9 +431,8 @@ impl VectorStore for ElasticsearchVectorStore {
             .map(Value::String)
             .collect::<Vec<Value>>();
         let query = serde_json::json!({ "terms": { primary.name.clone(): candidates } });
-        self.rest
-            .delete_by_query(&self.index_name(collection), &query)
-            .await
+        let index = self.checked_index_name(collection)?;
+        self.rest.delete_by_query(&index, &query).await
     }
 
     async fn delete_docs_by_filters(&self, collection: &str, filters: &Value) -> Result<usize> {
@@ -372,14 +440,68 @@ impl VectorStore for ElasticsearchVectorStore {
         // like the in-memory reference.
         let _schema = self.schema_or_not_found(collection).await?;
         let query = client::translate_filter(filters)?;
-        self.rest
-            .delete_by_query(&self.index_name(collection), &query)
-            .await
+        let index = self.checked_index_name(collection)?;
+        self.rest.delete_by_query(&index, &query).await
     }
 
     async fn list_collection_names(&self) -> Result<Vec<String>> {
         self.rest.index_names(&self.config.index_prefix).await
     }
+}
+
+/// Checks that `collection` can name one index inside the configured prefix.
+///
+/// A collection name becomes a URL path segment below the endpoint, so a name
+/// carrying a path separator, a dot segment, or a query/fragment delimiter could
+/// address an index outside this store's namespace (`x/../docs` would normalise
+/// to `DELETE /docs`). The rule matches the kernel's own collection-name
+/// validation (`openjiuwen_foundation::store::document`), which is `pub(crate)`
+/// there and therefore replicated here, like the Redis and SQLite backends do.
+///
+/// # Errors
+///
+/// [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+/// naming the offending character (or the empty name).
+fn validate_collection(collection: &str) -> Result<()> {
+    let invalid = if collection.is_empty() {
+        Some("must not be empty")
+    } else if collection.contains('/') || collection.contains('\\') {
+        Some("must not contain a path separator")
+    } else if collection.contains("..") || collection == "." {
+        Some("must not be a dot segment")
+    } else if collection.contains('\0') {
+        Some("must not contain a NUL byte")
+    } else if collection.contains('?') || collection.contains('#') {
+        Some("must not contain a query or fragment delimiter")
+    } else {
+        None
+    };
+    match invalid {
+        Some(reason) => Err(Error::validation(format!(
+            "invalid vector collection name {collection:?}: {reason}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Checks that `prefix` can namespace this store's indices.
+///
+/// The prefix is concatenated with `"__"` and the collection name, so it must
+/// obey the same character rules; it is validated once, at construction.
+///
+/// # Errors
+///
+/// [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+/// when the prefix is empty or carries a path separator, a dot segment, a NUL
+/// byte, or a `?`/`#` delimiter.
+fn validate_index_prefix(prefix: &str) -> Result<()> {
+    validate_collection(prefix).map_err(|error| {
+        Error::validation(format!(
+            "invalid elasticsearch index_prefix {:?}: {}",
+            prefix,
+            error.message()
+        ))
+    })
 }
 
 /// Whether a filter matches every document and therefore need not be sent.

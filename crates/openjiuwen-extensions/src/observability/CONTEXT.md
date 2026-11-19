@@ -62,7 +62,7 @@ export-path utilities around it.
   silent: every failed export and every dropped span increments a counter and stores the reason
   in `last_error()`, so a host polls the handle's `file_exporter()` to learn that export is broken.
   The file name uses `chrono::Local`, matching Python's local-date rollover.
-- `transforming` loses no telemetry: a failing transform logs and exports the original span.
+- `transforming` loses no telemetry: a failing transform logs and exports the original span, and a transform that panics is caught with `catch_unwind` (the SDK drives `export` on its batch-processor thread, where an escaping panic would silently drop every later span) and logged with its panic message before the original span is exported.
 - Files ≤ ~1000 lines; `project_semconv.rs` is at the baseline and is a flat constant table, which
   is why it is not split further.
 - Known upstream gap: the pinned registry has no `gen_ai.client.*` metric names (Python only

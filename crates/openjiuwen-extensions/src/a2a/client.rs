@@ -37,11 +37,14 @@
 //!
 //! # Timeouts, stop-on-error, and cancellation
 //!
-//! [`A2aClientConfig::timeout`] is a per-request timeout (60 s when `None`) and
-//! is applied by the transport to the whole exchange, including reading the
-//! response body; a stream that stays open longer than the request timeout is
-//! therefore cut off by the transport. A transport timeout surfaces as
-//! [`Error::Timeout`] (`"<method> timed out after <x>s"`).
+//! [`A2aClientConfig::timeout`] is a per-request budget (60 s when `None`). A
+//! unary call ([`A2aClient::invoke`], [`A2aClient::cancel_task`]) spends it on
+//! the whole exchange, body included; a streaming call
+//! ([`A2aClient::stream`]) spends it on connecting and then as a per-chunk
+//! *idle* deadline, so a long healthy stream is never cut off while a silent
+//! peer still fails within the budget. Either budget maps onto
+//! [`Error::Timeout`] (`"<method> timed out after <x>s"`), which is what a retry
+//! policy keys on.
 //!
 //! [`A2aRemoteClient`] adds the Python `A2ARemoteClient` semantics on top: an
 //! optional caller budget per call, and `stop()` before re-raising any failure
@@ -70,7 +73,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::try_stream;
-use futures::stream::{BoxStream, StreamExt};
+use futures::stream::{BoxStream, Stream, StreamExt};
 use openjiuwen_common::error::{Error, Result};
 use reqwest::header::ACCEPT;
 use serde::Serialize;
@@ -88,6 +91,9 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The protocol binding this client speaks.
 const JSONRPC_BINDING: &str = "JSONRPC";
+
+/// The operation name the streaming timeout errors carry.
+const STREAM_OPERATION: &str = "stream";
 
 /// Settings for [`A2aClient`].
 ///
@@ -340,6 +346,40 @@ fn timeout_error(operation: &str, budget: Option<Duration>) -> Error {
     }
 }
 
+/// Reads the next chunk of a streaming response, failing when the peer goes
+/// quiet for longer than `idle`.
+///
+/// The deadline restarts on every chunk, so a stream may run for as long as the
+/// peer keeps sending while a stalled one still fails within the configured
+/// budget. A body error that the transport reports as a timeout keeps the
+/// [`Error::Timeout`] kind instead of degrading into a transport error.
+///
+/// # Errors
+///
+/// [`Error::Timeout`] when `idle` elapses with no chunk, and [`Error::Transport`]
+/// for any other body failure.
+async fn next_body_chunk<T, S>(body: &mut S, idle: Duration) -> Result<Option<T>>
+where
+    S: Stream<Item = reqwest::Result<T>> + Unpin,
+{
+    match tokio::time::timeout(idle, body.next()).await {
+        Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
+        Ok(Some(Err(error))) => Err(if error.is_timeout() {
+            timeout_error(STREAM_OPERATION, Some(idle))
+        } else {
+            Error::transport(format!("A2A stream body failed: {error}"))
+        }),
+        Ok(None) => Ok(None),
+        Err(_) => {
+            tracing::debug!(
+                idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX),
+                "the A2A stream sent nothing before its idle deadline"
+            );
+            Err(timeout_error(STREAM_OPERATION, Some(idle)))
+        }
+    }
+}
+
 /// The shared state of one [`A2aClient`], behind an [`Arc`] so `stream` can
 /// outlive the borrow of the client while keeping one request-id counter.
 #[derive(Debug)]
@@ -378,9 +418,15 @@ impl A2aClient {
         if config.rpc_url.trim().is_empty() {
             return Err(Error::config("A2A client requires a non-empty rpc_url"));
         }
-        let http = reqwest::Client::builder().build().map_err(|error| {
-            Error::config(format!("failed to build the A2A HTTP client: {error}"))
-        })?;
+        // The connect step is bounded on the client, because a streaming call
+        // keeps reading long after the headers arrive and therefore cannot carry
+        // a total request timeout.
+        let http = reqwest::Client::builder()
+            .connect_timeout(config.effective_timeout())
+            .build()
+            .map_err(|error| {
+                Error::config(format!("failed to build the A2A HTTP client: {error}"))
+            })?;
         Ok(Self {
             state: Arc::new(ClientState {
                 http,
@@ -442,12 +488,10 @@ impl A2aClient {
                 .post(method::SEND_STREAMING_MESSAGE, params, true)
                 .await?;
             ensure_success(&response, "stream")?;
+            let idle = client.state.config.effective_timeout();
             let mut body = Box::pin(response.bytes_stream());
             let mut framer = SseFramer::new();
-            while let Some(chunk) = body.next().await {
-                let chunk = chunk.map_err(|error| {
-                    Error::transport(format!("A2A stream body failed: {error}"))
-                })?;
+            while let Some(chunk) = next_body_chunk(&mut body, idle).await? {
                 for payload in framer.push(&chunk) {
                     let result = decode_frame(&payload, "stream")?;
                     yield with_session_id(result, session_id.as_deref());
@@ -516,14 +560,20 @@ impl A2aClient {
             url = %self.state.config.rpc_url,
             "sending an A2A JSON-RPC request"
         );
+        // A streaming response is read chunk by chunk long after the headers
+        // arrive, so a total request timeout would kill a healthy long stream;
+        // only the unary path is bounded as a whole. The connect step is bounded
+        // on the client itself, and the stream applies `timeout` as an idle
+        // deadline between chunks.
         let mut builder = self
             .state
             .http
             .post(&self.state.config.rpc_url)
-            .timeout(timeout)
             .json(&envelope);
         if accept_sse {
             builder = builder.header(ACCEPT, "text/event-stream");
+        } else {
+            builder = builder.timeout(timeout);
         }
         for (name, value) in &self.state.config.headers {
             let header_name =

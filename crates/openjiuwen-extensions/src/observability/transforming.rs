@@ -20,6 +20,10 @@
 //! [`SpanTransform::transform`] is therefore fallible
 //! ([`openjiuwen_common::error::Result`]) rather than panicking, and the
 //! exporter handles the error one span at a time.
+//! A transform that panics anyway is caught with [`std::panic::catch_unwind`]
+//! and logged the same way: the SDK drives `export` on its batch-processor
+//! thread, where an escaping panic would kill the processor and silently drop
+//! every later span of the process.
 use openjiuwen_common::error::Result;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::error::OTelSdkResult;
@@ -132,9 +136,16 @@ impl<E> TransformingSpanExporter<E> {
     /// The span name is logged at `debug` only, so a failing transform cannot
     /// fill the warning log with high-cardinality span names.
     fn project(&self, span: SpanData) -> SpanData {
-        match self.transform.transform(span.clone()) {
-            Ok(projected) => projected,
-            Err(error) => {
+        // The SDK calls `export` on its batch-processor thread, so a user
+        // transform that panics would take that thread down and silently drop
+        // every later span of the process. The clone is discarded when the
+        // callback unwinds, so the original is all that can be affected.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.transform.transform(span.clone())
+        }));
+        match outcome {
+            Ok(Ok(projected)) => projected,
+            Ok(Err(error)) => {
                 warn!(
                     target: TARGET,
                     exporter = std::any::type_name::<E>(),
@@ -144,9 +155,28 @@ impl<E> TransformingSpanExporter<E> {
                 debug!(target: TARGET, span = %span.name, "the span whose transform failed");
                 span
             }
+            Err(payload) => {
+                warn!(
+                    target: TARGET,
+                    exporter = std::any::type_name::<E>(),
+                    panic = %panic_message(payload.as_ref()),
+                    "span transform panicked - exporting the original span",
+                );
+                debug!(target: TARGET, span = %span.name, "the span whose transform panicked");
+                span
+            }
         }
     }
 }
+/// A human-readable message from a caught panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| String::from("<a non-string panic payload>"))
+}
+
 impl<E: fmt::Debug> fmt::Debug for TransformingSpanExporter<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TransformingSpanExporter")
@@ -391,6 +421,29 @@ mod tests {
         assert_eq!(spans[0].attributes, sample_span().attributes);
         assert_eq!(spans[1].attributes.len(), 2);
     }
+    #[test]
+    fn a_panicking_transform_is_caught_and_exports_the_original_span() {
+        // The SDK runs `export` on its batch-processor thread, so an escaping
+        // panic would kill every later export of the process.
+        let capture = CaptureExporter::new();
+        let exporter = TransformingSpanExporter::new(capture.clone(), |span: SpanData| {
+            panic!("projection exploded");
+            #[allow(unreachable_code)]
+            Ok(span)
+        });
+        let original = sample_span();
+        export_with(&exporter, vec![original.clone()]);
+        assert_eq!(only_span(&capture), original);
+
+        // A later batch proves the exporter (and its thread) is still usable.
+        export_with(&exporter, vec![original.clone()]);
+        assert_eq!(
+            capture.spans().len(),
+            2,
+            "the panic must not stop later exports"
+        );
+    }
+
     #[test]
     fn an_empty_batch_is_still_forwarded() {
         let inner = CountingExporter::default();

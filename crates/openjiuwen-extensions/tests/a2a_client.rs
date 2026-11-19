@@ -251,3 +251,130 @@ async fn remote_client_rejects_a_config_without_a_card() {
 
     assert_eq!(error.kind(), ErrorKind::Validation);
 }
+
+/// Serves the SSE `frames` on a real loopback socket, sleeping `gap` before
+/// every frame and (optionally) `stall` after the last one.
+///
+/// `wiremock` delivers a response body in one piece, so pacing needs an `axum`
+/// server that streams the frames itself.
+async fn serve_paced_stream(
+    frames: Vec<String>,
+    gap: std::time::Duration,
+    stall: Option<std::time::Duration>,
+) -> String {
+    use axum::body::Body;
+    use axum::http::{header, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+
+    let app = Router::new().route(
+        RPC_PATH,
+        post(move || async move {
+            let body = Body::from_stream(async_stream::stream! {
+                for frame in frames {
+                    tokio::time::sleep(gap).await;
+                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(frame));
+                }
+                if let Some(stall) = stall {
+                    tokio::time::sleep(stall).await;
+                }
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                body,
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("the stream server binds a loopback port");
+    let addr = listener.local_addr().expect("the listener has an address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}{RPC_PATH}")
+}
+
+/// One `data:` SSE frame carrying a completed task status.
+fn working_frame(task_id: &str) -> String {
+    let envelope = result_envelope(&TaskStatusUpdateEvent {
+        task_id: task_id.to_string(),
+        context_id: String::from("ctx-1"),
+        status: TaskStatus {
+            state: TaskState::Working,
+            ..TaskStatus::default()
+        },
+        ..TaskStatusUpdateEvent::default()
+    });
+    format!("data: {envelope}\n\n")
+}
+
+/// A healthy stream may run far longer than the request budget: `timeout` is an
+/// idle deadline between chunks, not a total budget, so pacing a stream slower
+/// than the budget must not cut it off.
+#[tokio::test]
+async fn a_slow_stream_outlives_the_request_budget() {
+    let budget = std::time::Duration::from_millis(500);
+    let frames = vec![
+        working_frame("task-1"),
+        working_frame("task-1"),
+        working_frame("task-1"),
+    ];
+    let url = serve_paced_stream(frames, std::time::Duration::from_millis(200), None).await;
+    let client =
+        A2aClient::new(A2aClientConfig::new(url).with_timeout(budget)).expect("the client builds");
+
+    let started = std::time::Instant::now();
+    let results: Vec<Result<AgentResult, _>> = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.stream(json!({ "query": "go" })).collect(),
+    )
+    .await
+    .expect("the stream finished within the test bound");
+    let elapsed = started.elapsed();
+
+    assert_eq!(results.len(), 3, "every paced frame arrives");
+    for result in &results {
+        let result = result.as_ref().expect("a healthy stream yields no error");
+        assert_eq!(result.status, AgentStatus::Working);
+    }
+    assert!(
+        elapsed > budget,
+        "the stream outlived the {budget:?} budget: {elapsed:?}"
+    );
+}
+
+/// A peer that answers the headers and then goes quiet is a timeout, so retry
+/// policies see `Error::Timeout` instead of a transport error or a hang.
+#[tokio::test]
+async fn a_stalled_stream_times_out_with_the_typed_error() {
+    let budget = std::time::Duration::from_millis(200);
+    let url = serve_paced_stream(
+        vec![working_frame("task-1")],
+        std::time::Duration::from_millis(0),
+        Some(std::time::Duration::from_secs(30)),
+    )
+    .await;
+    let client =
+        A2aClient::new(A2aClientConfig::new(url).with_timeout(budget)).expect("the client builds");
+
+    let started = std::time::Instant::now();
+    let results: Vec<Result<AgentResult, _>> = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.stream(json!({ "query": "go" })).collect(),
+    )
+    .await
+    .expect("the stalled stream ended instead of hanging");
+    let elapsed = started.elapsed();
+
+    assert_eq!(results.len(), 2, "one frame, then the failure");
+    assert!(results[0].is_ok(), "the frame that arrived is delivered");
+    let error = results[1].as_ref().expect_err("the idle peer is an error");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(error.to_string().contains("timed out"), "message {error}");
+    assert!(
+        elapsed >= budget,
+        "the idle deadline was {budget:?}, elapsed {elapsed:?}"
+    );
+}

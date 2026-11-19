@@ -41,10 +41,12 @@
 //! through unchanged (documented deviation).
 
 use std::fmt;
+use std::time::Duration;
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_core::foundation::store::{CollectionSchema, FieldSchema, Metric, VectorDataType};
 use serde_json::{json, Map, Value};
+use url::Url;
 
 use super::credentials::ElasticsearchCredentials;
 
@@ -88,10 +90,10 @@ pub(crate) struct Hit {
 /// the base URL (so a `reqwest` error message can never leak them).
 #[derive(Clone)]
 pub(crate) struct RestClient {
-    /// Shared HTTP connection pool.
+    /// Shared HTTP connection pool, carrying the configured timeouts.
     http: reqwest::Client,
     /// Endpoint without userinfo, query, fragment, or trailing slash.
-    base_url: String,
+    base_url: Url,
     /// Credentials resolved from the URL userinfo and the explicit fields.
     credentials: ElasticsearchCredentials,
 }
@@ -110,13 +112,25 @@ impl fmt::Debug for RestClient {
 
 impl RestClient {
     /// Builds a client for `base_url` (already stripped of userinfo and
-    /// trailing slash).
-    pub(crate) fn new(base_url: String, credentials: ElasticsearchCredentials) -> Result<Self> {
-        let http = reqwest::Client::builder().build().map_err(|error| {
-            Error::config(format!(
-                "elasticsearch HTTP client could not be built: {error}"
-            ))
-        })?;
+    /// trailing slash) with the configured request and connect timeouts.
+    ///
+    /// Both timeouts are set on the shared `reqwest` client, so a black-holed
+    /// node fails with [`Error::timeout`] instead of pinning the task forever.
+    pub(crate) fn new(
+        base_url: Url,
+        credentials: ElasticsearchCredentials,
+        timeout: Duration,
+        connect_timeout: Duration,
+    ) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(connect_timeout)
+            .build()
+            .map_err(|error| {
+                Error::config(format!(
+                    "elasticsearch HTTP client could not be built: {error}"
+                ))
+            })?;
         Ok(Self {
             http,
             base_url,
@@ -124,11 +138,30 @@ impl RestClient {
         })
     }
 
-    /// Starts a request to `path` (which must begin with `/`).
-    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let request = self
-            .http
-            .request(method, format!("{}{path}", self.base_url));
+    /// The absolute URL of `segments` below the endpoint, with `query` appended.
+    ///
+    /// Path segments are pushed one by one through [`Url::path_segments_mut`],
+    /// which percent-encodes each segment, so a name can never introduce a path
+    /// separator, a dot segment, or a query/fragment delimiter.
+    fn url(&self, segments: &[&str], query: Option<&str>) -> Result<Url> {
+        let mut url = self.base_url.clone();
+        {
+            let mut path = url.path_segments_mut().map_err(|()| {
+                Error::config(
+                    "elasticsearch endpoint cannot be used as a base URL for index requests",
+                )
+            })?;
+            for segment in segments {
+                path.push(segment);
+            }
+        }
+        url.set_query(query);
+        Ok(url)
+    }
+
+    /// Starts a request to `url`.
+    fn request(&self, method: reqwest::Method, url: Url) -> reqwest::RequestBuilder {
+        let request = self.http.request(method, url);
         if let Some((username, password)) = self.credentials.basic_auth() {
             request.basic_auth(username, Some(password))
         } else if let Some(api_key) = &self.credentials.api_key {
@@ -142,7 +175,7 @@ impl RestClient {
     pub(crate) async fn index_exists(&self, index: &str) -> Result<bool> {
         let operation = format!("check vector index {index:?}");
         let response = self
-            .request(reqwest::Method::HEAD, &format!("/{index}"))
+            .request(reqwest::Method::HEAD, self.url(&[index], None)?)
             .send()
             .await
             .map_err(|error| transport_error(&error, &operation))?;
@@ -165,7 +198,7 @@ impl RestClient {
     ) -> Result<()> {
         let operation = format!("create vector collection {collection:?}");
         let response = self
-            .request(reqwest::Method::PUT, &format!("/{index}"))
+            .request(reqwest::Method::PUT, self.url(&[index], None)?)
             .json(body)
             .send()
             .await
@@ -188,7 +221,7 @@ impl RestClient {
         }
         let operation = format!("delete vector collection {collection:?}");
         let response = self
-            .request(reqwest::Method::DELETE, &format!("/{index}"))
+            .request(reqwest::Method::DELETE, self.url(&[index], None)?)
             .send()
             .await
             .map_err(|error| transport_error(&error, &operation))?;
@@ -203,7 +236,7 @@ impl RestClient {
     pub(crate) async fn mapping(&self, index: &str) -> Result<Option<Value>> {
         let operation = format!("read the mapping of vector index {index:?}");
         let response = self
-            .request(reqwest::Method::GET, &format!("/{index}/_mapping"))
+            .request(reqwest::Method::GET, self.url(&[index, "_mapping"], None)?)
             .send()
             .await
             .map_err(|error| transport_error(&error, &operation))?;
@@ -251,7 +284,10 @@ impl RestClient {
         }
         let operation = format!("bulk index into vector index {index:?}");
         let response = self
-            .request(reqwest::Method::POST, "/_bulk?refresh=false")
+            .request(
+                reqwest::Method::POST,
+                self.url(&["_bulk"], Some("refresh=false"))?,
+            )
             .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
             .body(body)
             .send()
@@ -310,7 +346,7 @@ impl RestClient {
     pub(crate) async fn knn_search(&self, index: &str, body: &Value) -> Result<Vec<Hit>> {
         let operation = format!("search vector index {index:?}");
         let response = self
-            .request(reqwest::Method::POST, &format!("/{index}/_search"))
+            .request(reqwest::Method::POST, self.url(&[index, "_search"], None)?)
             .json(body)
             .send()
             .await
@@ -364,7 +400,7 @@ impl RestClient {
         let response = self
             .request(
                 reqwest::Method::POST,
-                &format!("/{index}/_delete_by_query?refresh=true"),
+                self.url(&[index, "_delete_by_query"], Some("refresh=true"))?,
             )
             .json(&json!({ "query": query }))
             .send()
@@ -400,7 +436,10 @@ impl RestClient {
         let response = self
             .request(
                 reqwest::Method::GET,
-                &format!("/_cat/indices/{pattern}?format=json&h=index"),
+                self.url(
+                    &["_cat", "indices", pattern.as_str()],
+                    Some("format=json&h=index"),
+                )?,
             )
             .send()
             .await

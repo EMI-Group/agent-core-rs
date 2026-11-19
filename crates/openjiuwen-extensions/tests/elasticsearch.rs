@@ -1448,3 +1448,127 @@ async fn document_api_key_header_comes_from_the_backend() {
         vec![expected.to_string(), expected.to_string()]
     );
 }
+
+/// A collection name is one URL path segment, so a name that could address a
+/// different index (`x/../docs` normalises to `DELETE /docs`) is a validation
+/// error on every entry point, before any request is built.
+#[tokio::test]
+async fn hostile_collection_names_never_reach_the_endpoint() {
+    let server = MockServer::start().await;
+    let store = connect(&server).await;
+    for name in [
+        "",
+        "x/../docs",
+        "/docs",
+        "docs/",
+        "a\\b",
+        "..",
+        "a..b",
+        "nul\0byte",
+        "docs?pretty",
+        "docs#frag",
+    ] {
+        let outcomes = [
+            store.create_collection(name, schema()).await.err(),
+            store.delete_collection(name).await.err(),
+            store.collection_exists(name).await.err(),
+            store.get_schema(name).await.err(),
+            store
+                .search(name, &VectorQuery::new(vec![1.0, 0.0, 0.0]))
+                .await
+                .err(),
+            store
+                .add_docs(
+                    name,
+                    vec![
+                        json!({"id": "a", "embedding": [1.0, 0.0, 0.0], "title": "A"})
+                            .as_object()
+                            .cloned()
+                            .unwrap(),
+                    ],
+                )
+                .await
+                .err(),
+        ];
+        for error in outcomes {
+            let error = error.unwrap_or_else(|| panic!("collection {name:?} was accepted"));
+            assert_eq!(error.kind(), ErrorKind::Validation, "name {name:?}");
+            assert!(
+                error.message().contains("invalid vector collection name"),
+                "name {name:?}: {error}"
+            );
+        }
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("the mock records requests")
+            .is_empty(),
+        "a rejected collection name must not send anything"
+    );
+}
+
+/// A benign name (underscores, dots, non-ASCII) stays one encoded path segment.
+#[tokio::test]
+async fn a_benign_collection_name_is_encoded_into_one_path_segment() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"acknowledged": true})))
+        .mount(&server)
+        .await;
+    let store = connect(&server).await;
+    store.create_collection("docs_v2", schema()).await.unwrap();
+    store.create_collection("notes_ü", schema()).await.unwrap();
+
+    let paths: Vec<String> = server
+        .received_requests()
+        .await
+        .expect("the mock records requests")
+        .iter()
+        .map(|request| request.url.path().to_string())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "/agent_vector__docs_v2".to_string(),
+            // `ü` is `%C3%BC`; the underscore and the dot stay literal.
+            "/agent_vector__notes_%C3%BC".to_string(),
+        ]
+    );
+}
+
+/// A node that accepts the connection and never answers must not pin the task:
+/// the configured request timeout maps onto `Error::Timeout`.
+#[tokio::test]
+async fn a_black_holed_node_yields_a_typed_timeout() {
+    let bound = std::time::Duration::from_secs(10);
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(INDEX))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let store = ElasticsearchVectorStore::connect(ElasticsearchVectorStoreConfig {
+        url: server.uri(),
+        index_prefix: "agent_vector".to_string(),
+        dimension: 3,
+        timeout: std::time::Duration::from_millis(100),
+        connect_timeout: std::time::Duration::from_secs(1),
+        ..ElasticsearchVectorStoreConfig::default()
+    })
+    .await
+    .expect("connecting performs no I/O");
+
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(bound, store.collection_exists("docs"))
+        .await
+        .expect("the request hung past the test bound")
+        .expect_err("a stalled node must not answer");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(error.message().contains("timed out"), "message {error}");
+    assert!(
+        started.elapsed() < bound,
+        "the configured request timeout was not applied"
+    );
+}

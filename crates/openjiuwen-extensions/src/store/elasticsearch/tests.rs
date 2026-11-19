@@ -449,3 +449,87 @@ fn empty_filters_are_not_sent_to_elasticsearch() {
     assert!(!super::filter_is_empty(&json!({"a": 1})));
     assert!(!super::filter_is_empty(&json!({"$and": []})));
 }
+
+#[test]
+fn default_timeouts_match_the_other_workspace_rest_clients() {
+    // 30 s request / 10 s connect, exactly like the kernel Elasticsearch
+    // document store and the MCP HTTP transport.
+    let config = ElasticsearchVectorStoreConfig::default();
+    assert_eq!(config.timeout, std::time::Duration::from_secs(30));
+    assert_eq!(config.connect_timeout, std::time::Duration::from_secs(10));
+    let configured = config
+        .clone()
+        .with_timeout(std::time::Duration::from_millis(250))
+        .with_connect_timeout(std::time::Duration::from_millis(50));
+    assert_eq!(configured.timeout, std::time::Duration::from_millis(250));
+    assert_eq!(
+        configured.connect_timeout,
+        std::time::Duration::from_millis(50)
+    );
+}
+
+#[test]
+fn zero_timeouts_are_validation_errors() {
+    for config in [
+        ElasticsearchVectorStoreConfig {
+            url: "http://localhost:9200".to_string(),
+            timeout: std::time::Duration::ZERO,
+            ..ElasticsearchVectorStoreConfig::default()
+        },
+        ElasticsearchVectorStoreConfig {
+            url: "http://localhost:9200".to_string(),
+            connect_timeout: std::time::Duration::ZERO,
+            ..ElasticsearchVectorStoreConfig::default()
+        },
+    ] {
+        let error = ElasticsearchVectorStore::new(config).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.message().contains("timeout"), "message {error}");
+    }
+}
+
+/// Collection names become one URL path segment, so anything that could address
+/// another index (or another endpoint) is rejected before a request is built.
+#[test]
+fn hostile_collection_names_and_prefixes_are_rejected() {
+    use super::{validate_collection, validate_index_prefix};
+
+    for name in [
+        "",
+        "x/../docs",
+        "/docs",
+        "docs/",
+        "a\\b",
+        "..",
+        "a..b",
+        ".",
+        "nul\0byte",
+        "docs?x=1",
+        "docs#frag",
+    ] {
+        let error = validate_collection(name).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation, "name {name:?}");
+        assert!(
+            error.message().contains("invalid vector collection name"),
+            "message {error}"
+        );
+    }
+    for name in ["docs", "docs_v2", "тест-1", "a.b", "UPPER-lower.01_x"] {
+        validate_collection(name).expect("a benign name is accepted");
+    }
+
+    for prefix in ["", "a/b", "..", "a?b", "a#b", "a\0b"] {
+        let error = validate_index_prefix(prefix).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation, "prefix {prefix:?}");
+        assert!(error.message().contains("index_prefix"), "message {error}");
+    }
+    validate_index_prefix("agent_vector").expect("the default prefix is accepted");
+    let rejected = ElasticsearchVectorStore::new(ElasticsearchVectorStoreConfig {
+        url: "http://localhost:9200".to_string(),
+        index_prefix: "x/../docs".to_string(),
+        ..ElasticsearchVectorStoreConfig::default()
+    })
+    .unwrap_err();
+    assert_eq!(rejected.kind(), ErrorKind::Validation);
+    assert!(rejected.message().contains("index_prefix"));
+}
