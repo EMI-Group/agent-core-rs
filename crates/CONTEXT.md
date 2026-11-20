@@ -97,11 +97,12 @@ Notable cross-layer edges, each justified in the consuming crate's `CONTEXT.md`:
 - `openjiuwen-runner` (layer 4) → `openjiuwen-memory` (layer 2): the runner owns the one dream-loop task so the memory crate stays spawn-free.
 - `openjiuwen-agent-teams` (layer 6) → `openjiuwen-memory` (layer 2), and optionally → `openjiuwen-extensions` (layer 5) behind its `otlp` feature for the team-memory → OTel bridge.
 - `openjiuwen-cli` (layer 7) → `openjiuwen-harness` with `notify`: the CLI's `watch` command and `chat --watch`.
-- `openjiuwen-harness-providers` (layer 6) → `openjiuwen-agent-teams` (same layer 6) behind `native-v2` is the only same-layer edge; it is off by default and enabled by nothing here.
+- `openjiuwen-harness-providers` (layer 6) → `openjiuwen-agent-teams` (same layer 6) behind `native-v2` is off by default and enabled by nothing here.
+- The other same-layer edges (all normal dependencies) are `openjiuwen-session` → `openjiuwen-foundation`, `openjiuwen-graph` → `openjiuwen-session`, `openjiuwen-multiagent` → `openjiuwen-agent`, `openjiuwen-core` → `openjiuwen-runner` and `openjiuwen-auto-harness` → `openjiuwen-rsi`.
 
 ## Constraints
 
-- A crate may depend only on crates in lower layers (see above); no cycles. `openjiuwen-runner` is driven by upper layers through their public seams only.
+- A crate may depend only on crates in lower layers or on the same-layer edges listed above; no cycles. The layer numbers are functional groupings, not a topological height: a strict `1 + max(dep layer)` over normal workspace deps yields heights 0–13 (`session` 2, `graph` 3, `workflow` 4, `agent` 5, `multiagent` 6, `runner` 7, `core` 8, layer-5 group 9, `agent-teams`/`rsi`/`agent-evolving` 10, `openjiuwen` 12, `cli`/dev crates 13). `openjiuwen-runner` is driven by upper layers through their public seams only.
 - `openjiuwen-core` and `openjiuwen` are umbrella crates; concrete crates must not depend on them except the harness layer and above.
 - Shared types belong in `openjiuwen-common` or `openjiuwen-foundation`, never duplicated across crates.
 - Crates are `publish = false` until the API stabilizes.
@@ -110,7 +111,7 @@ Notable cross-layer edges, each justified in the consuming crate's `CONTEXT.md`:
 - Request signing is hand-rolled over `sha2` in exactly three places — `openjiuwen-foundation::store::external::s3::sigv4` (AWS SigV4), `openjiuwen-security::backends::vendors::aliyun::signing` (ACS3-HMAC-SHA256) and `openjiuwen-symphony::object_artifact::http::hmac_sha256` (Azure Blob SharedKey); no workspace crate depends on the RustCrypto `hmac` crate (`hmac 0.12.1` is only a transitive lock entry via `sqlx-postgres`), and GCS service-account signing plus Azure AD client credentials remain typed `Error::Unsupported` (Azure SharedKey, SAS and anonymous access work).
 - The only real XML parser is the in-crate tolerant one at `openjiuwen-retrieval::parsing::xml` (re-exported as `parsing::parse_xml` and `openjiuwen_retrieval::parse_xml`); no XML crate (`quick-xml`, `roxmltree`, `xml-rs`, …) is a dependency or a `Cargo.lock` entry, and `openjiuwen-rsi`'s JUnit reader plus `openjiuwen-dev-tools`' tag helpers are hand-rolled scanners.
 - `openjiuwen-foundation` and `openjiuwen-retrieval` are both layer 1, so foundation cannot reuse that XML parser; upper layers reach it through the `openjiuwen_core::retrieval` umbrella alias.
-- `openjiuwen-harness` and `openjiuwen-harness-providers` are non-optional umbrella dependencies taken with default features, so their `native` default always applies.
+- `openjiuwen-harness` and `openjiuwen-harness-providers` are non-optional umbrella dependencies taken with default features, so their `native` default always applies and the umbrella's own `native` (default) forward changes nothing.
 - Capability deferrals are individually enumerated in each crate's `CONTEXT.md`; the crate-level table above is a summary, not the source of truth.
 
 ## Feature Flags
@@ -191,7 +192,7 @@ Note: nothing in the workspace enables `vendor`, so a consumer wanting vendor pr
 - `openjiuwen-examples/tests/examples_offline.rs` compiles and runs every example the enabled features select, and the `a2a` example is gated by its feature.
 - `openjiuwen-test-support` supplies the shared fakes: loopback `MockLlmServer`, `ScriptedModel`, temp-workspace/env fixtures, JSON assertions, eventual-consistency helpers.
 - Everything is offline and deterministic by default: scripted models or the loopback server, temp directories, loopback TCP/Unix sockets, no credentials, no wall-clock ordering, bounded awaits (10 s `BOUND` in `openjiuwen-e2e`).
-- The `live-tests` features (`foundation`, `harness`, `harness-providers`, `agent-teams`, `extensions`, `cli`, `openjiuwen`, `core`) are declared empty gates that no test or code path reads (only `openjiuwen-core/tests/feature_forwarding.rs` compile-checks their forwarding); suites that need an optional capability are gated by `#![cfg(feature = "…")]` (`a2a`, `otel`, `otlp`, `sqlite`, `redis`, `pulsar`, `vendor`, `native-v2`, `notify`) or by `#![cfg(unix)]`, and the single live-network test is `#[ignore]`d.
+- The `live-tests` features (`foundation`, `harness`, `harness-providers`, `agent-teams`, `extensions`, `cli`, `openjiuwen`, `core`) are declared empty gates that no test or code path reads (the `live-tests` mention in `openjiuwen-core/tests/feature_forwarding.rs` is a header comment only; that suite gates `sandbox`, `sqlite` and `otel`); suites that need an optional capability are gated by `#![cfg(feature = "…")]` (`a2a`, `otel`, `otlp`, `sqlite`, `redis`, `pulsar`, `vendor`, `native-v2`, `notify`) or by `#![cfg(unix)]`, and the single live-network test is `#[ignore]`d.
 - `cargo test --workspace` must pass offline; each crate additionally documents its own definition of done (`cargo fmt`, `cargo clippy -- -D warnings`) and verifies its feature matrixes with `--all-features`/`--no-default-features` where it declares features.
 - Deferred areas are proven, not just documented: dedicated suites assert `Error::Unsupported` and its message (`openjiuwen-dev-tools/tests/deferred_surface.rs`, `openjiuwen-symphony/tests/deferred.rs`, `openjiuwen-rsi/tests/deferred.rs`, `openjiuwen-agent-evolving/tests/rl.rs`, `openjiuwen-sysop/tests/sandbox_stub.rs`).
 - The `#[ignore]`d cases are load-bearing rather than skipped work: the e2e binary-resolution test, the runner's hermetic protocol-child helpers (re-executed by their own suites), and the sysop live-gateway probe.

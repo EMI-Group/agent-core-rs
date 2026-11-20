@@ -39,6 +39,10 @@ The Context Tree (`CONTEXT.md` per crate) is the primary source of intent and AP
 - A subsystem may be implemented while a documented seam still rejects a narrower path; record the narrower fact instead of a blanket "deferred".
 - Racy-looking counts (ignored tests, scenarios, examples) are cheap to re-measure with `cargo test --list` or an `rg` count; prefer measuring over copying.
 - A workspace-wide `cargo test --workspace` unifies features across crates, so a test that assumes an optional feature is off can pass under `-p <crate>` and fail in the workspace gate; measure both when a feature row changes.
+- `Error::Unsupported` is a tuple variant `Error::Unsupported(String)` rendered `unsupported: <msg>`, built by `Error::unsupported(impl Into<String>)` in `crates/openjiuwen-common/src/error.rs`; its `ErrorKind` is `Unsupported`.
+- Two crates funnel every deferred path through a local helper that still returns `Error::Unsupported`: `openjiuwen_symphony::error::unsupported(feature)` and `openjiuwen_rsi::deferred::not_implemented(surface, reason)`, so a bare `rg "Error::unsupported"` undercounts them.
+- `openjiuwen-harness-protocol` expresses capability limits as `HarnessError::UnsupportedCapability`, never `Error::Unsupported`.
+- A workspace `rg` for `Unsupported` also matches test fixtures and in-`src` `CONTEXT.md` prose; verify a crate's production seams through the `§Error::Unsupported surface` module list instead of trusting a hit count.
 
 ## Routing Table
 
