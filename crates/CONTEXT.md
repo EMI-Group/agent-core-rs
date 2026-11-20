@@ -199,6 +199,15 @@ Note: nothing in the workspace enables `vendor`, so a consumer wanting vendor pr
 - Module-level (`//!`) docs resolve intra-doc links in the parent module's scope, so links there usually need an explicit `crate::…` path.
 - `crates/openjiuwen-cli`'s `[[bin]] name = "openjiuwen"` sets `doc = false`: its rustdoc output name would otherwise collide with the `openjiuwen` umbrella crate's `target/doc/openjiuwen/`.
 
+## Compatibility Contract Map
+
+- LLM wire formats are built in `./openjiuwen-foundation/src/llm/{openai,anthropic,responses,dashscope}/` over the shared SSE decoder `src/llm/sse.rs`, and asserted by the wiremock suites `src/llm/<provider>/tests.rs`.
+- `*Card` JSON: `CardBase`/`Card`/`card_schema` live in `./openjiuwen-common/src/card/`; concrete cards live in foundation (`src/tool/card.rs`), agent, workflow, harness-protocol and multiagent, with round-trips in their `tests/card*.rs`/`tests/agent_card.rs`/`tests/team_card.rs`.
+- `${node.field}` parsing and resolution live in `./openjiuwen-workflow/src/reference.rs`; engine input/output projection is `src/engine/node.rs`. Covered by `tests/references.rs`.
+- Session/checkpoint persistence lives in `./openjiuwen-session/src/session_controller/store.rs` (`sessions.json`, `state.data`) and `src/checkpoint/{file,sqlite,redis}.rs`; the extensions Redis/vector adapters are in `./openjiuwen-extensions/src/checkpointer/` and `src/store/`.
+- Environment resolution is split: the generic SDK chain is `./openjiuwen-common/src/config/env.rs` (`tests/config_env.rs`), and the CLI-only chain (`OPENJIUWEN_API_BASE`/`_MODEL`/`_PROVIDER`) is `./openjiuwen-harness/src/cli/config.rs`.
+- CLI grammar is `./openjiuwen-cli/src/cli.rs`; its tests spawn the real binary via `tests/support/mod.rs`.
+
 ## Routing Table
 
 ### Kernel core (layers 0–4)
