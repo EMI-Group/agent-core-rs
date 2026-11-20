@@ -102,7 +102,7 @@ Notable cross-layer edges, each justified in the consuming crate's `CONTEXT.md`:
 
 ## Constraints
 
-- A crate may depend only on crates in lower layers (see above); no cycles. `openjiuwen-runner` is driven by upper layers through their public seams only.
+- A crate may depend only on crates in lower layers or on the same-layer edges listed above; no cycles. The layer numbers are functional groupings, not a topological height: a strict `1 + max(dep layer)` over normal workspace deps yields heights 0–13 (`session` 2, `graph` 3, `workflow` 4, `agent` 5, `multiagent` 6, `runner` 7, `core` 8, layer-5 group 9, `agent-teams`/`rsi`/`agent-evolving` 10, `openjiuwen` 12, `cli`/dev crates 13). `openjiuwen-runner` is driven by upper layers through their public seams only.
 - `openjiuwen-core` and `openjiuwen` are umbrella crates; concrete crates must not depend on them except the harness layer and above.
 - Shared types belong in `openjiuwen-common` or `openjiuwen-foundation`, never duplicated across crates.
 - Crates are `publish = false` until the API stabilizes.
