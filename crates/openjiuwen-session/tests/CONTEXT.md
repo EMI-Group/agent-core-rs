@@ -33,7 +33,9 @@ One integration test crate per concern (plus the `support/` module each file tha
 - Behavior ports name the Python test they mirror in a comment.
 - Every test compiles under `cargo test -p openjiuwen-session --offline` with default features; sqlite-only tests are feature-gated, the `otel` helper tests cover both feature states, and `--all-features` runs everything together.
 - TLS tests never depend on a public endpoint: they load `tests/fixtures/tls/ca.pem` (or `.der`) and a deliberately wrong CA, and write malformed CA files into a `tempfile` directory.
-- Pickle tests use hand-assembled byte streams (hex helpers) so the expected encodings stay readable and independent of the codec under test.
+- Pickle tests use hand-assembled byte streams (hex helpers) so the expected encodings stay readable and independent of the codec under test; no test shells out to `CPython`, so "readable by CPython" is only byte-pinned, never executed.
+- No suite opens the SQLite database directly or asserts its `session_checkpoints` DDL, columns or payload column shape; the SQLite format is covered only through the `Checkpointer` contract (`checkpoint_sqlite.rs`).
+- The SQLite suite is compiled out under default features and `make test`/`make test-all` never enable `-p openjiuwen-session --features sqlite`; it runs only via `--all-features` or an explicit `--features sqlite`.
 - `tests/fixtures/tls/` holds the static certificates (`ca`, `other-ca`, `server` in PEM and DER, the server key) with a `README.md` that documents provenance and regeneration; nothing there is secret and the certificates only cover `localhost`/`127.0.0.1`.
 
 ## Routing Table
