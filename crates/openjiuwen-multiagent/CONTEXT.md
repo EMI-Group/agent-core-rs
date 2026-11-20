@@ -489,7 +489,7 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - `tests/runtime_integration.rs` covers the runtime seams together: event emission, resource-manager fallback, member-scoped checkpoints across a resume, the outbound transport, and `AgentTool` task events.
 - `tests/handoff_events.rs` covers one `handoff_started` per hop, `handoff_completed` with `interrupted`, the `handoff` error event, and silence when the runtime was dropped.
 - `tests/api_surface.rs` pins the public contract at compile time: every crate-root re-export, inherent constructor and free-function signature, trait-object coercion (`Team`, `TeamStrategy`, `MessageHandler`, `ToolHost`, `Tool`), `Team` method reachability, the `Card` impl, serde round-trips and `schemars` property names, and the `TeamError` → `ErrorKind::External` mapping.
-- All tests are offline and deterministic: fake agents are local closures, models come from `openjiuwen-test-support::ScriptedModel`, timeouts use short durations only.
+- All tests are offline and deterministic: fake agents are local closures, models come from `openjiuwen-test-support::ScriptedModel`, timeouts use short durations only. The crate reads no environment variables at all (no `std::env` use in `src/` or `tests/`).
 
 ## Deferred Python Behavior
 
