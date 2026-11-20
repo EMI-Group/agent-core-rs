@@ -188,6 +188,7 @@ pub fn message_role_name(role: MessageRole) -> &'static str;
 - `Part.data` crosses the boundary as a structured JSON `Value`; Python's `_a2a_part_to_part` stringifies it with `str()`, so rich payloads do not round-trip there.
 - `AgentResult.status` defaults to `AgentStatus::Unknown` (Python's field defaults to `None`); `merge_results` treats `Unknown` as "unset", matching Python's `(None, UNKNOWN)` check.
 - `from_a2a` and the card adapter are lossy by design (Python parity): no interfaces/skills on the kernel card, empty `version` on the A2A card.
+- `AgentCardAdapter::to_a2a` takes no `tenant` and no caller-supplied `supported_interfaces` list, unlike Python's `to_a2a_agent_card` (which honours both); `tenant` is always left unset and exactly one interface (or none) is emitted.
 - `A2aServer::serve_in_background` is `async` (the socket must be bound before `local_addr()` is known); `A2aServerAdapter::start/stop` are `async` instead of Python's thread launcher.
 - `A2aExecutor::cancel`'s default body returns `Ok(())`; the server publishes `CANCELED` itself (same observable behavior as Python's "default: emit Canceled").
 - `A2aClient::stop` is a documented no-op (reqwest owns no persistent connection to close); it exists for Python call-sequence parity.
