@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="100%" viewBox="0 0 1080 560" role="img" aria-labelledby="fig-title fig-desc">
+  <title id="fig-title">一次 Agent 运行的数据流</title>
+  <desc id="fig-desc">Left to right flow of one agent run: entry through the openjiuwen CLI or a library call, the Runner that registers resources, routes and carries a cancellation token, the Agent ReAct loop of perceive, plan, tool call and observe, and the model and tool layer (foundation LLM client, Tool and MCP servers). Shared services sit below with dashed arrows up into the flow: Session and Checkpointer under the Runner, Context and Graph/Workflow under the Agent, harness DeepAgent spanning Agent and model, Memory and Retrieval under the Agent and model boundary, and Security under the model and tools. A right-hand lane holds observability and persistence: tracing and OTel spans, session JSON, and checkpoint backends file, sqlite and redis.</desc>
+  <style>
+    text {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    .mono {
+      font-family: "SFMono-Regular", Menlo, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+  </style>
+  <defs>
+    <marker id="flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#4B5563"/>
+    </marker>
+    <marker id="service-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8892A0"/>
+    </marker>
+  </defs>
+
+  <!-- canvas -->
+  <rect x="1" y="1" width="1078" height="558" rx="14" fill="#FFFFFF" stroke="#D0D7DE" stroke-width="1"/>
+
+  <!-- header -->
+  <text x="32" y="40" font-size="24" font-weight="700" fill="#111827">一次 Agent 运行的数据流</text>
+  <text x="32" y="64" font-size="12.5" fill="#57606A">实线为调用与数据流，虚线为共享服务注入；右侧车道汇总可观测性与持久化结果。</text>
+
+  <!-- ===== top row: numbered flow ===== -->
+  <!-- 1 entry -->
+  <rect x="32" y="84" width="180" height="132" rx="10" fill="#EEF2F7" stroke="#C8D5E3" stroke-width="1"/>
+  <circle cx="58" cy="112" r="13" fill="#4F6D8C"/>
+  <text x="58" y="116.5" text-anchor="middle" font-size="11.5" font-weight="700" fill="#FFFFFF">1</text>
+  <text x="80" y="118" font-size="15" font-weight="700" fill="#4F6D8C">入口</text>
+  <text x="50" y="144" font-size="11" fill="#57606A">openjiuwen CLI / 库调用</text>
+  <text x="50" y="172" font-size="10.5" fill="#374151">加载环境配置与模型参数</text>
+  <text x="50" y="190" font-size="10.5" fill="#374151">构建 Agent 与 Runner</text>
+  <text x="50" y="208" font-size="10.5" fill="#374151">发起 run / chat</text>
+
+  <!-- 2 runner -->
+  <rect x="238" y="84" width="190" height="132" rx="10" fill="#EAF0F8" stroke="#C3D2E6" stroke-width="1"/>
+  <circle cx="264" cy="112" r="13" fill="#33517E"/>
+  <text x="264" y="116.5" text-anchor="middle" font-size="11.5" font-weight="700" fill="#FFFFFF">2</text>
+  <text x="286" y="118" font-size="15" font-weight="700" fill="#33517E">Runner</text>
+  <text x="256" y="144" font-size="11" fill="#57606A">资源注册、路由、取消令牌</text>
+  <text x="256" y="172" font-size="10.5" fill="#374151">注册模型、工具、存储与内存</text>
+  <text x="256" y="190" font-size="10.5" fill="#374151">CancellationToken 贯穿全程</text>
+  <text x="256" y="208" font-size="10.5" fill="#374151">按会话路由并汇总结果</text>
+
+  <!-- 3 agent -->
+  <rect x="454" y="84" width="186" height="132" rx="10" fill="#FBF3E6" stroke="#E7D3AE" stroke-width="1"/>
+  <circle cx="480" cy="112" r="13" fill="#9A6B1F"/>
+  <text x="480" y="116.5" text-anchor="middle" font-size="11.5" font-weight="700" fill="#FFFFFF">3</text>
+  <text x="502" y="118" font-size="15" font-weight="700" fill="#9A6B1F">Agent</text>
+  <text x="472" y="144" font-size="11" fill="#57606A">ReAct 循环</text>
+  <text x="472" y="172" font-size="10.5" fill="#374151">感知：读取输入与上下文</text>
+  <text x="472" y="190" font-size="10.5" fill="#374151">规划：选择下一步动作</text>
+  <text x="472" y="208" font-size="10.5" fill="#374151">工具调用 → 观察 → 迭代</text>
+
+  <!-- 4 model and tools -->
+  <rect x="666" y="84" width="192" height="132" rx="10" fill="#EAF4F2" stroke="#BFDCD6" stroke-width="1"/>
+  <circle cx="692" cy="112" r="13" fill="#2F7D74"/>
+  <text x="692" y="116.5" text-anchor="middle" font-size="11.5" font-weight="700" fill="#FFFFFF">4</text>
+  <text x="714" y="118" font-size="15" font-weight="700" fill="#2F7D74">模型与工具</text>
+  <text x="684" y="144" font-size="11" fill="#57606A">foundation LLM 客户端</text>
+  <text x="684" y="172" font-size="10.5" fill="#374151">Tool 与 MCP servers</text>
+  <text x="684" y="190" font-size="10.5" fill="#374151">流式响应 / 工具调用协议</text>
+  <text x="684" y="208" font-size="10.5" fill="#374151">返回观测结果与最终答案</text>
+
+  <!-- flow arrows -->
+  <line x1="214" y1="150" x2="234" y2="150" stroke="#4B5563" stroke-width="1.8" marker-end="url(#flow-arrow)"/>
+  <text x="224" y="141" text-anchor="middle" font-size="9.5" fill="#6B7280">调用</text>
+  <line x1="430" y1="150" x2="450" y2="150" stroke="#4B5563" stroke-width="1.8" marker-end="url(#flow-arrow)"/>
+  <text x="440" y="141" text-anchor="middle" font-size="9.5" fill="#6B7280">驱动</text>
+  <line x1="642" y1="150" x2="662" y2="150" stroke="#4B5563" stroke-width="1.8" marker-end="url(#flow-arrow)"/>
+  <text x="652" y="141" text-anchor="middle" font-size="9.5" fill="#6B7280">请求</text>
+
+  <!-- flow to observability lane -->
+  <line x1="860" y1="150" x2="916" y2="150" stroke="#4B5563" stroke-width="1.6" marker-end="url(#flow-arrow)"/>
+  <text x="888" y="168" text-anchor="middle" font-size="9" fill="#6B7280">traces</text>
+
+  <!-- ===== shared services label ===== -->
+  <text x="32" y="360" font-size="12.5" font-weight="700" fill="#33517E">共享服务</text>
+  <text x="32" y="380" font-size="10" fill="#6B7280">由运行时按需调用</text>
+  <text x="32" y="396" font-size="10" fill="#6B7280">不经过入口层</text>
+
+  <!-- ===== dashed service arrows (drawn before cards) ===== -->
+  <line x1="268" y1="342" x2="318" y2="220" stroke="#8892A0" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#service-arrow)"/>
+  <line x1="380" y1="342" x2="505" y2="220" stroke="#8892A0" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#service-arrow)"/>
+  <line x1="492" y1="342" x2="560" y2="220" stroke="#8892A0" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#service-arrow)"/>
+  <line x1="604" y1="342" x2="628" y2="220" stroke="#8892A0" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#service-arrow)"/>
+  <line x1="716" y1="342" x2="660" y2="220" stroke="#8892A0" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#service-arrow)"/>
+  <line x1="828" y1="342" x2="790" y2="220" stroke="#8892A0" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#service-arrow)"/>
+
+  <!-- ===== shared service cards ===== -->
+  <!-- session -->
+  <rect x="218" y="344" width="100" height="122" rx="8" fill="#FFFFFF" stroke="#C8D5E3" stroke-width="1"/>
+  <rect x="219" y="345" width="98" height="3" rx="1.5" fill="#4F6D8C"/>
+  <text x="268" y="370" text-anchor="middle" font-size="11" font-weight="600" fill="#1F2328" class="mono">Session</text>
+  <text x="268" y="388" text-anchor="middle" font-size="10.5" fill="#1F2328" class="mono">Checkpointer</text>
+  <text x="268" y="414" text-anchor="middle" font-size="9.5" fill="#57606A">会话与检查点</text>
+  <text x="268" y="432" text-anchor="middle" font-size="9.5" fill="#57606A">可恢复</text>
+
+  <!-- context -->
+  <rect x="330" y="344" width="100" height="122" rx="8" fill="#FFFFFF" stroke="#E7D3AE" stroke-width="1"/>
+  <rect x="331" y="345" width="98" height="3" rx="1.5" fill="#9A6B1F"/>
+  <text x="380" y="370" text-anchor="middle" font-size="11" font-weight="600" fill="#1F2328" class="mono">Context</text>
+  <text x="380" y="388" text-anchor="middle" font-size="10.5" fill="#1F2328" class="mono">Engine</text>
+  <text x="380" y="414" text-anchor="middle" font-size="9.5" fill="#57606A">上下文窗口</text>
+  <text x="380" y="432" text-anchor="middle" font-size="9.5" fill="#57606A">压缩与裁剪</text>
+  <text x="380" y="450" text-anchor="middle" font-size="9.5" fill="#57606A">策略可配置</text>
+
+  <!-- graph / workflow -->
+  <rect x="442" y="344" width="100" height="122" rx="8" fill="#FFFFFF" stroke="#E7D3AE" stroke-width="1"/>
+  <rect x="443" y="345" width="98" height="3" rx="1.5" fill="#9A6B1F"/>
+  <text x="492" y="370" text-anchor="middle" font-size="11" font-weight="600" fill="#1F2328" class="mono">Graph</text>
+  <text x="492" y="388" text-anchor="middle" font-size="10.5" fill="#1F2328" class="mono">Workflow</text>
+  <text x="492" y="414" text-anchor="middle" font-size="9" fill="#57606A" class="mono">${node.field}</text>
+  <text x="492" y="432" text-anchor="middle" font-size="9.5" fill="#57606A">备选执行路径</text>
+
+  <!-- harness -->
+  <rect x="554" y="344" width="100" height="122" rx="8" fill="#FFFFFF" stroke="#E2C9DB" stroke-width="1"/>
+  <rect x="555" y="345" width="98" height="3" rx="1.5" fill="#8A4B7A"/>
+  <text x="604" y="370" text-anchor="middle" font-size="11" font-weight="600" fill="#1F2328" class="mono">harness</text>
+  <text x="604" y="388" text-anchor="middle" font-size="10.5" fill="#1F2328" class="mono">DeepAgent</text>
+  <text x="604" y="414" text-anchor="middle" font-size="9.5" fill="#57606A">文件与工作区工具</text>
+  <text x="604" y="432" text-anchor="middle" font-size="9.5" fill="#57606A">子代理编排</text>
+  <text x="604" y="450" text-anchor="middle" font-size="9.5" fill="#57606A">叠加在 ③—④</text>
+
+  <!-- memory / retrieval -->
+  <rect x="666" y="344" width="100" height="122" rx="8" fill="#FFFFFF" stroke="#CFCDE8" stroke-width="1"/>
+  <rect x="667" y="345" width="98" height="3" rx="1.5" fill="#5856A8"/>
+  <text x="716" y="370" text-anchor="middle" font-size="11" font-weight="600" fill="#1F2328" class="mono">Memory</text>
+  <text x="716" y="388" text-anchor="middle" font-size="10.5" fill="#1F2328" class="mono">Retrieval</text>
+  <text x="716" y="414" text-anchor="middle" font-size="9.5" fill="#57606A">长期记忆</text>
+  <text x="716" y="432" text-anchor="middle" font-size="9.5" fill="#57606A">向量检索</text>
+  <text x="716" y="450" text-anchor="middle" font-size="9.5" fill="#57606A">持久化状态</text>
+
+  <!-- security -->
+  <rect x="778" y="344" width="100" height="122" rx="8" fill="#FFFFFF" stroke="#CFCDE8" stroke-width="1"/>
+  <rect x="779" y="345" width="98" height="3" rx="1.5" fill="#5856A8"/>
+  <text x="828" y="370" text-anchor="middle" font-size="11" font-weight="600" fill="#1F2328" class="mono">Security</text>
+  <text x="828" y="388" text-anchor="middle" font-size="10.5" fill="#1F2328" class="mono">guardrails</text>
+  <text x="828" y="414" text-anchor="middle" font-size="9.5" fill="#57606A">输入 / 输出过滤</text>
+  <text x="828" y="432" text-anchor="middle" font-size="9.5" fill="#57606A">安全护栏策略</text>
+
+  <!-- ===== right lane: observability and persistence ===== -->
+  <rect x="920" y="84" width="136" height="380" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
+  <text x="988" y="108" text-anchor="middle" font-size="12" font-weight="700" fill="#33517E">观测与持久化</text>
+
+  <rect x="930" y="120" width="116" height="82" rx="6" fill="#FFFFFF" stroke="#D5DCE3" stroke-width="1"/>
+  <text x="988" y="142" text-anchor="middle" font-size="10.5" font-weight="600" fill="#1F2328" class="mono">tracing</text>
+  <text x="988" y="160" text-anchor="middle" font-size="10" fill="#374151">OTel spans</text>
+  <text x="988" y="178" text-anchor="middle" font-size="9.5" fill="#57606A">日志与指标</text>
+
+  <rect x="930" y="210" width="116" height="76" rx="6" fill="#FFFFFF" stroke="#D5DCE3" stroke-width="1"/>
+  <text x="988" y="232" text-anchor="middle" font-size="10" font-weight="600" fill="#1F2328" class="mono">session JSON</text>
+  <text x="988" y="250" text-anchor="middle" font-size="9.5" fill="#57606A">会话落盘</text>
+  <text x="988" y="266" text-anchor="middle" font-size="9.5" fill="#57606A">可重放</text>
+
+  <rect x="930" y="294" width="116" height="150" rx="6" fill="#FFFFFF" stroke="#D5DCE3" stroke-width="1"/>
+  <text x="988" y="316" text-anchor="middle" font-size="10.5" font-weight="600" fill="#1F2328" class="mono">checkpoint</text>
+  <text x="988" y="334" text-anchor="middle" font-size="10.5" font-weight="600" fill="#1F2328" class="mono">backends</text>
+  <text x="988" y="360" text-anchor="middle" font-size="9.5" fill="#374151" class="mono">file · sqlite</text>
+  <text x="988" y="378" text-anchor="middle" font-size="9.5" fill="#374151" class="mono">redis</text>
+  <text x="988" y="404" text-anchor="middle" font-size="9.5" fill="#57606A">可替换后端</text>
+
+  <!-- ===== legend ===== -->
+  <line x1="32" y1="522" x2="56" y2="522" stroke="#4B5563" stroke-width="1.8" marker-end="url(#flow-arrow)"/>
+  <text x="66" y="526" font-size="10.5" fill="#4B5563">实线：调用与数据流</text>
+  <line x1="196" y1="522" x2="220" y2="522" stroke="#8892A0" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#service-arrow)"/>
+  <text x="230" y="526" font-size="10.5" fill="#4B5563">虚线：共享服务注入</text>
+  <text x="440" y="526" font-size="10.5" fill="#57606A">取消令牌贯穿全链路；会话与检查点使运行可恢复。</text>
+</svg>
