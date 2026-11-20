@@ -262,7 +262,10 @@ pub fn resolve_schema(schema: &Value, source: &Value) -> Value;   // deep templa
 pub fn project(value: &Value, path: &str) -> Value;        // alias used by routers
 ```
 
-Rules: a string that is exactly `${…}` resolves to the referenced value (any JSON type); other strings are literals. Nested paths support dotted keys, `[i]`, `[-1]`, `['k']`; a numeric segment after `.` indexes arrays but falls back to a key. A missing path or a `null` root resolves to `null`; resolution never errors. When an intermediate value is an array and the next segment is a non-numeric field name, the field is projected over the elements (needed for buffered stream composition — see Design Decisions).
+Rules: a string that is exactly `${…}` resolves to the referenced value (any JSON type); other strings are literals. Nested paths support dotted keys, `[i]`, `[-1]`, `['k']` (and `["k"]`); a numeric segment after `.` indexes arrays but falls back to a key. A missing path or a `null` root resolves to `null`; resolution never errors. When an intermediate value is an array and the next segment is a non-numeric field name, the field is projected over the elements (needed for buffered stream composition — see Design Decisions).
+There is no escaping and no `${{…}}` form: a string with braces inside the delimiters (`${{a}}`, `${a}${b}`) is a literal, as is any string with text around a reference.
+`split_path` itself rejects malformed paths (unterminated/empty `[]`, bad quoted key, a bare non-integer subscript) with `Error::Validation`, but `resolve_path`/`resolve_schema`/`project` map a parse failure to `null`, so a malformed reference never fails a run.
+Engine node schemas are compiled once at graph build into the `pub(crate)` `reference::CompiledSchema` (pre-split `PathSegment`s), and `project_output` resolves them with `(node id, raw output)` plus `("output", raw)` root bindings; `resolve_schema` remains the re-parsing entry point for one-off templates.
 
 ### Conditions (`src/condition.rs`)
 
