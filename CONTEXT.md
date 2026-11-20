@@ -46,6 +46,18 @@ The complete per-package matrix, deviations, and deferred list live in `docs/PAR
 - **Offline builds**: every locked dependency (`reqwest 0.12.28`, `axum 0.8.9`, `wiremock 0.6.5`, `http 1.5.0`, `url 2.5.8`, `hyper 1.12.0`, `tower 0.5.3`, `bytes 1.12.1`) is present in `~/.cargo/registry/{cache,src}/index.crates.io-*/`, and `make test` (Makefile:7) runs the workspace offline.
 - **Foreign repo** is read-only; never modify it. Delegate investigation to read-only investigators.
 
+## Repository Facts
+
+- 30 workspace crates under `crates/*`; `default-members` lists 27 (all but `openjiuwen-test-support`, `openjiuwen-e2e`, `openjiuwen-examples`), so a bare `cargo build`/`cargo test` skips the three dev crates.
+- Every crate inherits `version = "0.1.0"`, `edition = "2021"`, `rust-version = "1.85"`, `license = "Apache-2.0"`, `repository`, and `publish = false` from `[workspace.package]`.
+- No `LICENSE` file exists in the repository despite the Apache-2.0 declaration; there is also no CI configuration, no `rustfmt.toml`/`clippy.toml`/`deny.toml`, and no `rust-toolchain` file — the `Makefile` targets are the only gate.
+- `[workspace.package] repository` is `https://github.com/openjiuwen/openjiuwen`, which does not match the Python upstream's declared `https://gitcode.com/openJiuwen/agent-core.git`.
+- Only `openjiuwen-common` declares a package `description`; no crate declares `homepage`, `documentation`, `keywords`, or `categories`, and all 30 set `publish = false`.
+- Workspace lints (`Cargo.toml:168-178`): Rust `unsafe_code = "deny"`, `missing_docs`/`unreachable_pub` warn; Clippy `all`/`pedantic` warn plus `unwrap_used`/`expect_used` warn.
+- No `unsafe` block, `unsafe fn`, `extern "C"`, or `#[no_mangle]` exists in tracked source; FFI is confined to dependencies (`sqlx` → bundled C SQLite via `libsqlite3-sys`, `nix`/`libc` syscalls, `ring`, `inotify` behind `notify`).
+- External process boundaries are real and numerous: shells/PTYs (`openjiuwen-sysop`), `git` worktrees (`openjiuwen-harness`, `openjiuwen-agent-teams`), LSP servers, vendor CLIs (`openjiuwen-harness-providers`), rmcp stdio MCP servers (`openjiuwen-foundation`), spawned `team-member`/runner children, and `docker run`/`docker exec` in agent-evolving's evaluator pipeline.
+- `println!`/`eprintln!` occur only in the `openjiuwen-cli` binary crate; library crates log through `tracing`.
+
 ## Routing Table
 
 - `./crates/` → workspace crates, dependency layers, status table, and per-crate responsibilities (`crates/CONTEXT.md`)
