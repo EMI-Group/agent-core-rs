@@ -67,6 +67,7 @@ pub mod redis {
 - `delete` writes `DEL payload` + `ZREM index` in one pipelined batch; deleting a missing checkpoint is a no-op.
 - `release` pages `SCAN MATCH openjiuwen:checkpoint:{session_id}:* COUNT 500`, deletes payloads in chunks of 500, then deletes the index key.
 - The release pattern ends in `:` and escapes glob metacharacters (`*?[]\`) in the session id, so `session-1` never matches `session-10`.
+- Session and checkpoint ids are interpolated into both key forms verbatim (only the `release` glob is escaped), unlike the store's Redis keys, which percent-escape every component.
 - `list` reads `ZRANGE index 0 -1`, `MGET`s the payloads in chunks of 500, drops index members whose payload vanished (and `ZREM`s them), and returns summaries newest first by `(created_at, checkpoint_id)` descending.
 - `latest` stays the trait default (sort `list`, then `load` the first), so it agrees with the backend ordering.
 - `session_exists` is `ZCARD index > 0`; an unknown session answers `false`, a missing payload answers `Ok(None)`, and an empty session lists no checkpoints — none of those are errors.
