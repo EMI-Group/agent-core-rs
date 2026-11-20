@@ -75,7 +75,7 @@ No row is `Stub` or `Deferred`: every row is `Implemented` or `Subset`, and a `S
 
 ### Cards, tools, and schemas
 
-- Every `*Card` is a serde struct with Python names and defaults; unknown fields are tolerated, and unset optionals match Python (`CardBase` omits, `AgentCard`/`WorkflowCard` emit `null`).
+- Every `*Card` is a serde struct with Python names and serde defaults; unknown fields are tolerated, and unset optionals match Python (`CardBase` omits, `AgentCard`/`WorkflowCard` emit `null`).
 - Cards implement `openjiuwen_common::card::Card` and derive `schemars::JsonSchema`, so JSON Schema is generated rather than hand-written.
 - `ToolCard` is flat (`id`, `name`, `description`, `input_params`, `properties`, policy flags) with `openai_tool()`/`flat_tool_info()`; `ToolInfo::flat()`/`from_flat()` round-trips Python's flat literal and `ToolInfo::openai()` emits the function-calling shape.
 - `FunctionTool` handlers are async-only; Python sync handlers and generator-based tool streams are not reproduced (a blocking handler must use `spawn_blocking`).
