@@ -13,6 +13,7 @@ Results are raw JSON so the appendix can be recomputed rather than copied.
 - `python/measure_proc.py` — one-child process probe printing `{"wall_s","maxrss_kb","exit"}`; wall from `perf_counter`, RSS from a second run under GNU `time -v`.
 - `aggregate.py` — recomputes every table in `../BENCHMARKS.md` from `results/` (`--raw` adds the per-rep values).
 - `results/process/` — 20-sample floor rows; `results/{rust,python}/{prompt,graph}_run{1,2,3}.json` — three interleaved rounds per side.
+- `bench.py` also rewrites `results/python/<workload>.json` on every invocation; the recorded rounds are the `_run{1,2,3}.json` captures of its stdout, and those are what the appendix aggregates.
 
 ## Constraints
 
