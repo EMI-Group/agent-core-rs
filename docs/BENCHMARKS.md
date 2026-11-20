@@ -12,7 +12,7 @@ Everything here is reproduceable from `docs/bench/` and the raw JSON under `docs
 
 | Item | Value |
 | --- | --- |
-| CPU | Intel Core Ultra 5 325, 8 logical CPUs, 1 thread/core, 3.2 GHz base / 4.5 GHz boost |
+| CPU | Intel Core Ultra 5 325, 8 logical CPUs, 1 thread/core, 400–4500 MHz (governor at 66–76% of max during runs) |
 | RAM | 24,725,495,808 bytes (23.0 GiB) total |
 | OS | NixOS 26.11, kernel `7.3.5` (`#1-NixOS SMP PREEMPT_DYNAMIC`), x86_64 |
 | Rust | `rustc 1.99.1 (58cf8f9c3 2026-10-13)`, `cargo 1.99.0`, LLVM 23.1.3 |
@@ -27,7 +27,7 @@ The reference repo is never written to: it is rsync-copied to `$TMPDIR/src/agent
 
 ## What was measured
 
-Four process-level rows, each with an explicit semantic label, and two pure-local operations that run the same code path on both sides.
+Six process-level rows, each with an explicit semantic label, and two pure-local operations that run the same code path on both sides.
 
 | id | Rust side | Python side | Same semantics? |
 | --- | --- | --- | --- |
@@ -69,7 +69,7 @@ The install succeeds online; dependency resolution is not pinned to `uv.lock`, s
 ### Timing protocol
 
 - One timing sample per repetition: `Instant::now()` (Rust) / `time.perf_counter()` (Python) around a whole batch of iterations.
-- 30 repetitions, the first 3 discarded as warmup; median and p95 (nearest-rank, `round((n-1)*0.95)`) over the 30 recorded values.
+- 30 repetitions, the first 3 discarded as warmup; median and p95 (nearest-rank, `round((n-1)*0.95)`) over the 27 retained values.
 - Batch sizes differ by side because the per-operation cost differs by ~20×: Rust uses 20 000 renders and 2 000 graph runs per rep, Python uses 2 000 and 200, so every batch is ≥ 7 ms and clear of timer and scheduler noise. Per-operation figures are the batch median divided by the batch size.
 - Both workloads were run three times per side, interleaved A/B/A/B, to expose drift on the shared host.
 - Python timings are taken with `logging.disable(logging.CRITICAL)` and per-logger levels for `openjiuwen.*`, and stdout redirected, so log formatting is outside the timed section.
@@ -108,6 +108,8 @@ Reading the floor rows:
 - `rust_hello_agent` is the closest Rust analogue of a real workload: process start plus an agent turn through the runtime with a scripted model. The Python side has no equivalent scripted-model path in this SDK, so no ratio is claimed.
 - `py_first_graph_run` is Python-only: `import openjiuwen` is lazy, and the first graph execution pulls in the runner/logging/provider chain (3 466 modules loaded at that point). It is a one-time cost per process and is not comparable to any Rust row.
 
+Cold versus warm: every figure above is a warm-page-cache figure, and within a series only `py_noop` shows a visible warm-up (its first six samples are 18.6–31.2 ms, the later ones 10.2–16.8 ms — the interpreter's own pages being faulted in). The three Rust rows show no warm-up trend (first sample 1.22 / 2.34 / 2.71 ms against medians 1.20 / 2.45 / 2.85 ms), and `py_import` is bimodal across the whole series (34–36 ms and 52–59 ms samples), which is host scheduling, not first-run cost. An empty-page-cache cold start was not measured.
+
 ### Pure-local operations
 
 Round 1 of the interleaved sequence; the three-round spread is in [Repeatability](#repeatability).
@@ -132,7 +134,7 @@ Batch medians per round, same host, interleaved A/B:
 | graph | Rust | 14.451 ms | 14.577 ms | 14.494 ms | 7.225–7.289 µs |
 | graph | Python | 22.468 ms | 21.903 ms | 22.342 ms | 109.5–112.3 µs |
 
-Process-floor medians move more between runs than the in-process batches (earlier floor series during heavier host load gave `py_import` 57.6 ms and `py_noop` 15.5 ms); treat single-digit-millisecond differences in the floor table as noise and read the median, not a single rep.
+The in-process batch medians are stable to within about 2% across the three rounds; the process floors move more with host load, so read their medians and treat single-digit-millisecond differences as noise.
 
 ### Raw values
 
