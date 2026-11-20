@@ -97,7 +97,8 @@ Notable cross-layer edges, each justified in the consuming crate's `CONTEXT.md`:
 - `openjiuwen-runner` (layer 4) → `openjiuwen-memory` (layer 2): the runner owns the one dream-loop task so the memory crate stays spawn-free.
 - `openjiuwen-agent-teams` (layer 6) → `openjiuwen-memory` (layer 2), and optionally → `openjiuwen-extensions` (layer 5) behind its `otlp` feature for the team-memory → OTel bridge.
 - `openjiuwen-cli` (layer 7) → `openjiuwen-harness` with `notify`: the CLI's `watch` command and `chat --watch`.
-- `openjiuwen-harness-providers` (layer 6) → `openjiuwen-agent-teams` (same layer 6) behind `native-v2` is the only same-layer edge; it is off by default and enabled by nothing here.
+- `openjiuwen-harness-providers` (layer 6) → `openjiuwen-agent-teams` (same layer 6) behind `native-v2` is off by default and enabled by nothing here.
+- The other same-layer edges (all normal dependencies) are `openjiuwen-session` → `openjiuwen-foundation`, `openjiuwen-graph` → `openjiuwen-session`, `openjiuwen-multiagent` → `openjiuwen-agent`, `openjiuwen-core` → `openjiuwen-runner` and `openjiuwen-auto-harness` → `openjiuwen-rsi`.
 
 ## Constraints
 
