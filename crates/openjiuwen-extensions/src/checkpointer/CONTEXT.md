@@ -107,6 +107,11 @@ pub mod redis {
 - Cluster URLs verify the seed as a cluster node and follow one `MOVED`/`ASK` redirection per command, so slot routing is real rather than recorded-and-ignored.
 - Python's pickle payload format and `{session_id}:agent:{agent_id}:agent_state_blobs` key layout are intentionally replaced by the JSON payload plus sorted-set index described above.
 
+## Known Issues
+
+- `validate_session_id`/`validate_checkpoint_id` (kernel `validate_id`) allow `:`, so the unescaped `openjiuwen:checkpoint:{session_id}:{checkpoint_id}` form is ambiguous: session `a:b` + checkpoint `c` writes the same key as session `a` + checkpoint `b:c`, and `release("a")` (pattern `openjiuwen:checkpoint:a:*`) deletes session `a:b`'s payloads.
+- No test covers a `:`-bearing id; `release_patterns_escape_glob_metacharacters` and the `session-1`/`session-10` case only cover glob characters and prefix collisions.
+
 ## Routing Table
 
 - `./mod.rs` → kernel re-exports, `build_checkpointer`, module-level docs, backend-selection tests
