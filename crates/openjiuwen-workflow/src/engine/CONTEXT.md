@@ -126,7 +126,7 @@ impl Node for ComponentNode { /* run(...) */ }
 6. stream/transform frames are stored under the node id as a JSON array. When the node is the workflow end,
    each frame is also written as an `end node stream` output frame with a 0-based index, and the stored array
    holds `{"type": "end node stream", "index", "payload"}` wires so `invoke` can return them verbatim.
-7. `outputs_schema` projects the raw output against `state + {"<id>": raw, "output": raw}`;
+7. `outputs_schema` (also compiled at graph build) projects the raw output against `state + {"<id>": raw, "output": raw}`, the extra keys supplied as root bindings so no state copy is made;
    `state.set(id, output)`.
 8. an error carrying `find_interrupt` keeps the tracing `interrupted(reason)` marker and is propagated
    unchanged (the interaction frame itself was already written by `ComponentContext::interact`), so the graph's
