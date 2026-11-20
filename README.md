@@ -8,7 +8,7 @@
 [![Crates](https://img.shields.io/badge/workspace-30%20crates-4a5568)](crates/CONTEXT.md)
 
 ```bash
-cargo run -p openjiuwen-examples --example 01_hello_agent   # 离线、确定性、无需网络
+cargo run -p openjiuwen-examples --example 01_hello_agent   # 离线、脚本化模型、无需网络
 ```
 
 ---
