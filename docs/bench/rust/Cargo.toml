@@ -1,0 +1,24 @@
+# Standalone measurement package for docs/BENCHMARKS.md.
+#
+# The empty [workspace] table is deliberate: it keeps this package out of the
+# root workspace so `cargo test --workspace` at the repo root is unaffected.
+# It depends on the shipped umbrella crate by path, so it measures the real
+# `openjiuwen` facade, not a copy.
+[package]
+name = "openjiuwen-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+openjiuwen = { path = "../../../crates/openjiuwen" }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+# Same optimization settings as the root workspace release profile, so the
+# numbers are comparable to `cargo build --release` binaries.
+lto = "thin"
+codegen-units = 1

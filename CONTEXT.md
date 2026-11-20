@@ -45,6 +45,13 @@ The complete per-package matrix, deviations, and deferred list live in `docs/PAR
 - `mockito` and `httpmock` are absent from the workspace, `Cargo.lock`, and the local registry cache — adding them would break `--offline` builds.
 - **Offline builds**: every locked dependency (`reqwest 0.12.28`, `axum 0.8.9`, `wiremock 0.6.5`, `http 1.5.0`, `url 2.5.8`, `hyper 1.12.0`, `tower 0.5.3`, `bytes 1.12.1`) is present in `~/.cargo/registry/{cache,src}/index.crates.io-*/`, and `make test` (Makefile:7) runs the workspace offline.
 - **Foreign repo** is read-only; never modify it. Delegate investigation to read-only investigators.
+- `OPENJIUWEN_MODEL`, `OPENJIUWEN_PROVIDER` and `OPENJIUWEN_API_BASE` are read only by the harness CLI option resolver (`crates/openjiuwen-harness/src/cli/config.rs:301-337`); library clients read `MODEL_NAME`/`MODEL_PROVIDER`/`API_BASE`/`OPENAI_BASE_URL` (`crates/openjiuwen-common/src/config/env.rs:134-158`).
+
+## Known Issues
+
+- No `LICENSE` file is tracked or present on disk, although root `README.md:84` points at one; the only license declaration is `license = "Apache-2.0"` in the workspace metadata (`Cargo.toml:41`), matching the Python reference's tracked Apache-2.0 `LICENSE`.
+- The upstream is `https://gitcode.com/openJiuwen/agent-core` (Python `pyproject.toml` `[project.urls]`, reference v0.1.20); `Cargo.toml:42` and `README.md:3` still point at `https://github.com/openjiuwen/openjiuwen`.
+- Root `README.md` is stale: line 24 claims the CLI runs offline (only the examples do; `run`/`chat` fail without a provider key), line 73 says 12 examples (26 exist), line 74 says `live-tests` gates provider tests (it is an empty gate; `OPENJIUWEN_LIVE` switches the examples).
 
 ## Repository Facts
 

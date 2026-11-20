@@ -125,6 +125,8 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - `Repl::with_session_id(id)` adopts a persisted session id (replacing the minted `cli-*` one and rebuilding the kernel session); the caller must seed the transcript itself (`Repl::seed_history`, e.g. from the `persistent_agent` module's `ResumePlan`) before the first turn, since adoption creates nothing on disk — `run_turn` then appends to `<home>/sessions/<id>.jsonl` instead of truncating it.
 - `build_agent_with` sets `DeepAgentConfig::persistent_agent = true`, so every CLI run/REPL turn journals a `persistent_agent` execution and rewrites its session record; it also passes the pinned `AgentCard::new("openjiuwen-cli").with_id("openjiuwen-cli")` (`CLI_AGENT_ID`), so the `(agent_id, session_id)` binding is the same in every process and `chat --resume <id>` finds the record an earlier process wrote.
 - `run_once_resumed` has no behavioural test: it resolves a real provider through `CliOptions::build_model`, so every offline suite drives `run_with_model_resumed` (which differs only by that call); `crates/openjiuwen-harness/tests/public_surface.rs` only signature-pins it.
+- `run_cli` resolves `CliOptions` before the chat onboarding wizard runs, and `build_model` falls back only to the process environment (not the settings file), so a provider/key/api-base entered in the first-run wizard is not used until the next process; that first `chat` still fails with the missing-credential error unless the environment supplies one.
+- A `run`/`chat` invocation with no credential (`--api-key`, `OPENJIUWEN_API_KEY`, `API_KEY`, `OPENAI_API_KEY`, or settings) fails in `build_model` with `Error::Config` (`provider `openai` requires an API key; set OPENJIUWEN_API_KEY, API_KEY, or OPENAI_API_KEY (or `api_key`)`) before any network call; there is no mock/echo model fallback.
 - `build_agent_with` installs `CliPermissionHost` with a freshly generated `run::session_id()`, not the caller's run/REPL session id, so `PermissionHost::session_id()` never matches the id in `<home>/sessions/<id>.jsonl`.
 - The one-shot `run` path never emits colour, even on a terminal: `run_cli` resolves colour only in the `chat` branch and hands `run` a `CliIo::stdio_non_interactive()` whose colour flag stays off.
 
@@ -137,7 +139,7 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - LLM-summarising `/compact` (bounded truncation instead).
 - The `lsp` built-in tool is not mounted by the CLI: a language server needs a per-workspace configuration the CLI does not resolve yet.
 - Plugin hot-loading (templates are loaded by `crate::spec`, not by the CLI) and a `--config` command.
-- No automatic resume in the binary: there is no `--resume`/`--session` flag and `run_cli` never restores a past transcript by itself; the `resume` module is the library seam a host drives.
+- `run_cli` itself never restores a past transcript: the `resume` module is the library seam, and the `openjiuwen-cli` binary's `run`/`chat` `--resume <ID>`/`--continue` flags are what drive it (`chat --resume` also adopts the id through `Repl::with_session_id`).
 - Multi-skill roots beyond `<workspace>/skills` and `<home>/skills` (`~/.claude/skills`, `~/.codex/skills` are not scanned).
 
 ## Routing Table
