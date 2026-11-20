@@ -9,8 +9,9 @@ The Context Tree (`CONTEXT.md` per crate) is the primary source of intent and AP
 
 - `ARCHITECTURE.md` — §1 the 27 crates in layers 0–7 plus the three development crates (30 in total); §2 the shared contracts (§2.1 cards/errors, §2.2 models, §2.3 tools, §2.4 sessions, §2.5 graph/workflow, §2.6 agents/runner, §2.7 harness protocol, §2.8 frame and event streams, §2.9 context engine, §2.10 memory providers, §2.11 observability, §2.12 resume and journal, §2.13 harness host seams); §3 async/streaming model; §4 configuration and environment; §5 feature flags; §6 testing infrastructure; §7 porting method.
 - `PARITY.md` — the status legend, the per-Python-path package matrix, wire/behavior compatibility (models, cards, sessions, workflow data flow, environment variables, CLI commands, documented deviations), the per-crate deferred-feature table, the `Error::Unsupported` surface, the gaps that are not typed seams, intentional differences, and the verification gates.
-- `BENCHMARKS.md` — the measurement appendix: environment, the exact commands and batch/repetition sizes, median and p95 for process start (wall, peak RSS) and two pure-local operations (prompt render, graph run), the raw per-repetition values, and the limits of what each row means.
+- `BENCHMARKS.md` — the measurement appendix: environment, the exact reproduce commands and batch/repetition sizes, median and p95 for process start (wall, peak RSS) and two pure-local operations (prompt render, graph run), the raw per-repetition values, and the limits of what each row means.
 - `bench/` — the harnesses and raw JSON behind `BENCHMARKS.md` (standalone Rust package plus Python scripts).
+- `assets/` — the two hand-authored SVG diagrams (`architecture-layers.svg`, `agent-run-flow.svg`) embedded by the root `README.md`.
 
 ## API Surface
 
@@ -22,6 +23,7 @@ The Context Tree (`CONTEXT.md` per crate) is the primary source of intent and AP
 - `ARCHITECTURE.md` §2 — the public seams whose signatures require updating every dependent crate when changed.
 - `ARCHITECTURE.md` §2.13 — the harness seams a host wires: `MemoryToolBackend`/`WorkspaceMemoryBackend` for the memory tools and `SubAgentSpawner`/`RuntimeSubAgentSpawner` for subagents.
 - `ARCHITECTURE.md` §5 — the complete feature-flag table: per-crate features, defaults and effects, the `default = []` crates, the empty marker features (`live-tests`, `openjiuwen-harness`'s `native`), the `#![cfg(feature = "…")]` suite gates and the umbrella forwarders.
+- `BENCHMARKS.md` §Reproduction — the exact commands and batch sizes behind each measured row; the harnesses live in `bench/` and the two SVG diagrams in `assets/`.
 
 ## Constraints
 
@@ -50,5 +52,6 @@ The Context Tree (`CONTEXT.md` per crate) is the primary source of intent and AP
 
 - `./ARCHITECTURE.md` → cross-cutting contracts, crate layering, feature flags, testing infrastructure
 - `./PARITY.md` → per-package parity matrix, deferred features, typed seams, verification gates
-- `./BENCHMARKS.md` → environment, measured process and pure-local operations, raw samples, limitations
+- `./BENCHMARKS.md` → environment, measured process and pure-local operations, raw samples, limitations, reproduce commands
 - `./bench/` → Rust and Python measurement harnesses plus the recorded raw results (`bench/CONTEXT.md`)
+- `./assets/` → the two SVG diagrams embedded by the root `README.md`
