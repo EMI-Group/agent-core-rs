@@ -137,7 +137,7 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - LLM-summarising `/compact` (bounded truncation instead).
 - The `lsp` built-in tool is not mounted by the CLI: a language server needs a per-workspace configuration the CLI does not resolve yet.
 - Plugin hot-loading (templates are loaded by `crate::spec`, not by the CLI) and a `--config` command.
-- No automatic resume in the binary: there is no `--resume`/`--session` flag and `run_cli` never restores a past transcript by itself; the `resume` module is the library seam a host drives.
+- `run_cli` itself never restores a past transcript: the `resume` module is the library seam, and the `openjiuwen-cli` binary's `run`/`chat` `--resume <ID>`/`--continue` flags are what drive it (`chat --resume` also adopts the id through `Repl::with_session_id`).
 - Multi-skill roots beyond `<workspace>/skills` and `<home>/skills` (`~/.claude/skills`, `~/.codex/skills` are not scanned).
 
 ## Routing Table
