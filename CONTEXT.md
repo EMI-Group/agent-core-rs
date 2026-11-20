@@ -27,6 +27,12 @@ The complete per-package matrix, deviations, and deferred list live in `docs/PAR
 - `crates/openjiuwen-examples/examples/` — 26 runnable examples mirroring the Python `examples/` tree (offline by default, live with `OPENJIUWEN_LIVE=1`); a few are feature-gated (`a2a`, `mcp`).
 - `crates/openjiuwen-examples/src/support/` — the shared example harness (`RunMode`, logging, banner) used by every example.
 - `docs/PARITY.md` — status legend, Python→Rust package matrix, wire compatibility, deferred features, intentional differences, verification.
+- `README.md` — the user-facing overview: original-project attribution, layering and run-flow diagrams, verified quick start, CLI, configuration, compatibility boundary, gates, performance and limits.
+- `REPORT.md` — the two-page rewrite summary (scope, code size, the two historical task ledgers, verification, measured benefits and limitations).
+- `docs/BENCHMARKS.md` + `docs/bench/` — measurement appendix, harness packages, raw per-repetition JSON and the aggregate script.
+- `docs/REWRITE_APPENDIX.md` — the statistics methodology behind `REPORT.md`: history ledger, duration/token arithmetic, LOC classification, reproduce commands.
+- `docs/assets/` — the two hand-authored SVG diagrams embedded by `README.md`.
+- `LICENSE` — the standard Apache-2.0 text; the workspace declares `license = "Apache-2.0"`.
 
 ## Constraints
 
@@ -49,8 +55,10 @@ The complete per-package matrix, deviations, and deferred list live in `docs/PAR
 
 ## Known Issues
 
-- The upstream is `https://gitcode.com/openJiuwen/agent-core` (Python `pyproject.toml` `[project.urls]`, reference v0.1.20); `Cargo.toml:42` now points at the canonical `https://github.com/openJiuwen-ai/agent-core` while `README.md:3` still links `https://github.com/openjiuwen/openjiuwen`.
-- Root `README.md` is stale: line 24 claims the CLI runs offline (only the examples do; `run`/`chat` fail without a provider key), line 73 says 12 examples (26 exist), line 74 says `live-tests` gates provider tests (it is an empty gate; `OPENJIUWEN_LIVE` switches the examples).
+- The Python upstream declares `https://gitcode.com/openJiuwen/agent-core.git` in `[project.urls]`; the project owner requires the GitHub mirror `https://github.com/openJiuwen-ai/agent-core`, which `Cargo.toml` `[workspace.package] repository` and `README.md` use consistently.
+- There is no CI, no `rustfmt.toml`/`clippy.toml`/`deny.toml` and no `rust-toolchain`; the `Makefile` targets are the only gate, so a green claim must name the command that produced it.
+- `docs/PARITY.md` is ~65 KB, just under the per-file read limit; keep additions as replacements rather than growth.
+- `docs/bench/rust` is a separate package (empty `[workspace]`) so benchmarks never become workspace members; `docs/bench/results/` holds the raw JSON the appendix cites.
 
 ## Repository Facts
 
@@ -70,5 +78,9 @@ The complete per-package matrix, deviations, and deferred list live in `docs/PAR
 - `./crates/openjiuwen-examples/` → runnable examples and their offline/live harness (`crates/openjiuwen-examples/CONTEXT.md`)
 - `./docs/` → architecture, parity matrix, and deferred-scope documentation (`docs/CONTEXT.md`)
 - `./docs/PARITY.md` → per-package status, wire compatibility, deferred features, intentional differences, verification
+- `./docs/BENCHMARKS.md` → measured performance, environment, commands, raw samples, limitations
+- `./docs/REWRITE_APPENDIX.md` → statistics methodology, history-task ledger, code-size classification, reproduce commands
+- `./README.md` → user-facing overview and verified quick start
+- `./REPORT.md` → the two-page rewrite summary
 - `./Cargo.toml` → workspace manifest, shared dependency versions, lints
 - `./Makefile` → build/test/lint/verify entry points
