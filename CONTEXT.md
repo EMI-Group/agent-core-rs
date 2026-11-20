@@ -45,6 +45,7 @@ The complete per-package matrix, deviations, and deferred list live in `docs/PAR
 - `mockito` and `httpmock` are absent from the workspace, `Cargo.lock`, and the local registry cache — adding them would break `--offline` builds.
 - **Offline builds**: every locked dependency (`reqwest 0.12.28`, `axum 0.8.9`, `wiremock 0.6.5`, `http 1.5.0`, `url 2.5.8`, `hyper 1.12.0`, `tower 0.5.3`, `bytes 1.12.1`) is present in `~/.cargo/registry/{cache,src}/index.crates.io-*/`, and `make test` (Makefile:7) runs the workspace offline.
 - **Foreign repo** is read-only; never modify it. Delegate investigation to read-only investigators.
+- `OPENJIUWEN_MODEL`, `OPENJIUWEN_PROVIDER` and `OPENJIUWEN_API_BASE` are read only by the harness CLI option resolver (`crates/openjiuwen-harness/src/cli/config.rs:301-337`); library clients read `MODEL_NAME`/`MODEL_PROVIDER`/`API_BASE`/`OPENAI_BASE_URL` (`crates/openjiuwen-common/src/config/env.rs:134-158`).
 
 ## Routing Table
 
