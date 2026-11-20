@@ -256,7 +256,7 @@ Layered BFS layout over the sorted spec maps, rounded start/end boxes, arrow mar
 ```rust
 pub fn is_ref_path(s: &str) -> bool;                       // "${…}", length > 3
 pub fn extract_origin_key(s: &str) -> Option<&str>;        // "${a.b}" → "a.b"
-pub fn split_path(path: &str) -> Vec<PathSegment>;         // a.b[0]['k'].c
+pub fn split_path(path: &str) -> Result<Vec<PathSegment>>; // a.b[0]['k'].c; malformed paths are Validation errors
 pub fn resolve_path(source: &Value, path: &str) -> Option<Value>;
 pub fn resolve_schema(schema: &Value, source: &Value) -> Value;   // deep template resolution
 pub fn project(value: &Value, path: &str) -> Value;        // alias used by routers
