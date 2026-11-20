@@ -49,7 +49,7 @@ cargo run -p openjiuwen-examples --example 01_hello_agent   # 离线、确定性
 ![工作区分层](docs/assets/architecture-layers.svg)
 
 30 个 crate 按依赖方向组织：下层只提供契约与工具，上层组合出 agent 运行时与产品入口。
-层号是**语义分组**，不完全等于拓扑深度（`graph → session`、`workflow → graph`、`core → runner`、`openjiuwen → 各 crate`、`cli → openjiuwen` 使实际深度到 13 层）；同层内也存在依赖边。
+层号是**语义分组**，不完全等于拓扑深度（`graph → session`、`workflow → graph`、`core → runner`、`openjiuwen → 各 crate`、`cli → openjiuwen` 使最长依赖链达到 13 条边、14 个 crate）；同层内也存在依赖边。
 
 | 层 | Crate | 职责 |
 |---|---|---|
@@ -107,7 +107,7 @@ cargo build --workspace
 make check
 ```
 
-第一个可运行示例（离线，脚本化模型，输出确定）：
+第一个可运行示例（离线，脚本化模型；除随机 card id 外输出固定）：
 
 ```bash
 cargo run -p openjiuwen-examples --example 01_hello_agent
@@ -116,7 +116,7 @@ cargo run -p openjiuwen-examples --example 01_hello_agent
 实际输出（节选）：
 
 ```text
-  - card: hello-agent (id bc43201a1d7b445e8c7489f91b8d7d16)
+  - card: hello-agent (id <random-uuid>)
   - invoking with: What is the capital of France?
 note: result type: answer
 note: iterations used: 1
@@ -243,18 +243,18 @@ error: config: provider `openai` requires an API key; set OPENJIUWEN_API_KEY, AP
 | 网络 | `http_proxy` / `https_proxy` / `NO_PROXY`、`SSRF_PROTECT_ENABLED`（默认 true，但当前仅解析、无实际拦截逻辑） |
 | 可选后端 | `OPENJIUWEN_REDIS_URL`、`OPENJIUWEN_S3_*`、`OPENJIUWEN_DASHSCOPE_API_KEY`、`OPENJIUWEN_OTEL_*` |
 
-各变量精确读取位置见 [docs/ARCHITECTURE.md §4](docs/ARCHITECTURE.md)。
+各变量精确读取位置见 [docs/ARCHITECTURE.md §4](docs/ARCHITECTURE.md#4-configuration-and-environment)。
 
 ---
 
 ## 实现范围与兼容边界
 
-状态含义：**Implemented** = 目标公共面已移植并有测试；**Subset** = 可用核心 + 已命名的缺口；缺口以 `Error::Unsupported` 类型化返回。
+状态含义：**Implemented** = 目标公共面已移植并有测试；**Subset** = 可用核心 + 已命名的缺口；多数缺口以 `Error::Unsupported` 类型化返回（CLI 的 `gap-analyze` 目前只是占位）。
 
 | 领域 | 状态 | 主要缺口 |
 |---|---|---|
 | kernel（common/foundation 基础、prompt、工具基座） | Implemented | 无 `tool::auth`、`form_handler`；`RestfulApiTool::stream` 类型化未实现 |
-| LLM 客户端 | Subset | `output_parsers`、`system_one`、request sanitizer、TPM/RPM 强制；Responses 的 `previous_response_id`/后台模式/托管工具 |
+| LLM 客户端 | Subset | `output_parsers`、`system_one`、request sanitizer、TPM/RPM 强制；Responses 的后台模式与托管工具 |
 | MCP / 外部存储 | Subset | Playwright transport、真正的 `resources/subscribe` 推送；PostgreSQL/Milvus/Chroma/ES 等外部后端类型化未实现 |
 | graph / workflow | Implemented / Subset | 工作流 PNG 绘制、`StreamDelivery::Interleaved`、分支 OR 合并未实现 |
 | context / memory / retrieval | Subset | 官方 provider tokenizer、分布式 KV 锁、托管向量库与 OCR、加密 PDF |
@@ -301,7 +301,7 @@ Err(Error::unsupported("unavailable vector store provider: milvus"))
 ```
 
 可执行的证据：`openjiuwen-dev-tools/tests/deferred_surface.rs`、`openjiuwen-symphony/tests/deferred.rs`、`openjiuwen-agent-evolving/tests/rl.rs`、`openjiuwen-sysop/tests/sandbox_stub.rs` 等直接断言错误消息。
-全量清单（约 341 处生产代码 `Unsupported` 点）见 [docs/PARITY.md §Deferred Features](docs/PARITY.md)。
+全量清单见 [docs/PARITY.md §Deferred Features](docs/PARITY.md#deferred-features)；按 `Error::unsupported(`/`Error::Unsupported(` 构造点粗计，生产代码约 260 处 `Unsupported`。
 
 ---
 
@@ -320,7 +320,7 @@ make verify      # fmt-check + clippy + test + doc + test-all + 示例构建
 
 - **`default-members` 陷阱**：直接运行 `cargo test` 只覆盖 27 个库/二进制 crate；`openjiuwen-e2e`、`openjiuwen-examples`、`openjiuwen-test-support` 需要 `--workspace` 或 `-p`。
 - **测试是封闭的**：无网络、无凭据、无墙上时钟依赖；服务器绑定 `127.0.0.1:0`，模型为脚本化或假服务器，存储在内存或 `tempfile` 目录。
-- **`#[ignore]` 只有 5 个**，且都是被父测试重新执行为子进程的协议桩（3 个 stdio 子进程、1 个需要真实 sandbox 网关、1 个属于 CLI 包的二进制探测），不是被跳过的功能测试。
+- **`#[ignore]` 只有 5 个**：3 个是被父测试重新执行为 stdio 协议子进程的桩，1 个是需要真实 sandbox 网关的探测，1 个是 e2e 侧的 `openjiuwen` 二进制探测；它们都不是被跳过的功能测试。
 - **特性开关**：`foundation` 默认启用 `mcp` 与 `tiktoken`；`harness`/`harness-providers` 默认 `native`；`sqlite`、`a2a`、`otel`、`sandbox`、`vendor`、`redis`、`pulsar` 均为可选。`live-tests` 是空标记特性（不 gate 任何代码），真实模型只由 `OPENJIUWEN_LIVE=1` 开启。
 - **离线**：`Cargo.lock` 中的依赖已在本地 registry 缓存，`make test` 全程 `--offline`。
 
@@ -339,8 +339,8 @@ make verify      # fmt-check + clippy + test + doc + test-all + 示例构建
 | prompt 模板渲染 | **0.356 µs/次**（2.81 M/s） | 16.37 µs/次（61.1 k/s） | 同语义 → 约 **46×** |
 | 2 节点图执行 | **7.23 µs/次**（138 k/s） | 112.3 µs/次（8.9 k/s） | 同语义 → 约 **15×** |
 
-限制：只测 warm page cache（无 root 无法清缓存）；未测 LLM/网络延迟、并发扩展、Python 侧 agent 回合；图执行比较的是逻辑形状而非同一引擎。
-完整方法、30 次重复的原始样本与复现命令见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
+限制：只测 warm page cache（无 root 无法清缓存）；进程级每行 20 个新进程，两个纯本地操作各 30 次重复（丢弃前 3 次）取中位数、另报 p95，两侧 batch 大小不同（Rust 10×）按每次操作归一；未测 LLM/网络延迟、并发扩展、Python 侧 agent 回合；图执行比较的是逻辑形状而非同一引擎。
+完整方法、逐次原始样本与复现命令见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
 
 ---
 
@@ -348,7 +348,7 @@ make verify      # fmt-check + clippy + test + doc + test-all + 示例构建
 
 | 分类 | 文件数 | 行数 | 说明 |
 |---|---:|---:|---|
-| 生产代码（`crates/*/src`，去掉文件内 `#[cfg(test)]` 之后的部分） | 2,314 | 803,046 | 含公开模块、文档注释与 `docs/bench/rust` |
+| 生产代码（路径含 `/src/`，去掉文件内 `#[cfg(test)]` 之后的部分） | 2,314 | 803,046 | `crates/*/src`（2,313）+ `docs/bench/rust/src`（1） |
 | 内嵌单元测试（`#[cfg(test)]` 模块） | — | 324,292 | 与实现同文件 |
 | 集成测试（`crates/*/tests`） | 593 | 295,499 | 一个文件一个测试二进制（含嵌套目录） |
 | 示例（`examples/`） | 27 | 11,930 | 26 个示例 + 共享 `common` |

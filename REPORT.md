@@ -12,13 +12,13 @@ Rust workspace 由 30 个 crate 组成，按依赖方向分层：基础（`commo
 |---|---|
 | kernel：错误/Card/配置/日志/HTTP、prompt、模型客户端、工具与 MCP、会话与检查点、图与工作流、上下文、记忆、检索、sysop、护栏 | 已实现或可用子集 |
 | Agent 运行时：ReAct、rails、controller、工具策略、runner、资源注册、HITL、spawn | 可用子集（分布式模式未实现） |
-| DeepAgent harness：任务循环、工作区、权限、20 个编码工具、subagent、skills、原生协议 | 可用子集 |
+| DeepAgent harness：任务循环、工作区、权限、20 个内置工具（文件/shell/搜索 + todo/记忆/询问）、subagent、skills、原生协议 | 可用子集 |
 | 多智能体团队：进程内团队、`team-member` CLI、team MCP server、跨进程 attach | 可用子集（ZeroMQ/WS/Pulsar、PG/MySQL 未实现） |
 | 扩展与工具链：A2A、OTel、prompt/skill/agent dev-tools、symphony、RSI/auto-harness、agent-evolving、`openjiuwen` CLI（8 个子命令） | 可用子集 |
 | 可运行示例 | 26 个，默认离线、确定性 |
 
 **兼容边界**：保留 OpenAI / Anthropic / Responses 线格式、`*Card` JSON 字段与默认值、`${node.field}` 引用、会话与检查点落盘格式、`OPENJIUWEN_*` 环境变量链与 CLI 子命令/退出码。
-**未实现**：依赖 GPU/ML 栈、厂商 SDK、外部数据库/消息中间件、桌面与移动传输、分布式运行时的路径；全仓约 341 处生产代码 `Unsupported` 点，逐项原因见 `docs/PARITY.md`。
+**未实现**：依赖 GPU/ML 栈、厂商 SDK、外部数据库/消息中间件、桌面与移动传输、分布式运行时的路径；全仓约 260 处生产代码 `Unsupported` 构造点（按 `Error::unsupported(` 粗计），逐项原因见 `docs/PARITY.md`。
 因此**不能声称 100% 等价**：覆盖面、性能与失败语义都按 Rust 实现重新定义，文档与测试是这一范围的权威。
 
 ## 2. 代码规模
@@ -33,8 +33,8 @@ Rust workspace 由 30 个 crate 组成，按依赖方向分层：基础（`commo
 | 示例 | 27 | 11,930 | 26 个示例 + 共享 `common` |
 | **合计** | **2,934** | **1,434,767** | `tokei` 计 1,098,785 行代码（排除空行/注释） |
 
-测试代码约占全部 Rust 行的 **43%**：24,293 个 `#[test]`/`#[tokio::test]` 函数，30 个 crate，5 个 `#[ignore]`（均为被父测试重新执行的协议桩）。
-Python 参考实现本身约 667 个文件 / 50,913 行（`tokei`，含测试）；两者不是逐行对应关系——Rust 侧包含大量文档注释、类型与 trait 样板、以及更完整的离线测试。
+测试代码约占全部 Rust 行的 **43%**：24,293 个 `#[test]`/`#[tokio::test]` 函数，30 个 crate，5 个 `#[ignore]`（3 个 stdio 协议子进程桩、1 个 live sandbox 探测、1 个 e2e 二进制探测，均非被跳过的功能测试）。
+参考实现（含 `tests/`）为 5,125 个 Python 文件 / 143.6 万物理行（`tokei`：119.7 万代码行），与 Rust 侧物理行数相当；差异在结构与测试/文档比重，不存在行数倍数关系。
 精确口径与复现命令见 [docs/REWRITE_APPENDIX.md](docs/REWRITE_APPENDIX.md)。
 
 ## 3. 两次历史任务的投入
@@ -73,7 +73,7 @@ Tokens（合计）：input **10,867,293,807**（其中缓存 10,644,263,936，�
 | prompt 模板渲染 | 0.356 µs/次 | 16.37 µs/次 | 同语义，约 46× |
 | 2 节点图执行 | 7.23 µs/次 | 112.3 µs/次 | 同语义，约 15× |
 
-每组 30 次重复（丢弃前 3 次）取中位数，另报 p95；只测 warm cache，未测 LLM 网络延迟、并发扩展与冷磁盘启动。
+进程级每行 20 个新进程；两个纯本地操作各 30 次重复（丢弃前 3 次）取中位数、另报 p95；两侧 batch 大小不同（Rust 10×），按每次操作归一。只测 warm cache，未测 LLM 网络延迟、并发扩展与冷磁盘启动。
 完整环境、命令、原始样本与限制见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
 
 ## 6. Rust 迁移的收益与限制
@@ -82,10 +82,10 @@ Tokens（合计）：input **10,867,293,807**（其中缓存 10,644,263,936，�
 - **内存与启动**：SDK 可达约 3.6 MiB、1.2 ms；完整 Agent 回合 8.6 MiB、2.9 ms。对 CLI、CI 与短生命周期工具，省掉解释器与 94 个模块的导入成本（Python 侧 20.0 MiB、51.6 ms）。
 - **纯本地吞吐**：prompt 渲染约 46×、图执行约 15×；这是类型化、无 GIL、无解释器开销的直接结果。
 - **架构**：trait 定义模型/工具/会话/runner 的缝，类型化 `Error`（18 个 kind）替代异常约定，`Send + Sync` 与 `CancellationToken` 把并发与取消写进类型，umbrella 只做再导出、公共类型下沉到最低公共祖先。
-- **部署与安全**：单一静态二进制；自有代码 0 个 `unsafe`、0 个 `extern "C"`（`unsafe_code = "deny"`），凭据 `SecretString` + 日志脱敏，未实现能力显式失败而非静默降级。
+- **部署与安全**：单一二进制（动态链接 glibc，约 34 MB）；自有代码 0 个 `unsafe`、0 个 `extern "C"`（`unsafe_code = "deny"`），凭据 `SecretString` + 日志脱敏，未实现能力显式失败而非静默降级。
 
 **限制**
-- **覆盖面**：仍是子集（约 341 个 `Unsupported` 点）；分布式模式、GPU/ML、厂商深度集成、浏览器/移动传输未实现。
+- **覆盖面**：仍是子集（约 260 个 `Unsupported` 构造点）；分布式模式、GPU/ML、厂商深度集成、浏览器/移动传输未实现。
 - **性能结论的边界**：倍数只对被测的两个纯本地操作成立；warm cache、单机、无并发扩展，不能外推为"整体快 N 倍"。
 - **安全不是自动保证**：Rust 消除的是内存安全类缺陷，不消除死锁、逻辑漏洞、资源耗尽与权限设计错误；FFI/子进程边界真实存在（`libsqlite3-sys`、`nix`/`libc`、`ring`、`inotify`、`/bin/sh`、`git`、LSP、MCP stdio、`docker`）。
 - **工程代价**：1,434,767 行 Rust、24,293 个测试函数的维护面；编译时间与二进制体积（CLI 约 34 MB）高于脚本方案；生态与人才熟悉度弱于 Python；上游继续演进时需手工跟踪。
@@ -93,5 +93,5 @@ Tokens（合计）：input **10,867,293,807**（其中缓存 10,644,263,936，�
 
 ## 7. 结论
 
-两次任务把一个约 5 万行的 Python Agent SDK 迁移为 30 个 crate、143 万行（含约 40% 测试）的可编译 Rust workspace，保住了线格式、Card/会话/工作流契约与 CLI 形状，并在可比的纯本地操作上取得 15–46× 的吞吐提升、启动内存降到约 1/5。
+两次任务把一个百万行级的 Python Agent SDK 迁移为 30 个 crate、143 万行（含约 43% 测试）的可编译 Rust workspace，保住了线格式、Card/会话/工作流契约与 CLI 形状，并在可比的纯本地操作上取得 15–46× 的吞吐提升；进程常驻内存 3.6–8.6 MiB，对照 Python 导入后 20.0 MiB（语义不同，不做倍数）。
 它以 `Unsupported` 而不是空实现标注边界，因此范围是可审计的；同时必须承认它**不是完整等价物**：分布式、GPU/ML 与厂商集成仍在范围之外，性能数字只覆盖已测场景。

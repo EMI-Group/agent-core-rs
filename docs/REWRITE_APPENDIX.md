@@ -55,7 +55,7 @@ print(p("2026-11-19T21:24:06.496Z") - p("2026-11-11T17:46:03.137Z"))  # 日历�
 
 | 任务 | 状态 | 窗口（UTC） | 墙钟 | usage / agent_count | 结果提交 |
 |---|---|---|---:|---|---|
-| `44c2113a77b2bb42` | failed（`Lease expired; owning instance no longer renewing`） | 2026-11-16T17:08:30.915Z → 2026-11-19T10:33:19.968Z | 235,489.053s（2d17h24m49s） | `null` / `null` | 无 |
+| `44c2113a77b2bb42` | failed（`Lease expired; owning instance no longer renewing`） | 2026-11-16T17:08:30.915Z → 2026-11-19T10:33:19.968Z | 235,489.053s（2d17h24m49.053s） | `null` / `null` | 无 |
 
 `null` 表示未记录，**不等于 0**。因此：
 
@@ -80,7 +80,7 @@ print(p("2026-11-19T21:24:06.496Z") - p("2026-11-11T17:46:03.137Z"))  # 日历�
 
 | 分类 | 规则 | 文件数 | 行数 |
 |---|---|---:|---:|
-| 生产代码 | `crates/*/src/**/*.rs`（不含路径中含 `/tests/` 的文件），减去每个文件第一个 `#[cfg(test)]` 到文件末尾的行 | 2,314 | 803,046 |
+| 生产代码 | 路径含 `/src/` 的 `.rs`（`crates/*/src` 2,313 个 + `docs/bench/rust/src` 1 个，后者是测量程序），减去每个文件第一个 `#[cfg(test)]` 到文件末尾的行 | 2,314 | 803,046 |
 | 内嵌单元测试 | 上述被减去的行（`#[cfg(test)]` 模块） | — | 324,292 |
 | 集成测试 | 路径中含 `/tests/` 的 `.rs`（含嵌套目录） | 593 | 295,499 |
 | 示例 | `crates/openjiuwen-examples/examples/**/*.rs` | 27 | 11,930 |
@@ -91,7 +91,7 @@ print(p("2026-11-19T21:24:06.496Z") - p("2026-11-11T17:46:03.137Z"))  # 日历�
 两种口径的差异必须说明：
 
 - “行数”是 `wc -l` 的物理行数，**包含空行与注释**。
-- `tokei 14.0.0` 对同一批文件报 **1,098,785 行代码**（另有 16,582 行注释、107,382 行空行，以及 174k+ 行以 `///` 写成的 Markdown 文档注释被单独归类）。因此 `tokei` 的 Code 列不含空行/注释，也不含 doc-comment 行。
+- `tokei 14.0.0` 对 `crates/*/{src,tests}` 与 `examples/` 报 **1,098,785 行代码**（另有 16,582 行注释、107,382 行空行；174k+ 行以 `///` 写成的 Markdown 文档注释被单独归类）。加上 `docs/bench/rust/src` 的 156 行后为 1,098,941。`tokei` 的 Code 列不含空行、注释与 doc-comment 行，因此与 `wc -l` 不可直接相加比较。
 - 内嵌测试的切分是近似规则（取每个文件第一个 `#[cfg(test)]` 到末尾）；少数把测试模块写在文件中间的源码会低估测试行、高估生产行。它只用于给出量级，不用于逐行审计。
 
 ### 2.3 复现命令
@@ -129,8 +129,8 @@ tokei crates/*/src crates/*/tests crates/openjiuwen-examples/examples
 
 ### 2.4 与 Python 参考的规模对照
 
-`tokei` 对只读参考仓库 `/home/bill/Source/agent-core`（v0.1.20，HEAD `455e2a338`）的统计：Python **667 个文件 / 50,913 行**（43,655 行代码）。
-两者不是逐行对应：Rust 侧包含大量公开文档注释、trait/类型样板与更完整的离线测试。
+`tokei` 对只读参考仓库 `/home/bill/Source/agent-core`（v0.1.20，HEAD `455e2a338`）的统计：`git ls-files '*.py'` 为 **5,125 个文件 / 1,435,607 物理行**，`tokei` 计 **1,197,139 行代码**；仅 `openjiuwen/` 包为 2,837 个文件 / 753,672 行（637,937 行代码）。
+两侧物理行数量级相当：Rust 侧行数的约 43% 是测试，另有大量公开文档注释、trait/类型样板；Python 侧则包含自己的 `tests/` 与文档。
 本附录不把“行数比”当作重写质量的度量。
 
 ## 3. 计数：crate、示例、测试
@@ -143,6 +143,7 @@ tokei crates/*/src crates/*/tests crates/openjiuwen-examples/examples
 | 测试函数 | 24,293 | `git grep -o '#\[\(tokio::\)\?test\]' -- '*.rs' \| wc -l` |
 | `#[ignore]` 测试 | 5 | `git grep -n '#\[ignore =' -- '*.rs'`（3 个 stdio 协议子进程桩、1 个 live sandbox 探测、1 个 e2e 二进制探测） |
 | CLI 子命令 | 8 | `openjiuwen --help`：`run`/`chat`/`sessions`/`lsp`/`cron`/`team`/`watch`/`auto-harness` |
+| 生产代码 `Unsupported` 构造点 | 263 | 统计 `crates/*/src`（排除 `*_tests.rs` 与每个文件第一个 `#[cfg(test)]` 之后的行）中 `Error::unsupported(` / `Error::Unsupported(` / `not_implemented(` 的出现次数；README/REPORT 取整为“约 260 处” |
 
 ## 4. 性能测量的位置
 
@@ -163,7 +164,7 @@ tokei crates/*/src crates/*/tests crates/openjiuwen-examples/examples
 |---|---|
 | `cargo run -q -p openjiuwen-cli -- --version` | `openjiuwen 0.1.0`，exit 0 |
 | `openjiuwen --help` / `run --help` | exit 0；8 个子命令与 README 表格一致 |
-| `openjiuwen run "hello" --provider openai`（无凭据） | exit 1，`error: config: provider \`openai\` requires an API key; …`，未发 HTTP 请求 |
+| `openjiuwen run "hello" --provider openai`（无凭据） | exit 1，`error: config: provider \`openai\` requires an API key; …`，未发 HTTP 请求。若 `$HOME` 不可写会先报 `failed to create workspace …: Read-only file system`；沙箱中复现请加 `-w <tmpdir>` |
 | `--example 01/02/04/06/08/16` | exit 0，离线输出与 README 引用一致 |
 | `--example 11_a2a_server_client --features a2a` | exit 0，loopback A2A，`answer: echo: hello a2a` |
 | `cargo build -p openjiuwen-examples --examples` | exit 0 |
