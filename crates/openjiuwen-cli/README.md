@@ -13,16 +13,23 @@ option resolution, the one-shot runner, the interactive REPL, permission
 prompts and session storage — lives in `openjiuwen_harness::cli`.
 
 ```console
-$ openjiuwen run "summarise src/lib.rs"
-$ openjiuwen chat
+$ openjiuwen run "summarise src/lib.rs"             # needs a model provider key
+$ openjiuwen chat                                   # needs a model provider key
 $ openjiuwen auto-harness run --task "fix the parser" --dry-run
-$ openjiuwen lsp diagnostics --file src/lib.rs
+$ openjiuwen lsp diagnostics --file src/lib.rs      # needs an installed language server
 $ openjiuwen cron list
-$ openjiuwen team --socket /tmp/team.sock members
+$ openjiuwen team --socket /tmp/team.sock members   # Unix only; needs a hosting team
 $ openjiuwen watch --list
 $ openjiuwen sessions list
-$ openjiuwen run "and now?" --continue
+$ openjiuwen run "and now?" --continue              # needs a model provider key
 ```
+
+Only `run` and `chat` build a model, so only they need model credentials
+(`--api-key`, `OPENJIUWEN_API_KEY` / `API_KEY` / `OPENAI_API_KEY`, or
+`~/.openjiuwen/settings.json`); without one they fail at startup. Everything
+else works offline: `auto-harness run --dry-run`, `cron`, `watch --list` and
+`sessions` touch only local files, `lsp` needs an installed language server,
+and `team` needs a hosting team reachable over a Unix domain socket.
 
 ## Build and run
 
@@ -34,7 +41,7 @@ cache.
 cargo build --offline                     # debug binary: target/debug/openjiuwen
 cargo build --release -p openjiuwen-cli   # release binary: target/release/openjiuwen
 cargo run -p openjiuwen-cli -- --help
-cargo run -p openjiuwen-cli -- run "hello"
+cargo run -p openjiuwen-cli -- run "hello"     # needs a model provider key
 cargo run -p openjiuwen-cli -- auto-harness run --task "tidy docs" --dry-run
 cargo run -p openjiuwen-cli -- cron list
 cargo run -p openjiuwen-cli -- watch --list
@@ -55,8 +62,8 @@ cargo metadata --offline --no-deps
 openjiuwen [GLOBAL OPTIONS] [COMMAND]
 ```
 
-Without a command the binary chooses one from the terminal: an interactive
-terminal starts `chat`, anything else behaves like `run` with the prompt read
+Without a command the binary chooses one from the terminal: when stdin is a
+terminal it starts `chat`, otherwise it behaves like `run` with the prompt read
 from stdin. That dispatch belongs to the harness.
 
 ### `run [PROMPT] [-f|--output-format <FORMAT>] [--worktree <NAME>] [--resume <ID>|--continue]`
@@ -477,9 +484,10 @@ the keys `id`, `kind`, `created_at`, `detail`, `messages: [{"role", "content"}]`
 
 `prune` prints `would prune <kind>\t<id>` for a dry run, `pruned <kind>\t<id>`
 otherwise, and `nothing to prune` when the selector matches nothing; `--json`
-prints `{"dry_run", "pruned", "entries"}`. Deleting a session removes **every**
-source it has — the `<home>/sessions/<id>.jsonl` CLI record (and any legacy
-`<id>.json` document the store still reads), each
+prints `{"dry_run", "pruned", "entries", "failures"}`. A deletion that fails is
+listed in `failures` and makes the command exit non-zero. Deleting a session
+removes **every** source it has — the `<home>/sessions/<id>.jsonl` CLI record
+(and any legacy `<id>.json` document the store still reads), each
 `persistent_agent/logs/<exec>/` journal directory and the
 `persistent_agent/sessions/<agent>/<session>/` directory — so a pruned session
 cannot reappear from a leftover store.
@@ -500,6 +508,13 @@ Every option is global and optional, so it may appear before or after a
 subcommand. The effective value of each field is resolved per level:
 **flag → `OPENJIUWEN_*` → generic SDK variable → `~/.openjiuwen/settings.json` →
 built-in default**, blank values skipped at every level.
+
+Only `run` and `chat` build a model, so `--model`, `--provider`, `--api-key` and
+`--api-base` take effect only there; every other command parses and ignores
+them. `-w`/`--workspace` selects the workspace every command that touches one
+uses (`run`, `chat`, `cron`, `lsp`, `watch`, `sessions` and the `auto-harness`
+data directory), while `-v`/`--verbose` and `--no-color` affect only the
+`run`/`chat` rendering.
 
 ## Exit codes
 
@@ -660,8 +675,10 @@ is explicit where it cannot:
 `tests/` holds the process-level suites, all offline and hermetic (temporary
 working directory, temporary `OPENJIUWEN_HOME`, ambient `OPENJIUWEN_*` /
 `OPENAI_*` / `API_KEY` / `API_BASE` / `MODEL_*` removed, bounded child waits).
-The ten suites hold 95 tests; no case needs the network, credentials or a
-terminal.
+The ten files are ten integration binaries holding 96 tests as of this commit
+(plus 56 in-source unit tests beside the modules in `src/`), and
+`cargo test -p openjiuwen-cli --offline` is the gate. No case needs the
+network, credentials or a terminal.
 
 | Suite | Covers |
 | --- | --- |
