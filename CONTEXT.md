@@ -49,8 +49,7 @@ The complete per-package matrix, deviations, and deferred list live in `docs/PAR
 
 ## Known Issues
 
-- No `LICENSE` file is tracked or present on disk, although root `README.md:84` points at one; the only license declaration is `license = "Apache-2.0"` in the workspace metadata (`Cargo.toml:41`), matching the Python reference's tracked Apache-2.0 `LICENSE`.
-- The upstream is `https://gitcode.com/openJiuwen/agent-core` (Python `pyproject.toml` `[project.urls]`, reference v0.1.20); `Cargo.toml:42` and `README.md:3` still point at `https://github.com/openjiuwen/openjiuwen`.
+- The upstream is `https://gitcode.com/openJiuwen/agent-core` (Python `pyproject.toml` `[project.urls]`, reference v0.1.20); `Cargo.toml:42` now points at the canonical `https://github.com/openJiuwen-ai/agent-core` while `README.md:3` still links `https://github.com/openjiuwen/openjiuwen`.
 - Root `README.md` is stale: line 24 claims the CLI runs offline (only the examples do; `run`/`chat` fail without a provider key), line 73 says 12 examples (26 exist), line 74 says `live-tests` gates provider tests (it is an empty gate; `OPENJIUWEN_LIVE` switches the examples).
 
 ## Repository Facts
