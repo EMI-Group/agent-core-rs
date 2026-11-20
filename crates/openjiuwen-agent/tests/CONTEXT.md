@@ -8,6 +8,7 @@ Crate-level integration suites for `openjiuwen-agent`, driven by `openjiuwen-tes
 
 Suites (run with `cargo test -p openjiuwen-agent`):
 - `agent_card.rs` → `AgentCard` field set/`Card` trait/round-trip, `AgentOutput` result-type wire strings and `state` frames, absent-when-empty key shapes, Python-shaped result dicts, `AgentChunk` ↔ `StreamItem` bridge.
+- Nothing pins an `AgentCard` JSON Schema (`schemars::schema_for!`) or its `{}` deserialization; the card's three optionals serialize as `null` (no `skip_serializing_if`), unlike `CardBase`'s skipped `None`.
 - `react_agent.rs` → no-tool answer, single tool, parallel tools, tool error as tool message, max-iteration policies (`error`, `return_observations`, `final_answer`), empty-response retry, prompt/window contents, input/config errors.
 - `streaming.rs` → `llm_output`/`llm_reasoning`/`llm_usage`/`answer` frame assembly from a streamed scripted model, plus frame mirroring into a supplied session.
 - `rails.rs` → rails steering the running loop: priority ordering per event, force-finish before the model and before a tool, `ModelBackupRail` retry, `GuardrailRail` blocking (`ErrorKind::Security`), `MemoryRail` recall reaching the model + write-back, `skip_tool` replacement.

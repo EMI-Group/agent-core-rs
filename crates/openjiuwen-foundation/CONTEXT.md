@@ -63,6 +63,19 @@ Storage (`store`):
 - `tokio-rustls`/`webpki-roots` are pinned inline in this crate's `Cargo.toml` (not in `[workspace.dependencies]`) for the Redis `rediss://` client, and `nix` (unix only) backs the OAuth token-file lock; all three are already in `Cargo.lock` through `reqwest`/the workspace, so offline builds resolve them. `sqlx-postgres 0.8.6` stays in the lock and the local registry cache without a consumer.
 - Default features (`mcp`, `tiktoken`) compile and test offline; no test may hit the network or need credentials. The network storage adapters need no feature gate because their dependencies are non-optional.
 
+## Environment Variables
+
+- `MODEL_PROVIDER`, `OPENJIUWEN_API_KEY` → `API_KEY` → `OPENAI_API_KEY`, `API_BASE` → `OPENAI_BASE_URL`, and `MODEL_NAME` are read only through `openjiuwen_common::config::env` (`ModelClientConfig::{from_env,resolve_for}` at `src/llm/config.rs`, `ModelRequestConfig::from_env` at `src/llm/config.rs`, and the factory's blank-provider fallback at `src/llm/factory.rs`).
+- Precedence there: an explicit non-blank `provider`/`api_key`/`api_base` wins, then the environment, then the provider's static default (`openai` for `MODEL_PROVIDER`, a per-provider base URL); `MODEL_NAME` has no default and becomes `""`.
+- `OPENJIUWEN_MCP_RECONNECT_ATTEMPTS` (default 3, floored at 1) is read by `tool::mcp::client::reconnect_attempt_budget` through the same helper.
+- Redis reads `OPENJIUWEN_REDIS_URL` then `REDIS_URL`; `OPENJIUWEN_REDIS_USERNAME`/`OPENJIUWEN_REDIS_PASSWORD` override the URL, and empty values count as unset.
+- S3 reads `OPENJIUWEN_S3_ENDPOINT`/`_REGION`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`/`_BUCKET` before the matching `AWS_*` variable, plus `AWS_SESSION_TOKEN`.
+- DashScope reads `OPENJIUWEN_DASHSCOPE_API_KEY`/`_API_BASE` before `DASHSCOPE_API_KEY`/`DASHSCOPE_API_BASE`; the base defaults to the public cloud and a missing key is `Error::Config`.
+- The OAuth auth-store path resolves `OPENJIUWEN_AUTH_FILE`, then `$OPENJIUWEN_HOME/auth.json`, then `$HOME/.openjiuwen/auth.json` (`%USERPROFILE%` on Windows).
+- `OPENJIUWEN_OPENAI_ACCOUNT_MODELS_CACHE_FILE` and `OPENJIUWEN_OPENAI_ACCOUNT_BASE_URL` override the model-catalog cache path and the account base URL.
+- All resolvers trim blank values to absent; the inline S3/Redis readers use their own empty filter instead of `env::var`.
+- Test gaps: `S3Config::from_env`, the `REDIS_URL` fallback, and `OPENJIUWEN_OPENAI_ACCOUNT_BASE_URL` have no direct test, and `reconnect_attempt_budget_is_never_below_one` only asserts `>= 1`.
+
 ## Design Decisions
 
 - **Messages live in `prompt`**, not `llm`: the Python `llm/schema` message types are the crate's most widely used data types, and `llm` depends on `prompt`, never the reverse. `llm` re-exports `BaseMessage`, `ToolCall`, `Usage` for Python-shaped call sites.

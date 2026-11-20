@@ -111,9 +111,9 @@ impl Node for ComponentNode { /* run(...) */ }
 
 `run` semantics:
 
-1. `source = state.as_value()`; the root seed always carries a reserved `"inputs"` key with the run's original
+1. `source` is the graph state as a JSON object: `StateView` takes the state map with `mem::take` (no deep clone) and drops it back, with the node's output, on every outcome; the root seed always carries a reserved `"inputs"` key with the run's original
    inputs, so both `${query}` (root) and `${start.query}` resolve.
-2. `inputs = resolve_schema(inputs_schema, &source)` when a schema exists, else the whole source object; for
+2. `inputs = NodeSchemas::resolve_inputs(ability, &source)`: the input template compiled at graph build when one exists, else the whole source object; for
    `Collect` / `Transform`, resolve `stream_inputs_schema` too and merge the objects (`stream` keys win).
 3. `ComponentContext::new(session, id, workflow_id)` + `.with_interactions(scope.interactions)` +
    `.with_writer(scope.writer)` + `.with_cancellation(...)` + `.with_depth(scope.depth)`; `run` errors with
@@ -126,7 +126,7 @@ impl Node for ComponentNode { /* run(...) */ }
 6. stream/transform frames are stored under the node id as a JSON array. When the node is the workflow end,
    each frame is also written as an `end node stream` output frame with a 0-based index, and the stored array
    holds `{"type": "end node stream", "index", "payload"}` wires so `invoke` can return them verbatim.
-7. `outputs_schema` projects the raw output against `state + {"<id>": raw, "output": raw}`;
+7. `outputs_schema` (also compiled at graph build) projects the raw output against `state + {"<id>": raw, "output": raw}`, the extra keys supplied as root bindings so no state copy is made;
    `state.set(id, output)`.
 8. an error carrying `find_interrupt` keeps the tracing `interrupted(reason)` marker and is propagated
    unchanged (the interaction frame itself was already written by `ComponentContext::interact`), so the graph's

@@ -27,6 +27,8 @@ No panics on user input: all fallible paths return `Result`.
 `pub struct CardId(String)` is a transparent serde/schemars newtype with `Display`, `From<&str>`, `From<String>`, `as_str()`, `CardId::generate()` (Python `uuid4().hex`, 32 lowercase hex chars), and `Default` = generated.
 Card JSON is one-to-one with Python `BaseCard.model_dump()` for the shared fields; round-trips through `serde_json` and rejects no unknown keys.
 `AgentCard` and the other concrete cards are NOT defined here: `AgentCard` lives in `openjiuwen-agent` (`src/card.rs`) and embeds its fields directly instead of flattening `CardBase`.
+No real concrete card flattens `CardBase`: `ToolCard` (`openjiuwen-foundation`) is flat and implements `Card`, `AgentCard`, `WorkflowCard` (`openjiuwen-workflow`) and `HarnessCard` (`openjiuwen-harness-protocol`) are independent serde types (only `WorkflowCard`/`HarnessCard` diverge on schemars: neither derives `JsonSchema`), and `TeamCard` re-declares `id`/`name`/`description` so its wire keys match Python's `BaseCard`.
+Only the trait and `CardBase` live here; every downstream card owns its own JSON shape and unknown-field tolerance tests.
 `card_schema::<C: Card>() -> Result<Value>` and `card_base_schema() -> Result<Value>` emit deterministic JSON Schemas (generated-id defaults stripped).
 
 ### `logging` — `crate::logging`
@@ -41,6 +43,8 @@ Card JSON is one-to-one with Python `BaseCard.model_dump()` for the shared field
 `env`: `var`, `flag`, `truthy` (`1/true/yes/on`), `parse<T: FromStr>`, plus typed resolvers `api_key() -> Option<SecretString>` (`OPENJIUWEN_API_KEY` → `API_KEY` → `OPENAI_API_KEY`), `api_base() -> Option<String>` (`API_BASE` → `OPENAI_BASE_URL`), `model_provider() -> String` (default `"openai"`), `model_name() -> Option<String>`, `openjiuwen_home() -> Option<PathBuf>`, `server_url()`, `bash_strict() -> bool` (default false), `mcp_reconnect_attempts() -> u32` (default 3), `otel_global_instrument_enabled() -> bool` (default false), `ssrf_protect_enabled() -> bool` (default true), `http_proxy()`/`no_proxy()`.
 `home`: `OpenJiuwenHome { root: PathBuf }` with `resolve()` (`OPENJIUWEN_HOME` → `$HOME/.openjiuwen` → `./.openjiuwen`), `from_root`, `root()`, `join(rel)`, `logs_dir()`, `sessions_dir()`, `ensure() -> Result<()>`; it is `Debug + Clone + PartialEq + Eq + Default`, has no `serde`, and no `skills_dir`/`settings_path`/`history_path` helpers.
 `load_dotenv()` is the only `.env` entry point and is documented as binary-only; library constructors never read `.env`.
+Deliberately not read by these resolvers: `OPENJIUWEN_API_BASE`, `OPENJIUWEN_MODEL`, `OPENJIUWEN_PROVIDER`, `OPENJIUWEN_MODEL_NAME`, `OPENJIUWEN_MODEL_PROVIDER`, `OPENAI_MODEL`.
+The harness CLI owns its own chain in `crates/openjiuwen-harness/src/cli/config.rs` (`OPENJIUWEN_API_BASE` → `API_BASE` → `OPENAI_BASE_URL`, `OPENJIUWEN_MODEL` → `MODEL_NAME`, `OPENJIUWEN_PROVIDER` → `MODEL_PROVIDER`), and the examples' live-mode probe `crates/openjiuwen-examples/src/support/mode.rs` reads `OPENJIUWEN_MODEL_NAME`, `OPENJIUWEN_MODEL_PROVIDER` and `OPENAI_MODEL`; the shared `env::api_key`/`api_base`/`model_provider`/`model_name` chain stops at the generic SDK variables by design.
 
 ### `security` — `crate::security::{SecretString, constant_time_eq, redact}`
 `SecretString` redacts in `Debug`/`Display` (`<REDACTED>`), serializes its value (config round-trip, Python parity), never logs, exposes `SecretString::new(impl Into<String>)`, `From<String>`, `From<&str>`, `Default`, `expose_secret() -> &str`, `is_empty()`, `len()`; `PartialEq`/`Eq` compare in constant time.
@@ -103,6 +107,7 @@ Panics are isolated with `FutureExt::catch_unwind` and recorded as `Failed`; `jo
 
 ## Known Issues
 
+- `config::env::server_url()` (`OPENJIUWEN_SERVER_URL`) has no non-test consumer anywhere in the workspace.
 - `src/task/manager.rs:509` — terminal tasks leave the registry only through an explicit `remove_finished()`, so a long-lived manager (including `TaskManager::global()`) grows per spawn and `list()` clones every dead snapshot while holding the registry lock.
 - `src/task/` has no consumer anywhere else in the workspace (`openjiuwen_core::common::task` is reachable but unused), so the structured-task guarantees are exercised only by this crate's tests.
 - `src/logging/events.rs:613` — `emit` builds the redacted JSON payload (a full clone of the event tree plus serialization) before `tracing` consults the level filter, so a filtered-out level still pays the whole cost.

@@ -256,13 +256,16 @@ Layered BFS layout over the sorted spec maps, rounded start/end boxes, arrow mar
 ```rust
 pub fn is_ref_path(s: &str) -> bool;                       // "${…}", length > 3
 pub fn extract_origin_key(s: &str) -> Option<&str>;        // "${a.b}" → "a.b"
-pub fn split_path(path: &str) -> Vec<PathSegment>;         // a.b[0]['k'].c
+pub fn split_path(path: &str) -> Result<Vec<PathSegment>>; // a.b[0]['k'].c; malformed paths are Validation errors
 pub fn resolve_path(source: &Value, path: &str) -> Option<Value>;
 pub fn resolve_schema(schema: &Value, source: &Value) -> Value;   // deep template resolution
 pub fn project(value: &Value, path: &str) -> Value;        // alias used by routers
 ```
 
-Rules: a string that is exactly `${…}` resolves to the referenced value (any JSON type); other strings are literals. Nested paths support dotted keys, `[i]`, `[-1]`, `['k']`; a numeric segment after `.` indexes arrays but falls back to a key. A missing path or a `null` root resolves to `null`; resolution never errors. When an intermediate value is an array and the next segment is a non-numeric field name, the field is projected over the elements (needed for buffered stream composition — see Design Decisions).
+Rules: a string that is exactly `${…}` resolves to the referenced value (any JSON type); other strings are literals. Nested paths support dotted keys, `[i]`, `[-1]`, `['k']` (and `["k"]`); a numeric segment after `.` indexes arrays but falls back to a key. A missing path or a `null` root resolves to `null`; resolution never errors. When an intermediate value is an array and the next segment is a non-numeric field name, the field is projected over the elements (needed for buffered stream composition — see Design Decisions).
+There is no escaping and no `${{…}}` form: a string with braces inside the delimiters (`${{a}}`, `${a}${b}`) is a literal, as is any string with text around a reference.
+`split_path` itself rejects malformed paths (unterminated/empty `[]`, bad quoted key, a bare non-integer subscript) with `Error::Validation`, but `resolve_path`/`resolve_schema`/`project` map a parse failure to `null`, so a malformed reference never fails a run.
+Engine node schemas are compiled once at graph build into the `pub(crate)` `reference::CompiledSchema` (pre-split `PathSegment`s), and `project_output` resolves them with `(node id, raw output)` plus `("output", raw)` root bindings; `resolve_schema` remains the re-parsing entry point for one-off templates.
 
 ### Conditions (`src/condition.rs`)
 
@@ -296,6 +299,7 @@ pub fn generate_workflow_key(workflow_id: &str, workflow_version: &str) -> Strin
 ```
 
 Field names, defaults, and card keys match Python (`id`, `name`, `description`, `version`, `input_params`; `timeout` in seconds, negative = none). Every type is serde snake_case, tolerates unknown fields, and round-trips through JSON.
+`WorkflowCard` and `ComponentCard` are plain serde types: neither implements `openjiuwen_common::card::Card`, embeds `CardBase`, nor derives `schemars::JsonSchema`, so no JSON Schema is exposed for workflow cards, and neither type has a field-level serde attribute (`rename_all` is a no-op on the already-snake_case field names).
 
 ### Errors (`src/error.rs`)
 
@@ -430,12 +434,14 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 - Python's per-component config objects are replaced by injected collaborators: `ToolComponentConfig`, `KnowledgeRetrievalCompConfig`/`ComponentKBConfig` and `MemoryRetrievalCompConfig`/`MemoryWriteCompConfig` have no Rust counterpart (the components take the tool/KB/memory seam directly), and `WorkflowCard::tool_info()` has no counterpart because workflow-as-tool registration belongs to the runner/agent layers.
 - A workflow is immutable during a run: per-run topology changes are a mutated, revalidated copy (`CompiledWorkflow::mutated`/`invoke_mutated`/`stream_mutated`), never an edit of a running graph.
 - `outputs_schema` resolves against workflow state plus the node's own id and an `output` key (`${<id>.field}` / `${output.field}`); there is no `self` shorthand, and a bare `${field}` resolves to `null`.
+- Reference strings are not validated at build time: a malformed `${…}` path resolves to `null` (`resolve_path` maps the `split_path` `Validation` error to `None`), so a typo is a runtime data gap rather than a build error.
+- Python's end-node input sanitization (`_sanitize_unexecuted_branch_inputs`) replaces a reference value from an unexecuted branch with `""` before template rendering; this crate resolves the same reference to `null` and the end template omits it (same rendered batch text), but a custom end component sees `null` rather than `""`.
 - `ComponentOptions::streaming()` declares `[Invoke, Stream]` (plus `Transform` when a stream input schema is set), so it cannot be used on a component that implements only `Stream`, and a streaming end is not a valid `add_stream_connection` target unless it declares `Transform`.
 - Unknown-component ids and capability mismatches are reported as one compile error rather than Python's split between build-time and run-start checks.
 - Recovery is inline in `ComponentNode::run` rather than Python's `component_error_recovery` callback framework; the observable contract (defaults written under the node id, run continues) is the same.
 - `enable_history` history is per session (`__messages__`), not per `ModelContext`: two history-enabled nodes on one session see each other's turns, and only plain text survives a round trip.
-- Hot-path cost: `ComponentNode::run` deep-clones the whole state (`state.as_value()`) and the resolved inputs (for the trace span, whether or not a tracer exists) and `project_output` clones state plus the raw output twice, so one node execution costs several full-state copies per superstep.
-- Hot-path cost: `reference::resolve_schema` re-parses every `${…}` string (`split_path` allocates a `Vec<char>` and a `Vec<PathSegment>`) on every node execution and every output projection; nothing is cached even though a node's schemas are immutable.
+- Node execution takes the graph state map into an `engine::node::StateView` (an O(1) `mem::take`, not a deep clone) and restores it with the node's output on drop; the remaining per-node copies are the resolved component inputs and the projected output values, and a trace span only materializes inputs when the session has a tracer.
+- Engine node schemas are compiled once at graph build (`reference::CompiledSchema`) and resolved through pre-split `PathSegment`s; `reference::resolve_schema` re-parses every `${…}` string per call and is only used for one-off templates (`execute_single_component` inputs, loop variables, `loop_set_variable`).
 - `components/http_request/mod.rs::HttpRequestComponent::invoke` builds a new `HttpClient` per invocation, so connection pooling is lost and each HTTP node pays a client/TLS build.
 - `components/http_request/digest.rs::digest_parameters` slices `trimmed[..6]` without a char-boundary check; unreachable through HTTP today only because `HeaderValue::to_str` accepts visible ASCII, but a non-ASCII header value would panic.
 - Deviations from Python documented in `src/components/CONTEXT.md`: batch end templates stringify with JSON text instead of `str()`, branch routers support a Rust-only default target, loops return a `loop_results` wrapper, the retrieval component returns `documents` instead of Python's `results`/`context`, memory components return `memories`/record results instead of Python's fragment/summary split, the HTTP component accepts `max_redirects`/`disable_compression`/`use_stream` without acting on them (its multipart, digest and SigV4 branches are implemented here while Python only declares the configuration), the questioner injects its model directly and keeps chat history in the session `__messages__` lane rather than a `ModelContext` window, intent detection adds an offline keyword path, ReAct returns a plain answer/observations value instead of Python's rich result dict and maps interrupts to data, and a sub-workflow's stream cache merges mixed types last-wins instead of raising `TypeError`.

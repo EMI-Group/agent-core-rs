@@ -67,6 +67,7 @@ pub mod redis {
 - `delete` writes `DEL payload` + `ZREM index` in one pipelined batch; deleting a missing checkpoint is a no-op.
 - `release` pages `SCAN MATCH openjiuwen:checkpoint:{session_id}:* COUNT 500`, deletes payloads in chunks of 500, then deletes the index key.
 - The release pattern ends in `:` and escapes glob metacharacters (`*?[]\`) in the session id, so `session-1` never matches `session-10`.
+- Session and checkpoint ids are interpolated into both key forms verbatim (only the `release` glob is escaped), unlike the store's Redis keys, which percent-escape every component.
 - `list` reads `ZRANGE index 0 -1`, `MGET`s the payloads in chunks of 500, drops index members whose payload vanished (and `ZREM`s them), and returns summaries newest first by `(created_at, checkpoint_id)` descending.
 - `latest` stays the trait default (sort `list`, then `load` the first), so it agrees with the backend ordering.
 - `session_exists` is `ZCARD index > 0`; an unknown session answers `false`, a missing payload answers `Ok(None)`, and an empty session lists no checkpoints — none of those are errors.
@@ -105,6 +106,11 @@ pub mod redis {
 - `rediss://`/`rediss+cluster://` work through the crate's client: the TLS handshake verifies the server against the web PKI (`tokio-rustls` + `webpki-roots`, both locked offline), so no TLS error is returned for a valid certificate chain.
 - Cluster URLs verify the seed as a cluster node and follow one `MOVED`/`ASK` redirection per command, so slot routing is real rather than recorded-and-ignored.
 - Python's pickle payload format and `{session_id}:agent:{agent_id}:agent_state_blobs` key layout are intentionally replaced by the JSON payload plus sorted-set index described above.
+
+## Known Issues
+
+- `validate_session_id`/`validate_checkpoint_id` (kernel `validate_id`) allow `:`, so the unescaped `openjiuwen:checkpoint:{session_id}:{checkpoint_id}` form is ambiguous: session `a:b` + checkpoint `c` writes the same key as session `a` + checkpoint `b:c`, and `release("a")` (pattern `openjiuwen:checkpoint:a:*`) deletes session `a:b`'s payloads.
+- No test covers a `:`-bearing id; `release_patterns_escape_glob_metacharacters` and the `session-1`/`session-10` case only cover glob characters and prefix collisions.
 
 ## Routing Table
 

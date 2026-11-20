@@ -44,6 +44,8 @@ impl TeamConfig { pub fn configure_max_agents(self, n: usize) -> Self;
                   pub fn configure_timeout(self, seconds: f64) -> Self; }
 ```
 
+`TeamCard` re-declares `id`/`name`/`description` rather than flattening `CardBase`, whose extra `metadata`/`version` keys are absent from Python's `BaseCard`; `EventDrivenTeamCard` mirrors Python inheritance with `#[serde(flatten)]` on `card` (plus a derived `Default`), so the wire shape is one flat object.
+
 ### Members (`member.rs`)
 
 ```rust
@@ -464,7 +466,7 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 ## Test Strategy
 
 - Unit tests beside each module: card/config serde defaults and unknown-field tolerance; envelope P2P/pub-sub classification; wildcard matching and subscription indexing; bus duplicate-subscribe, cleanup/re-subscribe, timeout, fan-out failure isolation, start/stop idempotence; runtime registration/pinning/unregistration; team validation messages and `max_agents`; orchestrator route graph/cap/termination/first-wins; signal precedence; handoff tool card shape and never-raise; `AgentTool` card and dispatch; event filter combination and sequence stamping; subscription derivation rules; Python-literal parsing and rendering; resource-manager duplicates; member checkpoint key/id layout; transport construction and key naming; ability routing.
-- `tests/team_card.rs` pins the wire contract: JSON field names, `version: "1.0.0"`, `agent_cards`, `subscriptions`, `TeamConfig` defaults 10/100/30.0.
+- `tests/team_card.rs` pins the wire contract: JSON field names, `version: "1.0.0"`, `agent_cards`, `subscriptions`, `TeamConfig` defaults 10/100/30.0. Unknown-field tolerance is pinned only for `TeamCard` (`card::tests::unknown_keys_are_tolerated`), and the event-driven card's schema check asserts only that the root is an object, not its property names.
 - `tests/message_bus.rs` drives the bus directly with a recording handler: P2P ordering per sender, concurrent fan-out to sorted subscribers, missing-subscriber publish no-op, timeout error text, session cleanup, graceful shutdown, plus a gated handler that fills a one-slot queue to pin the caller timeout on queue admission (typed `Timeout` within the bound, the abandoned message is never handled) and the no-deadline path that keeps waiting for capacity.
 - `tests/runtime.rs` covers registration, provider binding, P2P session construction from a bound team session, empty-response error, P2P timeout override, transport-backed subscription gating (subscribe delivers, unsubscribe stops delivery, introspection agrees with the transport) and an `Unsupported` error from a transport without a subscription registry.
 - `tests/team.rs` covers `add_agent`/`add_member`/`remove_agent`/`remove_member`, duplicate no-op, `max_agents`, queries, send/publish validation, start/stop idempotence, a custom strategy, and the unsupported-strategy error.
@@ -487,7 +489,7 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - `tests/runtime_integration.rs` covers the runtime seams together: event emission, resource-manager fallback, member-scoped checkpoints across a resume, the outbound transport, and `AgentTool` task events.
 - `tests/handoff_events.rs` covers one `handoff_started` per hop, `handoff_completed` with `interrupted`, the `handoff` error event, and silence when the runtime was dropped.
 - `tests/api_surface.rs` pins the public contract at compile time: every crate-root re-export, inherent constructor and free-function signature, trait-object coercion (`Team`, `TeamStrategy`, `MessageHandler`, `ToolHost`, `Tool`), `Team` method reachability, the `Card` impl, serde round-trips and `schemars` property names, and the `TeamError` → `ErrorKind::External` mapping.
-- All tests are offline and deterministic: fake agents are local closures, models come from `openjiuwen-test-support::ScriptedModel`, timeouts use short durations only.
+- All tests are offline and deterministic: fake agents are local closures, models come from `openjiuwen-test-support::ScriptedModel`, timeouts use short durations only. The crate reads no environment variables at all (no `std::env` use in `src/` or `tests/`).
 
 ## Deferred Python Behavior
 

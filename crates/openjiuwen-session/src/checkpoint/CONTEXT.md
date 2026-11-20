@@ -49,6 +49,9 @@ Checkpoint payloads are JSON, so the crate never guesses a storage format; `pick
 - Redis has no cluster or Sentinel support and no pipelining: commands are serialized over one connection per checkpointer, and a cluster URL is not detected (the host list parses as one host).
 - The TLS stack is pinned inline in `Cargo.toml` (`rustls 0.23` with `ring`, `tokio-rustls 0.26`, `webpki-roots 1`); no PEM or base64 crate is used.
 - No `unsafe`, no stdout logging; backend code is split one file per backend, and `pickle.rs` (~1450 lines) stays whole because it is one codec plus its checkpoint mapping and inline opcode tests.
+- `SqliteCheckpointer` stores plain compact JSON (`serde_json::to_string`) in one `payload TEXT` column; there is no envelope, schema version, compression or pickle path, and no backend auto-detects a stored format.
+- `SqliteCheckpointer::open` pins no `busy_timeout` and no WAL pragma (Python's `persistence.py` enables WAL), so a file-backed database uses the default rollback journal and concurrent writers serialize on a pool of up to 4 connections; a busy timeout surfaces as `Error::Session`.
+- No test opens the SQLite file directly: `tests/checkpoint_sqlite.rs` asserts the `Checkpointer` contract, factory selection and reopen-after-save, not the DDL or column contents.
 - `resp_tls`'s pure helpers are unit-tested inline; the end-to-end TLS behaviour is covered by `tests/checkpoint_redis_tls.rs` against the static fixtures and the loopback server's TLS mode.
 
 ## Routing Table

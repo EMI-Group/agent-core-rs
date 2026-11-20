@@ -238,6 +238,7 @@ The full per-module signatures, wire contracts and gaps live in the child `CONTE
 - Unknown Python config keys are ignored rather than forwarded into `extra` (Python's `model_config = {"extra": "allow"}` keeps them on the model); only the documented aliases and the typed fields survive a cross-language round trip.
 - A Python `reasoning` payload that is not an intent object (a raw legacy dict) is forwarded verbatim by the OpenAI-compatible and Responses builders but rejected with `Error::Validation` by the Anthropic builder, which has no raw `reasoning` body key to forward it to.
 - A `float` `max_tokens`/`context_window` (`512.0`) is not coerced to an integer the way pydantic's lax mode does; only the integer JSON form decodes.
+- Two documented Anthropic wire facts have no test: that the client sends only `x-api-key` and never `authorization` (the wiremock suite matches `x-api-key`/`anthropic-version` positively and never asserts header absence), and that an `event:` name wins over a payload `type` when both are present (`anthropic/stream.rs::event_name`; only the missing-`event:` fallback is tested).
 
 ## Routing Table
 
