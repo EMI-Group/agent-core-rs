@@ -49,16 +49,15 @@ The complete per-package matrix, deviations, and deferred list live in `docs/PAR
 
 ## Known Issues
 
-- No `LICENSE` file is tracked or present on disk, although root `README.md:84` points at one; the only license declaration is `license = "Apache-2.0"` in the workspace metadata (`Cargo.toml:41`), matching the Python reference's tracked Apache-2.0 `LICENSE`.
-- The upstream is `https://gitcode.com/openJiuwen/agent-core` (Python `pyproject.toml` `[project.urls]`, reference v0.1.20); `Cargo.toml:42` and `README.md:3` still point at `https://github.com/openjiuwen/openjiuwen`.
+- The upstream is `https://gitcode.com/openJiuwen/agent-core` (Python `pyproject.toml` `[project.urls]`, reference v0.1.20); `Cargo.toml:42` now points at the canonical `https://github.com/openJiuwen-ai/agent-core` while `README.md:3` still links `https://github.com/openjiuwen/openjiuwen`.
 - Root `README.md` is stale: line 24 claims the CLI runs offline (only the examples do; `run`/`chat` fail without a provider key), line 73 says 12 examples (26 exist), line 74 says `live-tests` gates provider tests (it is an empty gate; `OPENJIUWEN_LIVE` switches the examples).
 
 ## Repository Facts
 
 - 30 workspace crates under `crates/*`; `default-members` lists 27 (all but `openjiuwen-test-support`, `openjiuwen-e2e`, `openjiuwen-examples`), so a bare `cargo build`/`cargo test` skips the three dev crates.
 - Every crate inherits `version = "0.1.0"`, `edition = "2021"`, `rust-version = "1.85"`, `license = "Apache-2.0"`, `repository`, and `publish = false` from `[workspace.package]`.
-- No `LICENSE` file exists in the repository despite the Apache-2.0 declaration; there is also no CI configuration, no `rustfmt.toml`/`clippy.toml`/`deny.toml`, and no `rust-toolchain` file — the `Makefile` targets are the only gate.
-- `[workspace.package] repository` is `https://github.com/openjiuwen/openjiuwen`, which does not match the Python upstream's declared `https://gitcode.com/openJiuwen/agent-core.git`.
+- Root `LICENSE` holds the standard Apache-2.0 text (201 lines, copied verbatim from the Python reference); there is also no CI configuration, no `rustfmt.toml`/`clippy.toml`/`deny.toml`, and no `rust-toolchain` file — the `Makefile` targets are the only gate.
+- `[workspace.package] repository` is `https://github.com/openJiuwen-ai/agent-core` (the canonical original-project link); the Python upstream declares `https://gitcode.com/openJiuwen/agent-core.git`.
 - Only `openjiuwen-common` declares a package `description`; no crate declares `homepage`, `documentation`, `keywords`, or `categories`, and all 30 set `publish = false`.
 - Workspace lints (`Cargo.toml:168-178`): Rust `unsafe_code = "deny"`, `missing_docs`/`unreachable_pub` warn; Clippy `all`/`pedantic` warn plus `unwrap_used`/`expect_used` warn.
 - No `unsafe` block, `unsafe fn`, `extern "C"`, or `#[no_mangle]` exists in tracked source; FFI is confined to dependencies (`sqlx` → bundled C SQLite via `libsqlite3-sys`, `nix`/`libc` syscalls, `ring`, `inotify` behind `notify`).
