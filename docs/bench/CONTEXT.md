@@ -9,8 +9,9 @@ Results are raw JSON so the appendix can be recomputed rather than copied.
 ## API Surface
 
 - `rust/` — cargo package `openjiuwen-bench` (own `[workspace]`, path dependencies on workspace crates) exposing the `floor`, `prompt`, and `graph` subcommands.
-- `python/bench.py` — CPython harness for the same prompt-render and pregel-graph workloads plus the import floor.
-- `results/` — raw per-repetition output (`*.json`) from each side; the appendix tables are derived from these files.
+- `python/bench.py` — CPython harness for the same prompt-render and pregel-graph workloads, writing per-repetition JSON to `results/python/<workload>.json`.
+- `python/measure_proc.py` — single-child process wrapper printing `{"wall_s", "maxrss_kb", "exit"}` as one JSON line; used for the import-floor measurement of either language.
+- `results/` — raw per-repetition output (`*.json`) from each side; `results/python/floor.json` holds the 20 import-floor samples; the appendix tables are derived from these files.
 
 ## Constraints
 
