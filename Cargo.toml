@@ -39,7 +39,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/openjiuwen/openjiuwen"
+repository = "https://github.com/openJiuwen-ai/agent-core"
 authors = ["openJiuwen contributors"]
 
 [workspace.dependencies]
