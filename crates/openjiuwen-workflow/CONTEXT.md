@@ -296,6 +296,7 @@ pub fn generate_workflow_key(workflow_id: &str, workflow_version: &str) -> Strin
 ```
 
 Field names, defaults, and card keys match Python (`id`, `name`, `description`, `version`, `input_params`; `timeout` in seconds, negative = none). Every type is serde snake_case, tolerates unknown fields, and round-trips through JSON.
+`WorkflowCard` and `ComponentCard` are plain serde types: neither implements `openjiuwen_common::card::Card`, embeds `CardBase`, nor derives `schemars::JsonSchema`, so no JSON Schema is exposed for workflow cards, and neither type has a field-level serde attribute (`rename_all` is a no-op on the already-snake_case field names).
 
 ### Errors (`src/error.rs`)
 
