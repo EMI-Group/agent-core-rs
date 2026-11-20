@@ -151,7 +151,7 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 - `println!`/`eprintln!` are allowed here (binary crate) for user-facing results and diagnostics only; libraries log through `tracing`.
 - No new crates.io dependencies: these surfaces need only `chrono` (the cron clock, the catalogue timestamps) and the `openjiuwen-harness` `notify` feature (the watcher), both already in the manifest; the crate builds offline with the workspace-pinned set, and `openjiuwen-test-support` is a dev-dependency only.
 - Declared dependencies: `openjiuwen` (the umbrella, for the `agent_teams` attach types), `openjiuwen-harness`, `openjiuwen-core` (`foundation::tool` in `lsp`), `openjiuwen-common`, `openjiuwen-rsi`, `clap`, `chrono`, `tokio`, `tracing`, `tracing-subscriber`, `dotenvy`, `serde` (only `auto_harness/experience.rs`) and `serde_json`; `anyhow` and `openjiuwen-harness-protocol` are declared but referenced by no source file.
-- Files stay around ≤1000 lines (`src/sessions/catalog.rs` is the largest at ~816, with its inline tests split into `src/sessions/catalog/tests.rs`); sibling binaries are not added here.
+- Files stay around ≤1000 lines, though `src/sessions/catalog.rs` is the largest at ~1048 (its inline tests live in `src/sessions/catalog/tests.rs`); sibling binaries are not added here.
 - The `[[bin]]` target declares `doc = false` so rustdoc never collides with the `openjiuwen` umbrella crate's `target/doc/openjiuwen/`.
 - `team` is Unix-only at runtime: the grammar and wire types compile everywhere, but the attach transport answers `Error::Unsupported` ("cross-process attach requires Unix domain sockets") on non-Unix targets.
 
