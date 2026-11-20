@@ -46,3 +46,5 @@ The Context Tree (`CONTEXT.md` per crate) is the primary source of intent and AP
 
 - `./ARCHITECTURE.md` → cross-cutting contracts, crate layering, feature flags, testing infrastructure
 - `./PARITY.md` → per-package parity matrix, deferred features, typed seams, verification gates
+- `./BENCHMARKS.md` → environment, measured process and pure-local operations, raw samples, limitations
+- `./bench/` → Rust and Python measurement harnesses plus the recorded raw results (`bench/CONTEXT.md`)
