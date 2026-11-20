@@ -111,9 +111,9 @@ impl Node for ComponentNode { /* run(...) */ }
 
 `run` semantics:
 
-1. `source = state.as_value()`; the root seed always carries a reserved `"inputs"` key with the run's original
+1. `source` is the graph state as a JSON object: `StateView` takes the state map with `mem::take` (no deep clone) and drops it back, with the node's output, on every outcome; the root seed always carries a reserved `"inputs"` key with the run's original
    inputs, so both `${query}` (root) and `${start.query}` resolve.
-2. `inputs = resolve_schema(inputs_schema, &source)` when a schema exists, else the whole source object; for
+2. `inputs = NodeSchemas::resolve_inputs(ability, &source)`: the input template compiled at graph build when one exists, else the whole source object; for
    `Collect` / `Transform`, resolve `stream_inputs_schema` too and merge the objects (`stream` keys win).
 3. `ComponentContext::new(session, id, workflow_id)` + `.with_interactions(scope.interactions)` +
    `.with_writer(scope.writer)` + `.with_cancellation(...)` + `.with_depth(scope.depth)`; `run` errors with
