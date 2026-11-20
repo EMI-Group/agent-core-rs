@@ -44,6 +44,8 @@ impl TeamConfig { pub fn configure_max_agents(self, n: usize) -> Self;
                   pub fn configure_timeout(self, seconds: f64) -> Self; }
 ```
 
+`TeamCard` re-declares `id`/`name`/`description` rather than flattening `CardBase`, whose extra `metadata`/`version` keys are absent from Python's `BaseCard`; `EventDrivenTeamCard` mirrors Python inheritance with `#[serde(flatten)]` on `card` (plus a derived `Default`), so the wire shape is one flat object.
+
 ### Members (`member.rs`)
 
 ```rust
